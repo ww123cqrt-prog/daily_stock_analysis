@@ -13,6 +13,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:smoke": "playwright test",
+    "test:smoke:local": "DSA_WEB_E2E_BASE_URL=${DSA_WEB_E2E_BASE_URL:-http://127.0.0.1:8010} playwright test e2e/local-workbench.spec.ts --config playwright.config.ts",
+    "test:smoke:fake-analysis": "DSA_WEB_SMOKE_MANAGED=1 DSA_WEB_E2E_FAKE_ANALYSIS=1 DSA_E2E_FAKE_ANALYSIS=1 DSA_WEB_SMOKE_BACKEND_PORT=${DSA_WEB_SMOKE_BACKEND_PORT:-18010} DSA_WEB_DEV_API_TARGET=${DSA_WEB_DEV_API_TARGET:-http://127.0.0.1:18010} DSA_WEB_E2E_BASE_URL=${DSA_WEB_E2E_BASE_URL:-http://127.0.0.1:4173} playwright test e2e/local-workbench.spec.ts --config playwright.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {

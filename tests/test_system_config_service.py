@@ -36,7 +36,8 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        os.environ["ENV_FILE"] = str(self.env_path)
+        self._env_patcher = patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True)
+        self._env_patcher.start()
         Config.reset_instance()
 
         self.manager = ConfigManager(env_path=self.env_path)
@@ -44,7 +45,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         Config.reset_instance()
-        os.environ.pop("ENV_FILE", None)
+        self._env_patcher.stop()
         self.temp_dir.cleanup()
 
     def _rewrite_env(self, *lines: str) -> None:

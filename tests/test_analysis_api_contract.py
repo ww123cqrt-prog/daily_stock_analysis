@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import Future
 from datetime import datetime
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,7 +42,7 @@ except Exception:  # pragma: no cover - optional dependency environments
 from src.enums import ReportType
 from src.services.analysis_service import AnalysisService
 from src.services.image_stock_extractor import _call_litellm_vision
-from src.services.task_queue import AnalysisTaskQueue, TaskStatus
+from src.services.task_queue import AnalysisTaskQueue, TaskStatus, _e2e_fake_analysis_enabled
 
 
 def _analysis_context_pack_overview() -> dict:
@@ -2710,6 +2711,72 @@ class BatchTaskQueueContractTestCase(unittest.TestCase):
             if executor is not None and hasattr(executor, "shutdown"):
                 executor.shutdown(wait=False, cancel_futures=True)
         AnalysisTaskQueue._instance = self._original_instance
+
+    def test_e2e_fake_analysis_requires_smoke_management_gate(self) -> None:
+        with patch.dict(os.environ, {"DSA_E2E_FAKE_ANALYSIS": "1"}, clear=False):
+            os.environ.pop("DSA_WEB_SMOKE_MANAGED", None)
+            os.environ.pop("PYTEST_CURRENT_TEST", None)
+            self.assertFalse(_e2e_fake_analysis_enabled())
+
+        with patch.dict(
+            os.environ,
+            {"DSA_E2E_FAKE_ANALYSIS": "1", "DSA_WEB_SMOKE_MANAGED": "1"},
+            clear=False,
+        ):
+            self.assertTrue(_e2e_fake_analysis_enabled())
+
+    def test_e2e_fake_analysis_env_completes_and_persists_history(self) -> None:
+        from src.storage import DatabaseManager
+
+        queue = AnalysisTaskQueue(max_workers=1)
+        stock_code = "689997"
+
+        with patch.dict(os.environ, {"DSA_E2E_FAKE_ANALYSIS": "1", "DSA_WEB_SMOKE_MANAGED": "1"}):
+            accepted, duplicates = queue.submit_tasks_batch(
+                [stock_code],
+                stock_name="E2E分析",
+                original_query=stock_code,
+                selection_source="manual",
+                notify=False,
+                force_refresh=True,
+                report_type="detailed",
+            )
+            self.assertEqual(duplicates, [])
+            self.assertEqual(len(accepted), 1)
+            task = accepted[0]
+
+            deadline = datetime.now().timestamp() + 5
+            completed = queue.get_task(task.task_id)
+            while datetime.now().timestamp() < deadline:
+                completed = queue.get_task(task.task_id)
+                if completed and completed.status == TaskStatus.COMPLETED:
+                    break
+                import time
+                time.sleep(0.05)
+
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.status, TaskStatus.COMPLETED)
+        self.assertEqual(completed.progress, 100)
+        self.assertIn("dsa_e2e_fake_analysis", completed.result["report"]["summary"]["analysis_summary"])
+        query_id = completed.result["query_id"]
+        self.assertTrue(query_id.startswith("dsa_e2e_fake_analysis_"))
+        self.addCleanup(
+            lambda: DatabaseManager.get_instance().delete_analysis_history_records([
+                row.id
+                for row in DatabaseManager.get_instance().get_analysis_history(query_id=query_id, limit=10)
+            ])
+        )
+        rows = DatabaseManager.get_instance().get_analysis_history(query_id=query_id, limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].code, stock_code)
+        self.assertIn("dsa_e2e_fake_analysis", rows[0].analysis_summary)
+
+        if get_analysis_status is None or analysis_endpoint_module is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+        with patch("api.v1.endpoints.analysis.get_task_queue", return_value=queue):
+            status = get_analysis_status(task.task_id)
+        serialized = status.model_dump_json()
+        self.assertIn("dsa_e2e_fake_analysis", serialized)
 
     def test_batch_submit_rolls_back_when_executor_submit_fails(self) -> None:
         class FailingExecutor:

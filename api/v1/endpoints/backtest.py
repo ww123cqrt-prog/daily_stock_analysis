@@ -131,7 +131,7 @@ def get_backtest_results(
 
 @router.get(
     "/performance",
-    response_model=PerformanceMetrics,
+    response_model=Optional[PerformanceMetrics],
     responses={
         200: {"description": "整体回测表现"},
         400: {"description": "请求参数错误", "model": ErrorResponse},
@@ -145,8 +145,9 @@ def get_overall_performance(
     analysis_date_from: Optional[date] = Query(None, description="分析日期起始（含）"),
     analysis_date_to: Optional[date] = Query(None, description="分析日期结束（含）"),
     analysis_phase: Optional[BacktestAnalysisPhaseQuery] = Query(None, description="分析阶段过滤：premarket/intraday/postmarket/unknown"),
+    empty_ok: bool = Query(False, description="无汇总时返回 null，供网页空状态使用"),
     db_manager: DatabaseManager = Depends(get_database_manager),
-) -> PerformanceMetrics:
+) -> Optional[PerformanceMetrics]:
     try:
         _validate_analysis_date_range(analysis_date_from, analysis_date_to)
         service = BacktestService(db_manager)
@@ -159,6 +160,8 @@ def get_overall_performance(
             analysis_phase=analysis_phase,
         )
         if summary is None:
+            if empty_ok:
+                return None
             raise HTTPException(
                 status_code=404,
                 detail={"error": "not_found", "message": "未找到整体回测汇总"},
@@ -181,7 +184,7 @@ def get_overall_performance(
 
 @router.get(
     "/performance/{code}",
-    response_model=PerformanceMetrics,
+    response_model=Optional[PerformanceMetrics],
     responses={
         200: {"description": "单股回测表现"},
         400: {"description": "请求参数错误", "model": ErrorResponse},
@@ -196,8 +199,9 @@ def get_stock_performance(
     analysis_date_from: Optional[date] = Query(None, description="分析日期起始（含）"),
     analysis_date_to: Optional[date] = Query(None, description="分析日期结束（含）"),
     analysis_phase: Optional[BacktestAnalysisPhaseQuery] = Query(None, description="分析阶段过滤：premarket/intraday/postmarket/unknown"),
+    empty_ok: bool = Query(False, description="无汇总时返回 null，供网页空状态使用"),
     db_manager: DatabaseManager = Depends(get_database_manager),
-) -> PerformanceMetrics:
+) -> Optional[PerformanceMetrics]:
     try:
         _validate_analysis_date_range(analysis_date_from, analysis_date_to)
         service = BacktestService(db_manager)
@@ -210,6 +214,8 @@ def get_stock_performance(
             analysis_phase=analysis_phase,
         )
         if summary is None:
+            if empty_ok:
+                return None
             raise HTTPException(
                 status_code=404,
                 detail={"error": "not_found", "message": f"未找到 {code} 的回测汇总"},

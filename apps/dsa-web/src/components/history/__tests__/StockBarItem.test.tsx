@@ -20,7 +20,7 @@ const issue1600Item: StockBarItem = {
 
 describe('StockBarItemComponent', () => {
   it('keeps market phase in the meta row instead of the action row', () => {
-    render(
+    const { container } = render(
       <StockBarItemComponent
         item={issue1600Item}
         isViewing={false}
@@ -33,7 +33,9 @@ describe('StockBarItemComponent', () => {
     const meta = screen.getByTestId('history-card-meta');
 
     expect(within(actions).getByText('观望 62')).toBeInTheDocument();
-    expect(within(actions).getByRole('button', { name: /删除 贵州茅台股票股份有限公司 历史记录/ })).toBeInTheDocument();
+    const deleteButton = within(actions).getByRole('button', { name: /删除 贵州茅台股票股份有限公司 历史记录/ });
+    expect(deleteButton).toBeInTheDocument();
+    expect(deleteButton).toHaveClass('group-focus-within/item:opacity-100');
     expect(within(actions).queryByText('CN · 非交易日')).not.toBeInTheDocument();
     expect(within(meta).getByText('CN · 非交易日')).toBeVisible();
 
@@ -43,6 +45,7 @@ describe('StockBarItemComponent', () => {
         name: /^贵州茅台股票股份有限公司 600519 历史记录$/,
       }),
     ).toBeInTheDocument();
+    expect(container.querySelector('button button')).not.toBeInTheDocument();
   });
 
   it('uses structured action before legacy operation advice', () => {

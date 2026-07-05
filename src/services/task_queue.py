@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -35,6 +36,142 @@ from src.services.run_diagnostics import (
 from src.utils.analysis_metadata import SELECTION_SOURCES
 
 logger = logging.getLogger(__name__)
+
+
+def _e2e_fake_analysis_enabled() -> bool:
+    """Return whether browser smoke tests may use deterministic local analysis."""
+    requested = os.environ.get("DSA_E2E_FAKE_ANALYSIS", "").strip().lower() in {"1", "true", "yes", "on"}
+    managed_smoke = os.environ.get("DSA_WEB_SMOKE_MANAGED", "").strip().lower() in {"1", "true", "yes", "on"}
+    pytest_managed = bool(os.environ.get("PYTEST_CURRENT_TEST", "").strip())
+    return requested and (managed_smoke or pytest_managed)
+
+
+def _build_e2e_fake_analysis_result(
+    *,
+    task_id: str,
+    trace_id: str,
+    stock_code: str,
+    stock_name: Optional[str],
+    report_type: str,
+    report_language: Optional[str],
+) -> Dict[str, Any]:
+    """Build and persist a deterministic report for local E2E smoke tests."""
+    from types import SimpleNamespace
+
+    from src.storage import DatabaseManager
+
+    display_name = stock_name or f"E2E{stock_code}"
+    language = report_language or "zh"
+    query_id = f"dsa_e2e_fake_analysis_{task_id}"
+    created_at = datetime.now().isoformat()
+    summary = f"dsa_e2e_fake_analysis 本地浏览器验证报告：{stock_code}"
+    operation_advice = "持有观察"
+    trend_prediction = "震荡上行"
+    sentiment_score = 67
+    sniper_points = {
+        "ideal_buy": 11.8,
+        "secondary_buy": 11.2,
+        "stop_loss": 10.5,
+        "take_profit": 14.8,
+    }
+    raw_payload = {
+        "code": stock_code,
+        "name": display_name,
+        "report_language": language,
+        "report_type": report_type,
+        "sentiment_score": sentiment_score,
+        "operation_advice": operation_advice,
+        "trend_prediction": trend_prediction,
+        "analysis_summary": summary,
+        "action": "hold",
+        "action_label": "持有",
+        "current_price": 12.34,
+        "change_pct": 1.23,
+        "technical_analysis": "dsa_e2e_fake_analysis 技术面验证内容。",
+        "fundamental_analysis": "dsa_e2e_fake_analysis 基本面验证内容。",
+        "news_summary": "本地 E2E fake 分析不会访问外部 LLM 或行情源。",
+        "risk_warning": "仅用于本地 smoke 测试，不构成投资建议。",
+        "key_points": "验证首页输入、异步任务、历史刷新和报告展示链路。",
+        "model_used": "dsa-e2e-fake",
+        "success": True,
+    }
+    context_snapshot = {
+        "report_language": language,
+        "realtime_quote": {
+            "current_price": 12.34,
+            "change_pct": 1.23,
+        },
+        "analysis_context_pack_overview": {
+            "metadata": {
+                "trigger_source": "e2e_fake_analysis",
+                "query_id": query_id,
+                "task_id": task_id,
+            },
+            "data_quality": {
+                "overall_score": 100,
+            },
+        },
+    }
+    result_object = SimpleNamespace(
+        code=stock_code,
+        name=display_name,
+        sentiment_score=sentiment_score,
+        operation_advice=operation_advice,
+        trend_prediction=trend_prediction,
+        analysis_summary=summary,
+        data_sources="e2e_fake",
+        raw_response=dict(raw_payload),
+        to_dict=lambda: dict(raw_payload),
+        get_sniper_points=lambda: sniper_points,
+    )
+    DatabaseManager.get_instance().save_analysis_history(
+        result_object,
+        query_id=query_id,
+        report_type=report_type,
+        news_content=raw_payload["news_summary"],
+        context_snapshot=context_snapshot,
+    )
+
+    return {
+        "query_id": query_id,
+        "task_id": task_id,
+        "trace_id": trace_id,
+        "stock_code": stock_code,
+        "stock_name": display_name,
+        "created_at": created_at,
+        "report": {
+            "meta": {
+                "query_id": query_id,
+                "stock_code": stock_code,
+                "stock_name": display_name,
+                "report_type": report_type,
+                "report_language": language,
+                "created_at": created_at,
+                "current_price": 12.34,
+                "change_pct": 1.23,
+                "model_used": "dsa-e2e-fake",
+            },
+            "summary": {
+                "analysis_summary": summary,
+                "operation_advice": operation_advice,
+                "action": "hold",
+                "action_label": "持有",
+                "trend_prediction": trend_prediction,
+                "sentiment_score": sentiment_score,
+                "sentiment_label": "中性偏多",
+            },
+            "strategy": {
+                "ideal_buy": str(sniper_points["ideal_buy"]),
+                "secondary_buy": str(sniper_points["secondary_buy"]),
+                "stop_loss": str(sniper_points["stop_loss"]),
+                "take_profit": str(sniper_points["take_profit"]),
+            },
+            "details": {
+                "news_content": raw_payload["news_summary"],
+                "raw_result": dict(raw_payload),
+            },
+        },
+    }
 
 
 def _dedupe_stock_code_key(stock_code: str) -> str:
@@ -652,6 +789,35 @@ class AnalysisTaskQueue:
         self._broadcast_event("task_started", task.to_dict())
         
         try:
+            if _e2e_fake_analysis_enabled():
+                result = _build_e2e_fake_analysis_result(
+                    task_id=task_id,
+                    trace_id=trace_id,
+                    stock_code=stock_code,
+                    stock_name=task.stock_name,
+                    report_type=report_type,
+                    report_language=report_language,
+                )
+                with self._data_lock:
+                    task = self._tasks.get(task_id)
+                    if task:
+                        task.status = TaskStatus.COMPLETED
+                        task.progress = 100
+                        task.completed_at = datetime.now()
+                        task.result = result
+                        task.message = "分析完成"
+                        task.stock_name = result.get("stock_name", task.stock_name)
+
+                        dedupe_key = _dedupe_stock_code_key(task.stock_code)
+                        if dedupe_key in self._analyzing_stocks:
+                            del self._analyzing_stocks[dedupe_key]
+
+                if task:
+                    self._broadcast_event("task_completed", task.to_dict())
+                logger.info("[TaskQueue] E2E fake 分析任务完成: %s (%s)", task_id, stock_code)
+                self._cleanup_old_tasks()
+                return result
+
             # 导入分析服务（延迟导入避免循环依赖）
             from src.services.analysis_service import AnalysisService
             

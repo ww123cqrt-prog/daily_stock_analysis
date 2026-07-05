@@ -91,6 +91,9 @@ const PortfolioPage: React.FC = () => {
   const [accountCreating, setAccountCreating] = useState(false);
   const [accountCreateError, setAccountCreateError] = useState<string | null>(null);
   const [accountCreateSuccess, setAccountCreateSuccess] = useState<string | null>(null);
+  const [pendingAccountDelete, setPendingAccountDelete] = useState<PortfolioAccountItem | null>(null);
+  const [accountDeleteLoading, setAccountDeleteLoading] = useState(false);
+  const [accountDeleteSuccess, setAccountDeleteSuccess] = useState<string | null>(null);
   const [accountForm, setAccountForm] = useState({
     name: '',
     broker: 'Demo',
@@ -183,7 +186,7 @@ const PortfolioPage: React.FC = () => {
     );
   };
 
-  const loadAccounts = useCallback(async () => {
+  const loadAccounts = useCallback(async (): Promise<PortfolioAccountItem[]> => {
     try {
       const response = await portfolioApi.getAccounts(false);
       const items = response.accounts || [];
@@ -194,8 +197,10 @@ const PortfolioPage: React.FC = () => {
         return prev;
       });
       if (items.length === 0) setShowCreateAccount(true);
+      return items;
     } catch (err) {
       setError(getParsedApiError(err));
+      return [];
     }
   }, []);
 
@@ -561,6 +566,39 @@ const PortfolioPage: React.FC = () => {
     }
   };
 
+  const handleOpenAccountDelete = () => {
+    if (!writableAccount) {
+      setWriteWarning(text.selectAccountBeforeDelete);
+      return;
+    }
+    setAccountDeleteSuccess(null);
+    setPendingAccountDelete(writableAccount);
+  };
+
+  const handleConfirmAccountDelete = async () => {
+    if (!pendingAccountDelete || accountDeleteLoading) return;
+
+    try {
+      setAccountDeleteLoading(true);
+      setWriteWarning(null);
+      setAccountDeleteSuccess(null);
+      setError(null);
+      await portfolioApi.deleteAccount(pendingAccountDelete.id);
+      const activeAccounts = await loadAccounts();
+      const nextAccount = activeAccounts.find((item) => item.id !== pendingAccountDelete.id) || null;
+      setSelectedAccount(nextAccount?.id ?? 'all');
+      setEventPage(1);
+      setPendingAccountDelete(null);
+      setAccountDeleteSuccess(
+        formatUiText(text.accountDeleteSuccess, { name: pendingAccountDelete.name }),
+      );
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setAccountDeleteLoading(false);
+    }
+  };
+
   const handleCreateAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     const name = accountForm.name.trim();
@@ -583,6 +621,7 @@ const PortfolioPage: React.FC = () => {
       setSelectedAccount(created.id);
       setShowCreateAccount(false);
       setWriteWarning(null);
+      setAccountDeleteSuccess(null);
       setAccountForm({
         name: '',
         broker: 'Demo',
@@ -712,7 +751,7 @@ const PortfolioPage: React.FC = () => {
         </div>
         {hasAccounts ? (
           <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-            <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_220px_280px] gap-2 items-end">
+            <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_220px_minmax(360px,420px)] gap-2 items-end">
               <div>
                 <p className="text-xs text-secondary mb-1">{text.accountView}</p>
                 <select
@@ -739,10 +778,10 @@ const PortfolioPage: React.FC = () => {
                   <option value="avg">{text.avg}</option>
                 </select>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
-                  className="btn-secondary text-sm flex-1"
+                  className="btn-secondary text-sm min-w-[7rem] flex-1"
                   onClick={() => {
                     setShowCreateAccount((prev) => !prev);
                     setAccountCreateError(null);
@@ -755,9 +794,17 @@ const PortfolioPage: React.FC = () => {
                   type="button"
                   onClick={() => void handleRefresh()}
                   disabled={isLoading || fxRefreshing}
-                  className="btn-secondary text-sm flex-1"
+                  className="btn-secondary text-sm min-w-[7rem] flex-1"
                 >
                   {isLoading ? text.refreshing : text.refreshData}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleOpenAccountDelete}
+                  disabled={!writableAccount || accountDeleteLoading}
+                  className="btn-secondary min-w-[8rem] flex-1 border-danger/30 text-sm text-danger hover:bg-danger/10 disabled:text-secondary"
+                >
+                  {text.deleteCurrentAccount}
                 </button>
               </div>
             </div>
@@ -791,6 +838,13 @@ const PortfolioPage: React.FC = () => {
           variant="success"
           title={text.analysisTask}
           message={positionAnalysisMessage}
+        />
+      ) : null}
+      {accountDeleteSuccess ? (
+        <InlineAlert
+          variant="success"
+          title={text.accountDeletedTitle}
+          message={accountDeleteSuccess}
         />
       ) : null}
 
@@ -1339,6 +1393,22 @@ const PortfolioPage: React.FC = () => {
         onCancel={() => {
           if (!deleteLoading) {
             setPendingDelete(null);
+          }
+        }}
+      />
+      <ConfirmDialog
+        isOpen={Boolean(pendingAccountDelete)}
+        title={text.accountDeleteTitle}
+        message={pendingAccountDelete
+          ? formatUiText(text.accountDeleteMessage, { name: pendingAccountDelete.name })
+          : text.accountDeleteFallbackMessage}
+        confirmText={accountDeleteLoading ? text.deletingAccount : text.confirmDeleteAccount}
+        cancelText={text.cancel}
+        isDanger
+        onConfirm={() => void handleConfirmAccountDelete()}
+        onCancel={() => {
+          if (!accountDeleteLoading) {
+            setPendingAccountDelete(null);
           }
         }}
       />

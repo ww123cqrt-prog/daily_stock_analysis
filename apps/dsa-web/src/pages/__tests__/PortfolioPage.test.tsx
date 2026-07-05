@@ -17,6 +17,7 @@ const {
   listCorporateActions,
   createTrade,
   deleteTrade,
+  deleteAccount,
   createCashLedger,
   deleteCashLedger,
   createCorporateAction,
@@ -36,6 +37,7 @@ const {
   listCorporateActions: vi.fn(),
   createTrade: vi.fn(),
   deleteTrade: vi.fn(),
+  deleteAccount: vi.fn(),
   createCashLedger: vi.fn(),
   deleteCashLedger: vi.fn(),
   createCorporateAction: vi.fn(),
@@ -58,6 +60,7 @@ vi.mock('../../api/portfolio', () => ({
     listCorporateActions,
     createTrade,
     deleteTrade,
+    deleteAccount,
     createCashLedger,
     deleteCashLedger,
     createCorporateAction,
@@ -225,6 +228,7 @@ describe('PortfolioPage FX refresh', () => {
     listCorporateActions.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 20 });
     createTrade.mockResolvedValue({ id: 1 });
     deleteTrade.mockResolvedValue({ deleted: 1 });
+    deleteAccount.mockResolvedValue({ deleted: 1 });
     createCashLedger.mockResolvedValue({ id: 1 });
     deleteCashLedger.mockResolvedValue({ deleted: 1 });
     createCorporateAction.mockResolvedValue({ id: 1 });
@@ -406,6 +410,44 @@ describe('PortfolioPage FX refresh', () => {
       });
     });
     expect(await screen.findByText('已提交 HK00700 分析任务：task-portfolio-1')).toBeInTheDocument();
+  });
+
+  it('keeps account deletion disabled until a concrete account is selected', async () => {
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+
+    const deleteButton = await screen.findByRole('button', { name: '删除当前账户' });
+
+    expect(deleteButton).toBeDisabled();
+    expect(screen.getAllByRole('combobox')[0]).toHaveValue('all');
+  });
+
+  it('deactivates the selected account after confirmation and reloads active accounts', async () => {
+    getAccounts
+      .mockResolvedValueOnce(makeAccounts([{ id: 1, name: 'Main' }, { id: 2, name: 'Archive me' }]))
+      .mockResolvedValueOnce(makeAccounts([{ id: 1, name: 'Main' }]));
+
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+
+    const accountSelect = screen.getAllByRole('combobox')[0];
+    fireEvent.change(accountSelect, { target: { value: '2' } });
+    await waitFor(() => expect(accountSelect).toHaveValue('2'));
+
+    fireEvent.click(screen.getByRole('button', { name: '删除当前账户' }));
+    expect(await screen.findByText('删除账户')).toBeInTheDocument();
+    const dialog = screen.getByRole('dialog', { name: '删除账户' });
+    expect(within(dialog).getByText(/Archive me/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/历史流水会保留/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => expect(deleteAccount).toHaveBeenCalledWith(2));
+    await waitFor(() => expect(getAccounts).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(accountSelect).toHaveValue('1'));
+    expect(await screen.findByText('账户「Archive me」已从活跃视图移除。')).toBeInTheDocument();
   });
 
   it('prefers disabled feedback over empty-pair feedback when refresh is disabled', async () => {

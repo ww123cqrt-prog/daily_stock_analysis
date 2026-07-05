@@ -31,6 +31,14 @@ vi.mock('./pages/HomePage', () => ({
   default: () => <div data-testid="home-page">Home</div>,
 }));
 
+vi.mock('./pages/ResearchPage', () => ({
+  default: () => <div data-testid="research-page">Research</div>,
+}));
+
+vi.mock('./pages/WorkflowPage', () => ({
+  default: () => <div data-testid="workflow-page">Workflow</div>,
+}));
+
 vi.mock('./pages/ChatPage', () => ({
   default: () => {
     if (chatPageShouldThrow.value) {
@@ -122,6 +130,24 @@ describe('App routing behavior', () => {
     expect(setCurrentRoute).toHaveBeenCalledWith('/chat');
     expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
     expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
+  });
+
+  it('renders the research workspace route after auth is ready', async () => {
+    window.history.pushState({}, '', '/research');
+
+    render(<App />);
+
+    expect(await screen.findByTestId('research-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/research');
+  });
+
+  it('renders the workflow route after auth is ready', async () => {
+    window.history.pushState({}, '', '/workflow');
+
+    render(<App />);
+
+    expect(await screen.findByTestId('workflow-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/workflow');
   });
 
   it('redirects authenticated login visits back to the home page', async () => {

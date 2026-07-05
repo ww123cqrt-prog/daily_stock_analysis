@@ -12,9 +12,14 @@
 
 # 本地评审与高级路由配置（可能包含敏感信息或临时分析产物）
 /.codex
+/.omo/
+/.playwright-cli/
 /review.md
 /litellm_config.yaml
 /litellm_config.*.yaml
+
+# 本地 CodeGraph 索引数据库
+.codegraph/
 
 # Python
 __pycache__/

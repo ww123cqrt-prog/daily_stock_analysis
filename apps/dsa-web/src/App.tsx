@@ -13,6 +13,8 @@ import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
 
 const HomePage = lazy(() => import('./pages/HomePage'));
+const ResearchPage = lazy(() => import('./pages/ResearchPage'));
+const WorkflowPage = lazy(() => import('./pages/WorkflowPage'));
 const BacktestPage = lazy(() => import('./pages/BacktestPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const LoginPage = lazy(() => import('./pages/LoginPage'));
@@ -78,6 +80,8 @@ const AppContent: React.FC = () => {
         )}
       >
         <Route path="/" element={<HomePage />} />
+        <Route path="/research" element={<ResearchPage />} />
+        <Route path="/workflow" element={<WorkflowPage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/screening" element={<StockScreeningPage />} />

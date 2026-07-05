@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(currentDir, '../..');
-const shouldRunWebSmoke = !!process.env.DSA_WEB_SMOKE_PASSWORD;
+const shouldManageWebServers = process.env.DSA_WEB_SMOKE_MANAGED === '1' || !!process.env.DSA_WEB_SMOKE_PASSWORD;
+const backendPort = process.env.DSA_WEB_SMOKE_BACKEND_PORT || '8000';
 
 function resolveBackendCommand() {
   if (process.env.DSA_WEB_SMOKE_BACKEND_CMD) {
@@ -14,15 +15,15 @@ function resolveBackendCommand() {
 
   const unixVenvPython = path.join(repoRoot, '.venv', 'bin', 'python');
   if (fs.existsSync(unixVenvPython)) {
-    return `${unixVenvPython} main.py --webui-only --host 127.0.0.1 --port 8000`;
+    return `${unixVenvPython} main.py --webui-only --host 127.0.0.1 --port ${backendPort}`;
   }
 
   const windowsVenvPython = path.join(repoRoot, '.venv', 'Scripts', 'python.exe');
   if (fs.existsSync(windowsVenvPython)) {
-    return `"${windowsVenvPython}" main.py --webui-only --host 127.0.0.1 --port 8000`;
+    return `"${windowsVenvPython}" main.py --webui-only --host 127.0.0.1 --port ${backendPort}`;
   }
 
-  return 'python main.py --webui-only --host 127.0.0.1 --port 8000';
+  return `python main.py --webui-only --host 127.0.0.1 --port ${backendPort}`;
 }
 
 export default defineConfig({
@@ -37,12 +38,12 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
-  webServer: shouldRunWebSmoke
+  webServer: shouldManageWebServers
     ? [
         {
           command: resolveBackendCommand(),
           cwd: repoRoot,
-          url: 'http://127.0.0.1:8000/api/v1/auth/status',
+          url: `http://127.0.0.1:${backendPort}/api/v1/auth/status`,
           reuseExistingServer: !process.env.CI,
           timeout: 120_000,
         },

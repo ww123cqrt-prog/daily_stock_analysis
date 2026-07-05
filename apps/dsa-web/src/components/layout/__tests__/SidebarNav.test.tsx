@@ -48,6 +48,30 @@ describe('SidebarNav', () => {
     expect(screen.queryByRole('link', { name: '选股' })).not.toBeInTheDocument();
   });
 
+  it('shows the research navigation item as a first-class entry', () => {
+    render(
+      <MemoryRouter initialEntries={['/research']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const researchLink = screen.getByRole('link', { name: '研究' });
+    expect(researchLink).toHaveAttribute('href', '/research');
+    expect(researchLink).toHaveClass('font-medium');
+  });
+
+  it('shows the workflow navigation item for browser-run quant tasks', () => {
+    render(
+      <MemoryRouter initialEntries={['/workflow']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const workflowLink = screen.getByRole('link', { name: '工作流' });
+    expect(workflowLink).toHaveAttribute('href', '/workflow');
+    expect(workflowLink).toHaveClass('font-medium');
+  });
+
   it('shows the screening navigation item when AlphaSift is enabled', async () => {
     mockGetAlphaSiftStatus.mockResolvedValueOnce({ enabled: true, available: false, installSpecIsDefault: false });
 
@@ -71,7 +95,7 @@ describe('SidebarNav', () => {
 
     await screen.findByRole('link', { name: '选股' });
     const hrefs = screen.getAllByRole('link').map((link) => link.getAttribute('href'));
-    expect(hrefs.slice(0, 4)).toEqual(['/', '/chat', '/screening', '/portfolio']);
+    expect(hrefs.slice(0, 6)).toEqual(['/', '/research', '/workflow', '/chat', '/screening', '/portfolio']);
   });
 
   it('refreshes the screening navigation item after any config save event', async () => {

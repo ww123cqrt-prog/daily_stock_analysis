@@ -132,6 +132,23 @@ describe('stockIndexLoader', () => {
       expect(result.error).toBeInstanceOf(Error);
     });
 
+    test('logs stock index fallback as a warning instead of a console error', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      mockFetch.mockRejectedValueOnce(new Error('Network error'));
+
+      await loadStockIndex();
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[StockIndexLoader] Failed to load stock index:',
+        expect.any(Error),
+      );
+
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    });
+
     test('returns fallback mode on HTTP error', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: false,

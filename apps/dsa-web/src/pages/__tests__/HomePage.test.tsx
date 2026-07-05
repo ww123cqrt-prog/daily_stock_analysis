@@ -957,6 +957,39 @@ describe('HomePage', () => {
     expect(trigger).toHaveFocus();
   });
 
+  it('closes the strategy menu when Escape is pressed on the trigger after clicking it open', async () => {
+    vi.mocked(agentApi.getSkills).mockResolvedValue({
+      default_skill_id: 'bull_trend',
+      skills: [
+        { id: 'bull_trend', name: '默认多头趋势', description: '趋势分析' },
+        { id: 'growth_quality', name: '成长质量', description: '成长股分析' },
+      ],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const trigger = await screen.findByRole('button', { name: '策略' });
+    fireEvent.click(trigger);
+    expect(await screen.findByRole('menu')).toBeInTheDocument();
+
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+
+    await waitFor(() => {
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    });
+    expect(trigger).toHaveFocus();
+  });
+
   it('renders market review history reports with a dedicated markdown view', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 1,

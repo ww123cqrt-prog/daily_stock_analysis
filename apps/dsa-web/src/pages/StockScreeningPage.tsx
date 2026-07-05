@@ -10,6 +10,7 @@ import {
 } from '../api/alphasift';
 import { formatParsedApiError, getParsedApiError, toApiErrorMessage, type ParsedApiError } from '../api/error';
 import { AppPage, Button, InlineAlert } from '../components/common';
+import { useUiLanguage } from '../contexts/UiLanguageContext';
 
 const MARKETS = [{ id: 'cn', label: 'A 股' }];
 const SCREEN_TASK_STORAGE_KEY = 'dsa.alphasift.activeScreenTask.v1';
@@ -265,6 +266,12 @@ const hasLlmInsight = (item: AlphaSiftCandidate) =>
   );
 
 const StockScreeningPage: React.FC = () => {
+  const { t } = useUiLanguage();
+
+  useEffect(() => {
+    document.title = t('screening.pageTitle');
+  }, [t]);
+
   const [restoredTask] = useState<PersistedScreenTask | null>(() => readPersistedScreenTask());
   const [enabled, setEnabled] = useState(false);
   const [available, setAvailable] = useState(false);

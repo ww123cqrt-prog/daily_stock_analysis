@@ -45,7 +45,7 @@ export async function loadStockIndex(): Promise<IndexLoadResult> {
       fallback: false,
     };
   } catch (error) {
-    console.error('[StockIndexLoader] Failed to load stock index:', error);
+    console.warn('[StockIndexLoader] Failed to load stock index:', error);
     return {
       data: [],
       loaded: false,

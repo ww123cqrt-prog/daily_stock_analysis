@@ -1324,6 +1324,7 @@ textarea {
 .home-history-item {
   position: relative;
   overflow: hidden;
+  cursor: pointer;
   border-radius: 0.875rem;
   border: 1px solid var(--home-panel-border);
   background: var(--home-history-item-bg);

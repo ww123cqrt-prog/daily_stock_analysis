@@ -1,7 +1,9 @@
 import type React from 'react';
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { Check, Minus, X } from 'lucide-react';
 import { backtestApi } from '../api/backtest';
+import { researchApi, type ResearchCashControlBacktest, type ResearchExperimentRun, type ResearchStatus } from '../api/research';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, EmptyState, Pagination, StatusDot, Tooltip } from '../components/common';
@@ -30,6 +32,7 @@ const BACKTEST_INPUT_CLASS =
 const BACKTEST_COMPACT_INPUT_CLASS =
   'input-surface input-focus-glow h-10 rounded-xl border bg-transparent px-3 py-2 text-xs transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 type BacktestText = (typeof BACKTEST_TEXT)[UiLanguage];
+type BacktestTab = 'dsa' | 'qlib';
 
 // ============ Helpers ============
 
@@ -159,6 +162,100 @@ function phaseBreakdownText(metrics: PerformanceMetrics, language: UiLanguage): 
   return parts;
 }
 
+function formatQlibMetric(value: number): string {
+  if (!Number.isFinite(value)) return '--';
+  return Math.abs(value) < 1 ? value.toFixed(4) : value.toFixed(2);
+}
+
+function formatRatioPct(value?: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '--';
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatRatioNumber(value?: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '--';
+  return Math.abs(value) < 10 ? value.toFixed(2) : value.toFixed(1);
+}
+
+const CashControlBacktestCard: React.FC<{ report?: ResearchCashControlBacktest | null; text: BacktestText }> = ({ report, text }) => {
+  const baseline = report?.comparison?.baseline || {};
+  const cashControl = report?.comparison?.cashControl || {};
+  const summary = report?.signalSummary || {};
+  const rows = [
+    {
+      label: text.qlibCashControlCumulativeReturn,
+      baseline: formatRatioPct(baseline.cumulativeReturn),
+      cashControl: formatRatioPct(cashControl.cumulativeReturn),
+    },
+    {
+      label: text.qlibCashControlAnnualizedReturn,
+      baseline: formatRatioPct(baseline.annualizedReturn),
+      cashControl: formatRatioPct(cashControl.annualizedReturn),
+    },
+    {
+      label: text.qlibCashControlMaxDrawdown,
+      baseline: formatRatioPct(baseline.maxDrawdown),
+      cashControl: formatRatioPct(cashControl.maxDrawdown),
+    },
+    {
+      label: text.qlibCashControlSharpeRatio,
+      baseline: formatRatioNumber(baseline.sharpeRatio ?? baseline.informationRatio),
+      cashControl: formatRatioNumber(cashControl.sharpeRatio ?? cashControl.informationRatio),
+    },
+  ];
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">{text.qlibCashControlTitle}</h3>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">{text.qlibCashControlDescription}</p>
+        </div>
+      </div>
+      {!report ? (
+        <p className="mt-3 text-sm text-secondary-text">{text.qlibCashControlNoReport}</p>
+      ) : (
+        <>
+          <div className="mt-3 grid gap-2 md:grid-cols-3">
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{text.qlibCashControlLatestRegime}</p>
+              <p className="mt-1 font-mono text-sm text-foreground">{summary.latestRegime || '--'}</p>
+            </div>
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{text.qlibCashControlLatestCash}</p>
+              <p className="mt-1 font-mono text-sm text-foreground">{formatRatioPct(summary.latestCashRatio)}</p>
+            </div>
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{text.qlibCashControlAverageCash}</p>
+              <p className="mt-1 font-mono text-sm text-foreground">{formatRatioPct(summary.averageCashRatio)}</p>
+            </div>
+          </div>
+          <div className="mt-3 overflow-x-auto rounded-xl border border-subtle">
+            <table className="min-w-full divide-y divide-subtle text-sm">
+              <thead className="bg-surface/40 text-xs text-muted-text">
+                <tr>
+                  <th scope="col" className="px-3 py-2 text-left font-medium">Metric</th>
+                  <th scope="col" className="px-3 py-2 text-right font-medium">{text.qlibCashControlBaseline}</th>
+                  <th scope="col" className="px-3 py-2 text-right font-medium">{text.qlibCashControlOverlay}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-subtle">
+                {rows.map((row) => (
+                  <tr key={row.label}>
+                    <td className="px-3 py-2 text-secondary-text">{row.label}</td>
+                    <td className="px-3 py-2 text-right font-mono text-foreground">{row.baseline}</td>
+                    <td className="px-3 py-2 text-right font-mono text-foreground">{row.cashControl}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+};
+
 // ============ Performance Card ============
 
 const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; language: UiLanguage }> = ({ metrics, title, language }) => {
@@ -218,6 +315,164 @@ const RunSummary: React.FC<{ data: BacktestRunResponse; language: UiLanguage }> 
   );
 };
 
+const QlibRunCard: React.FC<{ run: ResearchExperimentRun; text: BacktestText }> = ({ run, text }) => {
+  const metrics = Object.entries(run.metrics || {}).slice(0, 6);
+  return (
+    <Card variant="bordered" padding="md" className="min-h-[12rem]">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold text-foreground">{run.experimentName || text.qlibExperimentFallback}</p>
+          <p className="mt-1 truncate font-mono text-xs text-muted-text">{run.runId || '--'}</p>
+        </div>
+        <Badge variant={run.status === 'completed' ? 'success' : 'default'} size="sm">{run.status}</Badge>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+        <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+          <p className="text-xs text-muted-text">{text.qlibModel}</p>
+          <p className="mt-1 truncate text-foreground">{run.model || '--'}</p>
+        </div>
+        <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+          <p className="text-xs text-muted-text">{text.qlibStrategy}</p>
+          <p className="mt-1 truncate text-foreground">{run.strategy || '--'}</p>
+        </div>
+      </div>
+      {run.datasetRange ? (
+        <p className="mt-3 text-xs text-secondary-text">{formatUiText(text.qlibDatasetRange, { range: run.datasetRange })}</p>
+      ) : null}
+      {run.conclusion ? (
+        <p className="mt-2 text-sm leading-5 text-secondary-text">{run.conclusion}</p>
+      ) : null}
+      {metrics.length > 0 ? (
+        <div className="mt-3 grid gap-2">
+          {metrics.map(([name, value]) => (
+            <div key={name} className="flex items-center justify-between gap-3 text-xs">
+              <span className="min-w-0 truncate text-muted-text">{name}</span>
+              <span className="shrink-0 font-mono text-secondary-text">
+                {typeof value === 'number' ? formatQlibMetric(value) : String(value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </Card>
+  );
+};
+
+const QlibBacktestPanel: React.FC<{
+  status: ResearchStatus | null;
+  loading: boolean;
+  error: string | null;
+  text: BacktestText;
+}> = ({ status, loading, error, text }) => {
+  const latestTraining = status?.latestTraining;
+  const cashControlBacktest = status?.cashControlBacktest;
+  const runs = status?.experimentNotebook?.runs || [];
+  const metrics = Object.entries(latestTraining?.metrics || {}).slice(0, 8);
+
+  return (
+    <main className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <section className="flex flex-col gap-4">
+          <Card variant="bordered" padding="md">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <span className="label-uppercase">{text.qlibEyebrow}</span>
+                <h2 className="mt-2 text-xl font-semibold text-foreground">{text.qlibTitle}</h2>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-secondary-text">
+                  {text.qlibDescription}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <a href="http://127.0.0.1:6006/" target="_blank" rel="noreferrer" className="btn-secondary h-9 px-3 text-sm">
+                  {text.qlibOpenMlflow}
+                </a>
+                <Link to="/workflow" className="btn-primary h-9 px-3 text-sm">
+                  {text.qlibRunTrainingTask}
+                </Link>
+              </div>
+            </div>
+            {error ? (
+              <ApiErrorAlert
+                error={{
+                  title: text.qlibStatusReadFailed,
+                  message: error,
+                  rawMessage: error,
+                  category: 'unknown',
+                }}
+                className="mt-4"
+              />
+            ) : null}
+            {loading ? (
+              <p className="mt-4 text-sm text-secondary-text">{text.qlibLoading}</p>
+            ) : null}
+          </Card>
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <Card variant="bordered" padding="md">
+              <span className="label-uppercase">Provider</span>
+              <p className="mt-3 text-lg font-semibold text-foreground">{status?.qlibProvider?.calendarRange || '--'}</p>
+              <p className="mt-2 text-xs text-muted-text">股票池 {status?.qlibProvider?.instruments ?? '--'} · 日历 {status?.qlibProvider?.calendarDays ?? '--'}</p>
+            </Card>
+            <Card variant="bordered" padding="md">
+              <span className="label-uppercase">Experiment</span>
+              <p className="mt-3 truncate text-lg font-semibold text-foreground">{latestTraining?.experimentName || '--'}</p>
+              <p className="mt-2 truncate font-mono text-xs text-muted-text">{latestTraining?.runId || '--'}</p>
+            </Card>
+            <Card variant="bordered" padding="md">
+              <span className="label-uppercase">Status</span>
+              <p className="mt-3 text-lg font-semibold text-foreground">{latestTraining?.status || '--'}</p>
+              <p className="mt-2 text-xs text-muted-text">
+                {formatUiText(text.qlibStatusCount, { count: String(status?.experimentNotebook?.totalRuns ?? 0) })}
+              </p>
+            </Card>
+            <Card variant="bordered" padding="md">
+              <span className="label-uppercase">Boundary</span>
+              <p className="mt-3 text-sm font-semibold text-foreground">{text.qlibBoundaryTitle}</p>
+              <p className="mt-2 text-xs leading-5 text-muted-text">{text.qlibBoundaryDescription}</p>
+            </Card>
+          </div>
+
+          <Card variant="bordered" padding="md">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-foreground">{text.qlibLatestMetrics}</h3>
+              {latestTraining?.runId ? <Badge variant="info">{latestTraining.runId}</Badge> : null}
+            </div>
+            {metrics.length === 0 ? (
+              <p className="mt-3 text-sm text-secondary-text">{text.qlibNoMetrics}</p>
+            ) : (
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                {metrics.map(([name, value]) => (
+                  <div key={name} className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+                    <p className="truncate text-xs text-muted-text">{name}</p>
+                    <p className="mt-1 font-mono text-sm text-foreground">
+                      {typeof value === 'number' ? formatQlibMetric(value) : String(value)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          <CashControlBacktestCard report={cashControlBacktest} text={text} />
+        </section>
+
+        <aside className="flex flex-col gap-3">
+          <Card variant="bordered" padding="md">
+            <h3 className="text-sm font-semibold text-foreground">{text.qlibRecentRuns}</h3>
+            <div className="mt-3 flex flex-col gap-3">
+              {runs.length === 0 ? (
+                <p className="text-sm text-secondary-text">{text.qlibNoRuns}</p>
+              ) : runs.slice(0, 5).map((run, index) => (
+                <QlibRunCard key={run.runId || `${run.experimentName || 'run'}-${index}`} run={run} text={text} />
+              ))}
+            </div>
+          </Card>
+        </aside>
+      </div>
+    </main>
+  );
+};
+
 // ============ Main Page ============
 
 const BacktestPage: React.FC = () => {
@@ -225,11 +480,39 @@ const BacktestPage: React.FC = () => {
   const text = BACKTEST_TEXT[language];
   const phaseFilterOptions = BACKTEST_PHASE_FILTER_OPTIONS[language];
   const actionLabels = buildDecisionActionLabelMap(t);
+  const [activeTab, setActiveTab] = useState<BacktestTab>('dsa');
+  const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
+  const [isLoadingQlibStatus, setIsLoadingQlibStatus] = useState(false);
+  const [qlibStatusError, setQlibStatusError] = useState<string | null>(null);
 
   // Set page title
   useEffect(() => {
     document.title = text.documentTitle;
   }, [text.documentTitle]);
+
+  useEffect(() => {
+    if (activeTab !== 'qlib') {
+      return undefined;
+    }
+    let active = true;
+    setIsLoadingQlibStatus(true);
+    researchApi.getStatus()
+      .then((status) => {
+        if (!active) return;
+        setResearchStatus(status);
+        setQlibStatusError(null);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setQlibStatusError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (active) setIsLoadingQlibStatus(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeTab]);
 
   // Input state
   const [codeFilter, setCodeFilter] = useState('');
@@ -330,18 +613,31 @@ const BacktestPage: React.FC = () => {
 
   // Initial load — fetch performance first, then filter results by its window
   useEffect(() => {
+    let active = true;
     const init = async () => {
-      // Get latest performance (unfiltered returns most recent summary)
-      const overall = await backtestApi.getOverallPerformance();
-      setOverallPerf(overall);
-      // Use the summary's eval_window_days to filter results consistently
-      const windowDays = overall?.evalWindowDays;
-      if (windowDays && !evalDays) {
-        setEvalDays(String(windowDays));
+      try {
+        // Get latest performance (unfiltered returns most recent summary)
+        const overall = await backtestApi.getOverallPerformance();
+        if (!active) return;
+        setOverallPerf(overall);
+        // Use the summary's eval_window_days to filter results consistently
+        const windowDays = overall?.evalWindowDays;
+        if (windowDays && !evalDays) {
+          setEvalDays(String(windowDays));
+        }
+        fetchResults(1, undefined, windowDays, undefined, undefined, 'all');
+      } catch (err) {
+        if (!active) return;
+        console.error('Failed to initialize backtest page:', err);
+        setPageError(getParsedApiError(err));
+        setResults([]);
+        setTotalResults(0);
       }
-      fetchResults(1, undefined, windowDays, undefined, undefined, 'all');
     };
-    init();
+    void init();
+    return () => {
+      active = false;
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Run backtest
@@ -401,6 +697,32 @@ const BacktestPage: React.FC = () => {
 
   return (
     <div className="min-h-full flex flex-col rounded-[1.5rem] bg-transparent">
+      <div className="flex flex-wrap gap-2 border-b border-white/5 px-3 py-3 sm:px-4">
+        <button
+          type="button"
+          className={`btn-secondary h-9 px-3 text-sm ${activeTab === 'dsa' ? 'border-cyan/40 bg-cyan/10 text-cyan' : ''}`}
+          onClick={() => setActiveTab('dsa')}
+        >
+          {text.tabDsa}
+        </button>
+        <button
+          type="button"
+          className={`btn-secondary h-9 px-3 text-sm ${activeTab === 'qlib' ? 'border-cyan/40 bg-cyan/10 text-cyan' : ''}`}
+          onClick={() => setActiveTab('qlib')}
+        >
+          {text.tabQlib}
+        </button>
+      </div>
+
+      {activeTab === 'qlib' ? (
+        <QlibBacktestPanel
+          status={researchStatus}
+          loading={isLoadingQlibStatus}
+          error={qlibStatusError}
+          text={text}
+        />
+      ) : (
+      <>
       {/* Header */}
       <header className="flex-shrink-0 border-b border-white/5 px-3 py-3 sm:px-4">
         <div className="flex max-w-5xl flex-wrap items-center gap-2">
@@ -686,6 +1008,8 @@ const BacktestPage: React.FC = () => {
           )}
         </section>
       </main>
+      </>
+      )}
     </div>
   );
 };

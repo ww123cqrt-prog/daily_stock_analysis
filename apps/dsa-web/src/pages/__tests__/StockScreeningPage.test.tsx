@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import StockScreeningPage from '../StockScreeningPage';
 
 const {
@@ -88,6 +89,7 @@ describe('StockScreeningPage', () => {
     startScreenTask.mockClear();
     getStrategies.mockResolvedValue(mockStrategiesResponse);
     window.sessionStorage.clear();
+    window.localStorage.clear();
   });
 
   it('re-syncs enabled state when AlphaSift availability check fails after config is enabled', async () => {
@@ -107,6 +109,7 @@ describe('StockScreeningPage', () => {
     render(<StockScreeningPage />);
 
     expect(await screen.findByText('选股未开启')).toBeInTheDocument();
+    expect(document.title).toBe('AlphaSift 选股 - DSA');
     expect(screen.getByRole('button', { name: /运行选股/ })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('button', { name: '开启 AlphaSift' }));
@@ -116,6 +119,23 @@ describe('StockScreeningPage', () => {
     expect(screen.getByRole('button', { name: /运行选股/ })).toBeDisabled();
     expect(screen.getByText(/适配层当前不可用/)).toBeInTheDocument();
     expect(screen.getByText('AlphaSift 适配层不可用。请执行 pip install -r requirements.txt')).toBeInTheDocument();
+  });
+
+  it('uses the active UI language for the document title', async () => {
+    window.localStorage.setItem('dsa.uiLanguage', 'en');
+    getAlphaSiftStatus.mockResolvedValueOnce({
+      enabled: false,
+      available: false,
+      installSpecIsDefault: true,
+    });
+
+    render(
+      <UiLanguageProvider>
+        <StockScreeningPage />
+      </UiLanguageProvider>,
+    );
+
+    await waitFor(() => expect(document.title).toBe('AlphaSift screening - DSA'));
   });
 
   it('shows input strategy when strategy is not in preset list', async () => {

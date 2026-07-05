@@ -249,6 +249,12 @@ const HomePage: React.FC = () => {
     return () => window.clearTimeout(timeout);
   }, [focusStrategyItem, getSelectedStrategyIndex, strategyMenuOpen]);
   const handleStrategyButtonKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'Escape' && strategyMenuOpen) {
+      event.preventDefault();
+      closeStrategyMenu(true);
+      return;
+    }
+
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
       return;
     }
@@ -261,7 +267,7 @@ const HomePage: React.FC = () => {
     }
     strategyInitialFocusIndexRef.current = targetIndex;
     setStrategyMenuOpen(true);
-  }, [focusStrategyItem, strategyMenuOpen, strategyOptions.length]);
+  }, [closeStrategyMenu, focusStrategyItem, strategyMenuOpen, strategyOptions.length]);
   const handleStrategyMenuKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
     const itemCount = strategyOptions.length;
     if (itemCount === 0) {

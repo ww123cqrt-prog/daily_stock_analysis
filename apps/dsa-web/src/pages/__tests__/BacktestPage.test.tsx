@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
@@ -9,11 +10,13 @@ const {
   mockGetOverallPerformance,
   mockGetStockPerformance,
   mockRun,
+  mockGetResearchStatus,
 } = vi.hoisted(() => ({
   mockGetResults: vi.fn(),
   mockGetOverallPerformance: vi.fn(),
   mockGetStockPerformance: vi.fn(),
   mockRun: vi.fn(),
+  mockGetResearchStatus: vi.fn(),
 }));
 
 vi.mock('../../api/backtest', () => ({
@@ -22,6 +25,12 @@ vi.mock('../../api/backtest', () => ({
     getOverallPerformance: mockGetOverallPerformance,
     getStockPerformance: mockGetStockPerformance,
     run: mockRun,
+  },
+}));
+
+vi.mock('../../api/research', () => ({
+  researchApi: {
+    getStatus: mockGetResearchStatus,
   },
 }));
 
@@ -88,20 +97,99 @@ beforeEach(() => {
     insufficient: 0,
     errors: 0,
   });
+  mockGetResearchStatus.mockResolvedValue({
+    generatedAt: '2026-07-03T21:00:00+08:00',
+    trainable: true,
+    trainingReadiness: { status: 'trainable', summary: 'ready' },
+    dataSources: [],
+    qlibProvider: {
+      path: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata',
+      calendarDays: 1500,
+      calendarRange: '2020-01-02 ~ 2026-07-03',
+      instruments: 5300,
+    },
+    latestTraining: {
+      status: 'completed',
+      experimentName: 'baseline_lgb_alpha158',
+      runId: 'abc123',
+      metrics: {
+        IC: 0.0123,
+        '1day.excess_return_with_cost.annualized_return': 0.0339,
+      },
+    },
+    cashControlBacktest: {
+      generatedAt: '2026-07-05T09:00:00+08:00',
+      mode: 'read_only_cash_control_overlay',
+      comparison: {
+        baseline: {
+          cumulativeReturn: 0.20,
+          annualizedReturn: 0.18,
+          maxDrawdown: -0.30,
+          sharpeRatio: 0.70,
+        },
+        cashControl: {
+          cumulativeReturn: 0.12,
+          annualizedReturn: 0.11,
+          maxDrawdown: -0.12,
+          sharpeRatio: 0.95,
+        },
+        delta: {
+          cumulativeReturn: -0.08,
+          annualizedReturn: -0.07,
+          maxDrawdown: 0.18,
+          sharpeRatio: 0.25,
+        },
+      },
+      signalSummary: {
+        latestRegime: 'risk_off',
+        latestCashRatio: 0.80,
+        averageCashRatio: 0.45,
+      },
+    },
+    experimentNotebook: {
+      status: 'available',
+      totalRuns: 1,
+      latestNote: 'baseline note',
+      runs: [
+        {
+          runId: 'abc123',
+          experimentName: 'baseline_lgb_alpha158',
+          status: 'completed',
+          model: 'LGBModel',
+          strategy: 'TopkDropoutStrategy',
+          datasetRange: '2020-01-02 ~ 2026-07-01',
+          conclusion: '收益质量偏弱，需要补风险控制。',
+        },
+      ],
+    },
+  });
 });
 
 describe('BacktestPage', () => {
+  function renderPage() {
+    window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
+    render(
+      <MemoryRouter>
+        <UiLanguageProvider>
+          <BacktestPage />
+        </UiLanguageProvider>
+      </MemoryRouter>,
+    );
+  }
+
   function renderEnglishPage() {
     window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
     render(
-      <UiLanguageProvider>
-        <BacktestPage />
-      </UiLanguageProvider>,
+      <MemoryRouter>
+        <UiLanguageProvider>
+          <BacktestPage />
+        </UiLanguageProvider>
+      </MemoryRouter>,
     );
   }
 
   it('renders shared surface inputs and prediction tracking outputs', async () => {
-    render(<BacktestPage />);
+    renderPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -130,6 +218,145 @@ describe('BacktestPage', () => {
     expect(screen.getByText('平均模拟收益')).toBeInTheDocument();
   });
 
+  it('shows an error instead of leaving initial backtest load unhandled', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    mockGetOverallPerformance.mockRejectedValueOnce(new Error('initial performance failed'));
+
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('initial performance failed');
+    expect(mockGetResults).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('shows Qlib model and strategy backtest results in a separate tab', async () => {
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    expect(await screen.findByText('Qlib 模型/策略回测')).toBeInTheDocument();
+    expect(screen.getAllByText('baseline_lgb_alpha158').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('abc123').length).toBeGreaterThan(0);
+    expect(screen.getByText('LGBModel')).toBeInTheDocument();
+    expect(screen.getByText('TopkDropoutStrategy')).toBeInTheDocument();
+    expect(screen.getByText(/收益质量偏弱/)).toBeInTheDocument();
+    expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
+    expect(screen.getByText('现金仓位叠加回测')).toBeInTheDocument();
+    expect(screen.getByText('risk_off')).toBeInTheDocument();
+    expect(screen.getByText('80.0%')).toBeInTheDocument();
+    expect(screen.getByText('Baseline')).toBeInTheDocument();
+    expect(screen.getByText('Cash-control')).toBeInTheDocument();
+    expect(screen.getByText('最大回撤')).toBeInTheDocument();
+    expect(screen.getByText('夏普比率')).toBeInTheDocument();
+    expect(screen.getByText('0.95')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '运行训练任务' })).toHaveAttribute('href', '/workflow');
+  });
+
+  it('shows an empty cash-control state when no cash-control report exists', async () => {
+    mockGetResearchStatus.mockResolvedValueOnce({
+      generatedAt: '2026-07-03T21:00:00+08:00',
+      trainable: true,
+      trainingReadiness: { status: 'trainable', summary: 'ready' },
+      dataSources: [],
+      latestTraining: null,
+      qlibProvider: null,
+      cashControlBacktest: null,
+      experimentNotebook: { status: 'missing', totalRuns: 0, runs: [] },
+    });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    expect(await screen.findByText('暂无现金仓位叠加报告。先在工作流页面运行“生成现金仓位叠加回测”。')).toBeInTheDocument();
+  });
+
+  it('keeps cash-control card stable when optional metrics are missing', async () => {
+    mockGetResearchStatus.mockResolvedValueOnce({
+      generatedAt: '2026-07-03T21:00:00+08:00',
+      trainable: true,
+      trainingReadiness: { status: 'trainable', summary: 'ready' },
+      dataSources: [],
+      qlibProvider: null,
+      latestTraining: null,
+      cashControlBacktest: {
+        generatedAt: '2026-07-05T09:00:00+08:00',
+        mode: 'read_only_cash_control_overlay',
+        comparison: {
+          baseline: {
+            cumulativeReturn: null,
+          },
+          cashControl: {
+            sharpeRatio: null,
+          },
+          delta: {},
+        },
+        signalSummary: {
+          latestRegime: null,
+          latestCashRatio: null,
+          averageCashRatio: null,
+        },
+      },
+      experimentNotebook: { status: 'missing', totalRuns: 0, runs: [] },
+    });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    expect(await screen.findByText('现金仓位叠加回测')).toBeInTheDocument();
+    expect(screen.getByText('夏普比率')).toBeInTheDocument();
+    expect(screen.getAllByText('--').length).toBeGreaterThanOrEqual(5);
+  });
+
+  it('shows a localized Qlib status error when research status loading fails', async () => {
+    mockGetResearchStatus.mockRejectedValueOnce(new Error('research failed'));
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Qlib 状态读取失败');
+    expect(screen.getByRole('alert')).toHaveTextContent('research failed');
+  });
+
+  it('refreshes Qlib research status each time the Qlib backtest tab is reopened', async () => {
+    renderPage();
+
+    expect(await screen.findByText('600519')).toBeInTheDocument();
+    expect(mockGetResearchStatus).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    await waitFor(() => {
+      expect(mockGetResearchStatus).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByText('Qlib 模型/策略回测')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'DSA分析准确性回测' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Qlib模型/策略回测' }));
+
+    await waitFor(() => {
+      expect(mockGetResearchStatus).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('renders the Qlib model and strategy tab in English UI mode', async () => {
+    renderEnglishPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Qlib model/strategy backtest' }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Qlib model/strategy backtest').length).toBeGreaterThan(1);
+    });
+    expect(screen.getByText('Model')).toBeInTheDocument();
+    expect(screen.getByText('Strategy')).toBeInTheDocument();
+    expect(screen.getByText('Latest training metrics')).toBeInTheDocument();
+    expect(screen.getByText('Recent experiment records')).toBeInTheDocument();
+    expect(screen.queryByText('Qlib 模型/策略回测')).not.toBeInTheDocument();
+  });
+
   it('falls back to the taxonomy label when backtest actionLabel is missing', async () => {
     mockGetResults.mockResolvedValueOnce({
       total: 1,
@@ -144,7 +371,7 @@ describe('BacktestPage', () => {
       ],
     });
 
-    render(<BacktestPage />);
+    renderPage();
 
     const codeCell = await screen.findByText('600519');
     const resultRow = codeCell.closest('tr');
@@ -196,7 +423,7 @@ describe('BacktestPage', () => {
       ],
     });
 
-    render(<BacktestPage />);
+    renderPage();
 
     const codeCell = await screen.findByText('600519');
     const resultRow = codeCell.closest('tr');
@@ -223,7 +450,7 @@ describe('BacktestPage', () => {
   });
 
   it('filters results with stock code, window, phase, and analysis date range when clicking Filter', async () => {
-    render(<BacktestPage />);
+    renderPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -258,7 +485,7 @@ describe('BacktestPage', () => {
   });
 
   it('runs a backtest and refreshes results using the shared filter values', async () => {
-    render(<BacktestPage />);
+    renderPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -299,7 +526,7 @@ describe('BacktestPage', () => {
   });
 
   it('switches to next-day validation with the 1D shortcut', async () => {
-    render(<BacktestPage />);
+    renderPage();
 
     await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     fireEvent.click(screen.getByRole('button', { name: '1 日验证' }));

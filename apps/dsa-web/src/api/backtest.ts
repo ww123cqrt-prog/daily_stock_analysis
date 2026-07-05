@@ -75,15 +75,16 @@ export const backtestApi = {
     analysisPhase?: BacktestPhaseFilter;
   } = {}): Promise<PerformanceMetrics | null> => {
     try {
-      const queryParams: Record<string, string | number> = {};
+      const queryParams: Record<string, string | number | boolean> = { empty_ok: true };
       if (params.evalWindowDays) queryParams.eval_window_days = params.evalWindowDays;
       if (params.analysisDateFrom) queryParams.analysis_date_from = params.analysisDateFrom;
       if (params.analysisDateTo) queryParams.analysis_date_to = params.analysisDateTo;
       if (params.analysisPhase && params.analysisPhase !== 'all') queryParams.analysis_phase = params.analysisPhase;
-      const response = await apiClient.get<Record<string, unknown>>(
+      const response = await apiClient.get<Record<string, unknown> | null>(
         '/api/v1/backtest/performance',
         { params: queryParams },
       );
+      if (response.data == null) return null;
       return toCamelCase<PerformanceMetrics>(response.data);
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'response' in err) {
@@ -104,15 +105,16 @@ export const backtestApi = {
     analysisPhase?: BacktestPhaseFilter;
   } = {}): Promise<PerformanceMetrics | null> => {
     try {
-      const queryParams: Record<string, string | number> = {};
+      const queryParams: Record<string, string | number | boolean> = { empty_ok: true };
       if (params.evalWindowDays) queryParams.eval_window_days = params.evalWindowDays;
       if (params.analysisDateFrom) queryParams.analysis_date_from = params.analysisDateFrom;
       if (params.analysisDateTo) queryParams.analysis_date_to = params.analysisDateTo;
       if (params.analysisPhase && params.analysisPhase !== 'all') queryParams.analysis_phase = params.analysisPhase;
-      const response = await apiClient.get<Record<string, unknown>>(
+      const response = await apiClient.get<Record<string, unknown> | null>(
         `/api/v1/backtest/performance/${encodeURIComponent(code)}`,
         { params: queryParams },
       );
+      if (response.data == null) return null;
       return toCamelCase<PerformanceMetrics>(response.data);
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'response' in err) {

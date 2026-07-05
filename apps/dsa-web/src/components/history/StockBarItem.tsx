@@ -40,11 +40,21 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
     ?.replace('市场阶段: ', '')
     .replace('市场阶段：', '')
     .replace('Market phase: ', '');
+  const openHistory = () => onClick(item.id);
+  const handleCardKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      openHistory();
+    }
+  };
 
   return (
-    <button
-      type="button"
-      onClick={() => onClick(item.id)}
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={openHistory}
+      onKeyDown={handleCardKeyDown}
       aria-label={t('history.itemAria', { name: stockName, code: item.stockCode })}
       className={`home-history-item w-full min-w-0 flex-1 text-left p-2.5 group/item ${
         isViewing ? 'home-history-item-selected' : ''
@@ -108,7 +118,7 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
                     onDelete(item.stockCode);
                   }}
                   disabled={isDeleting}
-                  className="opacity-0 group-hover/item:opacity-100 transition-opacity h-6 w-6 p-0 flex items-center justify-center"
+                  className="opacity-0 group-hover/item:opacity-100 group-focus-within/item:opacity-100 transition-opacity h-6 w-6 p-0 flex items-center justify-center"
                   aria-label={t('history.deleteRecord', { name: item.stockName || item.stockCode })}
                 >
                   <svg className="h-3.5 w-3.5 text-danger" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -149,6 +159,6 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
           </div>
         </div>
       </div>
-    </button>
+    </div>
   );
 };
