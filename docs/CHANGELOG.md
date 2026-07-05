@@ -15,13 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增本地量化任务中心 `/workflow`、研究总览 `/research` 和 Qlib 模型/策略回测视图，支持从 Web 运行白名单量化脚本、查看任务日志、读取实验记录与 Qlib 回测摘要。
 - [改进] `/workflow` 任务按钮支持在网页端填写预设白名单参数，例如下载日期、股票数量上限、Qlib 训练配置、实验名称和 DSA 回测窗口。
 - [修复] 量化任务 SSE 流增加连接寿命上限，并修正 Web 取消运行中任务后状态卡计数短暂不刷新的问题。
+- [文档] 新增本地统一量化研究与回测工作台核对手册，说明 DSA、quant_workflow、Qlib、china-astock-quant、MLflow 和同花顺只读观察的职责、网页入口、安全边界和验收命令。
+- [改进] `/backtest` 的 Qlib 模型/策略回测标签页新增“实验复现与产物”区块，展示 provider、配置文件、MLflow run 和训练 artifact，方便用户自行排查和复现实验。
+- [改进] Qlib 工作流新增只读预测摘要任务，读取 MLflow `pred.pkl` 生成 `qlib_predictions_latest.{json,md}`，并在 `/backtest` 展示最新交易日最高/最低模型评分排行。
 - [测试] 新增本地工作台浏览器 smoke 入口 `npm run test:smoke:local`，默认验证当前 `http://127.0.0.1:8010` 的研究、工作流、回测、问股、组合、告警、设置和选股页面。
 - [测试] 新增 `npm run test:smoke:fake-analysis`，自动托管临时 fake-analysis 后端和 Vite 前端，验证首页提交分析、异步完成、报告展示和历史持久化链路，无需调用真实 LLM。
 - [修复] 首页个股历史卡片不再使用嵌套按钮结构，修复浏览器 smoke 中 React 报出的 `<button>` 内嵌 `<button>` 警告，并保留键盘打开历史与独立删除按钮。
-- [文档] `.env.example` 补充本地量化工作流路径覆盖项，说明 `DSA_ROOT`、`WORKING_PROJECTS_ROOT`、`QUANT_WORKFLOW_ROOT`、`QUANT_WORKFLOW_REPORTS_ROOT` 与 `QLIB_PYTHON` 的默认兄弟目录约定。
+- [文档] `.env.example` 补充本地量化工作流路径覆盖项，说明 `DSA_ROOT`、`WORKING_PROJECTS_ROOT`、`QUANT_WORKFLOW_ROOT`、`QUANT_WORKFLOW_REPORTS_ROOT`，并将 Qlib/china-astock 适配层默认收口到共享 DSA Python 运行时。
+- [改进] 量化任务中心默认使用 `daily_stock_analysis/.venv` 作为唯一 Python 环境，避免 Web 任务自动跳到 `qlib/.venv` 或 `china-astock-quant/.venv`。
+- [修复] opencode 只读 review 后收口量化脚本路径：`supervise_baostock.py`、DSA 回测任务、Qlib 检查/训练/策略优化脚本统一支持共享解释器、`QUANT_DATA_ROOT` 和可覆盖 `MLFLOW_URL`。
+- [修复] 托管浏览器 smoke 现在使用隔离 `QUANT_WORKFLOW_REPORTS_ROOT`，量化任务产物写入 `apps/dsa-web/test-results/managed-smoke/`；数据质量报告的 `research_status_latest.json` 和训练摘要也只读取/写入隔离 reports，避免覆盖或混用真实 `quant_workflow/reports/*_latest` 指针。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。
+- [修复] 量化工作流的数据质量报告任务新增 `merged_sample` 浏览器参数，smoke 测试可用小样本验证 UI 到脚本链路，避免误触发全量 merged 数据扫描导致超时。
+- [改进] 研究页新增后端驱动的“能力验收矩阵”，统一展示 DSA、quant_workflow、Qlib、china-astock-quant、同花顺只读观察和交易执行禁区的测试、浏览器验证与安全边界。
+- [改进] 研究页新增“功能入口盘点”和 `china-astock-quant` 复用清单，把网页入口、缺口、验收口径和禁止接入的交易模块显式列账。
+- [改进] `/workflow` 新增“策略优化预演”任务，使用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路，只读生成报告且不训练、不连接券商、不自动下单。
+- [文档] 本地量化工作台手册补充 `quant_workflow` 脚本覆盖盘点，说明 `add_index_benchmark.py`、`generate_csi300.py` 和 `supervise_baostock.py` 暂不作为网页按钮暴露的原因。
 
 ## [3.21.0] - 2026-06-07
 

@@ -1,4 +1,13 @@
 import apiClient from './index';
+import type {
+  ResearchCashControlBacktest,
+  ResearchDataSource,
+  ResearchExperimentNotebook,
+  ResearchQlibPredictions,
+  ResearchQlibProvider,
+  ResearchTrainingReadiness,
+  ResearchTrainingResult,
+} from './research';
 import { toCamelCase } from './utils';
 
 export type QuantJobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string;
@@ -27,11 +36,27 @@ export interface QuantJobTypeInfo {
   allowedParams: string[];
 }
 
+export interface QuantMlflowStatus {
+  url: string;
+  status: string;
+  role: string;
+}
+
 export interface QuantStatus {
   availableJobTypes: Record<string, QuantJobTypeInfo>;
   activeCount: number;
   latestJobs: Record<string, QuantJob>;
   recentJobs: QuantJob[];
+  generatedAt?: string;
+  trainable: boolean;
+  trainingReadiness?: ResearchTrainingReadiness;
+  dataSources: ResearchDataSource[];
+  qlibProvider?: ResearchQlibProvider | null;
+  latestTraining?: ResearchTrainingResult | null;
+  cashControlBacktest?: ResearchCashControlBacktest | null;
+  qlibPredictions?: ResearchQlibPredictions | null;
+  experimentNotebook?: ResearchExperimentNotebook | null;
+  mlflow?: QuantMlflowStatus;
 }
 
 export interface QuantJobListResponse {
@@ -64,11 +89,22 @@ function convertRecordValues<T>(data: unknown, converter: (value: unknown) => T)
 }
 
 function convertStatus(data: Record<string, unknown>): QuantStatus {
+  const camel = toCamelCase<Partial<QuantStatus>>(data);
   return {
     availableJobTypes: convertRecordValues(data.available_job_types, convertJobTypeInfo),
     activeCount: Number(data.active_count || 0),
     latestJobs: convertRecordValues(data.latest_jobs, convertJob),
     recentJobs: Array.isArray(data.recent_jobs) ? data.recent_jobs.map(convertJob) : [],
+    generatedAt: camel.generatedAt,
+    trainable: Boolean(camel.trainable),
+    trainingReadiness: camel.trainingReadiness,
+    dataSources: Array.isArray(camel.dataSources) ? camel.dataSources : [],
+    qlibProvider: camel.qlibProvider ?? null,
+    latestTraining: camel.latestTraining ?? null,
+    cashControlBacktest: camel.cashControlBacktest ?? null,
+    qlibPredictions: camel.qlibPredictions ?? null,
+    experimentNotebook: camel.experimentNotebook ?? null,
+    mlflow: camel.mlflow,
   };
 }
 

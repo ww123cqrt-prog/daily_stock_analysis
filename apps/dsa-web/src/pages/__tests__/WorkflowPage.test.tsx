@@ -146,8 +146,10 @@ describe('WorkflowPage', () => {
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
         report_market_regime: { label: '生成市场状态和现金仓位信号', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_cash_control_backtest: { label: '生成现金仓位叠加回测', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
+        report_qlib_predictions: { label: '生成 Qlib 预测摘要', allowedParams: ['run_id', 'topk'] },
         train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config'] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
+        optimize_strategy: { label: '策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
       },
       activeCount: 0,
       latestJobs: {
@@ -210,7 +212,7 @@ describe('WorkflowPage', () => {
   it('renders a Chinese web-first quant workflow console', async () => {
     renderWorkflowPage();
 
-    expect(screen.getByRole('heading', { name: '量化工作流' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '量化任务中心' })).toBeInTheDocument();
     expect(await screen.findByText('当前数据可训练')).toBeInTheDocument();
     expect(screen.getByText('MLflow 原始记录')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
@@ -224,6 +226,8 @@ describe('WorkflowPage', () => {
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
     expect(screen.getByText('生成现金仓位叠加回测')).toBeInTheDocument();
     expect(screen.getByLabelText('生成现金仓位叠加回测 回看交易日')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 预测摘要')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 预测摘要 TopK')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
     expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
     expect(screen.getByText('今日流程')).toBeInTheDocument();
@@ -372,6 +376,25 @@ describe('WorkflowPage', () => {
     });
   });
 
+  it('submits sampled data quality report parameters from the workflow page', async () => {
+    renderWorkflowPage();
+
+    fireEvent.change(await screen.findByLabelText('生成数据质量报告 重叠样本数'), {
+      target: { value: '5' },
+    });
+    fireEvent.change(screen.getByLabelText('生成数据质量报告 合并样本数'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成数据质量报告' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_data_quality', {
+        overlap_sample: '5',
+        merged_sample: '5',
+      });
+    });
+  });
+
   it('submits market regime report parameters from the workflow page', async () => {
     renderWorkflowPage();
 
@@ -418,6 +441,25 @@ describe('WorkflowPage', () => {
     });
   });
 
+  it('submits Qlib prediction summary parameters from the workflow page', async () => {
+    renderWorkflowPage();
+
+    fireEvent.change(await screen.findByLabelText('生成 Qlib 预测摘要 TopK'), {
+      target: { value: '15' },
+    });
+    fireEvent.change(screen.getByLabelText('生成 Qlib 预测摘要 MLflow Run ID'), {
+      target: { value: 'safe_run_20260705' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成 Qlib 预测摘要' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_qlib_predictions', {
+        topk: '15',
+        run_id: 'safe_run_20260705',
+      });
+    });
+  });
+
   it('submits the cleaned Qlib provider task from the workflow page', async () => {
     renderWorkflowPage();
 
@@ -453,6 +495,26 @@ describe('WorkflowPage', () => {
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('run_china_astock_comparison', {});
+    });
+  });
+
+  it('submits browser-safe strategy optimization dry-run parameters', async () => {
+    renderWorkflowPage();
+
+    fireEvent.change(await screen.findByLabelText('策略优化预演 阶段'), {
+      target: { value: '4' },
+    });
+    fireEvent.change(screen.getByLabelText('策略优化预演 TopK'), {
+      target: { value: '30' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '运行 策略优化预演' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('optimize_strategy', {
+        dry_run: true,
+        phase: '4',
+        topk: '30',
+      });
     });
   });
 

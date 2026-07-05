@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -33,15 +34,16 @@ def _env_path(name: str, default: Path) -> Path:
 DSA_ROOT = _env_path("DSA_ROOT", Path(__file__).resolve().parents[2])
 PROJECTS_ROOT = _env_path("WORKING_PROJECTS_ROOT", DSA_ROOT.parent)
 QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", PROJECTS_ROOT / "quant_workflow")
-DEFAULT_JOBS_ROOT = QUANT_WORKFLOW_ROOT / "reports" / "jobs"
-REPORTS_ROOT = QUANT_WORKFLOW_ROOT / "reports"
-QLIB_PYTHON = _env_path("QLIB_PYTHON", PROJECTS_ROOT / "qlib" / ".venv" / "bin" / "python")
+REPORTS_ROOT = _env_path("QUANT_WORKFLOW_REPORTS_ROOT", QUANT_WORKFLOW_ROOT / "reports")
+DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
+QLIB_PYTHON = _env_path("QLIB_PYTHON", Path(sys.executable))
 
 JOB_TERMINATE_TIMEOUT_SECONDS = 5
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EXIT_STATUS_FILENAME = "exit_status.json"
 JQDATA_WEB_DRY_RUN_DEFAULT_LIMIT = 3
 JQDATA_WEB_DRY_RUN_MAX_LIMIT = 20
+QLIB_PREDICTION_WEB_TOPK_MAX = 500
 _DURABLE_RUNNER_CODE = r"""
 import json
 import os
@@ -80,9 +82,12 @@ NUMERIC_PARAM_RULES = {
     "timeout": ("number", 1),
     "max_consecutive_failures": ("integer", 1),
     "overlap_sample": ("integer", 1),
+    "merged_sample": ("integer", 1),
     "eval_window_days": ("integer", 1),
     "lookback_days": ("integer", 2),
     "min_symbols": ("integer", 1),
+    "phase": ("integer", 0),
+    "topk": ("integer", 1),
 }
 JOB_UPDATE_COLUMNS = {
     "status": "status",
@@ -166,17 +171,21 @@ def _append_value(command: List[str], params: Mapping[str, Any], key: str, flag:
     command.extend([flag, str(value)])
 
 
+def _numeric_kind_label(kind: str) -> str:
+    return "an integer" if kind == "integer" else f"a {kind}"
+
+
 def _validate_numeric_params(params: Mapping[str, Any]) -> None:
     for key, (kind, minimum) in NUMERIC_PARAM_RULES.items():
         value = params.get(key)
         if value is None or value == "":
             continue
         if isinstance(value, bool):
-            raise ValueError(f"Param {key} must be a {kind}.")
+            raise ValueError(f"Param {key} must be {_numeric_kind_label(kind)}.")
         try:
             number = int(str(value)) if kind == "integer" else float(str(value))
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Param {key} must be a {kind}.") from exc
+            raise ValueError(f"Param {key} must be {_numeric_kind_label(kind)}.") from exc
         if not math.isfinite(float(number)) or number < minimum:
             raise ValueError(f"Param {key} must be >= {minimum}.")
 
@@ -210,6 +219,35 @@ def _ensure_jqdata_web_dry_run(params: Mapping[str, Any]) -> None:
         raise ValueError("download_jqdata web jobs only support dry_run=true. Use the script directly for real downloads.")
 
 
+def _ensure_optimize_strategy_web_dry_run(params: Mapping[str, Any]) -> None:
+    if "dry_run" in params and not _as_bool(params.get("dry_run")):
+        raise ValueError("optimize_strategy web jobs only support dry_run=true. Use the script directly for full experiments.")
+    phase = _int_param(params.get("phase", 4), "phase")
+    if phase < 0 or phase > 4:
+        raise ValueError("phase must be between 0 and 4.")
+    topk = _int_param(params.get("topk", 30), "topk")
+    if topk < 1:
+        raise ValueError("Param topk must be >= 1.")
+    if topk > 500:
+        raise ValueError("Param topk must be <= 500.")
+
+
+def _safe_run_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw and not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        raise ValueError("run_id may only contain letters, numbers, underscores, or hyphens.")
+    return raw
+
+
+def _ensure_qlib_prediction_summary_params(params: Mapping[str, Any]) -> None:
+    topk = _int_param(params.get("topk", 20), "topk")
+    if topk < 1:
+        raise ValueError("Param topk must be >= 1.")
+    if topk > QLIB_PREDICTION_WEB_TOPK_MAX:
+        raise ValueError(f"Param topk must be <= {QLIB_PREDICTION_WEB_TOPK_MAX}.")
+    _safe_run_id(params.get("run_id"))
+
+
 def _safe_config_path(value: Any) -> str:
     raw = str(value or "baseline_lgb_alpha158.yaml").strip()
     if not raw:
@@ -235,9 +273,14 @@ def _script_command(script_name: str) -> List[str]:
     return [_python_bin(), str(QUANT_WORKFLOW_ROOT / "scripts" / script_name)]
 
 
+def _append_reports_out_dir(command: List[str]) -> None:
+    command.extend(["--out-dir", str(REPORTS_ROOT)])
+
+
 def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
     def prepare_baostock_refresh(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("prepare_baostock_refresh.py")
+        _append_reports_out_dir(command)
         _append_value(command, params, "target_end", "--target-end")
         _append_value(command, params, "limit", "--limit")
         return command
@@ -285,6 +328,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def apply_data_cleaning(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("apply_data_cleaning.py")
+        _append_reports_out_dir(command)
         _append_flag(command, params, "dry_run", "--dry-run")
         _append_flag(command, params, "no_overwrite", "--no-overwrite")
         _append_flag(command, params, "skip_qlib_convert", "--skip-qlib-convert")
@@ -297,11 +341,19 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def report_data_quality(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_data_quality.py")
+        _append_reports_out_dir(command)
         _append_value(command, params, "overlap_sample", "--overlap-sample")
+        _append_value(command, params, "merged_sample", "--merged-sample")
+        return command
+
+    def report_data_anomalies(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("report_data_anomalies.py")
+        _append_reports_out_dir(command)
         return command
 
     def report_market_regime(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_market_regime.py")
+        _append_reports_out_dir(command)
         _append_value(command, params, "lookback_days", "--lookback-days")
         _append_value(command, params, "min_symbols", "--min-symbols")
         _append_value(command, params, "limit", "--limit")
@@ -309,9 +361,28 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def report_cash_control_backtest(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_cash_control_backtest.py")
+        _append_reports_out_dir(command)
         _append_value(command, params, "lookback_days", "--lookback-days")
         _append_value(command, params, "min_symbols", "--min-symbols")
         _append_value(command, params, "limit", "--limit")
+        return command
+
+    def report_qlib_predictions(params: Mapping[str, Any]) -> List[str]:
+        _ensure_qlib_prediction_summary_params(params)
+        command = _script_command("report_qlib_predictions.py")
+        _append_reports_out_dir(command)
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        _append_value(command, params, "topk", "--topk")
+        return command
+
+    def optimize_strategy(params: Mapping[str, Any]) -> List[str]:
+        _ensure_optimize_strategy_web_dry_run(params)
+        command = _script_command("optimize_strategy.py")
+        command.extend(["--dry-run", "--skip-training", "--output-dir", str(REPORTS_ROOT)])
+        _append_value(command, params, "phase", "--phase")
+        _append_value(command, params, "topk", "--topk")
         return command
 
     def train_baseline_lgb(params: Mapping[str, Any]) -> List[str]:
@@ -322,7 +393,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         return command
 
     def run_dsa_backtest(params: Mapping[str, Any]) -> List[str]:
-        command = [str(Path(sys.executable)), str(DSA_ROOT / "main.py"), "--backtest"]
+        command = [_python_bin(), str(DSA_ROOT / "main.py"), "--backtest"]
         _append_value(command, params, "code", "--backtest-code")
         _append_value(command, params, "eval_window_days", "--backtest-days")
         _append_flag(command, params, "force", "--backtest-force")
@@ -395,7 +466,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         "report_data_quality": {
             "label": "生成数据质量报告",
             "command": report_data_quality,
-            "allowed_params": {"overlap_sample"},
+            "allowed_params": {"overlap_sample", "merged_sample"},
             "artifact_patterns": [
                 str(REPORTS_ROOT / "data_quality_report_latest.md"),
                 str(REPORTS_ROOT / "data_quality_report_*.md"),
@@ -408,7 +479,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         },
         "report_data_anomalies": {
             "label": "生成异常股票和清洗策略",
-            "command": _script_command("report_data_anomalies.py"),
+            "command": report_data_anomalies,
             "allowed_params": set(),
             "artifact_patterns": [
                 str(REPORTS_ROOT / "data_anomaly_stocks_latest.csv"),
@@ -441,6 +512,17 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "cash_control_backtest_*.md"),
             ],
         },
+        "report_qlib_predictions": {
+            "label": "生成 Qlib 预测摘要",
+            "command": report_qlib_predictions,
+            "allowed_params": {"run_id", "topk"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "qlib_predictions_latest.json"),
+                str(REPORTS_ROOT / "qlib_predictions_latest.md"),
+                str(REPORTS_ROOT / "qlib_predictions_*.json"),
+                str(REPORTS_ROOT / "qlib_predictions_*.md"),
+            ],
+        },
         "run_china_astock_comparison": {
             "label": "生成 china-astock 策略对比",
             "command": _script_command("run_china_astock_comparison.py"),
@@ -451,6 +533,17 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_latest.json"),
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_*.csv"),
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_*.md"),
+            ],
+        },
+        "optimize_strategy": {
+            "label": "策略优化预演",
+            "command": optimize_strategy,
+            "allowed_params": {"dry_run", "phase", "topk"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "optimization_results_latest.json"),
+                str(REPORTS_ROOT / "optimization_results_latest.md"),
+                str(REPORTS_ROOT / "optimization_results_*.json"),
+                str(REPORTS_ROOT / "optimization_results_*.md"),
             ],
         },
         "train_baseline_lgb": {

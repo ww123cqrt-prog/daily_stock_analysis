@@ -36,6 +36,7 @@ export type ResearchTrainingResult = {
   sourceConfig?: string;
   runtimeConfig?: string;
   metrics?: Record<string, number>;
+  artifacts?: string[];
   generatedAt?: string;
 };
 
@@ -70,6 +71,33 @@ export type ResearchCashControlBacktest = {
     latestRegime?: string | null;
     latestCashRatio?: number | null;
     latestPositionRatio?: number | null;
+  };
+  artifacts?: Record<string, string>;
+};
+
+export type ResearchQlibPredictionScore = {
+  instrument: string;
+  score?: number | null;
+};
+
+export type ResearchQlibPredictions = {
+  generatedAt?: string;
+  mode?: string;
+  runId?: string;
+  experimentName?: string;
+  predictionPath?: string;
+  latestDate?: string;
+  scoreColumn?: string;
+  topk?: number;
+  top?: ResearchQlibPredictionScore[];
+  bottom?: ResearchQlibPredictionScore[];
+  summary?: {
+    rows?: number;
+    latestRows?: number;
+    dateCount?: number;
+    scoreMin?: number | null;
+    scoreMax?: number | null;
+    scoreMean?: number | null;
   };
   artifacts?: Record<string, string>;
 };
@@ -122,6 +150,54 @@ export type ResearchExternalTools = {
   iphoneMirroring?: ResearchExternalTool;
 };
 
+export type ResearchCapabilityMatrixItem = {
+  id: string;
+  module: string;
+  status: string;
+  entry: string;
+  route?: string;
+  tests: string;
+  browser: string;
+  review: string;
+  next: string;
+  restrictions?: string[];
+};
+
+export type ResearchFunctionInventoryItem = {
+  id: string;
+  area: string;
+  name: string;
+  status: string;
+  entry: string;
+  route?: string;
+  owner: string;
+  coverage: string;
+  gaps: string;
+  next: string;
+  verification: string;
+};
+
+export type ResearchChinaAstockReuseItem = {
+  id: string;
+  capability: string;
+  source: string;
+  status: string;
+  priority: string;
+  decision: string;
+  target: string;
+  next: string;
+  restrictions?: string[];
+};
+
+export type ResearchAcceptanceChecklistItem = {
+  id: string;
+  title: string;
+  status: string;
+  route?: string;
+  evidence: string;
+  next: string;
+};
+
 export type ResearchExperimentMutationResult = {
   removedRun: ResearchExperimentRun;
   noteRemoved?: boolean;
@@ -136,8 +212,13 @@ export type ResearchStatus = {
   qlibProvider?: ResearchQlibProvider | null;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
+  qlibPredictions?: ResearchQlibPredictions | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   externalTools?: ResearchExternalTools | null;
+  capabilityMatrix?: ResearchCapabilityMatrixItem[] | null;
+  functionInventory?: ResearchFunctionInventoryItem[] | null;
+  chinaAstockReuse?: ResearchChinaAstockReuseItem[] | null;
+  acceptanceChecklist?: ResearchAcceptanceChecklistItem[] | null;
 };
 
 export const researchApi = {

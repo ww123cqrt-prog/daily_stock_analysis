@@ -30,6 +30,44 @@ describe('quantApi', () => {
           },
         },
         active_count: 0,
+        generated_at: '2026-07-05T15:30:00+08:00',
+        trainable: true,
+        training_readiness: {
+          status: 'trainable',
+          summary: 'Qlib provider is ready.',
+        },
+        data_sources: [
+          {
+            name: 'merged',
+            files: 5340,
+            rows: 7580087,
+            date_range: '2008-01-02 ~ 2026-07-03',
+            status: 'available',
+          },
+        ],
+        qlib_provider: {
+          path: '/tmp/qlib',
+          calendar_days: 4492,
+          calendar_range: '2008-01-02 ~ 2026-07-03',
+          instruments: 5340,
+        },
+        latest_training: {
+          status: 'completed',
+          experiment_name: 'baseline_lgb_alpha158_cleaned',
+          run_id: 'run_20260705',
+        },
+        qlib_predictions: {
+          mode: 'read_only_qlib_prediction_summary',
+          latest_date: '2026-07-02',
+          top: [{ instrument: 'SZ000002', score: 0.25 }],
+          bottom: [{ instrument: 'SZ000001', score: -0.4 }],
+          summary: { latest_rows: 3 },
+        },
+        mlflow: {
+          url: 'http://127.0.0.1:6006/',
+          status: 'linked',
+          role: 'experiment_raw_records',
+        },
         latest_jobs: {
           check_qlib_data: {
             job_id: 'qj_1',
@@ -54,6 +92,14 @@ describe('quantApi', () => {
     expect(status.availableJobTypes.check_qlib_data.label).toBe('检查 Qlib 数据');
     expect(status.latestJobs.check_qlib_data.jobId).toBe('qj_1');
     expect(status.latestJobs.checkQlibData).toBeUndefined();
+    expect(status.trainable).toBe(true);
+    expect(status.trainingReadiness?.status).toBe('trainable');
+    expect(status.dataSources[0].dateRange).toBe('2008-01-02 ~ 2026-07-03');
+    expect(status.qlibProvider?.calendarDays).toBe(4492);
+    expect(status.latestTraining?.runId).toBe('run_20260705');
+    expect(status.qlibPredictions?.latestDate).toBe('2026-07-02');
+    expect(status.qlibPredictions?.top?.[0].instrument).toBe('SZ000002');
+    expect(status.mlflow?.url).toBe('http://127.0.0.1:6006/');
   });
 
   it('parses streamed job snapshots into frontend job objects', () => {

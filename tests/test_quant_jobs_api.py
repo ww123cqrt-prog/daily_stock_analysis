@@ -30,6 +30,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
         patcher.start()
         return TestClient(create_app(static_dir=static_dir))
 
+    def _assert_reports_dir_arg(self, command: list[str], flag: str = "--out-dir") -> None:
+        self.assertIn(flag, command)
+        reports_dir = command[command.index(flag) + 1]
+        self.assertTrue(reports_dir.endswith("quant_workflow/reports"), reports_dir)
+
     def test_rejects_unknown_job_type_before_any_process_is_started(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
@@ -109,6 +114,127 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("report_data_quality", status_body["available_job_types"])
         self.assertEqual(status_body["latest_jobs"]["report_data_quality"]["status"], "completed")
         self.assertEqual(status_body["active_count"], 0)
+
+    def test_status_includes_research_snapshot_for_workflow_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-05T15:30:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {"status": "trainable", "summary": "Qlib provider is ready."},
+                        "data_sources": [
+                            {
+                                "name": "merged",
+                                "files": 5340,
+                                "rows": 7580087,
+                                "date_range": "2008-01-02 ~ 2026-07-03",
+                                "status": "available",
+                            }
+                        ],
+                        "qlib_provider": {
+                            "path": "/tmp/qlib",
+                            "calendar_days": 4492,
+                            "calendar_range": "2008-01-02 ~ 2026-07-03",
+                            "instruments": 5340,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (reports_dir / "latest_training_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "experiment_name": "baseline_lgb_alpha158_cleaned",
+                        "run_id": "run_20260705",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+
+            with patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path):
+                resp = client.get("/api/v1/quant/status")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["trainable"])
+        self.assertEqual(body["training_readiness"]["status"], "trainable")
+        self.assertEqual(body["data_sources"][0]["name"], "merged")
+        self.assertEqual(body["qlib_provider"]["calendar_range"], "2008-01-02 ~ 2026-07-03")
+        self.assertEqual(body["latest_training"]["run_id"], "run_20260705")
+        self.assertEqual(body["mlflow"]["url"], "http://127.0.0.1:6006/")
+        self.assertEqual(body["mlflow"]["role"], "experiment_raw_records")
+
+    def test_status_mlflow_url_can_be_overridden_by_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-05T15:30:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {"status": "trainable", "summary": "ready"},
+                        "data_sources": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+
+            with (
+                patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path),
+                patch.dict(os.environ, {"MLFLOW_URL": "http://127.0.0.1:6606/"}, clear=False),
+            ):
+                resp = client.get("/api/v1/quant/status")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["mlflow"]["url"], "http://127.0.0.1:6606/")
+
+    def test_status_mlflow_url_uses_default_when_environment_is_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-05T15:30:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {"status": "trainable", "summary": "ready"},
+                        "data_sources": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+
+            with (
+                patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path),
+                patch.dict(os.environ, {"MLFLOW_URL": "   "}, clear=False),
+            ):
+                resp = client.get("/api/v1/quant/status")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["mlflow"]["url"], "http://127.0.0.1:6006/")
 
     def test_missing_job_uses_structured_not_found_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -530,6 +656,63 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(recovered.status, "completed")
         self.assertEqual(recovered.artifact_paths, [str(artifact_path)])
 
+    def test_default_specs_include_read_only_qlib_prediction_summary_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            available = service.available_job_types()
+            command = service._build_command(
+                "report_qlib_predictions",
+                {"run_id": "safe_run_20260705", "topk": "15"},
+            )
+
+        self.assertIn("report_qlib_predictions", available)
+        self.assertIn("topk", available["report_qlib_predictions"]["allowed_params"])
+        self.assertIn("run_id", available["report_qlib_predictions"]["allowed_params"])
+        self.assertIn("report_qlib_predictions.py", command[1])
+        self._assert_reports_dir_arg(command)
+        self.assertIn("--run-id", command)
+        self.assertIn("safe_run_20260705", command)
+        self.assertIn("--topk", command)
+        self.assertIn("15", command)
+
+    def test_report_and_refresh_jobs_use_configured_reports_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            refresh_command = service._build_command("prepare_baostock_refresh", {"limit": 3})
+            anomaly_command = service._build_command("report_data_anomalies", {})
+
+        self.assertIn("prepare_baostock_refresh.py", refresh_command[1])
+        self._assert_reports_dir_arg(refresh_command)
+        self.assertIn("--limit", refresh_command)
+        self.assertIn("3", refresh_command)
+        self.assertIn("report_data_anomalies.py", anomaly_command[1])
+        self._assert_reports_dir_arg(anomaly_command)
+
+    def test_qlib_prediction_summary_job_rejects_unsafe_run_id_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            with self.assertRaises(ValueError):
+                service._build_command("report_qlib_predictions", {"run_id": "../unsafe", "topk": "10"})
+
+    def test_qlib_prediction_summary_job_rejects_invalid_topk_before_launch(self) -> None:
+        invalid_values = [
+            ("0", "Param topk must be >= 1."),
+            ("501", "Param topk must be <= 500."),
+            ("1.5", "Param topk must be an integer."),
+            ("abc", "Param topk must be an integer."),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            for topk, expected_message in invalid_values:
+                with self.subTest(topk=topk):
+                    with self.assertRaises(ValueError) as ctx:
+                        service._build_command("report_qlib_predictions", {"topk": topk})
+                    self.assertIn(expected_message, str(ctx.exception))
+
     def test_completed_job_artifact_can_be_downloaded_by_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             reports_dir = Path(temp_dir) / "reports"
@@ -651,8 +834,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
             dsa_root = base / "dsa"
             projects_root = base / "workspace"
             workflow_root = base / "workflow"
+            reports_root = base / "isolated_reports"
             qlib_python = base / "qlib-python"
             workflow_root.mkdir(parents=True)
+            reports_root.mkdir(parents=True)
             qlib_python.write_text("#!/bin/sh\n", encoding="utf-8")
 
             env = os.environ.copy()
@@ -661,6 +846,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "DSA_ROOT": str(dsa_root),
                     "WORKING_PROJECTS_ROOT": str(projects_root),
                     "QUANT_WORKFLOW_ROOT": str(workflow_root),
+                    "QUANT_WORKFLOW_REPORTS_ROOT": str(reports_root),
                     "QLIB_PYTHON": str(qlib_python),
                 }
             )
@@ -675,9 +861,12 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "print(json.dumps({"
                         "'dsa_root': str(q.DSA_ROOT), "
                         "'projects_root': str(q.PROJECTS_ROOT), "
+                        "'reports_root': str(q.REPORTS_ROOT), "
                         "'jobs_root': str(q.DEFAULT_JOBS_ROOT), "
                         "'check_command': specs['check_qlib_data']['command'], "
-                        "'train_command': specs['train_baseline_lgb']['command']({'config': 'custom.yaml'})"
+                        "'quality_command': specs['report_data_quality']['command']({}), "
+                        "'train_command': specs['train_baseline_lgb']['command']({'config': 'custom.yaml'}), "
+                        "'dsa_backtest_command': specs['run_dsa_backtest']['command']({})"
                         "}))"
                     ),
                 ],
@@ -691,10 +880,60 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["dsa_root"], str(dsa_root))
         self.assertEqual(payload["projects_root"], str(projects_root))
-        self.assertEqual(payload["jobs_root"], str(workflow_root / "reports" / "jobs"))
+        self.assertEqual(payload["reports_root"], str(reports_root))
+        self.assertEqual(payload["jobs_root"], str(reports_root / "jobs"))
         self.assertEqual(payload["check_command"][0], str(qlib_python))
+        self.assertEqual(payload["dsa_backtest_command"][0], str(qlib_python))
         self.assertEqual(payload["check_command"][1], str(workflow_root / "scripts" / "check_qlib_data.py"))
+        self.assertEqual(payload["quality_command"][payload["quality_command"].index("--out-dir") + 1], str(reports_root))
         self.assertEqual(payload["train_command"][3], str(workflow_root / "configs" / "custom.yaml"))
+
+    def test_default_quant_commands_use_backend_python_even_when_qlib_venv_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            dsa_root = base / "daily_stock_analysis"
+            projects_root = base / "workspace"
+            workflow_root = projects_root / "quant_workflow"
+            qlib_python = projects_root / "qlib" / ".venv" / "bin" / "python"
+            workflow_root.mkdir(parents=True)
+            qlib_python.parent.mkdir(parents=True)
+            qlib_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env.pop("QLIB_PYTHON", None)
+            env.update(
+                {
+                    "DSA_ROOT": str(dsa_root),
+                    "WORKING_PROJECTS_ROOT": str(projects_root),
+                    "QUANT_WORKFLOW_ROOT": str(workflow_root),
+                }
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, sys; "
+                        "import src.services.quant_job_service as q; "
+                        "specs = q._build_default_command_specs(); "
+                        "print(json.dumps({"
+                        "'expected': sys.executable, "
+                        "'check_command': specs['check_qlib_data']['command'], "
+                        "'train_command': specs['train_baseline_lgb']['command']({'config': 'custom.yaml'})"
+                        "}))"
+                    ),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["check_command"][0], payload["expected"])
+        self.assertEqual(payload["train_command"][0], payload["expected"])
+        self.assertNotEqual(payload["check_command"][0], str(qlib_python))
 
     def test_train_config_param_must_stay_under_configs_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -751,6 +990,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             spec = service.command_specs["apply_data_cleaning"]
 
         self.assertIn("apply_data_cleaning.py", command[1])
+        self._assert_reports_dir_arg(command)
         self.assertEqual(status["apply_data_cleaning"]["label"], "应用清洗策略生成 cleaned Qlib")
         self.assertEqual(status["apply_data_cleaning"]["allowed_params"], ["dry_run", "no_overwrite", "skip_qlib_convert"])
         self.assertIn("--dry-run", service._build_command("apply_data_cleaning", {"dry_run": True}))
@@ -816,6 +1056,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             spec = service.command_specs["report_market_regime"]
 
         self.assertIn("report_market_regime.py", command[1])
+        self._assert_reports_dir_arg(command)
         self.assertIn("--lookback-days", command)
         self.assertIn("120", command)
         self.assertIn("--min-symbols", command)
@@ -833,6 +1074,35 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 service._build_command("report_market_regime", {"min_symbols": 0})
         self.assertIn("Param min_symbols must be >= 1", str(ctx.exception))
 
+    def test_data_quality_report_job_supports_browser_safe_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            command = service._build_command(
+                "report_data_quality",
+                {"overlap_sample": 5, "merged_sample": 5},
+            )
+            status = service.available_job_types()
+
+        self.assertIn("report_data_quality.py", command[1])
+        self._assert_reports_dir_arg(command)
+        self.assertIn("--overlap-sample", command)
+        self.assertIn("5", command)
+        self.assertIn("--merged-sample", command)
+        self.assertCountEqual(
+            status["report_data_quality"]["allowed_params"],
+            ["merged_sample", "overlap_sample"],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+            with self.assertRaises(ValueError) as zero_ctx:
+                service._build_command("report_data_quality", {"merged_sample": 0})
+            with self.assertRaises(ValueError) as text_ctx:
+                service._build_command("report_data_quality", {"merged_sample": "abc"})
+        self.assertIn("Param merged_sample must be >= 1", str(zero_ctx.exception))
+        self.assertIn("Param merged_sample must be an integer", str(text_ctx.exception))
+
     def test_cash_control_backtest_job_is_whitelisted_with_safe_params(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -845,6 +1115,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             spec = service.command_specs["report_cash_control_backtest"]
 
         self.assertIn("report_cash_control_backtest.py", command[1])
+        self._assert_reports_dir_arg(command)
         self.assertIn("--lookback-days", command)
         self.assertIn("80", command)
         self.assertIn("--min-symbols", command)
@@ -879,6 +1150,39 @@ class QuantJobsApiTestCase(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             service._build_command("run_china_astock_comparison", {"unsafe": "value"})
         self.assertIn("Unsupported params for run_china_astock_comparison", str(ctx.exception))
+
+    def test_optimize_strategy_job_is_whitelisted_as_browser_safe_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            command = service._build_command("optimize_strategy", {"phase": 4, "topk": 30, "dry_run": True})
+            status = service.available_job_types()
+            spec = service.command_specs["optimize_strategy"]
+
+        self.assertIn("optimize_strategy.py", command[1])
+        self.assertIn("--dry-run", command)
+        self.assertIn("--skip-training", command)
+        self._assert_reports_dir_arg(command, "--output-dir")
+        self.assertIn("--phase", command)
+        self.assertIn("4", command)
+        self.assertIn("--topk", command)
+        self.assertIn("30", command)
+        self.assertEqual(status["optimize_strategy"]["label"], "策略优化预演")
+        self.assertEqual(status["optimize_strategy"]["allowed_params"], ["dry_run", "phase", "topk"])
+        self.assertTrue(any("optimization_results_latest.json" in item for item in spec["artifact_patterns"]))
+        self.assertTrue(any("optimization_results_latest.md" in item for item in spec["artifact_patterns"]))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+            with self.assertRaises(ValueError) as real_ctx:
+                service._build_command("optimize_strategy", {"dry_run": False})
+            with self.assertRaises(ValueError) as phase_ctx:
+                service._build_command("optimize_strategy", {"dry_run": True, "phase": 5})
+            with self.assertRaises(ValueError) as topk_ctx:
+                service._build_command("optimize_strategy", {"dry_run": True, "topk": 0})
+        self.assertIn("only support dry_run=true", str(real_ctx.exception))
+        self.assertIn("phase must be between 0 and 4", str(phase_ctx.exception))
+        self.assertIn("Param topk must be >= 1", str(topk_ctx.exception))
 
     def test_numeric_job_params_are_rejected_before_subprocess_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

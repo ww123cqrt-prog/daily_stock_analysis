@@ -169,6 +169,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         description: '汇总覆盖率、日期范围、来源重叠和可训练状态。',
         params: [
           { key: 'overlap_sample', label: '重叠样本数', kind: 'number', min: 1 },
+          { key: 'merged_sample', label: '合并样本数', kind: 'number', min: 1 },
         ],
       },
       { type: 'report_data_anomalies', label: '生成异常股票和清洗策略', description: '输出异常股票清单，并给出后续清洗策略。' },
@@ -230,6 +231,37 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'lookback_days', label: '回看交易日', kind: 'number', min: 2, placeholder: '60' },
           { key: 'min_symbols', label: '最少股票数', kind: 'number', min: 1, placeholder: '100' },
           { key: 'limit', label: '抽样上限', kind: 'number', min: 1, placeholder: '留空为全量' },
+        ],
+      },
+      {
+        type: 'report_qlib_predictions',
+        label: '生成 Qlib 预测摘要',
+        description: '读取最新 Qlib/MLflow pred.pkl，生成最新交易日 Top/Bottom 模型评分摘要；只读排行，不连接券商、不自动下单。',
+        defaultParams: { topk: '20' },
+        params: [
+          { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '20' },
+          { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
+        ],
+      },
+      {
+        type: 'optimize_strategy',
+        label: '策略优化预演',
+        description: '用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；只读生成报告，不训练、不连接券商、不自动下单。',
+        defaultParams: { dry_run: true, phase: '4', topk: '30' },
+        params: [
+          {
+            key: 'phase',
+            label: '阶段',
+            kind: 'select',
+            options: [
+              { value: '0', label: '全部阶段' },
+              { value: '1', label: '低换手' },
+              { value: '2', label: '市场择时' },
+              { value: '3', label: '回撤保护' },
+              { value: '4', label: '综合策略' },
+            ],
+          },
+          { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '30' },
         ],
       },
       {
@@ -607,6 +639,20 @@ const WorkflowPage: React.FC = () => {
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
 
   const latestJobs = useMemo(() => quantStatus?.latestJobs ?? {}, [quantStatus]);
+  const workflowStatus = useMemo<ResearchStatus | null>(() => {
+    if (researchStatus) return researchStatus;
+    if (!quantStatus) return null;
+    return {
+      generatedAt: quantStatus.generatedAt,
+      trainable: quantStatus.trainable,
+      trainingReadiness: quantStatus.trainingReadiness || { status: 'unknown', summary: '' },
+      dataSources: quantStatus.dataSources,
+      qlibProvider: quantStatus.qlibProvider,
+      latestTraining: quantStatus.latestTraining,
+      cashControlBacktest: quantStatus.cashControlBacktest,
+      experimentNotebook: quantStatus.experimentNotebook,
+    };
+  }, [researchStatus, quantStatus]);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -643,7 +689,7 @@ const WorkflowPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    document.title = '量化工作流 - DSA';
+    document.title = '量化任务中心 - DSA';
     void refresh();
     const timer = window.setInterval(() => {
       if (typeof window.EventSource === 'undefined') {
@@ -810,11 +856,11 @@ const WorkflowPage: React.FC = () => {
     }
   };
 
-  const trainable = researchStatus?.trainable;
-  const latestTraining = researchStatus?.latestTraining;
+  const trainable = workflowStatus?.trainable;
+  const latestTraining = workflowStatus?.latestTraining;
   const dailyGuideSteps = useMemo(
-    () => buildDailyGuideSteps(researchStatus, latestJobs),
-    [researchStatus, latestJobs],
+    () => buildDailyGuideSteps(workflowStatus, latestJobs),
+    [workflowStatus, latestJobs],
   );
 
   return (
@@ -824,7 +870,7 @@ const WorkflowPage: React.FC = () => {
           <div>
             <span className="label-uppercase">Quant Workflow</span>
             <h1 className="mt-2 text-2xl font-semibold tracking-normal text-foreground sm:text-3xl">
-              量化工作流
+              量化任务中心
             </h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">
               在网页端完成数据更新、Qlib 转换、质量检查、模型训练、实验追踪和回测查看；后台只执行白名单脚本。
@@ -858,17 +904,17 @@ const WorkflowPage: React.FC = () => {
               {trainable ? '当前数据可训练' : loading ? '正在读取数据状态' : '数据暂不可训练'}
             </p>
             <p className="mt-2 text-sm leading-5 text-secondary-text">
-              {researchStatus?.trainingReadiness?.summary || '运行质量报告后，这里会显示训练准备状态。'}
+              {workflowStatus?.trainingReadiness?.summary || '运行质量报告后，这里会显示训练准备状态。'}
             </p>
           </Card>
 
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <span className="label-uppercase">Qlib Provider</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
-              {researchStatus?.qlibProvider?.calendarRange || '-'}
+              {workflowStatus?.qlibProvider?.calendarRange || '-'}
             </p>
             <p className="mt-2 text-sm text-secondary-text">
-              股票池 {formatNumber(researchStatus?.qlibProvider?.instruments)} · 日历 {formatNumber(researchStatus?.qlibProvider?.calendarDays)}
+              股票池 {formatNumber(workflowStatus?.qlibProvider?.instruments)} · 日历 {formatNumber(workflowStatus?.qlibProvider?.calendarDays)}
             </p>
           </Card>
 

@@ -28,13 +28,22 @@ import {
   WalletCards,
 } from 'lucide-react';
 import { researchApi } from '../api/research';
-import type { ResearchDataSource, ResearchExperimentRun, ResearchExternalTools, ResearchStatus } from '../api/research';
+import type {
+  ResearchChinaAstockReuseItem,
+  ResearchAcceptanceChecklistItem,
+  ResearchCapabilityMatrixItem,
+  ResearchDataSource,
+  ResearchExperimentRun,
+  ResearchExternalTools,
+  ResearchFunctionInventoryItem,
+  ResearchStatus,
+} from '../api/research';
 import { AppPage, Badge, Card, PageHeader, StatusDot } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 
 type StatusTone = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
 type BadgeVariant = 'default' | 'success' | 'warning' | 'danger' | 'info' | 'history';
-type SupportState = 'available' | 'partial' | 'future';
+type SupportState = 'available' | 'partial' | 'future' | 'read_only' | 'deferred' | 'not_planned';
 
 type StatusItem = {
   label: string;
@@ -83,7 +92,12 @@ type SelfServiceCoverageItem = {
   browser: string;
   review: string;
   next: string;
+  restrictions?: string[];
 };
+
+type FunctionInventoryItem = ResearchFunctionInventoryItem;
+type ChinaAstockReuseItem = ResearchChinaAstockReuseItem;
+type AcceptanceChecklistItem = ResearchAcceptanceChecklistItem;
 
 type DevelopmentQueueItem = {
   priority: string;
@@ -117,6 +131,9 @@ const STATUS_STYLE: Record<SupportState, { zh: string; en: string; variant: Badg
   available: { zh: '可用', en: 'Available', variant: 'success', tone: 'success' },
   partial: { zh: '部分可用', en: 'Partial', variant: 'warning', tone: 'warning' },
   future: { zh: '待补强', en: 'Planned', variant: 'default', tone: 'neutral' },
+  read_only: { zh: '只读可用', en: 'Read-only', variant: 'info', tone: 'info' },
+  deferred: { zh: '暂缓', en: 'Deferred', variant: 'default', tone: 'neutral' },
+  not_planned: { zh: '不计划', en: 'Not planned', variant: 'danger', tone: 'danger' },
 };
 
 const DATA_STATUS_STYLE: Record<string, { zh: string; en: string; variant: BadgeVariant; tone: StatusTone }> = {
@@ -148,14 +165,32 @@ const RESEARCH_TEXT = {
     experimentNotebookDescription: '把每次量化训练的动机、数据版本、核心指标、结论和下一步沉淀成中文研究记录。',
     latestNoteTitle: '最新中文记录',
     latestRunsTitle: '最近实验',
-    coverageTitle: '自助覆盖矩阵',
-    coverageDescription: '按模块核对“能否在网页端自助完成”和当前验收口径；测试、浏览器和 opencode 都作为继续推进的门槛。',
+    coverageTitle: '能力验收矩阵',
+    coverageDescription: '按模块核对“能否在网页端自助完成”和当前验收口径；测试、浏览器、opencode 和安全边界都作为继续推进的门槛。',
     coverageModuleLabel: '模块',
     coverageEntryLabel: '网页入口',
     coverageTestsLabel: '测试脚本',
     coverageBrowserLabel: '浏览器执行',
     coverageReviewLabel: 'opencode复审',
     coverageNextLabel: '下一步',
+    inventoryTitle: '功能入口盘点',
+    inventoryDescription: '把 DSA 原有页面、量化流水线、Qlib 接入、实验记录和外部观察层统一列账；核心流程必须有网页入口或明确缺口。',
+    inventoryAreaLabel: '类别',
+    inventoryOwnerLabel: '归属',
+    inventoryCoverageLabel: '当前覆盖',
+    inventoryGapsLabel: '缺口',
+    inventoryVerificationLabel: '验收',
+    chinaReuseTitle: 'china-astock-quant 复用清单',
+    chinaReuseDescription: '只复用适合研究和回测的能力；交易、券商和自动下单相关模块保留为参考，不进入本阶段主工作台。',
+    chinaReuseCapabilityLabel: '能力',
+    chinaReuseSourceLabel: '来源',
+    chinaReuseDecisionLabel: '决策',
+    chinaReuseTargetLabel: '接入目标',
+    chinaReuseRestrictionLabel: '限制',
+    acceptanceTitle: '阶段验收清单',
+    acceptanceDescription: '把当前阶段是否真的可交付列成页面内清单，避免只靠口头说明。',
+    acceptanceEvidenceLabel: '证据',
+    acceptanceNextLabel: '下一步',
     developmentQueueTitle: '后续开发队列',
     developmentQueueDescription: '把接下来要做的事拆成可验收模块；每一条都必须走测试、浏览器执行和只读复审。',
     developmentPriorityLabel: '优先级',
@@ -217,7 +252,7 @@ const RESEARCH_TEXT = {
         icon: Building2,
       },
       {
-        title: '技术分析',
+        title: '技术面/技术分析',
         status: 'available',
         description: '复用价格序列、均线、MACD、RSI/KDJ、成交量与形态判断。',
         focus: ['K线与均线', 'MACD/RSI/KDJ', '量价结构'],
@@ -235,7 +270,7 @@ const RESEARCH_TEXT = {
         icon: WalletCards,
       },
       {
-        title: '情绪分析',
+        title: '情绪面/情绪分析',
         status: 'partial',
         description: '围绕市场心理、热点、新闻和涨跌家数做辅助判断，短线权重更高。',
         focus: ['新闻与热点', '涨跌家数', '风险偏好变化'],
@@ -344,14 +379,32 @@ const RESEARCH_TEXT = {
     experimentNotebookDescription: 'Human-readable research notes for each quant run: intent, data version, key metrics, conclusion, and next step.',
     latestNoteTitle: 'Latest Human Note',
     latestRunsTitle: 'Latest Experiments',
-    coverageTitle: 'Self-service Coverage Matrix',
-    coverageDescription: 'Module-by-module status for browser self-service and the current verification gates: automated tests, browser execution, and opencode review.',
+    coverageTitle: 'Capability Acceptance Matrix',
+    coverageDescription: 'Module-by-module status for browser self-service and the current verification gates: automated tests, browser execution, opencode review, and safety boundaries.',
     coverageModuleLabel: 'Module',
     coverageEntryLabel: 'Web entry',
     coverageTestsLabel: 'Automated tests',
     coverageBrowserLabel: 'Browser execution',
     coverageReviewLabel: 'opencode review',
     coverageNextLabel: 'Next',
+    inventoryTitle: 'Function Entry Inventory',
+    inventoryDescription: 'A ledger of existing DSA pages, quant workflow, Qlib integration, experiment records, and external observation. Core flows need a web entry or an explicit gap.',
+    inventoryAreaLabel: 'Area',
+    inventoryOwnerLabel: 'Owner',
+    inventoryCoverageLabel: 'Current coverage',
+    inventoryGapsLabel: 'Gaps',
+    inventoryVerificationLabel: 'Verification',
+    chinaReuseTitle: 'china-astock-quant Reuse List',
+    chinaReuseDescription: 'Only research and backtest capabilities are candidates. Broker, trading, and automatic order modules remain reference-only and out of scope for this phase.',
+    chinaReuseCapabilityLabel: 'Capability',
+    chinaReuseSourceLabel: 'Source',
+    chinaReuseDecisionLabel: 'Decision',
+    chinaReuseTargetLabel: 'Target',
+    chinaReuseRestrictionLabel: 'Restrictions',
+    acceptanceTitle: 'Acceptance Checklist',
+    acceptanceDescription: 'A page-level checklist for whether this phase is actually shippable, not just verbally described.',
+    acceptanceEvidenceLabel: 'Evidence',
+    acceptanceNextLabel: 'Next',
     developmentQueueTitle: 'Development Queue',
     developmentQueueDescription: 'Next work is split into verifiable modules. Each item must pass automated tests, browser execution, and read-only review.',
     developmentPriorityLabel: 'Priority',
@@ -648,6 +701,52 @@ function externalToolStatus(status: string | undefined, installed?: boolean): Su
   return 'future';
 }
 
+function normalizeSupportState(status: string | undefined): SupportState {
+  if (
+    status === 'available'
+    || status === 'partial'
+    || status === 'future'
+    || status === 'read_only'
+    || status === 'deferred'
+    || status === 'not_planned'
+  ) {
+    return status;
+  }
+  if (status === 'verified') {
+    return 'available';
+  }
+  if (status === 'missing') {
+    return 'deferred';
+  }
+  return 'future';
+}
+
+function buildCapabilityMatrixItems(
+  matrix: ResearchCapabilityMatrixItem[] | null | undefined,
+  language: 'zh' | 'en',
+): SelfServiceCoverageItem[] | null {
+  if (!matrix?.length) {
+    return null;
+  }
+  return matrix.map((item) => {
+    const restrictions = item.restrictions ?? [];
+    const restrictionText = restrictions.length
+      ? `${language === 'zh' ? '限制' : 'Restrictions'}: ${joinResearchList(restrictions, language)}`
+      : '';
+    return {
+      module: item.module,
+      status: normalizeSupportState(item.status),
+      entry: item.entry,
+      route: item.route,
+      tests: item.tests,
+      browser: item.browser,
+      review: item.review,
+      next: restrictionText ? `${item.next} ${restrictionText}` : item.next,
+      restrictions,
+    };
+  });
+}
+
 function buildCoverageItems(
   items: readonly SelfServiceCoverageItem[],
   externalTools: ResearchExternalTools | null | undefined,
@@ -734,7 +833,11 @@ const ResearchPage: React.FC = () => {
   const notebookStatusMeta = DATA_STATUS_STYLE[notebookStatus] ?? DATA_STATUS_STYLE.unknown;
   const notebookStatusVariant: BadgeVariant = notebookStatusMeta.variant;
   const notebookStatusTone: StatusTone = notebookStatusMeta.tone;
-  const coverageItems = buildCoverageItems(text.coverageItems, researchStatus?.externalTools, language);
+  const coverageItems = buildCapabilityMatrixItems(researchStatus?.capabilityMatrix, language)
+    ?? buildCoverageItems(text.coverageItems, researchStatus?.externalTools, language);
+  const functionInventoryItems: FunctionInventoryItem[] = researchStatus?.functionInventory ?? [];
+  const chinaReuseItems: ChinaAstockReuseItem[] = researchStatus?.chinaAstockReuse ?? [];
+  const acceptanceItems: AcceptanceChecklistItem[] = researchStatus?.acceptanceChecklist ?? [];
 
   const applyExperimentMutation = async (runId: string, action: 'archive' | 'permanent') => {
     setMutatingRunKey(`${action}:${runId}`);
@@ -999,6 +1102,184 @@ const ResearchPage: React.FC = () => {
                 </Fragment>
               ))}
             </div>
+          </div>
+        </Card>
+      </section>
+
+      <section aria-label={text.inventoryTitle}>
+        <Card padding="lg" className="space-y-4">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-foreground">{text.inventoryTitle}</h2>
+              <p className="mt-1 max-w-4xl text-sm leading-6 text-secondary-text">{text.inventoryDescription}</p>
+            </div>
+            <Badge variant="info" size="sm" className="w-fit rounded-lg">
+              {formatCompactNumber(functionInventoryItems.length)}
+            </Badge>
+          </div>
+
+          <div className="grid gap-3 xl:hidden">
+            {functionInventoryItems.map((item) => (
+              <article key={item.id} className="rounded-xl border border-border/70 bg-surface/60 p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-muted-text">{item.area}</p>
+                    <h3 className="mt-1 break-words text-sm font-semibold text-foreground">{item.name}</h3>
+                  </div>
+                  <StatusBadge status={normalizeSupportState(item.status)} language={language} />
+                </div>
+                <dl className="mt-3 space-y-2 text-xs leading-5 text-secondary-text">
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.coverageEntryLabel}</dt>
+                    <dd className="mt-1 break-words text-foreground">
+                      {item.route ? <Link to={item.route} className="text-cyan hover:underline">{item.entry}</Link> : item.entry}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.inventoryCoverageLabel}</dt>
+                    <dd className="mt-1 break-words">{item.coverage}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.inventoryGapsLabel}</dt>
+                    <dd className="mt-1 break-words">{item.gaps}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.coverageNextLabel}</dt>
+                    <dd className="mt-1 break-words">{item.next}</dd>
+                  </div>
+                </dl>
+              </article>
+            ))}
+          </div>
+
+          <div className="hidden xl:block">
+            <div className="grid grid-cols-[0.85fr_1fr_1.25fr_1.45fr_1.25fr_1.25fr] overflow-hidden rounded-xl border border-border/70 bg-surface/60 text-xs">
+              {[
+                text.inventoryAreaLabel,
+                text.coverageModuleLabel,
+                text.coverageEntryLabel,
+                text.inventoryCoverageLabel,
+                text.inventoryGapsLabel,
+                text.inventoryVerificationLabel,
+              ].map((heading) => (
+                <div key={heading} className="border-b border-border/70 bg-background/50 px-3 py-2 font-semibold text-muted-text">
+                  {heading}
+                </div>
+              ))}
+              {functionInventoryItems.map((item) => (
+                <Fragment key={item.id}>
+                  <div className="border-t border-border/60 px-3 py-3 leading-5 text-secondary-text">{item.area}</div>
+                  <div className="border-t border-border/60 px-3 py-3">
+                    <div className="flex flex-col gap-2">
+                      <span className="break-words font-semibold text-foreground">{item.name}</span>
+                      <StatusBadge status={normalizeSupportState(item.status)} language={language} />
+                    </div>
+                  </div>
+                  <div className="border-t border-border/60 px-3 py-3 leading-5 text-secondary-text">
+                    {item.route ? <Link to={item.route} className="break-words text-cyan hover:underline">{item.entry}</Link> : item.entry}
+                    <p className="mt-1 break-words text-muted-text">{item.owner}</p>
+                  </div>
+                  <div className="border-t border-border/60 px-3 py-3 leading-5 text-secondary-text">{item.coverage}</div>
+                  <div className="border-t border-border/60 px-3 py-3 leading-5 text-secondary-text">{item.gaps}</div>
+                  <div className="border-t border-border/60 px-3 py-3 leading-5 text-secondary-text">
+                    <p>{item.verification}</p>
+                    <p className="mt-2 text-muted-text">{item.next}</p>
+                  </div>
+                </Fragment>
+              ))}
+            </div>
+          </div>
+        </Card>
+      </section>
+
+      <section aria-label={text.chinaReuseTitle}>
+        <Card padding="lg" className="space-y-4">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-foreground">{text.chinaReuseTitle}</h2>
+              <p className="mt-1 max-w-4xl text-sm leading-6 text-secondary-text">{text.chinaReuseDescription}</p>
+            </div>
+            <Badge variant="warning" size="sm" className="w-fit rounded-lg">
+              {formatCompactNumber(chinaReuseItems.length)}
+            </Badge>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">
+            {chinaReuseItems.map((item) => {
+              const restrictions = item.restrictions ?? [];
+              return (
+                <article key={item.id} className="flex min-h-[260px] flex-col rounded-xl border border-border/70 bg-surface/60 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-muted-text">{item.priority}</p>
+                      <h3 className="mt-1 break-words text-base font-semibold text-foreground">{item.capability}</h3>
+                    </div>
+                    <StatusBadge status={normalizeSupportState(item.status)} language={language} />
+                  </div>
+                  <dl className="mt-4 space-y-2 text-xs leading-5 text-secondary-text">
+                    <div>
+                      <dt className="font-medium text-muted-text">{text.chinaReuseSourceLabel}</dt>
+                      <dd className="mt-1 break-all font-mono text-foreground">{item.source}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-medium text-muted-text">{text.chinaReuseDecisionLabel}</dt>
+                      <dd className="mt-1 break-words">{item.decision}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-medium text-muted-text">{text.chinaReuseTargetLabel}</dt>
+                      <dd className="mt-1 break-words">{item.target}</dd>
+                    </div>
+                    {restrictions.length ? (
+                      <div>
+                        <dt className="font-medium text-muted-text">{text.chinaReuseRestrictionLabel}</dt>
+                        <dd className="mt-1 break-words">{joinResearchList(restrictions, language)}</dd>
+                      </div>
+                    ) : null}
+                  </dl>
+                  <p className="mt-auto pt-4 text-sm leading-6 text-secondary-text">{item.next}</p>
+                </article>
+              );
+            })}
+          </div>
+        </Card>
+      </section>
+
+      <section aria-label={text.acceptanceTitle}>
+        <Card padding="lg" className="space-y-4">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-foreground">{text.acceptanceTitle}</h2>
+              <p className="mt-1 max-w-4xl text-sm leading-6 text-secondary-text">{text.acceptanceDescription}</p>
+            </div>
+            <Badge variant="success" size="sm" className="w-fit rounded-lg">
+              {formatCompactNumber(acceptanceItems.length)}
+            </Badge>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">
+            {acceptanceItems.map((item) => (
+              <article key={item.id} className="flex min-h-[210px] flex-col rounded-xl border border-border/70 bg-surface/60 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="break-all font-mono text-xs text-muted-text">{item.id}</p>
+                    <h3 className="mt-1 break-words text-base font-semibold text-foreground">
+                      {item.route ? <Link to={item.route} className="hover:text-cyan hover:underline">{item.title}</Link> : item.title}
+                    </h3>
+                  </div>
+                  <StatusBadge status={normalizeSupportState(item.status)} language={language} />
+                </div>
+                <dl className="mt-4 space-y-3 text-xs leading-5 text-secondary-text">
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.acceptanceEvidenceLabel}</dt>
+                    <dd className="mt-1 break-words">{item.evidence}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-medium text-muted-text">{text.acceptanceNextLabel}</dt>
+                    <dd className="mt-1 break-words">{item.next}</dd>
+                  </div>
+                </dl>
+              </article>
+            ))}
           </div>
         </Card>
       </section>

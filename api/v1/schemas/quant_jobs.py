@@ -49,3 +49,13 @@ class QuantStatusResponse(BaseModel):
     active_count: int
     latest_jobs: Dict[str, QuantJobResponse]
     recent_jobs: List[QuantJobResponse] = Field(default_factory=list)
+    generated_at: Optional[str] = None
+    trainable: bool = False
+    training_readiness: Dict[str, Any] = Field(default_factory=dict)
+    data_sources: List[Dict[str, Any]] = Field(default_factory=list)
+    qlib_provider: Optional[Dict[str, Any]] = None
+    latest_training: Optional[Dict[str, Any]] = None
+    cash_control_backtest: Optional[Dict[str, Any]] = None
+    qlib_predictions: Optional[Dict[str, Any]] = None
+    experiment_notebook: Optional[Dict[str, Any]] = None
+    mlflow: Dict[str, Any] = Field(default_factory=dict)

@@ -17,7 +17,9 @@ def test_env_example_documents_quant_workflow_path_overrides() -> None:
         "WORKING_PROJECTS_ROOT",
         "QUANT_WORKFLOW_ROOT",
         "QUANT_WORKFLOW_REPORTS_ROOT",
+        "QUANT_DATA_ROOT",
         "QLIB_PYTHON",
+        "MLFLOW_URL",
     ):
         assert f"# {key}=" in env_example
 
@@ -29,6 +31,47 @@ def test_changelog_mentions_web_quant_workflow_entry() -> None:
     assert "/workflow" in unreleased
     assert "量化任务中心" in unreleased
     assert "Qlib" in unreleased
+
+
+def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
+    manual_path = ROOT_DIR / "docs" / "local-quant-workbench.md"
+
+    manual = manual_path.read_text(encoding="utf-8")
+
+    for phrase in (
+        "本地统一量化研究与回测工作台",
+        "http://127.0.0.1:8010/",
+        "/workflow",
+        "/research",
+        "/backtest",
+        "quant_workflow",
+        "Qlib",
+        "china-astock-quant",
+        "唯一 Python 虚拟环境",
+        "QUANT_DATA_ROOT",
+        "MLFLOW_URL",
+        "策略优化预演",
+        "Qlib 预测摘要",
+        "qlib_predictions_latest",
+        "实验复现与产物",
+        "pred.pkl",
+        "runtime config",
+        "quant_workflow 脚本覆盖盘点",
+        "add_index_benchmark.py",
+        "generate_csi300.py",
+        "supervise_baostock.py",
+        "provider 维护脚本",
+        "MLflow",
+        "不自动下单",
+        "不读取账号密码",
+        "pytest tests/test_quant_jobs_api.py",
+        "npm run lint",
+        "npm run build",
+        "npm run test:smoke:fake-analysis",
+        "npm run test:smoke:local",
+        "apps/dsa-web/test-results/managed-smoke",
+    ):
+        assert phrase in manual
 
 
 def test_web_package_exposes_local_workbench_smoke_entry() -> None:
@@ -57,6 +100,11 @@ def test_web_package_exposes_fake_analysis_smoke_entry() -> None:
     assert "DSA_E2E_FAKE_ANALYSIS=1" in package_json
     assert "DSA_WEB_SMOKE_BACKEND_PORT" in package_json
     assert "DSA_WEB_SMOKE_MANAGED" in playwright_config
+    assert "DSA_WEB_SMOKE_REPORTS_ROOT" in playwright_config
+    assert "QUANT_WORKFLOW_REPORTS_ROOT" in playwright_config
+    assert "managedWebServerEnv.QUANT_WORKFLOW_REPORTS_ROOT = managedReportsRoot" in playwright_config
+    assert "env: managedWebServerEnv" in playwright_config
+    assert "managed-smoke" in playwright_config
     assert "DSA_WEB_DEV_API_TARGET" in vite_config
     assert "test:smoke:fake-analysis" in unreleased
     assert "嵌套按钮" in unreleased

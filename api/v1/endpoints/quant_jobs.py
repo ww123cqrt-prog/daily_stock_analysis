@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,6 +21,7 @@ from api.v1.schemas.quant_jobs import (
     QuantJobSubmitRequest,
     QuantStatusResponse,
 )
+from api.v1.endpoints.research_status import build_research_status_payload
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
 
 
@@ -27,6 +29,11 @@ router = APIRouter()
 JOB_STREAM_POLL_INTERVAL_SECONDS = 2.0
 JOB_STREAM_MAX_JOB_EVENTS = 300
 TEXT_ARTIFACT_SUFFIXES = {".md", ".txt", ".csv", ".json", ".jsonl", ".log"}
+DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
+
+
+def _mlflow_url() -> str:
+    return os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
 
 
 @lru_cache(maxsize=1)
@@ -61,11 +68,26 @@ async def get_quant_status() -> QuantStatusResponse:
         job_type: _job_response(job)
         for job_type, job in service.get_latest_jobs_by_type().items()
     }
+    research_status = build_research_status_payload()
     return QuantStatusResponse(
         available_job_types=service.available_job_types(),
         active_count=service.active_count(),
         latest_jobs=latest_jobs,
         recent_jobs=[_job_response(job) for job in service.list_jobs(limit=10)],
+        generated_at=research_status.get("generated_at"),
+        trainable=bool(research_status.get("trainable")),
+        training_readiness=research_status.get("training_readiness") or {},
+        data_sources=research_status.get("data_sources") or [],
+        qlib_provider=research_status.get("qlib_provider"),
+        latest_training=research_status.get("latest_training"),
+        cash_control_backtest=research_status.get("cash_control_backtest"),
+        qlib_predictions=research_status.get("qlib_predictions"),
+        experiment_notebook=research_status.get("experiment_notebook"),
+        mlflow={
+            "url": _mlflow_url(),
+            "status": "linked",
+            "role": "experiment_raw_records",
+        },
     )
 
 

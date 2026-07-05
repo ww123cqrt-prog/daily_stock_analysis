@@ -112,6 +112,11 @@ beforeEach(() => {
       status: 'completed',
       experimentName: 'baseline_lgb_alpha158',
       runId: 'abc123',
+      provider: 'cleaned',
+      providerUri: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata_cleaned',
+      sourceConfig: '/Users/cq/WorkingProjects/quant_workflow/configs/baseline_lgb_alpha158.yaml',
+      runtimeConfig: '/Users/cq/WorkingProjects/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml',
+      artifacts: ['pred.pkl', 'portfolio_analysis', 'task'],
       metrics: {
         IC: 0.0123,
         '1day.excess_return_with_cost.annualized_return': 0.0339,
@@ -145,6 +150,22 @@ beforeEach(() => {
         latestCashRatio: 0.80,
         averageCashRatio: 0.45,
       },
+    },
+    qlibPredictions: {
+      generatedAt: '2026-07-05T10:00:00+08:00',
+      mode: 'read_only_qlib_prediction_summary',
+      runId: 'abc123',
+      latestDate: '2026-07-02',
+      topk: 2,
+      top: [
+        { instrument: 'SZ000002', score: 0.25 },
+        { instrument: 'SH600000', score: 0.05 },
+      ],
+      bottom: [
+        { instrument: 'SZ000001', score: -0.4 },
+        { instrument: 'SH600000', score: 0.05 },
+      ],
+      summary: { latestRows: 3 },
     },
     experimentNotebook: {
       status: 'available',
@@ -250,6 +271,23 @@ describe('BacktestPage', () => {
     expect(screen.getByText('最大回撤')).toBeInTheDocument();
     expect(screen.getByText('夏普比率')).toBeInTheDocument();
     expect(screen.getByText('0.95')).toBeInTheDocument();
+    expect(screen.getByText('Qlib 预测摘要')).toBeInTheDocument();
+    expect(screen.getAllByText('2026-07-02').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('SZ000002')).toBeInTheDocument();
+    expect(screen.getByText('SZ000001')).toBeInTheDocument();
+    expect(screen.getByText('0.2500')).toBeInTheDocument();
+    expect(screen.getByText('-0.4000')).toBeInTheDocument();
+    expect(screen.getByText(/只读模型评分摘要/)).toBeInTheDocument();
+    expect(screen.getByText(/不自动下单/)).toBeInTheDocument();
+    expect(screen.getByText('实验复现与产物')).toBeInTheDocument();
+    expect(screen.getByText('数据版本')).toBeInTheDocument();
+    expect(screen.getByText('cleaned')).toBeInTheDocument();
+    expect(screen.getByText('Provider 路径')).toBeInTheDocument();
+    expect(screen.getByText('/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata_cleaned')).toBeInTheDocument();
+    expect(screen.getByText('运行配置')).toBeInTheDocument();
+    expect(screen.getByText('/Users/cq/WorkingProjects/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml')).toBeInTheDocument();
+    expect(screen.getByText('MLflow Run')).toBeInTheDocument();
+    expect(screen.getByText('pred.pkl')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '运行训练任务' })).toHaveAttribute('href', '/workflow');
   });
 
@@ -353,6 +391,8 @@ describe('BacktestPage', () => {
     expect(screen.getByText('Model')).toBeInTheDocument();
     expect(screen.getByText('Strategy')).toBeInTheDocument();
     expect(screen.getByText('Latest training metrics')).toBeInTheDocument();
+    expect(screen.getByText('Qlib prediction summary')).toBeInTheDocument();
+    expect(screen.getByText('Reproducibility and artifacts')).toBeInTheDocument();
     expect(screen.getByText('Recent experiment records')).toBeInTheDocument();
     expect(screen.queryByText('Qlib 模型/策略回测')).not.toBeInTheDocument();
   });

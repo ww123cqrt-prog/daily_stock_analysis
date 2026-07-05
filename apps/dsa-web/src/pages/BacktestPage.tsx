@@ -3,7 +3,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Check, Minus, X } from 'lucide-react';
 import { backtestApi } from '../api/backtest';
-import { researchApi, type ResearchCashControlBacktest, type ResearchExperimentRun, type ResearchStatus } from '../api/research';
+import {
+  researchApi,
+  type ResearchCashControlBacktest,
+  type ResearchExperimentRun,
+  type ResearchQlibPredictions,
+  type ResearchStatus,
+} from '../api/research';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, EmptyState, Pagination, StatusDot, Tooltip } from '../components/common';
@@ -256,6 +262,88 @@ const CashControlBacktestCard: React.FC<{ report?: ResearchCashControlBacktest |
   );
 };
 
+const QlibPredictionCard: React.FC<{ report?: ResearchQlibPredictions | null; text: BacktestText }> = ({ report, text }) => {
+  const copy = text.tabQlib === 'Qlib model/strategy backtest'
+    ? {
+      title: 'Qlib prediction summary',
+      description: 'Read-only model score summary: shows the latest-date highest and lowest ranked instruments for human review, not automated trading.',
+      noReport: 'No Qlib prediction summary yet. Run the prediction summary task from the workflow page first.',
+      latestDate: 'Latest prediction date',
+      rows: 'Latest rows',
+      run: 'Run ID',
+      top: 'Highest scores',
+      bottom: 'Lowest scores',
+    }
+    : {
+      title: 'Qlib 预测摘要',
+      description: '只读模型评分摘要：展示最新交易日最高/最低评分股票，用于人工研究和复核，不自动下单。',
+      noReport: '暂无 Qlib 预测摘要。先在工作流页面运行“生成 Qlib 预测摘要”。',
+      latestDate: '最新预测日',
+      rows: '当日样本数',
+      run: 'Run ID',
+      top: '最高评分',
+      bottom: '最低评分',
+    };
+  const top = (report?.top || []).slice(0, 5);
+  const bottom = (report?.bottom || []).slice(0, 5);
+  const renderRows = (rows: typeof top) => (
+    <div className="mt-2 grid gap-1.5">
+      {rows.length === 0 ? (
+        <p className="text-xs text-muted-text">--</p>
+      ) : rows.map((item) => (
+        <div key={`${item.instrument}-${item.score}`} className="flex items-center justify-between gap-3 rounded-lg border border-subtle bg-surface/35 px-2.5 py-1.5 text-xs">
+          <span className="min-w-0 truncate font-mono text-foreground">{item.instrument}</span>
+          <span className="shrink-0 font-mono text-secondary-text">
+            {typeof item.score === 'number' ? formatQlibMetric(item.score) : '--'}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">{copy.title}</h3>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">{copy.description}</p>
+        </div>
+        {report?.latestDate ? <Badge variant="info">{report.latestDate}</Badge> : null}
+      </div>
+      {!report ? (
+        <p className="mt-3 text-sm text-secondary-text">{copy.noReport}</p>
+      ) : (
+        <>
+          <div className="mt-3 grid gap-2 md:grid-cols-3">
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{copy.latestDate}</p>
+              <p className="mt-1 font-mono text-sm text-foreground">{report.latestDate || '--'}</p>
+            </div>
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{copy.rows}</p>
+              <p className="mt-1 font-mono text-sm text-foreground">{report.summary?.latestRows ?? '--'}</p>
+            </div>
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{copy.run}</p>
+              <p className="mt-1 truncate font-mono text-sm text-foreground">{report.runId || '--'}</p>
+            </div>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div>
+              <p className="text-xs font-medium text-muted-text">{copy.top}</p>
+              {renderRows(top)}
+            </div>
+            <div>
+              <p className="text-xs font-medium text-muted-text">{copy.bottom}</p>
+              {renderRows(bottom)}
+            </div>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+};
+
 // ============ Performance Card ============
 
 const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; language: UiLanguage }> = ({ metrics, title, language }) => {
@@ -358,6 +446,58 @@ const QlibRunCard: React.FC<{ run: ResearchExperimentRun; text: BacktestText }> 
   );
 };
 
+const QlibArtifactsCard: React.FC<{ status: ResearchStatus | null; text: BacktestText }> = ({ status, text }) => {
+  const latestTraining = status?.latestTraining;
+  const artifacts = (latestTraining?.artifacts || [])
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .slice(0, 12);
+  const candidateRows: Array<{ label: string; value?: string | null }> = [
+    { label: text.qlibArtifactProvider, value: latestTraining?.provider },
+    {
+      label: text.qlibArtifactProviderPath,
+      value: latestTraining?.providerUri || latestTraining?.qlibProvider || status?.qlibProvider?.path,
+    },
+    { label: text.qlibArtifactSourceConfig, value: latestTraining?.sourceConfig },
+    { label: text.qlibArtifactRuntimeConfig, value: latestTraining?.runtimeConfig },
+    { label: text.qlibArtifactMlflowRun, value: latestTraining?.runId },
+  ];
+  const rows = candidateRows.filter((row): row is { label: string; value: string } => Boolean(row.value));
+  const hasDetails = rows.length > 0 || artifacts.length > 0;
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-semibold text-foreground">{text.qlibArtifactsTitle}</h3>
+        <p className="max-w-3xl text-sm leading-6 text-secondary-text">{text.qlibArtifactsDescription}</p>
+      </div>
+      {!hasDetails ? (
+        <p className="mt-3 text-sm text-secondary-text">{text.qlibArtifactNoData}</p>
+      ) : (
+        <div className="mt-3 grid gap-3">
+          {rows.map((row) => (
+            <div key={row.label} className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{row.label}</p>
+              <p className="mt-1 break-all font-mono text-xs leading-5 text-foreground">{row.value}</p>
+            </div>
+          ))}
+          {artifacts.length ? (
+            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+              <p className="text-xs text-muted-text">{text.qlibArtifactFiles}</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {artifacts.map((artifact) => (
+                  <Badge key={artifact} variant="history" size="sm" className="rounded-lg font-mono">
+                    {artifact}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </Card>
+  );
+};
+
 const QlibBacktestPanel: React.FC<{
   status: ResearchStatus | null;
   loading: boolean;
@@ -366,6 +506,7 @@ const QlibBacktestPanel: React.FC<{
 }> = ({ status, loading, error, text }) => {
   const latestTraining = status?.latestTraining;
   const cashControlBacktest = status?.cashControlBacktest;
+  const qlibPredictions = status?.qlibPredictions;
   const runs = status?.experimentNotebook?.runs || [];
   const metrics = Object.entries(latestTraining?.metrics || {}).slice(0, 8);
 
@@ -452,6 +593,10 @@ const QlibBacktestPanel: React.FC<{
               </div>
             )}
           </Card>
+
+          <QlibPredictionCard report={qlibPredictions} text={text} />
+
+          <QlibArtifactsCard status={status} text={text} />
 
           <CashControlBacktestCard report={cashControlBacktest} text={text} />
         </section>

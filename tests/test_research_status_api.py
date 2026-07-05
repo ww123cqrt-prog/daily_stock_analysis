@@ -103,6 +103,33 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertIn("长历史 baseline 已跑通", body["experiment_notebook"]["latest_note"])
         self.assertEqual(body["experiment_notebook"]["runs"][0]["run_id"], "abc123")
         self.assertEqual(body["experiment_notebook"]["runs"][0]["dataset_range"], "2020-01-02 ~ 2026-07-01")
+        matrix_by_id = {item["id"]: item for item in body["capability_matrix"]}
+        self.assertEqual(matrix_by_id["dsa_web_core"]["status"], "available")
+        self.assertEqual(matrix_by_id["quant_workflow_pipeline"]["route"], "/workflow")
+        self.assertEqual(matrix_by_id["qlib_integration"]["route"], "/backtest")
+        self.assertEqual(matrix_by_id["china_astock_quant_reuse"]["status"], "partial")
+        self.assertEqual(matrix_by_id["external_tools_tonghuashun"]["status"], "read_only")
+        self.assertEqual(matrix_by_id["trading_execution"]["status"], "not_planned")
+        self.assertIn("不自动下单", matrix_by_id["trading_execution"]["restrictions"])
+        self.assertIn("不读取券商密码", matrix_by_id["trading_execution"]["restrictions"])
+        inventory_by_id = {item["id"]: item for item in body["function_inventory"]}
+        self.assertEqual(inventory_by_id["qlib_data_pipeline"]["route"], "/workflow")
+        self.assertEqual(inventory_by_id["china_astock_reference"]["status"], "partial")
+        self.assertEqual(inventory_by_id["quant_workflow_script_coverage"]["route"], "/research")
+        self.assertIn("add_index_benchmark.py", inventory_by_id["quant_workflow_script_coverage"]["coverage"])
+        self.assertIn("generate_csi300.py", inventory_by_id["quant_workflow_script_coverage"]["coverage"])
+        self.assertIn("supervise_baostock.py", inventory_by_id["quant_workflow_script_coverage"]["gaps"])
+        reuse_by_id = {item["id"]: item for item in body["china_astock_reuse"]}
+        self.assertEqual(reuse_by_id["indicators"]["priority"], "P1")
+        self.assertEqual(reuse_by_id["paper_trading"]["status"], "not_planned")
+        self.assertIn("不自动下单", reuse_by_id["paper_trading"]["restrictions"])
+        acceptance_by_id = {item["id"]: item for item in body["acceptance_checklist"]}
+        self.assertEqual(acceptance_by_id["project_hygiene"]["status"], "partial")
+        self.assertIn("无散落未跟踪源码", acceptance_by_id["project_hygiene"]["evidence"])
+        self.assertEqual(acceptance_by_id["qlib_web_flow"]["route"], "/workflow")
+        self.assertIn("MLflow", acceptance_by_id["qlib_web_flow"]["evidence"])
+        self.assertEqual(acceptance_by_id["opencode_review"]["status"], "verified")
+        self.assertIn("opencode", acceptance_by_id["opencode_review"]["evidence"])
 
     def test_status_prefers_latest_training_result_over_stale_status_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -194,6 +221,50 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["cash_control_backtest"]["signal_summary"]["latest_regime"], "risk_off")
         self.assertEqual(body["cash_control_backtest"]["comparison"]["cash_control"]["max_drawdown"], -0.12)
 
+    def test_status_includes_latest_qlib_prediction_summary_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            static_dir = Path(temp_dir) / "static"
+            static_dir.mkdir()
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            predictions_path = Path(temp_dir) / "qlib_predictions_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-02T10:00:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {"status": "trainable", "summary": "ready"},
+                        "data_sources": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            predictions_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-05T10:00:00+08:00",
+                        "mode": "read_only_qlib_prediction_summary",
+                        "run_id": "run_1",
+                        "latest_date": "2026-07-02",
+                        "top": [{"instrument": "SZ000002", "score": 0.25}],
+                        "bottom": [{"instrument": "SZ000001", "score": -0.40}],
+                        "summary": {"latest_rows": 3},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path):
+                client = TestClient(create_app(static_dir=static_dir))
+                resp = client.get("/api/v1/research/status")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["qlib_predictions"]["mode"], "read_only_qlib_prediction_summary")
+        self.assertEqual(body["qlib_predictions"]["latest_date"], "2026-07-02")
+        self.assertEqual(body["qlib_predictions"]["top"][0]["instrument"], "SZ000002")
+        self.assertEqual(body["qlib_predictions"]["bottom"][0]["score"], -0.40)
+
     def test_status_returns_missing_payload_when_artifact_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             static_dir = Path(temp_dir) / "static"
@@ -211,6 +282,25 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["data_sources"], [])
         self.assertEqual(body["experiment_notebook"]["status"], "missing")
         self.assertEqual(body["experiment_notebook"]["runs"], [])
+        self.assertIsNone(body["qlib_predictions"])
+        self.assertIn("capability_matrix", body)
+        self.assertIn("function_inventory", body)
+        self.assertIn("china_astock_reuse", body)
+        self.assertIn("acceptance_checklist", body)
+        self.assertEqual(
+            {item["id"] for item in body["capability_matrix"]},
+            {
+                "dsa_web_core",
+                "quant_workflow_pipeline",
+                "qlib_integration",
+                "china_astock_quant_reuse",
+                "external_tools_tonghuashun",
+                "trading_execution",
+            },
+        )
+        self.assertIn("quant_workflow_jobs", {item["id"] for item in body["function_inventory"]})
+        self.assertIn("event_backtest", {item["id"] for item in body["china_astock_reuse"]})
+        self.assertIn("self_service_docs", {item["id"] for item in body["acceptance_checklist"]})
 
     def test_status_includes_read_only_tonghuashun_detection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -247,6 +337,29 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(tonghuashun["path"], str(app_path))
         self.assertIn("不自动下单", tonghuashun["restrictions"])
         self.assertEqual(body["external_tools"]["iphone_mirroring"]["status"], "deferred")
+        matrix_by_id = {item["id"]: item for item in body["capability_matrix"]}
+        self.assertEqual(matrix_by_id["external_tools_tonghuashun"]["status"], "read_only")
+        self.assertIn("本机应用存在检测", matrix_by_id["external_tools_tonghuashun"]["browser"])
+        self.assertIn("不连接券商交易接口", matrix_by_id["external_tools_tonghuashun"]["restrictions"])
+
+    def test_capability_matrix_ignores_non_string_external_tool_restrictions(self) -> None:
+        from api.v1.endpoints.research_status import _capability_matrix_payload
+
+        matrix = _capability_matrix_payload(
+            {
+                "tonghuashun": {
+                    "status": "available",
+                    "installed": True,
+                    "summary": "detected",
+                    "capabilities": ["本机应用存在检测", {"unexpected": "object"}],
+                    "restrictions": ["不自动下单", {"unexpected": "object"}, ""],
+                }
+            }
+        )
+
+        tonghuashun = {item["id"]: item for item in matrix}["external_tools_tonghuashun"]
+        self.assertEqual(tonghuashun["browser"], "detected 能力：本机应用存在检测")
+        self.assertEqual(tonghuashun["restrictions"], ["不自动下单"])
 
     def test_archive_experiment_run_rewrites_active_log_and_archives_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
