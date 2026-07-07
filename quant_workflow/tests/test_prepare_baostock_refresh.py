@@ -1,6 +1,9 @@
 import importlib.util
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -34,6 +37,37 @@ class PrepareBaostockRefreshTest(unittest.TestCase):
         selected = module.select_refresh_symbols(summary, pd.Timestamp("2026-07-03"))
 
         self.assertEqual(list(selected["symbol"]), ["000003", "600519", "000001"])
+
+    def test_writes_empty_plan_when_anomaly_report_is_missing(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "reports"
+            missing = Path(tmp) / "missing_anomaly_stocks.csv"
+            argv = [
+                "prepare_baostock_refresh.py",
+                "--anomaly-stocks",
+                str(missing),
+                "--out-dir",
+                str(out_dir),
+                "--target-end",
+                "2026-07-03",
+                "--limit",
+                "3",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(module.main(), 0)
+
+            plan = out_dir / "baostock_refresh_plan_latest.md"
+            symbols = out_dir / "baostock_refresh_symbols_latest.csv"
+
+            self.assertTrue(plan.exists())
+            self.assertTrue(symbols.exists())
+            text = plan.read_text(encoding="utf-8")
+            self.assertIn("Baostock Refresh Plan", text)
+            self.assertIn("Symbols to refresh: 0", text)
+            self.assertIn("Run `report_data_anomalies.py` first", text)
 
 
 if __name__ == "__main__":

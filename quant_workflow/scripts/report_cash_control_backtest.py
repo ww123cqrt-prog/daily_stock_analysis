@@ -208,13 +208,25 @@ def build_rolling_market_signals(
     lookback_days: int = 60,
     min_symbols: int = 100,
 ) -> pd.DataFrame:
+    signal_dates = pd.DatetimeIndex(signal_dates).sort_values()
     if close_matrix.empty:
-        raise ValueError("Market close matrix is empty.")
+        signals = [
+            _neutral_signal(pd.Timestamp(raw_date), "Insufficient prior market data; default to neutral cash control.")
+            for raw_date in signal_dates
+        ]
+        signal_frame = pd.DataFrame(signals)
+        if signal_frame.empty:
+            empty = pd.DataFrame(columns=["regime", "cash_ratio", "position_ratio"])
+            empty.index = pd.DatetimeIndex([], name="datetime")
+            return empty
+        signal_frame.index = pd.to_datetime(signal_frame.pop("date"))
+        signal_frame.index.name = "datetime"
+        return signal_frame
 
     signals: list[dict[str, Any]] = []
     lookback_rows = max(lookback_days + 1, 2)
     min_history_rows = max(2, min(20, lookback_days // 2))
-    for raw_date in pd.DatetimeIndex(signal_dates).sort_values():
+    for raw_date in signal_dates:
         date = pd.Timestamp(raw_date)
         history = close_matrix.loc[close_matrix.index < date].tail(lookback_rows)
         history = history.dropna(axis=1, thresh=min_history_rows)
@@ -325,14 +337,16 @@ def compare_returns(
 
 def summarize_signals(signals: pd.DataFrame) -> dict[str, Any]:
     regime_counts = signals["regime"].value_counts().sort_index().to_dict() if "regime" in signals else {}
+    cash_ratio = pd.to_numeric(signals["cash_ratio"], errors="coerce") if "cash_ratio" in signals else pd.Series(dtype="float64")
+    position_ratio = pd.to_numeric(signals["position_ratio"], errors="coerce") if "position_ratio" in signals else pd.Series(dtype="float64")
     return {
         "days": int(len(signals)),
         "regime_counts": {str(key): int(value) for key, value in regime_counts.items()},
-        "average_cash_ratio": _safe_float(pd.to_numeric(signals["cash_ratio"], errors="coerce").mean()),
-        "average_position_ratio": _safe_float(pd.to_numeric(signals["position_ratio"], errors="coerce").mean()),
-        "latest_regime": str(signals["regime"].iloc[-1]) if len(signals) else None,
-        "latest_cash_ratio": _safe_float(signals["cash_ratio"].iloc[-1]) if len(signals) else None,
-        "latest_position_ratio": _safe_float(signals["position_ratio"].iloc[-1]) if len(signals) else None,
+        "average_cash_ratio": _safe_float(cash_ratio.mean()),
+        "average_position_ratio": _safe_float(position_ratio.mean()),
+        "latest_regime": str(signals["regime"].iloc[-1]) if len(signals) and "regime" in signals else None,
+        "latest_cash_ratio": _safe_float(cash_ratio.iloc[-1]) if len(cash_ratio) else None,
+        "latest_position_ratio": _safe_float(position_ratio.iloc[-1]) if len(position_ratio) else None,
     }
 
 
@@ -393,15 +407,24 @@ def generate_report(
     limit: int = 0,
     return_column: str = "return",
     trading_days_per_year: int = DEFAULT_TRADING_DAYS_PER_YEAR,
+    preflight_unavailable_reason: str = "",
 ) -> dict[str, Any]:
-    returns = load_portfolio_returns(portfolio_report_path, return_column=return_column)
-    close_matrix = load_close_matrix(market_data_dir, limit=limit)
-    signals = build_rolling_market_signals(
-        close_matrix,
-        signal_dates=pd.DatetimeIndex(returns.index),
-        lookback_days=lookback_days,
-        min_symbols=min_symbols,
-    )
+    unavailable_reason = preflight_unavailable_reason
+    try:
+        returns = load_portfolio_returns(portfolio_report_path, return_column=return_column)
+    except (FileNotFoundError, ValueError) as exc:
+        unavailable_reason = unavailable_reason or str(exc)
+        returns = pd.Series(dtype="float64", index=pd.DatetimeIndex([], name="datetime"), name=return_column)
+        signals = pd.DataFrame(columns=["regime", "cash_ratio", "position_ratio"])
+        signals.index = pd.DatetimeIndex([], name="datetime")
+    else:
+        close_matrix = load_close_matrix(market_data_dir, limit=limit)
+        signals = build_rolling_market_signals(
+            close_matrix,
+            signal_dates=pd.DatetimeIndex(returns.index),
+            lookback_days=lookback_days,
+            min_symbols=min_symbols,
+        )
     overlay = apply_cash_control_overlay(returns, signals)
     comparison = compare_returns(returns, overlay, trading_days_per_year=trading_days_per_year)
 
@@ -424,6 +447,7 @@ def generate_report(
         "trading_days_per_year": int(trading_days_per_year),
         "comparison": comparison,
         "signal_summary": summarize_signals(signals),
+        "unavailable_reason": unavailable_reason,
         "sample_signals": signals.tail(10).reset_index().assign(datetime=lambda frame: frame["datetime"].dt.strftime("%Y-%m-%d")).to_dict(orient="records"),
         "artifacts": {
             "json": str(json_path),
@@ -454,7 +478,12 @@ def main() -> int:
     parser.add_argument("--trading-days-per-year", type=int, default=DEFAULT_TRADING_DAYS_PER_YEAR)
     args = parser.parse_args()
 
-    portfolio_report = args.portfolio_report or find_portfolio_report_path(run_id=args.run_id)
+    preflight_unavailable_reason = ""
+    try:
+        portfolio_report = args.portfolio_report or find_portfolio_report_path(run_id=args.run_id)
+    except FileNotFoundError as exc:
+        preflight_unavailable_reason = str(exc)
+        portfolio_report = args.out_dir / "missing_report_normal_1day.pkl"
     payload = generate_report(
         portfolio_report_path=portfolio_report,
         market_data_dir=args.market_data_dir,
@@ -464,6 +493,7 @@ def main() -> int:
         limit=args.limit,
         return_column=args.return_column,
         trading_days_per_year=args.trading_days_per_year,
+        preflight_unavailable_reason=preflight_unavailable_reason,
     )
     baseline = payload["comparison"]["baseline"]
     cash_control = payload["comparison"]["cash_control"]

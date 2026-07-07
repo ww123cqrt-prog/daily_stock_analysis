@@ -146,6 +146,14 @@ def main() -> int:
 
     provider = args.provider
     if not provider.exists():
+        if args.dry_run:
+            print(f"DRY RUN: provider not found: {provider}")
+            print("Feature directory renames: 0")
+            print("all.txt: 0 metadata changes")
+            print("csi300.txt: 0 metadata changes")
+            print("csi300.txt: 0 non-all removals")
+            print("Orphan feature directories removed: 0")
+            return 0
         print(f"ERROR: provider not found: {provider}")
         return 1
 

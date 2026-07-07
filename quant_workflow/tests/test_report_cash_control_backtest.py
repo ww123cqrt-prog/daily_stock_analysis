@@ -171,6 +171,29 @@ class ReportCashControlBacktestTest(unittest.TestCase):
         self.assertIn("read-only", markdown)
         self.assertIn("不连接券商", markdown)
 
+    def test_generates_empty_latest_report_when_portfolio_report_is_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_dir = root / "reports"
+
+            payload = module.generate_report(
+                portfolio_report_path=root / "missing_report_normal_1day.pkl",
+                market_data_dir=root / "market",
+                out_dir=out_dir,
+                lookback_days=20,
+                min_symbols=2,
+            )
+
+            latest_md = out_dir / "cash_control_backtest_latest.md"
+            markdown = latest_md.read_text(encoding="utf-8")
+
+        self.assertEqual(payload["mode"], "read_only_cash_control_overlay")
+        self.assertEqual(payload["comparison"]["baseline"]["days"], 0)
+        self.assertIn("missing_report_normal_1day.pkl", payload["unavailable_reason"])
+        self.assertIn("Cash-Control Backtest", markdown)
+        self.assertIn("read-only research report", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

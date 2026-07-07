@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -99,6 +100,44 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertEqual(isolated_payload["data_sources"][0]["name"], "merged")
         self.assertEqual(isolated_payload["latest_training"]["run_id"], "isolated-run")
         self.assertEqual(official_payload, {"generated_at": "original"})
+
+    def test_main_writes_empty_report_when_stock_list_and_data_are_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_dir = root / "reports"
+            module.STOCK_LIST = root / "missing_stock_lists.json"
+            module.EMPTY_CODES = root / "missing_empty_codes.json"
+            module.TIMEOUT_CODES = root / "missing_timeout_codes.json"
+            module.BAOSTOCK_DIR = root / "baostock"
+            module.JQDATA_DIR = root / "jqdata"
+            module.AKSHARE_DIR = root / "akshare"
+            module.AKSHARE_SAMPLE_DIR = root / "akshare_sample"
+            module.MERGED_DIR = root / "merged"
+            module.QLIB_DIR = root / "qlib"
+            argv = [
+                "report_data_quality.py",
+                "--out-dir",
+                str(out_dir),
+                "--overlap-sample",
+                "5",
+                "--merged-sample",
+                "5",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(module.main(), 0)
+
+            report = out_dir / "data_quality_report_latest.md"
+            status = out_dir / "research_status_latest.json"
+
+            self.assertTrue(report.exists())
+            self.assertTrue(status.exists())
+            text = report.read_text(encoding="utf-8")
+
+        self.assertIn("A-Share Data Quality Report", text)
+        self.assertIn("Qlib Provider", text)
+        self.assertIn("Stock universe: 0", text)
 
 
 if __name__ == "__main__":

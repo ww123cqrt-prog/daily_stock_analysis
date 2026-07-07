@@ -38,6 +38,7 @@ const BACKTEST_INPUT_CLASS =
 const BACKTEST_COMPACT_INPUT_CLASS =
   'input-surface input-focus-glow h-10 rounded-xl border bg-transparent px-3 py-2 text-xs transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const DEFAULT_MLFLOW_URL = 'http://127.0.0.1:6006/';
+const EXPECTED_QLIB_ARTIFACTS = ['pred.pkl', 'portfolio_analysis', 'task'];
 type BacktestText = (typeof BACKTEST_TEXT)[UiLanguage];
 type BacktestTab = 'dsa' | 'qlib';
 
@@ -452,6 +453,8 @@ const QlibArtifactsCard: React.FC<{ status: ResearchStatus | null; text: Backtes
   const artifacts = (latestTraining?.artifacts || [])
     .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     .slice(0, 12);
+  const visibleArtifacts = artifacts.length > 0 ? artifacts : EXPECTED_QLIB_ARTIFACTS;
+  const artifactLabel = text.qlibArtifactFiles;
   const candidateRows: Array<{ label: string; value?: string | null }> = [
     { label: text.qlibArtifactProvider, value: latestTraining?.provider },
     {
@@ -473,28 +476,29 @@ const QlibArtifactsCard: React.FC<{ status: ResearchStatus | null; text: Backtes
       </div>
       {!hasDetails ? (
         <p className="mt-3 text-sm text-secondary-text">{text.qlibArtifactNoData}</p>
-      ) : (
-        <div className="mt-3 grid gap-3">
+      ) : null}
+      <div className="mt-3 grid gap-3">
+        {hasDetails ? (
+          <>
           {rows.map((row) => (
             <div key={row.label} className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
               <p className="text-xs text-muted-text">{row.label}</p>
               <p className="mt-1 break-all font-mono text-xs leading-5 text-foreground">{row.value}</p>
             </div>
           ))}
-          {artifacts.length ? (
-            <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
-              <p className="text-xs text-muted-text">{text.qlibArtifactFiles}</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {artifacts.map((artifact) => (
-                  <Badge key={artifact} variant="history" size="sm" className="rounded-lg font-mono">
-                    {artifact}
-                  </Badge>
-                ))}
-              </div>
-            </div>
-          ) : null}
+          </>
+        ) : null}
+        <div className="rounded-xl border border-subtle bg-surface/35 px-3 py-2">
+          <p className="text-xs text-muted-text">{artifactLabel}</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {visibleArtifacts.map((artifact) => (
+              <Badge key={artifact} variant={artifacts.length > 0 ? 'history' : 'default'} size="sm" className="rounded-lg font-mono">
+                {artifact}
+              </Badge>
+            ))}
+          </div>
         </div>
-      )}
+      </div>
     </Card>
   );
 };

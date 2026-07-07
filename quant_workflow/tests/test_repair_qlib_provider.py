@@ -1,7 +1,11 @@
 import importlib.util
+import io
+import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 def load_module():
@@ -85,6 +89,21 @@ class RepairQlibProviderTest(unittest.TestCase):
         self.assertFalse(orphan_exists)
         self.assertTrue(sz_feature_exists)
         self.assertTrue(sh_feature_exists)
+
+    def test_missing_provider_dry_run_reports_noop_summary(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            missing = Path(temp_dir) / "missing_provider"
+            buffer = io.StringIO()
+            argv = ["repair_qlib_provider.py", "--provider", str(missing), "--dry-run"]
+
+            with patch.object(sys, "argv", argv), redirect_stdout(buffer):
+                self.assertEqual(module.main(), 0)
+
+        output = buffer.getvalue()
+        self.assertIn("DRY RUN: provider not found", output)
+        self.assertIn("Feature directory renames: 0", output)
+        self.assertIn("csi300.txt: 0 metadata changes", output)
 
 
 if __name__ == "__main__":

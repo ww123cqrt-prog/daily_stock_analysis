@@ -98,9 +98,21 @@ def write_csi300(
     *,
     dry_run: bool = False,
 ) -> dict[str, str | int]:
-    symbols = load_csi300_symbols(stock_list_path, astock_project, allow_network_fallback=not dry_run)
+    try:
+        symbols = load_csi300_symbols(stock_list_path, astock_project, allow_network_fallback=not dry_run)
+    except ValueError as exc:
+        if not dry_run:
+            raise
+        print(f"DRY RUN: {exc}")
+        symbols = []
     print(f"Found {len(symbols)} CSI300 constituents")
-    start_date, end_date = read_calendar_range(calendar_path)
+    try:
+        start_date, end_date = read_calendar_range(calendar_path)
+    except (FileNotFoundError, ValueError) as exc:
+        if not dry_run:
+            raise
+        print(f"DRY RUN: Qlib calendar unavailable: {exc}")
+        start_date, end_date = "", ""
 
     lines = build_instrument_lines(symbols, start_date, end_date)
     qlib_symbols = [line.split("\t", 1)[0] for line in lines]

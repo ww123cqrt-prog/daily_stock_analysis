@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -56,7 +58,7 @@ class GenerateCsi300Test(unittest.TestCase):
         self.assertEqual(status["symbols"], 2)
         self.assertFalse(output.exists())
 
-    def test_dry_run_requires_cached_stock_list_without_network_fallback(self):
+    def test_dry_run_without_cached_stock_list_returns_empty_plan_without_network_fallback(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -71,12 +73,15 @@ class GenerateCsi300Test(unittest.TestCase):
                 AssertionError("network fallback must not be used during dry-run")
             )
             try:
-                with self.assertRaises(ValueError) as ctx:
-                    module.write_csi300(output, calendar, stock_list, root / "astock", dry_run=True)
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    status = module.write_csi300(output, calendar, stock_list, root / "astock", dry_run=True)
             finally:
                 module._load_csi300_from_project = original
 
-        self.assertIn("cached CSI300", str(ctx.exception))
+        self.assertEqual(status["status"], "dry-run")
+        self.assertEqual(status["symbols"], 0)
+        self.assertIn("cached CSI300", buffer.getvalue())
         self.assertFalse(output.exists())
 
     def test_write_csi300_creates_instrument_file(self):

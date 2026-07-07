@@ -61,6 +61,17 @@ def read_json_list(path: Path) -> list[str]:
     return data if isinstance(data, list) else []
 
 
+def read_stock_universe(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    raw_codes = data.get("all", []) if isinstance(data, dict) else []
+    return [str(code).split(".")[0] for code in raw_codes if str(code).strip()]
+
+
 def file_size_mb(path: Path) -> float:
     if path.is_file():
         return path.stat().st_size / 1024 / 1024
@@ -378,7 +389,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    stock_codes = [c.split(".")[0] for c in json.loads(STOCK_LIST.read_text(encoding="utf-8"))["all"]]
+    stock_codes = read_stock_universe(STOCK_LIST)
     stock_set = set(stock_codes)
     empty_codes = set(read_json_list(EMPTY_CODES))
     timeout_codes = set(read_json_list(TIMEOUT_CODES))

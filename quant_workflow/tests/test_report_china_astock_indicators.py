@@ -157,6 +157,32 @@ class ReportChinaAstockIndicatorsTest(unittest.TestCase):
 
         self.assertEqual(status["limit"], 50)
 
+    def test_missing_default_input_dir_writes_unavailable_rows_for_requested_symbols(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            china_root = base / "china-astock-quant"
+            write_indicator_fixture(china_root)
+
+            status = module.run_report(
+                input_dir=base / "missing-input",
+                output_dir=base / "reports",
+                china_astock_root=china_root,
+                timestamp="20260706_030405",
+                symbols="000001,600519",
+                lookback_days=60,
+                limit=2,
+            )
+
+            latest_md = base / "reports" / "china_astock_indicator_report_latest.md"
+            markdown = latest_md.read_text(encoding="utf-8")
+
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual([row["symbol"] for row in status["rows"]], ["000001", "600519"])
+        self.assertIn("data_unavailable", status["rows"][0]["tags"])
+        self.assertIn("000001", markdown)
+        self.assertIn("只读研究报告", markdown)
+
     def test_rejects_limit_above_browser_safe_bound(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

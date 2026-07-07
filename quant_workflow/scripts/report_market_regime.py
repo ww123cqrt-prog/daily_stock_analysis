@@ -120,7 +120,32 @@ def analyze_market_regime(data_dir: Path, lookback_days: int = 252, min_symbols:
     matrix = load_close_matrix(data_dir, lookback_days=lookback_days, limit=limit)
     matrix = matrix.dropna(axis=1, thresh=max(2, min(len(matrix), lookback_days // 2)))
     if matrix.shape[1] < min_symbols:
-        raise ValueError(f"Need at least {min_symbols} symbols with close data, got {matrix.shape[1]}.")
+        start_date = str(matrix.index.min().date()) if not matrix.empty else ""
+        end_date = str(matrix.index.max().date()) if not matrix.empty else ""
+        return {
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "regime": "insufficient_data",
+            "cash_ratio": 0.80,
+            "position_ratio": 0.20,
+            "interpretation": (
+                f"Need at least {min_symbols} symbols with close data, got {matrix.shape[1]}; "
+                "use a defensive cash setting until local data is prepared."
+            ),
+            "metrics": {
+                "symbols": int(matrix.shape[1]),
+                "calendar_days": int(len(matrix)),
+                "start_date": start_date,
+                "end_date": end_date,
+                "return_20d": None,
+                "return_60d": None,
+                "breadth_20d": None,
+                "breadth_60d": None,
+                "drawdown": None,
+                "volatility_20d": None,
+            },
+            "source_dir": str(data_dir),
+            "mode": "read_only_research_report",
+        }
 
     market_index = matrix.pct_change(fill_method=None).mean(axis=1, skipna=True).fillna(0).add(1).cumprod()
     daily_returns = market_index.pct_change(fill_method=None).dropna()

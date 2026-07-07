@@ -209,9 +209,28 @@ def generate_report(
     run_id: str = "",
     experiment_name: str = "",
     topk: int = DEFAULT_TOPK,
+    preflight_unavailable_reason: str = "",
 ) -> dict[str, Any]:
-    scores = load_prediction_scores(prediction_path)
-    summary = summarize_latest_predictions(scores, topk=topk)
+    unavailable_reason = preflight_unavailable_reason
+    try:
+        scores = load_prediction_scores(prediction_path)
+        summary = summarize_latest_predictions(scores, topk=topk)
+    except (FileNotFoundError, ValueError) as exc:
+        unavailable_reason = unavailable_reason or str(exc)
+        summary = {
+            "latest_date": "n/a",
+            "score_column": "score",
+            "top": [],
+            "bottom": [],
+            "summary": {
+                "rows": 0,
+                "latest_rows": 0,
+                "date_count": 0,
+                "score_min": None,
+                "score_max": None,
+                "score_mean": None,
+            },
+        }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -227,6 +246,7 @@ def generate_report(
         "experiment_name": str(experiment_name or ""),
         "prediction_path": str(prediction_path),
         "topk": int(topk),
+        "unavailable_reason": unavailable_reason,
         "artifacts": {
             "json": str(json_path),
             "markdown": str(md_path),
@@ -257,17 +277,23 @@ def main() -> int:
     latest_training = _read_json_object(args.latest_training) or {}
     run_id = _safe_run_id(args.run_id or latest_training.get("run_id"))
     experiment_name = str(latest_training.get("experiment_name") or "")
-    prediction_path = args.prediction_path or find_prediction_path(
-        latest_training_path=args.latest_training,
-        mlruns_dir=args.mlruns_dir,
-        run_id=run_id,
-    )
+    preflight_unavailable_reason = ""
+    try:
+        prediction_path = args.prediction_path or find_prediction_path(
+            latest_training_path=args.latest_training,
+            mlruns_dir=args.mlruns_dir,
+            run_id=run_id,
+        )
+    except FileNotFoundError as exc:
+        preflight_unavailable_reason = str(exc)
+        prediction_path = args.out_dir / "missing_pred.pkl"
     payload = generate_report(
         prediction_path=prediction_path,
         out_dir=args.out_dir,
         run_id=run_id,
         experiment_name=experiment_name,
         topk=args.topk,
+        preflight_unavailable_reason=preflight_unavailable_reason,
     )
     print(f"Latest prediction date: {payload['latest_date']}")
     print(f"Latest markdown: {payload['artifacts']['latest_markdown']}")

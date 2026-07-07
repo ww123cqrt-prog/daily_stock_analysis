@@ -202,6 +202,28 @@ def _build_rows(df: pd.DataFrame, indicator_module: Any, lookback_days: int) -> 
     return rows
 
 
+def _build_unavailable_rows(symbols: list[str], reason: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "symbol": symbol,
+            "last_date": "",
+            "rows_used": 0,
+            "close": None,
+            "sma20": None,
+            "ema20": None,
+            "rsi14": None,
+            "atr14": None,
+            "bollinger_lower": None,
+            "bollinger_mid": None,
+            "bollinger_upper": None,
+            "bollinger_position": None,
+            "volume": None,
+            "tags": f"data_unavailable:{reason}",
+        }
+        for symbol in symbols
+    ]
+
+
 def _write_markdown(path: Path, payload: dict[str, Any]) -> None:
     lines = [
         "# china-astock 技术指标报告",
@@ -248,9 +270,26 @@ def run_report(
     parsed_symbols = _parse_symbols(symbols)
     parsed_lookback = _as_int(lookback_days, default=120, minimum=20)
     parsed_limit = _as_int(limit, default=DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
-    indicators, project_root = _load_indicator_module(china_astock_root)
-    prices = _read_prices(input_csv=input_csv, input_dir=input_dir, symbols=parsed_symbols, limit=parsed_limit)
-    rows = _build_rows(prices, indicators, parsed_lookback)
+    unavailable_reason = ""
+    try:
+        indicators, project_root = _load_indicator_module(china_astock_root)
+    except FileNotFoundError as exc:
+        indicators = None
+        project_root = Path(china_astock_root).expanduser().resolve() if china_astock_root else default_china_astock_root().expanduser().resolve()
+        unavailable_reason = str(exc)
+    try:
+        prices = _read_prices(input_csv=input_csv, input_dir=input_dir, symbols=parsed_symbols, limit=parsed_limit)
+    except (FileNotFoundError, ValueError) as exc:
+        if input_csv:
+            raise
+        unavailable_reason = unavailable_reason or str(exc)
+        rows = _build_unavailable_rows(parsed_symbols, unavailable_reason)
+    else:
+        if indicators is None:
+            symbols_from_data = sorted(prices["symbol"].astype(str).str.upper().unique())
+            rows = _build_unavailable_rows(parsed_symbols or symbols_from_data[:parsed_limit], unavailable_reason)
+        else:
+            rows = _build_rows(prices, indicators, parsed_lookback)
 
     source = str(Path(input_csv).expanduser().resolve()) if input_csv else str(Path(input_dir or DEFAULT_INPUT_DIR).expanduser().resolve())
     payload = {
@@ -263,6 +302,7 @@ def run_report(
         "lookback_days": parsed_lookback,
         "limit": parsed_limit,
         "symbols_requested": parsed_symbols,
+        "unavailable_reason": unavailable_reason,
         "rows": rows,
     }
 

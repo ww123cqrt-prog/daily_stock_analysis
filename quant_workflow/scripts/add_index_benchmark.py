@@ -86,8 +86,17 @@ def add_benchmark(
     baostock_module=None,
 ) -> dict[str, str | int]:
     paths = BenchmarkPaths(provider_dir)
-    calendar = _read_calendar(paths.calendar_file)
-    print(f"Calendar: {len(calendar)} trading days ({calendar[0]} ~ {calendar[-1]})")
+    try:
+        calendar = _read_calendar(paths.calendar_file)
+    except (FileNotFoundError, ValueError) as exc:
+        if not dry_run:
+            raise
+        calendar = []
+        print(f"DRY RUN: Qlib calendar unavailable: {exc}")
+    if calendar:
+        print(f"Calendar: {len(calendar)} trading days ({calendar[0]} ~ {calendar[-1]})")
+    else:
+        print("Calendar: 0 trading days (unavailable)")
     print(f"Provider: {paths.provider_dir}")
     print(f"Benchmark feature dir: {paths.feature_dir}")
 

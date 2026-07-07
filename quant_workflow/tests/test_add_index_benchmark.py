@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -26,6 +28,20 @@ class AddIndexBenchmarkTest(unittest.TestCase):
 
         self.assertEqual(status["status"], "dry-run")
         self.assertEqual(status["calendar_days"], 2)
+        self.assertFalse((provider / "features" / "sh000300").exists())
+
+    def test_dry_run_without_calendar_reports_empty_benchmark_plan(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "missing-provider"
+            buffer = io.StringIO()
+
+            with redirect_stdout(buffer):
+                status = module.add_benchmark(provider, dry_run=True, baostock_module=object())
+
+        self.assertEqual(status["status"], "dry-run")
+        self.assertEqual(status["calendar_days"], 0)
+        self.assertIn("Dry run OK", buffer.getvalue())
         self.assertFalse((provider / "features" / "sh000300").exists())
 
     def test_remove_symbol_if_present_removes_only_benchmark_symbol(self):

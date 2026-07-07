@@ -22,6 +22,7 @@ from _paths import reports_root, workflow_root  # noqa: E402
 WORKFLOW = workflow_root()
 REPORT_DIR = reports_root()
 ANOMALY_STOCKS = REPORT_DIR / "data_anomaly_stocks_latest.csv"
+SUMMARY_COLUMNS = ["symbol", "end", "severity"]
 
 
 def normalize_symbol(value: str) -> str:
@@ -55,11 +56,40 @@ def write_latest(path: Path, latest_name: str) -> Path:
     return latest
 
 
-def build_plan(selected: pd.DataFrame, target_end: pd.Timestamp, symbols_txt: Path, symbols_csv: Path) -> str:
+def load_anomaly_summary(path: Path) -> tuple[pd.DataFrame, str]:
+    if not path.exists():
+        return (
+            pd.DataFrame(columns=SUMMARY_COLUMNS),
+            f"Missing anomaly stock report: `{path}`. Run `report_data_anomalies.py` first.",
+        )
+
+    summary = pd.read_csv(path, dtype={"symbol": str})
+    missing = [column for column in SUMMARY_COLUMNS if column not in summary.columns]
+    if "symbol" in missing:
+        return (
+            pd.DataFrame(columns=SUMMARY_COLUMNS),
+            f"Anomaly stock report is missing the required `symbol` column: `{path}`.",
+        )
+
+    if "end" in missing:
+        summary["end"] = ""
+    if "severity" in missing:
+        summary["severity"] = "review"
+    return summary, ""
+
+
+def build_plan(
+    selected: pd.DataFrame,
+    target_end: pd.Timestamp,
+    symbols_txt: Path,
+    symbols_csv: Path,
+    source_note: str = "",
+) -> str:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     oldest = selected["end"].replace("", pd.NA).dropna().min() if not selected.empty else ""
     newest = selected["end"].replace("", pd.NA).dropna().max() if not selected.empty else ""
     severity_counts = selected["severity"].value_counts().to_dict() if "severity" in selected else {}
+    note_section = f"\n## Source Note\n\n{source_note}\n" if source_note else ""
     return f"""# Baostock Refresh Plan
 
 Generated: {generated}
@@ -70,6 +100,7 @@ Generated: {generated}
 - Symbols to refresh: {len(selected)}
 - Current selected end-date range: {oldest} ~ {newest}
 - Severity counts: {severity_counts}
+{note_section}
 
 ## Strategy
 
@@ -94,7 +125,7 @@ def main() -> int:
     args = parser.parse_args()
 
     target_end = pd.Timestamp(args.target_end)
-    summary = pd.read_csv(args.anomaly_stocks, dtype={"symbol": str})
+    summary, source_note = load_anomaly_summary(args.anomaly_stocks)
     selected = select_refresh_symbols(summary, target_end)
     if args.limit > 0:
         selected = selected.head(args.limit)
@@ -107,7 +138,7 @@ def main() -> int:
 
     symbols_txt.write_text("\n".join(selected["symbol"].tolist()) + "\n", encoding="utf-8")
     selected.to_csv(symbols_csv, index=False)
-    plan_path.write_text(build_plan(selected, target_end, symbols_txt, symbols_csv), encoding="utf-8")
+    plan_path.write_text(build_plan(selected, target_end, symbols_txt, symbols_csv, source_note), encoding="utf-8")
 
     latest_txt = write_latest(symbols_txt, "baostock_refresh_symbols_latest.txt")
     latest_csv = write_latest(symbols_csv, "baostock_refresh_symbols_latest.csv")

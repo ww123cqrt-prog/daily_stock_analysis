@@ -84,6 +84,28 @@ class ReportQlibPredictionsTest(unittest.TestCase):
         self.assertIn("read-only", markdown)
         self.assertIn("不自动下单", markdown)
 
+    def test_generates_empty_prediction_summary_when_pred_artifact_is_missing(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_dir = root / "reports"
+
+            payload = module.generate_report(
+                prediction_path=root / "missing_pred.pkl",
+                out_dir=out_dir,
+                run_id="run_1",
+                experiment_name="baseline_lgb_alpha158_cleaned",
+                topk=3,
+            )
+
+            markdown = (out_dir / "qlib_predictions_latest.md").read_text(encoding="utf-8")
+
+        self.assertEqual(payload["latest_date"], "n/a")
+        self.assertEqual(payload["summary"]["rows"], 0)
+        self.assertIn("missing_pred.pkl", payload["unavailable_reason"])
+        self.assertIn("Qlib Prediction Summary", markdown)
+        self.assertIn("不自动下单", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

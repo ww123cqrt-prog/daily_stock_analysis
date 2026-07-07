@@ -1652,7 +1652,7 @@ test('workflow page can cancel a running quant job from the browser', async ({ p
     expect(cancelled.error).toContain('Cancelled by user');
 
     await expect.poll(() => isPidAlive(runningJob.pid), { timeout: 15_000 }).toBe(false);
-    await expect(page.getByText('已取消')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId('workflow-job-check_qlib_data').getByText('已取消')).toBeVisible({ timeout: 15_000 });
     const detail = await page.request.get(`/api/v1/quant/jobs/${runningJob.jobId}`);
     expect(detail.ok()).toBeTruthy();
     expect((await detail.json() as { status?: string }).status).toBe('cancelled');

@@ -112,6 +112,22 @@ class ReportMarketRegimeTest(unittest.TestCase):
         self.assertIn("Market Regime Report", markdown)
         self.assertIn("cash_ratio", serialized)
 
+    def test_writes_insufficient_data_report_for_empty_directory(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "empty"
+            out_dir = root / "reports"
+            data_dir.mkdir()
+
+            payload = module.generate_report(data_dir, out_dir, lookback_days=60, min_symbols=2)
+            markdown = (out_dir / "market_regime_latest.md").read_text(encoding="utf-8")
+
+        self.assertEqual(payload["regime"], "insufficient_data")
+        self.assertEqual(payload["cash_ratio"], 0.80)
+        self.assertIn("Market Regime Report", markdown)
+        self.assertIn("Suggested cash_ratio", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()
