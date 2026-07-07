@@ -37,6 +37,7 @@ DSA_PRE_RANK_CONTEXT_MAX_CANDIDATES = 3
 DSA_ALPHASIFT_LLM_CANDIDATE_MULTIPLIER = 2
 DSA_ALPHASIFT_LLM_MAX_CANDIDATES = 12
 DSA_ALPHASIFT_SNAPSHOT_SOURCE_PRIORITY = "em_datacenter,tushare,efinance,akshare_em"
+_E2E_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _DSA_FETCHER_MANAGER_LOCK = threading.RLock()
 _DSA_FETCHER_MANAGER: Any = None
 _FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards")
@@ -67,6 +68,16 @@ class AlphaSiftService:
         self.config = config
 
     def status(self) -> Dict[str, Any]:
+        if _e2e_fake_analysis_enabled():
+            return {
+                "enabled": bool(self.config.alphasift_enabled),
+                "available": True,
+                "install_spec_is_default": _is_default_alphasift_install_spec(self.config.alphasift_install_spec),
+                "contract_version": "e2e-fake",
+                "version": "e2e-fake",
+                "strategy_count": len(_e2e_fake_alphasift_strategies()),
+            }
+
         adapter_status, available, diagnostics = _get_alphasift_status_snapshot()
         payload = {
             "enabled": bool(self.config.alphasift_enabled),
@@ -82,6 +93,14 @@ class AlphaSiftService:
 
     def strategies(self) -> Dict[str, Any]:
         _ensure_alphasift_enabled(self.config)
+        if _e2e_fake_analysis_enabled():
+            strategies = _e2e_fake_alphasift_strategies()
+            return {
+                "enabled": True,
+                "strategies": strategies,
+                "strategy_count": len(strategies),
+            }
+
         _ensure_alphasift_available_for_use()
         strategies = _list_strategies()
         return {
@@ -97,6 +116,9 @@ class AlphaSiftService:
 
     def screen(self, *, strategy: str, market: str, max_results: int) -> Dict[str, Any]:
         _ensure_alphasift_enabled(self.config)
+        if _e2e_fake_analysis_enabled():
+            return _e2e_fake_alphasift_screen(strategy=strategy, market=market, max_results=max_results)
+
         _ensure_alphasift_available_for_use()
         _ensure_supported_market(market)
         _ensure_supported_strategy(strategy)
@@ -151,6 +173,158 @@ class AlphaSiftService:
             "source_errors": raw_data.get("source_errors") or [],
             "dsa_enrichment": dsa_enrichment,
         }
+
+
+def _e2e_fake_analysis_enabled() -> bool:
+    requested = os.environ.get("DSA_E2E_FAKE_ANALYSIS", "").strip().lower() in _E2E_TRUE_VALUES
+    managed_smoke = os.environ.get("DSA_WEB_SMOKE_MANAGED", "").strip().lower() in _E2E_TRUE_VALUES
+    return requested and managed_smoke
+
+
+def _e2e_fake_alphasift_strategies() -> List[Dict[str, Any]]:
+    return [
+        _strategy_model(
+            id="dual_low",
+            name="双低选股",
+            title="双低选股",
+            description="本地 E2E fake 低估值候选策略",
+            category="value",
+            tag="value",
+            tags=["value", "e2e"],
+            market_scope=["cn"],
+            market="cn",
+        ),
+        _strategy_model(
+            id="balanced_alpha",
+            name="均衡多因子",
+            title="均衡多因子",
+            description="本地 E2E fake 多因子候选策略",
+            category="framework",
+            tag="framework",
+            tags=["framework", "e2e"],
+            market_scope=["cn"],
+            market="cn",
+        ),
+    ]
+
+
+def _e2e_fake_alphasift_screen(*, strategy: str, market: str, max_results: int) -> Dict[str, Any]:
+    if market != "cn":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "alphasift_invalid_market",
+                "message": f"市场 {market} 不在 AlphaSift E2E fake 支持范围内（支持市场：cn）。",
+            },
+        )
+
+    candidates = [
+        {
+            "rank": 1,
+            "code": "000001",
+            "name": "平安银行",
+            "score": 88.6,
+            "screen_score": 88.6,
+            "reason": "dsa_e2e_fake_alphasift 本地选股候选，用于浏览器 smoke 验证。",
+            "risk_level": "low",
+            "risk_flags": [],
+            "llm_score": 82,
+            "llm_confidence": 0.76,
+            "llm_sector": "银行",
+            "llm_theme": "低估值金融",
+            "llm_tags": ["e2e", "value"],
+            "llm_thesis": "本地 fake 数据验证 AlphaSift 选股链路，不访问外部行情或 LLM。",
+            "llm_catalysts": ["E2E smoke"],
+            "llm_risks": ["仅用于测试"],
+            "llm_watch_items": ["候选列表渲染"],
+            "llm_invalidators": ["非真实研究结果"],
+            "llm_style_fit": "测试",
+            "price": 12.34,
+            "change_pct": 1.23,
+            "amount": 1042000000,
+            "industry": "银行",
+            "factor_scores": {"value": 87.4, "liquidity": 93.3, "momentum": 72.1},
+            "dsa_context": {
+                "enriched": True,
+                "profile": "e2e_fake",
+                "news_included": False,
+                "quote": {"price": 12.34, "change_pct": 1.23, "amount": 1042000000},
+                "fundamentals": {"coverage": {"valuation": "available"}},
+                "news": {"success": True, "results": []},
+                "warnings": [],
+            },
+            "dsa_news": [],
+            "dsa_analysis_summary": "DSA E2E fake：现价 12.34，涨跌幅 1.23%，用于本地浏览器验证。",
+            "post_analysis_summaries": {"e2e": "本地 fake AlphaSift 候选。"},
+            "post_analysis_tags": ["e2e"],
+            "raw": {
+                "code": "000001",
+                "name": "平安银行",
+                "source": "dsa_e2e_fake_alphasift",
+                "strategy": strategy,
+            },
+        },
+        {
+            "rank": 2,
+            "code": "600519",
+            "name": "贵州茅台",
+            "score": 81.2,
+            "screen_score": 81.2,
+            "reason": "dsa_e2e_fake_alphasift 备用候选。",
+            "risk_level": "medium",
+            "risk_flags": [],
+            "price": 1688.0,
+            "change_pct": 0.42,
+            "amount": 2042000000,
+            "industry": "白酒",
+            "factor_scores": {"quality": 90.0, "liquidity": 85.0},
+            "dsa_context": {
+                "enriched": True,
+                "profile": "e2e_fake",
+                "news_included": False,
+                "quote": {"price": 1688.0, "change_pct": 0.42, "amount": 2042000000},
+                "fundamentals": {"coverage": {"earnings": "available"}},
+                "news": {"success": True, "results": []},
+                "warnings": [],
+            },
+            "dsa_news": [],
+            "dsa_analysis_summary": "DSA E2E fake：备用候选，用于验证 max_results。",
+            "post_analysis_summaries": {"e2e": "本地 fake AlphaSift 备用候选。"},
+            "post_analysis_tags": ["e2e"],
+            "raw": {
+                "code": "600519",
+                "name": "贵州茅台",
+                "source": "dsa_e2e_fake_alphasift",
+                "strategy": strategy,
+            },
+        },
+    ][:max_results]
+    return {
+        "enabled": True,
+        "candidates": candidates,
+        "candidate_count": len(candidates),
+        "run_id": f"dsa_e2e_fake_alphasift_{market}_{strategy}",
+        "strategy": strategy,
+        "market": market,
+        "snapshot_count": 2,
+        "snapshot_source": "dsa_e2e_fake",
+        "after_filter_count": len(candidates),
+        "llm_ranked": True,
+        "llm_market_view": "E2E fake market view",
+        "llm_selection_logic": "Deterministic local smoke-test fixture.",
+        "llm_portfolio_risk": "仅用于浏览器验证，不构成投资建议。",
+        "llm_coverage": 1.0,
+        "llm_parse_errors": [],
+        "warnings": [],
+        "source_errors": [],
+        "dsa_enrichment": {
+            "enabled": True,
+            "max_candidates": DSA_ENRICHMENT_MAX_CANDIDATES,
+            "requested_count": len(candidates),
+            "enriched_count": len(candidates),
+            "warnings": [],
+        },
+    }
 
 
 def _install_alphasift(config: Config) -> Dict[str, Any]:

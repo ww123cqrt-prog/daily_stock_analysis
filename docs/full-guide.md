@@ -490,6 +490,8 @@ docker run -d \
 
 如需固定版本或便于回滚，请将 `latest` 替换为具体版本 tag，例如 `v3.13.0`。
 
+如果使用 `--host 0.0.0.0`、`WEBUI_HOST=0.0.0.0` 或生产环境部署，必须先在 `.env` 中启用 `ADMIN_AUTH_ENABLED=true` 并设置管理员密码；未启用认证时服务只允许绑定本机 `127.0.0.1`/`localhost`，以避免量化任务、配置和历史记录接口被公网或局域网误访问。
+
 ### 运行模式说明
 
 | 命令 | 说明 | 端口 |
@@ -1492,6 +1494,8 @@ curl "http://127.0.0.1:8000/api/v1/backtest/results?page=1&limit=20"
 ```bash
 python main.py --serve-only --host 0.0.0.0 --port 8888
 ```
+
+当监听地址不是 `127.0.0.1`/`localhost` 时，请同时启用 `ADMIN_AUTH_ENABLED=true`；否则服务会拒绝启动。局域网或公网访问还应配置反向代理、来源白名单和防火墙规则。
 
 ### 支持的股票代码格式
 

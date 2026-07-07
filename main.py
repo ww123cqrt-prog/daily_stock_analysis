@@ -68,6 +68,7 @@ from data_provider.base import canonical_stock_code
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
 from src.logging_config import setup_logging
+from src.web_bind import publish_bind_host
 
 
 logger = logging.getLogger(__name__)
@@ -715,6 +716,8 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     """
     import threading
     import uvicorn
+
+    publish_bind_host(host)
 
     def run_server():
         level_name = (config.log_level or "INFO").lower()

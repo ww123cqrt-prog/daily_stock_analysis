@@ -10,7 +10,7 @@ const backendPort = process.env.DSA_WEB_SMOKE_BACKEND_PORT || '8000';
 const managedSmokeRoot = path.join(currentDir, 'test-results', 'managed-smoke');
 const managedReportsRoot = process.env.DSA_WEB_SMOKE_REPORTS_ROOT
   || path.join(managedSmokeRoot, 'quant_workflow', 'reports');
-const realReportsRoot = path.resolve(repoRoot, '..', 'quant_workflow', 'reports');
+const realReportsRoot = path.resolve(repoRoot, 'quant_workflow', 'reports');
 
 function copyIfExists(source: string, destination: string) {
   if (!fs.existsSync(source)) return;
@@ -45,6 +45,12 @@ function seedManagedSmokeReports() {
     'data_anomaly_stocks_latest.csv',
     'data_anomaly_events_latest.csv',
     'data_cleaning_strategy_latest.md',
+    'data_hygiene_inventory_latest.md',
+    'data_hygiene_inventory_latest.json',
+    'data_hygiene_cleanup_plan_latest.md',
+    'data_hygiene_cleanup_plan_latest.json',
+    'workbench_capability_inventory_latest.md',
+    'workbench_capability_inventory_latest.json',
     'optimization_results_latest.json',
     'optimization_results_latest.md',
     'china_astock_strategy_comparison_latest.csv',

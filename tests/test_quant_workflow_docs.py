@@ -18,7 +18,7 @@ def test_env_example_documents_quant_workflow_path_overrides() -> None:
         "QUANT_WORKFLOW_ROOT",
         "QUANT_WORKFLOW_REPORTS_ROOT",
         "QUANT_DATA_ROOT",
-        "QLIB_PYTHON",
+        "QUANT_WORKFLOW_PYTHON",
         "MLFLOW_URL",
     ):
         assert f"# {key}=" in env_example
@@ -51,17 +51,32 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         "QUANT_DATA_ROOT",
         "MLFLOW_URL",
         "策略优化预演",
+        "china-astock 技术指标报告",
+        "report_china_astock_indicators.py",
         "Qlib 预测摘要",
         "qlib_predictions_latest",
+        "Qlib 研究增强",
+        "report_qlib_research.py",
+        "qlib_research_model_explainability_latest",
         "实验复现与产物",
         "pred.pkl",
         "runtime config",
         "quant_workflow 脚本覆盖盘点",
+        "report_data_hygiene.py",
+        "data_hygiene_inventory_latest",
+        "data_hygiene_cleanup_plan_latest",
+        "不包含真实删除动作",
+        "report_workbench_capabilities.py",
+        "workbench_capability_inventory_latest",
         "add_index_benchmark.py",
         "generate_csi300.py",
+        "repair_qlib_provider.py",
+        "缓存缺失时直接失败，不走 AkShare fallback",
         "supervise_baostock.py",
         "provider 维护脚本",
         "MLflow",
+        "CHILD_ENV_EXACT_NAMES",
+        "CHILD_ENV_PREFIXES",
         "不自动下单",
         "不读取账号密码",
         "pytest tests/test_quant_jobs_api.py",
@@ -70,8 +85,63 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         "npm run test:smoke:fake-analysis",
         "npm run test:smoke:local",
         "apps/dsa-web/test-results/managed-smoke",
+        "git status --short",
+        "未跟踪正式文件",
     ):
         assert phrase in manual
+
+
+def test_verification_script_opencode_review_covers_untracked_files() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(encoding="utf-8")
+
+    assert "current working tree" in script
+    assert "git diff HEAD" in script
+    assert "git status --short" in script
+    assert "untracked files" in script
+    assert "newly added but untracked files" in script
+    assert "HEAD~2..HEAD" in script
+
+
+def test_verification_script_quick_covers_schedule_mode_regression() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(encoding="utf-8")
+    quick_body = script.split("run_quick() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert "tests/test_main_schedule_mode.py" in quick_body
+    assert "tests/test_safe_urls.py" in quick_body
+    assert "run_py_compile" in quick_body
+    assert "check_quant_workflow_scripts" in quick_body
+    assert "REQUIRED_QUANT_WORKFLOW_SCRIPTS" in script
+    assert "report_china_astock_indicators.py" in script
+    assert "report_workbench_capabilities.py" in script
+    assert "report_qlib_research.py" in script
+    assert "train_baseline_lgb.py" in script
+    assert "Missing quant_workflow script(s)" in script
+    assert "run_dsa_backtest is intentionally a DSA-native job" in script
+    assert "Missing DSA backtest entrypoint" in script
+    assert "python -m py_compile" not in script
+    assert '"${PYTHON_BIN}" -m py_compile' in script
+    assert "git diff --name-only HEAD -- '*.py'" in script
+    assert "git ls-files --others --exclude-standard -- '*.py'" in script
+    assert "No changed Python files to compile." in script
+    assert "run_quick_browser_hygiene" in quick_body
+    assert "verify-data-hygiene.spec.ts" in script
+    assert "[SKIPPED] Local DSA service is not reachable" in script
+    assert './scripts/ci_gate.sh all' in script
+    assert 'PATH="$(dirname "${PYTHON_BIN}"):${PATH}"' in script
+
+
+def test_verification_script_opencode_review_fails_without_bridge() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(encoding="utf-8")
+
+    assert "opencode-review cannot run" in script
+    assert "Install cli-agent-interop or set AGENT_BRIDGE" in script
+    assert "before claiming complete verification" in script
+    assert "OPENCODE_REVIEW_TIMEOUT_SECONDS" in script
+    assert "opencode-review timed out" in script
+    assert "SystemExit(124)" in script
+    opencode_body = script.split("run_opencode_review() {", 1)[1].split("\n}\n", 1)[0]
+    assert "return 2" in opencode_body
+    assert "return 0" not in opencode_body
 
 
 def test_web_package_exposes_local_workbench_smoke_entry() -> None:

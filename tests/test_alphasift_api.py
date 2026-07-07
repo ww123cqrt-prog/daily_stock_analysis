@@ -143,6 +143,47 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(payload["version"], "0.2.0")
         self.assertEqual(payload["strategy_count"], 8)
 
+    def test_e2e_fake_alphasift_returns_deterministic_candidates_without_importing_adapter(self) -> None:
+        config = self._config(enabled=True)
+
+        with (
+            patch.dict(
+                alphasift_service.os.environ,
+                {"DSA_E2E_FAKE_ANALYSIS": "1", "DSA_WEB_SMOKE_MANAGED": "1"},
+                clear=False,
+            ),
+            patch("src.services.alphasift_service._import_alphasift", side_effect=AssertionError("adapter import")),
+        ):
+            status = alphasift_endpoint.alphasift_status(config=config)
+            strategies = self._strategies(config=config)
+            payload = self._screen(config=config, market="cn", strategy="dual_low", max_results=1)
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["contract_version"], "e2e-fake")
+        self.assertEqual(strategies["strategy_count"], 2)
+        self.assertEqual(strategies["strategies"][0]["id"], "dual_low")
+        self.assertEqual(payload["candidate_count"], 1)
+        self.assertEqual(payload["candidates"][0]["code"], "000001")
+        self.assertEqual(payload["snapshot_source"], "dsa_e2e_fake")
+        self.assertTrue(payload["llm_ranked"])
+
+    def test_e2e_fake_alphasift_requires_managed_smoke_gate(self) -> None:
+        config = self._config(enabled=True)
+
+        with (
+            patch.dict(
+                alphasift_service.os.environ,
+                {"DSA_E2E_FAKE_ANALYSIS": "1"},
+                clear=False,
+            ),
+            patch("src.services.alphasift_service._call_alphasift_status", side_effect=_raise_alphasift_unavailable),
+        ):
+            alphasift_service.os.environ.pop("DSA_WEB_SMOKE_MANAGED", None)
+            status = alphasift_endpoint.alphasift_status(config=config)
+
+        self.assertFalse(status["available"])
+        self.assertNotEqual(status.get("contract_version"), "e2e-fake")
+
     def test_status_preserves_adapter_available_false_without_diagnostics(self) -> None:
         config = self._config(enabled=False)
 

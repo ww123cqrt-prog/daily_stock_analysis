@@ -7,11 +7,26 @@ import json
 import logging
 import os
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
-from fastapi import APIRouter, HTTPException
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - msvcrt is only available on Windows.
+    msvcrt = None
+
+from fastapi import APIRouter, HTTPException, Query
+
+from src.safe_urls import public_http_url
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -21,16 +36,32 @@ def _env_path(name: str, default: Path) -> Path:
 
 DSA_ROOT = _env_path("DSA_ROOT", Path(__file__).resolve().parents[3])
 PROJECTS_ROOT = _env_path("WORKING_PROJECTS_ROOT", DSA_ROOT.parent)
-QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", PROJECTS_ROOT / "quant_workflow")
+QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", DSA_ROOT / "quant_workflow")
 QUANT_WORKFLOW_REPORTS_ROOT = _env_path("QUANT_WORKFLOW_REPORTS_ROOT", QUANT_WORKFLOW_ROOT / "reports")
+QUANT_DATA_ROOT = _env_path("QUANT_DATA_ROOT", DSA_ROOT / "quant_data")
+QLIB_PROVIDER_ROOT = _env_path("QLIB_PROVIDER_ROOT", QUANT_DATA_ROOT / "qlib")
 RESEARCH_STATUS_PATH = QUANT_WORKFLOW_REPORTS_ROOT / "research_status_latest.json"
 EXPERIMENT_LOG_FILENAME = "experiment_log.md"
 EXPERIMENT_RUNS_FILENAME = "experiment_runs.jsonl"
 EXPERIMENT_DELETED_RUNS_FILENAME = "experiment_runs_deleted.jsonl"
+EXPERIMENT_LOCK_FILENAME = ".experiment.lock"
 LATEST_TRAINING_RESULT_FILENAME = "latest_training_result.json"
 CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
+QLIB_RESEARCH_REPORTS = {
+    "model_explainability": ("模型效果深度解释", "qlib_research_model_explainability_latest.json"),
+    "backtest_detail": ("回测详细分解", "qlib_research_backtest_detail_latest.json"),
+    "model_comparison": ("多模型/多实验对比", "qlib_research_model_comparison_latest.json"),
+    "factor_analysis": ("因子挖掘辅助", "qlib_research_factor_analysis_latest.json"),
+    "rolling_training": ("滚动训练计划", "qlib_research_rolling_training_latest.json"),
+    "risk_model": ("风险模型集成诊断", "qlib_research_risk_model_latest.json"),
+}
 EXPERIMENT_FILE_LOCK = threading.RLock()
+DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
+DIRECTORY_SIZE_CACHE_TTL_SECONDS = 60.0
+DIRECTORY_SIZE_SCAN_MAX_ENTRIES = 50000
+DIRECTORY_SIZE_SCAN_MAX_SECONDS = 0.5
+CLEANUP_ACTION_PREVIEW_LIMIT = 50
 TONGHUASHUN_CANDIDATE_PATHS = (
     Path("/Applications/同花顺.app"),
     Path("/Applications/同花顺远航版.app"),
@@ -42,6 +73,47 @@ TONGHUASHUN_CANDIDATE_PATHS = (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
+_DIRECTORY_SIZE_CACHE: Dict[str, Tuple[float, float]] = {}
+
+
+def _lock_experiment_handle(lock_handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:  # pragma: no cover - covered through patched fallback tests on non-Windows.
+        lock_handle.seek(0, os.SEEK_END)
+        if lock_handle.tell() == 0:
+            lock_handle.write("0")
+            lock_handle.flush()
+        lock_handle.seek(0)
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _unlock_experiment_handle(lock_handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - covered through patched fallback tests on non-Windows.
+        lock_handle.seek(0)
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _experiment_file_guard(reports_dir: Path) -> Iterator[None]:
+    """Guard experiment notebook mutations across threads and local processes."""
+    with EXPERIMENT_FILE_LOCK:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = reports_dir / EXPERIMENT_LOCK_FILENAME
+        # Keep this small advisory lock file around deliberately. It only
+        # coordinates writers that also take this lock; quant_workflow writers
+        # must use the same path before mutating experiment notebook files.
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            _lock_experiment_handle(lock_handle)
+            try:
+                yield
+            finally:
+                _unlock_experiment_handle(lock_handle)
 
 
 def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
@@ -54,6 +126,31 @@ def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
+def _public_path_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        return raw
+    resolved = _resolve_for_boundary(path)
+    for root in (PROJECTS_ROOT, DSA_ROOT, QUANT_WORKFLOW_ROOT, QUANT_DATA_ROOT):
+        root_resolved = _resolve_for_boundary(root)
+        try:
+            relative = resolved.relative_to(root_resolved)
+        except ValueError:
+            continue
+        return str(Path(root_resolved.name) / relative)
+    return resolved.name or path.name or raw
+
+
+def _file_mtime_iso(path: Path) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        return None
+
+
 def _latest_training_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
     return _read_json_object(reports_dir / LATEST_TRAINING_RESULT_FILENAME)
 
@@ -64,6 +161,251 @@ def _cash_control_backtest_payload(reports_dir: Path) -> Optional[Dict[str, Any]
 
 def _qlib_predictions_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
     return _read_json_object(reports_dir / QLIB_PREDICTIONS_FILENAME)
+
+
+def _public_artifacts(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    artifacts: Dict[str, str] = {}
+    for key, value in raw.items():
+        label = _public_path_label(value)
+        if label:
+            artifacts[str(key)] = label
+    return artifacts
+
+
+def _qlib_research_payload(reports_dir: Path) -> Dict[str, Any]:
+    sections: Dict[str, Any] = {}
+    available_count = 0
+    for section, (title, filename) in QLIB_RESEARCH_REPORTS.items():
+        path = reports_dir / filename
+        payload = _read_json_object(path)
+        if payload:
+            item = dict(payload)
+            item["artifacts"] = _public_artifacts(item.get("artifacts"))
+            item["path"] = _public_path_label(path)
+            sections[section] = item
+            available_count += 1
+        else:
+            sections[section] = {
+                "section": section,
+                "title": title,
+                "status": "missing",
+                "path": _public_path_label(path) if path.exists() else None,
+            }
+    return {
+        "status": "available" if available_count else "missing",
+        "available_sections": available_count,
+        "total_sections": len(QLIB_RESEARCH_REPORTS),
+        "sections": sections,
+    }
+
+
+def _mlflow_payload() -> Dict[str, Any]:
+    raw_url = os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
+    payload = {
+        "url": public_http_url(raw_url, DEFAULT_MLFLOW_URL),
+        "status": "linked",
+        "role": "experiment_raw_records",
+        "checked_at": None,
+        "health_checked": False,
+        "error": "Link only; live health is checked on the workflow page for local MLflow URLs, and remote MLflow URLs are not probed by design.",
+    }
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL must be an http(s) URL."
+    elif parsed.username or parsed.password:
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL must not include username or password."
+    else:
+        decoded_path = unquote(parsed.path or "")
+        if any(part == ".." for part in decoded_path.replace("\\", "/").split("/")):
+            payload["status"] = "invalid"
+            payload["error"] = "MLFLOW_URL must not contain path traversal."
+    return payload
+
+
+def _data_quality_summary_from_json(path: Path) -> Optional[Dict[str, Any]]:
+    payload = _read_json_object(path)
+    if not payload:
+        return None
+    raw_summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+    summary: Dict[str, Any] = {}
+    for source_key, target_key in (
+        ("stock_universe", "stock_universe"),
+        ("usable_instruments", "usable_instruments"),
+        ("merged_usable_instruments", "usable_instruments"),
+        ("total_rows", "total_rows"),
+        ("merged_rows", "total_rows"),
+        ("date_range", "date_range"),
+        ("calendar_range", "date_range"),
+    ):
+        value = raw_summary.get(source_key)
+        if value not in (None, ""):
+            summary[target_key] = str(value)
+    return summary or None
+
+
+def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    summary: Dict[str, Any] = {}
+    prefixes = {
+        "Stock universe": "stock_universe",
+        "Merged usable instruments": "usable_instruments",
+        "Merged rows": "total_rows",
+        "Calendar range": "date_range",
+    }
+    for line in lines[:30]:
+        clean = line.strip()
+        if clean.startswith("- "):
+            clean = clean[2:].strip()
+        for prefix, key in prefixes.items():
+            marker = f"{prefix}:"
+            if clean.startswith(marker):
+                summary[key] = clean[len(marker):].strip()
+                break
+    return summary or None
+
+
+def _data_quality_summary_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
+    return (
+        _data_quality_summary_from_json(reports_dir / "data_quality_report_latest.json")
+        or _data_quality_summary_from_markdown(reports_dir / "data_quality_report_latest.md")
+    )
+
+
+def _directory_size_mb(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    cache_key = str(path.expanduser().absolute())
+    now = time.monotonic()
+    with _DIRECTORY_SIZE_CACHE_LOCK:
+        cached = _DIRECTORY_SIZE_CACHE.get(cache_key)
+        if cached and now - cached[0] <= DIRECTORY_SIZE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    total = 0
+    scanned_entries = 0
+    started_at = time.monotonic()
+    try:
+        for item in path.rglob("*"):
+            scanned_entries += 1
+            if scanned_entries > DIRECTORY_SIZE_SCAN_MAX_ENTRIES:
+                logger.warning(
+                    "Directory size scan exceeded %s entries under %s; returning unknown size.",
+                    DIRECTORY_SIZE_SCAN_MAX_ENTRIES,
+                    path,
+                )
+                return None
+            if scanned_entries % 100 == 0 and time.monotonic() - started_at > DIRECTORY_SIZE_SCAN_MAX_SECONDS:
+                logger.warning(
+                    "Directory size scan exceeded %.2f seconds under %s; returning unknown size.",
+                    DIRECTORY_SIZE_SCAN_MAX_SECONDS,
+                    path,
+                )
+                return None
+            if item.is_symlink():
+                continue
+            if item.is_file():
+                total += item.stat().st_size
+    except OSError:
+        return None
+    size_mb = round(total / (1024 * 1024), 2)
+    with _DIRECTORY_SIZE_CACHE_LOCK:
+        _DIRECTORY_SIZE_CACHE[cache_key] = (time.monotonic(), size_mb)
+    return size_mb
+
+
+def _clear_directory_size_cache() -> None:
+    with _DIRECTORY_SIZE_CACHE_LOCK:
+        _DIRECTORY_SIZE_CACHE.clear()
+
+
+def _resolve_for_boundary(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except OSError:
+        return path.expanduser().absolute()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_trusted_qlib_provider_path(path: Path) -> bool:
+    provider_path = _resolve_for_boundary(path)
+    provider_root = _resolve_for_boundary(QLIB_PROVIDER_ROOT)
+    if provider_path == provider_root or not _is_relative_to(provider_path, provider_root):
+        return False
+    required_children = ("calendars", "instruments", "features")
+    return all((provider_path / child).is_dir() for child in required_children)
+
+
+def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
+    provider: Dict[str, Any] = {"path": str(path)}
+    calendar_path = path / "calendars" / "day.txt"
+    instruments_path = path / "instruments" / "all.txt"
+    features_path = path / "features"
+
+    try:
+        if calendar_path.exists():
+            calendar_days = [
+                line.strip()
+                for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            provider["calendar_days"] = len(calendar_days)
+            if calendar_days:
+                provider["calendar_range"] = f"{calendar_days[0]} ~ {calendar_days[-1]}"
+        if instruments_path.exists():
+            provider["instruments"] = sum(
+                1
+                for line in instruments_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        if features_path.exists():
+            provider["feature_dirs"] = sum(1 for item in features_path.iterdir() if item.is_dir())
+    except OSError:
+        return provider
+
+    size_mb = _directory_size_mb(path)
+    if size_mb is not None:
+        provider["size_mb"] = size_mb
+    return provider
+
+
+def _sync_qlib_provider_with_latest_training(payload: Dict[str, Any], latest_training: Dict[str, Any]) -> None:
+    provider_uri = latest_training.get("provider_uri") or latest_training.get("qlib_provider")
+    if not isinstance(provider_uri, str) or not provider_uri.strip():
+        return
+
+    provider_path = Path(provider_uri).expanduser()
+    existing = payload.get("qlib_provider")
+    provider = dict(existing) if isinstance(existing, dict) else {}
+    if not _is_trusted_qlib_provider_path(provider_path):
+        provider["latest_training_provider_uri"] = str(provider_path)
+        provider["latest_training_provider_trusted"] = False
+        provider["provider_uri_warning"] = (
+            "latest_training provider_uri is outside configured Qlib provider root "
+            "or is not a concrete Qlib provider; skipped provider scan."
+        )
+        payload["qlib_provider"] = provider
+        return
+
+    provider.update(_qlib_provider_from_path(provider_path))
+    provider["latest_training_provider_trusted"] = True
+    payload["qlib_provider"] = provider
 
 
 def _experiment_notebook_payload(reports_dir: Path) -> Dict[str, Any]:
@@ -104,8 +446,8 @@ def _experiment_notebook_payload(reports_dir: Path) -> Dict[str, Any]:
         "runs": runs[-20:][::-1],
         "total_runs": len(runs),
         "invalid_lines": invalid_lines,
-        "log_path": str(log_path),
-        "runs_path": str(runs_path),
+        "log_path": _public_path_label(log_path),
+        "runs_path": _public_path_label(runs_path),
     }
 
 
@@ -142,6 +484,154 @@ def _tonghuashun_status_payload() -> Dict[str, Any]:
             "不连接券商交易接口",
         ],
     }
+
+
+def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
+    inventory_path = reports_dir / "data_hygiene_inventory_latest.json"
+    cleanup_plan_path = reports_dir / "data_hygiene_cleanup_plan_latest.json"
+    quality_report_path = reports_dir / "data_quality_report_latest.md"
+    cleaning_strategy_path = reports_dir / "data_cleaning_strategy_latest.md"
+    manifest_path = QUANT_DATA_ROOT / "DATA_MANIFEST.json"
+    readme_path = QUANT_DATA_ROOT / "README.md"
+    maintenance_lock_path = QUANT_DATA_ROOT / ".maintenance.lock"
+
+    inventory = _read_json_object(inventory_path)
+    cleanup_plan = _read_json_object(cleanup_plan_path)
+    manifest = _read_json_object(manifest_path)
+    official_entries = manifest.get("official_entries") if manifest else None
+
+    maintenance_locked = maintenance_lock_path.exists()
+
+    # Extract cleanup plan actions
+    cleanup_actions = []
+    cleanup_plan_actions = cleanup_plan.get("actions", []) if cleanup_plan else []
+    if not isinstance(cleanup_plan_actions, list):
+        cleanup_plan_actions = []
+    if cleanup_plan_actions:
+        for action in cleanup_plan_actions[:CLEANUP_ACTION_PREVIEW_LIMIT]:
+            if not isinstance(action, dict):
+                continue
+            cleanup_actions.append({
+                "action": str(action.get("action") or ""),
+                "source": _public_path_label(action.get("source") or ""),
+                "destination": _public_path_label(action.get("destination") or "") or None,
+                "reason": str(action.get("reason") or ""),
+                "risk": str(action.get("risk") or "") or None,
+                "requires_confirmation": action.get("requires_user_confirmation", False),
+            })
+
+    quality_summary = _data_quality_summary_payload(reports_dir)
+    inventory_counts = _data_hygiene_inventory_counts(inventory)
+
+    return {
+        "inventory": {
+            "status": "available" if inventory else "missing",
+            "path": _public_path_label(inventory_path) if inventory_path.exists() else None,
+            "generated_at": inventory.get("generated_at") if inventory else None,
+            "official_entries": inventory_counts["official_entries"],
+            "candidate_entries": inventory_counts["candidate_entries"],
+            "legacy_entries": inventory_counts["legacy_entries"],
+            "archive_candidates": inventory_counts["archive_candidates"],
+        },
+        "cleanup_plan": {
+            "status": "available" if cleanup_plan else "missing",
+            "path": _public_path_label(cleanup_plan_path) if cleanup_plan_path.exists() else None,
+            "generated_at": cleanup_plan.get("generated_at") if cleanup_plan else None,
+            "dry_run_only": cleanup_plan.get("dry_run_only", True) if cleanup_plan else True,
+            "total_actions": len(cleanup_plan_actions),
+            "preview_limit": CLEANUP_ACTION_PREVIEW_LIMIT,
+            "truncated": len(cleanup_plan_actions) > len(cleanup_actions),
+            "actions": cleanup_actions,
+        },
+        "quality_report": {
+            "status": "available" if quality_report_path.exists() else "missing",
+            "path": _public_path_label(quality_report_path) if quality_report_path.exists() else None,
+            "summary": quality_summary,
+        },
+        "cleaning_strategy": {
+            "status": "available" if cleaning_strategy_path.exists() else "missing",
+            "path": _public_path_label(cleaning_strategy_path) if cleaning_strategy_path.exists() else None,
+        },
+        "manifest": {
+            "status": "available" if manifest else "missing",
+            "path": _public_path_label(manifest_path) if manifest_path.exists() else None,
+            "generated_at": manifest.get("generated_at") if manifest else None,
+            "source_report": _public_path_label(manifest.get("source_report")) if manifest else None,
+            "official_entries": _collection_count(official_entries),
+        },
+        "readme": {
+            "status": "available" if readme_path.exists() else "missing",
+            "path": _public_path_label(readme_path) if readme_path.exists() else None,
+        },
+        "maintenance_lock": {
+            "locked": maintenance_locked,
+            "path": _public_path_label(maintenance_lock_path),
+            "updated_at": _file_mtime_iso(maintenance_lock_path) if maintenance_locked else None,
+        },
+    }
+
+
+def _collection_count(value: Any) -> int:
+    if isinstance(value, (dict, list, tuple)):
+        return len(value)
+    return 0
+
+
+def _data_hygiene_inventory_counts(inventory: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    if not inventory:
+        return {
+            "official_entries": 0,
+            "candidate_entries": 0,
+            "legacy_entries": 0,
+            "archive_candidates": 0,
+        }
+
+    direct_counts = {
+        "official_entries": inventory.get("official_entries"),
+        "candidate_entries": inventory.get("candidate_entries"),
+        "legacy_entries": inventory.get("legacy_entries"),
+        "archive_candidates": inventory.get("archive_candidates"),
+    }
+    if all(isinstance(value, int) for value in direct_counts.values()):
+        return {key: int(value) for key, value in direct_counts.items()}
+
+    items = inventory.get("items")
+    if not isinstance(items, list):
+        return {
+            "official_entries": _safe_int(direct_counts["official_entries"]),
+            "candidate_entries": _safe_int(direct_counts["candidate_entries"]),
+            "legacy_entries": _safe_int(direct_counts["legacy_entries"]),
+            "archive_candidates": _safe_int(direct_counts["archive_candidates"]),
+        }
+
+    return {
+        "official_entries": _count_inventory_category(items, "official"),
+        "candidate_entries": _count_inventory_category(items, "candidate"),
+        "legacy_entries": _count_inventory_category(items, "legacy"),
+        "archive_candidates": _count_inventory_category(items, "archive_candidate"),
+    }
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _count_inventory_category(items: list[Any], category: str) -> int:
+    total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_category = item.get("category")
+        categories = item.get("categories")
+        if item_category == category:
+            total += 1
+            continue
+        if isinstance(categories, list) and category in categories:
+            total += 1
+    return total
 
 
 def _external_tools_payload() -> Dict[str, Any]:
@@ -221,13 +711,13 @@ def _capability_matrix_payload(external_tools: Dict[str, Any]) -> list[Dict[str,
         {
             "id": "china_astock_quant_reuse",
             "module": "china-astock-quant",
-            "status": "partial",
-            "entry": "研究页项目关系",
-            "route": "/research",
-            "tests": "CodeGraph 已初始化，尚未直接包装脚本",
-            "browser": "暂作为策略、指标和工程参考展示",
-            "review": "待接入具体脚本后复审",
-            "next": "筛选可复用策略并白名单化进入 quant_workflow。",
+            "status": "available",
+            "entry": "工作流技术指标报告 / 研究页项目关系",
+            "route": "/workflow",
+            "tests": "report_china_astock_indicators + run_china_astock_comparison + DSA quant API 测试",
+            "browser": "可从网页生成只读技术指标报告和策略对比报告",
+            "review": "待本阶段 opencode 复审",
+            "next": "继续评估是否把事件驱动回测包装为只读对比报告。",
             "restrictions": ["不改造成主网页", "不接入交易执行"],
         },
         {
@@ -327,20 +817,22 @@ def _function_inventory_payload() -> list[Dict[str, Any]]:
             "id": "quant_workflow_script_coverage",
             "area": "量化流水线",
             "name": "quant_workflow 脚本覆盖盘点",
-            "status": "partial",
+            "status": "available",
             "entry": "研究页功能入口盘点",
             "route": "/research",
             "owner": "quant_workflow + daily_stock_analysis",
             "coverage": (
                 "网页白名单覆盖下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、"
-                "市场状态、现金仓位回测、china-astock 对比、策略优化预演和 baseline 训练；"
-                "add_index_benchmark.py 与 generate_csi300.py 目前作为 provider 维护脚本保留在脚本层。"
+                "数据治理盘点和 dry-run 清理预案、市场状态、现金仓位回测、china-astock 指标报告、"
+                "china-astock 对比、策略优化预演和 baseline 训练；"
+                "report_data_hygiene.py 可从网页生成 inventory 与 dry-run cleanup plan；"
+                "add_index_benchmark.py 与 generate_csi300.py 已作为 provider 维护预演接入网页任务中心，强制 dry-run。"
             ),
             "gaps": (
                 "supervise_baostock.py 与网页任务中心的持久任务能力重叠，暂不单独暴露；"
-                "provider 维护脚本需先补 dry-run/参数化后再进入网页白名单。"
+                "provider 维护任务当前只开放 dry-run 预演，不允许网页写入 provider。"
             ),
-            "next": "把 provider 维护脚本改造成安全 dry-run 包装后，再考虑加入工作流任务中心。",
+            "next": "先保持 provider 维护任务为 dry-run；若未来需要真实写入，必须补二次确认、目标 provider 参数和产物 diff 预览。",
             "verification": "research_status API 测试 + ResearchPage 功能入口盘点展示。",
         },
         {
@@ -360,14 +852,14 @@ def _function_inventory_payload() -> list[Dict[str, Any]]:
             "id": "china_astock_reference",
             "area": "参考项目复用",
             "name": "china-astock-quant 可复用能力",
-            "status": "partial",
-            "entry": "研究页清单 + 工作流对比报告",
-            "route": "/research",
+            "status": "available",
+            "entry": "研究页清单 + 工作流指标报告 + 工作流对比报告",
+            "route": "/workflow",
             "owner": "china-astock-quant + quant_workflow",
-            "coverage": "已作为策略、指标、回测工程经验参考，并有只读策略对比报告入口。",
-            "gaps": "尚未把策略直接白名单包装成可运行回测任务。",
-            "next": "优先接入指标库和策略对比，再决定是否包装事件驱动回测。",
-            "verification": "run_china_astock_comparison 测试 + 后续接入后 opencode 复审。",
+            "coverage": "已复用指标库生成只读技术指标报告，并有只读策略对比报告入口。",
+            "gaps": "事件驱动回测和策略搜索尚未作为网页任务直接运行。",
+            "next": "继续评估是否包装事件驱动回测；交易相关模块保持禁止接入。",
+            "verification": "report_china_astock_indicators 测试 + run_china_astock_comparison 测试 + WorkflowPage 测试。",
         },
         {
             "id": "external_observation",
@@ -394,8 +886,8 @@ def _china_astock_reuse_payload() -> list[Dict[str, Any]]:
             "status": "available",
             "priority": "P1",
             "decision": "优先复用",
-            "target": "quant_workflow 指标/策略报告",
-            "next": "复用 sma/ema/rsi/atr/bollinger 做 DSA 技术分析和策略报告补强。",
+            "target": "工作流指标报告 report_china_astock_indicators",
+            "next": "继续把指标报告结果接入研究页摘要和后续技术分析解释。",
             "restrictions": [],
         },
         {
@@ -463,8 +955,8 @@ def _acceptance_checklist_payload() -> list[Dict[str, Any]]:
             "title": "项目整洁",
             "status": "partial",
             "route": "/research",
-            "evidence": "DSA 无散落未跟踪源码；当前仍有已暂存正式改动，提交后才算 Git 工作区完全干净。",
-            "next": "完成最终提交或明确保留暂存改动。",
+            "evidence": "DSA 无散落未跟踪源码；当前仍有未提交的正式改动，提交或明确保留后才算 Git 工作区完全干净。",
+            "next": "完成最终提交或明确保留当前正式改动。",
         },
         {
             "id": "core_pages_browser",
@@ -495,8 +987,8 @@ def _acceptance_checklist_payload() -> list[Dict[str, Any]]:
             "title": "quant_workflow 稳定包装",
             "status": "available",
             "route": "/workflow",
-            "evidence": "核心脚本通过白名单任务中心运行；未暴露脚本已在脚本覆盖盘点中说明原因。",
-            "next": "把 provider 维护脚本补成 dry-run 后再评估是否入网页白名单。",
+            "evidence": "核心脚本通过白名单任务中心运行；provider 维护脚本已作为强制 dry-run 预演接入，未暴露脚本已在脚本覆盖盘点中说明原因。",
+            "next": "若未来开放 provider 真实写入，必须先补二次确认、目标 provider 参数和产物 diff 预览。",
         },
         {
             "id": "china_astock_reuse",
@@ -549,6 +1041,8 @@ def _missing_status_payload() -> Dict[str, Any]:
         "cash_control_backtest": _cash_control_backtest_payload(reports_dir),
         "qlib_predictions": _qlib_predictions_payload(reports_dir),
         "experiment_notebook": _experiment_notebook_payload(reports_dir),
+        "mlflow": _mlflow_payload(),
+        "data_hygiene": _data_hygiene_payload(reports_dir),
         "external_tools": external_tools,
         "capability_matrix": _capability_matrix_payload(external_tools),
         "function_inventory": _function_inventory_payload(),
@@ -605,21 +1099,30 @@ def _remove_active_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, A
 
 def _archive_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, Any]:
     deleted_runs_path = reports_dir / EXPERIMENT_DELETED_RUNS_FILENAME
-    removed = _remove_active_experiment_run(reports_dir, run_id)
-    archived = {
-        **removed,
-        "deleted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "deleted_from": EXPERIMENT_RUNS_FILENAME,
-    }
+    runs_path = reports_dir / EXPERIMENT_RUNS_FILENAME
+    runs_snapshot = _snapshot_text_file(runs_path)
+    deleted_runs_snapshot = _snapshot_text_file(deleted_runs_path)
     try:
+        removed = _remove_active_experiment_run(reports_dir, run_id)
+        archived = {
+            **removed,
+            "deleted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "deleted_from": EXPERIMENT_RUNS_FILENAME,
+        }
         with deleted_runs_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(archived, ensure_ascii=False, sort_keys=True) + "\n")
-    except OSError as exc:
+    except HTTPException:
+        _restore_text_file(runs_path, *runs_snapshot)
+        _restore_text_file(deleted_runs_path, *deleted_runs_snapshot)
+        raise
+    except Exception as exc:
+        _restore_text_file(runs_path, *runs_snapshot)
+        _restore_text_file(deleted_runs_path, *deleted_runs_snapshot)
         raise HTTPException(status_code=500, detail=f"Experiment run could not be archived: {exc}") from exc
     return archived
 
 
-def _find_marked_experiment_note_block(reports_dir: Path, run_id: str) -> Optional[tuple[Path, str, int, int]]:
+def _find_marked_experiment_note_block(reports_dir: Path, run_id: str) -> Optional[Tuple[Path, str, int, int]]:
     log_path = reports_dir / EXPERIMENT_LOG_FILENAME
     if not log_path.exists():
         return None
@@ -656,7 +1159,7 @@ def _remove_marked_experiment_note(reports_dir: Path, run_id: str) -> bool:
     updated = content[:start].rstrip() + "\n\n" + content[end:].lstrip()
     updated = updated.rstrip() + "\n" if updated.strip() else ""
     try:
-        log_path.write_text(updated, encoding="utf-8")
+        _write_text_file_atomic(log_path, updated)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Experiment log could not be updated: {exc}") from exc
     return True
@@ -671,10 +1174,23 @@ def _snapshot_text_file(path: Path) -> tuple[bool, str]:
         raise HTTPException(status_code=500, detail=f"{path.name} could not be read before mutation: {exc}") from exc
 
 
+def _write_text_file_atomic(path: Path, content: str) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _restore_text_file(path: Path, existed: bool, content: str) -> None:
     try:
         if existed:
-            path.write_text(content, encoding="utf-8")
+            _write_text_file_atomic(path, content)
         elif path.exists():
             path.unlink()
     except OSError as exc:
@@ -709,11 +1225,15 @@ def build_research_status_payload() -> Dict[str, Any]:
     latest_training = _latest_training_payload(reports_dir)
     if latest_training is not None:
         payload["latest_training"] = latest_training
+        _sync_qlib_provider_with_latest_training(payload, latest_training)
     cash_control_backtest = _cash_control_backtest_payload(reports_dir)
     if cash_control_backtest is not None:
         payload["cash_control_backtest"] = cash_control_backtest
     payload["qlib_predictions"] = _qlib_predictions_payload(reports_dir)
+    payload["qlib_research"] = _qlib_research_payload(reports_dir)
     payload["experiment_notebook"] = _experiment_notebook_payload(reports_dir)
+    payload["mlflow"] = _mlflow_payload()
+    payload["data_hygiene"] = _data_hygiene_payload(reports_dir)
     external_tools = _external_tools_payload()
     payload["external_tools"] = external_tools
     payload["capability_matrix"] = _capability_matrix_payload(external_tools)
@@ -732,7 +1252,7 @@ async def get_research_status() -> Dict[str, Any]:
 @router.post("/experiments/{run_id}/archive")
 async def archive_experiment_run(run_id: str) -> Dict[str, Any]:
     """Archive one experiment run from the active notebook list."""
-    with EXPERIMENT_FILE_LOCK:
+    with _experiment_file_guard(RESEARCH_STATUS_PATH.parent):
         removed = _archive_experiment_run(RESEARCH_STATUS_PATH.parent, run_id)
         return {
             "removed_run": removed,
@@ -747,10 +1267,16 @@ async def delete_experiment_run(run_id: str) -> Dict[str, Any]:
 
 
 @router.delete("/experiments/{run_id}/permanent")
-async def permanently_delete_experiment_run(run_id: str) -> Dict[str, Any]:
+async def permanently_delete_experiment_run(
+    run_id: str,
+    confirm: str = Query("", description="Must be 'permanent' to confirm irreversible deletion."),
+) -> Dict[str, Any]:
     """Permanently remove one experiment run and its marked Markdown note block."""
-    with EXPERIMENT_FILE_LOCK:
-        reports_dir = RESEARCH_STATUS_PATH.parent
+    if confirm != "permanent":
+        raise HTTPException(status_code=400, detail="Permanent deletion requires confirm=permanent.")
+
+    reports_dir = RESEARCH_STATUS_PATH.parent
+    with _experiment_file_guard(reports_dir):
         runs_path = reports_dir / EXPERIMENT_RUNS_FILENAME
         log_path = reports_dir / EXPERIMENT_LOG_FILENAME
 

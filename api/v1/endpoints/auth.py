@@ -33,10 +33,13 @@ from src.auth import (
 )
 from src.config import Config, setup_env
 from src.core.config_manager import ConfigManager
+from src.web_bind import declared_bind_host
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+_PRODUCTION_ENVS = frozenset({"prod", "production"})
 
 
 class LoginRequest(BaseModel):
@@ -133,6 +136,24 @@ def _apply_auth_enabled(enabled: bool, request: Request | None = None) -> bool:
     setup_env(override=True)
     refresh_auth_state()
     return True
+
+
+def _auth_disable_block_reason() -> str:
+    app_env = (
+        os.environ.get("DSA_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("ENV")
+        or ""
+    ).strip().lower()
+    if app_env in _PRODUCTION_ENVS:
+        return "生产环境必须保持管理员认证开启"
+
+    bind_host = declared_bind_host().lower()
+    if not bind_host:
+        return "无法确认当前服务绑定地址，必须保持管理员认证开启"
+    if bind_host and bind_host not in _LOCAL_BIND_HOSTS:
+        return f"当前服务绑定在 {bind_host}，必须保持管理员认证开启"
+    return ""
 
 
 def _password_set_for_response(auth_enabled: bool) -> bool:
@@ -282,6 +303,15 @@ async def auth_update_settings(request: Request, body: AuthSettingsRequest):
                     )
                 clear_rate_limit(ip)
     else:
+        block_reason = _auth_disable_block_reason()
+        if block_reason:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "auth_required_for_exposed_runtime",
+                    "message": block_reason,
+                },
+            )
         if current_enabled:
             cookie_val = request.cookies.get(COOKIE_NAME)
             is_valid_session = cookie_val and verify_session(cookie_val)

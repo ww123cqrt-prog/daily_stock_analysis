@@ -63,10 +63,24 @@ describe('quantApi', () => {
           bottom: [{ instrument: 'SZ000001', score: -0.4 }],
           summary: { latest_rows: 3 },
         },
+        qlib_research: {
+          status: 'available',
+          available_sections: 1,
+          total_sections: 6,
+          sections: {
+            model_explainability: {
+              section: 'model_explainability',
+              title: '模型效果深度解释',
+              status: 'available',
+              generated_at: '2026-07-05T11:00:00+08:00',
+            },
+          },
+        },
         mlflow: {
           url: 'http://127.0.0.1:6006/',
           status: 'linked',
           role: 'experiment_raw_records',
+          checked_at: '2026-07-03T13:10:00Z',
         },
         latest_jobs: {
           check_qlib_data: {
@@ -91,6 +105,9 @@ describe('quantApi', () => {
 
     expect(status.availableJobTypes.check_qlib_data.label).toBe('检查 Qlib 数据');
     expect(status.latestJobs.check_qlib_data.jobId).toBe('qj_1');
+    expect((status.latestJobs.check_qlib_data as unknown as { command?: unknown }).command).toBeUndefined();
+    expect((status.latestJobs.check_qlib_data as unknown as { cwd?: unknown }).cwd).toBeUndefined();
+    expect((status.latestJobs.check_qlib_data as unknown as { logPath?: unknown }).logPath).toBeUndefined();
     expect(status.latestJobs.checkQlibData).toBeUndefined();
     expect(status.trainable).toBe(true);
     expect(status.trainingReadiness?.status).toBe('trainable');
@@ -99,7 +116,9 @@ describe('quantApi', () => {
     expect(status.latestTraining?.runId).toBe('run_20260705');
     expect(status.qlibPredictions?.latestDate).toBe('2026-07-02');
     expect(status.qlibPredictions?.top?.[0].instrument).toBe('SZ000002');
+    expect(status.qlibResearch?.sections.model_explainability.generatedAt).toBe('2026-07-05T11:00:00+08:00');
     expect(status.mlflow?.url).toBe('http://127.0.0.1:6006/');
+    expect(status.mlflow?.checkedAt).toBe('2026-07-03T13:10:00Z');
   });
 
   it('parses streamed job snapshots into frontend job objects', () => {
@@ -126,10 +145,39 @@ describe('quantApi', () => {
     expect(jobs[0].jobId).toBe('qj_stream');
     expect(jobs[0].jobType).toBe('check_qlib_data');
     expect(jobs[0].artifactPaths).toEqual(['/tmp/report.md']);
+    expect((jobs[0] as unknown as { command?: unknown }).command).toBeUndefined();
+    expect((jobs[0] as unknown as { cwd?: unknown }).cwd).toBeUndefined();
+    expect((jobs[0] as unknown as { logPath?: unknown }).logPath).toBeUndefined();
   });
 
   it('builds artifact URLs without treating artifact paths as user input', () => {
     expect(quantApi.getJobArtifactUrl('qj_1/unsafe', 2)).toBe('/api/v1/quant/jobs/qj_1%2Funsafe/artifacts/2');
+  });
+
+  it('strips internal command fields from cancelled job responses', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        job_id: 'qj_cancelled',
+        job_type: 'check_qlib_data',
+        label: '检查 Qlib 数据',
+        status: 'cancelled',
+        params: {},
+        command: ['python', 'internal.py'],
+        cwd: '/Users/cq/WorkingProjects',
+        created_at: '2026-07-04T01:00:00+08:00',
+        updated_at: '2026-07-04T01:00:01+08:00',
+        log_path: '/tmp/job.log',
+        artifact_paths: [],
+      },
+    });
+
+    const job = await quantApi.cancelJob('qj_cancelled');
+
+    expect(post).toHaveBeenCalledWith('/api/v1/quant/jobs/qj_cancelled/cancel');
+    expect(job.jobId).toBe('qj_cancelled');
+    expect((job as unknown as { command?: unknown }).command).toBeUndefined();
+    expect((job as unknown as { cwd?: unknown }).cwd).toBeUndefined();
+    expect((job as unknown as { logPath?: unknown }).logPath).toBeUndefined();
   });
 
   it('loads a text artifact by job id and index for inline preview', async () => {

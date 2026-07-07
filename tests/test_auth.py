@@ -251,6 +251,18 @@ class AuthSetPasswordTestCase(unittest.TestCase):
 
         self._run_with_patch(run)
 
+    def test_auth_disable_is_blocked_for_non_local_bind_host(self) -> None:
+        from api.v1.endpoints.auth import _auth_disable_block_reason
+
+        with patch.dict(os.environ, {"DSA_BIND_HOST": "", "UVICORN_HOST": "", "DSA_ENV": ""}, clear=True):
+            self.assertIn("无法确认", _auth_disable_block_reason())
+
+        with patch.dict(os.environ, {"DSA_BIND_HOST": "0.0.0.0", "DSA_ENV": ""}, clear=False):
+            self.assertIn("0.0.0.0", _auth_disable_block_reason())
+
+        with patch.dict(os.environ, {"DSA_BIND_HOST": "127.0.0.1", "DSA_ENV": ""}, clear=False):
+            self.assertEqual(_auth_disable_block_reason(), "")
+
     def test_set_initial_password_invalid(self) -> None:
         def run():
             self.assertIsNotNone(auth.set_initial_password(""))

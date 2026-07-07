@@ -1,0 +1,333 @@
+"""
+Merge Baostock long history + JQData recent data, then convert to Qlib bin.
+
+Baostock and JQData files are both already in pre-adjusted (qfq/pre) price
+space. Baostock volume is kept for overlapping dates by default because it is
+in the same adjusted-volume space as the Baostock long-history series; JQData
+OHLC is still preferred on overlaps.
+
+`--no-overwrite` means "skip replacing existing output files"; it may still
+create missing directories and missing files required to complete the provider.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+
+
+WORKFLOW_ROOT = workflow_root()
+QUANT_DATA = quant_data_root()
+BS_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
+JQ_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
+MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+QLIB_BIN_DIR = qlib_provider_uri()
+
+REQUIRED_FIELDS = ["open", "close", "high", "low", "volume"]
+OPTIONAL_FIELDS = ["amount", "turn", "pctChg"]
+QLIB_FIELDS = ["open", "close", "high", "low", "volume", "factor"]
+
+
+def to_qlib_name(sym: str) -> str:
+    s = sym.strip().upper()
+    if s.startswith(("SH", "SZ", "BJ")):
+        return s
+    if s.startswith(("600", "601", "603", "605", "688", "689")):
+        return f"SH{s}"
+    if s.startswith(("000", "001", "002", "003", "300", "301", "302")):
+        return f"SZ{s}"
+    if s.startswith(("4", "8")):
+        return f"BJ{s}"
+    return s
+
+
+def normalize_frame(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    if "date" not in df.columns and df.index.name == "date":
+        df = df.reset_index()
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    keep = ["date"] + [c for c in REQUIRED_FIELDS + OPTIONAL_FIELDS if c in df.columns]
+    df = df[keep]
+    for col in keep:
+        if col != "date":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df.sort_values("date").drop_duplicates(subset=["date"])
+    return df
+
+
+def merge_one(sym: str, bs_path: Path | None, jq_path: Path | None) -> pd.DataFrame | None:
+    df_bs = normalize_frame(bs_path) if bs_path else None
+    df_jq = normalize_frame(jq_path) if jq_path else None
+
+    if df_bs is None and df_jq is None:
+        return None
+    if df_bs is None:
+        merged = df_jq
+    elif df_jq is None:
+        merged = df_bs
+    else:
+        # Start from Baostock long history, then overwrite OHLC on overlapping
+        # dates with JQData. Keep Baostock volume on overlaps to avoid a
+        # source-switch volume discontinuity in adjusted-volume space.
+        merged = df_bs.set_index("date")
+        jq = df_jq.set_index("date")
+        all_dates = merged.index.union(jq.index)
+        merged = merged.reindex(all_dates)
+
+        for col in ["open", "close", "high", "low"]:
+            if col in jq.columns:
+                merged.loc[jq.index, col] = jq[col]
+
+        jq_only_dates = jq.index.difference(df_bs["date"])
+        for col in REQUIRED_FIELDS:
+            if col in jq.columns:
+                merged.loc[jq_only_dates, col] = jq.loc[jq_only_dates, col]
+
+        merged = merged.reset_index().rename(columns={"index": "date"})
+
+    if merged is None or merged.empty:
+        return None
+
+    missing = [c for c in REQUIRED_FIELDS if c not in merged.columns]
+    if missing:
+        print(f"  SKIP {sym}: missing {missing}")
+        return None
+
+    merged = merged.dropna(subset=["date"] + REQUIRED_FIELDS)
+    if merged.empty:
+        return None
+
+    if "factor" not in merged.columns:
+        merged["factor"] = 1.0
+
+    keep = ["date"] + [c for c in REQUIRED_FIELDS + ["factor"] + OPTIONAL_FIELDS if c in merged.columns]
+    return merged[keep].sort_values("date").drop_duplicates(subset=["date"])
+
+
+def build_merged_parquet(bs_dir: Path, jq_dir: Path, out_dir: Path, overwrite: bool) -> int:
+    if overwrite and out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bs_files = {p.stem: p for p in bs_dir.glob("*.parquet")}
+    jq_files = {p.stem: p for p in jq_dir.glob("*.parquet")}
+    symbols = sorted(set(bs_files) | set(jq_files))
+
+    print(f"Baostock stocks: {len(bs_files)}")
+    print(f"JQData stocks:   {len(jq_files)}")
+    print(f"Union stocks:    {len(symbols)}")
+    print(f"Overlap stocks:  {len(set(bs_files) & set(jq_files))}")
+
+    merged_count = 0
+    skipped_existing = 0
+    t0 = time.time()
+    for i, sym in enumerate(symbols, 1):
+        out_path = out_dir / f"{sym}.parquet"
+        if not overwrite and out_path.exists():
+            merged_count += 1
+            skipped_existing += 1
+            if i <= 3 or i % 500 == 0 or i == len(symbols):
+                print(f"  [{i}/{len(symbols)}] {sym}: skip existing {out_path}")
+            continue
+        df = merge_one(sym, bs_files.get(sym), jq_files.get(sym))
+        if df is None or df.empty:
+            continue
+        df.to_parquet(out_path, index=False)
+        merged_count += 1
+        if i <= 3 or i % 500 == 0 or i == len(symbols):
+            print(
+                f"  [{i}/{len(symbols)}] {sym}: {len(df)} rows "
+                f"({df['date'].min().date()} ~ {df['date'].max().date()})"
+            )
+
+    skipped_text = f", skipped existing {skipped_existing}" if skipped_existing else ""
+    print(f"Merged {merged_count} stocks{skipped_text} in {time.time() - t0:.0f}s -> {out_dir}")
+    return merged_count
+
+
+def write_smoke_fixture(base_dir: Path, overwrite: bool) -> tuple[Path, Path, Path, Path]:
+    """Create a tiny isolated Baostock/JQData fixture for browser smoke runs."""
+    if overwrite and base_dir.exists():
+        shutil.rmtree(base_dir)
+    bs_dir = base_dir / "baostock_qfq"
+    jq_dir = base_dir / "jqdata"
+    merged_dir = base_dir / "merged"
+    qlib_dir = base_dir / "qlib"
+    bs_dir.mkdir(parents=True, exist_ok=True)
+    jq_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "open": [10.0, 10.2],
+            "high": [10.4, 10.5],
+            "low": [9.8, 10.0],
+            "close": [10.1, 10.3],
+            "volume": [1000.0, 1200.0],
+            "amount": [10100.0, 12360.0],
+            "turn": [0.5, 0.6],
+            "pctChg": [0.0, 1.98],
+        }
+    ).to_parquet(bs_dir / "000001.parquet", index=False)
+    pd.DataFrame(
+        {
+            "date": ["2024-01-03", "2024-01-04"],
+            "open": [10.25, 10.4],
+            "high": [10.55, 10.8],
+            "low": [10.05, 10.2],
+            "close": [10.35, 10.7],
+            "volume": [9999.0, 1400.0],
+        }
+    ).to_parquet(jq_dir / "000001.parquet", index=False)
+    return bs_dir, jq_dir, merged_dir, qlib_dir
+
+
+def run_smoke_fixture(base_dir: Path, overwrite: bool = True) -> int:
+    """Run the full merge + Qlib bin conversion on a local tiny fixture."""
+    bs_dir, jq_dir, merged_dir, qlib_dir = write_smoke_fixture(base_dir, overwrite=overwrite)
+    print(f"[smoke] Merge fixture root: {base_dir}")
+    merged_count = build_merged_parquet(bs_dir, jq_dir, merged_dir, overwrite=overwrite)
+    if merged_count == 0:
+        return 1
+    return convert_to_bin(merged_dir, qlib_dir, overwrite=overwrite)
+
+
+def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields: list[str] | None = None) -> int:
+    if overwrite and dst_dir.exists():
+        shutil.rmtree(dst_dir)
+
+    pq_files = sorted(src_dir.glob("*.parquet"))
+    if not pq_files:
+        print(f"ERROR: No Parquet files in {src_dir}")
+        return 1
+
+    all_dates: set[str] = set()
+    instruments: list[tuple[str, str, str]] = []
+    stock_data: dict[str, pd.DataFrame] = {}
+
+    required_for_row = REQUIRED_FIELDS if dropna_fields is None else list(dropna_fields)
+
+    print(f"Reading {len(pq_files)} merged Parquet files...")
+    for i, pq in enumerate(pq_files, 1):
+        sym = pq.stem
+        qlib_name = to_qlib_name(sym)
+        df = pd.read_parquet(pq)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"] + required_for_row)
+        df = df.sort_values("date").drop_duplicates(subset=["date"])
+        if df.empty:
+            continue
+
+        if "factor" not in df.columns:
+            df["factor"] = 1.0
+
+        date_str = df["date"].dt.strftime("%Y-%m-%d")
+        all_dates.update(date_str.tolist())
+        instruments.append((qlib_name, date_str.iloc[0], date_str.iloc[-1]))
+        stock_data[qlib_name] = df[["date"] + QLIB_FIELDS].copy()
+
+        if i % 1000 == 0:
+            print(f"  read {i}/{len(pq_files)}")
+
+    calendar = sorted(all_dates)
+    if not calendar:
+        print("ERROR: Empty calendar")
+        return 1
+
+    date_to_idx = {d: i for i, d in enumerate(calendar)}
+    cal_dir = dst_dir / "calendars"
+    inst_dir = dst_dir / "instruments"
+    feat_dir = dst_dir / "features"
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in ["day.txt", "day_future.txt"]:
+        path = cal_dir / name
+        if not overwrite and path.exists():
+            continue
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write("\n".join(calendar) + "\n")
+
+    instruments_path = inst_dir / "all.txt"
+    if overwrite or not instruments_path.exists():
+        with instruments_path.open("w", encoding="utf-8") as handle:
+            for name, start, end in sorted(instruments):
+                handle.write(f"{name}\t{start}\t{end}\n")
+
+    print(f"Writing Qlib bin for {len(stock_data)} stocks...")
+    skipped_existing = 0
+    for i, (qlib_name, df) in enumerate(sorted(stock_data.items()), 1):
+        date_str = df["date"].dt.strftime("%Y-%m-%d")
+        cal_idx = date_str.map(date_to_idx).astype(np.int64).to_numpy()
+        start_idx = int(cal_idx.min())
+        length = int(cal_idx.max()) - start_idx + 1
+        offsets = cal_idx - start_idx
+
+        out_dir = feat_dir / qlib_name.lower()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for field in QLIB_FIELDS:
+            field_path = out_dir / f"{field}.day.bin"
+            if not overwrite and field_path.exists():
+                skipped_existing += 1
+                continue
+            data = np.full(length, np.nan, dtype=np.float32)
+            data[offsets] = df[field].astype(np.float32).to_numpy()
+            with field_path.open("wb") as handle:
+                np.array([start_idx], dtype="<f").tofile(handle)
+                data.tofile(handle)
+
+        if i % 1000 == 0:
+            print(f"  wrote {i}/{len(stock_data)}")
+
+    total_size = sum(p.stat().st_size for p in dst_dir.rglob("*") if p.is_file())
+    print(f"Qlib bin: {len(stock_data)} stocks, {len(calendar)} days -> {dst_dir}")
+    print(f"  Date range: {calendar[0]} ~ {calendar[-1]}")
+    print(f"  Size: {total_size / 1024 / 1024:.0f} MB")
+    if skipped_existing:
+        print(f"  Skipped existing bin files: {skipped_existing}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--baostock-dir", type=Path, default=BS_DIR)
+    parser.add_argument("--jqdata-dir", type=Path, default=JQ_DIR)
+    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument("--qlib-dir", type=Path, default=QLIB_BIN_DIR)
+    parser.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Skip replacing existing output files; missing output files may still be created.",
+    )
+    parser.add_argument("--smoke-fixture", action="store_true", help="Run an isolated tiny merge+Qlib conversion fixture.")
+    parser.add_argument("--smoke-dir", type=Path, default=reports_root() / "smoke" / "merge_to_qlib")
+    args = parser.parse_args()
+
+    overwrite = not args.no_overwrite
+    if args.smoke_fixture:
+        return run_smoke_fixture(args.smoke_dir, overwrite=overwrite)
+
+    merged_count = build_merged_parquet(args.baostock_dir, args.jqdata_dir, args.merged_dir, overwrite)
+    if merged_count == 0:
+        return 1
+    return convert_to_bin(args.merged_dir, args.qlib_dir, overwrite)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

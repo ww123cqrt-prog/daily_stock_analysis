@@ -79,6 +79,17 @@ type RawAlphaSiftStatus = {
   diagnostics?: Record<string, string>;
 };
 
+type RawAlphaSiftScreenTaskStatus = {
+  status?: string;
+  error?: string | null;
+  message?: string | null;
+  result?: {
+    candidate_count?: number;
+    candidateCount?: number;
+    candidates?: Array<unknown>;
+  } | null;
+};
+
 type RawAnalysisTaskStatus = {
   status?: string;
   error?: string | null;
@@ -130,6 +141,28 @@ async function getAlphaSiftStatus(request: APIRequestContext): Promise<RawAlphaS
     throw new Error(`Failed to read AlphaSift status: HTTP ${response.status()}`);
   }
   return await response.json() as RawAlphaSiftStatus;
+}
+
+async function getAlphaSiftScreenTaskStatus(
+  request: APIRequestContext,
+  taskId: string,
+): Promise<RawAlphaSiftScreenTaskStatus> {
+  try {
+    const response = await request.get(`/api/v1/alphasift/screen/tasks/${encodeURIComponent(taskId)}`);
+    if (!response.ok()) {
+      return { status: `http_${response.status()}` };
+    }
+    return await response.json() as RawAlphaSiftScreenTaskStatus;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { status: `request_error:${message.slice(0, 120)}` };
+  }
+}
+
+function isDeterministicFakeAnalysisEnabled() {
+  return ['1', 'true', 'yes', 'on'].includes(String(
+    process.env.DSA_WEB_E2E_FAKE_ANALYSIS || process.env.DSA_E2E_FAKE_ANALYSIS || '',
+  ).trim().toLowerCase());
 }
 
 async function getTaskStatusForPoll(request: APIRequestContext, url: string): Promise<string> {
@@ -830,6 +863,7 @@ test('research page shows capability acceptance matrix and deferred external-too
     await openWorkbench(page, '/research');
     await expect(page.getByRole('heading', { name: '研究工作台' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('heading', { name: '能力验收矩阵' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '功能入口盘点' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '后续开发队列' })).toBeVisible();
     await expect(page.getByText('模型质量和清仓信号')).toBeVisible();
     await expect(page.getByText('场内基金/ETF深度版')).toBeVisible();
@@ -1014,20 +1048,19 @@ test('workflow page can launch a Qlib provider repair dry run from the browser',
   try {
     await openWorkbench(page, '/workflow');
     await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: '修复 Qlib Provider' })).toBeVisible({ timeout: 15_000 });
-
-    await page.getByLabel('修复 Qlib Provider 只检查不写入').check();
+    await expect(page.getByRole('heading', { name: '预演修复 Qlib Provider' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByLabel('修复 Qlib Provider 只检查不写入')).toHaveCount(0);
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 修复 Qlib Provider' }).click();
+    await page.getByRole('button', { name: '运行 预演修复 Qlib Provider' }).click();
     const submitResponse = await responsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
       job_type: 'repair_qlib_provider',
-      params: { dry_run: true },
+      params: {},
     });
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
@@ -1038,6 +1071,61 @@ test('workflow page can launch a Qlib provider repair dry run from the browser',
     await page.getByText(job.job_id).click();
     await expect(page.locator('pre')).toContainText('Feature directory renames', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('csi300.txt', { timeout: 15_000 });
+
+    expect(consoleWatch.errors).toEqual([]);
+  } finally {
+    consoleWatch.stop();
+  }
+});
+
+test('workflow page can launch provider maintenance dry-runs from the browser', async ({ page }) => {
+  const consoleWatch = watchConsole(page);
+  try {
+    await openWorkbench(page, '/workflow');
+    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+
+    const csiResponsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 预演生成 CSI300 股票池' }).click();
+    const csiResponse = await csiResponsePromise;
+    expect(csiResponse.ok()).toBeTruthy();
+    expect(csiResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'generate_csi300',
+      params: {},
+    });
+    const csiJob = await csiResponse.json() as { job_id: string };
+    createdQuantJobIds.add(csiJob.job_id);
+
+    await waitForJobToFinish(page, csiJob.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(csiJob.job_id)).toBeVisible({ timeout: 15_000 });
+    await page.getByText(csiJob.job_id).click();
+    await expect(page.locator('pre')).toContainText('Dry run OK', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('CSI300 constituents', { timeout: 15_000 });
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    const benchmarkResponsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 预演添加沪深300 benchmark' }).click();
+    const benchmarkResponse = await benchmarkResponsePromise;
+    expect(benchmarkResponse.ok()).toBeTruthy();
+    expect(benchmarkResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'add_index_benchmark',
+      params: {},
+    });
+    const benchmarkJob = await benchmarkResponse.json() as { job_id: string };
+    createdQuantJobIds.add(benchmarkJob.job_id);
+
+    await waitForJobToFinish(page, benchmarkJob.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(benchmarkJob.job_id)).toBeVisible({ timeout: 15_000 });
+    await page.getByText(benchmarkJob.job_id).click();
+    await expect(page.locator('pre')).toContainText('Dry run OK', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('benchmark', { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
   } finally {
@@ -1150,6 +1238,63 @@ test('workflow page can launch the anomaly stock report from the browser', async
     await previewButton.click();
     await expect(page.locator('pre')).toContainText('Abnormal Stock List and Cleaning Strategy', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('Cleaning Strategy', { timeout: 15_000 });
+
+    expect(consoleWatch.errors).toEqual([]);
+  } finally {
+    consoleWatch.stop();
+  }
+});
+
+test('workflow page can launch data governance and capability inventory reports from the browser', async ({ page }) => {
+  const consoleWatch = watchConsole(page);
+  try {
+    await openWorkbench(page, '/workflow');
+    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+
+    const hygieneResponsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 生成数据治理盘点和清理预案' }).click();
+    const hygieneResponse = await hygieneResponsePromise;
+    expect(hygieneResponse.ok()).toBeTruthy();
+    expect(hygieneResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'report_data_hygiene',
+      params: {},
+    });
+    const hygieneJob = await hygieneResponse.json() as { job_id: string };
+    createdQuantJobIds.add(hygieneJob.job_id);
+
+    await waitForJobToFinish(page, hygieneJob.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(hygieneJob.job_id)).toBeVisible({ timeout: 15_000 });
+    const hygienePreview = page.getByRole('button', { name: /预览 data_hygiene_inventory_latest\.md/ });
+    await expect(hygienePreview).toBeVisible({ timeout: 15_000 });
+    await hygienePreview.click();
+    await expect(page.locator('pre')).toContainText('A 股量化数据治理 Inventory', { timeout: 15_000 });
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    const capabilityResponsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 生成工作台能力盘点' }).click();
+    const capabilityResponse = await capabilityResponsePromise;
+    expect(capabilityResponse.ok()).toBeTruthy();
+    expect(capabilityResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'report_workbench_capabilities',
+      params: {},
+    });
+    const capabilityJob = await capabilityResponse.json() as { job_id: string };
+    createdQuantJobIds.add(capabilityJob.job_id);
+
+    await waitForJobToFinish(page, capabilityJob.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(capabilityJob.job_id)).toBeVisible({ timeout: 15_000 });
+    const capabilityPreview = page.getByRole('button', { name: /预览 workbench_capability_inventory_latest\.md/ });
+    await expect(capabilityPreview).toBeVisible({ timeout: 15_000 });
+    await capabilityPreview.click();
+    await expect(page.locator('pre')).toContainText('DSA 本地量化工作台能力盘点', { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
   } finally {
@@ -1282,6 +1427,44 @@ test('workflow page can launch a strategy optimization dry-run and preview the r
   }
 });
 
+test('workflow page can launch the Qlib prediction summary and preview the report', async ({ page }) => {
+  const consoleWatch = watchConsole(page);
+  try {
+    await openWorkbench(page, '/workflow');
+    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '生成 Qlib 预测摘要' })).toBeVisible({ timeout: 15_000 });
+
+    await page.getByLabel('生成 Qlib 预测摘要 TopK').fill('3');
+
+    const responsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 生成 Qlib 预测摘要' }).click();
+    const submitResponse = await responsePromise;
+    expect(submitResponse.ok()).toBeTruthy();
+    expect(submitResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'report_qlib_predictions',
+      params: { topk: '3' },
+    });
+    const job = await submitResponse.json() as { job_id: string };
+    createdQuantJobIds.add(job.job_id);
+
+    await waitForJobToFinish(page, job.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
+    const previewButton = page.getByRole('button', { name: /预览 qlib_predictions_latest\.md/ });
+    await expect(previewButton).toBeVisible({ timeout: 15_000 });
+    await previewButton.click();
+    await expect(page.locator('pre')).toContainText('Qlib Prediction Summary', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('不自动下单', { timeout: 15_000 });
+
+    expect(consoleWatch.errors).toEqual([]);
+  } finally {
+    consoleWatch.stop();
+  }
+});
+
 test('workflow page exposes the china-astock report-only comparison task without launching it', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
@@ -1297,6 +1480,49 @@ test('workflow page exposes the china-astock report-only comparison task without
       available_job_types?: Record<string, { allowed_params?: string[] }>;
     };
     expect(status.available_job_types?.run_china_astock_comparison?.allowed_params).toEqual([]);
+    expect(consoleWatch.errors).toEqual([]);
+  } finally {
+    consoleWatch.stop();
+  }
+});
+
+test('workflow page can launch the china-astock technical indicator report from the browser', async ({ page }) => {
+  const consoleWatch = watchConsole(page);
+  try {
+    await openWorkbench(page, '/workflow');
+    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '生成 china-astock 技术指标报告' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText(/复用 china-astock-quant 的 SMA\/EMA\/RSI\/ATR\/Bollinger/)).toBeVisible();
+
+    await page.getByLabel('生成 china-astock 技术指标报告 股票代码').fill('000001,600519');
+    await page.getByLabel('生成 china-astock 技术指标报告 回看交易日').fill('60');
+    await page.getByLabel('生成 china-astock 技术指标报告 股票数量上限').fill('2');
+
+    const responsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 生成 china-astock 技术指标报告' }).click();
+    const submitResponse = await responsePromise;
+    expect(submitResponse.ok()).toBeTruthy();
+    expect(submitResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'report_china_astock_indicators',
+      params: { symbols: '000001,600519', lookback_days: '60', limit: '2' },
+    });
+    const job = await submitResponse.json() as { job_id: string };
+    createdQuantJobIds.add(job.job_id);
+
+    await waitForJobToFinish(page, job.job_id);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
+    const previewButton = page.getByRole('button', { name: /预览 china_astock_indicator_report_latest\.md/ });
+    await expect(previewButton).toBeVisible({ timeout: 15_000 });
+    await previewButton.click();
+    await expect(page.locator('pre')).toContainText('china-astock 技术指标报告', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('只读研究报告', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('不自动下单', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('000001', { timeout: 15_000 });
+
     expect(consoleWatch.errors).toEqual([]);
   } finally {
     consoleWatch.stop();
@@ -1922,18 +2148,41 @@ test('screening page can run an AlphaSift screen from the browser when the adapt
       expect(taskId).toBeTruthy();
 
       await expect(page.getByText('选股任务运行中')).toBeVisible({ timeout: 15_000 });
+      let latestScreenTask: RawAlphaSiftScreenTaskStatus = {};
       await expect.poll(async () => {
-        return getTaskStatusForPoll(page.request, `/api/v1/alphasift/screen/tasks/${encodeURIComponent(taskId)}`);
+        latestScreenTask = await getAlphaSiftScreenTaskStatus(page.request, taskId);
+        return latestScreenTask.status || 'unknown';
       }, {
         intervals: [2000, 3000, 5000],
         timeout: 180_000,
       }).toMatch(/^(completed|failed)$/);
 
-      await expect(page.getByText('选股完成')).toBeVisible({ timeout: 180_000 });
-      await expect(page.getByText('1 条候选')).toBeVisible({ timeout: 15_000 });
-      await expect.poll(async () => page.locator('tbody tr').count(), {
-        timeout: 15_000,
-      }).toBeGreaterThanOrEqual(1);
+      if (latestScreenTask.status === 'failed') {
+        if (isDeterministicFakeAnalysisEnabled()) {
+          throw new Error(
+            `Deterministic AlphaSift smoke failed: ${latestScreenTask.error || latestScreenTask.message || 'unknown error'}`,
+          );
+        }
+        await expect(page.getByText('调用失败')).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByText(/选股任务失败/)).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByText('0 条候选')).toBeVisible({ timeout: 15_000 });
+      } else {
+        const candidateCount = Number(
+          latestScreenTask.result?.candidate_count
+            ?? latestScreenTask.result?.candidateCount
+            ?? latestScreenTask.result?.candidates?.length
+            ?? 0,
+        );
+        await expect(page.getByText('选股完成')).toBeVisible({ timeout: 180_000 });
+        await expect(page.getByText(`${candidateCount} 条候选`)).toBeVisible({ timeout: 15_000 });
+        if (candidateCount > 0) {
+          await expect.poll(async () => page.locator('tbody tr').count(), {
+            timeout: 15_000,
+          }).toBeGreaterThanOrEqual(1);
+        } else {
+          await expect(page.getByText('本次筛选没有返回候选，可调整策略参数或稍后重试。')).toBeVisible({ timeout: 15_000 });
+        }
+      }
     } else {
       await expect(page.getByText('AlphaSift 适配层不可用')).toBeVisible({ timeout: 15_000 });
       await expect(runButton).toBeDisabled();

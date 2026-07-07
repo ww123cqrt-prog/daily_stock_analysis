@@ -25,14 +25,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 量化任务中心默认使用 `daily_stock_analysis/.venv` 作为唯一 Python 环境，避免 Web 任务自动跳到 `qlib/.venv` 或 `china-astock-quant/.venv`。
 - [修复] opencode 只读 review 后收口量化脚本路径：`supervise_baostock.py`、DSA 回测任务、Qlib 检查/训练/策略优化脚本统一支持共享解释器、`QUANT_DATA_ROOT` 和可覆盖 `MLFLOW_URL`。
 - [修复] 托管浏览器 smoke 现在使用隔离 `QUANT_WORKFLOW_REPORTS_ROOT`，量化任务产物写入 `apps/dsa-web/test-results/managed-smoke/`；数据质量报告的 `research_status_latest.json` 和训练摘要也只读取/写入隔离 reports，避免覆盖或混用真实 `quant_workflow/reports/*_latest` 指针。
-<!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
-<!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。
 - [修复] 量化工作流的数据质量报告任务新增 `merged_sample` 浏览器参数，smoke 测试可用小样本验证 UI 到脚本链路，避免误触发全量 merged 数据扫描导致超时。
 - [改进] 研究页新增后端驱动的“能力验收矩阵”，统一展示 DSA、quant_workflow、Qlib、china-astock-quant、同花顺只读观察和交易执行禁区的测试、浏览器验证与安全边界。
 - [改进] 研究页新增“功能入口盘点”和 `china-astock-quant` 复用清单，把网页入口、缺口、验收口径和禁止接入的交易模块显式列账。
+- [改进] `/workflow` 新增只读 `china-astock` 技术指标报告任务，复用 `strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数生成 `china_astock_indicator_report_latest.{json,md}`。
+- [修复] `china-astock` 技术指标报告在网页端和脚本端省略 `limit` 时默认抽样 50 只股票，并限制研究状态 API 只扫描可信 Qlib provider 根目录内的路径。
 - [改进] `/workflow` 新增“策略优化预演”任务，使用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路，只读生成报告且不训练、不连接券商、不自动下单。
-- [文档] 本地量化工作台手册补充 `quant_workflow` 脚本覆盖盘点，说明 `add_index_benchmark.py`、`generate_csi300.py` 和 `supervise_baostock.py` 暂不作为网页按钮暴露的原因。
+- [改进] `/workflow` 新增 provider 维护预演任务：`repair_qlib_provider.py`、`generate_csi300.py` 与 `add_index_benchmark.py` 进入网页白名单但后端强制 `--dry-run`，不写入 Qlib provider；CSI300 预演缓存缺失时不走 AkShare fallback。
+- [文档] 本地量化工作台手册补充 `quant_workflow` 脚本覆盖盘点，说明 provider 维护脚本的 dry-run 边界，以及 `supervise_baostock.py` 暂不作为网页按钮暴露的原因。
+- [改进] `/workflow` 新增 `report_data_hygiene.py` 数据治理任务，网页可生成 inventory 与 dry-run 清理计划，计划不包含真实删除动作，迁移/归档建议必须用户确认。
+- [改进] `/workflow` 新增 `report_workbench_capabilities.py` 工作台能力盘点任务，网页可生成 `workbench_capability_inventory_latest.{json,md}`，列账 DSA 页面/API、量化任务、脚本覆盖和 `china-astock-quant` 复用边界。
+- [修复] WebUI 在 `CORS_ALLOW_ALL=true` 且未启用管理员认证时，若绑定非 localhost 或处于生产环境会拒绝启动，并在 `.env.example` 和本地工作台手册中说明该安全边界。
+- [测试] 新增 `scripts/verify-local-quant-workbench.sh`，统一串联 focused/full 后端前端测试、`quant_workflow` 脚本测试、浏览器 smoke、opencode 只读复审和最终 `complete` 验收入口；opencode 阶段必须审查当前工作树和未跟踪正式文件。
+- [修复] 量化任务 durable runner 改为白名单环境变量传递，避免 DSA API 进程中的无关 LLM key 或系统环境泄漏给外部脚本；实验记录归档、永久删除和训练脚本追加记录共用 `.experiment.lock` 跨进程锁。
+- [改进] 实验记录永久删除接口现在必须显式携带 `confirm=permanent` 查询参数（破坏性变更：缺少确认参数会返回 `400`），用于防止脚本、书签或误点绕过二次确认直接删除本地实验记录。
+- [修复] 量化任务 artifact 下载恢复越界路径 `403 forbidden` 与丢失文件 `404 not_found` 的区分；`repair_qlib_provider` 网页任务兼容 `dry_run=true` 但继续拒绝真实写入。
+- [修复] 量化任务 SSE 流异常时仅向浏览器返回通用错误，完整异常只写服务端日志，避免路径或内部状态进入前端事件。
+- [改进] 本机 CLI/自动化脚本调用量化/研究 mutation API 时必须显式携带本机 `Origin` 或 `Referer`；`X-DSA-Local-Client` 不作为来源保护旁路，浏览器跨站请求和非 localhost 绑定仍被拦截。
+- [文档] 新增本地量化工作台安装与复现手册、Agent 可维护契约，明确 DSA/Qlib/MLflow 分工、GitHub 分发边界、交接模板、验证分级和安全留痕规则。
+- [改进] 将干净版 `quant_workflow` 脚本、配置、测试和文档并入 DSA 仓库，默认路径收口到仓内 `quant_workflow/` 和 `quant_data/`，运行产物继续由 `.gitignore` 排除。
 
 ## [3.21.0] - 2026-06-07
 

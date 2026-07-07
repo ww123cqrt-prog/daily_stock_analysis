@@ -112,6 +112,26 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         warning_log.assert_not_called()
 
+    def test_start_api_server_publishes_bind_host_before_uvicorn_imports_app(self) -> None:
+        config = self._make_config(log_level="INFO")
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        with patch.dict(os.environ, {}, clear=False), \
+             patch("threading.Thread", ImmediateThread), \
+             patch("uvicorn.run") as uvicorn_run:
+            main.start_api_server("127.0.0.1", 8010, config)
+            self.assertEqual(os.environ["DSA_BIND_HOST"], "127.0.0.1")
+
+        uvicorn_run.assert_called_once()
+        self.assertEqual(uvicorn_run.call_args.kwargs["host"], "127.0.0.1")
+
     def test_schedule_mode_ignores_cli_stock_snapshot(self) -> None:
         args = self._make_args(schedule=True, stocks="600519,000001")
         config = self._make_config(schedule_enabled=False)

@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
+import threading
+import time
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -23,17 +31,194 @@ from api.v1.schemas.quant_jobs import (
 )
 from api.v1.endpoints.research_status import build_research_status_payload
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
+from src.safe_urls import public_http_url
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 JOB_STREAM_POLL_INTERVAL_SECONDS = 2.0
 JOB_STREAM_MAX_JOB_EVENTS = 300
 TEXT_ARTIFACT_SUFFIXES = {".md", ".txt", ".csv", ".json", ".jsonl", ".log"}
 DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
+MLFLOW_HEALTH_CACHE_TTL_SECONDS = 15.0
+MLFLOW_HEALTH_CACHE_MAX_ENTRIES = 8
+LOCAL_MLFLOW_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOCAL_MLFLOW_HEALTH_PORTS = {None, 6006, 6606}
+_POSIX_SENSITIVE_PATH_ROOTS = (
+    "Applications",
+    "Library",
+    "Users",
+    "Volumes",
+    "etc",
+    "home",
+    "opt",
+    "private",
+    "tmp",
+    "usr",
+    "var",
+)
+_POSIX_SENSITIVE_PATH_ROOT_PATTERN = "|".join(re.escape(root) for root in _POSIX_SENSITIVE_PATH_ROOTS)
+QUOTED_ABSOLUTE_PATH_RE = re.compile(
+    rf"(['\"])(/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\r\n'\"]*)?|[A-Za-z]:(?:[\\/])?[^\r\n'\"]+)\1"
+)
+POSIX_ABSOLUTE_PATH_RE = re.compile(
+    rf"(?<![A-Za-z0-9_:/.-])/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\s'\"<>]+)*"
+)
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:(?:[\\/])?)(?:[^\s'\"<>]+)")
+_MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
+_MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_QUANT_JOB_STREAM_LOCK = threading.Lock()
+_QUANT_JOB_STREAM_ACTIVE = 0
+
+
+class _ArtifactPathResolution(NamedTuple):
+    path: Optional[Path]
+    is_forbidden: bool = False
+
+
+def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float, *, minimum: float = 0.1) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return default
+
+
+MAX_QUANT_JOB_STREAMS = _int_env("MAX_QUANT_JOB_STREAMS", 8)
+MLFLOW_HEALTH_TIMEOUT_SECONDS = _float_env("MLFLOW_HEALTH_TIMEOUT_SECONDS", 2.0)
 
 
 def _mlflow_url() -> str:
     return os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
+
+
+def _public_mlflow_url(url: str) -> str:
+    return public_http_url(url, DEFAULT_MLFLOW_URL)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_public_error(error: Optional[str]) -> Optional[str]:
+    if not error:
+        return error
+    sanitized = QUOTED_ABSOLUTE_PATH_RE.sub(r"\1[path]\1", str(error))
+    sanitized = WINDOWS_ABSOLUTE_PATH_RE.sub("[path]", sanitized)
+    sanitized = POSIX_ABSOLUTE_PATH_RE.sub("[path]", sanitized)
+    return sanitized
+
+
+def _fresh_cached_mlflow_payload(url: str, now: float) -> Optional[Dict[str, Any]]:
+    cached = _MLFLOW_STATUS_CACHE.get(url)
+    if not cached or now - cached[0] > MLFLOW_HEALTH_CACHE_TTL_SECONDS:
+        return None
+    payload = cached[1]
+    if payload.get("status") == "available":
+        return None
+    return dict(payload)
+
+
+def _store_mlflow_status_cache(url: str, payload: Dict[str, Any], store_time: float) -> None:
+    if payload.get("status") == "available":
+        _MLFLOW_STATUS_CACHE.pop(url, None)
+        return
+    if len(_MLFLOW_STATUS_CACHE) >= MLFLOW_HEALTH_CACHE_MAX_ENTRIES and url not in _MLFLOW_STATUS_CACHE:
+        oldest_url = min(_MLFLOW_STATUS_CACHE, key=lambda key: _MLFLOW_STATUS_CACHE[key][0])
+        _MLFLOW_STATUS_CACHE.pop(oldest_url, None)
+    _MLFLOW_STATUS_CACHE[url] = (store_time, dict(payload))
+
+
+def _mlflow_status_payload() -> Dict[str, Any]:
+    url = _mlflow_url()
+    now = time.monotonic()
+    with _MLFLOW_STATUS_CACHE_LOCK:
+        cached_payload = _fresh_cached_mlflow_payload(url, now)
+        if cached_payload is not None:
+            return cached_payload
+
+    payload = _probe_mlflow_status_payload(url)
+    store_time = time.monotonic()
+    with _MLFLOW_STATUS_CACHE_LOCK:
+        cached_payload = _fresh_cached_mlflow_payload(url, store_time)
+        if cached_payload is not None:
+            return cached_payload
+        _store_mlflow_status_cache(url, payload, store_time)
+    return payload
+
+
+def _clear_mlflow_status_cache() -> None:
+    with _MLFLOW_STATUS_CACHE_LOCK:
+        _MLFLOW_STATUS_CACHE.clear()
+
+
+def _probe_mlflow_status_payload(url: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "url": _public_mlflow_url(url),
+        "status": "unavailable",
+        "role": "experiment_raw_records",
+        "checked_at": _now_iso(),
+        "health_checked": False,
+    }
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL must be an http(s) URL."
+        return payload
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL port is invalid."
+        return payload
+    if parsed.username or parsed.password:
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL must not include username or password."
+        return payload
+    decoded_path = unquote(parsed.path or "")
+    if any(part == ".." for part in decoded_path.replace("\\", "/").split("/")):
+        payload["status"] = "invalid"
+        payload["error"] = "MLFLOW_URL must not contain path traversal."
+        return payload
+    # This local-only probe avoids remote SSRF by refusing non-loopback hostnames
+    # and by limiting local health checks to the MLflow ports DSA owns.
+    if parsed.hostname not in LOCAL_MLFLOW_HOSTS:
+        payload["status"] = "linked"
+        payload["error"] = "Health check intentionally skipped for non-local MLflow URL; link is displayed without availability verification."
+        return payload
+    if parsed_port not in LOCAL_MLFLOW_HEALTH_PORTS:
+        payload["status"] = "invalid"
+        payload["error"] = "Local MLflow health checks are limited to ports 6006 and 6606."
+        return payload
+
+    probe_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""))
+    request = Request(probe_url, headers={"User-Agent": "DSA-MLflow-health-check/1.0"})
+    payload["health_checked"] = True
+    try:
+        with urlopen(request, timeout=MLFLOW_HEALTH_TIMEOUT_SECONDS) as response:
+            status_code = response.getcode()
+    except HTTPError as exc:
+        status_code = exc.code
+    except (OSError, TimeoutError, URLError, ValueError) as exc:
+        payload["error"] = _sanitize_public_error(str(exc))
+        return payload
+
+    payload["status"] = "available" if 200 <= int(status_code) < 400 else "unavailable"
+    if payload["status"] == "unavailable":
+        payload["error"] = f"MLflow returned HTTP {status_code}."
+    return payload
 
 
 @lru_cache(maxsize=1)
@@ -41,23 +226,42 @@ def get_quant_job_service() -> QuantJobService:
     return QuantJobService()
 
 
+def _clear_quant_job_service_cache() -> None:
+    get_quant_job_service.cache_clear()
+
+
+def _sanitize_job_error(error: Optional[str]) -> Optional[str]:
+    return _sanitize_public_error(error)
+
+
+def _job_public_payload(job: QuantJob) -> Dict[str, Any]:
+    payload = job.to_dict()
+    payload.pop("command", None)
+    payload.pop("cwd", None)
+    payload.pop("log_path", None)
+    payload["error"] = _sanitize_job_error(job.error)
+    payload["artifact_paths"] = [Path(path).name for path in job.artifact_paths]
+    return payload
+
+
 def _job_response(job: QuantJob) -> QuantJobResponse:
-    return QuantJobResponse(**job.to_dict())
+    payload = _job_public_payload(job)
+    return QuantJobResponse(**payload)
 
 
-def _is_allowed_artifact_path(path: Path, service: QuantJobService) -> bool:
+def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _ArtifactPathResolution:
     try:
-        resolved = path.expanduser().resolve(strict=True)
+        resolved = path.expanduser().resolve(strict=False)
     except OSError:
-        return False
+        return _ArtifactPathResolution(path=None)
     allowed_roots = {REPORTS_ROOT, service.jobs_root.parent}
     for root in allowed_roots:
         try:
             resolved.relative_to(root.expanduser().resolve())
-            return True
+            return _ArtifactPathResolution(path=resolved if resolved.is_file() else None)
         except ValueError:
             continue
-    return False
+    return _ArtifactPathResolution(path=None, is_forbidden=True)
 
 
 @router.get("/status", response_model=QuantStatusResponse)
@@ -82,12 +286,9 @@ async def get_quant_status() -> QuantStatusResponse:
         latest_training=research_status.get("latest_training"),
         cash_control_backtest=research_status.get("cash_control_backtest"),
         qlib_predictions=research_status.get("qlib_predictions"),
+        qlib_research=research_status.get("qlib_research"),
         experiment_notebook=research_status.get("experiment_notebook"),
-        mlflow={
-            "url": _mlflow_url(),
-            "status": "linked",
-            "role": "experiment_raw_records",
-        },
+        mlflow=await asyncio.to_thread(_mlflow_status_payload),
     )
 
 
@@ -128,23 +329,65 @@ async def _quant_job_event_generator(
     poll_interval_seconds: float = JOB_STREAM_POLL_INTERVAL_SECONDS,
 ):
     yield _sse_event("connected", {"type": "connected"})
-    for _ in range(max(1, int(max_job_events))):
-        jobs = [job.to_dict() for job in await _list_jobs_for_stream(service)]
-        yield _sse_event("jobs", {"type": "jobs", "jobs": jobs})
-        if poll_interval_seconds > 0:
-            await asyncio.sleep(poll_interval_seconds)
+    try:
+        for _ in range(max(1, int(max_job_events))):
+            jobs = [_job_public_payload(job) for job in await _list_jobs_for_stream(service)]
+            yield _sse_event("jobs", {"type": "jobs", "jobs": jobs})
+            if poll_interval_seconds > 0:
+                await asyncio.sleep(poll_interval_seconds)
+    except Exception:  # noqa: BLE001 - keep the browser stream self-describing.
+        logger.exception("Unable to stream quant job updates.")
+        yield _sse_event(
+            "stream_end",
+            {"type": "stream_end", "reason": "error", "error": "Unable to stream quant job updates."},
+        )
+        return
     yield _sse_event("stream_end", {"type": "stream_end", "reason": "max_events"})
+
+
+def _try_acquire_stream_slot() -> bool:
+    global _QUANT_JOB_STREAM_ACTIVE
+    with _QUANT_JOB_STREAM_LOCK:
+        if _QUANT_JOB_STREAM_ACTIVE >= MAX_QUANT_JOB_STREAMS:
+            return False
+        _QUANT_JOB_STREAM_ACTIVE += 1
+        return True
+
+
+def _release_stream_slot() -> None:
+    global _QUANT_JOB_STREAM_ACTIVE
+    with _QUANT_JOB_STREAM_LOCK:
+        _QUANT_JOB_STREAM_ACTIVE = max(0, _QUANT_JOB_STREAM_ACTIVE - 1)
+
+
+async def _limited_quant_job_event_generator(service: QuantJobService):
+    try:
+        async for event in _quant_job_event_generator(service):
+            yield event
+    finally:
+        _release_stream_slot()
 
 
 @router.get("/jobs/stream")
 async def stream_quant_jobs() -> StreamingResponse:
     """Stream lightweight quant job snapshots for the workflow page."""
     service = get_quant_job_service()
-    return StreamingResponse(
-        _quant_job_event_generator(service),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-    )
+    if not _try_acquire_stream_slot():
+        raise api_error(429, "too_many_streams", "Too many quant job stream connections.")
+    try:
+        return StreamingResponse(
+            _limited_quant_job_event_generator(service),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception:
+        _release_stream_slot()
+        raise
 
 
 @router.get("/jobs/{job_id}", response_model=QuantJobResponse)
@@ -167,6 +410,7 @@ async def get_quant_job_log(
         payload = service.get_log(job_id, max_bytes=max_bytes)
     except KeyError as exc:
         raise api_error(404, "not_found", f"Quant job {job_id} was not found.") from exc
+    payload.pop("log_path", None)
     return QuantJobLogResponse(**payload)
 
 
@@ -182,15 +426,16 @@ async def get_quant_job_artifact(job_id: str, artifact_index: int) -> FileRespon
         raise api_error(404, "not_found", f"Quant job artifact {artifact_index} was not found.")
 
     artifact_path = Path(job.artifact_paths[artifact_index])
-    if not artifact_path.is_file():
-        raise api_error(404, "not_found", f"Quant job artifact {artifact_index} is no longer available.")
-    if not _is_allowed_artifact_path(artifact_path, service):
+    artifact_resolution = _resolved_allowed_artifact_path(artifact_path, service)
+    if artifact_resolution.is_forbidden:
         raise api_error(403, "forbidden", f"Quant job artifact {artifact_index} is outside the allowed reports directory.")
+    if artifact_resolution.path is None:
+        raise api_error(404, "not_found", f"Quant job artifact {artifact_index} is no longer available.")
 
     is_text_artifact = artifact_path.suffix.lower() in TEXT_ARTIFACT_SUFFIXES
     try:
         return FileResponse(
-            artifact_path,
+            artifact_resolution.path,
             filename=artifact_path.name,
             media_type="text/plain" if is_text_artifact else None,
             content_disposition_type="inline" if is_text_artifact else "attachment",

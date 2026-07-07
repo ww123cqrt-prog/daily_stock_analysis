@@ -102,6 +102,29 @@ export type ResearchQlibPredictions = {
   artifacts?: Record<string, string>;
 };
 
+export type ResearchQlibResearchSection = {
+  section: string;
+  title: string;
+  status: string;
+  generatedAt?: string;
+  mode?: string;
+  path?: string | null;
+  artifacts?: Record<string, string>;
+  run?: Record<string, unknown>;
+  metrics?: Record<string, unknown>;
+  scoreFactor?: Record<string, unknown>;
+  riskMetrics?: Record<string, unknown>;
+  nextActions?: string[];
+  limitations?: string[];
+};
+
+export type ResearchQlibResearch = {
+  status: string;
+  availableSections: number;
+  totalSections: number;
+  sections: Record<string, ResearchQlibResearchSection>;
+};
+
 export type ResearchExperimentRun = {
   runId?: string;
   experimentName?: string;
@@ -134,6 +157,15 @@ export type ResearchExperimentNotebook = {
   runsPath?: string;
 };
 
+export type ResearchMlflow = {
+  url: string;
+  status?: string;
+  role?: string;
+  checkedAt?: string | null;
+  healthChecked?: boolean;
+  error?: string | null;
+};
+
 export type ResearchExternalTool = {
   name: string;
   status: string;
@@ -148,6 +180,73 @@ export type ResearchExternalTool = {
 export type ResearchExternalTools = {
   tonghuashun?: ResearchExternalTool;
   iphoneMirroring?: ResearchExternalTool;
+};
+
+export type ResearchDataHygieneInventory = {
+  status: string;
+  path?: string | null;
+  generatedAt?: string | null;
+  officialEntries?: number;
+  candidateEntries?: number;
+  legacyEntries?: number;
+  archiveCandidates?: number;
+};
+
+export type ResearchDataHygieneCleanupAction = {
+  action: string;
+  source: string;
+  destination?: string;
+  reason: string;
+  risk?: string;
+  requiresConfirmation: boolean;
+};
+
+export type ResearchDataHygieneCleanupPlan = {
+  status: string;
+  path?: string | null;
+  generatedAt?: string | null;
+  dryRunOnly?: boolean;
+  totalActions?: number;
+  previewLimit?: number;
+  truncated?: boolean;
+  actions?: ResearchDataHygieneCleanupAction[];
+};
+
+export type ResearchDataHygieneQualitySummary = {
+  stockUniverse?: string;
+  usableInstruments?: string;
+  totalRows?: string;
+  dateRange?: string;
+};
+
+export type ResearchDataHygieneReport = {
+  status: string;
+  path?: string | null;
+  summary?: ResearchDataHygieneQualitySummary | null;
+};
+
+export type ResearchDataHygieneManifest = {
+  status: string;
+  path?: string | null;
+  generatedAt?: string | null;
+  sourceReport?: string | null;
+  officialEntries?: number;
+};
+
+export type ResearchDataHygieneMaintenanceLock = {
+  locked: boolean;
+  path: string;
+  updatedAt?: string | null;
+};
+
+export type ResearchDataHygiene = {
+  inventory: ResearchDataHygieneInventory;
+  cleanupPlan: ResearchDataHygieneCleanupPlan;
+  qualityReport: ResearchDataHygieneReport;
+  cleaningStrategy: ResearchDataHygieneReport;
+  manifest?: ResearchDataHygieneManifest | null;
+  readme?: ResearchDataHygieneReport | null;
+  maintenanceLock: ResearchDataHygieneMaintenanceLock;
 };
 
 export type ResearchCapabilityMatrixItem = {
@@ -213,7 +312,10 @@ export type ResearchStatus = {
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
+  qlibResearch?: ResearchQlibResearch | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
+  mlflow?: ResearchMlflow | null;
+  dataHygiene?: ResearchDataHygiene | null;
   externalTools?: ResearchExternalTools | null;
   capabilityMatrix?: ResearchCapabilityMatrixItem[] | null;
   functionInventory?: ResearchFunctionInventoryItem[] | null;
@@ -221,10 +323,40 @@ export type ResearchStatus = {
   acceptanceChecklist?: ResearchAcceptanceChecklistItem[] | null;
 };
 
+export function convertQlibResearch(data: unknown): ResearchQlibResearch | null {
+  if (!data || typeof data !== 'object') {
+    return null;
+  }
+  const raw = data as Record<string, unknown>;
+  const camel = toCamelCase<Omit<ResearchQlibResearch, 'sections'> & { sections?: unknown }>(raw);
+  const rawSections = raw.sections;
+  const sections = rawSections && typeof rawSections === 'object'
+    ? Object.fromEntries(
+        Object.entries(rawSections as Record<string, unknown>).map(([key, value]) => [
+          key,
+          toCamelCase<ResearchQlibResearchSection>(value),
+        ]),
+      )
+    : {};
+
+  return {
+    status: camel.status || 'missing',
+    availableSections: Number(camel.availableSections || 0),
+    totalSections: Number(camel.totalSections || Object.keys(sections).length),
+    sections,
+  };
+}
+
+function convertResearchStatus(data: Record<string, unknown>): ResearchStatus {
+  const status = toCamelCase<ResearchStatus>(data);
+  status.qlibResearch = convertQlibResearch(data.qlib_research);
+  return status;
+}
+
 export const researchApi = {
   async getStatus(): Promise<ResearchStatus> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/research/status');
-    return toCamelCase<ResearchStatus>(response.data);
+    return convertResearchStatus(response.data);
   },
 
   async archiveExperimentRun(runId: string): Promise<ResearchExperimentMutationResult> {
@@ -237,6 +369,7 @@ export const researchApi = {
   async permanentlyDeleteExperimentRun(runId: string): Promise<ResearchExperimentMutationResult> {
     const response = await apiClient.delete<Record<string, unknown>>(
       `/api/v1/research/experiments/${encodeURIComponent(runId)}/permanent`,
+      { params: { confirm: 'permanent' } },
     );
     return toCamelCase<ResearchExperimentMutationResult>(response.data);
   },

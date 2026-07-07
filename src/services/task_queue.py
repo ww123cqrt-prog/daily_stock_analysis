@@ -42,8 +42,7 @@ def _e2e_fake_analysis_enabled() -> bool:
     """Return whether browser smoke tests may use deterministic local analysis."""
     requested = os.environ.get("DSA_E2E_FAKE_ANALYSIS", "").strip().lower() in {"1", "true", "yes", "on"}
     managed_smoke = os.environ.get("DSA_WEB_SMOKE_MANAGED", "").strip().lower() in {"1", "true", "yes", "on"}
-    pytest_managed = bool(os.environ.get("PYTEST_CURRENT_TEST", "").strip())
-    return requested and (managed_smoke or pytest_managed)
+    return requested and managed_smoke
 
 
 def _build_e2e_fake_analysis_result(

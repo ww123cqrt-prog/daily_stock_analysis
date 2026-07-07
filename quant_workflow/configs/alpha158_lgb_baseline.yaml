@@ -1,0 +1,48 @@
+qlib_init:
+    provider_uri: "quant_data/qlib/cn_data_baostock_jqdata"
+    region: cn
+
+task:
+    model:
+        class: LGBModel
+        module_path: qlib.contrib.model.gbdt
+        kwargs:
+            loss: mse
+            early_stopping_rounds: 50
+            num_boost_round: 1000
+            colsample_bytree: 0.8879
+            learning_rate: 0.0421
+            subsample: 0.8789
+            lambda_l1: 205.6999
+            lambda_l2: 580.9768
+            max_depth: 8
+            num_leaves: 210
+            num_threads: 4
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: Alpha158
+                module_path: qlib.contrib.data.handler
+                kwargs:
+                    start_time: "2020-01-02"
+                    end_time: "2025-06-11"
+                    fit_start_time: "2020-01-02"
+                    fit_end_time: "2023-06-30"
+                    instruments: "all"
+            segments:
+                train: ["2020-01-02", "2023-06-30"]
+                valid: ["2023-07-01", "2024-06-30"]
+                test:  ["2024-07-01", "2025-06-11"]
+    record:
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>

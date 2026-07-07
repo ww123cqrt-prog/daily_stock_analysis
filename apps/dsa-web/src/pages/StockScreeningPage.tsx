@@ -1,5 +1,5 @@
 import type React from 'react';
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, CircleAlert, Play, PlusCircle, Search, SlidersHorizontal } from 'lucide-react';
 import {
   alphasiftApi,
@@ -15,6 +15,8 @@ import { useUiLanguage } from '../contexts/UiLanguageContext';
 const MARKETS = [{ id: 'cn', label: 'A 股' }];
 const SCREEN_TASK_STORAGE_KEY = 'dsa.alphasift.activeScreenTask.v1';
 const SCREEN_TASK_POLL_INTERVAL_MS = 2000;
+const SCREEN_TASK_MAX_CONSECUTIVE_POLL_FAILURES = 6;
+const SCREEN_TASK_MAX_POLL_DURATION_MS = 5 * 60 * 1000;
 
 type PersistedScreenTask = {
   taskId: string;
@@ -290,6 +292,7 @@ const StockScreeningPage: React.FC = () => {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(restoredTask?.taskId ?? null);
   const [taskProgress, setTaskProgress] = useState(restoredTask?.taskId ? 10 : 0);
   const [taskMessage, setTaskMessage] = useState(restoredTask?.taskId ? '正在恢复选股任务状态...' : '');
+  const submittingRef = useRef(false);
 
   const selectedStrategy = useMemo(() => strategies.find((item) => item.id === strategy), [strategies, strategy]);
   const selectedStrategyTitle = selectedStrategy?.name || selectedStrategy?.title || '自定义策略';
@@ -304,6 +307,7 @@ const StockScreeningPage: React.FC = () => {
     : screenMessages;
   const isScreeningEnabled = enabled && available;
   const statusText = isScreeningEnabled ? '选股已开启' : '选股未开启';
+  const hasCompletedScreenRun = Boolean(screenMeta);
 
   const applyScreenResult = useCallback((result: AlphaSiftScreenResponse) => {
     const nextCandidates = result.candidates || [];
@@ -371,6 +375,8 @@ const StockScreeningPage: React.FC = () => {
     const pollingTaskId = activeTaskId;
     let active = true;
     let timer: ReturnType<typeof window.setTimeout> | undefined;
+    let consecutiveFailures = 0;
+    const startedAt = Date.now();
 
     function finishTask() {
       clearPersistedScreenTask();
@@ -382,6 +388,7 @@ const StockScreeningPage: React.FC = () => {
       const nextProgress = Number(task.progress ?? 0);
       setTaskProgress(Number.isFinite(nextProgress) ? nextProgress : 0);
       setTaskMessage(task.message || '');
+      consecutiveFailures = 0;
 
       if (task.status === 'completed') {
         if (task.result) {
@@ -406,6 +413,11 @@ const StockScreeningPage: React.FC = () => {
       }
 
       if (isRunningScreenTask(task.status)) {
+        if (Date.now() - startedAt >= SCREEN_TASK_MAX_POLL_DURATION_MS) {
+          setError('选股任务轮询已超过 5 分钟，已停止自动重试。请稍后重新运行或检查后端任务状态。');
+          finishTask();
+          return;
+        }
         setLoading(true);
         timer = window.setTimeout(pollTask, SCREEN_TASK_POLL_INTERVAL_MS);
         return;
@@ -431,6 +443,15 @@ const StockScreeningPage: React.FC = () => {
         if (isUnrecoverableScreenTaskError(parsedError)) {
           setCandidates([]);
           setScreenMeta(null);
+          finishTask();
+          return;
+        }
+        consecutiveFailures += 1;
+        if (
+          consecutiveFailures >= SCREEN_TASK_MAX_CONSECUTIVE_POLL_FAILURES
+          || Date.now() - startedAt >= SCREEN_TASK_MAX_POLL_DURATION_MS
+        ) {
+          setError(`${formatParsedApiError(parsedError) || '暂时无法获取选股任务状态'}；已停止自动重试，请重新运行。`);
           finishTask();
           return;
         }
@@ -494,6 +515,10 @@ const StockScreeningPage: React.FC = () => {
   };
 
   const handleSubmit = async () => {
+    if (submittingRef.current || loading || !isScreeningEnabled) {
+      return;
+    }
+    submittingRef.current = true;
     setLoading(true);
     setError('');
     setScreenMeta(null);
@@ -514,6 +539,8 @@ const StockScreeningPage: React.FC = () => {
       setCandidates([]);
       setLoading(false);
       setError(toApiErrorMessage(err, '选股任务提交失败，请稍后重试。'));
+    } finally {
+      submittingRef.current = false;
     }
   };
 
@@ -691,7 +718,13 @@ const StockScreeningPage: React.FC = () => {
             </span>
             <div>
               <h2 className="text-sm font-semibold text-foreground">
-                {loading ? '选股运行中' : candidates.length > 0 ? '选股完成' : isScreeningEnabled ? '等待运行' : '等待开启'}
+                {loading
+                  ? '选股运行中'
+                  : hasCompletedScreenRun
+                    ? '选股完成'
+                    : isScreeningEnabled
+                      ? '等待运行'
+                      : '等待开启'}
               </h2>
               <p className="mt-1 text-xs text-secondary-text">
                 {loading
@@ -742,7 +775,11 @@ const StockScreeningPage: React.FC = () => {
         {candidates.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border bg-surface/70 px-5 py-10 text-center">
             <p className="text-sm font-medium text-foreground">暂无结果</p>
-            <p className="mt-2 text-sm text-secondary-text">开启 AlphaSift 后点击“运行选股”生成候选列表。</p>
+            <p className="mt-2 text-sm text-secondary-text">
+              {hasCompletedScreenRun
+                ? '本次筛选没有返回候选，可调整策略参数或稍后重试。'
+                : '开启 AlphaSift 后点击“运行选股”生成候选列表。'}
+            </p>
           </div>
         ) : (
           <div className="overflow-hidden rounded-xl border border-border">

@@ -213,6 +213,31 @@ describe('StockScreeningPage', () => {
     });
   });
 
+  it('shows a completed empty state when AlphaSift returns no candidates', async () => {
+    getAlphaSiftStatus.mockResolvedValueOnce({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      candidates: [],
+      candidateCount: 0,
+      snapshotCount: 2,
+      afterFilterCount: 0,
+    });
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(await screen.findByText('选股完成')).toBeInTheDocument();
+    expect(screen.getByText('0 条候选')).toBeInTheDocument();
+    expect(screen.getByText('本次筛选没有返回候选，可调整策略参数或稍后重试。')).toBeInTheDocument();
+    expect(screen.queryByText('等待运行')).not.toBeInTheDocument();
+  });
+
   it('clears previous screening candidates when strategy changes', async () => {
     getStrategies.mockResolvedValueOnce({
       enabled: true,

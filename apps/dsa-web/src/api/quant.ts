@@ -1,12 +1,14 @@
 import apiClient from './index';
-import type {
-  ResearchCashControlBacktest,
-  ResearchDataSource,
-  ResearchExperimentNotebook,
-  ResearchQlibPredictions,
-  ResearchQlibProvider,
-  ResearchTrainingReadiness,
-  ResearchTrainingResult,
+import {
+  convertQlibResearch,
+  type ResearchCashControlBacktest,
+  type ResearchDataSource,
+  type ResearchExperimentNotebook,
+  type ResearchQlibPredictions,
+  type ResearchQlibResearch,
+  type ResearchQlibProvider,
+  type ResearchTrainingReadiness,
+  type ResearchTrainingResult,
 } from './research';
 import { toCamelCase } from './utils';
 
@@ -18,8 +20,6 @@ export interface QuantJob {
   label: string;
   status: QuantJobStatus;
   params: Record<string, unknown>;
-  command: string[];
-  cwd: string;
   pid?: number | null;
   returnCode?: number | null;
   createdAt: string;
@@ -27,7 +27,6 @@ export interface QuantJob {
   completedAt?: string | null;
   updatedAt: string;
   error?: string | null;
-  logPath: string;
   artifactPaths: string[];
 }
 
@@ -40,6 +39,9 @@ export interface QuantMlflowStatus {
   url: string;
   status: string;
   role: string;
+  checkedAt?: string | null;
+  healthChecked?: boolean;
+  error?: string | null;
 }
 
 export interface QuantStatus {
@@ -55,6 +57,7 @@ export interface QuantStatus {
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
+  qlibResearch?: ResearchQlibResearch | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   mlflow?: QuantMlflowStatus;
 }
@@ -68,11 +71,14 @@ export interface QuantJobLog {
   jobId: string;
   content: string;
   truncated: boolean;
-  logPath: string;
 }
 
 function convertJob(data: unknown): QuantJob {
-  return toCamelCase<QuantJob>(data);
+  const job = toCamelCase<QuantJob & { command?: unknown; cwd?: unknown; logPath?: unknown }>(data);
+  delete job.command;
+  delete job.cwd;
+  delete job.logPath;
+  return job;
 }
 
 function convertJobTypeInfo(data: unknown): QuantJobTypeInfo {
@@ -103,6 +109,7 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     latestTraining: camel.latestTraining ?? null,
     cashControlBacktest: camel.cashControlBacktest ?? null,
     qlibPredictions: camel.qlibPredictions ?? null,
+    qlibResearch: convertQlibResearch(data.qlib_research),
     experimentNotebook: camel.experimentNotebook ?? null,
     mlflow: camel.mlflow,
   };
@@ -163,7 +170,7 @@ export const quantApi = {
     const response = await apiClient.post<Record<string, unknown>>(
       `/api/v1/quant/jobs/${encodeURIComponent(jobId)}/cancel`,
     );
-    return toCamelCase<QuantJob>(response.data);
+    return convertJob(response.data);
   },
 
   getJobArtifactUrl(jobId: string, artifactIndex: number): string {

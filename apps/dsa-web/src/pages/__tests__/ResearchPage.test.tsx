@@ -119,6 +119,76 @@ describe('ResearchPage', () => {
           },
         ],
       },
+      mlflow: {
+        url: 'http://127.0.0.1:6106/',
+        status: 'linked',
+        role: 'experiment_raw_records',
+        checkedAt: null,
+        error: 'Health check is shown on the workflow page.',
+      },
+      dataHygiene: {
+        inventory: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_hygiene_inventory_latest.json',
+          generatedAt: '2026-07-06T08:00:00+08:00',
+          officialEntries: 2,
+          candidateEntries: 4,
+          legacyEntries: 5,
+          archiveCandidates: 8,
+        },
+        cleanupPlan: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_hygiene_cleanup_plan_latest.json',
+          generatedAt: '2026-07-06T08:00:00+08:00',
+          dryRunOnly: true,
+          totalActions: 2,
+          actions: [
+            {
+              action: 'archive',
+              source: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data',
+              destination: '/Users/cq/WorkingProjects/quant_data/archive/qlib/cn_data',
+              reason: '旧测试 provider，不是当前正式入口。',
+              risk: '可能影响旧实验复现。',
+              requiresConfirmation: true,
+            },
+            {
+              action: 'review',
+              source: '',
+              reason: '清理计划动作缺少来源时仍应能展示。',
+              requiresConfirmation: false,
+            },
+          ],
+        },
+        qualityReport: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_quality_report_latest.md',
+          summary: {
+            stockUniverse: '5509',
+            usableInstruments: '5340',
+            totalRows: '7,580,087',
+            dateRange: '2020-01-02 ~ 2026-07-03',
+          },
+        },
+        cleaningStrategy: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_cleaning_strategy_latest.md',
+        },
+        manifest: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_data/DATA_MANIFEST.json',
+          generatedAt: '2026-07-06T21:49:15+08:00',
+          officialEntries: 2,
+        },
+        readme: {
+          status: 'available',
+          path: '/Users/cq/WorkingProjects/quant_data/README.md',
+        },
+        maintenanceLock: {
+          locked: false,
+          path: '/Users/cq/WorkingProjects/quant_data/.maintenance.lock',
+          content: '',
+        },
+      },
       externalTools: {
         tonghuashun: {
           name: '同花顺桌面端',
@@ -181,14 +251,14 @@ describe('ResearchPage', () => {
         {
           id: 'china_astock_quant_reuse',
           module: 'china-astock-quant',
-          status: 'partial',
-          entry: '研究页项目关系',
-          route: '/research',
-          tests: 'CodeGraph 已初始化，尚未直接包装脚本',
-          browser: '暂作为策略参考展示',
-          review: '待接入具体脚本后复审',
-          next: '筛选可复用策略并白名单化',
-          restrictions: ['不接入交易执行'],
+          status: 'available',
+          entry: '工作流技术指标报告 / 研究页项目关系',
+          route: '/workflow',
+          tests: 'report_china_astock_indicators + run_china_astock_comparison + DSA quant API 测试',
+          browser: '可从网页生成只读技术指标报告和策略对比报告',
+          review: '待本阶段 opencode 复审',
+          next: '继续评估是否把事件驱动回测包装为只读对比报告。',
+          restrictions: ['不改造成主网页', '不接入交易执行'],
         },
         {
           id: 'external_tools_tonghuashun',
@@ -232,14 +302,14 @@ describe('ResearchPage', () => {
           id: 'china_astock_reference',
           area: '参考项目复用',
           name: 'china-astock-quant 可复用能力',
-          status: 'partial',
-          entry: '研究页清单 + 工作流对比报告',
-          route: '/research',
+          status: 'available',
+          entry: '研究页清单 + 工作流指标报告 + 工作流对比报告',
+          route: '/workflow',
           owner: 'china-astock-quant + quant_workflow',
-          coverage: '已作为策略、指标、回测工程经验参考。',
-          gaps: '尚未把策略直接白名单包装成可运行回测任务。',
-          next: '优先接入指标库和策略对比。',
-          verification: 'run_china_astock_comparison 测试。',
+          coverage: '已复用指标库生成只读技术指标报告，并有只读策略对比报告入口。',
+          gaps: '事件驱动回测和策略搜索尚未作为网页任务直接运行。',
+          next: '继续评估是否包装事件驱动回测；交易相关模块保持禁止接入。',
+          verification: 'report_china_astock_indicators 测试 + run_china_astock_comparison 测试 + WorkflowPage 测试。',
         },
         {
           id: 'quant_workflow_script_coverage',
@@ -249,9 +319,9 @@ describe('ResearchPage', () => {
           entry: '研究页功能入口盘点',
           route: '/research',
           owner: 'quant_workflow + daily_stock_analysis',
-          coverage: '网页白名单覆盖核心任务；add_index_benchmark.py 与 generate_csi300.py 目前作为 provider 维护脚本保留在脚本层。',
-          gaps: 'supervise_baostock.py 与网页任务中心的持久任务能力重叠，暂不单独暴露。',
-          next: '把 provider 维护脚本改造成安全 dry-run 包装后，再考虑加入工作流任务中心。',
+          coverage: '网页白名单覆盖核心任务；report_data_hygiene.py 可生成 inventory 与 dry-run cleanup plan；add_index_benchmark.py 与 generate_csi300.py 已作为 provider 维护预演接入网页任务中心。',
+          gaps: 'supervise_baostock.py 与网页任务中心的持久任务能力重叠，暂不单独暴露；provider 维护任务当前只开放 dry-run 预演。',
+          next: '先保持 provider 维护任务为 dry-run；若未来需要真实写入，必须补二次确认、目标 provider 参数和产物 diff 预览。',
           verification: 'research_status API 测试 + ResearchPage 功能入口盘点展示。',
         },
       ],
@@ -263,8 +333,8 @@ describe('ResearchPage', () => {
           status: 'available',
           priority: 'P1',
           decision: '优先复用',
-          target: 'quant_workflow 指标/策略报告',
-          next: '复用 sma/ema/rsi/atr/bollinger 做 DSA 技术分析和策略报告补强。',
+          target: '工作流指标报告 report_china_astock_indicators',
+          next: '继续把指标报告结果接入研究页摘要和后续技术分析解释。',
           restrictions: [],
         },
         {
@@ -351,7 +421,11 @@ describe('ResearchPage', () => {
     expect(screen.getByText('本机炒股软件读取')).toBeInTheDocument();
     expect(screen.getByText('iPhone 镜像 App 观察')).toBeInTheDocument();
 
-    expect(screen.getByRole('link', { name: /打开 MLflow/ })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    await waitFor(() => {
+      expect(screen.getByRole('link', { name: /打开 MLflow/ })).toHaveAttribute('href', 'http://127.0.0.1:6106/');
+    });
+    expect(screen.getAllByText('已链接').length).toBeGreaterThan(0);
+    expect(screen.getByText('Health check is shown on the workflow page.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /打开工作流/ })).toHaveAttribute('href', '/workflow');
 
     expect(await screen.findByText('数据状态')).toBeInTheDocument();
@@ -376,6 +450,19 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText(/长历史 baseline 已跑通/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/补充风险控制和市场择时实验/).length).toBeGreaterThan(0);
 
+    expect(screen.getByText('数据治理')).toBeInTheDocument();
+    expect(screen.getByText(/数据 Manifest/)).toBeInTheDocument();
+    expect(screen.getByText(/治理说明/)).toBeInTheDocument();
+    expect(screen.getByText('数据盘点')).toBeInTheDocument();
+    expect(screen.getByText('清理计划')).toBeInTheDocument();
+    expect(screen.getByText('清理动作预览')).toBeInTheDocument();
+    expect(screen.getByText('archive')).toBeInTheDocument();
+    expect(screen.getByText('未指定来源')).toBeInTheDocument();
+    expect(screen.getByText('需要确认')).toBeInTheDocument();
+    expect(screen.getByText('总行数')).toBeInTheDocument();
+    expect(screen.getByText('7,580,087')).toBeInTheDocument();
+    expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
+
     expect(screen.getByText('能力验收矩阵')).toBeInTheDocument();
     expect(screen.getAllByText('daily_stock_analysis WebUI').length).toBeGreaterThan(0);
     expect(screen.getAllByText('quant_workflow 流水线').length).toBeGreaterThan(0);
@@ -396,10 +483,14 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText('quant_workflow 脚本覆盖盘点').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/add_index_benchmark\.py/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/generate_csi300\.py/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/report_data_hygiene\.py/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/dry-run cleanup plan/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/supervise_baostock\.py/).length).toBeGreaterThan(0);
     expect(screen.getByText('china-astock-quant 复用清单')).toBeInTheDocument();
     expect(screen.getByText('技术指标库')).toBeInTheDocument();
     expect(screen.getByText('strategies/_indicators.py')).toBeInTheDocument();
+    expect(screen.getAllByText(/report_china_astock_indicators/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/工作流指标报告/).length).toBeGreaterThan(0);
     expect(screen.getByText('纸面交易/券商适配')).toBeInTheDocument();
     expect(screen.getByText('阶段验收清单')).toBeInTheDocument();
     expect(screen.getByText('项目整洁')).toBeInTheDocument();
@@ -431,6 +522,7 @@ describe('ResearchPage', () => {
     expect(screen.getByText('Trainable')).toBeInTheDocument();
     expect(screen.getAllByText('Partial').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Available').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Linked').length).toBeGreaterThan(0);
     expect(screen.getByText('Capability Acceptance Matrix')).toBeInTheDocument();
     expect(screen.getByText('Function Entry Inventory')).toBeInTheDocument();
     expect(screen.getByText('china-astock-quant Reuse List')).toBeInTheDocument();

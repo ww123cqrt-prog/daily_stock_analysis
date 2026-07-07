@@ -167,6 +167,10 @@ beforeEach(() => {
       ],
       summary: { latestRows: 3 },
     },
+    mlflow: {
+      url: 'http://127.0.0.1:6606/',
+      role: 'experiment_raw_records',
+    },
     experimentNotebook: {
       status: 'available',
       totalRuns: 1,
@@ -288,6 +292,7 @@ describe('BacktestPage', () => {
     expect(screen.getByText('/Users/cq/WorkingProjects/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml')).toBeInTheDocument();
     expect(screen.getByText('MLflow Run')).toBeInTheDocument();
     expect(screen.getByText('pred.pkl')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '打开 MLflow' })).toHaveAttribute('href', 'http://127.0.0.1:6606/');
     expect(screen.getByRole('link', { name: '运行训练任务' })).toHaveAttribute('href', '/workflow');
   });
 

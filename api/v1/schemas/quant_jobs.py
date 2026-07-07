@@ -19,8 +19,6 @@ class QuantJobResponse(BaseModel):
     label: str
     status: str
     params: Dict[str, Any] = Field(default_factory=dict)
-    command: List[str] = Field(default_factory=list)
-    cwd: str
     pid: Optional[int] = None
     return_code: Optional[int] = None
     created_at: str
@@ -28,7 +26,6 @@ class QuantJobResponse(BaseModel):
     completed_at: Optional[str] = None
     updated_at: str
     error: Optional[str] = None
-    log_path: str
     artifact_paths: List[str] = Field(default_factory=list)
 
 
@@ -41,7 +38,6 @@ class QuantJobLogResponse(BaseModel):
     job_id: str
     content: str
     truncated: bool
-    log_path: str
 
 
 class QuantStatusResponse(BaseModel):
@@ -57,5 +53,6 @@ class QuantStatusResponse(BaseModel):
     latest_training: Optional[Dict[str, Any]] = None
     cash_control_backtest: Optional[Dict[str, Any]] = None
     qlib_predictions: Optional[Dict[str, Any]] = None
+    qlib_research: Optional[Dict[str, Any]] = None
     experiment_notebook: Optional[Dict[str, Any]] = None
     mlflow: Dict[str, Any] = Field(default_factory=dict)

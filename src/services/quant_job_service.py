@@ -9,6 +9,7 @@ arbitrary shell strings from the web UI.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -26,6 +27,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 
+logger = logging.getLogger(__name__)
+
+
 def _env_path(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
     return Path(raw).expanduser() if raw else default
@@ -33,17 +37,71 @@ def _env_path(name: str, default: Path) -> Path:
 
 DSA_ROOT = _env_path("DSA_ROOT", Path(__file__).resolve().parents[2])
 PROJECTS_ROOT = _env_path("WORKING_PROJECTS_ROOT", DSA_ROOT.parent)
-QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", PROJECTS_ROOT / "quant_workflow")
+QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", DSA_ROOT / "quant_workflow")
 REPORTS_ROOT = _env_path("QUANT_WORKFLOW_REPORTS_ROOT", QUANT_WORKFLOW_ROOT / "reports")
 DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
-QLIB_PYTHON = _env_path("QLIB_PYTHON", Path(sys.executable))
+DSA_VENV_PYTHON = DSA_ROOT / ".venv" / "bin" / "python"
+QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
+_LEGACY_QLIB_PYTHON_WARNING_EMITTED = False
+_MISSING_QUANT_WORKFLOW_PYTHON_WARNING_EMITTED = False
+CHILD_ENV_EXACT_NAMES = {
+    "BAOSTOCK_LOGIN_TIMEOUT",
+    "CHINA_ASTOCK_COMPARISON_TIMEOUT_SECONDS",
+    "CHINA_ASTOCK_PYTHON",
+    "CHINA_ASTOCK_QUANT_ROOT",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NO_COLOR",
+    "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONPATH",
+    "PYTHONUNBUFFERED",
+    "QLIB_CLEANED_PROVIDER_URI",
+    "QLIB_PROVIDER_ROOT",
+    "QLIB_PROVIDER_URI",
+    "QUANT_DATA_ROOT",
+    "QUANT_STOCK_LIST_PATH",
+    "QUANT_WORKFLOW_MLRUNS_DIR",
+    "QUANT_WORKFLOW_PYTHON",
+    "QUANT_WORKFLOW_REPORTS_ROOT",
+    "QUANT_WORKFLOW_ROOT",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "VIRTUAL_ENV",
+    "WORKING_PROJECTS_ROOT",
+}
+CHILD_ENV_PREFIXES = ("BAOSTOCK_", "QLIB_")
 
 JOB_TERMINATE_TIMEOUT_SECONDS = 5
+RECOVERED_RUNNER_POLL_INTERVAL_SECONDS = 1.0
+RECOVERED_RUNNER_MAX_POLL_SECONDS = 48 * 60 * 60
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EXIT_STATUS_FILENAME = "exit_status.json"
 JQDATA_WEB_DRY_RUN_DEFAULT_LIMIT = 3
 JQDATA_WEB_DRY_RUN_MAX_LIMIT = 20
 QLIB_PREDICTION_WEB_TOPK_MAX = 500
+QLIB_RUN_ID_MAX_LENGTH = 256
+QLIB_RESEARCH_WEB_MAX_RUNS = 50
+QLIB_RESEARCH_WEB_MAX_WINDOWS = 60
+QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS = 20
+QLIB_RESEARCH_WEB_MAX_MONTHS = 120
+CHINA_ASTOCK_INDICATOR_DEFAULT_LIMIT = 50
+CHINA_ASTOCK_INDICATOR_MAX_LIMIT = 500
+CHINA_ASTOCK_SYMBOL_MAX_COUNT = 100
+CHINA_ASTOCK_SYMBOL_MAX_LENGTH = 20
+BAOSTOCK_WEB_MAX_RETRIES = 20
+BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES = 1000
+DATA_QUALITY_WEB_MAX_SAMPLE = 100000
+DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS = 3650
+MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS = 5000
+MARKET_REPORT_WEB_MAX_MIN_SYMBOLS = 10000
+OPTIMIZE_STRATEGY_WEB_MAX_PHASE = 4
+CONFIG_FILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _DURABLE_RUNNER_CODE = r"""
 import json
 import os
@@ -88,6 +146,30 @@ NUMERIC_PARAM_RULES = {
     "min_symbols": ("integer", 1),
     "phase": ("integer", 0),
     "topk": ("integer", 1),
+    "max_runs": ("integer", 1),
+    "windows": ("integer", 1),
+    "train_years": ("integer", 1),
+    "valid_months": ("integer", 1),
+    "test_months": ("integer", 1),
+    "step_months": ("integer", 1),
+}
+NUMERIC_PARAM_MAXIMUMS = {
+    "sleep": 60,
+    "retries": BAOSTOCK_WEB_MAX_RETRIES,
+    "timeout": 86400,
+    "max_consecutive_failures": BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES,
+    "overlap_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
+    "merged_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
+    "eval_window_days": DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS,
+    "lookback_days": MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS,
+    "min_symbols": MARKET_REPORT_WEB_MAX_MIN_SYMBOLS,
+    "phase": OPTIMIZE_STRATEGY_WEB_MAX_PHASE,
+    "max_runs": QLIB_RESEARCH_WEB_MAX_RUNS,
+    "windows": QLIB_RESEARCH_WEB_MAX_WINDOWS,
+    "train_years": QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS,
+    "valid_months": QLIB_RESEARCH_WEB_MAX_MONTHS,
+    "test_months": QLIB_RESEARCH_WEB_MAX_MONTHS,
+    "step_months": QLIB_RESEARCH_WEB_MAX_MONTHS,
 }
 JOB_UPDATE_COLUMNS = {
     "status": "status",
@@ -188,6 +270,9 @@ def _validate_numeric_params(params: Mapping[str, Any]) -> None:
             raise ValueError(f"Param {key} must be {_numeric_kind_label(kind)}.") from exc
         if not math.isfinite(float(number)) or number < minimum:
             raise ValueError(f"Param {key} must be >= {minimum}.")
+        maximum = NUMERIC_PARAM_MAXIMUMS.get(key)
+        if maximum is not None and number > maximum:
+            raise ValueError(f"Param {key} must be <= {maximum}.")
 
 
 def _int_param(value: Any, key: str) -> int:
@@ -234,6 +319,8 @@ def _ensure_optimize_strategy_web_dry_run(params: Mapping[str, Any]) -> None:
 
 def _safe_run_id(value: Any) -> str:
     raw = str(value or "").strip()
+    if len(raw) > QLIB_RUN_ID_MAX_LENGTH:
+        raise ValueError(f"run_id must be <= {QLIB_RUN_ID_MAX_LENGTH} characters.")
     if raw and not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
         raise ValueError("run_id may only contain letters, numbers, underscores, or hyphens.")
     return raw
@@ -248,13 +335,91 @@ def _ensure_qlib_prediction_summary_params(params: Mapping[str, Any]) -> None:
     _safe_run_id(params.get("run_id"))
 
 
+def _ensure_qlib_research_params(params: Mapping[str, Any]) -> None:
+    if "topk" in params and params.get("topk") not in (None, ""):
+        topk = _int_param(params.get("topk"), "topk")
+        if topk < 1:
+            raise ValueError("Param topk must be >= 1.")
+        if topk > QLIB_PREDICTION_WEB_TOPK_MAX:
+            raise ValueError(f"Param topk must be <= {QLIB_PREDICTION_WEB_TOPK_MAX}.")
+    if "max_runs" in params and params.get("max_runs") not in (None, ""):
+        max_runs = _int_param(params.get("max_runs"), "max_runs")
+        if max_runs > QLIB_RESEARCH_WEB_MAX_RUNS:
+            raise ValueError(f"Param max_runs must be <= {QLIB_RESEARCH_WEB_MAX_RUNS}.")
+    if "windows" in params and params.get("windows") not in (None, ""):
+        windows = _int_param(params.get("windows"), "windows")
+        if windows > QLIB_RESEARCH_WEB_MAX_WINDOWS:
+            raise ValueError(f"Param windows must be <= {QLIB_RESEARCH_WEB_MAX_WINDOWS}.")
+    if "train_years" in params and params.get("train_years") not in (None, ""):
+        train_years = _int_param(params.get("train_years"), "train_years")
+        if train_years > QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS:
+            raise ValueError(f"Param train_years must be <= {QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS}.")
+    for key in ("valid_months", "test_months", "step_months"):
+        if key in params and params.get(key) not in (None, ""):
+            months = _int_param(params.get(key), key)
+            if months > QLIB_RESEARCH_WEB_MAX_MONTHS:
+                raise ValueError(f"Param {key} must be <= {QLIB_RESEARCH_WEB_MAX_MONTHS}.")
+    _safe_run_id(params.get("run_id"))
+    if "config" in params and params.get("config") not in (None, ""):
+        _safe_config_path(params.get("config"))
+
+
+def _safe_symbols(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > 1000:
+        raise ValueError("symbols is too long.")
+    if not re.fullmatch(r"[A-Za-z0-9,._\- ]+", raw):
+        raise ValueError("symbols may only contain letters, numbers, commas, dots, underscores, hyphens, and spaces.")
+    symbols = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    if any(re.search(r"\s", symbol) for symbol in symbols):
+        raise ValueError("symbols must be comma-separated stock codes without embedded spaces.")
+    if len(symbols) > CHINA_ASTOCK_SYMBOL_MAX_COUNT:
+        raise ValueError(f"symbols may include at most {CHINA_ASTOCK_SYMBOL_MAX_COUNT} entries.")
+    too_long = next((symbol for symbol in symbols if len(symbol) > CHINA_ASTOCK_SYMBOL_MAX_LENGTH), None)
+    if too_long is not None:
+        raise ValueError(f"Each symbol must be <= {CHINA_ASTOCK_SYMBOL_MAX_LENGTH} characters.")
+    return ",".join(symbols)
+
+
+def _ensure_china_astock_indicator_params(params: Mapping[str, Any]) -> None:
+    lookback = _int_param(params.get("lookback_days", 120), "lookback_days")
+    if lookback < 20:
+        raise ValueError("lookback_days must be >= 20 for china-astock indicator reports.")
+    if lookback > 2000:
+        raise ValueError("lookback_days must be <= 2000 for china-astock indicator reports.")
+    _safe_china_astock_indicator_limit(params)
+    _safe_symbols(params.get("symbols"))
+
+
+def _safe_china_astock_indicator_limit(params: Mapping[str, Any]) -> int:
+    raw = params.get("limit")
+    limit = CHINA_ASTOCK_INDICATOR_DEFAULT_LIMIT if raw in (None, "") else _int_param(raw, "limit")
+    if limit < 1:
+        raise ValueError("Param limit must be >= 1.")
+    if limit > CHINA_ASTOCK_INDICATOR_MAX_LIMIT:
+        raise ValueError(f"Param limit must be <= {CHINA_ASTOCK_INDICATOR_MAX_LIMIT} for china-astock indicator reports.")
+    return limit
+
+
 def _safe_config_path(value: Any) -> str:
     raw = str(value or "baseline_lgb_alpha158.yaml").strip()
     if not raw:
         raw = "baseline_lgb_alpha158.yaml"
+    if "%" in raw:
+        raise ValueError("Config must be a file name under quant_workflow/configs.")
     if "/" in raw or "\\" in raw or ".." in raw:
         raise ValueError("Config must be a file name under quant_workflow/configs.")
-    return str(QUANT_WORKFLOW_ROOT / "configs" / raw)
+    if not CONFIG_FILE_NAME_RE.fullmatch(raw):
+        raise ValueError("Config file name may only contain letters, numbers, dots, underscores, and hyphens.")
+    if Path(raw).suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError("Config must be a .yaml or .yml file under quant_workflow/configs.")
+    configs_root = (QUANT_WORKFLOW_ROOT / "configs").resolve()
+    config_path = (configs_root / raw).resolve()
+    if not config_path.is_relative_to(configs_root):
+        raise ValueError("Config must be a file name under quant_workflow/configs.")
+    return str(config_path)
 
 
 def _safe_provider(value: Any) -> str:
@@ -266,7 +431,64 @@ def _safe_provider(value: Any) -> str:
 
 
 def _python_bin() -> str:
-    return str(QLIB_PYTHON if QLIB_PYTHON.exists() else Path(sys.executable))
+    _warn_if_legacy_qlib_python_is_ignored()
+    if QUANT_WORKFLOW_PYTHON.exists():
+        return str(QUANT_WORKFLOW_PYTHON)
+    _warn_if_missing_quant_workflow_python_is_ignored()
+    return str(Path(sys.executable))
+
+
+def _warn_if_legacy_qlib_python_is_ignored() -> None:
+    global _LEGACY_QLIB_PYTHON_WARNING_EMITTED
+    if _LEGACY_QLIB_PYTHON_WARNING_EMITTED:
+        return
+    if os.environ.get("QLIB_PYTHON") and not os.environ.get("QUANT_WORKFLOW_PYTHON"):
+        logger.warning(
+            "QLIB_PYTHON is ignored by the DSA web workflow. "
+            "Set QUANT_WORKFLOW_PYTHON to override the Python used by web quant jobs."
+        )
+        _LEGACY_QLIB_PYTHON_WARNING_EMITTED = True
+
+
+def _warn_if_missing_quant_workflow_python_is_ignored() -> None:
+    global _MISSING_QUANT_WORKFLOW_PYTHON_WARNING_EMITTED
+    if _MISSING_QUANT_WORKFLOW_PYTHON_WARNING_EMITTED:
+        return
+    if os.environ.get("QUANT_WORKFLOW_PYTHON"):
+        logger.warning(
+            "QUANT_WORKFLOW_PYTHON points to a missing file (%s); "
+            "falling back to the running DSA Python interpreter (%s).",
+            QUANT_WORKFLOW_PYTHON,
+            Path(sys.executable),
+        )
+        _MISSING_QUANT_WORKFLOW_PYTHON_WARNING_EMITTED = True
+
+
+def _quant_job_child_env(
+    extra: Mapping[str, str],
+    *,
+    allowed_names: Iterable[str] = (),
+    allowed_prefixes: Iterable[str] = (),
+) -> Dict[str, str]:
+    explicit_names = CHILD_ENV_EXACT_NAMES | {str(name) for name in allowed_names}
+    explicit_prefixes = tuple(CHILD_ENV_PREFIXES) + tuple(str(prefix) for prefix in allowed_prefixes)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in explicit_names or any(key.startswith(prefix) for prefix in explicit_prefixes)
+    }
+    env.update({key: str(value) for key, value in extra.items()})
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
+def _return_code_indicates_cancel(return_code: Optional[int]) -> bool:
+    return return_code in {
+        -signal.SIGTERM,
+        -signal.SIGKILL,
+        128 + signal.SIGTERM,
+        128 + signal.SIGKILL,
+    }
 
 
 def _script_command(script_name: str) -> List[str]:
@@ -334,10 +556,14 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_flag(command, params, "skip_qlib_convert", "--skip-qlib-convert")
         return command
 
-    def repair_qlib_provider(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("repair_qlib_provider.py")
-        _append_flag(command, params, "dry_run", "--dry-run")
-        return command
+    def repair_qlib_provider(_params: Mapping[str, Any]) -> List[str]:
+        return _script_command("repair_qlib_provider.py") + ["--dry-run"]
+
+    def generate_csi300(params: Mapping[str, Any]) -> List[str]:
+        return _script_command("generate_csi300.py") + ["--dry-run"]
+
+    def add_index_benchmark(params: Mapping[str, Any]) -> List[str]:
+        return _script_command("add_index_benchmark.py") + ["--dry-run"]
 
     def report_data_quality(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_data_quality.py")
@@ -348,6 +574,16 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def report_data_anomalies(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_data_anomalies.py")
+        _append_reports_out_dir(command)
+        return command
+
+    def report_data_hygiene(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("report_data_hygiene.py")
+        _append_reports_out_dir(command)
+        return command
+
+    def report_workbench_capabilities(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("report_workbench_capabilities.py")
         _append_reports_out_dir(command)
         return command
 
@@ -377,6 +613,39 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "topk", "--topk")
         return command
 
+    def report_qlib_research(section: str, params: Mapping[str, Any]) -> List[str]:
+        _ensure_qlib_research_params(params)
+        command = _script_command("report_qlib_research.py")
+        _append_reports_out_dir(command)
+        command.extend(["--section", section])
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        if "config" in params and params.get("config") not in (None, ""):
+            command.extend(["--config", _safe_config_path(params.get("config"))])
+        for key, flag in (
+            ("topk", "--topk"),
+            ("max_runs", "--max-runs"),
+            ("windows", "--windows"),
+            ("train_years", "--train-years"),
+            ("valid_months", "--valid-months"),
+            ("test_months", "--test-months"),
+            ("step_months", "--step-months"),
+        ):
+            _append_value(command, params, key, flag)
+        return command
+
+    def report_china_astock_indicators(params: Mapping[str, Any]) -> List[str]:
+        _ensure_china_astock_indicator_params(params)
+        command = _script_command("report_china_astock_indicators.py")
+        command.extend(["--output-dir", str(REPORTS_ROOT)])
+        symbols = _safe_symbols(params.get("symbols"))
+        if symbols:
+            command.extend(["--symbols", symbols])
+        _append_value(command, params, "lookback_days", "--lookback-days")
+        command.extend(["--limit", str(_safe_china_astock_indicator_limit(params))])
+        return command
+
     def optimize_strategy(params: Mapping[str, Any]) -> List[str]:
         _ensure_optimize_strategy_web_dry_run(params)
         command = _script_command("optimize_strategy.py")
@@ -398,6 +667,14 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "eval_window_days", "--backtest-days")
         _append_flag(command, params, "force", "--backtest-force")
         return command
+
+    def qlib_research_artifacts(section: str) -> List[str]:
+        return [
+            str(REPORTS_ROOT / f"qlib_research_{section}_latest.json"),
+            str(REPORTS_ROOT / f"qlib_research_{section}_latest.md"),
+            str(REPORTS_ROOT / f"qlib_research_{section}_*.json"),
+            str(REPORTS_ROOT / f"qlib_research_{section}_*.md"),
+        ]
 
     return {
         "prepare_baostock_refresh": {
@@ -436,6 +713,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "label": "验证 JQData 连接（dry-run）",
             "command": download_jqdata,
             "allowed_params": {"universe", "start", "end", "limit", "sleep", "dry_run"},
+            "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
         "merge_to_qlib": {
             "label": "合并并转换为 Qlib",
@@ -454,13 +732,23 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "repair_qlib_provider": {
-            "label": "修复 Qlib Provider",
+            "label": "预演修复 Qlib Provider",
             "command": repair_qlib_provider,
-            "allowed_params": {"dry_run"},
+            "allowed_params": set(),
         },
         "check_qlib_data": {
             "label": "检查 Qlib 数据",
             "command": _script_command("check_qlib_data.py"),
+            "allowed_params": set(),
+        },
+        "generate_csi300": {
+            "label": "预演生成 CSI300 股票池",
+            "command": generate_csi300,
+            "allowed_params": set(),
+        },
+        "add_index_benchmark": {
+            "label": "预演添加沪深300 benchmark",
+            "command": add_index_benchmark,
             "allowed_params": set(),
         },
         "report_data_quality": {
@@ -488,6 +776,26 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "data_anomaly_stocks_*.csv"),
                 str(REPORTS_ROOT / "data_anomaly_events_*.csv"),
                 str(REPORTS_ROOT / "data_cleaning_strategy_*.md"),
+            ],
+        },
+        "report_data_hygiene": {
+            "label": "生成数据治理盘点和清理预案",
+            "command": report_data_hygiene,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "data_hygiene_inventory_latest.md"),
+                str(REPORTS_ROOT / "data_hygiene_inventory_latest.json"),
+                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.md"),
+                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.json"),
+            ],
+        },
+        "report_workbench_capabilities": {
+            "label": "生成工作台能力盘点",
+            "command": report_workbench_capabilities,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "workbench_capability_inventory_latest.md"),
+                str(REPORTS_ROOT / "workbench_capability_inventory_latest.json"),
             ],
         },
         "report_market_regime": {
@@ -523,6 +831,42 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "qlib_predictions_*.md"),
             ],
         },
+        "report_qlib_model_explainability": {
+            "label": "生成 Qlib 模型解释报告",
+            "command": lambda params: report_qlib_research("model_explainability", params),
+            "allowed_params": {"run_id", "topk"},
+            "artifact_patterns": qlib_research_artifacts("model_explainability"),
+        },
+        "report_qlib_backtest_detail": {
+            "label": "生成 Qlib 回测明细报告",
+            "command": lambda params: report_qlib_research("backtest_detail", params),
+            "allowed_params": {"run_id"},
+            "artifact_patterns": qlib_research_artifacts("backtest_detail"),
+        },
+        "report_qlib_model_comparison": {
+            "label": "生成 Qlib 多模型/多实验对比",
+            "command": lambda params: report_qlib_research("model_comparison", params),
+            "allowed_params": {"max_runs"},
+            "artifact_patterns": qlib_research_artifacts("model_comparison"),
+        },
+        "report_qlib_factor_analysis": {
+            "label": "生成 Qlib 因子分析报告",
+            "command": lambda params: report_qlib_research("factor_analysis", params),
+            "allowed_params": {"run_id", "topk"},
+            "artifact_patterns": qlib_research_artifacts("factor_analysis"),
+        },
+        "report_qlib_rolling_training": {
+            "label": "生成 Qlib 滚动训练计划",
+            "command": lambda params: report_qlib_research("rolling_training", params),
+            "allowed_params": {"config", "windows", "train_years", "valid_months", "test_months", "step_months"},
+            "artifact_patterns": qlib_research_artifacts("rolling_training"),
+        },
+        "report_qlib_risk_model": {
+            "label": "生成 Qlib 风险模型诊断",
+            "command": lambda params: report_qlib_research("risk_model", params),
+            "allowed_params": {"run_id"},
+            "artifact_patterns": qlib_research_artifacts("risk_model"),
+        },
         "run_china_astock_comparison": {
             "label": "生成 china-astock 策略对比",
             "command": _script_command("run_china_astock_comparison.py"),
@@ -533,6 +877,17 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_latest.json"),
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_*.csv"),
                 str(REPORTS_ROOT / "china_astock_strategy_comparison_*.md"),
+            ],
+        },
+        "report_china_astock_indicators": {
+            "label": "生成 china-astock 技术指标报告",
+            "command": report_china_astock_indicators,
+            "allowed_params": {"symbols", "lookback_days", "limit"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "china_astock_indicator_report_latest.json"),
+                str(REPORTS_ROOT / "china_astock_indicator_report_latest.md"),
+                str(REPORTS_ROOT / "china_astock_indicator_report_*.json"),
+                str(REPORTS_ROOT / "china_astock_indicator_report_*.md"),
             ],
         },
         "optimize_strategy": {
@@ -576,7 +931,7 @@ class QuantJobService:
         self,
         jobs_root: Path = DEFAULT_JOBS_ROOT,
         command_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-        default_cwd: Path = PROJECTS_ROOT,
+        default_cwd: Path = DSA_ROOT,
     ) -> None:
         self.jobs_root = Path(jobs_root)
         self.db_path = self.jobs_root / "index.sqlite"
@@ -713,6 +1068,16 @@ class QuantJobService:
 
         with self._lock:
             current = self.get_job(job_id)
+            if current.status == "failed" and _return_code_indicates_cancel(current.return_code):
+                timestamp = _now()
+                self._update_job(
+                    job_id,
+                    status="cancelled",
+                    completed_at=current.completed_at or timestamp,
+                    updated_at=timestamp,
+                    error="Cancelled by user from the web UI.",
+                )
+                return self.get_job(job_id)
             if current.status in TERMINAL_STATUSES:
                 return current
             timestamp = _now()
@@ -762,17 +1127,21 @@ class QuantJobService:
             header = (
                 f"[job] {job.job_id} {job.job_type}\n"
                 f"[cwd] {job.cwd}\n"
+                # Keep secrets in the child environment only; command arguments
+                # are intentionally persisted to this user-visible audit log.
                 f"[command] {' '.join(job.command)}\n\n"
             )
             handle.write(header.encode("utf-8"))
             handle.flush()
-            env = os.environ.copy()
-            env.update(
+            spec = self._get_spec(job.job_type)
+            env = _quant_job_child_env(
                 {
                     "QUANT_JOB_COMMAND_JSON": _json_dumps(job.command),
                     "QUANT_JOB_CWD": job.cwd,
                     "QUANT_JOB_EXIT_STATUS_PATH": str(self._exit_status_path(job)),
-                }
+                },
+                allowed_names=spec.get("env_names", ()),
+                allowed_prefixes=spec.get("env_prefixes", ()),
             )
             process = subprocess.Popen(
                 [str(Path(sys.executable)), "-c", _DURABLE_RUNNER_CODE],
@@ -959,7 +1328,7 @@ class QuantJobService:
                 )
                 self._start_recovery_monitor(job.job_id, job.pid)
                 continue
-            self._mark_job_failed_after_restart(job.job_id)
+            self._mark_job_failed_after_restart(job)
 
     def _start_recovery_monitor(self, job_id: str, pid: Optional[int]) -> None:
         thread = threading.Thread(
@@ -970,9 +1339,16 @@ class QuantJobService:
         )
         thread.start()
 
-    def _poll_recovered_process(self, job_id: str, pid: Optional[int]) -> None:
+    def _poll_recovered_process(
+        self,
+        job_id: str,
+        pid: Optional[int],
+        *,
+        max_poll_seconds: float = RECOVERED_RUNNER_MAX_POLL_SECONDS,
+        poll_interval_seconds: float = RECOVERED_RUNNER_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        started_at = time.monotonic()
         while True:
-            time.sleep(1.0)
             try:
                 job = self.get_job(job_id)
             except KeyError:
@@ -999,11 +1375,31 @@ class QuantJobService:
                         error="Recovered durable runner exited without writing an exit status.",
                     )
                 return
+            if time.monotonic() - started_at >= max_poll_seconds:
+                timestamp = _now()
+                self._update_job(
+                    job_id,
+                    status="failed",
+                    completed_at=timestamp,
+                    updated_at=timestamp,
+                    error=(
+                        "Recovered durable runner exceeded the recovery monitoring "
+                        "window without writing an exit status."
+                    ),
+                )
+                return
+            if poll_interval_seconds > 0:
+                time.sleep(poll_interval_seconds)
 
-    def _mark_job_failed_after_restart(self, job_id: str) -> None:
+    def _mark_job_failed_after_restart(self, job: QuantJob) -> None:
+        payload = self._read_exit_status(job)
+        if payload is not None:
+            runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
+            self._complete_job_from_return_code(job, int(payload["return_code"]), _now(), runner_error)
+            return
         timestamp = _now()
         self._update_job(
-            job_id,
+            job.job_id,
             status="failed",
             completed_at=timestamp,
             updated_at=timestamp,

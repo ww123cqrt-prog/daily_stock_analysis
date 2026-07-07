@@ -125,6 +125,7 @@ type ExperimentComparison = {
   delta: number;
 };
 
+const DEFAULT_MLFLOW_URL = 'http://127.0.0.1:6006/';
 const COMPARISON_METRIC_KEY = '1day.excess_return_with_cost.annualized_return';
 
 const STATUS_STYLE: Record<SupportState, { zh: string; en: string; variant: BadgeVariant; tone: StatusTone }> = {
@@ -138,6 +139,8 @@ const STATUS_STYLE: Record<SupportState, { zh: string; en: string; variant: Badg
 
 const DATA_STATUS_STYLE: Record<string, { zh: string; en: string; variant: BadgeVariant; tone: StatusTone }> = {
   available: { zh: '可用', en: 'Available', variant: 'success', tone: 'success' },
+  linked: { zh: '已链接', en: 'Linked', variant: 'info', tone: 'info' },
+  invalid: { zh: '配置无效', en: 'Invalid', variant: 'danger', tone: 'danger' },
   partial: { zh: '部分可用', en: 'Partial', variant: 'warning', tone: 'warning' },
   missing: { zh: '缺失', en: 'Missing', variant: 'danger', tone: 'danger' },
   unknown: { zh: '未知', en: 'Unknown', variant: 'default', tone: 'neutral' },
@@ -155,6 +158,37 @@ const RESEARCH_TEXT = {
     statusTitle: '服务状态',
     dataStatusTitle: '数据状态',
     dataStatusDescription: '由 quant_workflow 生成的本地数据质量与训练状态，DSA 只读取结果产物。',
+    dataHygieneTitle: '数据治理',
+    dataHygieneDescription: '本地数据盘点、清理计划、质量报告和维护锁状态。',
+    maintenanceLockLabel: '维护锁',
+    locked: '已锁定',
+    notLocked: '未锁定',
+    inventoryLabel: '数据盘点',
+    cleanupPlanLabel: '清理计划',
+    qualityReportLabel: '质量报告',
+    cleaningStrategyLabel: '清洗策略',
+    manifestLabel: '数据 Manifest',
+    readmeLabel: '治理说明',
+    officialLabel: '正式',
+    candidateLabel: '候选',
+    legacyLabel: '旧数据',
+    archiveLabel: '待归档',
+    actionsLabel: '动作',
+    dryRunLabel: 'Dry-run',
+    viewReport: '查看报告',
+    viewDetails: '查看详情',
+    qualitySummaryTitle: '质量摘要',
+    cleanupActionsTitle: '清理动作预览',
+    actionTypeLabel: '类型',
+    sourceLabel: '源路径',
+    destinationLabel: '目标路径',
+    reasonLabel: '原因',
+    riskLabel: '风险',
+    confirmationRequired: '需要确认',
+    stockUniverse: '股票池',
+    usableInstruments: '可用股票',
+    totalRows: '总行数',
+    dateRange: '日期范围',
     trainable: '可训练',
     notTrainable: '暂不可训练',
     generatedAt: '生成时间',
@@ -233,12 +267,12 @@ const RESEARCH_TEXT = {
     projectMapDescription: '各项目保留原职责，DSA 只做本地研究入口和结果聚合。',
     futureTitle: '后续升级项',
     futureDescription: '这些能力本轮只作为路线图展示，默认只读观察，不读取密码、不自动下单。',
-    mlflowNote: 'MLflow 保持为实验记录页，不嵌入或改造。',
+    mlflowNote: 'MLflow 保持为实验记录页，不嵌入或改造；是否已启动以工作流页顶部状态为准。',
     portNote: 'DSA 跟随当前访问地址；本机 8000 可能被其他服务占用。',
     statusItems: [
       { label: 'DSA 服务', value: '当前页面', detail: '本地 WebUI', tone: 'success' },
       { label: '数据源', value: 'AkShare/JQData/本地数据', detail: '按现有链路获取', tone: 'info' },
-      { label: 'MLflow', value: '实验记录', detail: 'http://127.0.0.1:6006/', tone: 'success' },
+      { label: 'MLflow', value: '实验记录', detail: 'http://127.0.0.1:6006/（状态见工作流页）', tone: 'info' },
       { label: '端口', value: '跟随当前访问地址', detail: '不硬编码 8000', tone: 'warning' },
     ] satisfies StatusItem[],
     capabilities: [
@@ -339,7 +373,7 @@ const RESEARCH_TEXT = {
     coverageItems: [
       { module: 'daily_stock_analysis WebUI', status: 'available', entry: '首页 / 研究 / 工作流 / 回测 / 问股 / 持仓 / 告警 / 选股', route: '/workflow', tests: '后端 pytest + 前端 vitest/lint/build', browser: 'local-workbench smoke 覆盖主页面', review: 'opencode复审通过', next: '继续把重任务体验做顺' },
       { module: 'quant_workflow + Qlib', status: 'available', entry: '工作流任务中心', route: '/workflow', tests: 'quant_workflow unittest + DSA quant API 测试', browser: '可从网页运行数据检查、质量报告、训练入口', review: 'opencode复审通过', next: '补更多产物预览和失败排查' },
-      { module: 'china-astock-quant', status: 'partial', entry: '研究页项目关系', route: '/research', tests: 'CodeGraph 已初始化，尚未直接包装脚本', browser: '暂作为策略参考展示', review: '待接入具体脚本后复审', next: '筛选可复用策略并白名单化' },
+      { module: 'china-astock-quant', status: 'available', entry: '工作流指标报告 / 研究页项目关系', route: '/workflow', tests: 'report_china_astock_indicators + run_china_astock_comparison 测试', browser: '可生成只读技术指标报告和策略对比报告', review: '待本阶段 opencode 复审', next: '继续评估事件驱动回测是否包装为只读对比报告' },
       { module: '场内基金/ETF', status: 'partial', entry: '研究页 ETF 模式', route: '/research', tests: '现有股票链路可复用，基金专用字段未补齐', browser: '边界提示已可见', review: '待 ETF 深度版复审', next: '补折溢价、跟踪误差、规模份额和持仓' },
       { module: '同花顺桌面端', status: 'future', entry: '后续外部工具', tests: '暂不读取本机窗口', browser: '未接入', review: '接入前先做只读方案评审', next: '只读观察，暂不接入交易' },
       { module: 'iPhone 镜像', status: 'future', entry: '暂缓', tests: '手机连接暂不做', browser: '未接入', review: '暂不审', next: '按当前要求保持延期' },
@@ -348,7 +382,7 @@ const RESEARCH_TEXT = {
       { priority: 'P0', title: '每日研究向导', status: 'available', entry: '工作流 / 今日流程', route: '/workflow', next: '按网页顺序完成检查数据、质量报告、清洗预演、训练复盘和实验记录。', verification: 'Workflow vitest、local browser 切片、opencode复审均已覆盖。' },
       { priority: 'P1', title: '模型质量和清仓信号', status: 'partial', entry: '工作流 / 回测', route: '/workflow', next: '市场状态和现金仓位报告已可运行；下一步把 risk_off/defensive 信号接入组合回测和指标卡。', verification: '已有报告任务测试、浏览器预览和只读复审；后续仍需新增 Qlib 组合回测对比测试。' },
       { priority: 'P1', title: '场内基金/ETF深度版', status: 'partial', entry: '研究 / ETF模式', route: '/research', next: '补折溢价、跟踪误差、规模份额、持仓、基金类型和同类 ETF 对比。', verification: '先补数据字段和边界提示，再跑页面渲染与报告生成测试。' },
-      { priority: 'P2', title: 'china-astock脚本白名单化', status: 'partial', entry: '工作流任务中心', route: '/workflow', next: '筛选只读策略脚本，包装为报告任务，禁止券商接口和交易动作。', verification: '后端白名单参数测试、报告预览浏览器测试、opencode安全复审。' },
+      { priority: 'P2', title: 'china-astock脚本白名单化', status: 'available', entry: '工作流任务中心', route: '/workflow', next: '指标库已接入工作流指标报告；下一步评估事件驱动回测是否包装为只读对比报告。', verification: 'report_china_astock_indicators 测试、后端白名单参数测试、报告预览浏览器测试、opencode安全复审。' },
       { priority: 'P2', title: '同花顺只读观察层', status: 'future', entry: '后续外部工具', next: '先做本机窗口/截图/OCR可行性方案，不读取密码、不自动下单。', verification: '实现前先做只读方案评审，确认没有交易执行路径。' },
     ] satisfies DevelopmentQueueItem[],
     futureItems: [
@@ -369,6 +403,37 @@ const RESEARCH_TEXT = {
     statusTitle: 'Service Status',
     dataStatusTitle: 'Data Status',
     dataStatusDescription: 'Local data-quality and training status generated by quant_workflow; DSA only reads the artifact.',
+    dataHygieneTitle: 'Data Hygiene',
+    dataHygieneDescription: 'Local data inventory, cleanup plan, quality reports, and maintenance lock status.',
+    maintenanceLockLabel: 'Maintenance Lock',
+    locked: 'Locked',
+    notLocked: 'Not locked',
+    inventoryLabel: 'Inventory',
+    cleanupPlanLabel: 'Cleanup Plan',
+    qualityReportLabel: 'Quality Report',
+    cleaningStrategyLabel: 'Cleaning Strategy',
+    manifestLabel: 'Data Manifest',
+    readmeLabel: 'Governance README',
+    officialLabel: 'Official',
+    candidateLabel: 'Candidate',
+    legacyLabel: 'Legacy',
+    archiveLabel: 'Archive',
+    actionsLabel: 'Actions',
+    dryRunLabel: 'Dry-run',
+    viewReport: 'View Report',
+    viewDetails: 'View Details',
+    qualitySummaryTitle: 'Quality Summary',
+    cleanupActionsTitle: 'Cleanup Actions (Preview)',
+    actionTypeLabel: 'Type',
+    sourceLabel: 'Source',
+    destinationLabel: 'Destination',
+    reasonLabel: 'Reason',
+    riskLabel: 'Risk',
+    confirmationRequired: 'Requires confirmation',
+    stockUniverse: 'Stock Universe',
+    usableInstruments: 'Usable Instruments',
+    totalRows: 'Total Rows',
+    dateRange: 'Date Range',
     trainable: 'Trainable',
     notTrainable: 'Not trainable yet',
     generatedAt: 'Generated',
@@ -447,12 +512,12 @@ const RESEARCH_TEXT = {
     projectMapDescription: 'Each project keeps its role; DSA is the local research entry and result aggregation layer.',
     futureTitle: 'Future Upgrades',
     futureDescription: 'These items are roadmap only in this round: read-only observation by default, no password capture, no automatic orders.',
-    mlflowNote: 'MLflow remains the experiment-tracking page. It is not embedded or modified.',
+    mlflowNote: 'MLflow remains the experiment-tracking page. It is not embedded or modified; use the workflow header for live status.',
     portNote: 'DSA follows the current browser address; local port 8000 may belong to another service.',
     statusItems: [
       { label: 'DSA service', value: 'Current page', detail: 'Local WebUI', tone: 'success' },
       { label: 'Data sources', value: 'AkShare/JQData/local data', detail: 'Existing workflow', tone: 'info' },
-      { label: 'MLflow', value: 'Experiment tracking', detail: 'http://127.0.0.1:6006/', tone: 'success' },
+      { label: 'MLflow', value: 'Experiment tracking', detail: 'http://127.0.0.1:6006/ (status on Workflow)', tone: 'info' },
       { label: 'Port', value: 'Current browser address', detail: 'No hard-coded 8000', tone: 'warning' },
     ] satisfies StatusItem[],
     capabilities: [
@@ -553,7 +618,7 @@ const RESEARCH_TEXT = {
     coverageItems: [
       { module: 'daily_stock_analysis WebUI', status: 'available', entry: 'Home / Research / Workflow / Backtest / Ask / Portfolio / Alerts / Screening', route: '/workflow', tests: 'Backend pytest + frontend vitest/lint/build', browser: 'local-workbench smoke covers main pages', review: 'opencode review passed', next: 'Improve heavy-task ergonomics' },
       { module: 'quant_workflow + Qlib', status: 'available', entry: 'Workflow job center', route: '/workflow', tests: 'quant_workflow unittest + DSA quant API tests', browser: 'Data check, quality reports, and training entry are runnable from the browser', review: 'opencode review passed', next: 'Add richer artifact previews and failure triage' },
-      { module: 'china-astock-quant', status: 'partial', entry: 'Research project map', route: '/research', tests: 'CodeGraph initialized; scripts not directly wrapped yet', browser: 'Shown as a strategy reference for now', review: 'Review after concrete scripts are whitelisted', next: 'Select reusable strategies and whitelist them' },
+      { module: 'china-astock-quant', status: 'available', entry: 'Workflow indicator report / Research project map', route: '/workflow', tests: 'report_china_astock_indicators + run_china_astock_comparison tests', browser: 'Can generate read-only technical indicator and strategy comparison reports', review: 'Pending this-stage opencode review', next: 'Evaluate whether event-driven backtests should be wrapped as read-only comparison reports' },
       { module: 'Exchange-traded funds / ETF', status: 'partial', entry: 'Research ETF mode', route: '/research', tests: 'Existing stock workflow can be reused; fund-specific fields are missing', browser: 'Boundary notice is visible', review: 'Review after ETF deep version', next: 'Add premium/discount, tracking error, AUM/shares, and holdings' },
       { module: 'Tonghuashun desktop', status: 'future', entry: 'Future external tools', tests: 'No local window reading yet', browser: 'Not integrated', review: 'Read-only design review before integration', next: 'Read-only observation; no trading integration yet' },
       { module: 'iPhone mirroring', status: 'future', entry: 'Deferred', tests: 'Phone connection deferred', browser: 'Not integrated', review: 'Not reviewed yet', next: 'Keep deferred per current scope' },
@@ -562,7 +627,7 @@ const RESEARCH_TEXT = {
       { priority: 'P0', title: 'Daily research guide', status: 'available', entry: 'Workflow / daily flow', route: '/workflow', next: 'Use the browser flow for data checks, quality reports, cleaning dry-run, training review, and experiment notes.', verification: 'Workflow vitest, local browser slice, and opencode review are covered.' },
       { priority: 'P1', title: 'Model quality and cash signal', status: 'partial', entry: 'Workflow / Backtest', route: '/workflow', next: 'Market-regime and cash-ratio report is runnable; next wire risk_off/defensive signals into portfolio backtests and metric cards.', verification: 'Report job tests, browser preview, and read-only review are covered; Qlib portfolio comparison tests are still needed.' },
       { priority: 'P1', title: 'ETF deep version', status: 'partial', entry: 'Research / ETF mode', route: '/research', next: 'Add premium/discount, tracking error, AUM/shares, holdings, fund type, and peer ETF comparison.', verification: 'Add data fields and boundary notices first, then page-render and report-generation tests.' },
-      { priority: 'P2', title: 'china-astock script whitelist', status: 'partial', entry: 'Workflow job center', route: '/workflow', next: 'Select read-only strategy scripts, wrap them as report jobs, and block broker or trading actions.', verification: 'Backend whitelist tests, browser artifact preview, and opencode security review.' },
+      { priority: 'P2', title: 'china-astock script whitelist', status: 'available', entry: 'Workflow job center', route: '/workflow', next: 'Indicator functions are wired into the workflow indicator report; next evaluate event-driven backtests as read-only comparison reports.', verification: 'report_china_astock_indicators tests, backend whitelist tests, browser artifact preview, and opencode security review.' },
       { priority: 'P2', title: 'Tonghuashun read-only observation', status: 'future', entry: 'Future external tools', next: 'Design local window/screenshot/OCR feasibility first; no password reading and no automatic orders.', verification: 'Read-only design review before implementation; confirm no trading execution path.' },
     ] satisfies DevelopmentQueueItem[],
     futureItems: [
@@ -605,6 +670,11 @@ function sourceStatusTone(status: ResearchDataSource['status']): { variant: Badg
 
 function dataStatusLabel(status: string | undefined, language: 'zh' | 'en'): string {
   return (DATA_STATUS_STYLE[status ?? 'missing'] ?? DATA_STATUS_STYLE.unknown)[language];
+}
+
+function dataStatusMeta(status: string | undefined): { variant: BadgeVariant; tone: StatusTone } {
+  const meta = DATA_STATUS_STYLE[status ?? 'missing'] ?? DATA_STATUS_STYLE.unknown;
+  return { variant: meta.variant, tone: meta.tone };
 }
 
 function formatCompactNumber(value: number | undefined): string {
@@ -689,6 +759,14 @@ function joinResearchList(items: string[], language: 'zh' | 'en'): string {
     return '-';
   }
   return items.join(language === 'zh' ? '、' : ', ');
+}
+
+function cleanupActionSourceLabel(source: string | undefined, language: 'zh' | 'en'): string {
+  const clean = (source || '').trim();
+  if (!clean) {
+    return language === 'zh' ? '未指定来源' : 'Source not specified';
+  }
+  return clean.split('/').filter(Boolean).pop() || clean;
 }
 
 function externalToolStatus(status: string | undefined, installed?: boolean): SupportState {
@@ -826,6 +904,20 @@ const ResearchPage: React.FC = () => {
   const experimentRuns = experimentNotebook?.runs ?? [];
   const experimentComparison = buildExperimentComparison(experimentRuns);
   const experimentRunCount = experimentNotebook?.totalRuns ?? experimentRuns.length;
+  const mlflowUrl = researchStatus?.mlflow?.url || DEFAULT_MLFLOW_URL;
+  const mlflowStatus = researchStatus?.mlflow?.status || 'linked';
+  const mlflowStatusMeta = dataStatusMeta(mlflowStatus);
+  const mlflowStatusLabel = dataStatusLabel(mlflowStatus, language);
+  const statusItems = text.statusItems.map((item) => (
+    item.label === 'MLflow'
+      ? {
+          ...item,
+          value: mlflowStatusLabel,
+          detail: mlflowUrl,
+          tone: mlflowStatusMeta.tone,
+        }
+      : item
+  ));
   const experimentCountLabel = language === 'zh'
     ? `最近 ${experimentRunCount} 次实验`
     : `Latest ${experimentRunCount} experiment${experimentRunCount === 1 ? '' : 's'}`;
@@ -890,7 +982,7 @@ const ResearchPage: React.FC = () => {
               {text.openWorkflow}
             </Link>
             <a
-              href="http://127.0.0.1:6006/"
+              href={mlflowUrl}
               target="_blank"
               rel="noreferrer"
               className="inline-flex h-10 items-center gap-2 rounded-xl border border-cyan/30 bg-cyan/10 px-4 text-sm font-medium text-cyan transition-colors hover:bg-cyan/15"
@@ -910,7 +1002,7 @@ const ResearchPage: React.FC = () => {
       />
 
       <section aria-label={text.statusTitle} className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        {text.statusItems.map((item) => (
+        {statusItems.map((item) => (
           <Card key={item.label} padding="sm" className="min-h-[112px]">
             <div className="flex h-full items-start justify-between gap-3">
               <div className="min-w-0">
@@ -1022,6 +1114,259 @@ const ResearchPage: React.FC = () => {
           </div>
         </Card>
       </section>
+
+      {researchStatus?.dataHygiene ? (
+        <section aria-label={text.dataHygieneTitle}>
+          <Card padding="lg" className="space-y-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-foreground">{text.dataHygieneTitle}</h2>
+                <p className="mt-1 max-w-3xl text-sm leading-6 text-secondary-text">{text.dataHygieneDescription}</p>
+              </div>
+              <Badge
+                variant={researchStatus.dataHygiene.maintenanceLock.locked ? 'warning' : 'success'}
+                size="sm"
+                className="w-fit"
+              >
+                <StatusDot
+                  tone={researchStatus.dataHygiene.maintenanceLock.locked ? 'warning' : 'success'}
+                  className="h-1.5 w-1.5"
+                />
+                {text.maintenanceLockLabel}: {researchStatus.dataHygiene.maintenanceLock.locked ? text.locked : text.notLocked}
+              </Badge>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {researchStatus.dataHygiene.manifest ? (
+                <Badge
+                  variant={researchStatus.dataHygiene.manifest.status === 'available' ? 'success' : 'default'}
+                  size="sm"
+                  className="gap-1.5 shadow-none"
+                >
+                  <StatusDot
+                    tone={researchStatus.dataHygiene.manifest.status === 'available' ? 'success' : 'neutral'}
+                    className="h-1.5 w-1.5"
+                  />
+                  {text.manifestLabel}: {dataStatusLabel(researchStatus.dataHygiene.manifest.status, language)}
+                </Badge>
+              ) : null}
+              {researchStatus.dataHygiene.readme ? (
+                <Badge
+                  variant={researchStatus.dataHygiene.readme.status === 'available' ? 'success' : 'default'}
+                  size="sm"
+                  className="gap-1.5 shadow-none"
+                >
+                  <StatusDot
+                    tone={researchStatus.dataHygiene.readme.status === 'available' ? 'success' : 'neutral'}
+                    className="h-1.5 w-1.5"
+                  />
+                  {text.readmeLabel}: {dataStatusLabel(researchStatus.dataHygiene.readme.status, language)}
+                </Badge>
+              ) : null}
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">{text.inventoryLabel}</h3>
+                  <Badge
+                    variant={researchStatus.dataHygiene.inventory.status === 'available' ? 'success' : 'default'}
+                    size="sm"
+                  >
+                    <StatusDot
+                      tone={researchStatus.dataHygiene.inventory.status === 'available' ? 'success' : 'neutral'}
+                      className="h-1.5 w-1.5"
+                    />
+                    {dataStatusLabel(researchStatus.dataHygiene.inventory.status, language)}
+                  </Badge>
+                </div>
+                {researchStatus.dataHygiene.inventory.status === 'available' ? (
+                  <dl className="space-y-1 text-xs text-secondary-text">
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.officialLabel}</dt>
+                      <dd className="font-medium text-foreground">{researchStatus.dataHygiene.inventory.officialEntries ?? 0}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.candidateLabel}</dt>
+                      <dd className="font-medium text-foreground">{researchStatus.dataHygiene.inventory.candidateEntries ?? 0}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.legacyLabel}</dt>
+                      <dd className="font-medium text-foreground">{researchStatus.dataHygiene.inventory.legacyEntries ?? 0}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.archiveLabel}</dt>
+                      <dd className="font-medium text-foreground">{researchStatus.dataHygiene.inventory.archiveCandidates ?? 0}</dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <p className="text-xs text-secondary-text">{language === 'zh' ? '暂无盘点' : 'Not available'}</p>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">{text.cleanupPlanLabel}</h3>
+                  <Badge
+                    variant={researchStatus.dataHygiene.cleanupPlan.status === 'available' ? 'success' : 'default'}
+                    size="sm"
+                  >
+                    <StatusDot
+                      tone={researchStatus.dataHygiene.cleanupPlan.status === 'available' ? 'success' : 'neutral'}
+                      className="h-1.5 w-1.5"
+                    />
+                    {dataStatusLabel(researchStatus.dataHygiene.cleanupPlan.status, language)}
+                  </Badge>
+                </div>
+                {researchStatus.dataHygiene.cleanupPlan.status === 'available' ? (
+                  <dl className="space-y-1 text-xs text-secondary-text">
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.actionsLabel}</dt>
+                      <dd className="font-medium text-foreground">{researchStatus.dataHygiene.cleanupPlan.totalActions ?? 0}</dd>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <dt>{text.dryRunLabel}</dt>
+                      <dd className="font-medium text-foreground">
+                        {researchStatus.dataHygiene.cleanupPlan.dryRunOnly ? (language === 'zh' ? '是' : 'Yes') : (language === 'zh' ? '否' : 'No')}
+                      </dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <p className="text-xs text-secondary-text">{language === 'zh' ? '暂无计划' : 'Not available'}</p>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">{text.qualityReportLabel}</h3>
+                  <Badge
+                    variant={researchStatus.dataHygiene.qualityReport.status === 'available' ? 'success' : 'default'}
+                    size="sm"
+                  >
+                    <StatusDot
+                      tone={researchStatus.dataHygiene.qualityReport.status === 'available' ? 'success' : 'neutral'}
+                      className="h-1.5 w-1.5"
+                    />
+                    {dataStatusLabel(researchStatus.dataHygiene.qualityReport.status, language)}
+                  </Badge>
+                </div>
+                {researchStatus.dataHygiene.qualityReport.status === 'available' ? (
+                  <>
+                    {researchStatus.dataHygiene.qualityReport.summary ? (
+                      <dl className="space-y-1 text-xs text-secondary-text">
+                        {researchStatus.dataHygiene.qualityReport.summary.stockUniverse && (
+                          <div className="flex justify-between gap-3">
+                            <dt>{text.stockUniverse}</dt>
+                            <dd className="font-medium text-foreground">{researchStatus.dataHygiene.qualityReport.summary.stockUniverse}</dd>
+                          </div>
+                        )}
+                        {researchStatus.dataHygiene.qualityReport.summary.usableInstruments && (
+                          <div className="flex justify-between gap-3">
+                            <dt>{text.usableInstruments}</dt>
+                            <dd className="font-medium text-foreground">{researchStatus.dataHygiene.qualityReport.summary.usableInstruments}</dd>
+                          </div>
+                        )}
+                        {researchStatus.dataHygiene.qualityReport.summary.totalRows && (
+                          <div className="flex justify-between gap-3">
+                            <dt>{text.totalRows}</dt>
+                            <dd className="font-medium text-foreground">{researchStatus.dataHygiene.qualityReport.summary.totalRows}</dd>
+                          </div>
+                        )}
+                        {researchStatus.dataHygiene.qualityReport.summary.dateRange && (
+                          <div className="flex justify-between gap-3">
+                            <dt>{text.dateRange}</dt>
+                            <dd className="font-medium text-foreground">{researchStatus.dataHygiene.qualityReport.summary.dateRange}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    ) : researchStatus.dataHygiene.qualityReport.path ? (
+                      <p className="break-all text-xs text-secondary-text">{researchStatus.dataHygiene.qualityReport.path}</p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="text-xs text-secondary-text">{language === 'zh' ? '暂无报告' : 'Not available'}</p>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">{text.cleaningStrategyLabel}</h3>
+                  <Badge
+                    variant={researchStatus.dataHygiene.cleaningStrategy.status === 'available' ? 'success' : 'default'}
+                    size="sm"
+                  >
+                    <StatusDot
+                      tone={researchStatus.dataHygiene.cleaningStrategy.status === 'available' ? 'success' : 'neutral'}
+                      className="h-1.5 w-1.5"
+                    />
+                    {dataStatusLabel(researchStatus.dataHygiene.cleaningStrategy.status, language)}
+                  </Badge>
+                </div>
+                {researchStatus.dataHygiene.cleaningStrategy.status === 'available' && researchStatus.dataHygiene.cleaningStrategy.path ? (
+                  <p className="break-all text-xs text-secondary-text">{researchStatus.dataHygiene.cleaningStrategy.path}</p>
+                ) : (
+                  <p className="text-xs text-secondary-text">{language === 'zh' ? '暂无报告' : 'Not available'}</p>
+                )}
+              </div>
+            </div>
+
+            {researchStatus.dataHygiene.cleanupPlan.actions && researchStatus.dataHygiene.cleanupPlan.actions.length > 0 && (
+              <div className="mt-4 rounded-xl border border-border/70 bg-surface/60 p-4">
+                <h3 className="mb-3 text-sm font-semibold text-foreground">{text.cleanupActionsTitle}</h3>
+                <div className="space-y-2">
+                  {researchStatus.dataHygiene.cleanupPlan.actions.slice(0, 10).map((action, index) => (
+                    <details key={index} className="group rounded-lg border border-border/50 bg-background/50">
+                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-surface/50">
+                        <Badge variant="default" size="sm" className="shrink-0">
+                          {action.action}
+                        </Badge>
+                        <span className="flex-1 truncate font-mono text-secondary-text">
+                          {cleanupActionSourceLabel(action.source, language)}
+                        </span>
+                        {action.requiresConfirmation && (
+                          <Badge variant="warning" size="sm" className="shrink-0">
+                            {text.confirmationRequired}
+                          </Badge>
+                        )}
+                        <ArrowRight className="h-3 w-3 shrink-0 transition-transform group-open:rotate-90" />
+                      </summary>
+                      <div className="space-y-2 border-t border-border/50 px-3 py-2 text-xs">
+                        <div>
+                          <dt className="font-medium text-secondary-text">{text.sourceLabel}:</dt>
+                          <dd className="mt-0.5 break-all font-mono text-foreground">{action.source || '-'}</dd>
+                        </div>
+                        {action.destination && (
+                          <div>
+                            <dt className="font-medium text-secondary-text">{text.destinationLabel}:</dt>
+                            <dd className="mt-0.5 break-all font-mono text-foreground">{action.destination}</dd>
+                          </div>
+                        )}
+                        <div>
+                          <dt className="font-medium text-secondary-text">{text.reasonLabel}:</dt>
+                          <dd className="mt-0.5 text-secondary-text">{action.reason}</dd>
+                        </div>
+                        {action.risk && (
+                          <div>
+                            <dt className="font-medium text-warning">{text.riskLabel}:</dt>
+                            <dd className="mt-0.5 text-secondary-text">{action.risk}</dd>
+                          </div>
+                        )}
+                      </div>
+                    </details>
+                  ))}
+                  {researchStatus.dataHygiene.cleanupPlan.actions.length > 10 && (
+                    <p className="pt-2 text-center text-xs text-secondary-text">
+                      {language === 'zh'
+                        ? `显示前 10 个动作，共 ${researchStatus.dataHygiene.cleanupPlan.actions.length} 个`
+                        : `Showing first 10 of ${researchStatus.dataHygiene.cleanupPlan.actions.length} actions`}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </Card>
+        </section>
+      ) : null}
 
       <section aria-label={text.coverageTitle}>
         <Card padding="lg" className="space-y-4">
@@ -1688,11 +2033,20 @@ const ResearchPage: React.FC = () => {
               <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-info/20 bg-cyan/10 text-cyan">
                 <BarChart3 className="h-5 w-5" />
               </span>
-              <div>
-                <h2 className="text-base font-semibold text-foreground">MLflow</h2>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-base font-semibold text-foreground">MLflow</h2>
+                  <Badge variant={mlflowStatusMeta.variant} size="sm" className="gap-1.5 shadow-none">
+                    <StatusDot tone={mlflowStatusMeta.tone} className="h-1.5 w-1.5" />
+                    {mlflowStatusLabel}
+                  </Badge>
+                </div>
                 <p className="mt-2 text-sm leading-6 text-secondary-text">{text.mlflowNote}</p>
+                {researchStatus?.mlflow?.error ? (
+                  <p className="mt-2 text-xs leading-5 text-muted-text">{researchStatus.mlflow.error}</p>
+                ) : null}
                 <p className="mt-3 rounded-xl border border-border/70 bg-surface/70 px-3 py-2 font-mono text-xs text-secondary-text">
-                  http://127.0.0.1:6006/
+                  {mlflowUrl}
                 </p>
               </div>
             </div>

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import time
 import threading
 from collections.abc import Awaitable, Callable
@@ -20,6 +21,8 @@ import starlette.testclient
 from anyio._backends import _asyncio
 
 T = TypeVar("T")
+
+os.environ.setdefault("DSA_BIND_HOST", "127.0.0.1")
 
 _original_call_soon_threadsafe = asyncio.BaseEventLoop.call_soon_threadsafe
 
@@ -135,12 +138,14 @@ class _ThreadlessTestClient:
         base_url: str = "http://testserver",
         raise_server_exceptions: bool = True,
         follow_redirects: bool = True,
+        headers: dict[str, str] | None = None,
         **_: Any,
     ) -> None:
         self.app = app
         self.base_url = base_url
         self.raise_server_exceptions = raise_server_exceptions
         self.follow_redirects = follow_redirects
+        self.headers = httpx.Headers(headers or {})
         self.cookies = httpx.Cookies()
         self._lifespan_ctx = None
         self._lifespan_enter_count = 0
@@ -159,6 +164,7 @@ class _ThreadlessTestClient:
             transport=transport,
             base_url=self.base_url,
             follow_redirects=follow_redirects,
+            headers=self.headers,
             cookies=self.cookies,
         )
 

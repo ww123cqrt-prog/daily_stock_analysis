@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createParsedApiError } from '../../api/error';
@@ -143,13 +143,33 @@ describe('WorkflowPage', () => {
 
     getQuantStatus.mockResolvedValue({
       availableJobTypes: {
+        prepare_baostock_refresh: { label: '准备 Baostock 增量清单', allowedParams: ['target_end', 'limit'] },
+        download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
+        download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
+        merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
+        apply_data_cleaning: { label: '应用清洗策略生成 cleaned Qlib', allowedParams: ['dry_run', 'no_overwrite', 'skip_qlib_convert'] },
+        repair_qlib_provider: { label: '预演修复 Qlib Provider', allowedParams: [] },
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+        report_data_quality: { label: '生成数据质量报告', allowedParams: ['overlap_sample', 'merged_sample'] },
+        report_data_anomalies: { label: '生成异常股票和清洗策略', allowedParams: [] },
+        report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
+        report_workbench_capabilities: { label: '生成工作台能力盘点', allowedParams: [] },
         report_market_regime: { label: '生成市场状态和现金仓位信号', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_cash_control_backtest: { label: '生成现金仓位叠加回测', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_qlib_predictions: { label: '生成 Qlib 预测摘要', allowedParams: ['run_id', 'topk'] },
-        train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config'] },
+        report_qlib_model_explainability: { label: '生成 Qlib 模型解释报告', allowedParams: ['run_id', 'topk'] },
+        report_qlib_backtest_detail: { label: '生成 Qlib 回测明细报告', allowedParams: ['run_id'] },
+        report_qlib_model_comparison: { label: '生成 Qlib 多模型/多实验对比', allowedParams: ['max_runs'] },
+        report_qlib_factor_analysis: { label: '生成 Qlib 因子分析报告', allowedParams: ['run_id', 'topk'] },
+        report_qlib_rolling_training: { label: '生成 Qlib 滚动训练计划', allowedParams: ['config', 'windows', 'train_years', 'valid_months', 'test_months', 'step_months'] },
+        report_qlib_risk_model: { label: '生成 Qlib 风险模型诊断', allowedParams: ['run_id'] },
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config', 'experiment_name', 'provider'] },
+        generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
+        add_index_benchmark: { label: '预演添加沪深300 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
+        report_china_astock_indicators: { label: '生成 china-astock 技术指标报告', allowedParams: ['symbols', 'lookback_days', 'limit'] },
         optimize_strategy: { label: '策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
+        run_dsa_backtest: { label: '运行 DSA 分析准确性回测', allowedParams: ['code', 'eval_window_days', 'force'] },
       },
       activeCount: 0,
       latestJobs: {
@@ -168,6 +188,12 @@ describe('WorkflowPage', () => {
         },
       },
       recentJobs: [],
+      mlflow: {
+        url: 'http://127.0.0.1:6006/',
+        status: 'available',
+        role: 'experiment_raw_records',
+        checkedAt: '2026-07-03T13:10:00Z',
+      },
     });
     listQuantJobs.mockResolvedValue({
       total: 1,
@@ -215,10 +241,17 @@ describe('WorkflowPage', () => {
     expect(screen.getByRole('heading', { name: '量化任务中心' })).toBeInTheDocument();
     expect(await screen.findByText('当前数据可训练')).toBeInTheDocument();
     expect(screen.getByText('MLflow 原始记录')).toBeInTheDocument();
+    expect(screen.getAllByText('可用').length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.getByRole('link', { name: 'MLflow' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.queryByText('/Users/cq/WorkingProjects')).not.toBeInTheDocument();
+    expect(screen.queryByText('/tmp/job.log')).not.toBeInTheDocument();
     expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
     expect(screen.getAllByText('更新数据')).toHaveLength(2);
     expect(screen.getByText('合并 Qlib')).toBeInTheDocument();
+    expect(screen.getByText('预演生成 CSI300 股票池')).toBeInTheDocument();
+    expect(screen.getByText('预演添加沪深300 benchmark')).toBeInTheDocument();
+    expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
     expect(screen.getByText('应用清洗策略')).toBeInTheDocument();
     expect(screen.getAllByText('质量报告').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('训练+回测')).toBeInTheDocument();
@@ -228,8 +261,27 @@ describe('WorkflowPage', () => {
     expect(screen.getByLabelText('生成现金仓位叠加回测 回看交易日')).toBeInTheDocument();
     expect(screen.getByText('生成 Qlib 预测摘要')).toBeInTheDocument();
     expect(screen.getByLabelText('生成 Qlib 预测摘要 TopK')).toBeInTheDocument();
+    expect(screen.getByText('Qlib研究增强')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 模型解释报告')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 模型解释报告 TopK')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 回测明细报告')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 多模型/多实验对比')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 多模型/多实验对比 对比 Run 数')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 因子分析报告')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 滚动训练计划')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 滚动训练计划 窗口数')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 风险模型诊断')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
     expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
+    expect(screen.getByText('生成 china-astock 技术指标报告')).toBeInTheDocument();
+    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取本地 cleaned 行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 china-astock 技术指标报告 股票代码')).toBeInTheDocument();
+    expect(screen.getByText('生成数据治理盘点和清理预案')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-report_data_hygiene')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-report_data_hygiene')).toHaveAccessibleName('运行 生成数据治理盘点和清理预案');
+    expect(screen.getByText('只读盘点当前数据、日志、旧 provider 和临时脚本，生成 inventory 与 dry-run 清理计划；不移动、不删除、不改配置。')).toBeInTheDocument();
+    expect(screen.getByText('生成工作台能力盘点')).toBeInTheDocument();
+    expect(screen.getByText('只读扫描 DSA 页面/API、quant_workflow 脚本、Qlib 接入和 china-astock-quant 可复用能力，输出功能入口和缺口清单。')).toBeInTheDocument();
     expect(screen.getByText('今日流程')).toBeInTheDocument();
     expect(screen.getByText('按顺序完成检查、报告、预演、训练和记录。')).toBeInTheDocument();
     expect(screen.getByText('质量和异常')).toBeInTheDocument();
@@ -245,6 +297,60 @@ describe('WorkflowPage', () => {
     );
   });
 
+  it('shows a clear unavailable MLflow state from the quant status API', async () => {
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+      mlflow: {
+        url: 'http://127.0.0.1:6006/',
+        status: 'unavailable',
+        role: 'experiment_raw_records',
+        checkedAt: '2026-07-03T13:10:00Z',
+        error: 'connection refused',
+      },
+    });
+
+    renderWorkflowPage();
+
+    expect(await screen.findByText('MLflow 未启动')).toBeInTheDocument();
+    expect(screen.getByText('未启动')).toBeInTheDocument();
+    expect(screen.getByText('connection refused')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+  });
+
+  it('localizes the MLflow status card in English mode', async () => {
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+      mlflow: {
+        url: 'https://mlflow.example.com/',
+        status: 'linked',
+        role: 'experiment_raw_records',
+        checkedAt: null,
+        error: 'Health check skipped for non-local MLflow URL.',
+      },
+    });
+
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter>
+          <WorkflowPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByText('MLflow External Records')).toBeInTheDocument();
+    expect(screen.getByText('External Link')).toBeInTheDocument();
+    expect(screen.queryByText('外部链接')).not.toBeInTheDocument();
+    expect(screen.getByText('Health check skipped for non-local MLflow URL.')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'https://mlflow.example.com/');
+  });
+
   it('submits a whitelisted quant job from the workflow page', async () => {
     renderWorkflowPage();
 
@@ -253,7 +359,187 @@ describe('WorkflowPage', () => {
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('check_qlib_data', {});
     });
+
     expect(await screen.findByText('qj_check')).toBeInTheDocument();
+  });
+
+  it('does not increment the active count when a submitted job already failed to start', async () => {
+    submitQuantJob.mockResolvedValueOnce({
+      jobId: 'qj_failed_start',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'failed',
+      params: {},
+      command: [],
+      cwd: '/Users/cq/WorkingProjects',
+      createdAt: '2026-07-03T22:00:00+08:00',
+      completedAt: '2026-07-03T22:00:01+08:00',
+      updatedAt: '2026-07-03T22:00:01+08:00',
+      error: 'Failed to start job: boom',
+      logPath: '/tmp/job.log',
+      artifactPaths: [],
+    });
+    renderWorkflowPage();
+
+    expect(await screen.findByText('0 个运行中')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '运行 检查 Qlib 数据' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('check_qlib_data', {});
+    });
+    expect(await screen.findByText('qj_failed_start')).toBeInTheDocument();
+    expect(screen.getByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('1 个运行中')).not.toBeInTheDocument();
+  });
+
+  it('disables workflow jobs that are not advertised by the backend whitelist', async () => {
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {
+        check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      },
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+    });
+
+    renderWorkflowPage();
+
+    const hygieneButton = await screen.findByRole('button', { name: '运行 生成数据治理盘点和清理预案' });
+    expect(hygieneButton).toBeDisabled();
+    expect(screen.getAllByText('后端未启用').length).toBeGreaterThan(0);
+
+    fireEvent.click(hygieneButton);
+
+    expect(submitQuantJob).not.toHaveBeenCalledWith('report_data_hygiene', expect.anything());
+  });
+
+  it('waits for the backend whitelist before reporting a job as disabled', async () => {
+    let resolveStatus: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+
+    renderWorkflowPage();
+
+    const hygieneButton = await screen.findByRole('button', { name: '运行 生成数据治理盘点和清理预案' });
+    const hygieneHeading = screen.getByText('生成数据治理盘点和清理预案');
+    const hygieneHeadingCluster = hygieneHeading.closest('div');
+    expect(hygieneButton).toBeDisabled();
+    expect(screen.queryByText('后端未启用')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveStatus({
+        availableJobTypes: {
+          report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
+        },
+        activeCount: 0,
+        latestJobs: {},
+        recentJobs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(hygieneButton).not.toBeDisabled();
+    });
+    expect(within(hygieneHeadingCluster as HTMLElement).queryByText('后端未启用')).not.toBeInTheDocument();
+  });
+
+  it('keeps daily guide job shortcuts disabled until the backend whitelist loads', async () => {
+    let resolveStatus: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+
+    renderWorkflowPage();
+
+    const guideButton = await screen.findByRole('button', { name: '今日流程 清洗预演 预演' });
+    expect(guideButton).toBeDisabled();
+
+    fireEvent.click(guideButton);
+    expect(submitQuantJob).not.toHaveBeenCalled();
+    expect(screen.queryByText('后端未启用')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveStatus({
+        availableJobTypes: {
+          apply_data_cleaning: { label: '应用清洗策略生成 cleaned Qlib', allowedParams: ['dry_run', 'no_overwrite'] },
+        },
+        activeCount: 0,
+        latestJobs: {},
+        recentJobs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(guideButton).not.toBeDisabled();
+    });
+  });
+
+  it('disables daily guide job shortcuts that are missing from the backend whitelist', async () => {
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {
+        check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      },
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+    });
+
+    renderWorkflowPage();
+
+    const guideButton = await screen.findByRole('button', { name: '今日流程 清洗预演 预演' });
+    await waitFor(() => {
+      expect(guideButton).toBeDisabled();
+    });
+    expect(screen.getAllByText('后端未启用').length).toBeGreaterThan(0);
+
+    fireEvent.click(guideButton);
+    expect(submitQuantJob).not.toHaveBeenCalledWith('apply_data_cleaning', expect.anything());
+  });
+
+  it('submits provider maintenance preview jobs without user params', async () => {
+    renderWorkflowPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '运行 预演生成 CSI300 股票池' }));
+    fireEvent.click(await screen.findByRole('button', { name: '运行 预演添加沪深300 benchmark' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('generate_csi300', {});
+      expect(submitQuantJob).toHaveBeenCalledWith('add_index_benchmark', {});
+    });
+  });
+
+  it('submits the read-only workbench capability inventory job without parameters', async () => {
+    renderWorkflowPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '运行 生成工作台能力盘点' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_workbench_capabilities', {});
+    });
+  });
+
+  it('submits Qlib research enhancement jobs with fixed whitelist params', async () => {
+    renderWorkflowPage();
+
+    const explainTopk = await screen.findByLabelText('生成 Qlib 模型解释报告 TopK');
+    fireEvent.change(explainTopk, { target: { value: '12' } });
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成 Qlib 模型解释报告' }));
+
+    const rollingWindows = screen.getByLabelText('生成 Qlib 滚动训练计划 窗口数');
+    fireEvent.change(rollingWindows, { target: { value: '4' } });
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成 Qlib 滚动训练计划' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_qlib_model_explainability', { topk: '12' });
+      expect(submitQuantJob).toHaveBeenCalledWith('report_qlib_rolling_training', {
+        windows: '4',
+        train_years: '3',
+        valid_months: '12',
+        test_months: '1',
+        step_months: '1',
+      });
+    });
   });
 
   it('prevents duplicate submissions for the same running workflow action', async () => {
@@ -334,6 +620,29 @@ describe('WorkflowPage', () => {
       expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {
         provider: 'cleaned',
       });
+    });
+  });
+
+  it('renders and submits only parameters advertised by the backend whitelist', async () => {
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config'] },
+      },
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+    });
+
+    renderWorkflowPage();
+
+    expect(await screen.findByLabelText('训练 Qlib LightGBM 基线 配置文件')).toBeInTheDocument();
+    expect(screen.queryByLabelText('训练 Qlib LightGBM 基线 数据版本')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('训练 Qlib LightGBM 基线 实验名称')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 基线' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {});
     });
   });
 
@@ -495,6 +804,39 @@ describe('WorkflowPage', () => {
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('run_china_astock_comparison', {});
+    });
+  });
+
+  it('submits the china-astock indicator report parameters from the workflow page', async () => {
+    renderWorkflowPage();
+
+    fireEvent.change(await screen.findByLabelText('生成 china-astock 技术指标报告 股票代码'), {
+      target: { value: '000001,600519' },
+    });
+    fireEvent.change(screen.getByLabelText('生成 china-astock 技术指标报告 回看交易日'), {
+      target: { value: '60' },
+    });
+    fireEvent.change(screen.getByLabelText('生成 china-astock 技术指标报告 股票数量上限'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成 china-astock 技术指标报告' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_china_astock_indicators', {
+        symbols: '000001,600519',
+        lookback_days: '60',
+        limit: '2',
+      });
+    });
+  });
+
+  it('submits an empty china-astock indicator report form so the backend applies safe defaults', async () => {
+    renderWorkflowPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '运行 生成 china-astock 技术指标报告' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_china_astock_indicators', {});
     });
   });
 

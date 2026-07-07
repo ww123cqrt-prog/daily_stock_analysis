@@ -22,7 +22,7 @@ import {
 import { Badge, Card, InlineAlert, StatusDot } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { getParsedApiError } from '../api/error';
-import { parseQuantJobStreamEvent, quantApi, type QuantJob, type QuantStatus } from '../api/quant';
+import { parseQuantJobStreamEvent, quantApi, type QuantJob, type QuantJobTypeInfo, type QuantStatus } from '../api/quant';
 import { researchApi, type ResearchStatus } from '../api/research';
 
 type WorkflowJob = {
@@ -149,11 +149,18 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'repair_qlib_provider',
-        label: '修复 Qlib Provider',
-        description: '修复日历、股票池、benchmark 等 provider 元数据。',
-        params: [
-          { key: 'dry_run', label: '只检查不写入', kind: 'checkbox' },
-        ],
+        label: '预演修复 Qlib Provider',
+        description: '检查日历、股票池、benchmark 等 provider 元数据修复计划；网页端固定 dry-run，不写入 provider。',
+      },
+      {
+        type: 'generate_csi300',
+        label: '预演生成 CSI300 股票池',
+        description: '读取当前股票池和 Qlib 日历，预演生成 csi300.txt；网页端固定 dry-run，不写入 provider。',
+      },
+      {
+        type: 'add_index_benchmark',
+        label: '预演添加沪深300 benchmark',
+        description: '检查当前 provider 日历和 benchmark 目标目录；网页端固定 dry-run，不请求 Baostock、不写 bin、不改股票池。',
       },
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
     ],
@@ -174,9 +181,29 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       { type: 'report_data_anomalies', label: '生成异常股票和清洗策略', description: '输出异常股票清单，并给出后续清洗策略。' },
       {
+        type: 'report_data_hygiene',
+        label: '生成数据治理盘点和清理预案',
+        description: '只读盘点当前数据、日志、旧 provider 和临时脚本，生成 inventory 与 dry-run 清理计划；不移动、不删除、不改配置。',
+      },
+      {
+        type: 'report_workbench_capabilities',
+        label: '生成工作台能力盘点',
+        description: '只读扫描 DSA 页面/API、quant_workflow 脚本、Qlib 接入和 china-astock-quant 可复用能力，输出功能入口和缺口清单。',
+      },
+      {
         type: 'run_china_astock_comparison',
         label: '生成 china-astock 策略对比',
         description: '读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。',
+      },
+      {
+        type: 'report_china_astock_indicators',
+        label: '生成 china-astock 技术指标报告',
+        description: '复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取本地 cleaned 行情生成只读技术面观察报告，不连接券商、不自动下单。',
+        params: [
+          { key: 'symbols', label: '股票代码', kind: 'text', placeholder: '000001,600519；留空按数量上限抽样' },
+          { key: 'lookback_days', label: '回看交易日', kind: 'number', min: 20, placeholder: '120' },
+          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, max: 500, placeholder: '50' },
+        ],
       },
       {
         type: 'apply_data_cleaning',
@@ -276,6 +303,72 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
     ],
   },
+  {
+    title: 'Qlib研究增强',
+    description: '把已有 Qlib/MLflow 产物拆成模型解释、回测明细、对比、因子、滚动训练和风险诊断报告。',
+    icon: Activity,
+    jobs: [
+      {
+        type: 'report_qlib_model_explainability',
+        label: '生成 Qlib 模型解释报告',
+        description: '读取最新或指定 run 的 params/pred/label，输出特征重要性、Top/Bottom 预测差异和过拟合诊断；只读报告。',
+        defaultParams: { topk: '20' },
+        params: [
+          { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '20' },
+          { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
+        ],
+      },
+      {
+        type: 'report_qlib_backtest_detail',
+        label: '生成 Qlib 回测明细报告',
+        description: '读取 Qlib portfolio_analysis，输出收益、夏普、回撤、月度收益、持仓和交易活动代理；只读报告。',
+        params: [
+          { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
+        ],
+      },
+      {
+        type: 'report_qlib_model_comparison',
+        label: '生成 Qlib 多模型/多实验对比',
+        description: '扫描本地 MLflow 最近 runs，对比关键指标和预测相关性；可用于 LightGBM、Linear、CatBoost 等实验横向比较。',
+        defaultParams: { max_runs: '8' },
+        params: [
+          { key: 'max_runs', label: '对比 Run 数', kind: 'number', min: 1, max: 50, placeholder: '8' },
+        ],
+      },
+      {
+        type: 'report_qlib_factor_analysis',
+        label: '生成 Qlib 因子分析报告',
+        description: '基于 score 与 label 计算 IC、RankIC、分组收益和特征重要性代理，作为后续 Alpha158/自定义因子筛选入口。',
+        defaultParams: { topk: '20' },
+        params: [
+          { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '20' },
+          { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
+        ],
+      },
+      {
+        type: 'report_qlib_rolling_training',
+        label: '生成 Qlib 滚动训练计划',
+        description: '读取 Qlib 日历和 baseline 配置，生成月度滚动训练窗口计划；本任务只规划，不启动批量训练。',
+        defaultParams: { windows: '6', train_years: '3', valid_months: '12', test_months: '1', step_months: '1' },
+        params: [
+          { key: 'windows', label: '窗口数', kind: 'number', min: 1, max: 60, placeholder: '6' },
+          { key: 'train_years', label: '训练年数', kind: 'number', min: 1, max: 20, placeholder: '3' },
+          { key: 'valid_months', label: '验证月数', kind: 'number', min: 1, max: 120, placeholder: '12' },
+          { key: 'test_months', label: '测试月数', kind: 'number', min: 1, max: 120, placeholder: '1' },
+          { key: 'step_months', label: '滚动步长月', kind: 'number', min: 1, max: 120, placeholder: '1' },
+          { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
+        ],
+      },
+      {
+        type: 'report_qlib_risk_model',
+        label: '生成 Qlib 风险模型诊断',
+        description: '从组合收益、benchmark、换手和最新持仓中估算 beta、集中度、权重上限和风险约束缺口；只读报告。',
+        params: [
+          { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
+        ],
+      },
+    ],
+  },
 ];
 
 const WORKFLOW_JOBS_BY_TYPE = Object.fromEntries(
@@ -299,6 +392,37 @@ function statusTone(status: string): 'success' | 'danger' | 'warning' | 'info' |
   if (status === 'cancelled') return 'warning';
   if (status === 'running' || status === 'pending') return 'info';
   return 'neutral';
+}
+
+function mlflowStatusMeta(status: string | undefined, language: 'zh' | 'en'): {
+  label: string;
+  title: string;
+  tone: 'success' | 'danger' | 'warning' | 'info' | 'neutral';
+  variant: 'success' | 'danger' | 'warning' | 'info' | 'default';
+} {
+  const labels = language === 'zh'
+    ? {
+        available: ['可用', 'MLflow 原始记录'],
+        linked: ['外部链接', 'MLflow 外部记录'],
+        invalid: ['配置无效', 'MLflow 配置待修正'],
+        unavailable: ['未启动', 'MLflow 未启动'],
+      }
+    : {
+        available: ['Available', 'MLflow Raw Records'],
+        linked: ['External Link', 'MLflow External Records'],
+        invalid: ['Invalid Config', 'MLflow Config Needs Fixing'],
+        unavailable: ['Unavailable', 'MLflow Unavailable'],
+      };
+  if (status === 'available') {
+    return { label: labels.available[0], title: labels.available[1], tone: 'success', variant: 'success' };
+  }
+  if (status === 'linked') {
+    return { label: labels.linked[0], title: labels.linked[1], tone: 'info', variant: 'info' };
+  }
+  if (status === 'invalid') {
+    return { label: labels.invalid[0], title: labels.invalid[1], tone: 'danger', variant: 'danger' };
+  }
+  return { label: labels.unavailable[0], title: labels.unavailable[1], tone: 'warning', variant: 'warning' };
 }
 
 function formatTime(value?: string | null): string {
@@ -383,6 +507,7 @@ function jobDrivenStatus(
 function buildDailyGuideSteps(
   researchStatus: ResearchStatus | null,
   latestJobs: Record<string, QuantJob>,
+  mlflowUrl: string,
 ): DailyGuideStep[] {
   const updateJob = latestJobForTypes(latestJobs, ['prepare_baostock_refresh', 'download_baostock', 'download_jqdata']);
   const qualityJob = latestJobs.report_data_quality;
@@ -508,7 +633,7 @@ function buildDailyGuideSteps(
       ...noteStatus,
       actions: [
         { kind: 'link', label: '实验记录', to: '/research' },
-        { kind: 'external', label: 'MLflow', href: 'http://127.0.0.1:6006/' },
+        { kind: 'external', label: 'MLflow', href: mlflowUrl },
       ],
     },
   ];
@@ -519,9 +644,42 @@ function workflowErrorMessage(err: unknown): string {
   return parsed.message || parsed.rawMessage || '请求未成功完成，请稍后重试。';
 }
 
-function buildJobParams(job: WorkflowJob, values: Record<string, JobParamValue> = {}): Record<string, unknown> {
-  const params: Record<string, unknown> = { ...(job.defaultParams || {}) };
+function getBackendJobInfo(quantStatus: QuantStatus | null, jobType: string): {
+  catalogLoaded: boolean;
+  info?: QuantJobTypeInfo;
+  isEnabled: boolean;
+  isDisabled: boolean;
+  allowedParamKeys: Set<string> | null;
+} {
+  const info = quantStatus?.availableJobTypes?.[jobType];
+  const catalogLoaded = quantStatus !== null;
+  const isEnabled = Boolean(info);
+  return {
+    catalogLoaded,
+    info,
+    isEnabled,
+    isDisabled: catalogLoaded && !isEnabled,
+    allowedParamKeys: info ? new Set(info.allowedParams || []) : null,
+  };
+}
+
+function isAllowedParam(key: string, allowedParamKeys?: Set<string> | null): boolean {
+  return !allowedParamKeys || allowedParamKeys.has(key);
+}
+
+function filterJobParams(params: Record<string, unknown>, allowedParamKeys?: Set<string> | null): Record<string, unknown> {
+  if (!allowedParamKeys) return params;
+  return Object.fromEntries(Object.entries(params).filter(([key]) => allowedParamKeys.has(key)));
+}
+
+function buildJobParams(
+  job: WorkflowJob,
+  values: Record<string, JobParamValue> = {},
+  allowedParamKeys?: Set<string> | null,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = filterJobParams({ ...(job.defaultParams || {}) }, allowedParamKeys);
   for (const field of job.params || []) {
+    if (!isAllowedParam(field.key, allowedParamKeys)) continue;
     const value = values[field.key];
     if (field.kind === 'checkbox') {
       if (value === true) params[field.key] = true;
@@ -556,12 +714,14 @@ const WorkflowParamControls: React.FC<{
   job: WorkflowJob;
   values: Record<string, JobParamValue>;
   onChange: (jobType: string, key: string, value: JobParamValue) => void;
-}> = ({ job, values, onChange }) => {
-  if (!job.params?.length) return null;
+  allowedParamKeys?: Set<string> | null;
+}> = ({ job, values, onChange, allowedParamKeys }) => {
+  const fields = (job.params || []).filter((field) => isAllowedParam(field.key, allowedParamKeys));
+  if (!fields.length) return null;
 
   return (
     <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-      {job.params.map((field) => {
+      {fields.map((field) => {
         const ariaLabel = `${job.label} ${field.label}`;
         const value = values[field.key];
         if (field.kind === 'checkbox') {
@@ -625,7 +785,7 @@ const WorkflowParamControls: React.FC<{
 };
 
 const WorkflowPage: React.FC = () => {
-  const { t } = useUiLanguage();
+  const { language, t } = useUiLanguage();
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [quantStatus, setQuantStatus] = useState<QuantStatus | null>(null);
   const [jobs, setJobs] = useState<QuantJob[]>([]);
@@ -639,6 +799,9 @@ const WorkflowPage: React.FC = () => {
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
 
   const latestJobs = useMemo(() => quantStatus?.latestJobs ?? {}, [quantStatus]);
+  const mlflow = quantStatus?.mlflow;
+  const mlflowUrl = mlflow?.url || 'http://127.0.0.1:6006/';
+  const mlflowMeta = mlflowStatusMeta(mlflow?.status, language);
   const workflowStatus = useMemo<ResearchStatus | null>(() => {
     if (researchStatus) return researchStatus;
     if (!quantStatus) return null;
@@ -650,6 +813,8 @@ const WorkflowPage: React.FC = () => {
       qlibProvider: quantStatus.qlibProvider,
       latestTraining: quantStatus.latestTraining,
       cashControlBacktest: quantStatus.cashControlBacktest,
+      qlibPredictions: quantStatus.qlibPredictions,
+      qlibResearch: quantStatus.qlibResearch,
       experimentNotebook: quantStatus.experimentNotebook,
     };
   }, [researchStatus, quantStatus]);
@@ -737,6 +902,7 @@ const WorkflowPage: React.FC = () => {
     };
 
     const connect = () => {
+      if (closed) return;
       source = new window.EventSource(quantApi.getJobStreamUrl(), { withCredentials: true });
       source.addEventListener('jobs', handleJobs as EventListener);
       source.addEventListener('stream_end', handleStreamEnd as EventListener);
@@ -754,6 +920,7 @@ const WorkflowPage: React.FC = () => {
         reconnectDelayMs = Math.min(reconnectDelayMs * 2, STREAM_RECONNECT_MAX_DELAY_MS);
         reconnectTimer = window.setTimeout(() => {
           reconnectTimer = undefined;
+          if (closed) return;
           connect();
         }, delay);
       };
@@ -781,6 +948,15 @@ const WorkflowPage: React.FC = () => {
 
   const submitJob = async (workflowJob: WorkflowJob, explicitParams?: Record<string, unknown>) => {
     const jobType = workflowJob.type;
+    const backendJobInfo = getBackendJobInfo(quantStatus, jobType);
+    if (!backendJobInfo.catalogLoaded) {
+      setError('任务白名单仍在加载，请稍后再试。');
+      return;
+    }
+    if (!backendJobInfo.isEnabled) {
+      setError(`后端未启用任务：${workflowJob.label}`);
+      return;
+    }
     if (submittingJobTypesRef.current.has(jobType)) {
       return;
     }
@@ -788,13 +964,15 @@ const WorkflowPage: React.FC = () => {
     setSubmittingTypes((current) => ({ ...current, [jobType]: true }));
     setError(null);
     try {
-      const params = explicitParams ?? buildJobParams(workflowJob, jobParams[jobType]);
+      const params = explicitParams
+        ? filterJobParams(explicitParams, backendJobInfo.allowedParamKeys)
+        : buildJobParams(workflowJob, jobParams[jobType], backendJobInfo.allowedParamKeys);
       const job = await quantApi.submitJob(jobType, params);
       setJobs((current) => [job, ...current.filter((item) => item.jobId !== job.jobId)]);
       setQuantStatus((current) => current
         ? {
             ...current,
-            activeCount: current.activeCount + 1,
+            activeCount: isActiveJob(job) ? current.activeCount + 1 : current.activeCount,
             latestJobs: { ...current.latestJobs, [job.jobType]: job },
           }
         : current);
@@ -859,8 +1037,8 @@ const WorkflowPage: React.FC = () => {
   const trainable = workflowStatus?.trainable;
   const latestTraining = workflowStatus?.latestTraining;
   const dailyGuideSteps = useMemo(
-    () => buildDailyGuideSteps(workflowStatus, latestJobs),
-    [workflowStatus, latestJobs],
+    () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
+    [workflowStatus, latestJobs, mlflowUrl],
   );
 
   return (
@@ -939,11 +1117,20 @@ const WorkflowPage: React.FC = () => {
           </Card>
 
           <Card variant="bordered" padding="md" className="min-h-[132px]">
-            <span className="label-uppercase">MLflow</span>
-            <p className="mt-3 text-lg font-semibold text-foreground">MLflow 原始记录</p>
-            <p className="mt-2 truncate text-sm text-secondary-text">http://127.0.0.1:6006/</p>
+            <div className="flex items-start justify-between gap-3">
+              <span className="label-uppercase">MLflow</span>
+              <Badge variant={mlflowMeta.variant} size="sm" className="gap-1.5 shadow-none">
+                <StatusDot tone={mlflowMeta.tone} className="h-1.5 w-1.5" />
+                {mlflowMeta.label}
+              </Badge>
+            </div>
+            <p className="mt-3 text-lg font-semibold text-foreground">{mlflowMeta.title}</p>
+            <p className="mt-2 truncate text-sm text-secondary-text">{mlflowUrl}</p>
+            {mlflow?.error ? (
+              <p className="mt-2 line-clamp-2 text-xs leading-4 text-warning">{mlflow.error}</p>
+            ) : null}
             <a
-              href="http://127.0.0.1:6006/"
+              href={mlflowUrl}
               target="_blank"
               rel="noreferrer"
               aria-label="打开 MLflow，新窗口"
@@ -978,12 +1165,23 @@ const WorkflowPage: React.FC = () => {
                       const isSubmitting = submittingTypes[job.type] === true;
                       const paramValues = jobParams[job.type] || {};
                       const isKnownJobType = Boolean(WORKFLOW_JOBS_BY_TYPE[job.type]);
+                      const backendJobInfo = getBackendJobInfo(quantStatus, job.type);
                       return (
-                        <div key={job.type} className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+                        <div
+                          key={job.type}
+                          data-job-type={job.type}
+                          data-testid={`workflow-job-${job.type}`}
+                          className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center"
+                        >
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <h3 className="text-sm font-medium text-foreground">{job.label}</h3>
                               <JobStatusBadge job={latestJob} />
+                              {backendJobInfo.isDisabled ? (
+                                <Badge variant="warning" size="sm" className="shadow-none">
+                                  后端未启用
+                                </Badge>
+                              ) : null}
                             </div>
                             <p className="mt-1 text-sm leading-5 text-secondary-text">{job.description}</p>
                             <p className="mt-1 text-xs text-muted-text">
@@ -1022,11 +1220,12 @@ const WorkflowPage: React.FC = () => {
                                 ) : null}
                               </div>
                             ) : null}
-                            {isKnownJobType ? (
+                            {isKnownJobType && backendJobInfo.isEnabled ? (
                               <WorkflowParamControls
                                 job={job}
                                 values={paramValues}
                                 onChange={updateJobParam}
+                                allowedParamKeys={backendJobInfo.allowedParamKeys}
                               />
                             ) : null}
                           </div>
@@ -1050,9 +1249,10 @@ const WorkflowPage: React.FC = () => {
                             ) : null}
                             <button
                               type="button"
+                              data-testid={`workflow-run-${job.type}`}
                               className="btn-primary h-9 min-w-[8rem] gap-2 px-3 text-sm"
                               onClick={() => void submitJob(job)}
-                              disabled={isSubmitting}
+                              disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled}
                               aria-label={`运行 ${job.label}`}
                             >
                               {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -1104,18 +1304,25 @@ const WorkflowPage: React.FC = () => {
                           {step.actions.map((action) => {
                             if (action.kind === 'job') {
                               const isSubmitting = submittingTypes[action.jobType] === true;
+                              const backendJobInfo = getBackendJobInfo(quantStatus, action.jobType);
                               return (
-                                <button
-                                  key={`${step.id}-${action.jobType}-${action.label}`}
-                                  type="button"
-                                  className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-cyan/25 px-2 text-xs font-medium text-cyan transition-colors hover:bg-cyan/10 disabled:cursor-not-allowed disabled:opacity-60"
-                                  onClick={() => void submitGuideJob(action.jobType, action.params)}
-                                  disabled={isSubmitting}
-                                  aria-label={`今日流程 ${step.title} ${action.label}`}
-                                >
-                                  {isSubmitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-                                  {action.label}
-                                </button>
+                                <span key={`${step.id}-${action.jobType}-${action.label}`} className="inline-flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-cyan/25 px-2 text-xs font-medium text-cyan transition-colors hover:bg-cyan/10 disabled:cursor-not-allowed disabled:opacity-60"
+                                    onClick={() => void submitGuideJob(action.jobType, action.params)}
+                                    disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled}
+                                    aria-label={`今日流程 ${step.title} ${action.label}`}
+                                  >
+                                    {isSubmitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                                    {action.label}
+                                  </button>
+                                  {backendJobInfo.isDisabled ? (
+                                    <Badge variant="warning" size="sm" className="shadow-none">
+                                      后端未启用
+                                    </Badge>
+                                  ) : null}
+                                </span>
                               );
                             }
                             if (action.kind === 'external') {

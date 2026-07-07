@@ -23,7 +23,7 @@ import re
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
@@ -31,6 +31,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+
+from src.web_bind import declared_bind_host
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,26 @@ _FRONTEND_INDEX_NO_CACHE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+_CSRF_PROTECTED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_CSRF_PROTECTED_API_PREFIX = "/api/v1/"
+_CSRF_STRICT_ORIGIN_PREFIXES = (
+    "/api/v1/alphasift/",
+    "/api/v1/auth/",
+    "/api/v1/quant/",
+    "/api/v1/research/experiments/",
+)
+_LOCAL_ORIGIN_PROTECTED_GET_PATHS = frozenset({
+    "/api/v1/research/status",
+})
+_LOCAL_ORIGIN_PROTECTED_GET_PREFIXES = (
+    # /api/v1/quant/status includes local job metadata, artifact names, data
+    # readiness, and MLflow linkage, so it stays same-origin/local-only even
+    # though it is also used by CLI health checks with no Origin header.
+    "/api/v1/quant/",
+)
+_LOCAL_ORIGIN_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+_PRODUCTION_ENVS = frozenset({"prod", "production"})
 
 
 def _frontend_index_response(static_dir: Path) -> FileResponse:
@@ -123,14 +145,112 @@ def _missing_asset_media_type(asset_path: str) -> str:
     return "text/plain"
 
 
-def _warn_if_open_cors_without_auth() -> None:
+def _app_env() -> str:
+    return (
+        os.environ.get("DSA_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("ENV")
+        or ""
+    ).strip().lower()
+
+
+def _enforce_runtime_auth_safety(*, allow_all_origins: bool) -> None:
     if is_auth_enabled():
         return
-    logger.warning(
-        "CORS_ALLOW_ALL=true is enabled while ADMIN_AUTH_ENABLED is false. "
-        "The API will accept browser requests from any origin; only use this "
-        "on trusted local networks or enable admin authentication."
+    bind_host = (declared_bind_host() or "127.0.0.1").lower()
+    app_env = _app_env()
+    auth_required_reason = ""
+    if app_env in _PRODUCTION_ENVS:
+        auth_required_reason = "running in production"
+    elif bind_host and bind_host not in _LOCAL_BIND_HOSTS:
+        auth_required_reason = f"bound to {bind_host}"
+
+    if auth_required_reason:
+        raise RuntimeError(
+            "Unsafe web runtime configuration: ADMIN_AUTH_ENABLED=true is "
+            f"required when DSA is {auth_required_reason}."
+        )
+
+    if allow_all_origins:
+        logger.warning(
+            "CORS_ALLOW_ALL=true is enabled while ADMIN_AUTH_ENABLED is false. "
+            "Read-only API requests may be accepted from any origin, while API "
+            "mutations are protected by the local origin guard. Only use this on "
+            "trusted local machines or enable admin authentication."
+        )
+
+
+def _origin_from_url(value: str) -> str:
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _is_local_origin(origin: str) -> bool:
+    parsed = urlparse(origin)
+    return parsed.scheme in {"http", "https"} and (parsed.hostname or "") in _LOCAL_ORIGIN_HOSTS
+
+
+def _allows_local_origin_shortcut() -> bool:
+    bind_host = declared_bind_host().lower()
+    return not bind_host or bind_host in _LOCAL_BIND_HOSTS
+
+
+def _is_csrf_protected_request(request: Request) -> bool:
+    if request.method.upper() not in _CSRF_PROTECTED_METHODS:
+        return False
+    return request.url.path.startswith(_CSRF_PROTECTED_API_PREFIX)
+
+
+def _requires_explicit_mutation_origin(request: Request) -> bool:
+    return any(request.url.path.startswith(prefix) for prefix in _CSRF_STRICT_ORIGIN_PREFIXES)
+
+
+def _is_local_origin_protected_read_request(request: Request) -> bool:
+    if request.method.upper() != "GET":
+        return False
+    path = request.url.path
+    return path in _LOCAL_ORIGIN_PROTECTED_GET_PATHS or any(
+        path.startswith(prefix) for prefix in _LOCAL_ORIGIN_PROTECTED_GET_PREFIXES
     )
+
+
+def _request_origin(request: Request) -> str:
+    if "origin" in request.headers:
+        return request.headers.get("origin", "").strip()
+    referer = request.headers.get("referer", "").strip()
+    return _origin_from_url(referer) if referer else ""
+
+
+def _request_declares_origin_context(request: Request) -> bool:
+    return "origin" in request.headers or "referer" in request.headers
+
+
+def _is_allowed_origin_value(origin: str, allowed_origins: List[str]) -> bool:
+    if not origin:
+        return False
+    if origin == "null":
+        return False
+    return origin in allowed_origins or (_allows_local_origin_shortcut() and _is_local_origin(origin))
+
+
+def _is_allowed_mutation_origin(request: Request, allowed_origins: List[str]) -> bool:
+    origin = _request_origin(request)
+    if (
+        not origin
+        and not _request_declares_origin_context(request)
+        and not _requires_explicit_mutation_origin(request)
+    ):
+        return True
+    return _is_allowed_origin_value(origin, allowed_origins)
+
+
+def _is_allowed_read_origin(origin: str, allowed_origins: List[str]) -> bool:
+    if not origin:
+        return True
+    return _is_allowed_origin_value(origin, allowed_origins)
+
 
 from api.v1 import api_v1_router
 from api.middlewares.auth import add_auth_middleware
@@ -246,19 +366,42 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     # 允许所有来源（开发/演示用）
     allow_all_origins = os.environ.get("CORS_ALLOW_ALL", "").lower() == "true"
     allow_credentials = not allow_all_origins
+    _enforce_runtime_auth_safety(allow_all_origins=allow_all_origins)
     if allow_all_origins:
-        _warn_if_open_cors_without_auth()
         allowed_origins = ["*"]
     
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
         allow_credentials=allow_credentials,
-        allow_methods=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
     add_auth_middleware(app)
+
+    @app.middleware("http")
+    async def local_sensitive_origin_guard(request: Request, call_next):
+        if _is_csrf_protected_request(request):
+            if not _is_allowed_mutation_origin(request, allowed_origins):
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "csrf_forbidden",
+                        "message": "Cross-origin local quant mutation requests are not allowed.",
+                    },
+                )
+        elif _is_local_origin_protected_read_request(request):
+            origin = _request_origin(request)
+            if not _is_allowed_read_origin(origin, allowed_origins):
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "csrf_forbidden",
+                        "message": "Cross-origin local quant read requests are not allowed.",
+                    },
+                )
+        return await call_next(request)
     
     # ============================================================
     # 注册路由

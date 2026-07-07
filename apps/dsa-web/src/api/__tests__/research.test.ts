@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { researchApi } from '../research';
 
-const { get } = vi.hoisted(() => ({
+const { del, get } = vi.hoisted(() => ({
+  del: vi.fn(),
   get: vi.fn(),
 }));
 
 vi.mock('../index', () => ({
   default: {
+    delete: del,
     get,
     defaults: { baseURL: '' },
   },
@@ -14,6 +16,7 @@ vi.mock('../index', () => ({
 
 describe('researchApi', () => {
   beforeEach(() => {
+    del.mockReset();
     get.mockReset();
   });
 
@@ -32,6 +35,20 @@ describe('researchApi', () => {
           top: [{ instrument: 'SZ000002', score: 0.25 }],
           bottom: [{ instrument: 'SZ000001', score: -0.4 }],
           summary: { latest_rows: 3 },
+        },
+        qlib_research: {
+          status: 'available',
+          available_sections: 1,
+          total_sections: 6,
+          sections: {
+            risk_model: {
+              section: 'risk_model',
+              title: '风险模型集成诊断',
+              status: 'available',
+              generated_at: '2026-07-05T11:00:00+08:00',
+              risk_metrics: { beta_to_benchmark: 0.8 },
+            },
+          },
         },
         capability_matrix: [
           {
@@ -85,11 +102,32 @@ describe('researchApi', () => {
     expect(status.qlibPredictions?.top?.[0].instrument).toBe('SZ000002');
     expect(status.qlibPredictions?.bottom?.[0].score).toBe(-0.4);
     expect(status.qlibPredictions?.summary?.latestRows).toBe(3);
+    expect(status.qlibResearch?.availableSections).toBe(1);
+    expect(status.qlibResearch?.sections.risk_model.riskMetrics?.betaToBenchmark).toBe(0.8);
     expect(status.capabilityMatrix?.[0].id).toBe('trading_execution');
     expect(status.capabilityMatrix?.[0].restrictions).toEqual(['不自动下单', '不读取券商密码']);
     expect(status.functionInventory?.[0].route).toBe('/workflow');
     expect(status.functionInventory?.[0].verification).toBe('train_baseline_lgb 测试。');
     expect(status.chinaAstockReuse?.[0].id).toBe('paper_trading');
     expect(status.chinaAstockReuse?.[0].restrictions).toEqual(['不自动下单', '不读取券商密码']);
+  });
+
+  it('passes an explicit backend confirmation token for permanent experiment deletion', async () => {
+    del.mockResolvedValueOnce({
+      data: {
+        removed_run: { run_id: 'abc123' },
+        note_removed: true,
+        experiment_notebook: { status: 'available', runs: [], total_runs: 0 },
+      },
+    });
+
+    const result = await researchApi.permanentlyDeleteExperimentRun('abc123');
+
+    expect(del).toHaveBeenCalledWith(
+      '/api/v1/research/experiments/abc123/permanent',
+      { params: { confirm: 'permanent' } },
+    );
+    expect(result.noteRemoved).toBe(true);
+    expect(result.removedRun.runId).toBe('abc123');
   });
 });
