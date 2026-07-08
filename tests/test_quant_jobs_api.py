@@ -63,7 +63,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         message = (
             "Failed to start job: [Errno 2] No such file or directory: "
-            "'/Users/cq/WorkingProjects/quant_workflow/scripts/missing.py'; "
+            "'/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/scripts/missing.py'; "
             "container=/app/quant_data/raw/secret.csv; "
             "fallback=C:\\Users\\cq\\secret\\runner.py; "
             "drive_relative=C:secret\\runner.py; "

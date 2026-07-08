@@ -82,8 +82,8 @@ describe('ResearchPage', () => {
         status: 'available',
         totalRuns: 2,
         latestNote: '# 实验记录本\n\n## 2026-07-03 baseline_lgb_alpha158\n\n结论：长历史 baseline 已跑通，但收益质量偏弱。\n\n下一步：补充风险控制和市场择时实验。',
-        logPath: '/Users/cq/WorkingProjects/quant_workflow/reports/experiment_log.md',
-        runsPath: '/Users/cq/WorkingProjects/quant_workflow/reports/experiment_runs.jsonl',
+        logPath: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/experiment_log.md',
+        runsPath: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/experiment_runs.jsonl',
         runs: [
           {
             runId: 'cleaned123',
@@ -129,7 +129,7 @@ describe('ResearchPage', () => {
       dataHygiene: {
         inventory: {
           status: 'available',
-          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_hygiene_inventory_latest.json',
+          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_hygiene_inventory_latest.json',
           generatedAt: '2026-07-06T08:00:00+08:00',
           officialEntries: 2,
           candidateEntries: 4,
@@ -138,7 +138,7 @@ describe('ResearchPage', () => {
         },
         cleanupPlan: {
           status: 'available',
-          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_hygiene_cleanup_plan_latest.json',
+          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_hygiene_cleanup_plan_latest.json',
           generatedAt: '2026-07-06T08:00:00+08:00',
           dryRunOnly: true,
           totalActions: 2,
@@ -161,7 +161,7 @@ describe('ResearchPage', () => {
         },
         qualityReport: {
           status: 'available',
-          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_quality_report_latest.md',
+          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_quality_report_latest.md',
           summary: {
             stockUniverse: '5509',
             usableInstruments: '5340',
@@ -171,7 +171,7 @@ describe('ResearchPage', () => {
         },
         cleaningStrategy: {
           status: 'available',
-          path: '/Users/cq/WorkingProjects/quant_workflow/reports/data_cleaning_strategy_latest.md',
+          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_cleaning_strategy_latest.md',
         },
         manifest: {
           status: 'available',

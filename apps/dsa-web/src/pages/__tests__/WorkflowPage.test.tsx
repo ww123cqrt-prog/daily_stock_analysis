@@ -184,7 +184,7 @@ describe('WorkflowPage', () => {
           createdAt: '2026-07-03T21:00:00+08:00',
           updatedAt: '2026-07-03T21:10:00+08:00',
           logPath: '/tmp/job.log',
-          artifactPaths: ['/Users/cq/WorkingProjects/quant_workflow/reports/latest_training_result.json'],
+          artifactPaths: ['/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/latest_training_result.json'],
         },
       },
       recentJobs: [],
@@ -209,7 +209,7 @@ describe('WorkflowPage', () => {
           createdAt: '2026-07-03T21:00:00+08:00',
           updatedAt: '2026-07-03T21:10:00+08:00',
           logPath: '/tmp/job.log',
-          artifactPaths: ['/Users/cq/WorkingProjects/quant_workflow/reports/latest_training_result.json'],
+          artifactPaths: ['/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/latest_training_result.json'],
         },
       ],
     });

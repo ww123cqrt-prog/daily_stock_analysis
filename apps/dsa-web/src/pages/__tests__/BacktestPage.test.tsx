@@ -114,8 +114,8 @@ beforeEach(() => {
       runId: 'abc123',
       provider: 'cleaned',
       providerUri: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata_cleaned',
-      sourceConfig: '/Users/cq/WorkingProjects/quant_workflow/configs/baseline_lgb_alpha158.yaml',
-      runtimeConfig: '/Users/cq/WorkingProjects/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml',
+      sourceConfig: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/configs/baseline_lgb_alpha158.yaml',
+      runtimeConfig: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml',
       artifacts: ['pred.pkl', 'portfolio_analysis', 'task'],
       metrics: {
         IC: 0.0123,
@@ -289,7 +289,7 @@ describe('BacktestPage', () => {
     expect(screen.getByText('Provider 路径')).toBeInTheDocument();
     expect(screen.getByText('/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata_cleaned')).toBeInTheDocument();
     expect(screen.getByText('运行配置')).toBeInTheDocument();
-    expect(screen.getByText('/Users/cq/WorkingProjects/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml')).toBeInTheDocument();
+    expect(screen.getByText('/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/runtime_configs/baseline_lgb_alpha158_cleaned_latest.yaml')).toBeInTheDocument();
     expect(screen.getByText('MLflow Run')).toBeInTheDocument();
     expect(screen.getByText('pred.pkl')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '打开 MLflow' })).toHaveAttribute('href', 'http://127.0.0.1:6606/');
