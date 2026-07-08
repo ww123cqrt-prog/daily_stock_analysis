@@ -40,6 +40,32 @@ function sqlString(value: string) {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatLocalIso(value: Date) {
+  const timezoneOffsetMinutes = -value.getTimezoneOffset();
+  const sign = timezoneOffsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffsetMinutes = Math.abs(timezoneOffsetMinutes);
+  return [
+    `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}`,
+    `T${pad2(value.getHours())}:${pad2(value.getMinutes())}:${pad2(value.getSeconds())}`,
+    `${sign}${pad2(Math.floor(absoluteOffsetMinutes / 60))}:${pad2(absoluteOffsetMinutes % 60)}`,
+  ].join('');
+}
+
+function formatLocalCompact(value: Date) {
+  return [
+    value.getFullYear(),
+    pad2(value.getMonth() + 1),
+    pad2(value.getDate()),
+    pad2(value.getHours()),
+    pad2(value.getMinutes()),
+    pad2(value.getSeconds()),
+  ].join('');
+}
+
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -532,7 +558,7 @@ function getQuantReportsRoot() {
       ? configuredReportsRoot
       : path.resolve(repoRoot, configuredReportsRoot);
   }
-  const configuredRoot = process.env.QUANT_WORKFLOW_ROOT || path.resolve(repoRoot, '..', 'quant_workflow');
+  const configuredRoot = process.env.QUANT_WORKFLOW_ROOT || path.resolve(repoRoot, 'quant_workflow');
   const quantWorkflowRoot = path.isAbsolute(configuredRoot)
     ? configuredRoot
     : path.resolve(repoRoot, configuredRoot);
@@ -594,14 +620,14 @@ function terminateProcessGroup(pid: number) {
 function createTemporaryQuantArtifactJob() {
   assertLocalSmokeTarget();
   const timestamp = new Date();
-  const timestampCompact = timestamp.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const timestampCompact = formatLocalCompact(timestamp);
   const jobId = `qj_${timestampCompact}_${Math.random().toString(16).slice(2, 10).padEnd(8, '0')}`;
   const jobsRoot = getQuantJobsRoot();
   const jobDir = path.join(jobsRoot, jobId);
   const logPath = path.join(jobDir, 'job.log');
   const artifactPath = path.join(jobDir, `${e2ePrefix}_artifact_report.md`);
   const databasePath = path.join(jobsRoot, 'index.sqlite');
-  const now = timestamp.toISOString();
+  const now = formatLocalIso(timestamp);
 
   fs.mkdirSync(jobDir, { recursive: true });
   fs.writeFileSync(logPath, `dsa e2e artifact job ${jobId}\n`, 'utf-8');
@@ -662,13 +688,13 @@ function createTemporaryQuantArtifactJob() {
 function createTemporaryRunningQuantJob() {
   assertLocalSmokeTarget();
   const timestamp = new Date();
-  const timestampCompact = timestamp.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const timestampCompact = formatLocalCompact(timestamp);
   const jobId = `qj_${timestampCompact}_${Math.random().toString(16).slice(2, 10).padEnd(8, '0')}`;
   const jobsRoot = getQuantJobsRoot();
   const jobDir = path.join(jobsRoot, jobId);
   const logPath = path.join(jobDir, 'job.log');
   const databasePath = path.join(jobsRoot, 'index.sqlite');
-  const now = timestamp.toISOString();
+  const now = formatLocalIso(timestamp);
 
   fs.mkdirSync(jobDir, { recursive: true });
   fs.writeFileSync(logPath, `dsa e2e cancellable job ${jobId}\n`, 'utf-8');

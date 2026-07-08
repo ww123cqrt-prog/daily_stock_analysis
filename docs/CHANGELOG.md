@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - [改进] 方案 A 将 `quant_workflow` 正式收口为 DSA 仓内脚本与运行态正本，历史 reports/mlruns 已迁移到仓内默认目录；旧同级 `quant_workflow` 只在仓内没有历史 marker 时作为迁移期兜底，避免服务重启后训练记录变空。
+- [测试] 本机工作台浏览器 smoke 的临时量化 job helper 默认写入仓内 `quant_workflow/reports/jobs`，并使用本地时区时间戳，避免方案 A 后仍向旧同级 `quant_workflow` 写入测试记录或被最近任务排序挤出列表。
 - [修复] 量化任务公开错误脱敏补齐 Docker `/app/...` 路径，并收窄 Windows 盘符路径匹配，避免把 `E:5`、`R:42` 这类普通文本误替换为 `[path]`。
 - [修复] 网页量化任务为通用 `limit` 参数增加 10000 上限，覆盖 Baostock 刷新/下载、市场状态和现金仓位回测报告等入口；JQData 与 `china-astock` 报告继续使用更小的专用上限。
 - [修复] `CORS_ALLOW_ALL=true` 只影响浏览器 CORS 响应头，不再覆盖本地敏感 API 的显式来源白名单；组合、告警和股票写接口也要求 no-origin 请求提供可信本机来源。
