@@ -176,6 +176,7 @@ run_quick() {
     tests/test_main_schedule_mode.py \
     tests/test_alphasift_api.py \
     tests/test_quant_jobs_api.py \
+    tests/test_quant_workflow_paths.py \
     tests/test_research_status_api.py \
     tests/test_quant_workflow_docs.py \
     tests/test_safe_urls.py \

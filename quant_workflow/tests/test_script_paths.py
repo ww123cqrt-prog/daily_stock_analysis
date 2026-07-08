@@ -112,6 +112,43 @@ class ScriptPathsTest(unittest.TestCase):
                 self.assertEqual(module.reports_root(), sibling_reports)
                 self.assertEqual(module.mlruns_root(), sibling_mlruns)
 
+    def test_repo_local_reports_and_mlruns_win_when_both_payloads_exist(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            dsa_root = temp_root / "daily_stock_analysis"
+            workflow_root = dsa_root / "quant_workflow"
+            repo_reports = workflow_root / "reports"
+            repo_mlruns = workflow_root / "mlruns"
+            sibling_reports = temp_root / "quant_workflow" / "reports"
+            sibling_mlruns = temp_root / "quant_workflow" / "mlruns"
+            repo_reports.mkdir(parents=True)
+            repo_mlruns.mkdir(parents=True)
+            sibling_reports.mkdir(parents=True)
+            sibling_mlruns.mkdir(parents=True)
+            (repo_reports / "research_status_latest.json").write_text("{}", encoding="utf-8")
+            (repo_mlruns / "0").mkdir()
+            (sibling_reports / "latest_training_result.json").write_text("{}", encoding="utf-8")
+            (sibling_mlruns / "models").mkdir()
+
+            with patch.object(module, "DEFAULT_DSA_ROOT", dsa_root), patch.object(
+                module, "DEFAULT_WORKFLOW_ROOT", workflow_root
+            ), patch.object(module, "DEFAULT_PROJECTS_ROOT", temp_root), patch.dict(
+                os.environ,
+                {
+                    key: ""
+                    for key in [
+                        "WORKING_PROJECTS_ROOT",
+                        "QUANT_WORKFLOW_ROOT",
+                        "QUANT_WORKFLOW_REPORTS_ROOT",
+                        "QUANT_WORKFLOW_MLRUNS_DIR",
+                    ]
+                },
+                clear=False,
+            ):
+                self.assertEqual(module.reports_root(), repo_reports)
+                self.assertEqual(module.mlruns_root(), repo_mlruns)
+
     def test_specific_env_overrides_take_precedence(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -146,14 +146,14 @@ ETF 的基本面分析会降级：不要把股票公司的财报、ROE、公司�
 | --- | --- |
 | DSA 代码 | `daily_stock_analysis/` |
 | 稳定量化脚本 | `daily_stock_analysis/quant_workflow/scripts/` |
-| 量化报告和实验记录 | 默认 `daily_stock_analysis/quant_workflow/reports/`；既有本机若仓内无历史标记且 DSA 同级 `quant_workflow/reports/` 有真实记录，会自动读取同级历史；可用 `QUANT_WORKFLOW_REPORTS_ROOT` 固定位置，运行态产物不入库 |
-| MLflow 原始记录 | 默认 `daily_stock_analysis/quant_workflow/mlruns/`；既有本机同理可自动读取 DSA 同级 `quant_workflow/mlruns/`，或用 `QUANT_WORKFLOW_MLRUNS_DIR` 固定位置，运行态产物不入库 |
+| 量化报告和实验记录 | 默认 `daily_stock_analysis/quant_workflow/reports/`；旧安装的同级 `quant_workflow/reports/` 只作为仓内无历史标记时的迁移期兜底；可用 `QUANT_WORKFLOW_REPORTS_ROOT` 显式固定位置，运行态产物不入库 |
+| MLflow 原始记录 | 默认 `daily_stock_analysis/quant_workflow/mlruns/`；旧安装的同级 `quant_workflow/mlruns/` 只作为仓内无历史标记时的迁移期兜底；可用 `QUANT_WORKFLOW_MLRUNS_DIR` 显式固定位置，运行态产物不入库 |
 | 临时实验草稿 | `daily_stock_analysis/quant_workflow/scratch/`，只保留 README |
 | Qlib provider 和行情数据 | `daily_stock_analysis/quant_data/`，运行态数据，不入库 |
 | CodeGraph 索引 | 每个项目自己的 `.codegraph/` |
 | Python 虚拟环境 | `daily_stock_analysis/.venv/` 是唯一 Python 运行时；`qlib/.venv` 和 `china-astock-quant/.venv` 不作为网页任务默认运行环境 |
 
-可迁移路径统一通过环境变量覆盖：`QUANT_DATA_ROOT` 指向行情数据和 Qlib provider 根目录，`QUANT_WORKFLOW_ROOT` 指向量化脚本层，`QUANT_WORKFLOW_REPORTS_ROOT` 指向报告/实验摘要，`QUANT_WORKFLOW_MLRUNS_DIR` 指向 MLflow file store，`MLFLOW_URL` 控制网页里展示的 MLflow 链接，`MAX_QUANT_JOB_STREAMS` 控制工作流实时状态连接上限。默认代码真源是仓内 `quant_workflow/`；运行态 reports/mlruns 在仓内没有历史标记时会优先复用 DSA 同级旧历史，避免合并仓库后网页重启变空；其余默认值分别是仓内或同级 `quant_data/`、`http://127.0.0.1:6006/` 和 `8`。
+可迁移路径统一通过环境变量覆盖：`QUANT_DATA_ROOT` 指向行情数据和 Qlib provider 根目录，`QUANT_WORKFLOW_ROOT` 指向量化脚本层，`QUANT_WORKFLOW_REPORTS_ROOT` 指向报告/实验摘要，`QUANT_WORKFLOW_MLRUNS_DIR` 指向 MLflow file store，`MLFLOW_URL` 控制网页里展示的 MLflow 链接，`MAX_QUANT_JOB_STREAMS` 控制工作流实时状态连接上限。默认代码真源和运行态正本都是仓内 `quant_workflow/`；旧同级 reports/mlruns 只在仓内完全没有历史 marker 时作为迁移期读取兜底，避免旧安装升级后网页重启变空；其余默认值分别是仓内或同级 `quant_data/`、`http://127.0.0.1:6006/` 和 `8`。
 
 量化任务统一使用 `QUANT_WORKFLOW_PYTHON`，默认指向 `daily_stock_analysis/.venv/bin/python`。旧的 `QLIB_PYTHON` 不再作为网页任务中心的 Python 入口；如果其他脚本仍设置了 `QLIB_PYTHON`，不会覆盖 DSA 网页任务运行环境。
 

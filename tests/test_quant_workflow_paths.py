@@ -65,6 +65,39 @@ class QuantWorkflowPathsTestCase(unittest.TestCase):
             ):
                 self.assertEqual(paths.reports_root(), embedded_reports)
 
+    def test_embedded_reports_and_mlruns_win_when_both_payloads_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dsa_root = root / "daily_stock_analysis"
+            embedded_workflow = dsa_root / "quant_workflow"
+            embedded_reports = embedded_workflow / "reports"
+            embedded_mlruns = embedded_workflow / "mlruns"
+            sibling_reports = root / "quant_workflow" / "reports"
+            sibling_mlruns = root / "quant_workflow" / "mlruns"
+            embedded_reports.mkdir(parents=True)
+            embedded_mlruns.mkdir(parents=True)
+            sibling_reports.mkdir(parents=True)
+            sibling_mlruns.mkdir(parents=True)
+            (embedded_reports / "experiment_runs.jsonl").write_text("", encoding="utf-8")
+            (embedded_mlruns / "0").mkdir()
+            (sibling_reports / "latest_training_result.json").write_text("{}", encoding="utf-8")
+            (sibling_mlruns / "models").mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "DSA_ROOT": str(dsa_root),
+                    "WORKING_PROJECTS_ROOT": "",
+                    "QUANT_WORKFLOW_ROOT": "",
+                    "QUANT_WORKFLOW_REPORTS_ROOT": "",
+                    "QUANT_WORKFLOW_MLRUNS_DIR": "",
+                },
+                clear=False,
+            ):
+                self.assertEqual(paths.workflow_root(), embedded_workflow)
+                self.assertEqual(paths.reports_root(), embedded_reports)
+                self.assertEqual(paths.mlruns_root(), embedded_mlruns)
+
     def test_explicit_environment_overrides_take_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

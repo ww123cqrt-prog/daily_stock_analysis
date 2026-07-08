@@ -91,10 +91,9 @@ UVICORN_PORT=8010
 DSA_ROOT=/path/to/daily_stock_analysis
 WORKING_PROJECTS_ROOT=/path/to
 QUANT_WORKFLOW_ROOT=/path/to/daily_stock_analysis/quant_workflow
-# 既有本机若 reports/mlruns 已在 DSA 同级 quant_workflow，可用下列变量固定；
-# 不设置时，仓内没有历史标记而同级有历史时会自动读取同级历史。
-# QUANT_WORKFLOW_REPORTS_ROOT=/path/to/quant_workflow/reports
-# QUANT_WORKFLOW_MLRUNS_DIR=/path/to/quant_workflow/mlruns
+# reports/mlruns 的正式位置是仓内 quant_workflow；外部路径仅用于迁移/回滚。
+# QUANT_WORKFLOW_REPORTS_ROOT=/path/to/daily_stock_analysis/quant_workflow/reports
+# QUANT_WORKFLOW_MLRUNS_DIR=/path/to/daily_stock_analysis/quant_workflow/mlruns
 # 数据可以放在仓内 quant_data，也可以放在 DSA 同级的 quant_data；
 # 不设置时会先找仓内目录，再找同级目录。
 # QUANT_DATA_ROOT=/path/to/quant_data
@@ -133,6 +132,8 @@ mkdir -p quant_data
 ```
 
 DSA 通过 `.env` 中的 `QUANT_WORKFLOW_ROOT` 读取量化脚本层。默认值指向仓内 `quant_workflow/`；只有你把脚本层移到外部目录时才需要覆盖。
+
+`quant_workflow/reports/` 和 `quant_workflow/mlruns/` 是 DSA 量化工作台的默认运行态目录，但它们被 `.gitignore` 排除，不会随 GitHub 分发。旧安装如果还保留 DSA 同级的 `quant_workflow/reports` 或 `mlruns`，路径解析器只在仓内目录没有历史标记时临时读取同级旧历史；一旦仓内已有 marker 文件，仓内目录就是默认读写位置。
 
 ## 启动 DSA
 
@@ -214,7 +215,7 @@ GitHub 仓库应只包含可复现的代码、测试、文档和示例配置。�
 5. 启动 DSA 和 MLflow。
 6. 在 `/workflow` 里运行数据检查、质量报告、转换、训练和回测。
 
-不要把你的 `.env`、股票全量数据、Qlib provider、MLflow `mlruns`、日志和报告推送到 GitHub。它们是本地私有运行态资产。
+不要把你的 `.env`、股票全量数据、Qlib provider、MLflow `mlruns`、日志和报告推送到 GitHub。它们是本地私有运行态资产。仓库只提交 `quant_workflow` 的脚本、测试和说明文件，不提交其中的 `reports/` 与 `mlruns/` 运行数据。
 
 ## 常见问题
 

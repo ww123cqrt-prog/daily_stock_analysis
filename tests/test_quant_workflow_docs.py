@@ -23,6 +23,9 @@ def test_env_example_documents_quant_workflow_path_overrides() -> None:
     ):
         assert f"# {key}=" in env_example
 
+    assert "reports/mlruns 的正式位置是仓内" in env_example
+    assert "迁移期只读兜底" in env_example
+
 
 def test_changelog_mentions_web_quant_workflow_entry() -> None:
     changelog = (ROOT_DIR / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -62,6 +65,7 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         "pred.pkl",
         "runtime config",
         "quant_workflow 脚本覆盖盘点",
+        "旧安装的同级 `quant_workflow/reports/` 只作为仓内无历史标记时的迁移期兜底",
         "report_data_hygiene.py",
         "data_hygiene_inventory_latest",
         "data_hygiene_cleanup_plan_latest",
@@ -89,6 +93,18 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         "未跟踪正式文件",
     ):
         assert phrase in manual
+
+
+def test_quant_workflow_runtime_data_doc_marks_embedded_runtime_canonical() -> None:
+    runtime_doc = (ROOT_DIR / "quant_workflow" / "RUNTIME_DATA.md").read_text(encoding="utf-8")
+
+    assert "canonical local runtime home" in runtime_doc
+    assert "reports/" in runtime_doc
+    assert "mlruns/" in runtime_doc
+    assert "../quant_workflow/reports/" in runtime_doc
+    assert "rollback/deprecated copy" in runtime_doc
+    assert "/Users/" not in runtime_doc
+    assert "JQ_PASSWORD" not in runtime_doc
 
 
 def test_verification_script_opencode_review_covers_untracked_files() -> None:
