@@ -91,19 +91,36 @@ UVICORN_PORT=8010
 DSA_ROOT=/path/to/daily_stock_analysis
 WORKING_PROJECTS_ROOT=/path/to
 QUANT_WORKFLOW_ROOT=/path/to/daily_stock_analysis/quant_workflow
-QUANT_DATA_ROOT=/path/to/daily_stock_analysis/quant_data
+# 既有本机若 reports/mlruns 已在 DSA 同级 quant_workflow，可用下列变量固定；
+# 不设置时，仓内没有历史标记而同级有历史时会自动读取同级历史。
+# QUANT_WORKFLOW_REPORTS_ROOT=/path/to/quant_workflow/reports
+# QUANT_WORKFLOW_MLRUNS_DIR=/path/to/quant_workflow/mlruns
+# 数据可以放在仓内 quant_data，也可以放在 DSA 同级的 quant_data；
+# 不设置时会先找仓内目录，再找同级目录。
+# QUANT_DATA_ROOT=/path/to/quant_data
 QUANT_WORKFLOW_PYTHON=/path/to/daily_stock_analysis/.venv/bin/python
 MLFLOW_URL=http://127.0.0.1:6006/
 ```
 
-需要 JQData 时，在 `.env` 写：
+需要 JQData 时，优先把账号密码放到本机私有文件，不放在项目目录：
 
 ```bash
+mkdir -p ~/.agents/private/quant-workbench
+chmod 700 ~/.agents/private/quant-workbench
+cat > ~/.agents/private/quant-workbench/jqdata.env <<'EOF'
 JQ_USERNAME=你的聚宽手机号或邮箱
 JQ_PASSWORD=你的聚宽密码
+EOF
+chmod 600 ~/.agents/private/quant-workbench/jqdata.env
 ```
 
-`.env` 是本机敏感文件，禁止提交。
+如需放到其他位置，在 DSA `.env` 里只写路径：
+
+```bash
+JQDATA_ENV_FILE=/absolute/path/to/jqdata.env
+```
+
+项目 `.env` 是本机配置文件，禁止提交；真实账号、密码和 token 更推荐放在 `~/.agents/private/`。
 
 ## 准备相关项目
 
@@ -112,7 +129,7 @@ JQ_PASSWORD=你的聚宽密码
 ```bash
 cd /path/to
 git clone --depth 1 https://github.com/MisakaMikoto128/china-astock-quant.git china-astock-quant
-mkdir -p daily_stock_analysis/quant_data
+mkdir -p quant_data
 ```
 
 DSA 通过 `.env` 中的 `QUANT_WORKFLOW_ROOT` 读取量化脚本层。默认值指向仓内 `quant_workflow/`；只有你把脚本层移到外部目录时才需要覆盖。
@@ -142,7 +159,7 @@ MLflow 3.x 对 file store 有安全限制，本地启动时显式允许：
 ```bash
 cd /path/to/daily_stock_analysis
 mkdir -p logs quant_workflow/mlruns
-screen -dmS mlflow-6006 zsh -lc 'MLFLOW_ALLOW_FILE_STORE=true .venv/bin/python -m mlflow ui --backend-store-uri file://$PWD/quant_workflow/mlruns --host 127.0.0.1 --port 6006 >> logs/mlflow_6006.log 2>&1'
+screen -dmS mlflow-6006 zsh -lc 'MLFLOW_STORE="${QUANT_WORKFLOW_MLRUNS_DIR:-$PWD/quant_workflow/mlruns}"; MLFLOW_ALLOW_FILE_STORE=true .venv/bin/python -m mlflow ui --backend-store-uri "file://$MLFLOW_STORE" --host 127.0.0.1 --port 6006 >> logs/mlflow_6006.log 2>&1'
 ```
 
 检查：

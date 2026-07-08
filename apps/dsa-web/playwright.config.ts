@@ -11,6 +11,7 @@ const managedSmokeRoot = path.join(currentDir, 'test-results', 'managed-smoke');
 const managedReportsRoot = process.env.DSA_WEB_SMOKE_REPORTS_ROOT
   || path.join(managedSmokeRoot, 'quant_workflow', 'reports');
 const realReportsRoot = path.resolve(repoRoot, 'quant_workflow', 'reports');
+const managedPythonFixtureRoot = path.join(currentDir, 'e2e', 'fixtures', 'python');
 
 function copyIfExists(source: string, destination: string) {
   if (!fs.existsSync(source)) return;
@@ -74,6 +75,15 @@ const managedWebServerEnv: Record<string, string> = Object.fromEntries(
   Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
 );
 managedWebServerEnv.QUANT_WORKFLOW_REPORTS_ROOT = managedReportsRoot;
+
+if (process.env.DSA_WEB_E2E_FAKE_ANALYSIS === '1') {
+  managedWebServerEnv.JQ_USERNAME = 'managed-smoke-jq-user';
+  managedWebServerEnv.JQ_PASSWORD = 'managed-smoke-jq-password';
+  managedWebServerEnv.PYTHONPATH = [
+    managedPythonFixtureRoot,
+    managedWebServerEnv.PYTHONPATH,
+  ].filter(Boolean).join(path.delimiter);
+}
 
 function resolveBackendCommand() {
   if (process.env.DSA_WEB_SMOKE_BACKEND_CMD) {

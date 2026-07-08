@@ -21,7 +21,7 @@
 
 `daily_stock_analysis` 是主项目和本地网页控制台。用户通过它访问研究、工作流、回测、实验记录和设置。
 
-仓内 `quant_workflow/` 是脚本和产物层。网页任务只能调用白名单脚本，不能从浏览器提交任意 shell。
+仓内 `quant_workflow/` 是脚本真源。网页任务只能调用白名单脚本，不能从浏览器提交任意 shell。运行态 reports/mlruns 是本地资产：新安装默认放在仓内 `quant_workflow/reports` 和 `quant_workflow/mlruns`；既有本机若仓内没有历史标记而 DSA 同级 `quant_workflow/reports` 或 `mlruns` 有真实实验历史，路径 helper 会自动复用同级历史，或由 `QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR` 显式固定。
 
 Qlib 是通过 Python 包安装的量化研究引擎。除非任务明确要求开发 Qlib 本身，不要修改官方 Qlib 源码，也不要把 Qlib 仓库当作主 UI。
 
@@ -30,6 +30,8 @@ MLflow 是独立实验记录服务，不属于 Qlib，也不是 DSA 的替代 UI
 `china-astock-quant` 是 A 股指标、策略和工程经验参考库。默认只复用只读指标和报告能力，不接券商交易模块。
 
 `quant_data`、Qlib provider、MLflow `mlruns`、下载缓存、日志和报告是本地数据资产。它们不应提交到 Git。
+
+JQData 凭据的首选位置是 `~/.agents/private/quant-workbench/jqdata.env`，也可通过 `JQDATA_ENV_FILE` 指向其他本机私有文件。不要把 `JQ_USERNAME` / `JQ_PASSWORD` 写入 DSA 仓库、Qlib 源码目录或交接报告。历史兼容路径 `WORKING_PROJECTS_ROOT/qlib/.env` 只能作为迁移期 fallback；发现该文件含真实凭据时，应先迁移到私有目录并确认脚本仍可读取。
 
 ## Agent 开工检查
 
@@ -182,13 +184,16 @@ scripts/verify-local-quant-workbench.sh complete
 启动 MLflow 时保留本地 file store 显式开关：
 
 ```bash
+MLFLOW_STORE="${QUANT_WORKFLOW_MLRUNS_DIR:-/path/to/daily_stock_analysis/quant_workflow/mlruns}"
 MLFLOW_ALLOW_FILE_STORE=true .venv/bin/python -m mlflow ui \
-  --backend-store-uri file:///path/to/daily_stock_analysis/quant_workflow/mlruns \
+  --backend-store-uri "file://$MLFLOW_STORE" \
   --host 127.0.0.1 \
   --port 6006
 ```
 
 长跑服务或下载任务应使用 `screen`、`tmux`、`nohup`、`launchd` 或项目持久任务机制，并写入日志。不要把正式长任务裸跑在一次性前台 shell 里。
+
+如果 agent 或外部脚本绕过 `main.py` / `webui.py` / `server.py`，直接用 `uvicorn.Config(host=...)` 创建服务，必须先设置 `DSA_BIND_HOST` 或调用 `src.web_bind.publish_bind_host(host)`。否则应用工厂无法看到真实 host，公网绑定认证检查只能按 localhost 默认处理。
 
 ## GitHub 分发边界
 

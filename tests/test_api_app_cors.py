@@ -495,6 +495,44 @@ class AppCorsConfigTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"], "csrf_forbidden")
 
+    def test_allow_all_keeps_explicit_origins_for_non_localhost_mutation_guard(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CORS_ALLOW_ALL": "true",
+                "CORS_ORIGINS": "http://127.0.0.1:8010",
+                "DSA_BIND_HOST": "0.0.0.0",
+            },
+            clear=False,
+        ), \
+             patch("api.app.is_auth_enabled", return_value=True), \
+             patch("api.middlewares.auth.is_auth_enabled", return_value=False):
+            client = TestClient(self._build_app())
+            resp = client.post(
+                "/api/v1/quant/jobs",
+                headers={"Origin": "http://127.0.0.1:8010"},
+                json={"job_type": "not_a_real_job"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["error"], "invalid_params")
+
+    def test_missing_origin_sensitive_mutations_are_rejected_consistently(self):
+        mutation_paths = [
+            ("POST", "/api/v1/portfolio/accounts"),
+            ("POST", "/api/v1/alerts/rules"),
+            ("POST", "/api/v1/stocks/extract-from-image"),
+        ]
+        with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
+             patch("api.app.is_auth_enabled", return_value=False), \
+             patch("api.middlewares.auth.is_auth_enabled", return_value=False):
+            client = TestClient(self._build_app())
+            for method, path in mutation_paths:
+                with self.subTest(method=method, path=path):
+                    resp = client.request(method, path, json={})
+                    self.assertEqual(resp.status_code, 403)
+                    self.assertEqual(resp.json()["error"], "csrf_forbidden")
+
 
 if __name__ == "__main__":
     unittest.main()

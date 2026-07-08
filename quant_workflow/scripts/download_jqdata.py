@@ -35,9 +35,12 @@ WORKFLOW_ROOT = workflow_root()
 PROJECTS_ROOT = projects_root()
 QUANT_DATA = quant_data_root()
 PARQUET_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
-DEFAULT_ENV_FILE = PROJECTS_ROOT / "qlib" / ".env"
+JQDATA_ENV_FILE_ENV = "JQDATA_ENV_FILE"
+PRIVATE_ENV_FILE = Path.home() / ".agents" / "private" / "quant-workbench" / "jqdata.env"
+LEGACY_ENV_FILE = PROJECTS_ROOT / "qlib" / ".env"
 DEFAULT_DRY_RUN_LIMIT = 3
 CUSTOM_CODE_PATTERN = re.compile(r"^(?P<symbol>\d{6})(?:\.(?P<exchange>XSHG|XSHE|XBSE))?$")
+_USE_DEFAULT_ENV_FILES = object()
 
 
 def load_env_file(path: Path, environ: MutableMapping[str, str] | None = None) -> None:
@@ -55,6 +58,23 @@ def load_env_file(path: Path, environ: MutableMapping[str, str] | None = None) -
             target[key] = value.strip()
 
 
+def default_env_files(environ: MutableMapping[str, str] | None = None) -> list[Path]:
+    """Return JQData env files in safe precedence order."""
+    target = os.environ if environ is None else environ
+    configured = target.get(JQDATA_ENV_FILE_ENV) or os.environ.get(JQDATA_ENV_FILE_ENV)
+    paths: list[Path] = []
+    if configured:
+        paths.append(Path(configured).expanduser())
+    paths.append(PRIVATE_ENV_FILE)
+    paths.append(LEGACY_ENV_FILE)
+    return paths
+
+
+def load_env_files(paths: Sequence[Path], environ: MutableMapping[str, str] | None = None) -> None:
+    for path in paths:
+        load_env_file(path, environ=environ)
+
+
 def _load_jq_module():
     import jqdatasdk as jq
 
@@ -64,10 +84,15 @@ def _load_jq_module():
 def authenticate(
     jq_module: Any,
     environ: MutableMapping[str, str],
-    env_file: Path | None = DEFAULT_ENV_FILE,
+    env_file: Path | Sequence[Path] | None | object = _USE_DEFAULT_ENV_FILES,
 ) -> bool:
-    if env_file is not None:
-        load_env_file(env_file, environ=environ)
+    if env_file is _USE_DEFAULT_ENV_FILES:
+        load_env_files(default_env_files(environ), environ=environ)
+    elif env_file is not None:
+        if isinstance(env_file, (str, os.PathLike)):
+            load_env_file(Path(env_file), environ=environ)
+        else:
+            load_env_files([Path(item) for item in env_file], environ=environ)
     username = environ.get("JQ_USERNAME")
     password = environ.get("JQ_PASSWORD")
     if not username or not password:
@@ -186,14 +211,20 @@ def main(
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument("--out", type=Path, default=PARQUET_DIR)
-    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Optional credential env file. Defaults to JQDATA_ENV_FILE, private jqdata.env, then legacy qlib/.env.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and resolve symbols without writing parquet files.")
     args = parser.parse_args(argv)
 
     env = os.environ if environ is None else environ
     jq = _load_jq_module() if jq_module is None else jq_module
 
-    if not authenticate(jq, env, env_file=args.env_file):
+    env_file = args.env_file if args.env_file is not None else _USE_DEFAULT_ENV_FILES
+    if not authenticate(jq, env, env_file=env_file):
         return 1
 
     try:

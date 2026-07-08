@@ -63,7 +63,7 @@ class PortfolioApiTestCase(unittest.TestCase):
         Config.reset_instance()
         DatabaseManager.reset_instance()
         app = create_app(static_dir=self.data_dir / "empty-static")
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers={"Origin": "http://127.0.0.1:8010"})
         self.db = DatabaseManager.get_instance()
 
     def tearDown(self) -> None:

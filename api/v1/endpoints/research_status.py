@@ -27,6 +27,13 @@ except ImportError:  # pragma: no cover - msvcrt is only available on Windows.
 from fastapi import APIRouter, HTTPException, Query
 
 from src.safe_urls import public_http_url
+from src.services.quant_workflow_paths import (
+    dsa_root,
+    projects_root,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -34,11 +41,11 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
-DSA_ROOT = _env_path("DSA_ROOT", Path(__file__).resolve().parents[3])
-PROJECTS_ROOT = _env_path("WORKING_PROJECTS_ROOT", DSA_ROOT.parent)
-QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", DSA_ROOT / "quant_workflow")
-QUANT_WORKFLOW_REPORTS_ROOT = _env_path("QUANT_WORKFLOW_REPORTS_ROOT", QUANT_WORKFLOW_ROOT / "reports")
-QUANT_DATA_ROOT = _env_path("QUANT_DATA_ROOT", DSA_ROOT / "quant_data")
+DSA_ROOT = dsa_root()
+PROJECTS_ROOT = projects_root(DSA_ROOT)
+QUANT_WORKFLOW_ROOT = workflow_root(DSA_ROOT)
+QUANT_WORKFLOW_REPORTS_ROOT = reports_root(DSA_ROOT)
+QUANT_DATA_ROOT = quant_data_root(DSA_ROOT)
 QLIB_PROVIDER_ROOT = _env_path("QLIB_PROVIDER_ROOT", QUANT_DATA_ROOT / "qlib")
 RESEARCH_STATUS_PATH = QUANT_WORKFLOW_REPORTS_ROOT / "research_status_latest.json"
 EXPERIMENT_LOG_FILENAME = "experiment_log.md"

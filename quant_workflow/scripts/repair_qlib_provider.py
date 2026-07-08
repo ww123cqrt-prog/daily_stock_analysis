@@ -14,23 +14,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import qlib_provider_uri  # noqa: E402
+from _symbols import to_qlib_name  # noqa: E402
 
 
 DEFAULT_PROVIDER = qlib_provider_uri()
 BENCHMARK_SYMBOLS = {"SH000300"}
-
-
-def to_qlib_name(sym: str) -> str:
-    s = sym.strip().upper()
-    if s.startswith(("SH", "SZ", "BJ")):
-        return s
-    if s.startswith(("600", "601", "603", "605", "688", "689")):
-        return f"SH{s}"
-    if s.startswith(("000", "001", "002", "003", "300", "301", "302")):
-        return f"SZ{s}"
-    if s.startswith(("4", "8")):
-        return f"BJ{s}"
-    return s
 
 
 def read_instruments(path: Path) -> list[tuple[str, str, str]]:

@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
+from src.services.quant_workflow_paths import dsa_root, projects_root, reports_root, workflow_root
+
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +37,10 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
-DSA_ROOT = _env_path("DSA_ROOT", Path(__file__).resolve().parents[2])
-PROJECTS_ROOT = _env_path("WORKING_PROJECTS_ROOT", DSA_ROOT.parent)
-QUANT_WORKFLOW_ROOT = _env_path("QUANT_WORKFLOW_ROOT", DSA_ROOT / "quant_workflow")
-REPORTS_ROOT = _env_path("QUANT_WORKFLOW_REPORTS_ROOT", QUANT_WORKFLOW_ROOT / "reports")
+DSA_ROOT = dsa_root()
+PROJECTS_ROOT = projects_root(DSA_ROOT)
+QUANT_WORKFLOW_ROOT = workflow_root(DSA_ROOT)
+REPORTS_ROOT = reports_root(DSA_ROOT)
 DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
 DSA_VENV_PYTHON = DSA_ROOT / ".venv" / "bin" / "python"
 QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
@@ -84,6 +86,7 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EXIT_STATUS_FILENAME = "exit_status.json"
 JQDATA_WEB_DRY_RUN_DEFAULT_LIMIT = 3
 JQDATA_WEB_DRY_RUN_MAX_LIMIT = 20
+GENERIC_WEB_LIMIT_MAX = 10000
 QLIB_PREDICTION_WEB_TOPK_MAX = 500
 QLIB_RUN_ID_MAX_LENGTH = 256
 QLIB_RESEARCH_WEB_MAX_RUNS = 50
@@ -154,6 +157,7 @@ NUMERIC_PARAM_RULES = {
     "step_months": ("integer", 1),
 }
 NUMERIC_PARAM_MAXIMUMS = {
+    "limit": GENERIC_WEB_LIMIT_MAX,
     "sleep": 60,
     "retries": BAOSTOCK_WEB_MAX_RETRIES,
     "timeout": 86400,

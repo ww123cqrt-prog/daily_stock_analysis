@@ -64,8 +64,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
         message = (
             "Failed to start job: [Errno 2] No such file or directory: "
             "'/Users/cq/WorkingProjects/quant_workflow/scripts/missing.py'; "
+            "container=/app/quant_data/raw/secret.csv; "
             "fallback=C:\\Users\\cq\\secret\\runner.py; "
-            "drive_relative=C:secret\\runner.py"
+            "drive_relative=C:secret\\runner.py; "
+            "metrics=E:5 R:42"
         )
 
         sanitized = _sanitize_job_error(message)
@@ -75,7 +77,9 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("'[path]'", sanitized)
         self.assertIn("fallback=[path]", sanitized)
         self.assertIn("drive_relative=[path]", sanitized)
+        self.assertIn("metrics=E:5 R:42", sanitized)
         self.assertNotIn("/Users/cq", sanitized)
+        self.assertNotIn("/app/quant_data", sanitized)
         self.assertNotIn("C:\\Users", sanitized)
         self.assertNotIn("C:secret", sanitized)
 
@@ -2485,6 +2489,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 ("run_dsa_backtest", {"code": "600519", "eval_window_days": 3651}, "Param eval_window_days must be <="),
                 ("report_market_regime", {"lookback_days": 5001}, "Param lookback_days must be <="),
                 ("report_market_regime", {"min_symbols": 10001}, "Param min_symbols must be <="),
+                ("report_market_regime", {"limit": 10001}, "Param limit must be <="),
+                ("report_cash_control_backtest", {"limit": 10001}, "Param limit must be <="),
+                ("prepare_baostock_refresh", {"limit": 10001}, "Param limit must be <="),
+                ("download_baostock", {"limit": 10001}, "Param limit must be <="),
                 ("optimize_strategy", {"dry_run": True, "phase": 5}, "Param phase must be <="),
             ]
 

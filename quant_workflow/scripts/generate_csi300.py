@@ -13,6 +13,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import _env_path, china_astock_root, qlib_provider_uri, quant_data_root, workflow_root  # noqa: E402
+from _symbols import normalize_symbol as _normalize_symbol, to_qlib_name as _to_qlib_name  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -32,12 +33,7 @@ def read_calendar_range(path: Path) -> tuple[str, str]:
 
 
 def normalize_symbol(symbol: str) -> str:
-    raw = symbol.strip().upper()
-    if "." in raw:
-        raw = raw.split(".", 1)[0]
-    if raw.startswith(("SH", "SZ", "BJ")):
-        raw = raw[2:]
-    return raw
+    return _normalize_symbol(symbol, strip_any_suffix=True, strip_prefix=True)
 
 
 def _load_csi300_from_project(project_root: Path = ASTOCK_PROJECT) -> list[str]:
@@ -77,12 +73,7 @@ def load_csi300_symbols(
 
 
 def to_qlib_name(sym: str) -> str:
-    s = normalize_symbol(sym)
-    if s.startswith(("600", "601", "603", "605", "688", "689")):
-        return f"SH{s}"
-    if s.startswith(("4", "8")):
-        return f"BJ{s}"
-    return f"SZ{s}"
+    return _to_qlib_name(sym, default_exchange="SZ", strip_any_suffix=True, strip_prefix=True)
 
 
 def build_instrument_lines(symbols: list[str], start_date: str, end_date: str) -> list[str]:

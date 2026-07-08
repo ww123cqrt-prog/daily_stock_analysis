@@ -49,6 +49,7 @@ _POSIX_SENSITIVE_PATH_ROOTS = (
     "Library",
     "Users",
     "Volumes",
+    "app",
     "etc",
     "home",
     "opt",
@@ -58,13 +59,15 @@ _POSIX_SENSITIVE_PATH_ROOTS = (
     "var",
 )
 _POSIX_SENSITIVE_PATH_ROOT_PATTERN = "|".join(re.escape(root) for root in _POSIX_SENSITIVE_PATH_ROOTS)
+_WINDOWS_SENSITIVE_PATH_PATTERN = r"[A-Za-z]:(?:[\\/][^\s'\"<>]+|[^\s'\"<>\\/]+[\\/][^\s'\"<>]+)"
+_WINDOWS_QUOTED_SENSITIVE_PATH_PATTERN = r"[A-Za-z]:(?:[\\/][^\r\n'\"]+|[^\r\n'\"\\/]+[\\/][^\r\n'\"]+)"
 QUOTED_ABSOLUTE_PATH_RE = re.compile(
-    rf"(['\"])(/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\r\n'\"]*)?|[A-Za-z]:(?:[\\/])?[^\r\n'\"]+)\1"
+    rf"(['\"])(/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\r\n'\"]*)?|{_WINDOWS_QUOTED_SENSITIVE_PATH_PATTERN})\1"
 )
 POSIX_ABSOLUTE_PATH_RE = re.compile(
     rf"(?<![A-Za-z0-9_:/.-])/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\s'\"<>]+)*"
 )
-WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:(?:[\\/])?)(?:[^\s'\"<>]+)")
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(rf"(?<![A-Za-z0-9_]){_WINDOWS_SENSITIVE_PATH_PATTERN}")
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _QUANT_JOB_STREAM_LOCK = threading.Lock()

@@ -20,13 +20,15 @@
 
 ## 本地安全边界
 
-本地研究默认只绑定 `127.0.0.1`。只要 `DSA_BIND_HOST`/`UVICORN_HOST` 指向非 localhost，或 `DSA_ENV=production`，后端就要求 `ADMIN_AUTH_ENABLED=true`；否则启动会直接拒绝。设置页也不能在这些暴露运行时关闭认证。需要局域网或公网访问时，先启用管理员认证，再配置明确的来源列表或反向代理。
+本地研究默认只绑定 `127.0.0.1`。只要 `DSA_BIND_HOST`/`UVICORN_HOST` 指向非 localhost，或 `DSA_ENV=production`，后端就要求 `ADMIN_AUTH_ENABLED=true`；否则启动会直接拒绝。设置页也不能在这些暴露运行时关闭认证。需要局域网或公网访问时，先启用管理员认证，再配置明确的来源列表或反向代理。若绕过项目入口、手写 `uvicorn.Config(host=...)` 启动服务，必须先设置 `DSA_BIND_HOST` 或调用 `src.web_bind.publish_bind_host()`，否则应用工厂无法可靠感知真实绑定地址。
 
 `/api/v1/quant/*` 的任务创建/取消/SSE，以及 `/api/v1/research/experiments/*` 的实验记录变更，都要求请求带有本机 `Origin` 或本机 `Referer`。`/api/v1/quant/*` 的任务列表、日志、产物和状态读取，以及 `/api/v1/research/status` 也会拒绝跨站浏览器读取；无 `Origin` 的本机 CLI 健康检查仍可读取。浏览器里的 DSA 页面会自动满足这个条件；裸 `curl`/脚本调试 mutation API 时，应显式带上本机 `Referer: http://127.0.0.1:8010/workflow` 或 `Origin: http://127.0.0.1:8010`。`X-DSA-Local-Client` 不作为来源保护旁路；一旦绑定到 `0.0.0.0` 或生产环境，应启用管理员认证后按受控客户端方式接入。
 
 量化任务接口在本地模式下可以不启用登录认证，但安全边界是“只绑定 localhost + 来源校验 + 白名单脚本”。如果要给局域网或公网使用，必须启用 `ADMIN_AUTH_ENABLED=true`，并额外评估访问控制、反向代理和提交频率限制。
 
 量化任务中心启动脚本时只向子进程传递白名单环境变量：`CHILD_ENV_EXACT_NAMES` 和 `CHILD_ENV_PREFIXES` 默认只包含路径、运行时和非敏感数据配置；`JQ_USERNAME`、`JQ_PASSWORD`、`TUSHARE_TOKEN`、`AKSHARE_TOKEN` 这类数据源凭据不会进入所有任务。只有任务 spec 显式声明 `env_names` / `env_prefixes` 时，对应 job 才能拿到必要凭据，例如 `download_jqdata` 只允许 JQData 登录变量。LLM/API provider key、`MLFLOW_URL`、`MLFLOW_*`、未列入白名单的 `QUANT_API_KEY` / `QUANT_SECRET_TOKEN` 和其他系统环境不会原样继承给 durable runner。新增任务脚本时也要遵守同一边界：不要把 token 放进命令参数，不要打印 `os.environ`，不要把密码写入日志或报告。
+
+JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依次尝试 `~/.agents/private/quant-workbench/jqdata.env` 和历史兼容位置 `WORKING_PROJECTS_ROOT/qlib/.env`。新安装和新 agent 维护时，应使用私有目录，不要把 `JQ_USERNAME` / `JQ_PASSWORD` 写回项目目录。
 
 `MLFLOW_URL` 只用于网页链接和本地 health check。health check 只探测 `127.0.0.1`、`localhost` 或 `::1`，并拒绝带用户名密码或路径穿越段的 URL；API 返回给前端的展示 URL 会移除 username/password、query 和 fragment。非本机 MLflow 地址只展示为外部链接，不主动探测。`MAX_QUANT_JOB_STREAMS` 可调节 `/workflow` SSE 连接上限，默认 8，最小值按 1 处理。
 
@@ -144,19 +146,20 @@ ETF 的基本面分析会降级：不要把股票公司的财报、ROE、公司�
 | --- | --- |
 | DSA 代码 | `daily_stock_analysis/` |
 | 稳定量化脚本 | `daily_stock_analysis/quant_workflow/scripts/` |
-| 量化报告和实验记录 | `daily_stock_analysis/quant_workflow/reports/`，运行态产物，不入库 |
+| 量化报告和实验记录 | 默认 `daily_stock_analysis/quant_workflow/reports/`；既有本机若仓内无历史标记且 DSA 同级 `quant_workflow/reports/` 有真实记录，会自动读取同级历史；可用 `QUANT_WORKFLOW_REPORTS_ROOT` 固定位置，运行态产物不入库 |
+| MLflow 原始记录 | 默认 `daily_stock_analysis/quant_workflow/mlruns/`；既有本机同理可自动读取 DSA 同级 `quant_workflow/mlruns/`，或用 `QUANT_WORKFLOW_MLRUNS_DIR` 固定位置，运行态产物不入库 |
 | 临时实验草稿 | `daily_stock_analysis/quant_workflow/scratch/`，只保留 README |
 | Qlib provider 和行情数据 | `daily_stock_analysis/quant_data/`，运行态数据，不入库 |
 | CodeGraph 索引 | 每个项目自己的 `.codegraph/` |
 | Python 虚拟环境 | `daily_stock_analysis/.venv/` 是唯一 Python 运行时；`qlib/.venv` 和 `china-astock-quant/.venv` 不作为网页任务默认运行环境 |
 
-可迁移路径统一通过环境变量覆盖：`QUANT_DATA_ROOT` 指向行情数据和 Qlib provider 根目录，`QUANT_WORKFLOW_ROOT` 指向量化脚本层，`MLFLOW_URL` 控制网页里展示的 MLflow 链接，`MAX_QUANT_JOB_STREAMS` 控制工作流实时状态连接上限。默认值分别是仓内 `quant_data/`、仓内 `quant_workflow/`、`http://127.0.0.1:6006/` 和 `8`。
+可迁移路径统一通过环境变量覆盖：`QUANT_DATA_ROOT` 指向行情数据和 Qlib provider 根目录，`QUANT_WORKFLOW_ROOT` 指向量化脚本层，`QUANT_WORKFLOW_REPORTS_ROOT` 指向报告/实验摘要，`QUANT_WORKFLOW_MLRUNS_DIR` 指向 MLflow file store，`MLFLOW_URL` 控制网页里展示的 MLflow 链接，`MAX_QUANT_JOB_STREAMS` 控制工作流实时状态连接上限。默认代码真源是仓内 `quant_workflow/`；运行态 reports/mlruns 在仓内没有历史标记时会优先复用 DSA 同级旧历史，避免合并仓库后网页重启变空；其余默认值分别是仓内或同级 `quant_data/`、`http://127.0.0.1:6006/` 和 `8`。
 
 量化任务统一使用 `QUANT_WORKFLOW_PYTHON`，默认指向 `daily_stock_analysis/.venv/bin/python`。旧的 `QLIB_PYTHON` 不再作为网页任务中心的 Python 入口；如果其他脚本仍设置了 `QLIB_PYTHON`，不会覆盖 DSA 网页任务运行环境。
 
 新增 `quant_workflow` 网页任务时，如果脚本依赖新的环境变量，必须同步评估并更新 `src/services/quant_job_service.py` 里的默认非敏感白名单，或在该 job spec 上显式声明 `env_names` / `env_prefixes`。任务中心不会把 DSA API 进程的完整环境直接透传给子进程；漏配白名单会导致脚本在网页端缺少变量，误把所有变量放开则会增加 token、密码或 LLM key 暴露到日志的风险。
 
-`download_jqdata` 在网页端固定为 dry-run，是“验证 JQData 登录和连接是否可用”，不是全量下载。该任务只向子进程透传 `JQ_USERNAME` 和 `JQ_PASSWORD`；日志只记录命令和状态，不应打印或持久化真实密码。
+`download_jqdata` 在网页端固定为 dry-run，是“验证 JQData 登录和连接是否可用”，不是全量下载。该任务可从私有 env 文件加载 `JQ_USERNAME` 和 `JQ_PASSWORD`，也只允许显式透传这两个变量；日志只记录命令和状态，不应打印或持久化真实密码。
 
 不要把缓存、日志、报告、数据、`.venv/`、`.codegraph/`、`.pytest_cache/`、`__pycache__/` 提交到 Git。
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 量化工作台合并后区分“脚本真源”和“运行态历史”：代码默认使用仓内 `quant_workflow`，但当仓内 reports/mlruns 没有历史标记而 DSA 同级 `quant_workflow/reports` 或 `mlruns` 有真实实验产物时，研究页、任务中心和脚本会自动读取同级历史，避免服务重启后训练记录变空。
+- [修复] 量化任务公开错误脱敏补齐 Docker `/app/...` 路径，并收窄 Windows 盘符路径匹配，避免把 `E:5`、`R:42` 这类普通文本误替换为 `[path]`。
+- [修复] 网页量化任务为通用 `limit` 参数增加 10000 上限，覆盖 Baostock 刷新/下载、市场状态和现金仓位回测报告等入口；JQData 与 `china-astock` 报告继续使用更小的专用上限。
+- [修复] `CORS_ALLOW_ALL=true` 只影响浏览器 CORS 响应头，不再覆盖本地敏感 API 的显式来源白名单；组合、告警和股票写接口也要求 no-origin 请求提供可信本机来源。
+- [修复] 本地量化脚本在仓内 `quant_data` 不存在时会自动尝试 DSA 同级 `quant_data`，同时保留 `QUANT_DATA_ROOT` 显式覆盖，避免合并 `quant_workflow` 后默认指向空数据目录。
+- [修复] JQData 凭据加载改为 `JQDATA_ENV_FILE` / `~/.agents/private/quant-workbench/jqdata.env` 优先，历史 `WORKING_PROJECTS_ROOT/qlib/.env` 仅作为迁移期 fallback，减少账号密码滞留项目目录的风险。
+- [改进] 提取 Qlib 股票代码转换共享工具，收口 `merge_to_qlib`、`repair_qlib_provider`、`generate_csi300` 和 `train_baseline_lgb` 的 SH/SZ/BJ 映射规则。
+- [文档] 更新本地量化安装、核对手册、Agent 维护契约和 env 模板，明确仓外 `quant_data` 布局、私有 JQData env 文件和安全迁移约定。
 - [改进] #1390 P0 为个股分析与历史/回测展示新增可选八态 `action` / `action_label` 建议动作字段，保留 `operation_advice` 自由文本和 `decision_type=buy|hold|sell` 统计口径，不新增迁移或配置项。
 - [修复] #1390 收紧建议动作 legacy fallback：英文 `not to ...` 与 `avoid selling/reducing/trimming ...` 等否定/回避表达不再误判为买卖动作，Web 旧记录不再把中文金融上下文、`buy or sell`、多 guard 歧义文本或 `buyback` / `buy-back` / `buy back` / `selloff` / `sell-off` / `sell off` 等英文复合词渲染成 action badge，并在有结构化 `action` 时让回测/历史趋势等入口按界面语言显示 action 标签。
 - [改进] 完善运行时日志上下文，补充 logger name、触发来源、市场统计与实时行情预取链路状态，便于排查调度、API、Bot 和数据源降级路径。

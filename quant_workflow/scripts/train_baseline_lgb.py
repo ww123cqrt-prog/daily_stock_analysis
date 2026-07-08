@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import china_astock_root, mlruns_root, qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -76,18 +77,7 @@ def resolve_provider_uri(provider: str | None) -> Path:
 
 
 def to_qlib_name(sym: str) -> str:
-    value = str(sym).strip().upper()
-    if value.endswith(".XSHE") or value.endswith(".SZ"):
-        value = value.split(".")[0]
-    if value.endswith(".XSHG") or value.endswith(".SH"):
-        value = value.split(".")[0]
-    if value.startswith(("SH", "SZ", "BJ")):
-        return value
-    if value.startswith(("600", "601", "603", "605", "688", "689")):
-        return f"SH{value}"
-    if value.startswith(("4", "8")):
-        return f"BJ{value}"
-    return f"SZ{value}"
+    return _to_qlib_name(sym, default_exchange="SZ")
 
 
 def load_provider_instrument_ranges(provider_uri: Path) -> dict[str, tuple[str, str]]:

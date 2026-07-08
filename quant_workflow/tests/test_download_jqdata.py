@@ -82,6 +82,69 @@ class DownloadJQDataTest(unittest.TestCase):
         self.assertEqual(environ["JQ_USERNAME"], "existing-user")
         self.assertEqual(environ["JQ_PASSWORD"], "file-secret")
 
+    def test_authenticate_prefers_configured_private_env_file_without_logging_secret(self):
+        module = load_module()
+        fake_jq = FakeJQData()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / "jqdata.env"
+            env_path.write_text(
+                "JQ_USERNAME=private-user\nJQ_PASSWORD=private-secret\n",
+                encoding="utf-8",
+            )
+            environ = {"JQDATA_ENV_FILE": str(env_path)}
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                authenticated = module.authenticate(fake_jq, environ)
+
+        self.assertTrue(authenticated)
+        self.assertEqual(fake_jq.auth_calls, [("private-user", "private-secret")])
+        self.assertNotIn("private-secret", output.getvalue())
+
+    def test_main_default_env_file_order_honors_configured_private_env_file(self):
+        module = load_module()
+        fake_jq = FakeJQData()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / "jqdata.env"
+            env_path.write_text(
+                "JQ_USERNAME=private-user\nJQ_PASSWORD=private-secret\n",
+                encoding="utf-8",
+            )
+            environ = {"JQDATA_ENV_FILE": str(env_path)}
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                result = module.main(
+                    [
+                        "--universe",
+                        "csi300",
+                        "--limit",
+                        "1",
+                        "--sleep",
+                        "0",
+                        "--dry-run",
+                    ],
+                    jq_module=fake_jq,
+                    environ=environ,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(fake_jq.auth_calls, [("private-user", "private-secret")])
+        self.assertIn("JQData dry run OK", output.getvalue())
+        self.assertNotIn("private-secret", output.getvalue())
+
+    def test_authenticate_env_file_none_skips_default_files(self):
+        module = load_module()
+        fake_jq = FakeJQData()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            authenticated = module.authenticate(fake_jq, {}, env_file=None)
+
+        self.assertFalse(authenticated)
+        self.assertEqual(fake_jq.auth_calls, [])
+        self.assertIn("credentials are not configured", stderr.getvalue())
+
     def test_dry_run_authenticates_resolves_universe_and_writes_no_files(self):
         module = load_module()
         fake_jq = FakeJQData()

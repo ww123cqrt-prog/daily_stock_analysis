@@ -103,7 +103,7 @@ class StocksApiTestCase(unittest.TestCase):
         app = create_app(static_dir=self.data_dir / "empty-static")
         self.config_service = _FakeSystemConfigService()
         app.dependency_overrides[stocks_endpoint.get_system_config_service] = lambda: self.config_service
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers={"Origin": "http://127.0.0.1:8010"})
 
     def tearDown(self) -> None:
         Config.reset_instance()

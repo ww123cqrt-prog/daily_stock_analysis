@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _symbols import to_qlib_name  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -39,19 +40,6 @@ QLIB_BIN_DIR = qlib_provider_uri()
 REQUIRED_FIELDS = ["open", "close", "high", "low", "volume"]
 OPTIONAL_FIELDS = ["amount", "turn", "pctChg"]
 QLIB_FIELDS = ["open", "close", "high", "low", "volume", "factor"]
-
-
-def to_qlib_name(sym: str) -> str:
-    s = sym.strip().upper()
-    if s.startswith(("SH", "SZ", "BJ")):
-        return s
-    if s.startswith(("600", "601", "603", "605", "688", "689")):
-        return f"SH{s}"
-    if s.startswith(("000", "001", "002", "003", "300", "301", "302")):
-        return f"SZ{s}"
-    if s.startswith(("4", "8")):
-        return f"BJ{s}"
-    return s
 
 
 def normalize_frame(path: Path) -> pd.DataFrame:

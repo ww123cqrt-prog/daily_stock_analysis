@@ -23,9 +23,26 @@ class ScriptPathsTest(unittest.TestCase):
 
         self.assertEqual(module.workflow_root(), workflow_root)
         self.assertEqual(module.projects_root(), dsa_root.parent)
-        self.assertEqual(module.quant_data_root(), dsa_root / "quant_data")
-        self.assertEqual(module.reports_root(), workflow_root / "reports")
-        self.assertEqual(module.mlruns_root(), workflow_root / "mlruns")
+        sibling_quant_data = dsa_root.parent / "quant_data"
+        expected_quant_data = dsa_root / "quant_data"
+        if not expected_quant_data.exists() and sibling_quant_data.exists():
+            expected_quant_data = sibling_quant_data
+        self.assertEqual(module.quant_data_root(), expected_quant_data)
+        sibling_reports = dsa_root.parent / "quant_workflow" / "reports"
+        expected_reports = workflow_root / "reports"
+        if not any((expected_reports / name).exists() for name in module.REPORT_HISTORY_FILES) and any(
+            (sibling_reports / name).exists() for name in module.REPORT_HISTORY_FILES
+        ):
+            expected_reports = sibling_reports
+        self.assertEqual(module.reports_root(), expected_reports)
+
+        sibling_mlruns = dsa_root.parent / "quant_workflow" / "mlruns"
+        expected_mlruns = workflow_root / "mlruns"
+        if not any((expected_mlruns / name).exists() for name in ("0", ".trash", "models")) and any(
+            (sibling_mlruns / name).exists() for name in ("0", ".trash", "models")
+        ):
+            expected_mlruns = sibling_mlruns
+        self.assertEqual(module.mlruns_root(), expected_mlruns)
 
     def test_working_projects_override_moves_default_project_roots(self):
         module = load_module()
@@ -36,6 +53,64 @@ class ScriptPathsTest(unittest.TestCase):
                 self.assertEqual(module.workflow_root(), Path(__file__).resolve().parents[1])
                 self.assertEqual(module.quant_data_root(), Path(__file__).resolve().parents[2] / "quant_data")
                 self.assertEqual(module.china_astock_root(), projects_root / "china-astock-quant")
+
+    def test_sibling_quant_data_is_used_when_repo_local_data_is_absent(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            dsa_root = temp_root / "daily_stock_analysis"
+            workflow_root = dsa_root / "quant_workflow"
+            sibling_data = temp_root / "quant_data"
+            workflow_root.mkdir(parents=True)
+            sibling_data.mkdir()
+
+            with patch.object(module, "DEFAULT_DSA_ROOT", dsa_root), patch.object(
+                module, "DEFAULT_WORKFLOW_ROOT", workflow_root
+            ), patch.object(module, "DEFAULT_PROJECTS_ROOT", temp_root), patch.dict(
+                os.environ,
+                {
+                    key: ""
+                    for key in [
+                        "WORKING_PROJECTS_ROOT",
+                        "QUANT_DATA_ROOT",
+                    ]
+                },
+                clear=False,
+            ):
+                self.assertEqual(module.quant_data_root(), sibling_data)
+
+    def test_sibling_reports_and_mlruns_are_used_when_repo_local_payload_is_absent(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            dsa_root = temp_root / "daily_stock_analysis"
+            workflow_root = dsa_root / "quant_workflow"
+            sibling_workflow = temp_root / "quant_workflow"
+            sibling_reports = sibling_workflow / "reports"
+            sibling_mlruns = sibling_workflow / "mlruns"
+            workflow_root.mkdir(parents=True)
+            sibling_reports.mkdir(parents=True)
+            sibling_mlruns.mkdir(parents=True)
+            (sibling_reports / "latest_training_result.json").write_text("{}", encoding="utf-8")
+            (sibling_mlruns / "0").mkdir()
+
+            with patch.object(module, "DEFAULT_DSA_ROOT", dsa_root), patch.object(
+                module, "DEFAULT_WORKFLOW_ROOT", workflow_root
+            ), patch.object(module, "DEFAULT_PROJECTS_ROOT", temp_root), patch.dict(
+                os.environ,
+                {
+                    key: ""
+                    for key in [
+                        "WORKING_PROJECTS_ROOT",
+                        "QUANT_WORKFLOW_ROOT",
+                        "QUANT_WORKFLOW_REPORTS_ROOT",
+                        "QUANT_WORKFLOW_MLRUNS_DIR",
+                    ]
+                },
+                clear=False,
+            ):
+                self.assertEqual(module.reports_root(), sibling_reports)
+                self.assertEqual(module.mlruns_root(), sibling_mlruns)
 
     def test_specific_env_overrides_take_precedence(self):
         module = load_module()

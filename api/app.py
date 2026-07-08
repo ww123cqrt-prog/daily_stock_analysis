@@ -54,8 +54,11 @@ _CSRF_PROTECTED_API_PREFIX = "/api/v1/"
 _CSRF_STRICT_ORIGIN_PREFIXES = (
     "/api/v1/alphasift/",
     "/api/v1/auth/",
+    "/api/v1/alerts/",
+    "/api/v1/portfolio/",
     "/api/v1/quant/",
     "/api/v1/research/experiments/",
+    "/api/v1/stocks/",
 )
 _LOCAL_ORIGIN_PROTECTED_GET_PATHS = frozenset({
     "/api/v1/research/status",
@@ -367,12 +370,12 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     allow_all_origins = os.environ.get("CORS_ALLOW_ALL", "").lower() == "true"
     allow_credentials = not allow_all_origins
     _enforce_runtime_auth_safety(allow_all_origins=allow_all_origins)
-    if allow_all_origins:
-        allowed_origins = ["*"]
+    mutation_allowed_origins = list(allowed_origins)
+    cors_allowed_origins = ["*"] if allow_all_origins else allowed_origins
     
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins=cors_allowed_origins,
         allow_credentials=allow_credentials,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
@@ -383,7 +386,7 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     @app.middleware("http")
     async def local_sensitive_origin_guard(request: Request, call_next):
         if _is_csrf_protected_request(request):
-            if not _is_allowed_mutation_origin(request, allowed_origins):
+            if not _is_allowed_mutation_origin(request, mutation_allowed_origins):
                 return JSONResponse(
                     status_code=403,
                     content={
@@ -393,7 +396,7 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
                 )
         elif _is_local_origin_protected_read_request(request):
             origin = _request_origin(request)
-            if not _is_allowed_read_origin(origin, allowed_origins):
+            if not _is_allowed_read_origin(origin, mutation_allowed_origins):
                 return JSONResponse(
                     status_code=403,
                     content={
