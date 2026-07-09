@@ -8,6 +8,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -73,7 +74,13 @@ def build_validation_report(
         if latest is None:
             continue
         merged_date, merged_close = latest
-        snapshot_close = float(item["close"])
+        raw_close = item.get("close")
+        if raw_close in (None, ""):
+            continue
+        try:
+            snapshot_close = float(raw_close)
+        except (TypeError, ValueError):
+            continue
         rel_diff = abs(snapshot_close - merged_close) / abs(merged_close) if merged_close else None
         rows.append(
             {
@@ -105,6 +112,9 @@ def build_validation_report(
         f"| {row['symbol']} | {row['name']} | {row['snapshot_date']} | "
         f"{row['snapshot_close']:.4f} | {row['merged_date']} | {row['merged_close']:.4f} | "
         f"{row['close_rel_diff']:.6f} |"
+        if row['close_rel_diff'] is not None else
+        f"| {row['symbol']} | {row['name']} | {row['snapshot_date']} | "
+        f"{row['snapshot_close']:.4f} | {row['merged_date']} | {row['merged_close']:.4f} | n/a |"
         for row in rows
     )
     report = f"""# Latest Snapshot Validation

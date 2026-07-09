@@ -1,10 +1,14 @@
 """
-Merge Baostock long history + JQData recent data, then convert to Qlib bin.
+Merge multi-source A-share daily bars (Baostock/JQData/EastMoney/AkShare),
+then convert to Qlib bin.
 
-Baostock and JQData files are both already in pre-adjusted (qfq/pre) price
-space. Baostock volume is kept for overlapping dates by default because it is
-in the same adjusted-volume space as the Baostock long-history series; JQData
-OHLC is still preferred on overlaps.
+All sources are in pre-adjusted (qfq/pre) price space, but each provider
+computes its qfq curve against its own base/factors. To avoid splicing two
+differently-normalized curves, the FIRST available source (Baostock long
+history) is authoritative for every date it covers; later sources only FILL
+dates the base still lacks (mid-history gaps and the latest tail), whole-row.
+OHLC on overlapping dates is never overwritten. This keeps a single, internally
+consistent price/volume curve per symbol.
 
 `--no-overwrite` means "skip replacing existing output files"; it may still
 create missing directories and missing files required to complete the provider.
@@ -45,7 +49,14 @@ QLIB_FIELDS = ["open", "close", "high", "low", "volume", "factor"]
 
 
 def normalize_frame(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:
+        # A truncated/corrupt parquet (e.g. an interrupted download) must not
+        # crash the whole merge. Skip this source file with a warning; other
+        # sources still contribute for the symbol.
+        print(f"  WARN unreadable parquet, skipping: {path} ({exc})")
+        return pd.DataFrame(columns=["date"] + REQUIRED_FIELDS + OPTIONAL_FIELDS)
     if "date" not in df.columns and df.index.name == "date":
         df = df.reset_index()
     df = df.copy()
@@ -76,20 +87,20 @@ def merge_sources(sym: str, ordered_sources: list[tuple[str, Path | None]]) -> p
     merged = first.set_index("date")
 
     for name, frame in frames[1:]:
-        # Start from Baostock long history, then overlay newer sources in the
-        # configured order. OHLC is overwritten on overlaps; volume/amount are
-        # kept from the earlier source on overlaps to avoid adjusted-volume
-        # discontinuities, while source-only dates are fully appended.
+        # Base source (Baostock long history) is authoritative for every date it
+        # already covers. Newer sources ONLY fill dates the base lacks — mid-
+        # history gaps and the latest tail. We deliberately do NOT overwrite
+        # OHLC on overlapping dates: each provider computes qfq (forward-adjust)
+        # against its own base/factors, so overwriting the overlap would splice
+        # two differently-normalized curves and inject a price discontinuity
+        # into training/backtest. Rows are appended whole (all fields together)
+        # so a filled date stays internally consistent within one source.
         existing_dates = merged.index
         overlay = frame.set_index("date")
-        all_dates = existing_dates.union(overlay.index)
-        merged = merged.reindex(all_dates)
-
-        for col in ["open", "close", "high", "low"]:
-            if col in overlay.columns:
-                merged.loc[overlay.index, col] = overlay[col]
-
         source_only_dates = overlay.index.difference(existing_dates)
+        if len(source_only_dates) == 0:
+            continue
+        merged = merged.reindex(existing_dates.union(source_only_dates))
         for col in REQUIRED_FIELDS + OPTIONAL_FIELDS:
             if col in overlay.columns:
                 merged.loc[source_only_dates, col] = overlay.loc[source_only_dates, col]

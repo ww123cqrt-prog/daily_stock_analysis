@@ -105,11 +105,13 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("download_akshare", names)
         self.assertEqual(names[0], "merge_to_qlib")
 
-    def test_download_stage_is_incremental_required_and_not_heavy(self):
+    def test_download_stage_is_incremental_nonfatal_and_not_heavy(self):
         stages = self.module.build_stages(_args(limit=5))
         download = next(s for s in stages if s.name == "download_baostock")
         self.assertFalse(download.heavy)
-        self.assertTrue(download.required)
+        # Baostock download is non-fatal: merge reads on-disk parquet, so a
+        # transient download failure must not block the rebuild.
+        self.assertFalse(download.required)
         self.assertIn("--incremental", download.argv)
         self.assertIn("--limit", download.argv)
         self.assertIn("5", download.argv)
@@ -229,7 +231,11 @@ class DryRunMainTest(unittest.TestCase):
         self.assertEqual(summary["status"], "ok_with_warnings")
         self.assertTrue(any(s["name"] == "download_eastmoney" and s["status"] == "failed" for s in summary["stages"]))
 
-    def test_required_baostock_failure_makes_all_failed_no_new_day_run_fail(self):
+    def test_all_source_downloads_failing_is_nonfatal_and_still_rebuilds(self):
+        # Redundancy contract: every source download is non-fatal. Even if all
+        # of them fail on the network, the on-disk parquet is intact, so the
+        # rebuild (merge/clean/quality) must still run and the run must NOT
+        # fail — it completes with ok_with_warnings.
         module = self.module
 
         def fake_run_stage(stage, dry_run):
@@ -245,14 +251,19 @@ class DryRunMainTest(unittest.TestCase):
                         ("2026-07-03", {"baostock": "2026-07-03"}),
                     ]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py", "--continue-on-error"]):
+                    patch.object(sys, "argv", ["run_daily_update.py", "--force"]):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(rc, 1)
-        self.assertEqual(summary["status"], "failed")
-        self.assertTrue(any(s["name"] == "download_baostock" and s["required"] and s["status"] == "failed" for s in summary["stages"]))
-        self.assertTrue(any(s["name"] == "merge_to_qlib" and s["status"] == "skipped" for s in summary["stages"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(summary["status"], "ok_with_warnings")
+        # baostock download failure is recorded but non-required (non-fatal)
+        self.assertTrue(any(
+            s["name"] == "download_baostock" and not s["required"] and s["status"] == "failed"
+            for s in summary["stages"]
+        ))
+        # rebuild still ran (forced), proving a dead source did not block it
+        self.assertTrue(any(s["name"] == "merge_to_qlib" and s["status"] == "ok" for s in summary["stages"]))
 
 
 if __name__ == "__main__":

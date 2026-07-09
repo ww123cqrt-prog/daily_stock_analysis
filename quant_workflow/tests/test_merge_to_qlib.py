@@ -54,7 +54,7 @@ class MergeToQlibTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(preserved["close"].tolist(), [99.0])
 
-    def test_merge_sources_overlays_new_sources_after_baostock_and_jqdata(self):
+    def test_merge_sources_keeps_base_and_only_fills_missing_dates(self):
         module = load_module()
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -121,9 +121,12 @@ class MergeToQlibTest(unittest.TestCase):
             "2026-07-04",
             "2026-07-05",
         ])
-        self.assertEqual(merged["close"].tolist(), [10.1, 20.2, 30.2, 40.2, 40.3])
-        # Overlap keeps the existing volume to avoid source-switch volume discontinuities;
-        # new source-only days still bring their own volume.
+        # Base (baostock) is authoritative for the dates it covers (07-01, 07-02);
+        # each later source fills ONLY the dates still missing, so its whole row
+        # (close + volume together) lands for that new date without overwriting
+        # any overlapping base date. 07-03 <- jqdata, 07-04 <- eastmoney,
+        # 07-05 <- akshare.
+        self.assertEqual(merged["close"].tolist(), [10.1, 10.2, 20.3, 30.3, 40.3])
         self.assertEqual(merged["volume"].tolist(), [1000.0, 1100.0, 1200.0, 1300.0, 1400.0])
 
     def test_build_merged_parquet_accepts_extra_source_directories_without_renaming_output(self):

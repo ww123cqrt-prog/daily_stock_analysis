@@ -146,8 +146,12 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
     stages: list[Stage] = []
 
     if not args.skip_download:
+        # All source downloads are non-fatal: merge reads on-disk parquet, so a
+        # transient network failure (any single source) must not block the
+        # rebuild while other sources' data is intact. This is the whole point
+        # of multi-source redundancy.
         download_specs = [
-            ("download_baostock", "download_baostock.py", False, True),
+            ("download_baostock", "download_baostock.py", False, False),
             ("download_eastmoney", "download_eastmoney.py", args.skip_eastmoney, False),
             ("download_akshare", "download_akshare.py", args.skip_akshare, False),
         ]
