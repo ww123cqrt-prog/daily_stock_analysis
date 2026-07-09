@@ -165,6 +165,24 @@ class TrainBaselineLgbTest(unittest.TestCase):
         record = payload["task"]["record"][1]
         self.assertEqual(record["kwargs"]["config"]["backtest"]["end_time"], "2026-07-08")
 
+    def test_runtime_config_normalizes_portana_config_even_without_calendar_day(self):
+        module = load_module()
+        payload = {
+            "task": {
+                "record": [
+                    {
+                        "class": "PortAnaRecord",
+                        "config": {"backtest": {"end_time": "2026-07-01"}},
+                    },
+                ]
+            }
+        }
+
+        module.update_runtime_config_dates(payload, "", backtest_end_day="")
+
+        record = payload["task"]["record"][0]
+        self.assertEqual(record["kwargs"]["config"], {"backtest": {"end_time": "2026-07-01"}})
+
     def test_repairs_mlruns_artifact_locations_to_active_root(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

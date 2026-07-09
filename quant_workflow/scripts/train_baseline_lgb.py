@@ -195,12 +195,21 @@ def _portana_record_config(record: dict) -> dict | None:
 
 
 def update_runtime_config_dates(payload: dict, latest_day: str, *, backtest_end_day: str | None = None) -> None:
-    if not latest_day:
-        return
-    portfolio_end = backtest_end_day or latest_day
     task = payload.get("task")
     if not isinstance(task, dict):
         return
+    records = task.get("record")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if record.get("class") != "PortAnaRecord":
+                continue
+            _portana_record_config(record)
+
+    if not latest_day:
+        return
+    portfolio_end = backtest_end_day or latest_day
     dataset = task.get("dataset")
     dataset_kwargs = dataset.get("kwargs") if isinstance(dataset, dict) else None
     if isinstance(dataset_kwargs, dict):
@@ -212,7 +221,6 @@ def update_runtime_config_dates(payload: dict, latest_day: str, *, backtest_end_
         test_segment = segments.get("test") if isinstance(segments, dict) else None
         if isinstance(test_segment, list) and len(test_segment) >= 2:
             test_segment[-1] = portfolio_end
-    records = task.get("record")
     if isinstance(records, list):
         for record in records:
             if not isinstance(record, dict):

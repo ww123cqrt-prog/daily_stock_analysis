@@ -24,7 +24,8 @@ def test_env_example_documents_quant_workflow_path_overrides() -> None:
         assert f"# {key}=" in env_example
 
     assert "reports/mlruns 的正式位置是仓内" in env_example
-    assert "迁移期只读兜底" in env_example
+    assert "不再自动按 marker 兜底读取" in env_example
+    assert "迁移时复制旧 reports/mlruns 到仓内" in env_example
 
 
 def test_changelog_mentions_web_quant_workflow_entry() -> None:
@@ -104,6 +105,8 @@ def test_quant_workflow_runtime_data_doc_marks_embedded_runtime_canonical() -> N
     assert "mlruns/" in runtime_doc
     assert "../quant_workflow/reports/" in runtime_doc
     assert "rollback/deprecated copy" in runtime_doc
+    assert "no longer auto-detects sibling history marker files" in runtime_doc
+    assert "QUANT_WORKFLOW_REPORTS_ROOT" in runtime_doc
     assert "/Users/" not in runtime_doc
     assert "JQ_PASSWORD" not in runtime_doc
 

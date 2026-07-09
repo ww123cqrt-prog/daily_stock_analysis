@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,129 @@ def load_module():
 
 
 class ReportCatdeskSignalValidationTest(unittest.TestCase):
+    def _generate_minimal_report(self, allow_backfilled_qlib: bool):
+        module = load_module()
+        captured = {}
+        base_row = {
+            "code": "000001",
+            "name": "平安银行",
+            "theme": "金融",
+            "filtered_score": 80.0,
+            "validation_return_pct": 1.2,
+            "hit": True,
+        }
+
+        def fake_load_latest_qlib_scores(signal_date, top_reference_date, run_cutoff):
+            captured["signal_date"] = signal_date
+            captured["top_reference_date"] = top_reference_date
+            captured["run_cutoff"] = run_cutoff
+            return {
+                "available": True,
+                "prediction_path": "/tmp/pred.pkl",
+                "latest_date": signal_date,
+                "scores": {"SZ000001": 0.8},
+                "percentiles": {"SZ000001": 0.9},
+            }
+
+        def fake_strategy_comparison(rows, top_n):
+            return {
+                module.DEFAULT_SELECTED_STRATEGY: {
+                    "selected": rows[:top_n],
+                    "summary": {"count": len(rows[:top_n])},
+                    "label": module.STRATEGY_LABELS[module.DEFAULT_SELECTED_STRATEGY],
+                    "description": "",
+                    "missed_top_actual_winners": [],
+                    "captured_top_actual_winner_count": len(rows[:top_n]),
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_dir = root / "reports"
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(module, "quant_data_root", return_value=root / "quant_data"))
+                stack.enter_context(patch.object(module, "reports_root", return_value=root / "reports_root"))
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "load_catdesk_candidates",
+                        return_value=(
+                            {"date": "2026-07-08", "generated_at": "2026-07-08T09:00:00+08:00"},
+                            [
+                                {
+                                    "raw": {"candidate": {"code": "000001", "name": "平安银行"}},
+                                    "theme": "金融",
+                                    "theme_rank": 1,
+                                }
+                            ],
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "classify_catdesk_report",
+                        return_value={
+                            "catdesk_report_status": "as_of_morning",
+                            "catdesk_report_reason": "",
+                        },
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "find_market_regime_path",
+                        return_value=(
+                            root / "market_regime_20260708_090000.json",
+                            {
+                                "market_regime_status": "as_of_signal_date",
+                                "market_regime_reason": "",
+                            },
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "load_market_regime",
+                        return_value={"regime": "neutral", "position_ratio": 0.5, "cash_ratio": 0.5},
+                    )
+                )
+                stack.enter_context(patch.object(module, "load_latest_qlib_scores", side_effect=fake_load_latest_qlib_scores))
+                stack.enter_context(patch.object(module, "read_price_point_on_or_before", return_value=module.PricePoint(close=10.0)))
+                stack.enter_context(patch.object(module, "score_candidate", return_value=dict(base_row)))
+                stack.enter_context(patch.object(module, "apply_validation", side_effect=lambda rows, **_kwargs: rows))
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "attach_strategy_scores",
+                        side_effect=lambda rows: [
+                            {**row, "strategy_scores": {module.DEFAULT_SELECTED_STRATEGY: row["filtered_score"]}}
+                            for row in rows
+                        ],
+                    )
+                )
+                stack.enter_context(patch.object(module, "strategy_comparison", side_effect=fake_strategy_comparison))
+                stack.enter_context(patch.object(module, "rank_by_strategy", side_effect=lambda rows, _strategy: rows))
+                stack.enter_context(patch.object(module, "summarize", side_effect=lambda rows: {"count": len(rows)}))
+                stack.enter_context(patch.object(module, "build_markdown", return_value="# ok\n"))
+
+                payload = module.generate_report(
+                    catdesk_report=root / "catdesk.json",
+                    signal_date="2026-07-08",
+                    validation_date="2026-07-09",
+                    candidate_set="ashare",
+                    top_n=1,
+                    selected_strategy=module.DEFAULT_SELECTED_STRATEGY,
+                    use_online_validation=False,
+                    use_system_proxy=False,
+                    allow_backfilled_qlib=allow_backfilled_qlib,
+                    timeout=5.0,
+                    out_dir=out_dir,
+                )
+
+        return captured, payload
+
     def test_signal_price_uses_previous_trade_date_when_requested_date_has_no_bar(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -279,6 +403,24 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertFalse(payload["available"])
         self.assertEqual(payload["run_id"], "run_late")
         self.assertIn("after validation cutoff", payload["reason"])
+
+    def test_generate_report_defaults_to_strict_qlib_run_cutoff(self):
+        captured, payload = self._generate_minimal_report(allow_backfilled_qlib=False)
+
+        self.assertEqual(captured["signal_date"], "2026-07-08")
+        self.assertEqual(captured["top_reference_date"], "2026-07-08")
+        self.assertEqual(captured["run_cutoff"], "2026-07-09T09:30:00+08:00")
+        self.assertEqual(payload["input_quality"]["qlib_run_cutoff"], "2026-07-09T09:30:00+08:00")
+        self.assertFalse(payload["input_quality"]["qlib_backfilled_allowed"])
+        self.assertFalse(payload["inputs"]["qlib_backfilled_allowed"])
+
+    def test_generate_report_marks_explicit_backfilled_qlib_mode(self):
+        captured, payload = self._generate_minimal_report(allow_backfilled_qlib=True)
+
+        self.assertEqual(captured["run_cutoff"], "")
+        self.assertEqual(payload["input_quality"]["qlib_run_cutoff"], "")
+        self.assertTrue(payload["input_quality"]["qlib_backfilled_allowed"])
+        self.assertTrue(payload["inputs"]["qlib_backfilled_allowed"])
 
     def test_qlib_scores_can_be_used_without_cutoff_for_backfilled_research(self):
         module = load_module()

@@ -20,9 +20,8 @@ Migration note:
   DSA workflow output there unless you explicitly set `QUANT_WORKFLOW_ROOT`,
   `QUANT_WORKFLOW_REPORTS_ROOT`, or `QUANT_WORKFLOW_MLRUNS_DIR`.
 
-The path resolver keeps a transitional fallback for older installations: if the
-embedded runtime folders have no history markers but a sibling `quant_workflow`
-does, DSA can still read the sibling data. Once embedded markers exist, embedded
-reports and MLflow runs win. This prevents a restarted DSA service from showing
-an empty `/research` page while keeping the repo-local layout as the source of
-truth.
+The path resolver no longer auto-detects sibling history marker files. Embedded
+reports and MLflow runs are the default source of truth. To reuse older sibling
+runtime data, copy it into this directory, or explicitly set
+`QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR` for a temporary
+rollback.

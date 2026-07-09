@@ -191,8 +191,34 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
         quality += ["--merged-sample", str(args.merged_sample)]
     stages.append(Stage("report_data_quality", quality, heavy=True))
     stages.append(Stage("check_qlib_data", _script("check_qlib_data.py"), heavy=True))
-    stages.append(Stage("sync_data_manifest", _script("sync_data_manifest.py") + out, heavy=False))
+    stages.append(Stage("sync_data_manifest", _script("sync_data_manifest.py") + out, heavy=False, required=False))
     return stages
+
+
+def source_refresh_failed_without_rebuild(results: list[StageResult]) -> bool:
+    """Return true when the run failed to refresh any source and rebuilt nothing.
+
+    Individual source failures are warnings because existing parquet can still
+    support a rebuild. If every attempted source failed and every heavy stage
+    was skipped, the daily run produced no useful update and should not be
+    reported as successful.
+    """
+    download_results = [r for r in results if r.name.startswith("download_")]
+    if not download_results or not all(r.status == "failed" for r in download_results):
+        return False
+    heavy_results = [
+        r for r in results
+        if r.name in {
+            "merge_to_qlib",
+            "add_index_benchmark",
+            "validate_latest_snapshot",
+            "report_data_anomalies",
+            "apply_data_cleaning",
+            "report_data_quality",
+            "check_qlib_data",
+        }
+    ]
+    return bool(heavy_results) and all(r.status == "skipped" for r in heavy_results)
 
 
 def run_stage(stage: "Stage", dry_run: bool) -> "StageResult":
@@ -312,6 +338,18 @@ def main() -> int:
             break
         if result.status == "failed" and not result.required:
             _log(f"stage {stage.name} failed but is non-fatal; continuing")
+
+    if source_refresh_failed_without_rebuild(results):
+        _log("all source downloads failed and rebuild stages were skipped; marking daily update failed")
+        results.append(
+            StageResult(
+                "source_refresh_gate",
+                "failed",
+                0.0,
+                1,
+                required=True,
+            )
+        )
 
     after_final, after_final_by_source = latest_any_source_date(SOURCE_DIRS)
     summary_path = write_summary(

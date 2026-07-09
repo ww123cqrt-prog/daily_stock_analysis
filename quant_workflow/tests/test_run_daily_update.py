@@ -137,7 +137,7 @@ class BuildStagesTest(unittest.TestCase):
         )
         manifest = next(s for s in stages if s.name == "sync_data_manifest")
         self.assertFalse(manifest.heavy)
-        self.assertTrue(manifest.required)
+        self.assertFalse(manifest.required)
 
     def test_source_downloads_can_be_individually_disabled(self):
         stages = self.module.build_stages(_args(skip_eastmoney=True, skip_akshare=True, skip_snapshot_validation=True))
@@ -231,7 +231,7 @@ class DryRunMainTest(unittest.TestCase):
         self.assertEqual(summary["status"], "ok_with_warnings")
         self.assertTrue(any(s["name"] == "download_eastmoney" and s["status"] == "failed" for s in summary["stages"]))
 
-    def test_all_source_downloads_failing_is_nonfatal_and_still_rebuilds(self):
+    def test_all_source_downloads_failing_is_nonfatal_when_forced_rebuild_still_runs(self):
         # Redundancy contract: every source download is non-fatal. Even if all
         # of them fail on the network, the on-disk parquet is intact, so the
         # rebuild (merge/clean/quality) must still run and the run must NOT
@@ -264,6 +264,60 @@ class DryRunMainTest(unittest.TestCase):
         ))
         # rebuild still ran (forced), proving a dead source did not block it
         self.assertTrue(any(s["name"] == "merge_to_qlib" and s["status"] == "ok" for s in summary["stages"]))
+
+    def test_all_source_downloads_failing_without_rebuild_fails_daily_update(self):
+        module = self.module
+
+        def fake_run_stage(stage, dry_run):
+            status = "failed" if stage.name.startswith("download_") else "ok"
+            return module.StageResult(stage.name, status, 0.0, 1 if status == "failed" else 0, required=stage.required)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp) / "reports"
+            with patch.object(module, "REPORTS_ROOT", reports), \
+                    patch.object(module, "latest_any_source_date", side_effect=[
+                        ("2026-07-03", {"baostock": "2026-07-03"}),
+                        ("2026-07-03", {"baostock": "2026-07-03"}),
+                        ("2026-07-03", {"baostock": "2026-07-03"}),
+                    ]), \
+                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
+                    patch.object(sys, "argv", ["run_daily_update.py"]):
+                rc = module.main()
+            summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(any(
+            s["name"] == "source_refresh_gate" and s["required"] and s["status"] == "failed"
+            for s in summary["stages"]
+        ))
+
+    def test_manifest_sync_failure_is_warning_not_daily_update_failure(self):
+        module = self.module
+
+        def fake_run_stage(stage, dry_run):
+            status = "failed" if stage.name == "sync_data_manifest" else "ok"
+            return module.StageResult(stage.name, status, 0.0, 1 if status == "failed" else 0, required=stage.required)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp) / "reports"
+            with patch.object(module, "REPORTS_ROOT", reports), \
+                    patch.object(module, "latest_any_source_date", side_effect=[
+                        ("2026-07-03", {"baostock": "2026-07-03"}),
+                        ("2026-07-08", {"baostock": "2026-07-08"}),
+                        ("2026-07-08", {"baostock": "2026-07-08"}),
+                    ]), \
+                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
+                    patch.object(sys, "argv", ["run_daily_update.py"]):
+                rc = module.main()
+            summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertTrue(any(
+            s["name"] == "sync_data_manifest" and not s["required"] and s["status"] == "failed"
+            for s in summary["stages"]
+        ))
 
 
 if __name__ == "__main__":
