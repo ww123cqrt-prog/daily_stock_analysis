@@ -1,7 +1,11 @@
 import importlib.util
+import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -78,6 +82,46 @@ class DownloadBaostockTest(unittest.TestCase):
         merged = module.merge_existing_frame(existing, fresh)
 
         self.assertEqual(merged["close"].tolist(), [10.0, 12.0, 13.0])
+
+    def test_incremental_range_after_end_is_no_new_without_querying_baostock(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stock_list = root / "stock_lists.json"
+            stock_list.write_text(json.dumps({"all": ["000001.XSHE"]}), encoding="utf-8")
+            out_dir = root / "parquet"
+            out_dir.mkdir()
+            pd.DataFrame({"date": pd.to_datetime(["2026-07-08"])}).to_parquet(out_dir / "000001.parquet", index=False)
+
+            fake_bs = types.SimpleNamespace(
+                login=lambda: types.SimpleNamespace(error_code="0", error_msg="success"),
+                logout=lambda: None,
+            )
+            query_one = Mock(side_effect=AssertionError("query_one should not run when start > end"))
+            argv = [
+                "download_baostock.py",
+                "--incremental",
+                "--overlap-days",
+                "0",
+                "--end",
+                "20260703",
+                "--sleep",
+                "0",
+                "--out",
+                str(out_dir),
+            ]
+            with patch.object(module, "STOCK_LIST", stock_list), \
+                    patch.object(module, "EMPTY_CODES_FILE", root / "empty.json"), \
+                    patch.object(module, "TIMEOUT_CODES_FILE", root / "timeout.json"), \
+                    patch.object(module, "CURRENT_FILE", root / "current.json"), \
+                    patch.object(module, "QUANT_DATA", root), \
+                    patch.object(module, "query_one", query_one), \
+                    patch.dict(sys.modules, {"baostock": fake_bs}), \
+                    patch.object(sys, "argv", argv):
+                rc = module.main()
+
+        self.assertEqual(rc, 0)
+        query_one.assert_not_called()
 
 
 if __name__ == "__main__":

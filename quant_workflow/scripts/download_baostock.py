@@ -229,6 +229,14 @@ def incremental_start_for_file(path: Path, default_start: str, overlap_days: int
     return str(start.date())
 
 
+def range_starts_after_end(start: str, end: str) -> bool:
+    start_ts = pd.to_datetime(start, errors="coerce")
+    end_ts = pd.to_datetime(end, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return False
+    return start_ts > end_ts
+
+
 def merge_existing_frame(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
     combined = pd.concat([existing, fresh], ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
@@ -329,6 +337,16 @@ def main() -> int:
                     ),
                     encoding="utf-8",
                 )
+                if args.incremental and out_path.exists() and range_starts_after_end(symbol_start, end):
+                    no_new += 1
+                    consecutive_failures = 0
+                    if no_new <= 5 or no_new % 50 == 0:
+                        print(
+                            f"NO_NEW {sym} ({bs_code}) cached through {symbol_start}; end={end}",
+                            flush=True,
+                        )
+                    continue
+
                 df = query_one(bs, bs_code, symbol_start, end, args.adjustflag, args.retries, args.timeout)
                 df = normalize_frame(df)
                 if df.empty:

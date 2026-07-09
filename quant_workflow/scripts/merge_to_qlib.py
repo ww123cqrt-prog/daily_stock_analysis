@@ -34,6 +34,8 @@ WORKFLOW_ROOT = workflow_root()
 QUANT_DATA = quant_data_root()
 BS_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
 JQ_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
+EASTMONEY_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "eastmoney_qfq"
+AKSHARE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "akshare_qfq"
 MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
 QLIB_BIN_DIR = qlib_provider_uri()
 
@@ -58,35 +60,41 @@ def normalize_frame(path: Path) -> pd.DataFrame:
     return df
 
 
-def merge_one(sym: str, bs_path: Path | None, jq_path: Path | None) -> pd.DataFrame | None:
-    df_bs = normalize_frame(bs_path) if bs_path else None
-    df_jq = normalize_frame(jq_path) if jq_path else None
+def merge_sources(sym: str, ordered_sources: list[tuple[str, Path | None]]) -> pd.DataFrame | None:
+    frames: list[tuple[str, pd.DataFrame]] = []
+    for name, path in ordered_sources:
+        if path is None or not path.exists():
+            continue
+        frame = normalize_frame(path)
+        if not frame.empty:
+            frames.append((name, frame))
 
-    if df_bs is None and df_jq is None:
+    if not frames:
         return None
-    if df_bs is None:
-        merged = df_jq
-    elif df_jq is None:
-        merged = df_bs
-    else:
-        # Start from Baostock long history, then overwrite OHLC on overlapping
-        # dates with JQData. Keep Baostock volume on overlaps to avoid a
-        # source-switch volume discontinuity in adjusted-volume space.
-        merged = df_bs.set_index("date")
-        jq = df_jq.set_index("date")
-        all_dates = merged.index.union(jq.index)
+
+    _, first = frames[0]
+    merged = first.set_index("date")
+
+    for name, frame in frames[1:]:
+        # Start from Baostock long history, then overlay newer sources in the
+        # configured order. OHLC is overwritten on overlaps; volume/amount are
+        # kept from the earlier source on overlaps to avoid adjusted-volume
+        # discontinuities, while source-only dates are fully appended.
+        existing_dates = merged.index
+        overlay = frame.set_index("date")
+        all_dates = existing_dates.union(overlay.index)
         merged = merged.reindex(all_dates)
 
         for col in ["open", "close", "high", "low"]:
-            if col in jq.columns:
-                merged.loc[jq.index, col] = jq[col]
+            if col in overlay.columns:
+                merged.loc[overlay.index, col] = overlay[col]
 
-        jq_only_dates = jq.index.difference(df_bs["date"])
-        for col in REQUIRED_FIELDS:
-            if col in jq.columns:
-                merged.loc[jq_only_dates, col] = jq.loc[jq_only_dates, col]
+        source_only_dates = overlay.index.difference(existing_dates)
+        for col in REQUIRED_FIELDS + OPTIONAL_FIELDS:
+            if col in overlay.columns:
+                merged.loc[source_only_dates, col] = overlay.loc[source_only_dates, col]
 
-        merged = merged.reset_index().rename(columns={"index": "date"})
+    merged = merged.reset_index().rename(columns={"index": "date"})
 
     if merged is None or merged.empty:
         return None
@@ -107,19 +115,55 @@ def merge_one(sym: str, bs_path: Path | None, jq_path: Path | None) -> pd.DataFr
     return merged[keep].sort_values("date").drop_duplicates(subset=["date"])
 
 
-def build_merged_parquet(bs_dir: Path, jq_dir: Path, out_dir: Path, overwrite: bool) -> int:
+def merge_one(
+    sym: str,
+    bs_path: Path | None,
+    jq_path: Path | None,
+    eastmoney_path: Path | None = None,
+    akshare_path: Path | None = None,
+) -> pd.DataFrame | None:
+    return merge_sources(
+        sym,
+        [
+            ("baostock", bs_path),
+            ("jqdata", jq_path),
+            ("eastmoney", eastmoney_path),
+            ("akshare", akshare_path),
+        ],
+    )
+
+
+def _source_files(directory: Path) -> dict[str, Path]:
+    return {p.stem: p for p in directory.glob("*.parquet")} if directory.exists() else {}
+
+
+def build_merged_parquet(
+    bs_dir: Path,
+    jq_dir: Path,
+    out_dir: Path,
+    overwrite: bool,
+    extra_source_dirs: list[tuple[str, Path]] | None = None,
+) -> int:
     if overwrite and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bs_files = {p.stem: p for p in bs_dir.glob("*.parquet")}
-    jq_files = {p.stem: p for p in jq_dir.glob("*.parquet")}
-    symbols = sorted(set(bs_files) | set(jq_files))
+    source_maps: list[tuple[str, dict[str, Path]]] = [
+        ("baostock", _source_files(bs_dir)),
+        ("jqdata", _source_files(jq_dir)),
+    ]
+    for name, directory in extra_source_dirs or []:
+        source_maps.append((name, _source_files(directory)))
 
-    print(f"Baostock stocks: {len(bs_files)}")
-    print(f"JQData stocks:   {len(jq_files)}")
+    symbols = sorted(set().union(*(set(files) for _, files in source_maps)))
+
+    for name, files in source_maps:
+        print(f"{name} stocks: {len(files)}")
     print(f"Union stocks:    {len(symbols)}")
-    print(f"Overlap stocks:  {len(set(bs_files) & set(jq_files))}")
+    if len(source_maps) >= 2:
+        base_name, base_files = source_maps[0]
+        for name, files in source_maps[1:]:
+            print(f"Overlap {base_name}/{name}: {len(set(base_files) & set(files))}")
 
     merged_count = 0
     skipped_existing = 0
@@ -132,7 +176,7 @@ def build_merged_parquet(bs_dir: Path, jq_dir: Path, out_dir: Path, overwrite: b
             if i <= 3 or i % 500 == 0 or i == len(symbols):
                 print(f"  [{i}/{len(symbols)}] {sym}: skip existing {out_path}")
             continue
-        df = merge_one(sym, bs_files.get(sym), jq_files.get(sym))
+        df = merge_sources(sym, [(name, files.get(sym)) for name, files in source_maps])
         if df is None or df.empty:
             continue
         df.to_parquet(out_path, index=False)
@@ -296,6 +340,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baostock-dir", type=Path, default=BS_DIR)
     parser.add_argument("--jqdata-dir", type=Path, default=JQ_DIR)
+    parser.add_argument("--eastmoney-dir", type=Path, default=EASTMONEY_DIR)
+    parser.add_argument("--akshare-dir", type=Path, default=AKSHARE_DIR)
     parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
     parser.add_argument("--qlib-dir", type=Path, default=QLIB_BIN_DIR)
     parser.add_argument(
@@ -311,7 +357,18 @@ def main() -> int:
     if args.smoke_fixture:
         return run_smoke_fixture(args.smoke_dir, overwrite=overwrite)
 
-    merged_count = build_merged_parquet(args.baostock_dir, args.jqdata_dir, args.merged_dir, overwrite)
+    extra_sources = [
+        (name, directory)
+        for name, directory in [("eastmoney", args.eastmoney_dir), ("akshare", args.akshare_dir)]
+        if directory.exists()
+    ]
+    merged_count = build_merged_parquet(
+        args.baostock_dir,
+        args.jqdata_dir,
+        args.merged_dir,
+        overwrite,
+        extra_source_dirs=extra_sources,
+    )
     if merged_count == 0:
         return 1
     return convert_to_bin(args.merged_dir, args.qlib_dir, overwrite)

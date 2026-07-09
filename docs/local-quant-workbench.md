@@ -4,7 +4,7 @@
 
 ## 一句话架构
 
-`daily_stock_analysis` 是主网页和主操作台；仓内 `quant_workflow/` 是本地量化流水线；`Qlib` 是机器学习量化引擎；`china-astock-quant` 是 A 股指标、策略和回测经验参考库；MLflow 只保留为实验原始记录页面。唯一 Python 虚拟环境是 `daily_stock_analysis/.venv`：DSA 后端、`quant_workflow` 稳定脚本、Qlib、JQData/AkShare 和 `china-astock-quant` 适配层都从这套环境运行。
+当前框架是：组织上统一，代码上分层，数据上外置，入口统一到 DSA。`daily_stock_analysis` 是主网页和主操作台；仓内 `quant_workflow/` 是本地量化流水线；`Qlib` 是机器学习量化引擎；`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 只保留为实验原始记录页面。唯一 Python 虚拟环境是 `daily_stock_analysis/.venv`：DSA 后端、`quant_workflow` 稳定脚本、Qlib、JQData/AkShare 和 `china-astock-quant` 适配层都从这套环境运行。
 
 ## 本机入口
 
@@ -46,6 +46,8 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 | `quant_workflow` | DSA 仓内稳定脚本和产物层 | 数据下载、清洗、异常报告、Qlib 转换、训练、回测、报告 | 不把一次性脚本散落到项目根目录，不提交运行产物 |
 | `Qlib` | 机器学习量化引擎 | 由 `daily_stock_analysis/.venv` 中的 PyPI 包调用，读取本地 provider，执行模型训练和回测 | 不改造成主网页，不随意改官方源码 |
 | `china-astock-quant` | 参考库和复用来源 | 由共享 DSA Python 环境调用其指标、样例策略、事件回测和工程经验 | 不接入交易模块，不改造成主网页 |
+| `ashare-live-research` | 本机只读实时观察 skill/MCP | 同花顺、手机镜像、行情异动、辅助交易观察层的后续研究 | 不并入 DSA 主仓，不读取密码，不自动下单 |
+| `a-share-us-catalyst` / CatDesk（九点猫研） | 外部催化观察服务 | 美股催化 A 股题材的独立页面和状态入口；负责发现题材和候选股 | 不把其候选信号历史验证混写成 Qlib 策略回测；不直接当买入信号 |
 | 同花顺桌面端 | 后续只读观察方向 | 界面参考、人工核对、未来只读截图/OCR 研究 | 不读取账号密码，不自动下单，不连接券商交易接口 |
 
 ## 网页自助流程
@@ -68,11 +70,12 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 建议顺序：
 
+0. 一键更新：运行“运行每日数据更新全链路”，自动串联 Baostock/东方财富/AkShare 增量下载、合并、最新快照校验、异常检测、清洗和跨源验证。日常维护优先用这一个入口；下面的 1-6 步是需要单独排查某一环时的手动拆分。
 1. 检查 Qlib 数据：运行“检查 Qlib 数据”。
-2. 更新数据：先运行“准备 Baostock 增量清单”，再按需运行“下载 Baostock 长历史”。
+2. 更新数据：先运行“准备 Baostock 增量清单”，再按需运行“下载 Baostock 长历史”、“下载东方财富日线”和“下载 AkShare 日线”。东方财富和 AkShare 都是免费匿名公开接口，写入 `eastmoney_qfq` / `akshare_qfq`，只作为冗余源，不覆盖原始 Baostock/JQData 目录。
 3. 验证 JQData：运行“验证 JQData 连接”。网页端只允许 dry-run、小样本认证和股票池解析，不写入真实数据目录。
 4. 合并 Qlib：运行“合并并转换为 Qlib”，必要时先用小样本演练。
-5. 质量报告：运行“生成数据质量报告”、“生成异常股票和清洗策略”、“生成数据治理盘点和清理预案”和“生成工作台能力盘点”。
+5. 质量报告：运行“生成数据质量报告”、“生成异常股票和清洗策略”、“校验新浪最新快照”、“生成数据治理盘点和清理预案”和“生成工作台能力盘点”。
 6. 清洗预演：先用“只预演不写入”，确认影响范围后再考虑生成 cleaned provider。
 7. 训练+回测：运行“训练 Qlib LightGBM 基线”，再运行“生成 Qlib 预测摘要”、市场状态、现金仓位叠加、策略优化预演、DSA 分析准确性回测。
 8. Qlib 研究增强：运行“生成 Qlib 模型解释报告”、“生成 Qlib 回测明细报告”、“生成 Qlib 多模型/多实验对比”、“生成 Qlib 因子分析报告”、“生成 Qlib 滚动训练计划”和“生成 Qlib 风险模型诊断”。
@@ -84,9 +87,46 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 `quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到网页按钮里。当前网页任务中心已经覆盖核心日常链路：数据下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、数据治理盘点和 dry-run 清理预案、市场状态、现金仓位叠加、Qlib 研究增强、china-astock 技术指标报告、china-astock 对比、策略优化预演和 baseline 训练。
 
+### 2.2 每日数据更新全链路与自动调度
+
+`run_daily_update.py` 在 `/workflow` 中作为“运行每日数据更新全链路”任务出现，把已有稳定脚本按依赖顺序串成一条可审计的链路：
+
+1. `download_baostock.py --incremental`：Baostock 增量刷新（匿名登录，不需要也不读取任何凭据）。
+2. `download_eastmoney.py --incremental`：东方财富 qfq 日线冗余源，写入 `quant_data/parquet/ashare_1d/eastmoney_qfq/`。
+3. `download_akshare.py --incremental`：AkShare `stock_zh_a_hist(adjust="qfq")` 冗余源，写入 `quant_data/parquet/ashare_1d/akshare_qfq/`。
+4. `merge_to_qlib.py`：把 Baostock 长历史、JQData 近期数据和已存在的新冗余源多源合并，输出目录名仍保持 `merged_baostock_jqdata`，再转换为 canonical Qlib provider。重叠交易日的 OHLC 覆盖顺序是 Baostock -> JQData -> EastMoney -> AkShare；成交量/成交额在重叠日保留较早来源以避免复权量突变，新来源只补自己独有日期的完整字段。
+5. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`；这是只读校验，不参与训练。
+6. `report_data_anomalies.py`：异常检测，产出清洗输入。
+7. `apply_data_cleaning.py`：套用清洗规则，生成官方 cleaned provider。
+8. `report_data_quality.py`：Baostock/JQData/东方财富/AkShare 重叠期跨源一致性验证。
+9. `check_qlib_data.py`：最终 provider 日历/股票池校验。
+
+编排器带一个交易日 gate：增量下载后会查看 Baostock、东方财富和 AkShare 三个源目录的最新日期；若没有新交易日（且未加 `--force`），会跳过 4-9 的重建阶段，避免无谓地重跑全市场合并和清洗。三个下载源在全链路中都是非致命阶段：某个免费源失败会写进 `daily_update_summary_latest.json` 并继续跑其他可执行阶段。`--skip-download` 只重建、不下载；`--skip-eastmoney` / `--skip-akshare` / `--skip-snapshot-validation` 可单独跳过新源；`--dry-run` 只打印计划、不执行；`--limit` 用于小样本演练。每次运行写 `daily_update_summary_latest.json` 记录各阶段状态、用时、退出码和各源日期。
+
+JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baostock 长历史序列之前，只在合并和跨源验证中复用既有 JQData parquet。东方财富和 AkShare 是免费冗余源，首次全市场下载会额外占用约 1GB 量级磁盘；日常增量只补最近窗口。
+
+东方财富、AkShare 和新浪快照任务默认绕过 macOS/系统代理，避免本机代理端口残留时把公开行情下载误判为源站失败；确实需要代理访问时，在网页任务里勾选“使用系统代理”，或在脚本端传 `--use-system-proxy`。Baostock 阶段使用其 SDK 的匿名连接路径，不走这组 requests 代理开关。
+
+自动调度用本机 launchd（不写入 Git，属机器本地配置）。安装脚本从仓内模板生成含绝对路径的 plist：
+
+```bash
+scripts/launchd/install-quant-daily-update.sh            # 生成 plist 并打印加载命令
+scripts/launchd/install-quant-daily-update.sh --load     # 生成并立即 bootstrap
+scripts/launchd/install-quant-daily-update.sh --dry-run  # 只打印解析后的 plist，不写入
+scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 plist
+```
+
+任务 `com.dsa.quant-daily-update` 默认工作日 18:40（A 股收盘且日终数据落定后）本地触发，用 `daily_stock_analysis/.venv` 运行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。`launchctl kickstart gui/<uid>/com.dsa.quant-daily-update` 可手动触发一次。
+
+### 2.3 只读盘点与报告任务
+
 `report_data_hygiene.py` 在 `/workflow` 中作为“生成数据治理盘点和清理预案”任务出现。它只读检查 `quant_data`、`quant_workflow`、DSA、Qlib、china-astock-quant 的当前体量、任务库状态、业务进程、官方 parquet、官方 Qlib provider、根目录日志/临时脚本和历史报告，输出 `data_hygiene_inventory_latest.{md,json}` 与 `data_hygiene_cleanup_plan_latest.{md,json}`。清理计划只包含 `keep`、`document`、`move`、`archive` 等 dry-run 建议，不包含真实删除动作；所有会改变路径的建议都标记为需要用户确认。
 
 `report_workbench_capabilities.py` 在 `/workflow` 中作为“生成工作台能力盘点”任务出现。它只读扫描 DSA 前端页面、DSA API router、后端量化任务白名单、网页任务卡、`quant_workflow/scripts` 稳定脚本、测试覆盖和 `china-astock-quant` 可复用边界，输出 `workbench_capability_inventory_latest.{json,md}`。这个任务用于回答“哪些能力已经有网页入口，哪些还缺测试、缺前端入口或只保留在脚本层”，不启动下载、转换、清洗、训练任务，也不接券商、不自动下单。
+
+`/research` 右侧栏提供 CatDesk 9（`a-share-us-catalyst` / 九点猫研）的本地跳转入口 `http://127.0.0.1:8765/`。当前只是网页级跳转，不共享 DSA/Qlib 数据，也不把 CatDesk 的“候选信号历史验证”归类为 Qlib 策略回测。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。后续若要合并模块，先单独审查重复数据源、术语和报告边界。
+
+`report_catdesk_signal_validation.py` 是 CatDesk 候选池的研究验证脚本。默认严格口径下，Qlib run 必须早于验证日 09:30，脚本才会把 Qlib 分数纳入排序；晚于这个时间的模型分数会标记为不可用，避免把事后生成的分数当成事前信号。若只是做事后研究对比，可以显式传 `--allow-backfilled-qlib`，报告会记录 `qlib_backfilled_allowed=true`，意思是“用了事后补跑的 Qlib 分数做研究比较”，不是证明当时盘前已经有这个信号。
 
 `report_china_astock_indicators.py` 复用 `china-astock-quant/strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数，读取本地 cleaned 行情生成 `china_astock_indicator_report_latest.{json,md}`。这是只读研究报告，不连接券商、不读取账号密码、不自动下单。网页端和脚本端省略 `limit` 时都默认只抽样 50 只股票，避免误把“安全报告”跑成全市场重任务；需要扩大范围时必须显式填写数量上限。
 
@@ -149,7 +189,7 @@ ETF 的基本面分析会降级：不要把股票公司的财报、ROE、公司�
 | 量化报告和实验记录 | 默认 `daily_stock_analysis/quant_workflow/reports/`；旧安装的同级 `quant_workflow/reports/` 只作为仓内无历史标记时的迁移期兜底；可用 `QUANT_WORKFLOW_REPORTS_ROOT` 显式固定位置，运行态产物不入库 |
 | MLflow 原始记录 | 默认 `daily_stock_analysis/quant_workflow/mlruns/`；旧安装的同级 `quant_workflow/mlruns/` 只作为仓内无历史标记时的迁移期兜底；可用 `QUANT_WORKFLOW_MLRUNS_DIR` 显式固定位置，运行态产物不入库 |
 | 临时实验草稿 | `daily_stock_analysis/quant_workflow/scratch/`，只保留 README |
-| Qlib provider 和行情数据 | `daily_stock_analysis/quant_data/`，运行态数据，不入库 |
+| Qlib provider 和行情数据 | 默认优先 `daily_stock_analysis/quant_data/`，若仓内不存在则使用 DSA 同级 `quant_data/`；可用 `QUANT_DATA_ROOT` 显式固定位置。运行态数据不入库 |
 | CodeGraph 索引 | 每个项目自己的 `.codegraph/` |
 | Python 虚拟环境 | `daily_stock_analysis/.venv/` 是唯一 Python 运行时；`qlib/.venv` 和 `china-astock-quant/.venv` 不作为网页任务默认运行环境 |
 

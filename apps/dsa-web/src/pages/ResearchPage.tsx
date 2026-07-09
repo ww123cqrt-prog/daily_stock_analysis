@@ -267,6 +267,12 @@ const RESEARCH_TEXT = {
     projectMapDescription: '各项目保留原职责，DSA 只做本地研究入口和结果聚合。',
     futureTitle: '后续升级项',
     futureDescription: '这些能力本轮只作为路线图展示，默认只读观察，不读取密码、不自动下单。',
+    externalToolsTitle: '外部研究工具',
+    externalToolsDescription: '先通过跳转把可用工具接到同一个工作台，后续再评估数据和模块是否合并。',
+    catdeskTitle: 'CatDesk 9 / 美股催化 A股早报',
+    catdeskDescription: '跨市场催化观察：用美股隔夜板块和主题变化生成 A 股候选清单；其中的回测证据是候选信号历史验证，不等同 Qlib 策略回测。',
+    catdeskOpen: '打开 CatDesk 9',
+    catdeskNote: '当前仅跳转，数据暂不互通；后续再评估重复模块如何合并简化。',
     mlflowNote: 'MLflow 保持为实验记录页，不嵌入或改造；是否已启动以工作流页顶部状态为准。',
     portNote: 'DSA 跟随当前访问地址；本机 8000 可能被其他服务占用。',
     statusItems: [
@@ -512,6 +518,12 @@ const RESEARCH_TEXT = {
     projectMapDescription: 'Each project keeps its role; DSA is the local research entry and result aggregation layer.',
     futureTitle: 'Future Upgrades',
     futureDescription: 'These items are roadmap only in this round: read-only observation by default, no password capture, no automatic orders.',
+    externalToolsTitle: 'External Research Tools',
+    externalToolsDescription: 'Use jump links first, then later decide whether data and modules should be merged.',
+    catdeskTitle: 'CatDesk 9 / US catalysts to A-share morning report',
+    catdeskDescription: 'Cross-market catalyst observation: rank A-share candidates from overnight US sector and theme moves. Its backtest evidence is candidate-signal evidence, not a Qlib strategy backtest.',
+    catdeskOpen: 'Open CatDesk 9',
+    catdeskNote: 'Current integration is link-only; data is not shared yet. Module de-duplication can be reviewed later.',
     mlflowNote: 'MLflow remains the experiment-tracking page. It is not embedded or modified; use the workflow header for live status.',
     portNote: 'DSA follows the current browser address; local port 8000 may belong to another service.',
     statusItems: [
@@ -697,6 +709,16 @@ function formatSignedMetricValue(value: number): string {
     return formatted;
   }
   return value > 0 ? `+${formatted}` : formatted;
+}
+
+function marketMetricClass(value: number): string {
+  if (value > 0) {
+    return 'text-market-up';
+  }
+  if (value < 0) {
+    return 'text-market-down';
+  }
+  return 'text-foreground';
 }
 
 function runText(run: ResearchExperimentRun, field: 'provider' | 'experimentName' | 'qlibProvider' | 'providerUri'): string {
@@ -1719,7 +1741,7 @@ const ResearchPage: React.FC = () => {
               <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_160px]">
                 <div className="rounded-xl border border-border/70 bg-background/60 p-3">
                   <p className="text-xs font-medium text-muted-text">{text.cleanedDataLabel}</p>
-                  <p className="mt-2 text-lg font-semibold text-success">
+                  <p className={`mt-2 text-lg font-semibold ${marketMetricClass(experimentComparison.cleanedValue)}`}>
                     {formatMetricValue(experimentComparison.cleanedValue)}
                   </p>
                   <p className="mt-1 break-words text-xs text-secondary-text">
@@ -1737,7 +1759,7 @@ const ResearchPage: React.FC = () => {
                 </div>
                 <div className="rounded-xl border border-border/70 bg-background/60 p-3">
                   <p className="text-xs font-medium text-muted-text">{text.comparisonDeltaLabel}</p>
-                  <p className={`mt-2 text-lg font-semibold ${experimentComparison.delta >= 0 ? 'text-success' : 'text-danger'}`}>
+                  <p className={`mt-2 text-lg font-semibold ${marketMetricClass(experimentComparison.delta)}`}>
                     {formatSignedMetricValue(experimentComparison.delta)}
                   </p>
                   <p className="mt-1 break-all font-mono text-xs text-secondary-text">
@@ -2025,6 +2047,29 @@ const ResearchPage: React.FC = () => {
                   </div>
                 );
               })}
+            </div>
+          </Card>
+
+          <Card padding="md">
+            <div className="flex items-start gap-3">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-cyan/20 bg-cyan/10 text-cyan">
+                <Globe2 className="h-5 w-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="label-uppercase">{text.externalToolsTitle}</p>
+                <h2 className="mt-1 text-base font-semibold text-foreground">{text.catdeskTitle}</h2>
+                <p className="mt-2 text-sm leading-6 text-secondary-text">{text.catdeskDescription}</p>
+                <p className="mt-2 text-xs leading-5 text-muted-text">{text.catdeskNote}</p>
+                <a
+                  href="http://127.0.0.1:8765/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-3 inline-flex h-9 items-center gap-2 rounded-lg border border-cyan/30 bg-cyan/10 px-3 text-sm font-medium text-cyan transition-colors hover:bg-cyan/15"
+                >
+                  <ArrowUpRight className="h-4 w-4" />
+                  {text.catdeskOpen}
+                </a>
+              </div>
             </div>
           </Card>
 

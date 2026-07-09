@@ -27,8 +27,8 @@ WORKFLOW = workflow_root()
 
 BAOSTOCK_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
 JQDATA_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
-AKSHARE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "qfq_full"
-AKSHARE_SAMPLE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "qfq"
+EASTMONEY_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "eastmoney_qfq"
+AKSHARE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "akshare_qfq"
 MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
 QLIB_DIR = qlib_provider_uri()
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
@@ -193,44 +193,71 @@ def scan_merged_files(directory: Path, sample_limit: int = 0) -> tuple[pd.DataFr
     return pd.DataFrame(summary_rows), pd.DataFrame(issue_rows)
 
 
-def overlap_consistency(sample_limit: int = 0) -> pd.DataFrame:
+def _compare_overlap_to_baostock(
+    *,
+    source_name: str,
+    source_dir: Path,
+    sample_limit: int = 0,
+) -> list[dict]:
     bs_files = load_source_index(BAOSTOCK_DIR)
-    jq_files = load_source_index(JQDATA_DIR)
-    symbols = sorted(bs_files & jq_files)
+    source_files = load_source_index(source_dir)
+    symbols = sorted(bs_files & source_files)
     if sample_limit > 0:
         symbols = symbols[:sample_limit]
 
     rows: list[dict] = []
     for i, sym in enumerate(symbols, 1):
         bs = pd.read_parquet(BAOSTOCK_DIR / f"{sym}.parquet")
-        jq = pd.read_parquet(JQDATA_DIR / f"{sym}.parquet")
+        other = pd.read_parquet(source_dir / f"{sym}.parquet")
         bs["date"] = pd.to_datetime(bs["date"], errors="coerce")
-        jq["date"] = pd.to_datetime(jq["date"], errors="coerce")
-        joined = bs.merge(jq, on="date", suffixes=("_bs", "_jq"))
+        other["date"] = pd.to_datetime(other["date"], errors="coerce")
+        joined = bs.merge(other, on="date", suffixes=("_bs", "_other"))
         if joined.empty:
-            rows.append({"symbol": sym, "overlap_days": 0})
+            rows.append({"source": source_name, "symbol": sym, "overlap_days": 0})
             continue
 
-        row = {"symbol": sym, "overlap_days": len(joined)}
+        row = {"source": source_name, "symbol": sym, "overlap_days": len(joined)}
         for col in ["open", "close", "high", "low"]:
-            diff = (pd.to_numeric(joined[f"{col}_bs"], errors="coerce") - pd.to_numeric(joined[f"{col}_jq"], errors="coerce")).abs()
-            base = pd.to_numeric(joined[f"{col}_jq"], errors="coerce").abs().replace(0, np.nan)
+            diff = (
+                pd.to_numeric(joined[f"{col}_bs"], errors="coerce")
+                - pd.to_numeric(joined[f"{col}_other"], errors="coerce")
+            ).abs()
+            base = pd.to_numeric(joined[f"{col}_other"], errors="coerce").abs().replace(0, np.nan)
             rel = (diff / base).replace([np.inf, -np.inf], np.nan)
             row[f"{col}_max_abs_diff"] = float(diff.max()) if not diff.empty else math.nan
             row[f"{col}_median_rel_diff"] = float(rel.median()) if not rel.dropna().empty else math.nan
 
-        if "volume_bs" in joined.columns and "volume_jq" in joined.columns:
+        if "volume_bs" in joined.columns and "volume_other" in joined.columns:
             vol_bs = pd.to_numeric(joined["volume_bs"], errors="coerce")
-            vol_jq = pd.to_numeric(joined["volume_jq"], errors="coerce").replace(0, np.nan)
-            ratio = (vol_bs / vol_jq).replace([np.inf, -np.inf], np.nan)
+            vol_other = pd.to_numeric(joined["volume_other"], errors="coerce").replace(0, np.nan)
+            ratio = (vol_bs / vol_other).replace([np.inf, -np.inf], np.nan)
             row["volume_ratio_median"] = float(ratio.median()) if not ratio.dropna().empty else math.nan
             row["volume_ratio_min"] = float(ratio.min()) if not ratio.dropna().empty else math.nan
             row["volume_ratio_max"] = float(ratio.max()) if not ratio.dropna().empty else math.nan
 
         rows.append(row)
         if i % 1000 == 0:
-            print(f"  compared {i}/{len(symbols)} overlap files")
+            print(f"  compared {i}/{len(symbols)} baostock/{source_name} overlap files")
 
+    return rows
+
+
+def overlap_consistency(sample_limit: int = 0) -> pd.DataFrame:
+    rows: list[dict] = []
+    for source_name, source_dir in [
+        ("jqdata", JQDATA_DIR),
+        ("eastmoney", EASTMONEY_DIR),
+        ("akshare", AKSHARE_DIR),
+    ]:
+        if not source_dir.exists():
+            continue
+        rows.extend(
+            _compare_overlap_to_baostock(
+                source_name=source_name,
+                source_dir=source_dir,
+                sample_limit=sample_limit,
+            )
+        )
     return pd.DataFrame(rows)
 
 
@@ -260,7 +287,7 @@ def qlib_provider_stats() -> dict:
 def source_status(name: str, stats: SourceStats, merged_symbols: set[str]) -> str:
     if stats.files == 0 or stats.rows == 0:
         return "missing"
-    if name in {"akshare", "jqdata"}:
+    if name in {"akshare", "eastmoney", "jqdata"}:
         return "partial"
     if name == "merged" and stats.files < max(len(merged_symbols), 1):
         return "partial"
@@ -396,9 +423,10 @@ def main() -> int:
 
     source_rows = []
     for name, directory in [
-        ("akshare", AKSHARE_DIR if AKSHARE_DIR.exists() else AKSHARE_SAMPLE_DIR),
         ("baostock", BAOSTOCK_DIR),
         ("jqdata", JQDATA_DIR),
+        ("eastmoney", EASTMONEY_DIR),
+        ("akshare", AKSHARE_DIR),
         ("merged", MERGED_DIR),
     ]:
         stats = source_stats(name, directory)
@@ -415,7 +443,7 @@ def main() -> int:
     merged_summary.to_csv(summary_csv, index=False)
     merged_issues.to_csv(issues_csv, index=False)
 
-    print("Comparing Baostock/JQData overlap...")
+    print("Comparing Baostock cross-source overlaps...")
     overlap = overlap_consistency(args.overlap_sample)
     overlap_csv = out_dir / f"data_quality_overlap_{ts}.csv"
     overlap.to_csv(overlap_csv, index=False)
@@ -439,6 +467,7 @@ def main() -> int:
     if not overlap.empty:
         overlap_metrics = {
             "symbols": len(overlap),
+            "sources": ", ".join(sorted(overlap["source"].dropna().unique())) if "source" in overlap.columns else "",
             "median_close_rel_diff": float(overlap["close_median_rel_diff"].median()),
             "p95_close_rel_diff": float(overlap["close_median_rel_diff"].quantile(0.95)),
             "median_volume_ratio": float(overlap["volume_ratio_median"].median()),
@@ -495,12 +524,13 @@ Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - Symbols with non-positive volume rows: {issue_counts["non_positive_volume"]}
 - Symbols with absolute daily return above 50%: {issue_counts["abs_return_gt_50pct"]}
 
-## Baostock vs JQData Overlap
+## Baostock Cross-source Overlap
 
-- Compared symbols: {overlap_metrics.get("symbols", 0)}
+- Compared rows: {overlap_metrics.get("symbols", 0)}
+- Sources: {overlap_metrics.get("sources", "")}
 - Median close relative difference: {overlap_metrics.get("median_close_rel_diff", math.nan):.6f}
 - P95 close relative difference: {overlap_metrics.get("p95_close_rel_diff", math.nan):.6f}
-- Median volume ratio, Baostock/JQData: {overlap_metrics.get("median_volume_ratio", math.nan):.6f}
+- Median volume ratio, Baostock/other source: {overlap_metrics.get("median_volume_ratio", math.nan):.6f}
 - P05/P95 volume ratio: {overlap_metrics.get("p05_volume_ratio", math.nan):.6f} / {overlap_metrics.get("p95_volume_ratio", math.nan):.6f}
 
 Interpretation: small close differences are expected because Baostock and JQData
@@ -519,7 +549,7 @@ expected in adjusted-volume space after corporate actions.
 - Source summary CSV: `{source_csv}`
 - Merged per-symbol summary CSV: `{summary_csv}`
 - Issues CSV: `{issues_csv}`
-- Baostock/JQData overlap CSV: `{overlap_csv}`
+- Baostock cross-source overlap CSV: `{overlap_csv}`
 """
 
     report_path = out_dir / f"data_quality_report_{ts}.md"

@@ -99,6 +99,126 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(runtime_payload["qlib_init"]["provider_uri"], "/new/provider")
         self.assertIn("cleaned", runtime.name)
 
+    def test_runtime_config_extends_dates_to_provider_latest_calendar_day(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            provider = base / "provider"
+            (provider / "calendars").mkdir(parents=True)
+            (provider / "calendars" / "day.txt").write_text(
+                "2026-07-08\n2026-07-09\n",
+                encoding="utf-8",
+            )
+            source = base / "baseline.yaml"
+            source.write_text(
+                yaml.safe_dump(
+                    {
+                        "qlib_init": {"provider_uri": "/old/provider", "region": "cn"},
+                        "task": {
+                            "dataset": {
+                                "kwargs": {
+                                    "handler": {"kwargs": {"end_time": "2026-07-03"}},
+                                    "segments": {"test": ["2024-01-01", "2026-07-01"]},
+                                }
+                            },
+                            "record": [
+                                {"class": "SignalRecord"},
+                                {
+                                    "class": "PortAnaRecord",
+                                    "config": {"backtest": {"end_time": "2026-07-01"}},
+                                },
+                            ],
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            runtime = module.write_runtime_config_with_provider(source, provider, "cleaned", base / "runtime")
+
+            runtime_payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
+            source_payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+
+        task = runtime_payload["task"]
+        self.assertEqual(task["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"], "2026-07-09")
+        self.assertEqual(task["dataset"]["kwargs"]["segments"]["test"], ["2024-01-01", "2026-07-08"])
+        self.assertEqual(task["record"][1]["kwargs"]["config"]["backtest"]["end_time"], "2026-07-08")
+        self.assertEqual(source_payload["task"]["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"], "2026-07-03")
+
+    def test_runtime_config_keeps_portana_config_under_qlib_kwargs(self):
+        module = load_module()
+        payload = {
+            "task": {
+                "record": [
+                    {"class": "SignalRecord"},
+                    {
+                        "class": "PortAnaRecord",
+                        "config": {"backtest": {"end_time": "2026-07-01"}},
+                    },
+                ]
+            }
+        }
+
+        module.update_runtime_config_dates(payload, "2026-07-09", backtest_end_day="2026-07-08")
+
+        record = payload["task"]["record"][1]
+        self.assertEqual(record["kwargs"]["config"]["backtest"]["end_time"], "2026-07-08")
+
+    def test_repairs_mlruns_artifact_locations_to_active_root(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mlruns = Path(temp_dir) / "mlruns"
+            exp_dir = mlruns / "123"
+            exp_dir.mkdir(parents=True)
+            meta = exp_dir / "meta.yaml"
+            meta.write_text(
+                yaml.safe_dump(
+                    {
+                        "experiment_id": "123",
+                        "name": "baseline",
+                        "artifact_location": "file:///old/quant_workflow/mlruns/123",
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            fixed = module.ensure_mlruns_artifact_locations(mlruns)
+
+            payload = yaml.safe_load(meta.read_text(encoding="utf-8"))
+        self.assertEqual(fixed, 1)
+        self.assertEqual(payload["artifact_location"], (mlruns / "123").resolve().as_uri())
+
+    def test_mirrors_legacy_run_artifacts_when_target_is_empty(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "quant_workflow" / "mlruns" / "123" / "run-1" / "artifacts"
+            target_root = root / "daily_stock_analysis" / "quant_workflow" / "mlruns"
+            legacy.mkdir(parents=True)
+            (legacy / "pred.pkl").write_bytes(b"prediction")
+
+            mirrored = module.mirror_run_artifacts_from_legacy_locations(
+                "run-1",
+                "123",
+                projects=root,
+                mlruns_dir=target_root,
+            )
+
+            target = target_root / "123" / "run-1" / "artifacts" / "pred.pkl"
+            self.assertTrue(mirrored)
+            self.assertEqual(target.read_bytes(), b"prediction")
+            self.assertEqual(module.local_run_artifacts("run-1", "123", mlruns_dir=target_root), ["pred.pkl"])
+
+    def test_local_run_artifacts_returns_empty_for_missing_run(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertEqual(
+                module.local_run_artifacts("missing-run", "123", mlruns_dir=Path(temp_dir) / "mlruns"),
+                [],
+            )
+
     def test_builds_csi300_lines_from_provider_instrument_ranges(self):
         module = load_module()
         ranges = {

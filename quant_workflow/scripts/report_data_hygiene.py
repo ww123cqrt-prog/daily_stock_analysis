@@ -42,10 +42,15 @@ class HygieneReportPaths:
 RUNTIME_PATTERNS = ["*.log", "*.pid", "*_launch*.json", "*.out", "*.err"]
 TEMP_SCRIPT_NAMES = {"monitor_akshare.py", "smart_retry.py"}
 STATE_PATTERNS = [
+    "akshare_current.json",
+    "akshare_download_summary_latest.json",
     "akshare_failures*.json",
     "baostock_*codes.json",
     "baostock_current.json",
     "baostock_failures.json",
+    "eastmoney_current.json",
+    "eastmoney_download_summary_latest.json",
+    "eastmoney_failures*.json",
     "stock_lists.json",
 ]
 SENSITIVE_TEXT_PATTERNS = [

@@ -427,6 +427,10 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText('已链接').length).toBeGreaterThan(0);
     expect(screen.getByText('Health check is shown on the workflow page.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /打开工作流/ })).toHaveAttribute('href', '/workflow');
+    expect(screen.getByText('外部研究工具')).toBeInTheDocument();
+    expect(screen.getByText('CatDesk 9 / 美股催化 A股早报')).toBeInTheDocument();
+    expect(screen.getByText(/候选信号历史验证，不等同 Qlib 策略回测/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '打开 CatDesk 9' })).toHaveAttribute('href', 'http://127.0.0.1:8765/');
 
     expect(await screen.findByText('数据状态')).toBeInTheDocument();
     expect(screen.getByText('可训练')).toBeInTheDocument();
@@ -524,6 +528,10 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText('Available').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Linked').length).toBeGreaterThan(0);
     expect(screen.getByText('Capability Acceptance Matrix')).toBeInTheDocument();
+    expect(screen.getByText('External Research Tools')).toBeInTheDocument();
+    expect(screen.getByText('CatDesk 9 / US catalysts to A-share morning report')).toBeInTheDocument();
+    expect(screen.getByText(/candidate-signal evidence, not a Qlib strategy backtest/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open CatDesk 9' })).toHaveAttribute('href', 'http://127.0.0.1:8765/');
     expect(screen.getByText('Function Entry Inventory')).toBeInTheDocument();
     expect(screen.getByText('china-astock-quant Reuse List')).toBeInTheDocument();
     expect(screen.getByText('Acceptance Checklist')).toBeInTheDocument();

@@ -44,6 +44,8 @@ export interface QuantMlflowStatus {
   error?: string | null;
 }
 
+export type QuantExternalServiceStatus = QuantMlflowStatus;
+
 export interface QuantStatus {
   availableJobTypes: Record<string, QuantJobTypeInfo>;
   activeCount: number;
@@ -60,6 +62,7 @@ export interface QuantStatus {
   qlibResearch?: ResearchQlibResearch | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   mlflow?: QuantMlflowStatus;
+  externalServices?: Record<string, QuantExternalServiceStatus>;
 }
 
 export interface QuantJobListResponse {
@@ -112,6 +115,7 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     qlibResearch: convertQlibResearch(data.qlib_research),
     experimentNotebook: camel.experimentNotebook ?? null,
     mlflow: camel.mlflow,
+    externalServices: camel.externalServices ?? {},
   };
 }
 

@@ -1021,6 +1021,12 @@
 .text-danger {
   color: hsl(var(--color-danger));
 }
+.text-market-up {
+  color: hsl(var(--color-red-400));
+}
+.text-market-down {
+  color: hsl(var(--color-emerald-400));
+}
 .text-warning {
   color: hsl(var(--color-warning));
 }

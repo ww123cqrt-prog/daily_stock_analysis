@@ -47,6 +47,27 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertEqual(summary["symbol"].tolist(), ["000001"])
         self.assertTrue(issues.empty)
 
+    def test_overlap_consistency_compares_public_sources_against_baostock(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            baostock = base / "baostock"
+            jqdata = base / "jqdata"
+            eastmoney = base / "eastmoney"
+            akshare = base / "akshare"
+            for directory in [baostock, jqdata, eastmoney, akshare]:
+                directory.mkdir()
+                write_prices(directory, "000001")
+            module.BAOSTOCK_DIR = baostock
+            module.JQDATA_DIR = jqdata
+            module.EASTMONEY_DIR = eastmoney
+            module.AKSHARE_DIR = akshare
+
+            overlap = module.overlap_consistency(sample_limit=10)
+
+        self.assertCountEqual(overlap["source"].tolist(), ["jqdata", "eastmoney", "akshare"])
+        self.assertTrue((overlap["overlap_days"] == 3).all())
+
     def test_write_research_status_custom_out_dir_does_not_touch_official_latest(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,8 +132,8 @@ class ReportDataQualityTest(unittest.TestCase):
             module.TIMEOUT_CODES = root / "missing_timeout_codes.json"
             module.BAOSTOCK_DIR = root / "baostock"
             module.JQDATA_DIR = root / "jqdata"
+            module.EASTMONEY_DIR = root / "eastmoney"
             module.AKSHARE_DIR = root / "akshare"
-            module.AKSHARE_SAMPLE_DIR = root / "akshare_sample"
             module.MERGED_DIR = root / "merged"
             module.QLIB_DIR = root / "qlib"
             argv = [

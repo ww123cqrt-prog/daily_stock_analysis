@@ -82,6 +82,22 @@ describe('quantApi', () => {
           role: 'experiment_raw_records',
           checked_at: '2026-07-03T13:10:00Z',
         },
+        external_services: {
+          dsa: {
+            url: '/',
+            status: 'available',
+            role: 'local_web_api',
+            checked_at: '2026-07-03T13:10:00Z',
+            health_checked: true,
+          },
+          catdesk: {
+            url: 'http://127.0.0.1:8765/',
+            status: 'available',
+            role: 'external_catalyst_dashboard',
+            checked_at: '2026-07-03T13:10:00Z',
+            health_checked: true,
+          },
+        },
         latest_jobs: {
           check_qlib_data: {
             job_id: 'qj_1',
@@ -119,6 +135,9 @@ describe('quantApi', () => {
     expect(status.qlibResearch?.sections.model_explainability.generatedAt).toBe('2026-07-05T11:00:00+08:00');
     expect(status.mlflow?.url).toBe('http://127.0.0.1:6006/');
     expect(status.mlflow?.checkedAt).toBe('2026-07-03T13:10:00Z');
+    expect(status.externalServices?.dsa.status).toBe('available');
+    expect(status.externalServices?.catdesk.url).toBe('http://127.0.0.1:8765/');
+    expect(status.externalServices?.catdesk.healthChecked).toBe(true);
   });
 
   it('parses streamed job snapshots into frontend job objects', () => {

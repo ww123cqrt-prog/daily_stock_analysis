@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -40,10 +41,13 @@ JOB_STREAM_POLL_INTERVAL_SECONDS = 2.0
 JOB_STREAM_MAX_JOB_EVENTS = 300
 TEXT_ARTIFACT_SUFFIXES = {".md", ".txt", ".csv", ".json", ".jsonl", ".log"}
 DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
+DEFAULT_CATDESK_URL = "http://127.0.0.1:8765/"
 MLFLOW_HEALTH_CACHE_TTL_SECONDS = 15.0
 MLFLOW_HEALTH_CACHE_MAX_ENTRIES = 8
 LOCAL_MLFLOW_HOSTS = {"127.0.0.1", "localhost", "::1"}
 LOCAL_MLFLOW_HEALTH_PORTS = {None, 6006, 6606}
+LOCAL_CATDESK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOCAL_CATDESK_HEALTH_PORTS = {8765}
 _POSIX_SENSITIVE_PATH_ROOTS = (
     "Applications",
     "Library",
@@ -101,14 +105,23 @@ def _float_env(name: str, default: float, *, minimum: float = 0.1) -> float:
 
 MAX_QUANT_JOB_STREAMS = _int_env("MAX_QUANT_JOB_STREAMS", 8)
 MLFLOW_HEALTH_TIMEOUT_SECONDS = _float_env("MLFLOW_HEALTH_TIMEOUT_SECONDS", 2.0)
+CATDESK_HEALTH_TIMEOUT_SECONDS = _float_env("CATDESK_HEALTH_TIMEOUT_SECONDS", 0.8)
 
 
 def _mlflow_url() -> str:
     return os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
 
 
+def _catdesk_url() -> str:
+    return os.environ.get("CATDESK_URL", DEFAULT_CATDESK_URL).strip() or DEFAULT_CATDESK_URL
+
+
 def _public_mlflow_url(url: str) -> str:
     return public_http_url(url, DEFAULT_MLFLOW_URL)
+
+
+def _public_catdesk_url(url: str) -> str:
+    return public_http_url(url, DEFAULT_CATDESK_URL)
 
 
 def _now_iso() -> str:
@@ -224,6 +237,74 @@ def _probe_mlflow_status_payload(url: str) -> Dict[str, Any]:
     return payload
 
 
+def _catdesk_status_payload() -> Dict[str, Any]:
+    return _probe_catdesk_status_payload(_catdesk_url())
+
+
+def _probe_catdesk_status_payload(url: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "url": _public_catdesk_url(url),
+        "status": "unavailable",
+        "role": "external_catalyst_dashboard",
+        "checked_at": _now_iso(),
+        "health_checked": False,
+    }
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        payload["status"] = "invalid"
+        payload["error"] = "CATDESK_URL must be an http(s) URL."
+        return payload
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        payload["status"] = "invalid"
+        payload["error"] = "CATDESK_URL port is invalid."
+        return payload
+    if parsed.username or parsed.password:
+        payload["status"] = "invalid"
+        payload["error"] = "CATDESK_URL must not include username or password."
+        return payload
+    decoded_path = unquote(parsed.path or "")
+    if any(part == ".." for part in decoded_path.replace("\\", "/").split("/")):
+        payload["status"] = "invalid"
+        payload["error"] = "CATDESK_URL must not contain path traversal."
+        return payload
+    if parsed.hostname not in LOCAL_CATDESK_HOSTS:
+        payload["status"] = "linked"
+        payload["error"] = "Health check intentionally skipped for non-local CatDesk URL; link is displayed without availability verification."
+        return payload
+    if parsed_port not in LOCAL_CATDESK_HEALTH_PORTS:
+        payload["status"] = "invalid"
+        payload["error"] = "Local CatDesk health checks are limited to port 8765."
+        return payload
+
+    payload["health_checked"] = True
+    try:
+        with socket.create_connection((parsed.hostname, parsed_port), timeout=CATDESK_HEALTH_TIMEOUT_SECONDS):
+            payload["status"] = "available"
+    except (OSError, TimeoutError, ValueError) as exc:
+        payload["error"] = _sanitize_public_error(str(exc))
+    return payload
+
+
+def _dsa_status_payload() -> Dict[str, Any]:
+    return {
+        "url": "/",
+        "status": "available",
+        "role": "local_web_api",
+        "checked_at": _now_iso(),
+        "health_checked": True,
+    }
+
+
+def _external_services_payload(mlflow_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {
+        "dsa": _dsa_status_payload(),
+        "mlflow": mlflow_payload,
+        "catdesk": _catdesk_status_payload(),
+    }
+
+
 @lru_cache(maxsize=1)
 def get_quant_job_service() -> QuantJobService:
     return QuantJobService()
@@ -276,6 +357,7 @@ async def get_quant_status() -> QuantStatusResponse:
         for job_type, job in service.get_latest_jobs_by_type().items()
     }
     research_status = build_research_status_payload()
+    mlflow_payload = await asyncio.to_thread(_mlflow_status_payload)
     return QuantStatusResponse(
         available_job_types=service.available_job_types(),
         active_count=service.active_count(),
@@ -291,7 +373,8 @@ async def get_quant_status() -> QuantStatusResponse:
         qlib_predictions=research_status.get("qlib_predictions"),
         qlib_research=research_status.get("qlib_research"),
         experiment_notebook=research_status.get("experiment_notebook"),
-        mlflow=await asyncio.to_thread(_mlflow_status_payload),
+        mlflow=mlflow_payload,
+        external_services=_external_services_payload(mlflow_payload),
     )
 
 

@@ -56,3 +56,4 @@ class QuantStatusResponse(BaseModel):
     qlib_research: Optional[Dict[str, Any]] = None
     experiment_notebook: Optional[Dict[str, Any]] = None
     mlflow: Dict[str, Any] = Field(default_factory=dict)
+    external_services: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

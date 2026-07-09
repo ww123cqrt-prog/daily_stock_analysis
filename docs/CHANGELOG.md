@@ -9,7 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- [改进] 方案 A 将 `quant_workflow` 正式收口为 DSA 仓内脚本与运行态正本，历史 reports/mlruns 已迁移到仓内默认目录；旧同级 `quant_workflow` 只在仓内没有历史 marker 时作为迁移期兜底，避免服务重启后训练记录变空。
+- [文档] 记录当前多项目组织决策：入口统一到 DSA、代码分层维护、`quant_data` 外置，`ashare-live-research` 和 `a-share-us-catalyst` 保持独立只读观察/催化服务，不硬合并进主仓。
+- [文档] 明确九点猫研/CatDesk 的定位：负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。
+- [新功能] 新增 `report_catdesk_signal_validation.py`，可用九点猫研早报候选池结合 DSA 风控、手写因子均衡规则和 Qlib 模型分数生成一日事后验证报告，验证行情可走在线快照且不回写 `quant_data`；报告支持多策略交叉对比、主线题材桶和向前逐日滚动验证，缺失早报会明确标记而不伪造历史信号。
+- [修复] CatDesk 历史验证支持非交易日信号价回退到上一交易日本地收盘价并在报告中记录 `signal_requested_date` / `signal_trade_date`；Qlib 分数限制为信号日当天或之前，避免历史验证偷用未来模型分数。
+- [修复] CatDesk 历史验证改为按工作日交易对滚动，CatDesk 早报若晚于信号日 09:30 生成会标记为 `backfilled_sample`；market regime 只读取信号日当天或之前的报告，Qlib run 默认必须早于验证日 09:30 并在报告中记录 run 元信息；需要事后研究时必须显式传 `--allow-backfilled-qlib`，报告会标记为回填研究，避免把回填样本、未来大盘状态或晚生成模型分数当成正式策略证据。
+- [新功能] 新增东方财富 qfq 日线、AkShare qfq 日线和新浪最新快照校验脚本，作为 A 股日线免费冗余源写入 `eastmoney_qfq` / `akshare_qfq` 并输出 `latest_snapshot_validation_latest.{json,md}`。
+- [改进] `/research` 新增 CatDesk 9 本地跳转入口，明确其“候选信号历史验证”不等同 Qlib 策略回测；行情收益展示新增红涨绿跌专用样式，避免和任务成功/失败语义色混用。
+- [新功能] 每日数据更新全链路脚本 `run_daily_update.py` 现在按序串联 Baostock/东方财富/AkShare 增量下载、多源合并转换、最新快照校验、异常检测、清洗、跨源一致性校验和 Qlib provider 校验；`/workflow` 新增“运行每日数据更新全链路”任务，产出 `daily_update_summary_latest.json`。
+- [改进] 东方财富、AkShare 和新浪快照任务默认绕过 macOS/系统代理，避免本机代理端口残留导致公开接口误失败；网页和脚本均提供 `use_system_proxy` / `--use-system-proxy` 作为显式开关。
+- [修复] 明确 `--symbols-file` 是公开源下载器的显式股票清单，修正恒真过滤表达式；东方财富/AkShare 下载重试增加有界退避，降低临时网络失败时的连续请求压力。
+- [新功能] 新增 launchd 定时任务模板 `scripts/launchd/com.dsa.quant-daily-update.plist.template` 和安装脚本 `install-quant-daily-update.sh`，在工作日收盘后用 DSA venv 自动跑全链路更新；Baostock 匿名登录，任务不读取任何凭据。
+- [改进] 全链路默认只在增量下载带来新交易日时才重建 merge/清洗/报告等重活；`--force` 可强制重建，`--skip-download` 只重建，`--dry-run` 预演完整链路而不执行。
+- [改进] 方案 A 将 `quant_workflow` 正式收口为 DSA 仓内脚本与运行态正本；默认优先读取/写入仓内 reports/mlruns，旧同级 `quant_workflow` 只在仓内没有历史 marker 时作为迁移期兜底，避免服务重启后训练记录变空。
+- [修复] 训练脚本会修正 MLflow experiment 的 `artifact_location` 到当前仓内 mlruns，并在发现旧同级 mlruns 写入当前 run artifacts 时镜像回仓内，避免指标/参数和 `pred.pkl` 分裂到两个目录。
 - [测试] 本机工作台浏览器 smoke 的临时量化 job helper 默认写入仓内 `quant_workflow/reports/jobs`，并使用本地时区时间戳，避免方案 A 后仍向旧同级 `quant_workflow` 写入测试记录或被最近任务排序挤出列表。
 - [修复] 量化任务公开错误脱敏补齐 Docker `/app/...` 路径，并收窄 Windows 盘符路径匹配，避免把 `E:5`、`R:42` 这类普通文本误替换为 `[path]`。
 - [修复] 网页量化任务为通用 `limit` 参数增加 10000 上限，覆盖 Baostock 刷新/下载、市场状态和现金仓位回测报告等入口；JQData 与 `china-astock` 报告继续使用更小的专用上限。

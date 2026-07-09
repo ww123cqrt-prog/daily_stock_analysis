@@ -54,6 +54,122 @@ class MergeToQlibTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(preserved["close"].tolist(), [99.0])
 
+    def test_merge_sources_overlays_new_sources_after_baostock_and_jqdata(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            bs_dir = base / "baostock"
+            jq_dir = base / "jqdata"
+            eastmoney_dir = base / "eastmoney"
+            akshare_dir = base / "akshare"
+            for directory in [bs_dir, jq_dir, eastmoney_dir, akshare_dir]:
+                directory.mkdir()
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-01", "2026-07-02"],
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1100.0],
+                }
+            ).to_parquet(bs_dir / "000001.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-02", "2026-07-03"],
+                    "open": [20.1, 20.2],
+                    "high": [20.3, 20.4],
+                    "low": [20.0, 20.1],
+                    "close": [20.2, 20.3],
+                    "volume": [9999.0, 1200.0],
+                }
+            ).to_parquet(jq_dir / "000001.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-03", "2026-07-04"],
+                    "open": [30.1, 30.2],
+                    "high": [30.3, 30.4],
+                    "low": [30.0, 30.1],
+                    "close": [30.2, 30.3],
+                    "volume": [9999.0, 1300.0],
+                }
+            ).to_parquet(eastmoney_dir / "000001.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-04", "2026-07-05"],
+                    "open": [40.1, 40.2],
+                    "high": [40.3, 40.4],
+                    "low": [40.0, 40.1],
+                    "close": [40.2, 40.3],
+                    "volume": [9999.0, 1400.0],
+                }
+            ).to_parquet(akshare_dir / "000001.parquet", index=False)
+
+            merged = module.merge_one(
+                "000001",
+                bs_dir / "000001.parquet",
+                jq_dir / "000001.parquet",
+                eastmoney_dir / "000001.parquet",
+                akshare_dir / "000001.parquet",
+            )
+
+        self.assertIsNotNone(merged)
+        self.assertEqual(merged["date"].dt.strftime("%Y-%m-%d").tolist(), [
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-03",
+            "2026-07-04",
+            "2026-07-05",
+        ])
+        self.assertEqual(merged["close"].tolist(), [10.1, 20.2, 30.2, 40.2, 40.3])
+        # Overlap keeps the existing volume to avoid source-switch volume discontinuities;
+        # new source-only days still bring their own volume.
+        self.assertEqual(merged["volume"].tolist(), [1000.0, 1100.0, 1200.0, 1300.0, 1400.0])
+
+    def test_build_merged_parquet_accepts_extra_source_directories_without_renaming_output(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            bs_dir = base / "baostock"
+            jq_dir = base / "jqdata"
+            eastmoney_dir = base / "eastmoney"
+            out_dir = base / "merged_baostock_jqdata"
+            for directory in [bs_dir, jq_dir, eastmoney_dir]:
+                directory.mkdir()
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-01"],
+                    "open": [10.0],
+                    "high": [10.2],
+                    "low": [9.9],
+                    "close": [10.1],
+                    "volume": [1000.0],
+                }
+            ).to_parquet(bs_dir / "000001.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-02"],
+                    "open": [10.2],
+                    "high": [10.4],
+                    "low": [10.1],
+                    "close": [10.3],
+                    "volume": [1100.0],
+                }
+            ).to_parquet(eastmoney_dir / "000001.parquet", index=False)
+
+            count = module.build_merged_parquet(
+                bs_dir,
+                jq_dir,
+                out_dir,
+                overwrite=True,
+                extra_source_dirs=[("eastmoney", eastmoney_dir)],
+            )
+            merged = pd.read_parquet(out_dir / "000001.parquet")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(out_dir.name, "merged_baostock_jqdata")
+        self.assertEqual(merged["close"].tolist(), [10.1, 10.3])
+
     def test_convert_to_bin_no_overwrite_preserves_existing_feature_file(self):
         module = load_module()
         with TemporaryDirectory() as temp_dir:

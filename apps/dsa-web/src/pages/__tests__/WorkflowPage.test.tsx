@@ -145,6 +145,9 @@ describe('WorkflowPage', () => {
       availableJobTypes: {
         prepare_baostock_refresh: { label: '准备 Baostock 增量清单', allowedParams: ['target_end', 'limit'] },
         download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
+        download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        download_akshare: { label: '下载 AkShare 日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
         merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
         apply_data_cleaning: { label: '应用清洗策略生成 cleaned Qlib', allowedParams: ['dry_run', 'no_overwrite', 'skip_qlib_convert'] },
@@ -194,6 +197,29 @@ describe('WorkflowPage', () => {
         role: 'experiment_raw_records',
         checkedAt: '2026-07-03T13:10:00Z',
       },
+      externalServices: {
+        dsa: {
+          url: '/',
+          status: 'available',
+          role: 'local_web_api',
+          checkedAt: '2026-07-03T13:10:00Z',
+          healthChecked: true,
+        },
+        mlflow: {
+          url: 'http://127.0.0.1:6006/',
+          status: 'available',
+          role: 'experiment_raw_records',
+          checkedAt: '2026-07-03T13:10:00Z',
+          healthChecked: true,
+        },
+        catdesk: {
+          url: 'http://127.0.0.1:8765/',
+          status: 'available',
+          role: 'external_catalyst_dashboard',
+          checkedAt: '2026-07-03T13:10:00Z',
+          healthChecked: true,
+        },
+      },
     });
     listQuantJobs.mockResolvedValue({
       total: 1,
@@ -240,15 +266,26 @@ describe('WorkflowPage', () => {
 
     expect(screen.getByRole('heading', { name: '量化任务中心' })).toBeInTheDocument();
     expect(await screen.findByText('当前数据可训练')).toBeInTheDocument();
+    expect(screen.getByText('外部服务状态')).toBeInTheDocument();
+    expect(screen.getByText('本地研究工作台')).toBeInTheDocument();
     expect(screen.getByText('MLflow 原始记录')).toBeInTheDocument();
+    expect(screen.getByText('CatDesk')).toBeInTheDocument();
+    expect(screen.getByText('美股催化观察台')).toBeInTheDocument();
     expect(screen.getAllByText('可用').length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.getByRole('link', { name: '打开 CatDesk，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:8765/');
     expect(screen.getByRole('link', { name: 'MLflow' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
     expect(screen.queryByText('/Users/cq/WorkingProjects')).not.toBeInTheDocument();
     expect(screen.queryByText('/tmp/job.log')).not.toBeInTheDocument();
     expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
     expect(screen.getAllByText('更新数据')).toHaveLength(2);
+    expect(screen.getByText('下载东方财富日线')).toBeInTheDocument();
+    expect(screen.getByText('匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。')).toBeInTheDocument();
+    expect(screen.getByText('下载 AkShare 日线')).toBeInTheDocument();
+    expect(screen.getByText('调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。')).toBeInTheDocument();
     expect(screen.getByText('合并 Qlib')).toBeInTheDocument();
+    expect(screen.getByText('校验新浪最新快照')).toBeInTheDocument();
+    expect(screen.getByText('抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。')).toBeInTheDocument();
     expect(screen.getByText('预演生成 CSI300 股票池')).toBeInTheDocument();
     expect(screen.getByText('预演添加沪深300 benchmark')).toBeInTheDocument();
     expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
@@ -315,7 +352,7 @@ describe('WorkflowPage', () => {
     renderWorkflowPage();
 
     expect(await screen.findByText('MLflow 未启动')).toBeInTheDocument();
-    expect(screen.getByText('未启动')).toBeInTheDocument();
+    expect(screen.getAllByText('未启动').length).toBeGreaterThan(0);
     expect(screen.getByText('connection refused')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
   });

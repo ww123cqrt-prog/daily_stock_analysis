@@ -13,11 +13,13 @@ from src.services import quant_workflow_paths as paths
 
 
 class QuantWorkflowPathsTestCase(unittest.TestCase):
-    def test_sibling_reports_and_mlruns_are_used_when_embedded_payload_is_absent(self) -> None:
+    def test_embedded_reports_and_mlruns_are_default_even_when_sibling_payload_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             dsa_root = root / "daily_stock_analysis"
             embedded_workflow = dsa_root / "quant_workflow"
+            embedded_reports = embedded_workflow / "reports"
+            embedded_mlruns = embedded_workflow / "mlruns"
             sibling_workflow = root / "quant_workflow"
             sibling_reports = sibling_workflow / "reports"
             sibling_mlruns = sibling_workflow / "mlruns"
@@ -39,10 +41,10 @@ class QuantWorkflowPathsTestCase(unittest.TestCase):
                 clear=False,
             ):
                 self.assertEqual(paths.workflow_root(), embedded_workflow)
-                self.assertEqual(paths.reports_root(), sibling_reports)
-                self.assertEqual(paths.mlruns_root(), sibling_mlruns)
+                self.assertEqual(paths.reports_root(), embedded_reports)
+                self.assertEqual(paths.mlruns_root(), embedded_mlruns)
 
-    def test_embedded_reports_take_precedence_when_they_have_history(self) -> None:
+    def test_embedded_reports_are_used_when_only_embedded_has_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             dsa_root = root / "daily_stock_analysis"
@@ -51,7 +53,6 @@ class QuantWorkflowPathsTestCase(unittest.TestCase):
             embedded_reports.mkdir(parents=True)
             sibling_reports.mkdir(parents=True)
             (embedded_reports / "latest_training_result.json").write_text("{}", encoding="utf-8")
-            (sibling_reports / "research_status_latest.json").write_text("{}", encoding="utf-8")
 
             with patch.dict(
                 os.environ,

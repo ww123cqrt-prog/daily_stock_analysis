@@ -15,13 +15,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_WORKFLOW_ROOT = SCRIPT_DIR.parent
 DEFAULT_DSA_ROOT = DEFAULT_WORKFLOW_ROOT.parent
 DEFAULT_PROJECTS_ROOT = DEFAULT_DSA_ROOT.parent
-REPORT_HISTORY_FILES = (
-    "research_status_latest.json",
-    "latest_training_result.json",
-    "experiment_runs.jsonl",
-    "experiment_log.md",
-)
-
 
 def _env_path(name: str, default: Path) -> Path:
     value = os.environ.get(name)
@@ -38,38 +31,18 @@ def workflow_root() -> Path:
     return _env_path("QUANT_WORKFLOW_ROOT", DEFAULT_WORKFLOW_ROOT)
 
 
-def _contains_any(path: Path, names: tuple[str, ...]) -> bool:
-    return any((path / name).exists() for name in names)
-
-
-def _prefer_payload_root(primary: Path, sibling: Path, marker_names: tuple[str, ...]) -> Path:
-    if _contains_any(primary, marker_names):
-        return primary
-    if _contains_any(sibling, marker_names):
-        return sibling
-    return primary
-
-
 def reports_root() -> Path:
     configured = os.environ.get("QUANT_WORKFLOW_REPORTS_ROOT")
     if configured:
         return Path(configured).expanduser()
-    primary = workflow_root() / "reports"
-    if os.environ.get("QUANT_WORKFLOW_ROOT"):
-        return primary
-    sibling = projects_root() / "quant_workflow" / "reports"
-    return _prefer_payload_root(primary, sibling, REPORT_HISTORY_FILES)
+    return workflow_root() / "reports"
 
 
 def mlruns_root() -> Path:
     configured = os.environ.get("QUANT_WORKFLOW_MLRUNS_DIR")
     if configured:
         return Path(configured).expanduser()
-    primary = workflow_root() / "mlruns"
-    if os.environ.get("QUANT_WORKFLOW_ROOT"):
-        return primary
-    sibling = projects_root() / "quant_workflow" / "mlruns"
-    return _prefer_payload_root(primary, sibling, ("0", ".trash", "models"))
+    return workflow_root() / "mlruns"
 
 
 def quant_data_root() -> Path:

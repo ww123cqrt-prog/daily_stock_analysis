@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from contextlib import contextmanager
 from datetime import datetime
@@ -26,7 +27,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import china_astock_root, mlruns_root, qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    china_astock_root,
+    mlruns_root,
+    projects_root,
+    qlib_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
 
 
@@ -144,6 +153,10 @@ def write_runtime_config_with_provider(
     qlib_init = dict(payload.get("qlib_init") or {})
     qlib_init["provider_uri"] = str(provider_uri)
     payload["qlib_init"] = qlib_init
+    calendar_tail = provider_calendar_tail(provider_uri)
+    latest_day = calendar_tail[-1] if calendar_tail else ""
+    backtest_end_day = calendar_tail[-2] if len(calendar_tail) >= 2 else latest_day
+    update_runtime_config_dates(payload, latest_day, backtest_end_day=backtest_end_day)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -154,11 +167,132 @@ def write_runtime_config_with_provider(
     return runtime_path
 
 
+def provider_calendar_tail(provider_uri: Path, count: int = 2) -> list[str]:
+    calendar = provider_uri / "calendars" / "day.txt"
+    if not calendar.exists():
+        return []
+    values = [line.strip() for line in calendar.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    return values[-count:]
+
+
+def _portana_record_config(record: dict) -> dict | None:
+    """Return the Qlib-consumed PortAnaRecord config, normalizing legacy layout."""
+    kwargs = record.get("kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+        record["kwargs"] = kwargs
+
+    config = kwargs.get("config")
+    if isinstance(config, dict):
+        return config
+
+    legacy_config = record.get("config")
+    if isinstance(legacy_config, dict):
+        kwargs["config"] = legacy_config
+        return legacy_config
+
+    return None
+
+
+def update_runtime_config_dates(payload: dict, latest_day: str, *, backtest_end_day: str | None = None) -> None:
+    if not latest_day:
+        return
+    portfolio_end = backtest_end_day or latest_day
+    task = payload.get("task")
+    if not isinstance(task, dict):
+        return
+    dataset = task.get("dataset")
+    dataset_kwargs = dataset.get("kwargs") if isinstance(dataset, dict) else None
+    if isinstance(dataset_kwargs, dict):
+        handler = dataset_kwargs.get("handler")
+        handler_kwargs = handler.get("kwargs") if isinstance(handler, dict) else None
+        if isinstance(handler_kwargs, dict):
+            handler_kwargs["end_time"] = latest_day
+        segments = dataset_kwargs.get("segments")
+        test_segment = segments.get("test") if isinstance(segments, dict) else None
+        if isinstance(test_segment, list) and len(test_segment) >= 2:
+            test_segment[-1] = portfolio_end
+    records = task.get("record")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if record.get("class") != "PortAnaRecord":
+                continue
+            record_config = _portana_record_config(record)
+            backtest = record_config.get("backtest") if isinstance(record_config, dict) else None
+            if isinstance(backtest, dict) and "end_time" in backtest:
+                backtest["end_time"] = portfolio_end
+
+
 def run_qrun(config_path: str, experiment_name: str = "baseline_lgb_alpha158"):
     """Run qrun programmatically (avoids subprocess)."""
     from qlib.cli.run import workflow
 
     workflow(config_path, experiment_name=experiment_name, uri_folder=str(MLRUNS_DIR))
+
+
+def ensure_mlruns_artifact_locations(mlruns_dir: Path = MLRUNS_DIR) -> int:
+    """Keep MLflow experiment artifact roots inside the active mlruns directory."""
+    import yaml
+
+    fixed = 0
+    mlruns_dir.mkdir(parents=True, exist_ok=True)
+    for meta_path in mlruns_dir.glob("*/meta.yaml"):
+        try:
+            payload = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        experiment_id = str(payload.get("experiment_id") or meta_path.parent.name)
+        expected = (mlruns_dir / experiment_id).resolve().as_uri()
+        if payload.get("artifact_location") == expected:
+            continue
+        payload["artifact_location"] = expected
+        meta_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        fixed += 1
+    if fixed:
+        print(f"[setup] Repaired {fixed} MLflow artifact location(s) under {mlruns_dir}")
+    return fixed
+
+
+def mirror_run_artifacts_from_legacy_locations(
+    run_id: str,
+    experiment_id: str,
+    *,
+    projects: Path | None = None,
+    mlruns_dir: Path = MLRUNS_DIR,
+) -> bool:
+    """Copy artifacts written to a legacy sibling mlruns directory back into this workspace."""
+    if not run_id or not experiment_id:
+        return False
+    projects_root_path = projects or projects_root()
+    legacy_artifacts = projects_root_path / "quant_workflow" / "mlruns" / experiment_id / run_id / "artifacts"
+    target_artifacts = mlruns_dir / experiment_id / run_id / "artifacts"
+    if not legacy_artifacts.exists() or legacy_artifacts.resolve() == target_artifacts.resolve():
+        return False
+    if target_artifacts.exists() and any(target_artifacts.iterdir()):
+        return False
+    target_artifacts.parent.mkdir(parents=True, exist_ok=True)
+    if target_artifacts.exists():
+        shutil.rmtree(target_artifacts)
+    shutil.copytree(legacy_artifacts, target_artifacts)
+    print(f"[setup] Mirrored legacy MLflow artifacts: {legacy_artifacts} -> {target_artifacts}")
+    return True
+
+
+def local_run_artifacts(
+    run_id: str,
+    experiment_id: str,
+    *,
+    mlruns_dir: Path = MLRUNS_DIR,
+) -> list[str]:
+    """Return the top-level artifact names currently present under the active mlruns root."""
+    if not run_id or not experiment_id:
+        return []
+    artifacts_dir = mlruns_dir / experiment_id / run_id / "artifacts"
+    if not artifacts_dir.exists():
+        return []
+    return sorted(item.name for item in artifacts_dir.iterdir())
 
 
 def load_latest_metrics(experiment_name: str = "baseline_lgb_alpha158") -> dict:
@@ -205,6 +339,7 @@ def load_latest_metrics(experiment_name: str = "baseline_lgb_alpha158") -> dict:
         return {
             "status": "completed" if str(run_meta.get("status", "")).upper() == "3" else str(run_meta.get("status", "")).lower(),
             "experiment_name": experiment_name,
+            "experiment_id": str(exp.experiment_id),
             "run_id": run_id,
             "start_time": run_meta.get("start_time"),
             "end_time": run_meta.get("end_time"),
@@ -218,6 +353,7 @@ def load_latest_metrics(experiment_name: str = "baseline_lgb_alpha158") -> dict:
     return {
         "status": status,
         "experiment_name": experiment_name,
+        "experiment_id": str(exp.experiment_id),
         "run_id": run.info.run_id,
         "start_time": run.info.start_time,
         "end_time": run.info.end_time,
@@ -398,6 +534,8 @@ def main():
     runtime_config_path = write_runtime_config_with_provider(config_path, provider_uri, args.provider)
 
     # ── Step 2: Run training + backtest ──
+    ensure_mlruns_artifact_locations(MLRUNS_DIR)
+
     print(f"\n{'='*60}")
     print(f"[run] Source config: {config_path}")
     print(f"[run] Runtime config: {runtime_config_path}")
@@ -414,6 +552,18 @@ def main():
 
     info = load_latest_metrics(args.experiment_name)
     if info:
+        mirror_run_artifacts_from_legacy_locations(
+            str(info.get("run_id") or ""),
+            str(info.get("experiment_id") or ""),
+            mlruns_dir=MLRUNS_DIR,
+        )
+        mirrored_artifacts = local_run_artifacts(
+            str(info.get("run_id") or ""),
+            str(info.get("experiment_id") or ""),
+            mlruns_dir=MLRUNS_DIR,
+        )
+        if mirrored_artifacts:
+            info["artifacts"] = mirrored_artifacts
         info.update(
             {
                 "provider": args.provider,

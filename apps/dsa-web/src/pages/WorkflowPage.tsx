@@ -87,6 +87,40 @@ const WORKFLOW_INPUT_CLASS =
 
 const WORKFLOW_STEPS: WorkflowStep[] = [
   {
+    title: '一键全链路',
+    description: '把下载、合并、清洗和交叉验证串成一次自动运行；无新交易日时自动跳过重建。',
+    icon: RefreshCw,
+    jobs: [
+      {
+        type: 'run_daily_update',
+        label: '运行每日数据更新全链路',
+        description:
+          '按顺序执行：Baostock/东方财富/AkShare 增量下载 → 合并转换 Qlib → 新浪快照校验 → 异常检测 → 清洗 → 多源交叉验证 → provider 校验。' +
+          'Baostock 失败会让日更失败；东方财富/AkShare 失败会记录为警告并继续后续可执行阶段；JQData 只参与合并与交叉验证，不在此下载。',
+        params: [
+          { key: 'skip_download', label: '跳过下载只重建', kind: 'checkbox' },
+          { key: 'force', label: '强制重建（无新数据也跑）', kind: 'checkbox' },
+          { key: 'dry_run', label: '仅预演不执行', kind: 'checkbox' },
+          { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
+          { key: 'skip_eastmoney', label: '跳过东方财富', kind: 'checkbox' },
+          { key: 'skip_akshare', label: '跳过 AkShare', kind: 'checkbox' },
+          { key: 'skip_snapshot_validation', label: '跳过快照校验', kind: 'checkbox' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
+          { key: 'end', label: '结束日期', kind: 'date' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '45' },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.3' },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1, placeholder: '60' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 0, placeholder: '3' },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
+          { key: 'snapshot_limit', label: '快照校验样本', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'overlap_sample', label: '交叉验证重叠样本', kind: 'number', min: 1, placeholder: '留空为全部' },
+          { key: 'merged_sample', label: '质量报告合并样本', kind: 'number', min: 1, placeholder: '留空为全部' },
+        ],
+      },
+    ],
+  },
+  {
     title: '更新数据',
     description: '准备增量清单，并从 Baostock/JQData 拉取本地价格数据。',
     icon: Database,
@@ -116,6 +150,44 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'retry_failed', label: '重试失败', kind: 'checkbox' },
           { key: 'retry_empty', label: '重试空数据', kind: 'checkbox' },
           { key: 'retry_timeout', label: '重试超时', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'download_eastmoney',
+        label: '下载东方财富日线',
+        description: '匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。',
+        defaultParams: { incremental: true },
+        params: [
+          { key: 'start', label: '开始日期', kind: 'date' },
+          { key: 'end', label: '结束日期', kind: 'date' },
+          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.1' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1 },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '30' },
+          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
+          { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'download_akshare',
+        label: '下载 AkShare 日线',
+        description: '调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。',
+        defaultParams: { incremental: true },
+        params: [
+          { key: 'start', label: '开始日期', kind: 'date' },
+          { key: 'end', label: '结束日期', kind: 'date' },
+          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.2' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1 },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '30' },
+          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
+          { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
         ],
       },
       {
@@ -180,6 +252,16 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         ],
       },
       { type: 'report_data_anomalies', label: '生成异常股票和清洗策略', description: '输出异常股票清单，并给出后续清洗策略。' },
+      {
+        type: 'validate_latest_snapshot',
+        label: '校验新浪最新快照',
+        description: '抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。',
+        params: [
+          { key: 'limit', label: '校验样本数', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1, placeholder: '10' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
+        ],
+      },
       {
         type: 'report_data_hygiene',
         label: '生成数据治理盘点和清理预案',
@@ -425,6 +507,20 @@ function mlflowStatusMeta(status: string | undefined, language: 'zh' | 'en'): {
   return { label: labels.unavailable[0], title: labels.unavailable[1], tone: 'warning', variant: 'warning' };
 }
 
+function serviceStatusMeta(status: string | undefined, language: 'zh' | 'en'): {
+  label: string;
+  tone: 'success' | 'danger' | 'warning' | 'info' | 'neutral';
+  variant: 'success' | 'danger' | 'warning' | 'info' | 'default';
+} {
+  const labels = language === 'zh'
+    ? { available: '可用', linked: '外部链接', invalid: '配置无效', unavailable: '未启动' }
+    : { available: 'Available', linked: 'External Link', invalid: 'Invalid Config', unavailable: 'Unavailable' };
+  if (status === 'available') return { label: labels.available, tone: 'success', variant: 'success' };
+  if (status === 'linked') return { label: labels.linked, tone: 'info', variant: 'info' };
+  if (status === 'invalid') return { label: labels.invalid, tone: 'danger', variant: 'danger' };
+  return { label: labels.unavailable, tone: 'warning', variant: 'warning' };
+}
+
 function formatTime(value?: string | null): string {
   if (!value) return '-';
   const date = new Date(value);
@@ -509,7 +605,14 @@ function buildDailyGuideSteps(
   latestJobs: Record<string, QuantJob>,
   mlflowUrl: string,
 ): DailyGuideStep[] {
-  const updateJob = latestJobForTypes(latestJobs, ['prepare_baostock_refresh', 'download_baostock', 'download_jqdata']);
+  const updateJob = latestJobForTypes(latestJobs, [
+    'run_daily_update',
+    'prepare_baostock_refresh',
+    'download_baostock',
+    'download_eastmoney',
+    'download_akshare',
+    'download_jqdata',
+  ]);
   const qualityJob = latestJobs.report_data_quality;
   const anomalyJob = latestJobs.report_data_anomalies;
   const cleaningJob = latestJobs.apply_data_cleaning;
@@ -592,6 +695,7 @@ function buildDailyGuideSteps(
       detail: '日常先生成增量清单；真正下载长任务仍在左侧填写参数后运行。',
       ...updateStatus,
       actions: [
+        { kind: 'job', label: '全链路', jobType: 'run_daily_update' },
         { kind: 'job', label: '增量清单', jobType: 'prepare_baostock_refresh' },
       ],
     },
@@ -799,9 +903,47 @@ const WorkflowPage: React.FC = () => {
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
 
   const latestJobs = useMemo(() => quantStatus?.latestJobs ?? {}, [quantStatus]);
-  const mlflow = quantStatus?.mlflow;
+  const externalServices = quantStatus?.externalServices ?? {};
+  const mlflow = externalServices.mlflow ?? quantStatus?.mlflow;
+  const dsaService = externalServices.dsa ?? {
+    url: '/',
+    status: quantStatus ? 'available' : 'unavailable',
+    role: 'local_web_api',
+  };
+  const catdeskService = externalServices.catdesk ?? {
+    url: 'http://127.0.0.1:8765/',
+    status: 'unavailable',
+    role: 'external_catalyst_dashboard',
+  };
   const mlflowUrl = mlflow?.url || 'http://127.0.0.1:6006/';
+  const catdeskUrl = catdeskService.url || 'http://127.0.0.1:8765/';
   const mlflowMeta = mlflowStatusMeta(mlflow?.status, language);
+  const externalServiceRows = [
+    {
+      key: 'dsa',
+      label: 'DSA',
+      title: language === 'zh' ? '本地研究工作台' : 'Local Research Console',
+      url: dsaService.url || '/',
+      service: dsaService,
+      internal: true,
+    },
+    {
+      key: 'mlflow',
+      label: 'MLflow',
+      title: mlflowMeta.title,
+      url: mlflowUrl,
+      service: mlflow,
+      internal: false,
+    },
+    {
+      key: 'catdesk',
+      label: 'CatDesk',
+      title: language === 'zh' ? '美股催化观察台' : 'US Catalyst Desk',
+      url: catdeskUrl,
+      service: catdeskService,
+      internal: false,
+    },
+  ];
   const workflowStatus = useMemo<ResearchStatus | null>(() => {
     if (researchStatus) return researchStatus;
     if (!quantStatus) return null;
@@ -1118,27 +1260,51 @@ const WorkflowPage: React.FC = () => {
 
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <div className="flex items-start justify-between gap-3">
-              <span className="label-uppercase">MLflow</span>
-              <Badge variant={mlflowMeta.variant} size="sm" className="gap-1.5 shadow-none">
-                <StatusDot tone={mlflowMeta.tone} className="h-1.5 w-1.5" />
-                {mlflowMeta.label}
+              <span className="label-uppercase">Services</span>
+              <Badge variant={serviceStatusMeta(catdeskService.status, language).variant} size="sm" className="gap-1.5 shadow-none">
+                <StatusDot tone={serviceStatusMeta(catdeskService.status, language).tone} className="h-1.5 w-1.5" />
+                外部服务
               </Badge>
             </div>
-            <p className="mt-3 text-lg font-semibold text-foreground">{mlflowMeta.title}</p>
-            <p className="mt-2 truncate text-sm text-secondary-text">{mlflowUrl}</p>
-            {mlflow?.error ? (
-              <p className="mt-2 line-clamp-2 text-xs leading-4 text-warning">{mlflow.error}</p>
-            ) : null}
-            <a
-              href={mlflowUrl}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="打开 MLflow，新窗口"
-              className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-lg border border-cyan/25 px-2.5 text-xs font-medium text-cyan transition-colors hover:bg-cyan/10"
-            >
-              打开 MLflow
-              <ArrowUpRight className="h-3.5 w-3.5" />
-            </a>
+            <p className="mt-3 text-lg font-semibold text-foreground">外部服务状态</p>
+            <div className="mt-3 space-y-2">
+              {externalServiceRows.map((item) => {
+                const meta = serviceStatusMeta(item.service?.status, language);
+                const error = item.service?.error;
+                const row = (
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium text-foreground">{item.label}</span>
+                    <span className="block truncate text-xs text-secondary-text">{item.title}</span>
+                  </span>
+                );
+                return (
+                  <div key={item.key} className="rounded-lg border border-subtle px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      {item.internal ? (
+                        <Link to={item.url} className="min-w-0 hover:text-cyan">
+                          {row}
+                        </Link>
+                      ) : (
+                        <a
+                          href={item.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label={`打开 ${item.label}，新窗口`}
+                          className="min-w-0 hover:text-cyan"
+                        >
+                          {row}
+                        </a>
+                      )}
+                      <Badge variant={meta.variant} size="sm" className="shrink-0 gap-1.5 shadow-none">
+                        <StatusDot tone={meta.tone} className="h-1.5 w-1.5" />
+                        {meta.label}
+                      </Badge>
+                    </div>
+                    {error ? <p className="mt-1 line-clamp-2 text-xs leading-4 text-warning">{error}</p> : null}
+                  </div>
+                );
+              })}
+            </div>
           </Card>
         </section>
 

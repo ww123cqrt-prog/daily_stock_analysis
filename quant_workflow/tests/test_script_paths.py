@@ -30,18 +30,10 @@ class ScriptPathsTest(unittest.TestCase):
         self.assertEqual(module.quant_data_root(), expected_quant_data)
         sibling_reports = dsa_root.parent / "quant_workflow" / "reports"
         expected_reports = workflow_root / "reports"
-        if not any((expected_reports / name).exists() for name in module.REPORT_HISTORY_FILES) and any(
-            (sibling_reports / name).exists() for name in module.REPORT_HISTORY_FILES
-        ):
-            expected_reports = sibling_reports
         self.assertEqual(module.reports_root(), expected_reports)
 
         sibling_mlruns = dsa_root.parent / "quant_workflow" / "mlruns"
         expected_mlruns = workflow_root / "mlruns"
-        if not any((expected_mlruns / name).exists() for name in ("0", ".trash", "models")) and any(
-            (sibling_mlruns / name).exists() for name in ("0", ".trash", "models")
-        ):
-            expected_mlruns = sibling_mlruns
         self.assertEqual(module.mlruns_root(), expected_mlruns)
 
     def test_working_projects_override_moves_default_project_roots(self):
@@ -79,7 +71,7 @@ class ScriptPathsTest(unittest.TestCase):
             ):
                 self.assertEqual(module.quant_data_root(), sibling_data)
 
-    def test_sibling_reports_and_mlruns_are_used_when_repo_local_payload_is_absent(self):
+    def test_repo_local_reports_and_mlruns_are_default_even_when_sibling_payload_exists(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -109,8 +101,8 @@ class ScriptPathsTest(unittest.TestCase):
                 },
                 clear=False,
             ):
-                self.assertEqual(module.reports_root(), sibling_reports)
-                self.assertEqual(module.mlruns_root(), sibling_mlruns)
+                self.assertEqual(module.reports_root(), workflow_root / "reports")
+                self.assertEqual(module.mlruns_root(), workflow_root / "mlruns")
 
     def test_repo_local_reports_and_mlruns_win_when_both_payloads_exist(self):
         module = load_module()

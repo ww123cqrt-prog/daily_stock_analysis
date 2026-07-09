@@ -99,6 +99,7 @@ CHINA_ASTOCK_SYMBOL_MAX_COUNT = 100
 CHINA_ASTOCK_SYMBOL_MAX_LENGTH = 20
 BAOSTOCK_WEB_MAX_RETRIES = 20
 BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES = 1000
+BAOSTOCK_WEB_MAX_OVERLAP_DAYS = 365
 DATA_QUALITY_WEB_MAX_SAMPLE = 100000
 DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS = 3650
 MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS = 5000
@@ -142,6 +143,8 @@ NUMERIC_PARAM_RULES = {
     "retries": ("integer", 0),
     "timeout": ("number", 1),
     "max_consecutive_failures": ("integer", 1),
+    "overlap_days": ("integer", 1),
+    "snapshot_limit": ("integer", 1),
     "overlap_sample": ("integer", 1),
     "merged_sample": ("integer", 1),
     "eval_window_days": ("integer", 1),
@@ -162,6 +165,8 @@ NUMERIC_PARAM_MAXIMUMS = {
     "retries": BAOSTOCK_WEB_MAX_RETRIES,
     "timeout": 86400,
     "max_consecutive_failures": BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES,
+    "overlap_days": BAOSTOCK_WEB_MAX_OVERLAP_DAYS,
+    "snapshot_limit": GENERIC_WEB_LIMIT_MAX,
     "overlap_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
     "merged_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
     "eval_window_days": DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS,
@@ -532,6 +537,35 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_flag(command, params, key, flag)
         return command
 
+    def download_public_daily(script_name: str, params: Mapping[str, Any]) -> List[str]:
+        command = _script_command(script_name)
+        for key, flag in (
+            ("start", "--start"),
+            ("end", "--end"),
+            ("sleep", "--sleep"),
+            ("limit", "--limit"),
+            ("retries", "--retries"),
+            ("timeout", "--timeout"),
+            ("max_consecutive_failures", "--max-consecutive-failures"),
+            ("overlap_days", "--overlap-days"),
+        ):
+            _append_value(command, params, key, flag)
+        for key, flag in (
+            ("retry_failed", "--retry-failed"),
+            ("incremental", "--incremental"),
+            ("use_system_proxy", "--use-system-proxy"),
+        ):
+            _append_flag(command, params, key, flag)
+        return command
+
+    def validate_latest_snapshot(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("validate_latest_snapshot.py")
+        _append_reports_out_dir(command)
+        _append_value(command, params, "limit", "--limit")
+        _append_value(command, params, "timeout", "--timeout")
+        _append_flag(command, params, "use_system_proxy", "--use-system-proxy")
+        return command
+
     def download_jqdata(params: Mapping[str, Any]) -> List[str]:
         _ensure_jqdata_web_dry_run(params)
         command = _script_command("download_jqdata.py")
@@ -665,6 +699,37 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "experiment_name", "--experiment-name")
         return command
 
+    def run_daily_update(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("run_daily_update.py")
+        for key, flag in (
+            ("skip_download", "--skip-download"),
+            ("force", "--force"),
+            ("dry_run", "--dry-run"),
+            ("continue_on_error", "--continue-on-error"),
+        ):
+            _append_flag(command, params, key, flag)
+        for key, flag in (
+            ("overlap_days", "--overlap-days"),
+            ("sleep", "--sleep"),
+            ("timeout", "--timeout"),
+            ("retries", "--retries"),
+            ("max_consecutive_failures", "--max-consecutive-failures"),
+            ("limit", "--limit"),
+            ("end", "--end"),
+            ("snapshot_limit", "--snapshot-limit"),
+            ("overlap_sample", "--overlap-sample"),
+            ("merged_sample", "--merged-sample"),
+        ):
+            _append_value(command, params, key, flag)
+        for key, flag in (
+            ("skip_eastmoney", "--skip-eastmoney"),
+            ("skip_akshare", "--skip-akshare"),
+            ("skip_snapshot_validation", "--skip-snapshot-validation"),
+            ("use_system_proxy", "--use-system-proxy"),
+        ):
+            _append_flag(command, params, key, flag)
+        return command
+
     def run_dsa_backtest(params: Mapping[str, Any]) -> List[str]:
         command = [_python_bin(), str(DSA_ROOT / "main.py"), "--backtest"]
         _append_value(command, params, "code", "--backtest-code")
@@ -711,6 +776,79 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": [
                 str(REPORTS_ROOT / "baostock_refresh_remaining_latest.txt"),
                 str(REPORTS_ROOT / "baostock_refresh_stale_*_latest.txt"),
+            ],
+        },
+        "run_daily_update": {
+            "label": "运行每日数据更新全链路",
+            "command": run_daily_update,
+            "allowed_params": {
+                "skip_download",
+                "force",
+                "dry_run",
+                "continue_on_error",
+                "overlap_days",
+                "sleep",
+                "timeout",
+                "retries",
+                "max_consecutive_failures",
+                "limit",
+                "end",
+                "snapshot_limit",
+                "skip_eastmoney",
+                "skip_akshare",
+                "skip_snapshot_validation",
+                "use_system_proxy",
+                "overlap_sample",
+                "merged_sample",
+            },
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "daily_update_summary_latest.json"),
+                str(REPORTS_ROOT / "daily_update_summary_*.json"),
+            ],
+        },
+        "download_eastmoney": {
+            "label": "下载东方财富日线",
+            "command": lambda params: download_public_daily("download_eastmoney.py", params),
+            "allowed_params": {
+                "start",
+                "end",
+                "sleep",
+                "limit",
+                "retries",
+                "timeout",
+                "max_consecutive_failures",
+                "retry_failed",
+                "incremental",
+                "overlap_days",
+                "use_system_proxy",
+            },
+        },
+        "download_akshare": {
+            "label": "下载 AkShare 日线",
+            "command": lambda params: download_public_daily("download_akshare.py", params),
+            "allowed_params": {
+                "start",
+                "end",
+                "sleep",
+                "limit",
+                "retries",
+                "timeout",
+                "max_consecutive_failures",
+                "retry_failed",
+                "incremental",
+                "overlap_days",
+                "use_system_proxy",
+            },
+        },
+        "validate_latest_snapshot": {
+            "label": "校验新浪最新快照",
+            "command": validate_latest_snapshot,
+            "allowed_params": {"limit", "timeout", "use_system_proxy"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "latest_snapshot_validation_latest.json"),
+                str(REPORTS_ROOT / "latest_snapshot_validation_latest.md"),
+                str(REPORTS_ROOT / "latest_snapshot_validation_*.json"),
+                str(REPORTS_ROOT / "latest_snapshot_validation_*.md"),
             ],
         },
         "download_jqdata": {

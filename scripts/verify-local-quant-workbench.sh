@@ -11,9 +11,13 @@ QUANT_WORKFLOW_ROOT="${QUANT_WORKFLOW_ROOT:-${REPO_ROOT}/quant_workflow}"
 LOCAL_BASE_URL="${DSA_WEB_E2E_BASE_URL:-http://127.0.0.1:8010}"
 REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   prepare_baostock_refresh.py
+  _ashare_sources.py
   download_baostock.py
+  download_eastmoney.py
+  download_akshare.py
   download_jqdata.py
   merge_to_qlib.py
+  validate_latest_snapshot.py
   apply_data_cleaning.py
   repair_qlib_provider.py
   generate_csi300.py
@@ -31,6 +35,7 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   report_china_astock_indicators.py
   optimize_strategy.py
   train_baseline_lgb.py
+  run_daily_update.py
 )
 
 section() {

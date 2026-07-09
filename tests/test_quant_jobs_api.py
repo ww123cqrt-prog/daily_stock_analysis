@@ -37,6 +37,14 @@ class _FakeHTTPResponse:
         return None
 
 
+class _FakeSocket:
+    def __enter__(self) -> "_FakeSocket":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
 class QuantJobsApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         from api.v1.endpoints.quant_jobs import _clear_mlflow_status_cache, _clear_quant_job_service_cache
@@ -473,6 +481,9 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(body["qlib_research"]["sections"]["risk_model"]["status"], "available")
         self.assertEqual(body["mlflow"]["url"], "http://127.0.0.1:6006/")
         self.assertEqual(body["mlflow"]["role"], "experiment_raw_records")
+        self.assertEqual(body["external_services"]["dsa"]["status"], "available")
+        self.assertEqual(body["external_services"]["mlflow"]["url"], "http://127.0.0.1:6006/")
+        self.assertEqual(body["external_services"]["catdesk"]["url"], "http://127.0.0.1:8765/")
 
     def test_status_mlflow_url_can_be_overridden_by_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -890,6 +901,38 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(request.full_url, "http://127.0.0.1:6006/")
         self.assertNotIn("token=secret", request.full_url)
         self.assertNotIn("#frag", request.full_url)
+
+    def test_catdesk_health_check_reports_local_port_availability(self) -> None:
+        from api.v1.endpoints.quant_jobs import _probe_catdesk_status_payload
+
+        with patch("api.v1.endpoints.quant_jobs.socket.create_connection", return_value=_FakeSocket()) as mocked_socket:
+            payload = _probe_catdesk_status_payload("http://127.0.0.1:8765/")
+
+        self.assertEqual(payload["url"], "http://127.0.0.1:8765/")
+        self.assertEqual(payload["status"], "available")
+        self.assertEqual(payload["role"], "external_catalyst_dashboard")
+        self.assertTrue(payload["health_checked"])
+        mocked_socket.assert_called_once()
+
+    def test_catdesk_health_check_skips_non_local_urls_and_rejects_unsafe_local_urls(self) -> None:
+        from api.v1.endpoints.quant_jobs import _probe_catdesk_status_payload
+
+        with patch("api.v1.endpoints.quant_jobs.socket.create_connection") as mocked_socket:
+            nonlocal_payload = _probe_catdesk_status_payload("https://catdesk.example.com/")
+            traversal = _probe_catdesk_status_payload("http://127.0.0.1:8765/%2e%2e/admin")
+            userinfo = _probe_catdesk_status_payload("http://user:pass@127.0.0.1:8765/?token=secret")
+            disallowed_port = _probe_catdesk_status_payload("http://127.0.0.1:6006/")
+
+        self.assertEqual(nonlocal_payload["status"], "linked")
+        self.assertIn("skipped", nonlocal_payload["error"])
+        self.assertEqual(traversal["status"], "invalid")
+        self.assertIn("path traversal", traversal["error"])
+        self.assertEqual(userinfo["status"], "invalid")
+        self.assertNotIn("user:pass", json.dumps(userinfo))
+        self.assertNotIn("token=secret", json.dumps(userinfo))
+        self.assertEqual(disallowed_port["status"], "invalid")
+        self.assertIn("port 8765", disallowed_port["error"])
+        mocked_socket.assert_not_called()
 
     def test_stream_limit_env_parser_uses_safe_default_and_minimum(self) -> None:
         from api.v1.endpoints.quant_jobs import _int_env
@@ -2417,6 +2460,74 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("only support dry_run=true", str(real_download_ctx.exception))
         self.assertIn("Param limit must be <= 20", str(too_many_ctx.exception))
 
+    def test_public_ashare_source_jobs_are_whitelisted_with_safe_params(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            eastmoney = service._build_command(
+                "download_eastmoney",
+                {
+                    "start": "2026-07-01",
+                    "end": "2026-07-08",
+                    "limit": 2,
+                    "incremental": True,
+                    "overlap_days": 7,
+                    "use_system_proxy": True,
+                },
+            )
+            akshare = service._build_command(
+                "download_akshare",
+                {"start": "2026-07-01", "end": "2026-07-08", "limit": 2, "incremental": True, "overlap_days": 7},
+            )
+            snapshot = service._build_command("validate_latest_snapshot", {"limit": 3, "timeout": 9})
+            status = service.available_job_types()
+
+            with self.assertRaises(ValueError) as unsafe_ctx:
+                service._build_command("download_eastmoney", {"output_dir": "/tmp/unsafe"})
+
+        self.assertIn("download_eastmoney.py", eastmoney[1])
+        self.assertIn("--incremental", eastmoney)
+        self.assertIn("--overlap-days", eastmoney)
+        self.assertIn("--use-system-proxy", eastmoney)
+        self.assertIn("download_akshare.py", akshare[1])
+        self.assertIn("--incremental", akshare)
+        self.assertIn("validate_latest_snapshot.py", snapshot[1])
+        self.assertIn("--out-dir", snapshot)
+        self.assertEqual(
+            status["download_eastmoney"]["allowed_params"],
+            [
+                "end",
+                "incremental",
+                "limit",
+                "max_consecutive_failures",
+                "overlap_days",
+                "retries",
+                "retry_failed",
+                "sleep",
+                "start",
+                "timeout",
+                "use_system_proxy",
+            ],
+        )
+        self.assertEqual(
+            status["download_akshare"]["allowed_params"],
+            [
+                "end",
+                "incremental",
+                "limit",
+                "max_consecutive_failures",
+                "overlap_days",
+                "retries",
+                "retry_failed",
+                "sleep",
+                "start",
+                "timeout",
+                "use_system_proxy",
+            ],
+        )
+        self.assertEqual(status["validate_latest_snapshot"]["allowed_params"], ["limit", "timeout", "use_system_proxy"])
+        self.assertIn("Unsupported params for download_eastmoney", str(unsafe_ctx.exception))
+
     def test_market_regime_report_job_is_whitelisted_with_safe_params(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -2493,6 +2604,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 ("report_cash_control_backtest", {"limit": 10001}, "Param limit must be <="),
                 ("prepare_baostock_refresh", {"limit": 10001}, "Param limit must be <="),
                 ("download_baostock", {"limit": 10001}, "Param limit must be <="),
+                ("download_eastmoney", {"limit": 10001}, "Param limit must be <="),
+                ("download_akshare", {"limit": 10001}, "Param limit must be <="),
                 ("optimize_strategy", {"dry_run": True, "phase": 5}, "Param phase must be <="),
             ]
 
