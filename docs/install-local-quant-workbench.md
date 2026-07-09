@@ -133,7 +133,7 @@ mkdir -p quant_data
 
 DSA 通过 `.env` 中的 `QUANT_WORKFLOW_ROOT` 读取量化脚本层。默认值指向仓内 `quant_workflow/`；只有你把脚本层移到外部目录时才需要覆盖。
 
-`quant_workflow/reports/` 和 `quant_workflow/mlruns/` 是 DSA 量化工作台的默认运行态目录，但它们被 `.gitignore` 排除，不会随 GitHub 分发。旧安装如果还保留 DSA 同级的 `quant_workflow/reports` 或 `mlruns`，路径解析器只在仓内目录没有历史标记时临时读取同级旧历史；一旦仓内已有 marker 文件，仓内目录就是默认读写位置。
+`quant_workflow/reports/` 和 `quant_workflow/mlruns/` 是 DSA 量化工作台的默认运行态目录，但它们被 `.gitignore` 排除，不会随 GitHub 分发。旧安装如果还保留 DSA 同级的 `quant_workflow/reports` 或 `mlruns`，路径解析器不会再按 marker 自动读取同级旧历史；需要迁移时应复制到仓内目录，需要临时回滚时显式设置 `QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR`。
 
 ## 启动 DSA
 

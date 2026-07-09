@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 明确 `--symbols-file` 是公开源下载器的显式股票清单，修正恒真过滤表达式；东方财富/AkShare 下载重试增加有界退避，降低临时网络失败时的连续请求压力。
 - [新功能] 新增 launchd 定时任务模板 `scripts/launchd/com.dsa.quant-daily-update.plist.template` 和安装脚本 `install-quant-daily-update.sh`，在工作日收盘后用 DSA venv 自动跑全链路更新；Baostock 匿名登录，任务不读取任何凭据。
 - [改进] 全链路默认只在增量下载带来新交易日时才重建 merge/清洗/报告等重活；`--force` 可强制重建，`--skip-download` 只重建，`--dry-run` 预演完整链路而不执行。
-- [改进] 方案 A 将 `quant_workflow` 正式收口为 DSA 仓内脚本与运行态正本；默认优先读取/写入仓内 reports/mlruns，旧同级 `quant_workflow` 只在仓内没有历史 marker 时作为迁移期兜底，避免服务重启后训练记录变空。
+- [改进] 方案 A 将 `quant_workflow` 正式收口为 DSA 仓内脚本与运行态正本；默认读取/写入仓内 reports/mlruns，旧同级 `quant_workflow` 不再自动兜底，迁移或回滚必须显式设置 `QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR`，避免服务重启后在两份历史之间分裂。
 - [修复] 训练脚本会修正 MLflow experiment 的 `artifact_location` 到当前仓内 mlruns，并在发现旧同级 mlruns 写入当前 run artifacts 时镜像回仓内，避免指标/参数和 `pred.pkl` 分裂到两个目录。
 - [测试] 本机工作台浏览器 smoke 的临时量化 job helper 默认写入仓内 `quant_workflow/reports/jobs`，并使用本地时区时间戳，避免方案 A 后仍向旧同级 `quant_workflow` 写入测试记录或被最近任务排序挤出列表。
 - [修复] 量化任务公开错误脱敏补齐 Docker `/app/...` 路径，并收窄 Windows 盘符路径匹配，避免把 `E:5`、`R:42` 这类普通文本误替换为 `[path]`。

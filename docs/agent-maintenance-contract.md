@@ -23,7 +23,7 @@
 
 `daily_stock_analysis` 是主项目和本地网页控制台。用户通过它访问研究、工作流、回测、实验记录和设置。
 
-仓内 `quant_workflow/` 是脚本真源。网页任务只能调用白名单脚本，不能从浏览器提交任意 shell。运行态 reports/mlruns 是本地资产：默认放在仓内 `quant_workflow/reports` 和 `quant_workflow/mlruns`，且不提交到 Git。旧安装如果仍有 DSA 同级 `quant_workflow/reports` 或 `mlruns`，路径 helper 只在仓内没有历史标记时把它当迁移期兜底；日常维护不得继续向同级旧目录写新产物，除非用户明确设置 `QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR` 做回滚。
+仓内 `quant_workflow/` 是脚本真源。网页任务只能调用白名单脚本，不能从浏览器提交任意 shell。运行态 reports/mlruns 是本地资产：默认放在仓内 `quant_workflow/reports` 和 `quant_workflow/mlruns`，且不提交到 Git。旧安装如果仍有 DSA 同级 `quant_workflow/reports` 或 `mlruns`，路径 helper 不再按 marker 自动兜底；迁移旧历史时应复制到仓内目录，或由用户明确设置 `QUANT_WORKFLOW_REPORTS_ROOT` / `QUANT_WORKFLOW_MLRUNS_DIR` 做临时回滚。日常维护不得继续向同级旧目录写新产物。
 
 Qlib 是通过 Python 包安装的量化研究引擎。除非任务明确要求开发 Qlib 本身，不要修改官方 Qlib 源码，也不要把 Qlib 仓库当作主 UI。
 
