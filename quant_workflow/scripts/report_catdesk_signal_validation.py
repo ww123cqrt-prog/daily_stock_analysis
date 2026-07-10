@@ -19,7 +19,7 @@ import math
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +71,7 @@ STRATEGY_DESCRIPTIONS = {
 CHINA_TZ = timezone(timedelta(hours=8))
 MORNING_CUTOFF_HOUR = 9
 MORNING_CUTOFF_MINUTE = 30
+MARKET_CLOSE_TIME = time(15, 0)
 MARKET_REGIME_PATTERN = re.compile(r"^market_regime_(\d{8})_(\d{6})\.json$")
 
 
@@ -314,13 +315,14 @@ def load_market_regime(path: Path) -> dict[str, Any]:
 
 def find_market_regime_path(reports_dir: Path, signal_date: str) -> tuple[Path, dict[str, Any]]:
     target = signal_date.replace("-", "")
+    morning_cutoff = f"{MORNING_CUTOFF_HOUR:02d}{MORNING_CUTOFF_MINUTE:02d}00"
     candidates: list[tuple[str, str, Path]] = []
     for path in reports_dir.glob("market_regime_*.json"):
         match = MARKET_REGIME_PATTERN.match(path.name)
         if not match:
             continue
         report_day, report_time = match.groups()
-        if report_day <= target:
+        if report_day < target or (report_day == target and report_time <= morning_cutoff):
             candidates.append((report_day, report_time, path))
 
     if not candidates:
@@ -443,6 +445,13 @@ def load_latest_qlib_scores(
     run_generated_at = metadata.get("run_generated_at")
     run_dt = _parse_datetime(run_generated_at)
     cutoff_dt = _parse_datetime(run_cutoff)
+    if run_cutoff and cutoff_dt is None:
+        return _qlib_unavailable(
+            f"Qlib validation cutoff is invalid: {run_cutoff!r}.",
+            pred_path=pred_path,
+            signal_date=signal_date,
+            metadata=metadata,
+        )
     if run_cutoff and cutoff_dt and run_dt is None:
         return _qlib_unavailable(
             "Qlib run generation time is unavailable; strict validation refuses to use it.",
@@ -785,13 +794,14 @@ def select_dominant_theme_bucket(rows: list[dict[str, Any]], top_n: int) -> list
     return (dominant_rows + remaining)[:top_n]
 
 
+def rank_evaluable_by_return(rows: list[dict[str, Any]], *, reverse: bool) -> list[dict[str, Any]]:
+    evaluable = [row for row in rows if _safe_float(row.get("validation_return_pct")) is not None]
+    return sorted(evaluable, key=lambda row: float(row["validation_return_pct"]), reverse=reverse)
+
+
 def strategy_comparison(rows: list[dict[str, Any]], top_n: int) -> dict[str, Any]:
     comparison: dict[str, Any] = {}
-    actual_winners = sorted(
-        rows,
-        key=lambda row: row.get("validation_return_pct") if row.get("validation_return_pct") is not None else -999.0,
-        reverse=True,
-    )
+    actual_winners = rank_evaluable_by_return(rows, reverse=True)
     winner_codes = {row["code"] for row in actual_winners[: max(top_n, 1)]}
     for strategy in STRATEGY_LABELS:
         ranked = rank_by_strategy(rows, strategy)
@@ -837,6 +847,7 @@ def apply_validation(
         source = local.source
         trade_date = validation_date if local.source else ""
         trade_time = ""
+        provisional_intraday = False
 
         if snapshot and snapshot.get("trade_date") == validation_date:
             close = _safe_float(snapshot.get("close"))
@@ -844,15 +855,25 @@ def apply_validation(
             source = snapshot.get("source") or "sina_snapshot"
             trade_date = str(snapshot.get("trade_date") or "")
             trade_time = str(snapshot.get("trade_time") or "")
+            try:
+                snapshot_time = datetime.strptime(trade_time, "%H:%M:%S").time()
+            except ValueError:
+                snapshot_time = None
+            provisional_intraday = snapshot_time is None or snapshot_time < MARKET_CLOSE_TIME
 
         signal_close = _safe_float(row.get("signal_close"))
         close_to_close_return = None
-        if close is not None and signal_close:
+        if not provisional_intraday and close is not None and signal_close:
             close_to_close_return = ((close / signal_close) - 1.0) * 100.0
+
+        validation_status = "provisional_intraday" if provisional_intraday else "final"
+        if not provisional_intraday and close_to_close_return is None:
+            validation_status = "unavailable"
 
         enriched = dict(row)
         enriched.update(
             {
+                "validation_status": validation_status,
                 "validation_close": close,
                 "validation_pct": pct,
                 "validation_return_pct": round(close_to_close_return, 6) if close_to_close_return is not None else None,
@@ -869,7 +890,7 @@ def apply_validation(
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    evaluable = [row for row in rows if row.get("validation_return_pct") is not None]
+    evaluable = [row for row in rows if _safe_float(row.get("validation_return_pct")) is not None]
     returns = [float(row["validation_return_pct"]) for row in evaluable]
     if not evaluable:
         return {
@@ -969,18 +990,22 @@ def build_markdown(payload: dict[str, Any]) -> str:
     selected_summary = payload["selected_summary"]
     raw_summary = payload["raw_summary"]
     strategies = payload.get("strategies") or {}
-    top_winners = sorted(all_rows, key=lambda row: row.get("validation_return_pct") or -999, reverse=True)[:10]
-    top_losers = sorted(all_rows, key=lambda row: row.get("validation_return_pct") if row.get("validation_return_pct") is not None else 999)[:10]
+    top_winners = rank_evaluable_by_return(all_rows, reverse=True)[:10]
+    top_losers = rank_evaluable_by_return(all_rows, reverse=False)[:10]
     qlib_latest_date = payload["qlib"].get("latest_date") or "n/a"
     signal_date = payload.get("signal_date")
     validation_date = payload.get("validation_date")
     selected_label = payload.get("selected_strategy_label") or "Filtered watchlist"
-    qlib_role = (
-        "Qlib contributes a small same-date model-score adjustment because the latest available Qlib score date matches the signal date."
-        if qlib_latest_date == signal_date
-        else "Qlib contributes only a small stale-score adjustment because the latest available Qlib score date does not match the signal date."
-    )
-    if payload.get("input_quality", {}).get("qlib_backfilled_allowed"):
+    qlib_available = payload["qlib"].get("available") is True
+    if not qlib_available:
+        qlib_role = "Qlib is unavailable and was not applied to candidate scores."
+        if payload["qlib"].get("reason"):
+            qlib_role += f" Reason: {payload['qlib']['reason']}"
+    elif qlib_latest_date == signal_date:
+        qlib_role = "Qlib contributes a small same-date model-score adjustment because the latest available Qlib score date matches the signal date."
+    else:
+        qlib_role = "Qlib contributes only a small stale-score adjustment because the latest available Qlib score date does not match the signal date."
+    if qlib_available and payload.get("input_quality", {}).get("qlib_backfilled_allowed"):
         qlib_role += " This report explicitly allowed backfilled Qlib scores for research comparison; it is not proof that the Qlib score existed before the validation date."
 
     return f"""# {payload.get("title") or "CatDesk + DSA/Qlib Signal Validation"}
@@ -1365,11 +1390,6 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
 
-    try:
-        resolved_validation_date, _calendar_source = resolve_validation_date(args.signal_date, args.validation_date)
-    except ValueError as exc:
-        parser.error(str(exc))
-
     if args.rolling_days:
         payload = generate_rolling_report(
             start_signal_date=args.signal_date,
@@ -1395,6 +1415,11 @@ def main() -> int:
         print(f"Latest markdown: {payload['artifacts']['latest_markdown']}")
         print(f"Latest JSON: {payload['artifacts']['latest_json']}")
         return 0
+
+    try:
+        resolved_validation_date, _calendar_source = resolve_validation_date(args.signal_date, args.validation_date)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     payload = generate_report(
         catdesk_report=args.catdesk_report,

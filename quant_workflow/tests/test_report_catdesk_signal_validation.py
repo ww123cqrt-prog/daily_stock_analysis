@@ -201,6 +201,44 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertNotIn("Local daily bars on or before 2026-07-08", markdown)
         self.assertNotIn("AlphaSift", markdown)
 
+    def test_markdown_says_qlib_unavailable_when_no_adjustment_applied(self):
+        module = load_module()
+        payload = {
+            "generated_at": "2026-07-09T17:30:00+08:00",
+            "title": "CatDesk + DSA/Qlib Signal Validation",
+            "signal_date": "2026-07-08",
+            "validation_date": "2026-07-09",
+            "selected": [],
+            "all_candidates": [],
+            "selected_summary": {},
+            "raw_summary": {},
+            "strategies": {},
+            "selected_strategy_label": "主线题材桶",
+            "inputs": {
+                "catdesk_report": "/tmp/2026-07-08-morning.json",
+                "signal_price_dir": "/tmp/prices",
+                "market_regime_report": "/tmp/market.json",
+            },
+            "qlib": {
+                "available": False,
+                "reason": "Qlib validation cutoff is invalid.",
+                "prediction_path": "/tmp/pred.pkl",
+                "latest_date": "2026-07-08",
+            },
+            "market_regime": {"regime": "risk_off", "position_ratio": 0.2, "cash_ratio": 0.8},
+            "input_quality": {
+                "catdesk_report_status": "as_of_morning",
+                "market_regime_status": "as_of_signal_date",
+                "return_basis": "close_to_close_research_only",
+            },
+        }
+
+        markdown = module.build_markdown(payload)
+
+        self.assertIn("Qlib is unavailable", markdown)
+        self.assertIn("was not applied", markdown)
+        self.assertNotIn("Qlib contributes a small", markdown)
+
     def test_business_day_pairs_skip_weekends(self):
         module = load_module()
 
@@ -260,7 +298,7 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             reports = Path(temp_dir)
-            old = reports / "market_regime_20260706_212319.json"
+            old = reports / "market_regime_20260706_092319.json"
             future_latest = reports / "market_regime_latest.json"
             old.write_text("{}", encoding="utf-8")
             future_latest.write_text("{}", encoding="utf-8")
@@ -269,6 +307,21 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
 
         self.assertEqual(path, old)
         self.assertEqual(status["market_regime_status"], "as_of_signal_date")
+
+    def test_market_regime_generated_after_morning_cutoff_uses_prior_safe_artifact(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports = Path(temp_dir)
+            prior_safe = reports / "market_regime_20260707_151500.json"
+            same_day_late = reports / "market_regime_20260708_093001.json"
+            prior_safe.write_text("{}", encoding="utf-8")
+            same_day_late.write_text("{}", encoding="utf-8")
+
+            path, status = module.find_market_regime_path(reports, "2026-07-08")
+
+        self.assertEqual(path, prior_safe)
+        self.assertEqual(status["market_regime_status"], "previous_available")
+        self.assertEqual(status["market_regime_as_of_date"], "2026-07-07")
 
     def test_market_regime_does_not_fall_forward_to_future_latest(self):
         module = load_module()
@@ -369,6 +422,32 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertEqual(payload["run_id"], "run_1")
         self.assertIn("generation time is unavailable", payload["reason"])
 
+    def test_unparseable_strict_qlib_cutoff_is_fail_closed(self):
+        module = load_module()
+        frame = pd.DataFrame(
+            {
+                "datetime": [pd.Timestamp("2026-07-08")],
+                "instrument": ["SZ000001"],
+                "score": [0.9],
+            }
+        )
+        module.find_prediction_path = lambda: Path("/tmp/mlruns/1/run_1/artifacts/pred.pkl")
+        module.load_prediction_scores = lambda _path: frame
+        module.load_qlib_run_metadata = lambda _path: {
+            "run_id": "run_1",
+            "run_generated_at": "2026-07-09T08:00:00+08:00",
+        }
+
+        payload = module.load_latest_qlib_scores(
+            "2026-07-08",
+            top_reference_date="2026-07-08",
+            run_cutoff="not-a-valid-cutoff",
+        )
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["run_id"], "run_1")
+        self.assertIn("cutoff is invalid", payload["reason"])
+
     def test_qlib_scores_accept_meta_yaml_end_time_before_validation_cutoff(self):
         module = load_module()
         frame = pd.DataFrame(
@@ -452,6 +531,87 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertEqual(payload["input_quality"]["qlib_run_cutoff"], "")
         self.assertTrue(payload["input_quality"]["qlib_backfilled_allowed"])
         self.assertTrue(payload["inputs"]["qlib_backfilled_allowed"])
+
+    def test_intraday_snapshot_is_provisional_and_not_evaluable(self):
+        module = load_module()
+        rows = [{"code": "000001", "signal_close": 10.0}]
+        snapshots = {
+            "000001": {
+                "close": 11.0,
+                "pct": 2.5,
+                "source": "sina_snapshot",
+                "trade_date": "2026-07-09",
+                "trade_time": "14:56:00",
+            }
+        }
+
+        with patch.object(module, "read_price_point", return_value=module.PricePoint()):
+            validated = module.apply_validation(
+                rows,
+                validation_date="2026-07-09",
+                validation_source_dir=Path("/tmp/prices"),
+                sina_snapshots=snapshots,
+            )
+
+        self.assertEqual(validated[0]["validation_status"], "provisional_intraday")
+        self.assertIsNone(validated[0]["validation_return_pct"])
+        self.assertFalse(validated[0]["hit"])
+        self.assertEqual(module.summarize(validated)["evaluable"], 0)
+
+    def test_snapshot_at_market_close_is_final_and_evaluable(self):
+        module = load_module()
+        rows = [{"code": "000001", "signal_close": 10.0}]
+        snapshots = {
+            "000001": {
+                "close": 11.0,
+                "pct": 2.5,
+                "source": "sina_snapshot",
+                "trade_date": "2026-07-09",
+                "trade_time": "15:00:00",
+            }
+        }
+
+        with patch.object(module, "read_price_point", return_value=module.PricePoint()):
+            validated = module.apply_validation(
+                rows,
+                validation_date="2026-07-09",
+                validation_source_dir=Path("/tmp/prices"),
+                sina_snapshots=snapshots,
+            )
+
+        self.assertEqual(validated[0]["validation_status"], "final")
+        self.assertEqual(validated[0]["validation_return_pct"], 10.0)
+        self.assertEqual(module.summarize(validated)["evaluable"], 1)
+
+    def test_actual_winners_exclude_rows_without_finite_numeric_returns(self):
+        module = load_module()
+
+        def row(code, validation_return_pct, strategy_score):
+            return {
+                "code": code,
+                "theme": "测试题材",
+                "theme_signal_score": 1.0,
+                "validation_return_pct": validation_return_pct,
+                "hit": validation_return_pct > 0,
+                "strong_hit": False,
+                "leader_hit": False,
+                "strategy_scores": {
+                    strategy: strategy_score
+                    for strategy in module.STRATEGY_LABELS
+                },
+            }
+
+        invalid = row("000001", float("inf"), 100.0)
+        valid = row("000002", 5.0, 10.0)
+
+        comparison = module.strategy_comparison([invalid, valid], top_n=1)
+        raw = comparison["catdesk_raw"]
+
+        self.assertEqual(raw["captured_top_actual_winner_count"], 0)
+        self.assertEqual(
+            [item["code"] for item in raw["missed_top_actual_winners"]],
+            ["000002"],
+        )
 
     def test_qlib_scores_can_be_used_without_cutoff_for_backfilled_research(self):
         module = load_module()
@@ -590,6 +750,33 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(captured["allow_backfilled_qlib"])
+
+    def test_rolling_mode_does_not_validate_unused_validation_date(self):
+        module = load_module()
+        captured = {}
+
+        def fake_generate_rolling_report(**kwargs):
+            captured.update(kwargs)
+            return {
+                "items": [{"status": "ok"}],
+                "artifacts": {"latest_markdown": "rolling.md", "latest_json": "rolling.json"},
+            }
+
+        module.generate_rolling_report = fake_generate_rolling_report
+        argv = [
+            "report_catdesk_signal_validation.py",
+            "--rolling-days",
+            "2",
+            "--validation-date",
+            "not-a-date",
+            "--no-online-validation",
+        ]
+
+        with patch.object(module.sys, "argv", argv):
+            exit_code = module.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["days"], 2)
 
 
 if __name__ == "__main__":
