@@ -216,6 +216,37 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             ],
         )
 
+    def test_business_day_pairs_use_qlib_calendar_across_market_holiday(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir)
+            calendar_dir = provider / "calendars"
+            calendar_dir.mkdir()
+            (calendar_dir / "day.txt").write_text(
+                "2026-09-29\n2026-09-30\n2026-10-08\n2026-10-09\n",
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}):
+                module = load_module()
+                pairs = module.business_day_pairs("2026-09-30", 2)
+
+        self.assertEqual(
+            pairs,
+            [
+                ("2026-09-30", "2026-10-08"),
+                ("2026-09-29", "2026-09-30"),
+            ],
+        )
+
+    def test_validation_date_uses_explicit_weekday_fallback_when_calendar_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir)
+            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}):
+                module = load_module()
+                validation_date, source = module.resolve_validation_date("2026-07-03", None)
+
+        self.assertEqual(validation_date, "2026-07-06")
+        self.assertEqual(source, "weekday_only")
+
     def test_catdesk_report_generated_after_morning_cutoff_is_backfilled_sample(self):
         module = load_module()
         payload = {"date": "2026-07-08", "generated_at": "2026-07-08T18:43:30+08:00"}
@@ -476,6 +507,63 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(captured["allow_backfilled_qlib"])
+
+    def test_cli_derives_validation_date_from_signal_date(self):
+        module = load_module()
+        captured = {}
+
+        def fake_generate_report(**kwargs):
+            captured.update(kwargs)
+            return {
+                "selected": [],
+                "all_candidates": [],
+                "selected_strategy_label": "主线题材桶",
+                "selected_strategy": "dominant_theme_bucket",
+                "selected_summary": {},
+                "raw_summary": {},
+                "artifacts": {"latest_markdown": "latest.md", "latest_json": "latest.json"},
+            }
+
+        module.generate_report = fake_generate_report
+        argv = [
+            "report_catdesk_signal_validation.py",
+            "--signal-date",
+            "2026-09-30",
+            "--no-online-validation",
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir)
+            calendar_dir = provider / "calendars"
+            calendar_dir.mkdir()
+            (calendar_dir / "day.txt").write_text(
+                "2026-09-30\n2026-10-08\n",
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}), patch.object(
+                module.sys, "argv", argv
+            ):
+                exit_code = module.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["validation_date"], "2026-10-08")
+
+    def test_cli_rejects_non_adjacent_validation_date(self):
+        module = load_module()
+        module.generate_report = lambda **_kwargs: self.fail("invalid dates must be rejected before report generation")
+        argv = [
+            "report_catdesk_signal_validation.py",
+            "--signal-date",
+            "2026-07-08",
+            "--validation-date",
+            "2026-07-10",
+            "--no-online-validation",
+        ]
+
+        with patch.object(module.sys, "argv", argv), self.assertRaises(SystemExit) as error:
+            module.main()
+
+        self.assertEqual(error.exception.code, 2)
 
     def test_cli_passes_allow_backfilled_qlib_to_rolling_report(self):
         module = load_module()

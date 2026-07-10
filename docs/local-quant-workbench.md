@@ -126,7 +126,7 @@ scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 pl
 
 `/research` 右侧栏提供 CatDesk 9（`a-share-us-catalyst` / 九点猫研）的本地跳转入口 `http://127.0.0.1:8765/`。当前只是网页级跳转，不共享 DSA/Qlib 数据，也不把 CatDesk 的“候选信号历史验证”归类为 Qlib 策略回测。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。后续若要合并模块，先单独审查重复数据源、术语和报告边界。
 
-`report_catdesk_signal_validation.py` 是 CatDesk 候选池的研究验证脚本。默认严格口径下，Qlib run 必须早于验证日 09:30，脚本才会把 Qlib 分数纳入排序；晚于这个时间的模型分数会标记为不可用，避免把事后生成的分数当成事前信号。若只是做事后研究对比，可以显式传 `--allow-backfilled-qlib`，报告会记录 `qlib_backfilled_allowed=true`，意思是“用了事后补跑的 Qlib 分数做研究比较”，不是证明当时盘前已经有这个信号。
+`report_catdesk_signal_validation.py` 是 CatDesk 候选池的研究验证脚本。单日模式未填写验证日时，脚本会从 cleaned Qlib provider 的 A 股交易日历自动选择信号日后的第一个交易日；显式填写的日期不是下一交易日时会直接拒绝，避免把多日收益冒充一日验证。日历缺失或日期超出本地日历范围时才退回“只跳周末”的规则，并在 JSON 和 Markdown 报告中标记 `weekday_only`。默认严格口径下，Qlib run 必须早于验证日 09:30，脚本才会把 Qlib 分数纳入排序；晚于这个时间的模型分数会标记为不可用，避免把事后生成的分数当成事前信号。若只是做事后研究对比，可以显式传 `--allow-backfilled-qlib`，报告会记录 `qlib_backfilled_allowed=true`，意思是“用了事后补跑的 Qlib 分数做研究比较”，不是证明当时盘前已经有这个信号。
 
 `report_china_astock_indicators.py` 复用 `china-astock-quant/strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数，读取本地 cleaned 行情生成 `china_astock_indicator_report_latest.{json,md}`。这是只读研究报告，不连接券商、不读取账号密码、不自动下单。网页端和脚本端省略 `limit` 时都默认只抽样 50 只股票，避免误把“安全报告”跑成全市场重任务；需要扩大范围时必须显式填写数量上限。
 

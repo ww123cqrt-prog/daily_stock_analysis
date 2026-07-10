@@ -32,6 +32,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import projects_root, quant_data_root, reports_root  # noqa: E402
 from _symbols import to_qlib_name  # noqa: E402
+from _trading_calendar import (  # noqa: E402
+    WEEKDAY_FALLBACK_SOURCE,
+    load_trading_calendar,
+)
 from market_data_clients import fetch_sina_a_snapshots  # noqa: E402
 from report_qlib_predictions import (  # noqa: E402
     find_prediction_path,
@@ -40,7 +44,6 @@ from report_qlib_predictions import (  # noqa: E402
 
 
 DEFAULT_SIGNAL_DATE = "2026-07-08"
-DEFAULT_VALIDATION_DATE = "2026-07-09"
 DEFAULT_TOP_N = 8
 DEFAULT_SELECTED_STRATEGY = "dominant_theme_bucket"
 
@@ -172,39 +175,32 @@ def classify_catdesk_report(payload: dict[str, Any], signal_date: str) -> dict[s
     }
 
 
-def _is_business_day(day: datetime) -> bool:
-    return day.weekday() < 5
-
-
-def _previous_business_day(day: datetime) -> datetime:
-    current = day - timedelta(days=1)
-    while not _is_business_day(current):
-        current -= timedelta(days=1)
-    return current
-
-
-def _next_business_day(day: datetime) -> datetime:
-    current = day + timedelta(days=1)
-    while not _is_business_day(current):
-        current += timedelta(days=1)
-    return current
-
-
-def _as_business_day(day: datetime) -> datetime:
-    current = day
-    while not _is_business_day(current):
-        current = _previous_business_day(current)
-    return current
-
-
 def business_day_pairs(start_signal_date: str, days: int) -> list[tuple[str, str]]:
+    calendar = load_trading_calendar()
     pairs: list[tuple[str, str]] = []
-    signal_dt = _as_business_day(_parse_date(start_signal_date))
+    signal_day = calendar.on_or_previous(_parse_date(start_signal_date).date()).day
     for _ in range(max(days, 1)):
-        validation_dt = _next_business_day(signal_dt)
-        pairs.append((signal_dt.strftime("%Y-%m-%d"), validation_dt.strftime("%Y-%m-%d")))
-        signal_dt = _previous_business_day(signal_dt)
+        validation_day = calendar.next(signal_day).day
+        pairs.append((signal_day.isoformat(), validation_day.isoformat()))
+        signal_day = calendar.previous(signal_day).day
     return pairs
+
+
+def resolve_validation_date(signal_date: str, validation_date: str | None) -> tuple[str, str]:
+    signal_day = _parse_date(signal_date).date()
+    decision = load_trading_calendar().next(signal_day)
+    expected = decision.day.isoformat()
+    if validation_date is None:
+        return expected, decision.source
+
+    requested_day = _parse_date(validation_date).date()
+    if requested_day <= signal_day:
+        raise ValueError("validation date must be after signal date")
+    if validation_date != expected:
+        raise ValueError(
+            f"validation date must be the next A-share trading day after {signal_date}: expected {expected}, got {validation_date}"
+        )
+    return validation_date, decision.source
 
 
 def _candidate_code(item: dict[str, Any]) -> str:
@@ -1070,6 +1066,7 @@ Risk penalties include: underperform rating, {signal_date} chase risk, sharp-dro
 - CatDesk report status: `{payload.get("input_quality", {}).get("catdesk_report_status", "unknown")}`. {payload.get("input_quality", {}).get("catdesk_report_reason", "")}
 - Market regime status: `{payload.get("input_quality", {}).get("market_regime_status", "unknown")}`. {payload.get("input_quality", {}).get("market_regime_reason", "")}
 - Qlib backfilled-score mode: `{payload.get("input_quality", {}).get("qlib_backfilled_allowed", False)}`.
+- A-share trading calendar: `{payload.get("input_quality", {}).get("trading_calendar_source", "unknown")}`. Calendar fallback: `{payload.get("input_quality", {}).get("calendar_fallback", "") or "none"}`.
 - Return basis: close-to-close research check only. This is not an executable entry-price backtest.
 - `signal_price_fallback_reason=requested_date_missing_use_previous_trade_date` means the requested signal date had no A-share bar, so the script used the nearest previous local trading day close and recorded that actual `signal_trade_date`.
 - `validation_source=sina_snapshot` means the {validation_date} result came from Sina quote snapshot and was not written back into the local database.
@@ -1082,7 +1079,7 @@ def generate_report(
     *,
     catdesk_report: Path,
     signal_date: str,
-    validation_date: str,
+    validation_date: str | None,
     candidate_set: str,
     top_n: int,
     selected_strategy: str,
@@ -1092,6 +1089,7 @@ def generate_report(
     timeout: float,
     out_dir: Path,
 ) -> dict[str, Any]:
+    validation_date, calendar_source = resolve_validation_date(signal_date, validation_date)
     catdesk_payload, candidates = load_catdesk_candidates(catdesk_report, candidate_set=candidate_set)
     catdesk_quality = classify_catdesk_report(catdesk_payload, signal_date)
     data_root = quant_data_root()
@@ -1163,6 +1161,8 @@ def generate_report(
             "qlib_backfilled_allowed": allow_backfilled_qlib,
             "qlib_status": "available" if qlib.get("available") else "unavailable",
             "qlib_reason": qlib.get("reason") or "",
+            "trading_calendar_source": calendar_source,
+            "calendar_fallback": WEEKDAY_FALLBACK_SOURCE if calendar_source == WEEKDAY_FALLBACK_SOURCE else "",
             "return_basis": "close_to_close_research_only",
             "return_basis_reason": "Validation uses close-to-close movement only and does not prove executable entry fills.",
         },
@@ -1343,7 +1343,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate CatDesk candidates with local DSA/Qlib filters.")
     parser.add_argument("--catdesk-report", type=Path, default=default_report)
     parser.add_argument("--signal-date", default=DEFAULT_SIGNAL_DATE)
-    parser.add_argument("--validation-date", default=DEFAULT_VALIDATION_DATE)
+    parser.add_argument("--validation-date", default=None)
     parser.add_argument("--candidate-set", choices=("top", "all"), default="top")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
     parser.add_argument("--selected-strategy", choices=tuple(STRATEGY_LABELS), default=DEFAULT_SELECTED_STRATEGY)
@@ -1364,6 +1364,11 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
+
+    try:
+        resolved_validation_date, _calendar_source = resolve_validation_date(args.signal_date, args.validation_date)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.rolling_days:
         payload = generate_rolling_report(
@@ -1394,7 +1399,7 @@ def main() -> int:
     payload = generate_report(
         catdesk_report=args.catdesk_report,
         signal_date=args.signal_date,
-        validation_date=args.validation_date,
+        validation_date=resolved_validation_date,
         candidate_set=args.candidate_set,
         top_n=max(args.top_n, 1),
         selected_strategy=args.selected_strategy,
