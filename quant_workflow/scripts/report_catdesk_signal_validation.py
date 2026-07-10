@@ -20,6 +20,7 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -795,7 +796,13 @@ def select_dominant_theme_bucket(rows: list[dict[str, Any]], top_n: int) -> list
 
 
 def rank_evaluable_by_return(rows: list[dict[str, Any]], *, reverse: bool) -> list[dict[str, Any]]:
-    evaluable = [row for row in rows if _safe_float(row.get("validation_return_pct")) is not None]
+    evaluable = [
+        row
+        for row in rows
+        if isinstance(row.get("validation_return_pct"), Real)
+        and not isinstance(row.get("validation_return_pct"), bool)
+        and math.isfinite(float(row["validation_return_pct"]))
+    ]
     return sorted(evaluable, key=lambda row: float(row["validation_return_pct"]), reverse=reverse)
 
 
@@ -1375,7 +1382,7 @@ def main() -> int:
     parser.add_argument(
         "--rolling-days",
         type=int,
-        default=0,
+        default=None,
         help="Walk backward from --signal-date for N business-day signal/validation pairs.",
     )
     parser.add_argument("--reports-web-dir", type=Path, default=default_reports_web_dir)
@@ -1390,7 +1397,10 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
 
-    if args.rolling_days:
+    if args.rolling_days is not None and args.rolling_days <= 0:
+        parser.error("--rolling-days must be a positive integer")
+
+    if args.rolling_days is not None:
         payload = generate_rolling_report(
             start_signal_date=args.signal_date,
             days=args.rolling_days,

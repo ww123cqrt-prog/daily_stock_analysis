@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -613,6 +614,18 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             ["000002"],
         )
 
+    def test_actual_winners_exclude_bool_and_numeric_strings(self):
+        module = load_module()
+        rows = [
+            {"code": "bool", "validation_return_pct": True},
+            {"code": "string", "validation_return_pct": "5.0"},
+            {"code": "real", "validation_return_pct": 4.0},
+        ]
+
+        winners = module.rank_evaluable_by_return(rows, reverse=True)
+
+        self.assertEqual([row["code"] for row in winners], ["real"])
+
     def test_qlib_scores_can_be_used_without_cutoff_for_backfilled_research(self):
         module = load_module()
         frame = pd.DataFrame(
@@ -777,6 +790,27 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(captured["days"], 2)
+
+    def test_rolling_days_rejects_nonpositive_values_without_generation(self):
+        module = load_module()
+        module.generate_report = lambda **_kwargs: self.fail("invalid rolling days must not generate a single report")
+        module.generate_rolling_report = lambda **_kwargs: self.fail("invalid rolling days must not generate a rolling report")
+
+        for rolling_days in (0, -1):
+            with self.subTest(rolling_days=rolling_days):
+                stderr = io.StringIO()
+                argv = [
+                    "report_catdesk_signal_validation.py",
+                    "--rolling-days",
+                    str(rolling_days),
+                    "--no-online-validation",
+                ]
+                with patch.object(module.sys, "argv", argv), patch.object(module.sys, "stderr", stderr):
+                    with self.assertRaises(SystemExit) as error:
+                        module.main()
+
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("--rolling-days must be a positive integer", stderr.getvalue())
 
 
 if __name__ == "__main__":
