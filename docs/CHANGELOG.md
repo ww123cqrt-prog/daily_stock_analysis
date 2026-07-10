@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增 `report_catdesk_signal_validation.py`，可用九点猫研早报候选池结合 DSA 风控、手写因子均衡规则和 Qlib 模型分数生成一日事后验证报告，验证行情可走在线快照且不回写 `quant_data`；报告支持多策略交叉对比、主线题材桶和向前逐日滚动验证，缺失早报会明确标记而不伪造历史信号。
 - [修复] CatDesk 历史验证支持非交易日信号价回退到上一交易日本地收盘价并在报告中记录 `signal_requested_date` / `signal_trade_date`；Qlib 分数限制为信号日当天或之前，避免历史验证偷用未来模型分数。
 - [修复] CatDesk 历史验证改为按工作日交易对滚动，CatDesk 早报若晚于信号日 09:30 生成会标记为 `backfilled_sample`；market regime 只读取信号日当天或之前的报告，Qlib run 默认必须早于验证日 09:30 并在报告中记录 run 元信息；需要事后研究时必须显式传 `--allow-backfilled-qlib`，报告会标记为回填研究，避免把回填样本、未来大盘状态或晚生成模型分数当成正式策略证据。
+- [修复] CatDesk 历史验证拒绝信号日开盘后的同日 market regime 和无效严格 Qlib cutoff；15:00 前在线快照标记为 `provisional_intraday` 并排除出收益统计，实际赢家只接受有限数值收益，报告在 Qlib 未应用时明确标记不可用。
 - [新功能] 新增东方财富 qfq 日线、AkShare qfq 日线和新浪最新快照校验脚本，作为 A 股日线免费冗余源写入 `eastmoney_qfq` / `akshare_qfq` 并输出 `latest_snapshot_validation_latest.{json,md}`。
 - [改进] `/research` 新增 CatDesk 9 本地跳转入口，明确其“候选信号历史验证”不等同 Qlib 策略回测；行情收益展示新增红涨绿跌专用样式，避免和任务成功/失败语义色混用。
 - [新功能] 每日数据更新全链路脚本 `run_daily_update.py` 现在按序串联 Baostock/东方财富/AkShare 增量下载、多源合并转换、最新快照校验、异常检测、清洗、跨源一致性校验和 Qlib provider 校验；`/workflow` 新增“运行每日数据更新全链路”任务，产出 `daily_update_summary_latest.json`。

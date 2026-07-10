@@ -128,6 +128,8 @@ scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 pl
 
 `report_catdesk_signal_validation.py` 是 CatDesk 候选池的研究验证脚本。单日模式未填写验证日时，脚本会从 cleaned Qlib provider 的 A 股交易日历自动选择信号日后的第一个交易日；显式填写的日期不是下一交易日时会直接拒绝，避免把多日收益冒充一日验证。日历缺失或日期超出本地日历范围时才退回“只跳周末”的规则，并在 JSON 和 Markdown 报告中标记 `weekday_only`。默认严格口径下，Qlib run 必须早于验证日 09:30，脚本才会把 Qlib 分数纳入排序；晚于这个时间的模型分数会标记为不可用，避免把事后生成的分数当成事前信号。若只是做事后研究对比，可以显式传 `--allow-backfilled-qlib`，报告会记录 `qlib_backfilled_allowed=true`，意思是“用了事后补跑的 Qlib 分数做研究比较”，不是证明当时盘前已经有这个信号。
 
+历史验证还会拒绝信号日 09:30 之后生成的同日 market-regime 文件，并回退到最近一个更早的安全文件；严格 Qlib cutoff 非空但无法解析时直接标记 Qlib 不可用，Markdown 会明确说明 Qlib 未参与调整。验证日在线快照只有 `trade_time >= 15:00:00` 才作为最终收盘证据，盘中或时间不可解析的快照会记录 `validation_status=provisional_intraday`，其 `validation_return_pct` 为 `null`，不进入命中率、收益统计或实际赢家排行；实际赢家只接受有限数值收益。滚动模式按每组交易日自动推导验证日，因此不会读取或校验单日模式的 `--validation-date`。
+
 `report_china_astock_indicators.py` 复用 `china-astock-quant/strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数，读取本地 cleaned 行情生成 `china_astock_indicator_report_latest.{json,md}`。这是只读研究报告，不连接券商、不读取账号密码、不自动下单。网页端和脚本端省略 `limit` 时都默认只抽样 50 只股票，避免误把“安全报告”跑成全市场重任务；需要扩大范围时必须显式填写数量上限。
 
 `report_qlib_research.py` 在 `/workflow` 中作为“Qlib 研究增强”的 6 个固定任务出现：模型效果深度解释、回测详细分解、多模型/多实验对比、因子挖掘辅助、滚动训练计划和风险模型集成诊断。每个网页按钮都固定传入对应 section，不能从网页提交任意 section 或 shell 命令。脚本读取本地 MLflow/Qlib 既有产物生成 `qlib_research_model_explainability_latest.{json,md}` 等报告；首版不重新训练、不计算无限制 SHAP、不接券商、不自动下单。
