@@ -5,10 +5,18 @@ import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
 import ResearchPage from '../ResearchPage';
 
-const { getResearchStatus, archiveExperimentRun, permanentlyDeleteExperimentRun } = vi.hoisted(() => ({
+const {
+  getResearchStatus,
+  archiveExperimentRun,
+  permanentlyDeleteExperimentRun,
+  submitQuantJob,
+  getQuantJob,
+} = vi.hoisted(() => ({
   getResearchStatus: vi.fn(),
   archiveExperimentRun: vi.fn(),
   permanentlyDeleteExperimentRun: vi.fn(),
+  submitQuantJob: vi.fn(),
+  getQuantJob: vi.fn(),
 }));
 
 vi.mock('../../api/research', () => ({
@@ -16,6 +24,13 @@ vi.mock('../../api/research', () => ({
     getStatus: () => getResearchStatus(),
     archiveExperimentRun: (runId: string) => archiveExperimentRun(runId),
     permanentlyDeleteExperimentRun: (runId: string) => permanentlyDeleteExperimentRun(runId),
+  },
+}));
+
+vi.mock('../../api/quant', () => ({
+  quantApi: {
+    submitJob: (jobType: string, params: Record<string, unknown>) => submitQuantJob(jobType, params),
+    getJob: (jobId: string) => getQuantJob(jobId),
   },
 }));
 
@@ -37,6 +52,8 @@ describe('ResearchPage', () => {
     getResearchStatus.mockReset();
     archiveExperimentRun.mockReset();
     permanentlyDeleteExperimentRun.mockReset();
+    submitQuantJob.mockReset();
+    getQuantJob.mockReset();
     getResearchStatus.mockResolvedValue({
       generatedAt: '2026-07-02T10:00:00+08:00',
       trainable: true,
@@ -541,7 +558,133 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText('Automated tests').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Browser execution').length).toBeGreaterThan(0);
     expect(screen.getAllByText('opencode review').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument();
     expect(screen.queryByText(/research\./)).not.toBeInTheDocument();
+  });
+
+  it('reruns the read-only data hygiene report and refreshes the displayed result', async () => {
+    const initialStatus = await getResearchStatus();
+    getResearchStatus.mockReset();
+    getResearchStatus
+      .mockResolvedValueOnce(initialStatus)
+      .mockResolvedValueOnce({
+        ...initialStatus,
+        dataHygiene: {
+          ...initialStatus.dataHygiene,
+          inventory: {
+            ...initialStatus.dataHygiene.inventory,
+            generatedAt: '2026-07-11T11:30:00+08:00',
+            officialEntries: 9,
+          },
+        },
+      });
+    submitQuantJob.mockResolvedValue({
+      jobId: 'hygiene-1',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:29:59+08:00',
+      artifactPaths: [],
+    });
+    getQuantJob.mockResolvedValue({
+      jobId: 'hygiene-1',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'completed',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:30:00+08:00',
+      completedAt: '2026-07-11T11:30:00+08:00',
+      artifactPaths: [],
+    });
+
+    renderResearchPage('zh');
+    fireEvent.click(await screen.findByRole('button', { name: '重新扫描' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_data_hygiene', {});
+      expect(getQuantJob).toHaveBeenCalledWith('hygiene-1');
+      expect(getResearchStatus).toHaveBeenCalledTimes(2);
+    });
+    expect(await screen.findByText('已更新')).toBeInTheDocument();
+    expect(screen.getByText('9')).toBeInTheDocument();
+  });
+
+  it('disables duplicate data hygiene submissions while the report is running', async () => {
+    submitQuantJob.mockResolvedValue({
+      jobId: 'hygiene-running',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:29:59+08:00',
+      artifactPaths: [],
+    });
+    getQuantJob.mockReturnValue(new Promise(() => undefined));
+
+    renderResearchPage('zh');
+    fireEvent.click(await screen.findByRole('button', { name: '重新扫描' }));
+
+    const runningButton = await screen.findByRole('button', { name: '扫描中' });
+    expect(runningButton).toBeDisabled();
+    fireEvent.click(runningButton);
+    expect(submitQuantJob).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the previous report visible when the data hygiene job fails', async () => {
+    submitQuantJob.mockResolvedValue({
+      jobId: 'hygiene-failed',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:29:59+08:00',
+      artifactPaths: [],
+    });
+    getQuantJob.mockResolvedValue({
+      jobId: 'hygiene-failed',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'failed',
+      error: '盘点脚本读取失败',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:30:00+08:00',
+      completedAt: '2026-07-11T11:30:00+08:00',
+      artifactPaths: [],
+    });
+
+    renderResearchPage('zh');
+    fireEvent.click(await screen.findByRole('button', { name: '重新扫描' }));
+
+    expect(await screen.findByText('重新扫描失败：盘点脚本读取失败')).toBeInTheDocument();
+    expect(screen.getByText('7,580,087')).toBeInTheDocument();
+    expect(getResearchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run data hygiene while the maintenance lock is active', async () => {
+    const lockedStatus = await getResearchStatus();
+    getResearchStatus.mockResolvedValueOnce({
+      ...lockedStatus,
+      dataHygiene: {
+        ...lockedStatus.dataHygiene,
+        maintenanceLock: {
+          ...lockedStatus.dataHygiene.maintenanceLock,
+          locked: true,
+        },
+      },
+    });
+
+    renderResearchPage('zh');
+
+    const button = await screen.findByRole('button', { name: '维护锁已锁定' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(submitQuantJob).not.toHaveBeenCalled();
   });
 
   it('falls back to static coverage items when the capability matrix is not returned', async () => {
