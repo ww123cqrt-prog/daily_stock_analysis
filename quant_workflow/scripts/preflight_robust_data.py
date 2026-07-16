@@ -47,6 +47,7 @@ REFERENCE_TABLES = {
     ),
 }
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+MEMBERSHIP_SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -115,6 +116,49 @@ def _read_membership(pit_dir: Path) -> tuple[pd.DataFrame, str | None]:
         membership["index_code"].astype(str).str.strip().str.upper()
     )
     return membership, None
+
+
+def _membership_source_provenance(
+    pit_dir: Path, start: pd.Timestamp, end: pd.Timestamp
+) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    path = pit_dir / MEMBERSHIP_SOURCE_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False, {"reason_code": "membership_source_missing"}, {}
+    except (OSError, json.JSONDecodeError):
+        return False, {"reason_code": "membership_source_invalid"}, {}
+    if not isinstance(raw, dict) or raw.get("selected") not in {
+        "jqdata",
+        "baostock",
+    }:
+        return False, {"reason_code": "membership_source_invalid"}, {}
+    date_range = raw.get("date_range")
+    indices = raw.get("indices")
+    try:
+        source_start = pd.Timestamp(date_range["start_date"]).normalize()
+        source_end = pd.Timestamp(date_range["end_date"]).normalize()
+    except (KeyError, TypeError, ValueError):
+        return False, {"reason_code": "membership_source_invalid"}, {}
+    if pd.isna(source_start) or pd.isna(source_end):
+        return False, {"reason_code": "membership_source_invalid"}, {}
+    expected_indices = {"csi300": "000300.XSHG", "csi500": "000905.XSHG"}
+    if indices != expected_indices or source_start > start or source_end < end:
+        return (
+            False,
+            {
+                "reason_code": "membership_source_range_incomplete",
+                "source_start": str(source_start.date()),
+                "source_end": str(source_end.date()),
+            },
+            {},
+        )
+    sanitized = {
+        key: raw[key]
+        for key in ("requested", "selected", "fallback_reason", "date_range", "indices")
+        if key in raw
+    }
+    return True, {"reason_code": None}, sanitized
 
 
 def _find_symbol_file(directory: Path, symbol: str) -> Path | None:
@@ -367,6 +411,19 @@ def run_preflight(
             membership_error or "PIT membership files are readable",
         )
     )
+    provenance_ok, provenance_details, membership_source = (
+        _membership_source_provenance(Path(pit_dir), start, end)
+    )
+    checks.append(
+        _check(
+            "membership_provenance",
+            provenance_ok,
+            "historical membership source and range are verified"
+            if provenance_ok
+            else "historical membership source is missing, invalid, or incomplete",
+            **provenance_details,
+        )
+    )
 
     invalid_membership_dates = (
         int(membership["date"].isna().sum()) if not membership.empty else 0
@@ -531,6 +588,7 @@ def run_preflight(
             "provider_dir": str(Path(provider_dir).resolve()),
             "reference_dir": str(Path(reference_dir).resolve()),
         },
+        "membership_source": membership_source,
         "summary": {
             "trading_days": len(expected_dates),
             "membership_coverage": membership_coverage,

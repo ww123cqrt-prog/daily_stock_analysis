@@ -23,6 +23,39 @@ def load_module():
     return module
 
 
+def test_membership_source_metadata_keeps_only_public_provenance(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    pit_dir = tmp_path / "pit"
+    pit_dir.mkdir()
+    (pit_dir / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": "2014-01-02",
+                    "end_date": "2026-07-16",
+                },
+                "indices": {
+                    "csi300": "000300.XSHG",
+                    "csi500": "000905.XSHG",
+                },
+                "private_path": "/Users/private/data",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = module._read_membership_source_metadata(pit_dir)
+
+    assert result["selected"] == "baostock"
+    assert result["fallback_reason"] == "jqdata_permission_denied"
+    assert "private_path" not in result
+
+
 def completed_artifact_state(module, root: Path, job) -> dict:
     prediction = root / f"{job.key}.parquet"
     model = root / f"{job.key}.pkl"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build point-in-time CSI300 + CSI500 membership from JQData."""
+"""Build point-in-time CSI300 + CSI500 membership from verified history."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ INDEX_SIZES = {CSI300: 300, CSI500: 500}
 EXPECTED_UNION_SIZE = 800
 DEFAULT_START_DATE = "2007-01-15"
 STATUS_FILENAME = "build_status_latest.json"
+SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
 TRANSACTION_JOURNAL_FILENAME = ".build_pit_csi800.transaction.json"
 REQUIRED_DAILY_COLUMNS = ("date", "symbol", "index_code")
 REQUIRED_INTERVAL_COLUMNS = ("symbol", "index_code", "start_date", "end_date")
@@ -75,11 +76,20 @@ class ExistingPartitionError(Exception):
         self.details = details
 
 
+class ProviderQueryError(Exception):
+    """A sanitized source-specific provider failure."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
 class JQDataProvider:
     """Small adapter that keeps the builder independent from the SDK in tests."""
 
     def __init__(self, jq_module: Any) -> None:
         self.jq_module = jq_module
+        self.source_name = "jqdata"
 
     def get_trading_days(self, start_date: date, end_date: date):
         return self.jq_module.get_trade_days(
@@ -89,6 +99,72 @@ class JQDataProvider:
 
     def get_index_members(self, index_code: str, on_date: date):
         return self.jq_module.get_index_stocks(index_code, date=on_date.isoformat())
+
+
+class BaostockProvider:
+    """Historical CSI membership adapter for the anonymous Baostock API."""
+
+    source_name = "baostock"
+
+    def __init__(self, baostock_module: Any) -> None:
+        self.baostock_module = baostock_module
+        login = baostock_module.login()
+        if str(getattr(login, "error_code", "0")) != "0":
+            raise ProviderQueryError("baostock_login_failed")
+        self._closed = False
+
+    @staticmethod
+    def _rows(result: Any) -> list[list[str]]:
+        if str(getattr(result, "error_code", "0")) != "0":
+            raise ProviderQueryError("baostock_fetch_failed")
+        rows: list[list[str]] = []
+        while result.next():
+            rows.append(result.get_row_data())
+        return rows
+
+    @staticmethod
+    def _symbol(value: Any) -> str:
+        parts = str(value).strip().upper().split(".", 1)
+        exchange = {"SH": "SH", "SZ": "SZ", "BJ": "BJ"}.get(parts[0])
+        code = parts[1] if len(parts) == 2 else ""
+        if exchange is None or not re.fullmatch(r"\d{6}", code):
+            raise ProviderQueryError("baostock_membership_invalid")
+        return f"{exchange}{code}"
+
+    def get_trading_days(self, start_date: date, end_date: date) -> list[date]:
+        rows = self._rows(
+            self.baostock_module.query_trade_dates(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+            )
+        )
+        try:
+            return [date.fromisoformat(row[0]) for row in rows if row[1] == "1"]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ProviderQueryError("baostock_calendar_invalid") from exc
+
+    def get_index_members(self, index_code: str, on_date: date) -> list[str]:
+        query_by_index = {
+            CSI300: self.baostock_module.query_hs300_stocks,
+            CSI500: self.baostock_module.query_zz500_stocks,
+        }
+        query = query_by_index.get(index_code)
+        if query is None:
+            raise ProviderQueryError("baostock_index_unsupported")
+        rows = self._rows(query(date=on_date.isoformat()))
+        try:
+            effective_dates = {date.fromisoformat(row[0]) for row in rows}
+            members = [self._symbol(row[1]) for row in rows]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ProviderQueryError("baostock_membership_invalid") from exc
+        if not effective_dates or any(value > on_date for value in effective_dates):
+            raise ProviderQueryError("baostock_membership_date_invalid")
+        return members
+
+    def close(self) -> None:
+        if not self._closed:
+            self.baostock_module.logout()
+            self._closed = True
 
 
 def default_output_dir() -> Path:
@@ -388,6 +464,8 @@ def _recover_transaction(
 
 
 def _reason_code_for_provider_error(exc: Exception) -> str:
+    if isinstance(exc, ProviderQueryError):
+        return exc.reason_code
     text = str(exc).lower()
     permission_markers = (
         "permission",
@@ -660,6 +738,7 @@ def _build_status(
     anomalies: Sequence[dict[str, Any]] = (),
     skipped_years: Sequence[int] = (),
     reason_code: str | None = None,
+    membership_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected = sorted(set(expected_dates))
     completed = sorted(set(completed_dates) & set(expected))
@@ -687,7 +766,68 @@ def _build_status(
     }
     if reason_code is not None:
         payload["reason_code"] = reason_code
+    if membership_source is not None:
+        payload["membership_source"] = dict(membership_source)
     return payload
+
+
+def _membership_source_payload(
+    provider: Any,
+    source_metadata: Mapping[str, Any] | None,
+    *,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    selected = str(getattr(provider, "source_name", "injected"))
+    payload = {
+        "requested": selected,
+        "selected": selected,
+        **dict(source_metadata or {}),
+        "date_range": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+        "indices": {
+            "csi300": CSI300,
+            "csi500": CSI500,
+        },
+    }
+    payload["selected"] = selected
+    return payload
+
+
+def _validate_existing_membership_source(
+    output_dir: Path, source_payload: Mapping[str, Any]
+) -> None:
+    daily_files = list((output_dir / "daily").glob("*.parquet"))
+    intervals_path = output_dir / "membership_intervals.parquet"
+    if not daily_files and not intervals_path.is_file():
+        return
+    source_path = output_dir / SOURCE_FILENAME
+    try:
+        existing = json.loads(source_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if source_payload.get("selected") not in {"jqdata", "baostock"}:
+            return
+        raise BuildBlocked("membership_source_provenance_missing") from None
+    except (OSError, json.JSONDecodeError):
+        raise BuildBlocked("membership_source_provenance_invalid") from None
+    existing_selected = existing.get("selected") if isinstance(existing, dict) else None
+    requested_selected = source_payload.get("selected")
+    if not isinstance(existing_selected, str) or not re.fullmatch(
+        r"[a-z][a-z0-9_]*", existing_selected
+    ):
+        raise BuildBlocked("membership_source_provenance_invalid")
+    if existing_selected != requested_selected:
+        raise BuildBlocked(
+            "membership_source_mismatch",
+            anomalies=[
+                {
+                    "stage": "source_provenance",
+                    "reason_code": "membership_source_mismatch",
+                }
+            ],
+        )
 
 
 def _blocked_from_provider_error(
@@ -724,8 +864,16 @@ def _build_pit_csi800_locked(
     force: bool = False,
     as_of_date: date | None = None,
     status_path: Path | None = None,
+    source_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     calendar_limit = date.today() if as_of_date is None else as_of_date
+    source_payload = _membership_source_payload(
+        provider,
+        source_metadata,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    _validate_existing_membership_source(output_dir, source_payload)
     try:
         raw_trading_days = provider.get_trading_days(start_date, end_date)
         trading_days = _normalize_trading_days(raw_trading_days, start_date, end_date)
@@ -937,8 +1085,11 @@ def _build_pit_csi800_locked(
         expected_dates=trading_days,
         completed_dates=completed_dates,
         skipped_years=skipped_years,
+        membership_source=source_payload,
     )
-    status_payloads = {} if status_path is None else {status_path: status}
+    status_payloads = {output_dir / SOURCE_FILENAME: source_payload}
+    if status_path is not None:
+        status_payloads[status_path] = status
 
     try:
         all_daily = _combine_daily_partitions(
@@ -1024,6 +1175,7 @@ def build_pit_csi800(
     force: bool = False,
     as_of_date: date | None = None,
     status_path: Path | None = None,
+    source_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     with _exclusive_transaction_locks(output_dir, status_path):
         if (
@@ -1044,6 +1196,7 @@ def build_pit_csi800(
                 force=force,
                 as_of_date=as_of_date,
                 status_path=status_path,
+                source_metadata=source_metadata,
             )
         except BuildBlocked as exc:
             if status_path is not None:
@@ -1057,6 +1210,12 @@ def build_pit_csi800(
                         anomalies=exc.anomalies,
                         skipped_years=exc.skipped_years,
                         reason_code=exc.reason_code,
+                        membership_source=_membership_source_payload(
+                            provider,
+                            source_metadata,
+                            start_date=start_date,
+                            end_date=end_date,
+                        ),
                     ),
                     status_path,
                 )
@@ -1070,13 +1229,19 @@ def build_pit_csi800(
                         end_date,
                         reason_code="build_failed",
                         anomalies=[{"stage": "build", "reason_code": "build_failed"}],
+                        membership_source=_membership_source_payload(
+                            provider,
+                            source_metadata,
+                            start_date=start_date,
+                            end_date=end_date,
+                        ),
                     ),
                     status_path,
                 )
             raise
 
 
-def _create_default_provider(
+def _create_jqdata_provider(
     jq_module: Any | None,
     environ: MutableMapping[str, str] | None,
 ) -> JQDataProvider:
@@ -1094,6 +1259,74 @@ def _create_default_provider(
     return JQDataProvider(jq)
 
 
+def _load_baostock_module() -> Any:
+    import baostock
+
+    return baostock
+
+
+def _create_baostock_provider(baostock_module: Any | None) -> BaostockProvider:
+    try:
+        module = _load_baostock_module() if baostock_module is None else baostock_module
+        return BaostockProvider(module)
+    except ProviderQueryError as exc:
+        raise BuildBlocked(exc.reason_code) from None
+    except Exception as exc:
+        raise BuildBlocked("baostock_sdk_unavailable") from exc
+
+
+def _probe_historical_membership(provider: Any, probe_date: date) -> None:
+    try:
+        csi300 = provider.get_index_members(CSI300, probe_date)
+        csi500 = provider.get_index_members(CSI500, probe_date)
+        build_daily_membership(probe_date, csi300, csi500)
+    except MembershipValidationError as exc:
+        raise BuildBlocked(
+            "membership_validation_failed", anomalies=[exc.details]
+        ) from None
+    except Exception as exc:
+        raise BuildBlocked(_reason_code_for_provider_error(exc)) from None
+
+
+def _create_membership_provider(
+    *,
+    requested_source: str,
+    probe_date: date,
+    jq_module: Any | None,
+    baostock_module: Any | None,
+    environ: MutableMapping[str, str] | None,
+) -> tuple[Any, dict[str, str]]:
+    if requested_source == "jqdata":
+        return _create_jqdata_provider(jq_module, environ), {
+            "requested": "jqdata",
+            "selected": "jqdata",
+        }
+    if requested_source == "baostock":
+        return _create_baostock_provider(baostock_module), {
+            "requested": "baostock",
+            "selected": "baostock",
+        }
+    if requested_source != "auto":
+        raise BuildBlocked("membership_source_invalid")
+
+    fallback_reason: str | None = None
+    try:
+        jq_provider = _create_jqdata_provider(jq_module, environ)
+        _probe_historical_membership(jq_provider, probe_date)
+        return jq_provider, {"requested": "auto", "selected": "jqdata"}
+    except BuildBlocked as exc:
+        if not exc.reason_code.startswith("jqdata_"):
+            raise
+        fallback_reason = exc.reason_code
+
+    baostock_provider = _create_baostock_provider(baostock_module)
+    return baostock_provider, {
+        "requested": "auto",
+        "selected": "baostock",
+        "fallback_reason": str(fallback_reason),
+    }
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build point-in-time CSI800 historical membership."
@@ -1108,6 +1341,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="Directory for build_status_latest.json; defaults to --output-dir.",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--membership-source",
+        choices=("auto", "jqdata", "baostock"),
+        default="auto",
+        help="Historical membership source. Auto prefers JQData and falls back to Baostock only when JQData is unavailable.",
+    )
     return parser
 
 
@@ -1133,6 +1372,7 @@ def main(
     *,
     provider: Any | None = None,
     jq_module: Any | None = None,
+    baostock_module: Any | None = None,
     environ: MutableMapping[str, str] | None = None,
     today: date | None = None,
 ) -> int:
@@ -1185,11 +1425,20 @@ def main(
         return BLOCKED_RETURN_CODE
 
     try:
-        active_provider = (
-            provider
-            if provider is not None
-            else _create_default_provider(jq_module, environ)
-        )
+        if provider is not None:
+            active_provider = provider
+            source_metadata = {
+                "requested": "injected",
+                "selected": str(getattr(provider, "source_name", "injected")),
+            }
+        else:
+            active_provider, source_metadata = _create_membership_provider(
+                requested_source=args.membership_source,
+                probe_date=start_date,
+                jq_module=jq_module,
+                baostock_module=baostock_module,
+                environ=environ,
+            )
     except BuildBlocked as exc:
         status = _build_status(
             "blocked_data",
@@ -1210,6 +1459,7 @@ def main(
             force=args.force,
             as_of_date=current_date,
             status_path=status_path,
+            source_metadata=source_metadata,
         )
     except BuildBlocked as exc:
         print(f"ERROR: blocked_data ({exc.reason_code})", file=sys.stderr)
@@ -1217,6 +1467,13 @@ def main(
     except Exception:
         print("ERROR: blocked_data (build_failed)", file=sys.stderr)
         return BLOCKED_RETURN_CODE
+    finally:
+        close = getattr(active_provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                print("WARNING: membership provider logout failed", file=sys.stderr)
 
     print(
         f"PIT CSI800 build completed: {status['completed_date_count']} trading dates; "

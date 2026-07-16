@@ -89,6 +89,11 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
         for stage in stages
     )
     joined = " ".join(part for stage in stages for part in stage.argv)
+    membership_stage = stages[0]
+    assert (
+        membership_stage.argv[membership_stage.argv.index("--membership-source") + 1]
+        == "auto"
+    )
     assert "candidate_pipeline_latest" not in joined
     assert "latest_training_result" not in joined
 

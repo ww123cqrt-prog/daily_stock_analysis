@@ -81,6 +81,23 @@ def build_small_valid_fixture(root: Path) -> tuple[Path, Path, Path]:
     ).to_frame(index=False)
     membership["index_code"] = ["000300.XSHG", "000905.XSHG"] * len(dates)
     membership.to_parquet(pit_dir / "daily" / "2026.parquet", index=False)
+    (pit_dir / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "date_range": {
+                    "start_date": dates[0],
+                    "end_date": dates[-1],
+                },
+                "indices": {
+                    "csi300": "000300.XSHG",
+                    "csi500": "000905.XSHG",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     price_dir = root / "parquet" / "ashare_1d" / "cleaned"
     for symbol in symbols:
@@ -128,6 +145,32 @@ def test_preflight_passes_complete_fixture_with_configurable_expected_members(
     assert result["summary"]["membership_coverage"] == 1.0
     assert result["summary"]["ohlcv_coverage"] == 1.0
     assert all(check["passed"] for check in result["checks"])
+
+
+def test_preflight_blocks_membership_without_valid_source_provenance(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, provider = build_small_valid_fixture(tmp_path)
+    (pit_dir / "MEMBERSHIP_SOURCE.json").unlink()
+
+    result = module.run_preflight(
+        pit_dir=pit_dir,
+        price_dir=price_dir,
+        provider_dir=provider,
+        reference_dir=tmp_path / "reference",
+        start_date="2026-01-05",
+        end_date="2026-01-06",
+        as_of_date="2026-01-06",
+        expected_members_per_day=2,
+    )
+
+    check = next(
+        item for item in result["checks"] if item["id"] == "membership_provenance"
+    )
+    assert result["status"] == "blocked_data"
+    assert check["passed"] is False
+    assert check["details"]["reason_code"] == "membership_source_missing"
 
 
 def test_preflight_blocks_when_benchmark_and_metadata_are_missing(

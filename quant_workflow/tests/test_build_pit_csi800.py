@@ -45,6 +45,8 @@ def normalized_daily_membership(dates: list[str]) -> pd.DataFrame:
 
 
 class FakeProvider:
+    source_name = "test_fixture"
+
     def __init__(
         self,
         trading_days: list[str],
@@ -256,9 +258,200 @@ def test_builds_normalized_daily_membership_intervals_and_separate_status(
     assert status["completed_date_count"] == 2
     assert status["missing_summary"]["count"] == 0
     assert status["anomaly_summary"]["count"] == 0
+    assert status["membership_source"]["selected"] == "test_fixture"
+    source = json.loads(
+        (output_dir / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
+    )
+    assert source["selected"] == "test_fixture"
+    assert source["date_range"] == {
+        "start_date": "2025-01-02",
+        "end_date": "2025-01-03",
+    }
     assert not (output_dir / "build_status_latest.json").exists()
     assert not (status_dir / "daily").exists()
     assert not (status_dir / "membership_intervals.parquet").exists()
+
+
+def test_baostock_provider_reads_historical_calendar_and_members() -> None:
+    module = load_module()
+
+    class Result:
+        error_code = "0"
+        error_msg = "success"
+
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.offset = 0
+
+        def next(self):
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.member_calls = []
+            self.logged_out = False
+
+        def login(self):
+            return type("Login", (), {"error_code": "0", "error_msg": "success"})()
+
+        def logout(self):
+            self.logged_out = True
+
+        def query_trade_dates(self, *, start_date, end_date):
+            assert (start_date, end_date) == ("2014-01-01", "2014-01-03")
+            return Result(
+                [
+                    ["2014-01-01", "0"],
+                    ["2014-01-02", "1"],
+                    ["2014-01-03", "1"],
+                ]
+            )
+
+        def query_hs300_stocks(self, *, date):
+            self.member_calls.append(("csi300", date))
+            return Result([["2013-12-30", "sh.600000", "name"]])
+
+        def query_zz500_stocks(self, *, date):
+            self.member_calls.append(("csi500", date))
+            return Result([["2013-12-30", "sz.000001", "name"]])
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    days = provider.get_trading_days(date(2014, 1, 1), date(2014, 1, 3))
+    csi300 = provider.get_index_members(CSI300, date(2014, 1, 2))
+    csi500 = provider.get_index_members(CSI500, date(2014, 1, 2))
+    provider.close()
+
+    assert days == [date(2014, 1, 2), date(2014, 1, 3)]
+    assert csi300 == ["SH600000"]
+    assert csi500 == ["SZ000001"]
+    assert fake.member_calls == [
+        ("csi300", "2014-01-02"),
+        ("csi500", "2014-01-02"),
+    ]
+    assert fake.logged_out is True
+
+
+def test_auto_source_falls_back_to_baostock_after_jqdata_permission_denial() -> None:
+    module = load_module()
+
+    class FakeJQData:
+        def auth(self, username, password):
+            assert username == "user"
+            assert password == "password"
+
+        def is_auth(self):
+            return True
+
+        def get_index_stocks(self, index_code, *, date):
+            raise PermissionError("historical membership denied")
+
+    class Result:
+        error_code = "0"
+        error_msg = "success"
+
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.offset = 0
+
+        def next(self):
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def login(self):
+            return type("Login", (), {"error_code": "0", "error_msg": "success"})()
+
+        def logout(self):
+            return None
+
+        def query_hs300_stocks(self, *, date):
+            return Result(
+                [
+                    ["2013-12-30", f"sh.{600000 + offset:06d}", "name"]
+                    for offset in range(300)
+                ]
+            )
+
+        def query_zz500_stocks(self, *, date):
+            return Result(
+                [
+                    ["2013-12-30", f"sz.{1 + offset:06d}", "name"]
+                    for offset in range(500)
+                ]
+            )
+
+    provider, metadata = module._create_membership_provider(
+        requested_source="auto",
+        probe_date=date(2014, 1, 2),
+        jq_module=FakeJQData(),
+        baostock_module=FakeBaostock(),
+        environ={"JQ_USERNAME": "user", "JQ_PASSWORD": "password"},
+    )
+
+    assert isinstance(provider, module.BaostockProvider)
+    assert metadata == {
+        "requested": "auto",
+        "selected": "baostock",
+        "fallback_reason": "jqdata_permission_denied",
+    }
+    provider.close()
+
+
+def test_existing_membership_cannot_be_extended_with_a_different_source(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    first = FakeProvider(["2025-01-02", "2025-01-03"])
+    first.source_name = "jqdata"
+    return_code, output_dir, status_dir = run_main(
+        module,
+        tmp_path,
+        first,
+        start_date="2025-01-02",
+        end_date="2025-01-02",
+    )
+    assert return_code == 0
+    daily_before = (output_dir / "daily" / "2025.parquet").read_bytes()
+    source_before = (output_dir / "MEMBERSHIP_SOURCE.json").read_bytes()
+
+    second = FakeProvider(["2025-01-02", "2025-01-03"])
+    second.source_name = "baostock"
+    return_code = module.main(
+        [
+            "--start-date",
+            "2025-01-03",
+            "--end-date",
+            "2025-01-03",
+            "--output-dir",
+            str(output_dir),
+            "--status-out-dir",
+            str(status_dir),
+        ],
+        provider=second,
+        today=date(2025, 12, 31),
+    )
+    status = json.loads(
+        (status_dir / "build_status_latest.json").read_text(encoding="utf-8")
+    )
+
+    assert return_code == 2
+    assert status["reason_code"] == "membership_source_mismatch"
+    assert second.member_calls == []
+    assert (output_dir / "daily" / "2025.parquet").read_bytes() == daily_before
+    assert (output_dir / "MEMBERSHIP_SOURCE.json").read_bytes() == source_before
 
 
 def test_default_output_and_status_directory_follow_quant_data_root(

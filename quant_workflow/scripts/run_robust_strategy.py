@@ -89,6 +89,12 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("safety.long_only must remain true")
     if payload.get("universe", {}).get("kind") != "pit_csi800":
         raise ValueError("universe.kind must remain pit_csi800")
+    if payload.get("universe", {}).get("membership_source") not in {
+        "auto",
+        "jqdata",
+        "baostock",
+    }:
+        raise ValueError("universe.membership_source must be a verified PIT source")
     if payload.get("statuses") != [
         "blocked_data",
         "development_failed",
@@ -179,6 +185,8 @@ def build_stages(
                     str(pit_dir),
                     "--status-out-dir",
                     str(report_dir),
+                    "--membership-source",
+                    str(universe["membership_source"]),
                 ],
             )
         )

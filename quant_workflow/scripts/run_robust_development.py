@@ -822,6 +822,31 @@ def _read_provider_state(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _read_membership_source_metadata(pit_dir: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(
+            (Path(pit_dir) / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("selected") not in {
+        "jqdata",
+        "baostock",
+    }:
+        return {}
+    return {
+        key: copy.deepcopy(raw[key])
+        for key in (
+            "requested",
+            "selected",
+            "fallback_reason",
+            "date_range",
+            "indices",
+        )
+        if key in raw
+    }
+
+
 def _failure(reason_code: str, *, as_of_date: str) -> dict[str, Any]:
     return {
         "status": "development_failed",
@@ -1124,6 +1149,7 @@ def _run_development_impl(
     )
     paths = config["paths"]
     pit_dir = quant_data_dir / paths["pit_membership"]
+    membership_source_metadata = _read_membership_source_metadata(pit_dir)
     reference_dir = quant_data_dir / Path(paths["security_master"]).parent
     price_dir = quant_data_dir / paths["price_parquet"]
     market = market_loader(
@@ -1191,6 +1217,7 @@ def _run_development_impl(
         "data_manifest_path": str(manifest_path),
         "data_manifest_hash": initial_manifest_hash,
         "membership_source": str(pit_dir / "membership_intervals.parquet"),
+        "membership_source_metadata": membership_source_metadata,
         "provider_uri": str(provider_uri),
         "provider_key": provider_key,
         "training_job_count": len(jobs),
@@ -1230,6 +1257,7 @@ def _run_development_impl(
             "git_commit": payload["git_commit"],
             "data_manifest_hash": payload["data_manifest_hash"],
             "membership_source": payload["membership_source"],
+            "membership_source_metadata": payload["membership_source_metadata"],
             "provider_uri": payload["provider_uri"],
             "provider_key": payload["provider_key"],
             "selected_models": selected_ids,
