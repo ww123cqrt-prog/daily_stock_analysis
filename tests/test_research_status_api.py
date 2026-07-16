@@ -34,6 +34,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             cleaning_strategy_path = Path(temp_dir) / "data_cleaning_strategy_latest.md"
             quant_data_root = Path(temp_dir) / "quant_data"
             quant_data_root.mkdir()
+            projects_root = Path(temp_dir) / "WorkingProjects"
             manifest_path = quant_data_root / "DATA_MANIFEST.json"
             readme_path = quant_data_root / "README.md"
             status_path.write_text(
@@ -123,8 +124,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                         "actions": [
                             {
                                 "action": "archive",
-                                "source": "/Users/cq/WorkingProjects/quant_data/qlib/cn_data",
-                                "destination": "/Users/cq/WorkingProjects/quant_data/archive/qlib/cn_data",
+                                "source": str(projects_root / "quant_data" / "qlib" / "cn_data"),
+                                "destination": str(projects_root / "quant_data" / "archive" / "qlib" / "cn_data"),
                                 "reason": "旧测试 provider，不是当前正式入口。",
                                 "risk": "可能影响旧实验复现。",
                                 "requires_user_confirmation": True,
@@ -195,6 +196,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             with (
                 patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path),
                 patch("api.v1.endpoints.research_status.QUANT_DATA_ROOT", quant_data_root),
+                patch("api.v1.endpoints.research_status.PROJECTS_ROOT", projects_root),
                 patch.dict(os.environ, {"MLFLOW_URL": "http://127.0.0.1:6106/"}, clear=False),
             ):
                 client = TestClient(create_app(static_dir=static_dir), headers={"Origin": "http://127.0.0.1:8010"})
@@ -247,7 +249,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["data_hygiene"]["manifest"]["official_entries"], 2)
         self.assertEqual(body["data_hygiene"]["readme"]["status"], "available")
         self.assertNotIn(str(temp_dir), json.dumps(body["data_hygiene"], ensure_ascii=False))
-        self.assertNotIn("/Users/cq/", json.dumps(body["data_hygiene"], ensure_ascii=False))
+        self.assertNotIn(str(projects_root), json.dumps(body["data_hygiene"], ensure_ascii=False))
         self.assertEqual(body["qlib_research"]["status"], "available")
         self.assertEqual(body["qlib_research"]["available_sections"], 1)
         self.assertEqual(

@@ -20,7 +20,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
+from src.services.quant_job_service import QUANT_WORKFLOW_PYTHON, QuantJob, QuantJobService, REPORTS_ROOT
 
 
 class _FakeHTTPResponse:
@@ -240,8 +240,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
             csi300 = service._build_command("generate_csi300", {})
             benchmark = service._build_command("add_index_benchmark", {})
 
-        self.assertTrue(csi300[0].endswith("daily_stock_analysis/.venv/bin/python"), csi300)
-        self.assertTrue(benchmark[0].endswith("daily_stock_analysis/.venv/bin/python"), benchmark)
+        self.assertEqual(csi300[0], str(QUANT_WORKFLOW_PYTHON), csi300)
+        self.assertEqual(benchmark[0], str(QUANT_WORKFLOW_PYTHON), benchmark)
         self.assertIn("generate_csi300.py", csi300[1])
         self.assertIn("add_index_benchmark.py", benchmark[1])
         self.assertIn("--dry-run", csi300)
@@ -305,7 +305,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 service._build_command("report_workbench_capabilities", {"start_training": True})
 
-        self.assertTrue(command[0].endswith("daily_stock_analysis/.venv/bin/python"), command)
+        self.assertEqual(command[0], str(QUANT_WORKFLOW_PYTHON), command)
         self.assertIn("report_workbench_capabilities.py", command[1])
         self._assert_reports_dir_arg(command)
         self.assertEqual(available["report_workbench_capabilities"]["allowed_params"], [])
@@ -369,7 +369,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         for job_type, (section, _params) in expected_sections.items():
             command = commands[job_type]
-            self.assertTrue(command[0].endswith("daily_stock_analysis/.venv/bin/python"), command)
+            self.assertEqual(command[0], str(QUANT_WORKFLOW_PYTHON), command)
             self.assertIn("report_qlib_research.py", command[1])
             self._assert_reports_dir_arg(command)
             self.assertEqual(command[command.index("--section") + 1], section)
