@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -57,10 +57,17 @@ LATEST_TRAINING_RESULT_FILENAME = "latest_training_result.json"
 CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
 CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
+ROBUST_STRATEGY_DIRNAME = "robust_strategy"
 QLIB_RESEARCH_REPORTS = {
-    "model_explainability": ("模型效果深度解释", "qlib_research_model_explainability_latest.json"),
+    "model_explainability": (
+        "模型效果深度解释",
+        "qlib_research_model_explainability_latest.json",
+    ),
     "backtest_detail": ("回测详细分解", "qlib_research_backtest_detail_latest.json"),
-    "model_comparison": ("多模型/多实验对比", "qlib_research_model_comparison_latest.json"),
+    "model_comparison": (
+        "多模型/多实验对比",
+        "qlib_research_model_comparison_latest.json",
+    ),
     "factor_analysis": ("因子挖掘辅助", "qlib_research_factor_analysis_latest.json"),
     "rolling_training": ("滚动训练计划", "qlib_research_rolling_training_latest.json"),
     "risk_model": ("风险模型集成诊断", "qlib_research_risk_model_latest.json"),
@@ -71,6 +78,10 @@ DIRECTORY_SIZE_CACHE_TTL_SECONDS = 60.0
 DIRECTORY_SIZE_SCAN_MAX_ENTRIES = 50000
 DIRECTORY_SIZE_SCAN_MAX_SECONDS = 0.5
 CLEANUP_ACTION_PREVIEW_LIMIT = 50
+ROBUST_REPORT_MAX_BYTES = 8 * 1024 * 1024
+ROBUST_LIST_PREVIEW_LIMIT = 100
+ROBUST_MAPPING_PREVIEW_LIMIT = 100
+ROBUST_TREE_MAX_DEPTH = 8
 TONGHUASHUN_CANDIDATE_PATHS = (
     Path("/Applications/同花顺.app"),
     Path("/Applications/同花顺远航版.app"),
@@ -90,7 +101,9 @@ def _lock_experiment_handle(lock_handle) -> None:
     if fcntl is not None:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         return
-    if msvcrt is not None:  # pragma: no cover - covered through patched fallback tests on non-Windows.
+    if (
+        msvcrt is not None
+    ):  # pragma: no cover - covered through patched fallback tests on non-Windows.
         lock_handle.seek(0, os.SEEK_END)
         if lock_handle.tell() == 0:
             lock_handle.write("0")
@@ -103,7 +116,9 @@ def _unlock_experiment_handle(lock_handle) -> None:
     if fcntl is not None:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         return
-    if msvcrt is not None:  # pragma: no cover - covered through patched fallback tests on non-Windows.
+    if (
+        msvcrt is not None
+    ):  # pragma: no cover - covered through patched fallback tests on non-Windows.
         lock_handle.seek(0)
         msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
 
@@ -160,6 +175,39 @@ def _file_mtime_iso(path: Path) -> Optional[str]:
         return None
 
 
+def _read_robust_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if path.stat().st_size > ROBUST_REPORT_MAX_BYTES:
+            return {
+                "status": "invalid",
+                "reason_code": "report_too_large",
+                "generated_at": _file_mtime_iso(path),
+            }
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return _read_json_object(path)
+
+
+def _robust_report_timestamp(path: Path, payload: Dict[str, Any]) -> float:
+    for key in ("updated_at", "generated_at", "created_at"):
+        raw = payload.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _latest_training_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
     return _read_json_object(reports_dir / LATEST_TRAINING_RESULT_FILENAME)
 
@@ -205,6 +253,436 @@ def _candidate_pipeline_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
     return _sanitize_public_tree(payload)
 
 
+ROBUST_PRIVATE_KEYS = {
+    "argv",
+    "command",
+    "commands",
+    "observations",
+    "artifacts",
+    "model_artifacts",
+}
+ROBUST_METRIC_KEYS = {
+    "annual_return",
+    "benchmark_annual_return",
+    "annual_excess_return",
+    "information_ratio",
+    "sharpe",
+    "max_drawdown",
+    "maximum_drawdown",
+    "average_turnover",
+    "rank_ic",
+    "rank_ic_mean",
+    "days",
+    "trading_days",
+    "portfolio_return",
+    "benchmark_return",
+    "net_excess_return",
+    "task_success_ratio",
+    "first_date",
+    "last_date",
+    "quarter",
+    "market_regime",
+    "regime",
+}
+
+
+def _sanitize_robust_tree(value: Any, *, _depth: int = 0) -> Any:
+    if _depth >= ROBUST_TREE_MAX_DEPTH:
+        return "[truncated]"
+    if isinstance(value, dict):
+        result = {}
+        items = list(value.items())
+        for key, item in items[:ROBUST_MAPPING_PREVIEW_LIMIT]:
+            normalized = str(key).lower()
+            if (
+                normalized in ROBUST_PRIVATE_KEYS
+                or normalized.endswith("_path")
+                or normalized.endswith("_uri")
+                or normalized in {"path", "uri"}
+            ):
+                continue
+            result[key] = _sanitize_robust_tree(item, _depth=_depth + 1)
+        if len(items) > ROBUST_MAPPING_PREVIEW_LIMIT:
+            result["_truncated"] = True
+            result["_total"] = len(items)
+        return result
+    if isinstance(value, list):
+        result = [
+            _sanitize_robust_tree(item, _depth=_depth + 1)
+            for item in value[:ROBUST_LIST_PREVIEW_LIMIT]
+        ]
+        if len(value) > ROBUST_LIST_PREVIEW_LIMIT:
+            result.append({"_truncated": True, "_total": len(value)})
+        return result
+    return _sanitize_public_tree(value)
+
+
+def _missing_robust_section() -> Dict[str, str]:
+    return {"status": "missing"}
+
+
+def _robust_metrics(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: _sanitize_robust_tree(value)
+        for key, value in raw.items()
+        if str(key) in ROBUST_METRIC_KEYS
+    }
+
+
+def _robust_verdict(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    result = {
+        key: _sanitize_robust_tree(raw[key])
+        for key in ("status", "passed", "remaining_days")
+        if key in raw
+    }
+    failed_gates = raw.get("failed_gates")
+    if isinstance(failed_gates, list):
+        result["failed_gates"] = _sanitize_robust_tree(
+            failed_gates[:ROBUST_LIST_PREVIEW_LIMIT]
+        )
+        result["failed_gates_total"] = len(failed_gates)
+        result["failed_gates_truncated"] = len(failed_gates) > ROBUST_LIST_PREVIEW_LIMIT
+    gates = raw.get("gates")
+    if isinstance(gates, dict):
+        gate_items = list(gates.items())[:ROBUST_MAPPING_PREVIEW_LIMIT]
+        result["gates"] = {
+            str(key): value for key, value in gate_items if isinstance(value, bool)
+        }
+        invalid_gates = [
+            str(key) for key, value in gate_items if not isinstance(value, bool)
+        ]
+        if invalid_gates:
+            result["invalid_gates"] = invalid_gates
+        result["gates_total"] = len(gates)
+        result["gates_truncated"] = len(gates) > ROBUST_MAPPING_PREVIEW_LIMIT
+    return result
+
+
+def _robust_model_stability(raw: Any) -> list[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw[:ROBUST_LIST_PREVIEW_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        stability = (
+            item.get("stability") if isinstance(item.get("stability"), dict) else {}
+        )
+        result.append(
+            {
+                key: value
+                for key, value in {
+                    "model_id": item.get("model_id"),
+                    "eligible": item.get("eligible"),
+                    "development_score": item.get("development_score"),
+                    "stability": {
+                        name: stability[name]
+                        for name in ("rank_correlation_median", "topk_overlap_mean")
+                        if name in stability
+                    },
+                }.items()
+                if value not in (None, {})
+            }
+        )
+    return _sanitize_robust_tree(result)
+
+
+def _robust_strategy_row(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    result: Dict[str, Any] = {}
+    if raw.get("strategy_id") is not None:
+        result["strategy_id"] = str(raw["strategy_id"])
+    acceptance = raw.get("acceptance")
+    if isinstance(acceptance, dict):
+        result["acceptance"] = {
+            key: _sanitize_robust_tree(acceptance[key])
+            for key in ("passed", "failed_gates")
+            if key in acceptance
+        }
+    for scenario in ("baseline", "stress", "delayed"):
+        section = raw.get(scenario)
+        if isinstance(section, dict):
+            result[scenario] = {"metrics": _robust_metrics(section.get("metrics"))}
+    quarter_metrics = raw.get("quarter_metrics")
+    if isinstance(quarter_metrics, list):
+        result["quarter_metrics"] = [
+            _robust_metrics(item)
+            for item in quarter_metrics[:ROBUST_LIST_PREVIEW_LIMIT]
+            if isinstance(item, dict)
+        ]
+        result["quarter_metrics_total"] = len(quarter_metrics)
+        result["quarter_metrics_truncated"] = (
+            len(quarter_metrics) > ROBUST_LIST_PREVIEW_LIMIT
+        )
+    regime_metrics = raw.get("regime_metrics")
+    if isinstance(regime_metrics, dict):
+        regime_items = list(regime_metrics.items())
+        result["regime_metrics"] = {
+            str(name): _robust_metrics(metrics)
+            for name, metrics in regime_items[:ROBUST_MAPPING_PREVIEW_LIMIT]
+            if isinstance(metrics, dict)
+        }
+        result["regime_metrics_total"] = len(regime_items)
+        result["regime_metrics_truncated"] = (
+            len(regime_items) > ROBUST_MAPPING_PREVIEW_LIMIT
+        )
+    return _sanitize_robust_tree(result)
+
+
+def _robust_strategy_matrix(raw: Any) -> list[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    return [
+        row
+        for item in raw[:ROBUST_LIST_PREVIEW_LIMIT]
+        if (row := _robust_strategy_row(item)) is not None
+    ]
+
+
+def _robust_shadow_daily_payload(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return _missing_robust_section()
+    result = {
+        key: _sanitize_robust_tree(raw[key])
+        for key in (
+            "status",
+            "reason_code",
+            "as_of",
+            "outcome",
+            "inference_success",
+            "appended_days",
+            "generated_at",
+            "state_status",
+            "error_type",
+        )
+        if key in raw
+    }
+    result["state_metrics"] = _robust_metrics(raw.get("state_metrics"))
+    return result
+
+
+def _robust_strategy_payload(reports_dir: Path) -> Dict[str, Any]:
+    robust_dir = reports_dir / ROBUST_STRATEGY_DIRNAME
+    orchestration_path = robust_dir / "robust_strategy_status_latest.json"
+    preflight_path = robust_dir / "preflight_latest.json"
+    development_path = robust_dir / "development_latest.json"
+    confirmation_path = robust_dir / "confirmation_latest.json"
+    shadow_path = robust_dir / "shadow_state_latest.json"
+    shadow_daily_path = robust_dir / "shadow_daily_latest.json"
+    orchestration = _read_robust_json_object(orchestration_path)
+    preflight_raw = _read_robust_json_object(preflight_path)
+    development_raw = _read_robust_json_object(development_path)
+    confirmation_raw = _read_robust_json_object(confirmation_path)
+    shadow_raw = _read_robust_json_object(shadow_path)
+    shadow_daily_raw = _read_robust_json_object(shadow_daily_path)
+    shadow_daily = _robust_shadow_daily_payload(shadow_daily_raw)
+    lifecycle_reports = [
+        (orchestration_path, orchestration),
+        (preflight_path, preflight_raw),
+        (development_path, development_raw),
+        (confirmation_path, confirmation_raw),
+        (shadow_path, shadow_raw),
+    ]
+    available_reports = [
+        (index, path, payload)
+        for index, (path, payload) in enumerate(lifecycle_reports)
+        if payload is not None
+    ]
+    primary_entry = max(
+        available_reports,
+        key=lambda item: (_robust_report_timestamp(item[1], item[2]), item[0]),
+        default=None,
+    )
+    primary_path = primary_entry[1] if primary_entry is not None else None
+    primary = primary_entry[2] if primary_entry is not None else None
+    if primary is None:
+        return {
+            "status": "missing",
+            "lifecycle_status": "not_started",
+            "stages": [],
+            "preflight": _missing_robust_section(),
+            "development": _missing_robust_section(),
+            "confirmation": _missing_robust_section(),
+            "shadow": _missing_robust_section(),
+            "shadow_daily": shadow_daily,
+            "mlflow_experiments": [
+                "robust_csi800_development",
+                "robust_csi800_confirmation",
+            ],
+        }
+
+    stages = []
+    stages_raw = (orchestration or {}).get("stages")
+    stages_status = (
+        "available"
+        if isinstance(stages_raw, dict)
+        else "invalid"
+        if stages_raw is not None
+        else "missing"
+    )
+    stage_items = list(stages_raw.items()) if isinstance(stages_raw, dict) else []
+    for name, raw in stage_items[:ROBUST_LIST_PREVIEW_LIMIT]:
+        if not isinstance(raw, dict):
+            continue
+        evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+        stages.append(
+            {
+                key: value
+                for key, value in {
+                    "name": str(name),
+                    "status": raw.get("status"),
+                    "started_at": raw.get("started_at"),
+                    "finished_at": raw.get("finished_at"),
+                    "return_code": raw.get("return_code"),
+                    "reason_code": evidence.get("reason_code"),
+                }.items()
+                if value is not None
+            }
+        )
+
+    if preflight_raw is None:
+        preflight: Dict[str, Any] = _missing_robust_section()
+    else:
+        preflight = {
+            key: _sanitize_robust_tree(preflight_raw[key])
+            for key in ("status", "reason_code", "generated_at", "as_of_date")
+            if key in preflight_raw
+        }
+        for field in ("summary", "checks"):
+            value = preflight_raw.get(field)
+            if isinstance(value, list):
+                preflight[field] = _sanitize_robust_tree(
+                    value[:ROBUST_LIST_PREVIEW_LIMIT]
+                )
+                preflight[f"{field}_total"] = len(value)
+                preflight[f"{field}_truncated"] = len(value) > ROBUST_LIST_PREVIEW_LIMIT
+            elif isinstance(value, dict):
+                items = list(value.items())
+                preflight[field] = _sanitize_robust_tree(
+                    dict(items[:ROBUST_MAPPING_PREVIEW_LIMIT])
+                )
+                preflight[f"{field}_total"] = len(items)
+                preflight[f"{field}_truncated"] = (
+                    len(items) > ROBUST_MAPPING_PREVIEW_LIMIT
+                )
+            elif value is not None:
+                preflight[field] = _sanitize_robust_tree(value)
+    if development_raw is None:
+        development: Dict[str, Any] = _missing_robust_section()
+    else:
+        development = {
+            key: _sanitize_robust_tree(development_raw[key])
+            for key in (
+                "status",
+                "reason_code",
+                "generated_at",
+                "as_of_date",
+                "run_id",
+                "training_job_count",
+                "selected_models",
+                "selected_strategy",
+            )
+            if key in development_raw
+        }
+        evaluation = (
+            development_raw.get("evaluation")
+            if isinstance(development_raw.get("evaluation"), dict)
+            else {}
+        )
+        model_reports = development_raw.get("model_reports")
+        strategies = evaluation.get("strategies")
+        development["model_stability"] = _robust_model_stability(model_reports)
+        development["model_stability_total"] = (
+            len(model_reports) if isinstance(model_reports, list) else 0
+        )
+        development["model_stability_truncated"] = (
+            isinstance(model_reports, list)
+            and len(model_reports) > ROBUST_LIST_PREVIEW_LIMIT
+        )
+        development["strategy_matrix"] = _robust_strategy_matrix(strategies)
+        development["strategy_matrix_total"] = (
+            len(strategies) if isinstance(strategies, list) else 0
+        )
+        development["strategy_matrix_truncated"] = (
+            isinstance(strategies, list) and len(strategies) > ROBUST_LIST_PREVIEW_LIMIT
+        )
+    if confirmation_raw is None:
+        confirmation: Dict[str, Any] = _missing_robust_section()
+    else:
+        confirmation = {
+            key: _sanitize_robust_tree(confirmation_raw[key])
+            for key in (
+                "status",
+                "reason_code",
+                "generated_at",
+                "run_id",
+                "confirmation_start",
+                "latest_signal_day",
+                "latest_market_day",
+                "selected_models",
+                "selected_strategy",
+            )
+            if key in confirmation_raw
+        }
+        confirmation["metrics"] = _robust_metrics(confirmation_raw.get("metrics"))
+        confirmation["verdict"] = _robust_verdict(confirmation_raw.get("verdict"))
+    if shadow_raw is None:
+        shadow: Dict[str, Any] = _missing_robust_section()
+    else:
+        shadow = {
+            key: _sanitize_robust_tree(shadow_raw[key])
+            for key in (
+                "status",
+                "confirmation_run_id",
+                "start_after",
+                "created_at",
+                "updated_at",
+            )
+            if key in shadow_raw
+        }
+        shadow["metrics"] = _robust_metrics(shadow_raw.get("metrics"))
+        shadow["verdict"] = _robust_verdict(shadow_raw.get("verdict"))
+    primary_updated_at = (
+        primary.get("updated_at")
+        or primary.get("generated_at")
+        or primary.get("created_at")
+        or (_file_mtime_iso(primary_path) if primary_path is not None else None)
+    )
+    result = {
+        key: value
+        for key, value in {
+            "status": primary.get("status") or "missing",
+            "lifecycle_status": primary.get("lifecycle_status")
+            or primary.get("status"),
+            "reason_code": primary.get("reason_code"),
+            "run_id": primary.get("run_id") or primary.get("confirmation_run_id"),
+            "current_stage": primary.get("current_stage"),
+            "failed_stage": primary.get("failed_stage"),
+            "updated_at": primary_updated_at,
+            "stages": stages,
+            "stages_status": stages_status,
+            "stages_total": len(stage_items),
+            "stages_truncated": len(stage_items) > ROBUST_LIST_PREVIEW_LIMIT,
+            "preflight": preflight,
+            "development": development,
+            "confirmation": confirmation,
+            "shadow": shadow,
+            "shadow_daily": shadow_daily,
+            "mlflow_experiments": [
+                "robust_csi800_development",
+                "robust_csi800_confirmation",
+            ],
+        }.items()
+        if value is not None
+    }
+    return _sanitize_robust_tree(result)
+
+
 def _qlib_research_payload(reports_dir: Path) -> Dict[str, Any]:
     sections: Dict[str, Any] = {}
     available_count = 0
@@ -233,7 +711,9 @@ def _qlib_research_payload(reports_dir: Path) -> Dict[str, Any]:
 
 
 def _mlflow_payload() -> Dict[str, Any]:
-    raw_url = os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
+    raw_url = (
+        os.environ.get("MLFLOW_URL", DEFAULT_MLFLOW_URL).strip() or DEFAULT_MLFLOW_URL
+    )
     payload = {
         "url": public_http_url(raw_url, DEFAULT_MLFLOW_URL),
         "status": "linked",
@@ -261,7 +741,9 @@ def _data_quality_summary_from_json(path: Path) -> Optional[Dict[str, Any]]:
     payload = _read_json_object(path)
     if not payload:
         return None
-    raw_summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+    raw_summary = (
+        payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+    )
     summary: Dict[str, Any] = {}
     for source_key, target_key in (
         ("stock_universe", "stock_universe"),
@@ -300,15 +782,16 @@ def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
         for prefix, key in prefixes.items():
             marker = f"{prefix}:"
             if clean.startswith(marker):
-                summary[key] = clean[len(marker):].strip()
+                summary[key] = clean[len(marker) :].strip()
                 break
     return summary or None
 
 
 def _data_quality_summary_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
-    return (
-        _data_quality_summary_from_json(reports_dir / "data_quality_report_latest.json")
-        or _data_quality_summary_from_markdown(reports_dir / "data_quality_report_latest.md")
+    return _data_quality_summary_from_json(
+        reports_dir / "data_quality_report_latest.json"
+    ) or _data_quality_summary_from_markdown(
+        reports_dir / "data_quality_report_latest.md"
     )
 
 
@@ -335,7 +818,10 @@ def _directory_size_mb(path: Path) -> Optional[float]:
                     path,
                 )
                 return None
-            if scanned_entries % 100 == 0 and time.monotonic() - started_at > DIRECTORY_SIZE_SCAN_MAX_SECONDS:
+            if (
+                scanned_entries % 100 == 0
+                and time.monotonic() - started_at > DIRECTORY_SIZE_SCAN_MAX_SECONDS
+            ):
                 logger.warning(
                     "Directory size scan exceeded %.2f seconds under %s; returning unknown size.",
                     DIRECTORY_SIZE_SCAN_MAX_SECONDS,
@@ -377,7 +863,9 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 def _is_trusted_qlib_provider_path(path: Path) -> bool:
     provider_path = _resolve_for_boundary(path)
     provider_root = _resolve_for_boundary(QLIB_PROVIDER_ROOT)
-    if provider_path == provider_root or not _is_relative_to(provider_path, provider_root):
+    if provider_path == provider_root or not _is_relative_to(
+        provider_path, provider_root
+    ):
         return False
     required_children = ("calendars", "instruments", "features")
     return all((provider_path / child).is_dir() for child in required_children)
@@ -406,7 +894,9 @@ def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
                 if line.strip()
             )
         if features_path.exists():
-            provider["feature_dirs"] = sum(1 for item in features_path.iterdir() if item.is_dir())
+            provider["feature_dirs"] = sum(
+                1 for item in features_path.iterdir() if item.is_dir()
+            )
     except OSError:
         return provider
 
@@ -416,8 +906,12 @@ def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
     return provider
 
 
-def _sync_qlib_provider_with_latest_training(payload: Dict[str, Any], latest_training: Dict[str, Any]) -> None:
-    provider_uri = latest_training.get("provider_uri") or latest_training.get("qlib_provider")
+def _sync_qlib_provider_with_latest_training(
+    payload: Dict[str, Any], latest_training: Dict[str, Any]
+) -> None:
+    provider_uri = latest_training.get("provider_uri") or latest_training.get(
+        "qlib_provider"
+    )
     if not isinstance(provider_uri, str) or not provider_uri.strip():
         return
 
@@ -492,7 +986,9 @@ def _tonghuashun_candidate_paths() -> list[Path]:
 
 
 def _tonghuashun_status_payload() -> Dict[str, Any]:
-    detected_path = next((path for path in _tonghuashun_candidate_paths() if path.exists()), None)
+    detected_path = next(
+        (path for path in _tonghuashun_candidate_paths() if path.exists()), None
+    )
     installed = detected_path is not None
     return {
         "name": "同花顺桌面端",
@@ -542,14 +1038,19 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
         for action in cleanup_plan_actions[:CLEANUP_ACTION_PREVIEW_LIMIT]:
             if not isinstance(action, dict):
                 continue
-            cleanup_actions.append({
-                "action": str(action.get("action") or ""),
-                "source": _public_path_label(action.get("source") or ""),
-                "destination": _public_path_label(action.get("destination") or "") or None,
-                "reason": str(action.get("reason") or ""),
-                "risk": str(action.get("risk") or "") or None,
-                "requires_confirmation": action.get("requires_user_confirmation", False),
-            })
+            cleanup_actions.append(
+                {
+                    "action": str(action.get("action") or ""),
+                    "source": _public_path_label(action.get("source") or ""),
+                    "destination": _public_path_label(action.get("destination") or "")
+                    or None,
+                    "reason": str(action.get("reason") or ""),
+                    "risk": str(action.get("risk") or "") or None,
+                    "requires_confirmation": action.get(
+                        "requires_user_confirmation", False
+                    ),
+                }
+            )
 
     quality_summary = _data_quality_summary_payload(reports_dir)
     inventory_counts = _data_hygiene_inventory_counts(inventory)
@@ -557,7 +1058,9 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
     return {
         "inventory": {
             "status": "available" if inventory else "missing",
-            "path": _public_path_label(inventory_path) if inventory_path.exists() else None,
+            "path": _public_path_label(inventory_path)
+            if inventory_path.exists()
+            else None,
             "generated_at": inventory.get("generated_at") if inventory else None,
             "official_entries": inventory_counts["official_entries"],
             "candidate_entries": inventory_counts["candidate_entries"],
@@ -566,9 +1069,13 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
         },
         "cleanup_plan": {
             "status": "available" if cleanup_plan else "missing",
-            "path": _public_path_label(cleanup_plan_path) if cleanup_plan_path.exists() else None,
+            "path": _public_path_label(cleanup_plan_path)
+            if cleanup_plan_path.exists()
+            else None,
             "generated_at": cleanup_plan.get("generated_at") if cleanup_plan else None,
-            "dry_run_only": cleanup_plan.get("dry_run_only", True) if cleanup_plan else True,
+            "dry_run_only": cleanup_plan.get("dry_run_only", True)
+            if cleanup_plan
+            else True,
             "total_actions": len(cleanup_plan_actions),
             "preview_limit": CLEANUP_ACTION_PREVIEW_LIMIT,
             "truncated": len(cleanup_plan_actions) > len(cleanup_actions),
@@ -576,18 +1083,26 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
         },
         "quality_report": {
             "status": "available" if quality_report_path.exists() else "missing",
-            "path": _public_path_label(quality_report_path) if quality_report_path.exists() else None,
+            "path": _public_path_label(quality_report_path)
+            if quality_report_path.exists()
+            else None,
             "summary": quality_summary,
         },
         "cleaning_strategy": {
             "status": "available" if cleaning_strategy_path.exists() else "missing",
-            "path": _public_path_label(cleaning_strategy_path) if cleaning_strategy_path.exists() else None,
+            "path": _public_path_label(cleaning_strategy_path)
+            if cleaning_strategy_path.exists()
+            else None,
         },
         "manifest": {
             "status": "available" if manifest else "missing",
-            "path": _public_path_label(manifest_path) if manifest_path.exists() else None,
+            "path": _public_path_label(manifest_path)
+            if manifest_path.exists()
+            else None,
             "generated_at": manifest.get("generated_at") if manifest else None,
-            "source_report": _public_path_label(manifest.get("source_report")) if manifest else None,
+            "source_report": _public_path_label(manifest.get("source_report"))
+            if manifest
+            else None,
             "official_entries": _collection_count(official_entries),
         },
         "readme": {
@@ -597,7 +1112,9 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
         "maintenance_lock": {
             "locked": maintenance_locked,
             "path": _public_path_label(maintenance_lock_path),
-            "updated_at": _file_mtime_iso(maintenance_lock_path) if maintenance_locked else None,
+            "updated_at": _file_mtime_iso(maintenance_lock_path)
+            if maintenance_locked
+            else None,
         },
     }
 
@@ -608,7 +1125,9 @@ def _collection_count(value: Any) -> int:
     return 0
 
 
-def _data_hygiene_inventory_counts(inventory: Optional[Dict[str, Any]]) -> Dict[str, int]:
+def _data_hygiene_inventory_counts(
+    inventory: Optional[Dict[str, Any]],
+) -> Dict[str, int]:
     if not inventory:
         return {
             "official_entries": 0,
@@ -692,15 +1211,25 @@ def _string_items(raw: Any) -> list[str]:
 
 
 def _capability_matrix_payload(external_tools: Dict[str, Any]) -> list[Dict[str, Any]]:
-    tonghuashun = external_tools.get("tonghuashun") if isinstance(external_tools, dict) else None
+    tonghuashun = (
+        external_tools.get("tonghuashun") if isinstance(external_tools, dict) else None
+    )
     tonghuashun = tonghuashun if isinstance(tonghuashun, dict) else {}
     tonghuashun_capabilities = _string_items(tonghuashun.get("capabilities"))
     tonghuashun_restrictions = _string_items(tonghuashun.get("restrictions"))
-    tonghuashun_summary = str(tonghuashun.get("summary") or "同花顺仅作为后续只读观察方向。")
-    tonghuashun_status = "read_only" if tonghuashun.get("status") == "available" or tonghuashun.get("installed") else "deferred"
+    tonghuashun_summary = str(
+        tonghuashun.get("summary") or "同花顺仅作为后续只读观察方向。"
+    )
+    tonghuashun_status = (
+        "read_only"
+        if tonghuashun.get("status") == "available" or tonghuashun.get("installed")
+        else "deferred"
+    )
     tonghuashun_browser = tonghuashun_summary
     if tonghuashun_capabilities:
-        tonghuashun_browser = f"{tonghuashun_browser} 能力：{'、'.join(tonghuashun_capabilities)}"
+        tonghuashun_browser = (
+            f"{tonghuashun_browser} 能力：{'、'.join(tonghuashun_capabilities)}"
+        )
 
     return [
         {
@@ -737,7 +1266,10 @@ def _capability_matrix_payload(external_tools: Dict[str, Any]) -> list[Dict[str,
             "browser": "网页可查看 Qlib 训练摘要、关键指标、MLflow 链接和回测入口",
             "review": "opencode复审通过",
             "next": "继续补模型质量、清仓信号和组合回测对比。",
-            "restrictions": ["不直接改造 Qlib 官方源码为主 UI", "MLflow 只作为实验原始记录页"],
+            "restrictions": [
+                "不直接改造 Qlib 官方源码为主 UI",
+                "MLflow 只作为实验原始记录页",
+            ],
         },
         {
             "id": "china_astock_quant_reuse",
@@ -1072,6 +1604,7 @@ def _missing_status_payload() -> Dict[str, Any]:
         "cash_control_backtest": _cash_control_backtest_payload(reports_dir),
         "qlib_predictions": _qlib_predictions_payload(reports_dir),
         "candidate_pipeline": _candidate_pipeline_payload(reports_dir),
+        "robust_strategy": _robust_strategy_payload(reports_dir),
         "experiment_notebook": _experiment_notebook_payload(reports_dir),
         "mlflow": _mlflow_payload(),
         "data_hygiene": _data_hygiene_payload(reports_dir),
@@ -1087,7 +1620,9 @@ def _remove_active_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, A
     runs_path = reports_dir / EXPERIMENT_RUNS_FILENAME
 
     if not runs_path.exists():
-        raise HTTPException(status_code=404, detail="Experiment runs file is not available.")
+        raise HTTPException(
+            status_code=404, detail="Experiment runs file is not available."
+        )
 
     remaining = []
     removed = None
@@ -1110,21 +1645,29 @@ def _remove_active_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, A
             else:
                 remaining.append(item)
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Experiment runs file could not be read: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Experiment runs file could not be read: {exc}"
+        ) from exc
 
     if removed is None:
-        raise HTTPException(status_code=404, detail=f"Experiment run {run_id} was not found.")
+        raise HTTPException(
+            status_code=404, detail=f"Experiment run {run_id} was not found."
+        )
 
     tmp_path = runs_path.with_suffix(runs_path.suffix + ".tmp")
     try:
         with tmp_path.open("w", encoding="utf-8") as handle:
             for item in remaining:
-                handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.write(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                )
             for line in invalid_lines:
                 handle.write(line + "\n")
         tmp_path.replace(runs_path)
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Experiment run could not be removed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Experiment run could not be removed: {exc}"
+        ) from exc
 
     return removed
 
@@ -1142,7 +1685,9 @@ def _archive_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, Any]:
             "deleted_from": EXPERIMENT_RUNS_FILENAME,
         }
         with deleted_runs_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(archived, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(archived, ensure_ascii=False, sort_keys=True) + "\n"
+            )
     except HTTPException:
         _restore_text_file(runs_path, *runs_snapshot)
         _restore_text_file(deleted_runs_path, *deleted_runs_snapshot)
@@ -1150,11 +1695,15 @@ def _archive_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, Any]:
     except Exception as exc:
         _restore_text_file(runs_path, *runs_snapshot)
         _restore_text_file(deleted_runs_path, *deleted_runs_snapshot)
-        raise HTTPException(status_code=500, detail=f"Experiment run could not be archived: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Experiment run could not be archived: {exc}"
+        ) from exc
     return archived
 
 
-def _find_marked_experiment_note_block(reports_dir: Path, run_id: str) -> Optional[Tuple[Path, str, int, int]]:
+def _find_marked_experiment_note_block(
+    reports_dir: Path, run_id: str
+) -> Optional[Tuple[Path, str, int, int]]:
     log_path = reports_dir / EXPERIMENT_LOG_FILENAME
     if not log_path.exists():
         return None
@@ -1165,7 +1714,9 @@ def _find_marked_experiment_note_block(reports_dir: Path, run_id: str) -> Option
     try:
         content = log_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Experiment log could not be read: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Experiment log could not be read: {exc}"
+        ) from exc
 
     start = content.find(start_marker)
     if start == -1:
@@ -1173,7 +1724,9 @@ def _find_marked_experiment_note_block(reports_dir: Path, run_id: str) -> Option
 
     end = content.find(end_marker, start + len(start_marker))
     if end == -1:
-        raise HTTPException(status_code=409, detail=f"Experiment note block for {run_id} is incomplete.")
+        raise HTTPException(
+            status_code=409, detail=f"Experiment note block for {run_id} is incomplete."
+        )
     end += len(end_marker)
     return log_path, content, start, end
 
@@ -1193,7 +1746,9 @@ def _remove_marked_experiment_note(reports_dir: Path, run_id: str) -> bool:
     try:
         _write_text_file_atomic(log_path, updated)
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Experiment log could not be updated: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Experiment log could not be updated: {exc}"
+        ) from exc
     return True
 
 
@@ -1203,7 +1758,10 @@ def _snapshot_text_file(path: Path) -> tuple[bool, str]:
     try:
         return True, path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"{path.name} could not be read before mutation: {exc}") from exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"{path.name} could not be read before mutation: {exc}",
+        ) from exc
 
 
 def _write_text_file_atomic(path: Path, content: str) -> None:
@@ -1263,6 +1821,7 @@ def build_research_status_payload() -> Dict[str, Any]:
         payload["cash_control_backtest"] = cash_control_backtest
     payload["qlib_predictions"] = _qlib_predictions_payload(reports_dir)
     payload["candidate_pipeline"] = _candidate_pipeline_payload(reports_dir)
+    payload["robust_strategy"] = _robust_strategy_payload(reports_dir)
     payload["qlib_research"] = _qlib_research_payload(reports_dir)
     payload["experiment_notebook"] = _experiment_notebook_payload(reports_dir)
     payload["mlflow"] = _mlflow_payload()
@@ -1289,7 +1848,9 @@ async def archive_experiment_run(run_id: str) -> Dict[str, Any]:
         removed = _archive_experiment_run(RESEARCH_STATUS_PATH.parent, run_id)
         return {
             "removed_run": removed,
-            "experiment_notebook": _experiment_notebook_payload(RESEARCH_STATUS_PATH.parent),
+            "experiment_notebook": _experiment_notebook_payload(
+                RESEARCH_STATUS_PATH.parent
+            ),
         }
 
 
@@ -1302,11 +1863,15 @@ async def delete_experiment_run(run_id: str) -> Dict[str, Any]:
 @router.delete("/experiments/{run_id}/permanent")
 async def permanently_delete_experiment_run(
     run_id: str,
-    confirm: str = Query("", description="Must be 'permanent' to confirm irreversible deletion."),
+    confirm: str = Query(
+        "", description="Must be 'permanent' to confirm irreversible deletion."
+    ),
 ) -> Dict[str, Any]:
     """Permanently remove one experiment run and its marked Markdown note block."""
     if confirm != "permanent":
-        raise HTTPException(status_code=400, detail="Permanent deletion requires confirm=permanent.")
+        raise HTTPException(
+            status_code=400, detail="Permanent deletion requires confirm=permanent."
+        )
 
     reports_dir = RESEARCH_STATUS_PATH.parent
     with _experiment_file_guard(reports_dir):

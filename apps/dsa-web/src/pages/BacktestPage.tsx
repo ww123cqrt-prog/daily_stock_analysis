@@ -9,6 +9,8 @@ import {
   type ResearchExperimentRun,
   type ResearchQlibPredictions,
   type ResearchCandidatePipeline,
+  type ResearchRobustMetricMap,
+  type ResearchRobustStrategy,
   type ResearchStatus,
 } from '../api/research';
 import type { ParsedApiError } from '../api/error';
@@ -453,6 +455,241 @@ const CandidatePipelineCard: React.FC<{
   );
 };
 
+function robustMetric(metrics: ResearchRobustMetricMap | undefined, key: string): number | null {
+  const value = metrics?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+const RobustStrategyCard: React.FC<{
+  report?: ResearchRobustStrategy | null;
+  text: BacktestText;
+}> = ({ report, text }) => {
+  if (!report) return null;
+  const english = text.tabQlib === 'Qlib model/strategy backtest';
+  const statusLabels: Record<string, string> = english
+    ? {
+        missing: 'Not started',
+        blocked_data: 'Blocked by data',
+        development_failed: 'Development failed',
+        research_candidate_ready: 'Research candidate frozen',
+        shadow_observation: '60-day shadow tracking',
+        robust_strategy_qualified: 'Robust strategy qualified',
+      }
+    : {
+        missing: '未启动',
+        blocked_data: '数据阻断',
+        development_failed: '开发未通过',
+        research_candidate_ready: '研究候选已冻结',
+        shadow_observation: '60日纸面跟踪中',
+        robust_strategy_qualified: '鲁棒策略合格',
+      };
+  const statusLabel = statusLabels[report.status] || report.status;
+  const statusVariant = report.status === 'robust_strategy_qualified'
+    ? 'success'
+    : report.status === 'development_failed'
+      ? 'danger'
+      : report.status === 'blocked_data'
+        ? 'warning'
+        : 'info';
+  const development = report.development;
+  const strategies = development?.strategyMatrix || [];
+  const selectedStrategy = strategies.find((item) => item.strategyId === development?.selectedStrategy)
+    || null;
+  const quarters = selectedStrategy?.quarterMetrics || [];
+  const regimes = Object.entries(selectedStrategy?.regimeMetrics || {});
+  const shadowDays = robustMetric(report.shadow?.metrics, 'tradingDays') ?? 0;
+  const remainingDays = report.shadow?.verdict?.remainingDays;
+  const shadowDailyFailed = report.shadowDaily?.status === 'development_failed';
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <span className="label-uppercase">Robust CSI800</span>
+          <h3 className="mt-2 text-sm font-semibold text-foreground">
+            {english ? 'Robustness matrix' : '鲁棒策略矩阵'}
+          </h3>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-text">
+            {english
+              ? 'Development selection, one-time 2026 confirmation, and future shadow observations are separate gates.'
+              : '开发期选型、2026 单次确认和未来纸面跟踪是三个独立门槛；前两项通过也不等于最终合格。'}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={statusVariant}>{statusLabel}</Badge>
+          <a href="/experiments/#/experiments" className="btn-secondary h-8 px-2.5 text-xs">
+            {english ? 'View robust experiments' : '查看鲁棒实验'}
+          </a>
+        </div>
+      </div>
+
+      {report.reasonCode ? (
+        <p className="mt-3 break-words font-mono text-xs text-warning">{report.reasonCode}</p>
+      ) : null}
+
+      {report.shadowDaily && report.shadowDaily.status !== 'missing' ? (
+        <div className={`mt-3 border-l-2 px-3 py-2 ${shadowDailyFailed ? 'border-danger bg-danger/5' : 'border-cyan bg-cyan/5'}`}>
+          <p className="text-xs font-semibold text-foreground">
+            {shadowDailyFailed
+              ? (english ? 'Latest shadow task failed' : '最近纸面任务失败')
+              : (english ? 'Latest shadow task recorded' : '最近纸面任务已记录')}
+          </p>
+          <p className="mt-1 break-words font-mono text-xs text-secondary-text">
+            {report.shadowDaily.asOf || '--'}
+            {report.shadowDaily.reasonCode ? ` · ${report.shadowDaily.reasonCode}` : ''}
+          </p>
+        </div>
+      ) : null}
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Selected models' : '入围模型'}</p>
+          <p className="mt-1 text-sm text-foreground">{(development?.selectedModels || []).join(', ') || '--'}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Frozen strategy' : '冻结策略'}</p>
+          <p className="mt-1 font-mono text-sm text-foreground">{development?.selectedStrategy || '--'}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Confirmation' : '确认期'}</p>
+          <p className="mt-1 text-sm text-foreground">{report.confirmation?.verdict?.passed ? (english ? 'Passed' : '通过') : (english ? 'Not passed' : '未通过')}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">
+            {english ? `Shadow tracking ${shadowDays} / 60 days` : `纸面跟踪 ${shadowDays} / 60 日`}
+          </p>
+          <p className="mt-1 text-sm text-foreground">
+            {remainingDays == null ? '--' : (english ? `${remainingDays} days remaining` : `还差 ${remainingDays} 日`)}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <h4 className="text-xs font-semibold text-foreground">{english ? 'Model stability' : '模型稳定性'}</h4>
+        <div className="mt-2 overflow-x-auto">
+          <table className="min-w-full text-left text-xs">
+            <thead className="text-muted-text">
+              <tr>
+                <th className="px-2 py-2 font-medium">{english ? 'Model' : '模型'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? 'Eligible' : '入围'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? 'Window rank corr.' : '窗口排名相关'}</th>
+                <th className="px-2 py-2 text-right font-medium">Top50 overlap</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-subtle">
+              {(development?.modelStability || []).map((model, index) => (
+                <tr key={model.modelId || index}>
+                  <td className="px-2 py-2 font-mono text-foreground">{model.modelId || '--'}</td>
+                  <td className="px-2 py-2 text-right text-foreground">{model.eligible ? (english ? 'Yes' : '是') : (english ? 'No' : '否')}</td>
+                  <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioNumber(model.stability?.rankCorrelationMedian)}</td>
+                  <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(model.stability?.topkOverlapMean)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <h4 className="text-xs font-semibold text-foreground">{english ? 'Strategy cost and delay stress tests' : '策略成本与延迟压力测试'}</h4>
+        <div className="mt-2 overflow-x-auto">
+          <table className="min-w-full text-left text-xs">
+            <thead className="text-muted-text">
+              <tr>
+                <th className="px-2 py-2 font-medium">{english ? 'Strategy' : '策略'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? 'Base excess' : '基准成本超额'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? '40bp stress' : '40bp 压力'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? 'One-day delay' : '延迟一日'}</th>
+                <th className="px-2 py-2 text-right font-medium">{english ? 'All gates' : '全部门槛'}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-subtle">
+              {strategies.map((strategy, index) => (
+                <tr key={strategy.strategyId || index}>
+                  <td className="px-2 py-2 font-mono text-foreground">{strategy.strategyId || '--'}</td>
+                  <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.baseline?.metrics, 'annualExcessReturn'))}</td>
+                  <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.stress?.metrics, 'annualExcessReturn'))}</td>
+                  <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.delayed?.metrics, 'annualExcessReturn'))}</td>
+                  <td className="px-2 py-2 text-right text-foreground">{strategy.acceptance?.passed ? (english ? 'Pass' : '通过') : (english ? 'Fail' : '未通过')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {quarters.length > 0 ? (
+        <div className="mt-5">
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Quarterly out-of-sample results' : '季度样本外表现'}</h4>
+          <div className="mt-2 overflow-x-auto">
+            <table className="min-w-full text-left text-xs">
+              <thead className="text-muted-text">
+                <tr>
+                  <th className="px-2 py-2 font-medium">{english ? 'Quarter' : '季度'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Excess return' : '超额收益'}</th>
+                  <th className="px-2 py-2 text-right font-medium">RankIC</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Max drawdown' : '最大回撤'}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-subtle">
+                {quarters.map((quarter, index) => (
+                  <tr key={String(quarter.quarter || index)}>
+                    <td className="px-2 py-2 font-mono text-foreground">{String(quarter.quarter || '--')}</td>
+                    <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(quarter, 'annualExcessReturn'))}</td>
+                    <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioNumber(robustMetric(quarter, 'rankIc'))}</td>
+                    <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(quarter, 'maximumDrawdown'))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
+
+      {regimes.length > 0 ? (
+        <div className="mt-5">
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Market regimes' : '牛熊与市场状态'}</h4>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            {regimes.map(([name, metrics]) => (
+              <div key={name} className="border-l-2 border-subtle pl-3">
+                <p className="font-mono text-xs text-muted-text">{name}</p>
+                <p className="mt-1 font-mono text-sm text-foreground">{formatRatioPct(robustMetric(metrics, 'annualExcessReturn'))}</p>
+                <p className="mt-1 text-xs text-muted-text">{String(metrics.days ?? '--')} {english ? 'days' : '日'}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="mt-5 grid gap-3 sm:grid-cols-2">
+        <div className="border-t border-subtle pt-3">
+          <p className="text-xs font-semibold text-foreground">{english ? 'Confirmation period' : '确认期'}</p>
+          <p className="mt-2 text-xs text-muted-text">{report.confirmation?.latestMarketDay || '--'}</p>
+          <p className="mt-1 font-mono text-sm text-foreground">
+            {english ? 'Excess ' : '年化超额 '}{formatRatioPct(robustMetric(report.confirmation?.metrics, 'annualExcessReturn'))}
+            {' · IR '}{formatRatioNumber(robustMetric(report.confirmation?.metrics, 'informationRatio'))}
+          </p>
+        </div>
+        <div className="border-t border-subtle pt-3">
+          <p className="text-xs font-semibold text-foreground">{english ? 'Shadow observation' : '纸面跟踪'}</p>
+          <p className="mt-2 font-mono text-sm text-foreground">
+            {english ? 'Net excess ' : '累计净超额 '}{formatRatioPct(robustMetric(report.shadow?.metrics, 'netExcessReturn'))}
+          </p>
+          <p className="mt-1 text-xs text-muted-text">
+            {english ? 'Task success ' : '任务成功率 '}{formatRatioPct(robustMetric(report.shadow?.metrics, 'taskSuccessRatio'))}
+          </p>
+        </div>
+      </div>
+
+      <p className="mt-4 text-xs text-muted-text">
+        {english
+          ? `MLflow experiments: ${(report.mlflowExperiments || []).join(', ') || '--'}. Research only; no broker connection or automatic orders.`
+          : `MLflow 实验：${(report.mlflowExperiments || []).join(', ') || '--'}。仅供研究复核；不连接券商，不自动下单。`}
+      </p>
+    </Card>
+  );
+};
+
 // ============ Performance Card ============
 
 const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; language: UiLanguage }> = ({ metrics, title, language }) => {
@@ -711,6 +948,8 @@ const QlibBacktestPanel: React.FC<{
           <QlibPredictionCard report={qlibPredictions} text={text} />
 
           {candidatePipeline ? <CandidatePipelineCard report={candidatePipeline} text={text} /> : null}
+
+          <RobustStrategyCard report={status?.robustStrategy} text={text} />
 
           <QlibArtifactsCard status={status} text={text} />
 

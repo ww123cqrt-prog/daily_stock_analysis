@@ -106,6 +106,30 @@ vi.mock('../../api/research', () => ({
         latestNote: 'baseline note',
         runs: [],
       },
+      robustStrategy: {
+        status: 'blocked_data',
+        lifecycleStatus: 'stopped',
+        reasonCode: 'jqdata_permission_denied',
+        runId: 'robust_20260716',
+        failedStage: 'build_pit_csi800',
+        updatedAt: '2026-07-16T08:10:00+08:00',
+        stages: [
+          { name: 'build_pit_csi800', status: 'blocked_data', reasonCode: 'jqdata_permission_denied' },
+          { name: 'download_robust_reference', status: 'pending' },
+        ],
+        preflight: null,
+        development: null,
+        confirmation: null,
+        shadow: null,
+        shadowDaily: {
+          status: 'development_failed',
+          reasonCode: 'inference_failed',
+          asOf: '2026-07-16',
+          inferenceSuccess: false,
+          appendedDays: 1,
+        },
+        mlflowExperiments: ['robust_csi800_development', 'robust_csi800_confirmation'],
+      },
     }),
   },
 }));
@@ -168,6 +192,9 @@ describe('WorkflowPage', () => {
         report_qlib_risk_model: { label: '生成 Qlib 风险模型诊断', allowedParams: ['run_id'] },
         train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config', 'experiment_name', 'provider'] },
         run_candidate_pipeline: { label: '运行五模型完整量化流程', allowedParams: ['dry_run', 'provider'] },
+        run_robust_strategy: { label: '运行鲁棒策略开发流程', allowedParams: ['as_of_date', 'run_id', 'resume', 'skip_membership_build'] },
+        run_robust_confirmation: { label: '运行冻结策略 2026 确认期', allowedParams: ['run_id', 'resume'] },
+        run_robust_shadow_day: { label: '运行鲁棒策略当日纸面跟踪', allowedParams: ['as_of_date'] },
         generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
         add_index_benchmark: { label: '预演添加沪深300 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
@@ -298,6 +325,19 @@ describe('WorkflowPage', () => {
     expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五模型完整量化流程');
     expect(screen.getByLabelText('运行五模型完整量化流程 数据版本')).toBeInTheDocument();
     expect(screen.getByLabelText('运行五模型完整量化流程 只做小样本预演')).toBeInTheDocument();
+    expect(screen.getByText('鲁棒策略生命周期')).toBeInTheDocument();
+    expect(screen.getByText('数据阻断')).toBeInTheDocument();
+    expect(screen.getAllByText('jqdata_permission_denied').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('build_pit_csi800').length).toBeGreaterThan(0);
+    expect(screen.getByText('最近纸面任务')).toBeInTheDocument();
+    expect(screen.getByText('2026-07-16')).toBeInTheDocument();
+    expect(screen.getAllByText('inference_failed').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('workflow-job-run_robust_strategy')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行 运行鲁棒策略开发流程' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行 运行冻结策略 2026 确认期' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行 运行鲁棒策略当日纸面跟踪' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看鲁棒性矩阵' })).toHaveAttribute('href', '/backtest');
+    expect(screen.getByRole('link', { name: '查看鲁棒实验' })).toHaveAttribute('href', '/experiments/#/experiments');
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
     expect(screen.getByText('生成现金仓位叠加回测')).toBeInTheDocument();

@@ -17,6 +17,7 @@ import {
   Play,
   RefreshCw,
   RotateCw,
+  ShieldCheck,
   TerminalSquare,
 } from 'lucide-react';
 import { Badge, Card, InlineAlert, StatusDot } from '../components/common';
@@ -106,6 +107,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'skip_eastmoney', label: '跳过东方财富', kind: 'checkbox' },
           { key: 'skip_akshare', label: '跳过 AkShare', kind: 'checkbox' },
           { key: 'skip_snapshot_validation', label: '跳过快照校验', kind: 'checkbox' },
+          { key: 'skip_robust_shadow', label: '跳过鲁棒策略纸面跟踪', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '45' },
@@ -405,6 +407,41 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     ],
   },
   {
+    title: '鲁棒策略',
+    description: '独立运行历史时点 CSI800、多窗口滚动开发、2026 单次确认和 60 日纸面跟踪，不覆盖日常候选流程。',
+    icon: ShieldCheck,
+    jobs: [
+      {
+        type: 'run_robust_strategy',
+        label: '运行鲁棒策略开发流程',
+        description: '依次检查 PIT CSI800、历史元数据、数据门槛和不可变 provider，再运行 396 个开发期训练任务。数据门槛未通过时固定停止为 blocked_data。',
+        params: [
+          { key: 'as_of_date', label: '数据截止日', kind: 'date' },
+          { key: 'run_id', label: '运行 ID', kind: 'text', placeholder: '留空自动生成' },
+          { key: 'resume', label: '恢复同一运行', kind: 'checkbox' },
+          { key: 'skip_membership_build', label: '复用已验证历史股票池', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'run_robust_confirmation',
+        label: '运行冻结策略 2026 确认期',
+        description: '只对已冻结且开发期通过的配置运行一次 2026 确认；确认结果不参与重新选模型或策略。',
+        params: [
+          { key: 'run_id', label: '确认运行 ID', kind: 'text', placeholder: '留空自动生成' },
+          { key: 'resume', label: '恢复已停止的同一确认运行', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'run_robust_shadow_day',
+        label: '运行鲁棒策略当日纸面跟踪',
+        description: '只加载冻结模型并对指定交易日推理，再从 2026 确认期起完整回放持仓；不重新训练、不补造漏跑日信号。',
+        params: [
+          { key: 'as_of_date', label: '跟踪交易日', kind: 'date' },
+        ],
+      },
+    ],
+  },
+  {
     title: 'Qlib研究增强',
     description: '把已有 Qlib/MLflow 产物拆成模型解释、回测明细、对比、因子、滚动训练和风险诊断报告。',
     icon: Activity,
@@ -486,6 +523,24 @@ const STATUS_LABEL: Record<string, string> = {
   failed: '失败',
   cancelled: '已取消',
 };
+
+const ROBUST_STATUS_LABELS: Record<string, { zh: string; en: string; variant: 'success' | 'danger' | 'warning' | 'info' | 'default' }> = {
+  missing: { zh: '未启动', en: 'Not started', variant: 'default' },
+  blocked_data: { zh: '数据阻断', en: 'Blocked by data', variant: 'warning' },
+  development_failed: { zh: '开发未通过', en: 'Development failed', variant: 'danger' },
+  research_candidate_ready: { zh: '研究候选已冻结', en: 'Research candidate frozen', variant: 'info' },
+  shadow_observation: { zh: '60日纸面跟踪中', en: '60-day shadow tracking', variant: 'info' },
+  robust_strategy_qualified: { zh: '鲁棒策略合格', en: 'Robust strategy qualified', variant: 'success' },
+};
+
+function robustStatusLabel(status: string | undefined, language: 'zh' | 'en') {
+  const meta = ROBUST_STATUS_LABELS[status || 'missing'] || {
+    zh: status || '未知',
+    en: status || 'Unknown',
+    variant: 'default' as const,
+  };
+  return { label: meta[language], variant: meta.variant };
+}
 
 function statusTone(status: string): 'success' | 'danger' | 'warning' | 'info' | 'neutral' {
   if (status === 'completed') return 'success';
@@ -1197,6 +1252,10 @@ const WorkflowPage: React.FC = () => {
 
   const trainable = workflowStatus?.trainable;
   const latestTraining = workflowStatus?.latestTraining;
+  const robustStrategy = workflowStatus?.robustStrategy;
+  const robustMeta = robustStatusLabel(robustStrategy?.status, language);
+  const shadowDaily = robustStrategy?.shadowDaily;
+  const shadowDailyFailed = shadowDaily?.status === 'development_failed';
   const dailyGuideSteps = useMemo(
     () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
     [workflowStatus, latestJobs, mlflowUrl],
@@ -1340,6 +1399,78 @@ const WorkflowPage: React.FC = () => {
 
         <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <div className="flex flex-col gap-4">
+            <Card variant="bordered" padding="md">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <span className="label-uppercase">Robust CSI800</span>
+                  <h2 className="mt-2 text-base font-semibold text-foreground">
+                    {language === 'zh' ? '鲁棒策略生命周期' : 'Robust strategy lifecycle'}
+                  </h2>
+                  <p className="mt-1 text-sm leading-5 text-secondary-text">
+                    {language === 'zh'
+                      ? '开发期、2026 单次确认和未来 60 个交易日纸面跟踪分开显示；只有最后一项也通过才算合格。'
+                      : 'Development, the one-time 2026 confirmation, and 60 future trading days are reported separately.'}
+                  </p>
+                </div>
+                <Badge variant={robustMeta.variant}>{robustMeta.label}</Badge>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">Run ID</p>
+                  <p className="mt-1 truncate font-mono text-sm text-foreground">{robustStrategy?.runId || '-'}</p>
+                </div>
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">{language === 'zh' ? '当前/失败阶段' : 'Current/failed stage'}</p>
+                  <p className="mt-1 truncate font-mono text-sm text-foreground">
+                    {robustStrategy?.currentStage || robustStrategy?.failedStage || '-'}
+                  </p>
+                </div>
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">{language === 'zh' ? '原因' : 'Reason'}</p>
+                  <p className="mt-1 break-words font-mono text-sm text-foreground">{robustStrategy?.reasonCode || '-'}</p>
+                </div>
+              </div>
+              {(robustStrategy?.stages || []).length > 0 ? (
+                <div className="mt-4 divide-y divide-subtle border-y border-subtle">
+                  {(robustStrategy?.stages || []).map((stage) => (
+                    <div key={stage.name} className="flex flex-wrap items-center justify-between gap-2 py-2 text-xs">
+                      <span className="font-mono text-foreground">{stage.name}</span>
+                      <span className="text-secondary-text">{stage.status}{stage.reasonCode ? ` · ${stage.reasonCode}` : ''}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {shadowDaily && shadowDaily.status !== 'missing' ? (
+                <div
+                  data-testid="robust-shadow-daily"
+                  className={`mt-4 border-l-2 px-3 py-2 ${shadowDailyFailed ? 'border-danger bg-danger/5' : 'border-cyan bg-cyan/5'}`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-foreground">
+                      {language === 'zh' ? '最近纸面任务' : 'Latest shadow task'}
+                    </p>
+                    <Badge variant={shadowDailyFailed ? 'danger' : 'info'} size="sm" className="shadow-none">
+                      {shadowDailyFailed
+                        ? (language === 'zh' ? '失败' : 'Failed')
+                        : (language === 'zh' ? '已记录' : 'Recorded')}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 text-xs text-secondary-text">
+                    <span className="font-mono">{shadowDaily.asOf || '-'}</span>
+                    {shadowDaily.reasonCode ? (
+                      <>
+                        <span> · </span>
+                        <span className="break-words font-mono">{shadowDaily.reasonCode}</span>
+                      </>
+                    ) : null}
+                  </p>
+                </div>
+              ) : null}
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Link to="/backtest" className="btn-secondary h-9 px-3 text-sm">{language === 'zh' ? '查看鲁棒性矩阵' : 'View robustness matrix'}</Link>
+                <a href="/experiments/#/experiments" className="btn-secondary h-9 px-3 text-sm">{language === 'zh' ? '查看鲁棒实验' : 'View robust experiments'}</a>
+              </div>
+            </Card>
             {WORKFLOW_STEPS.map((step) => {
               const Icon = step.icon;
               return (

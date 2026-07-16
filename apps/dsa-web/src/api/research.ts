@@ -149,6 +149,103 @@ export type ResearchCandidatePipeline = {
   artifacts?: Record<string, string>;
 };
 
+export type ResearchRobustStage = {
+  name: string;
+  status: string;
+  startedAt?: string;
+  finishedAt?: string;
+  returnCode?: number;
+  reasonCode?: string;
+};
+
+export type ResearchRobustMetricMap = Record<string, number | string | boolean | null | undefined>;
+
+export type ResearchRobustModelReport = {
+  modelId?: string;
+  eligible?: boolean;
+  developmentScore?: number;
+  stability?: {
+    rankCorrelationMedian?: number;
+    topkOverlapMean?: number;
+  };
+};
+
+export type ResearchRobustStrategyEvaluation = {
+  strategyId?: string;
+  acceptance?: { passed?: boolean; failedGates?: string[] };
+  baseline?: { metrics?: ResearchRobustMetricMap };
+  stress?: { metrics?: ResearchRobustMetricMap };
+  delayed?: { metrics?: ResearchRobustMetricMap };
+  quarterMetrics?: ResearchRobustMetricMap[];
+  regimeMetrics?: Record<string, ResearchRobustMetricMap>;
+};
+
+export type ResearchRobustStrategy = {
+  status: string;
+  lifecycleStatus?: string;
+  reasonCode?: string;
+  runId?: string;
+  currentStage?: string;
+  failedStage?: string;
+  updatedAt?: string;
+  stages: ResearchRobustStage[];
+  preflight?: {
+    status?: string;
+    reasonCode?: string;
+    generatedAt?: string;
+    asOfDate?: string;
+    summary?: Record<string, unknown>;
+    checks?: Record<string, unknown> | unknown[];
+  } | null;
+  development?: {
+    status?: string;
+    reasonCode?: string;
+    generatedAt?: string;
+    asOfDate?: string;
+    runId?: string;
+    trainingJobCount?: number;
+    selectedModels?: string[];
+    selectedStrategy?: string;
+    modelStability?: ResearchRobustModelReport[];
+    strategyMatrix?: ResearchRobustStrategyEvaluation[];
+  } | null;
+  confirmation?: {
+    status?: string;
+    reasonCode?: string;
+    generatedAt?: string;
+    runId?: string;
+    confirmationStart?: string;
+    latestSignalDay?: string;
+    latestMarketDay?: string;
+    selectedModels?: string[];
+    selectedStrategy?: string;
+    metrics?: ResearchRobustMetricMap;
+    verdict?: { passed?: boolean; failedGates?: string[] };
+  } | null;
+  shadow?: {
+    status?: string;
+    confirmationRunId?: string;
+    startAfter?: string;
+    createdAt?: string;
+    updatedAt?: string;
+    metrics?: ResearchRobustMetricMap;
+    verdict?: { passed?: boolean; remainingDays?: number; failedGates?: string[] };
+  } | null;
+  shadowDaily?: {
+    status?: string;
+    reasonCode?: string;
+    asOf?: string;
+    outcome?: string;
+    inferenceSuccess?: boolean;
+    appendedDays?: number;
+    generatedAt?: string;
+    stateStatus?: string;
+    stateMetrics?: ResearchRobustMetricMap;
+    errorType?: string;
+  } | null;
+  mlflowExperiments?: string[];
+};
+
 export type ResearchQlibResearchSection = {
   section: string;
   title: string;
@@ -360,6 +457,7 @@ export type ResearchStatus = {
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
   candidatePipeline?: ResearchCandidatePipeline | null;
+  robustStrategy?: ResearchRobustStrategy | null;
   qlibResearch?: ResearchQlibResearch | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   mlflow?: ResearchMlflow | null;

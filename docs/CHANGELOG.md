@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 新增独立 A 股鲁棒策略生命周期：历史时点 CSI800 数据门槛、五模型多窗口/多随机种子滚动样本外开发、五套交易规则、成本/延迟压力、2026 单次确认和 60 个交易日前向纸面跟踪；未通过门槛时明确输出 `blocked_data` 或 `development_failed`，不降低标准、不自动下单。
+- [新功能] `/workflow` 新增鲁棒开发、冻结确认和当日纸面跟踪入口，`/backtest` 新增模型稳定性、策略压力、季度/市场状态、确认期与纸面跟踪矩阵，`/experiments/` 可直达对应 MLflow Runs；鲁棒报告独立写入 `quant_workflow/reports/robust_strategy/`，不覆盖日常候选流程。
+- [修复] 鲁棒纸面跟踪现在严格核对交易日日历、禁止失败日期被重跑成成功，并用线程锁和进程锁保护信号与状态文件；研究状态 API 按报告内时间选择最新生命周期，单独展示最近一次纸面任务，限制超大报告/列表并补齐跨平台路径脱敏。
+- [测试] 新增历史股票池防前视、数据预检、标签切分、模型/策略稳定性、确认期冻结、影子跟踪、并发持久化、API 脱敏、工作流与回测页面测试；正式训练仍须先通过真实数据预检。
 - [新功能] 量化任务中心新增五模型完整候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择前两名及五套策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常模型或下单。
 - [新功能] DSA 新增唯一实验入口 `/experiments/`：后端流式代理现有 MLflow 3.14.0 `6006` 服务，并在官方页面上叠加中文/English 即时切换；本机 MLflow 链接统一改写到 8010，6006 退为后台且不再需要 6007 或额外代理进程。
 - [修复] MLflow 双语层保护实验名、Run 名、参数名、指标名和 artifact 文件名，不再把与界面词汇同名的业务数据翻译；第一版隐藏 GenAI、Prompt、AI Gateway、LLM Connections 和模型注册入口，并把越界路由重定向回训练实验。

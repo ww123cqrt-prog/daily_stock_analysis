@@ -189,6 +189,74 @@ beforeEach(() => {
       ],
       strategyEvaluations: [],
     },
+    robustStrategy: {
+      status: 'shadow_observation',
+      lifecycleStatus: 'completed',
+      runId: 'robust_20260716',
+      stages: [
+        { name: 'build_pit_csi800', status: 'completed' },
+        { name: 'run_robust_development', status: 'completed' },
+      ],
+      development: {
+        status: 'research_candidate_ready',
+        selectedModels: ['lightgbm', 'linear_ridge'],
+        selectedStrategy: 'full_risk_control',
+        modelStability: [
+          {
+            modelId: 'lightgbm',
+            eligible: true,
+            stability: { rankCorrelationMedian: 0.78, topkOverlapMean: 0.66 },
+          },
+          {
+            modelId: 'linear_ridge',
+            eligible: true,
+            stability: { rankCorrelationMedian: 0.72, topkOverlapMean: 0.63 },
+          },
+        ],
+        strategyMatrix: [
+            {
+              strategyId: 'weekly_top50',
+              acceptance: { passed: false },
+              baseline: { metrics: { annualExcessReturn: 0.04, informationRatio: 0.42, maxDrawdown: -0.18 } },
+              stress: { metrics: { annualExcessReturn: -0.01 } },
+              delayed: { metrics: { annualExcessReturn: 0.005 } },
+            },
+            {
+              strategyId: 'full_risk_control',
+              acceptance: { passed: true },
+              baseline: { metrics: { annualExcessReturn: 0.08, informationRatio: 0.81, maxDrawdown: -0.12 } },
+              stress: { metrics: { annualExcessReturn: 0.02 } },
+              delayed: { metrics: { annualExcessReturn: 0.01 } },
+              quarterMetrics: [
+                { quarter: '2025Q4', annualExcessReturn: 0.06, rankIc: 0.03, maximumDrawdown: -0.08 },
+              ],
+              regimeMetrics: {
+                risk_on: { annualExcessReturn: 0.09, days: 120 },
+                risk_off: { annualExcessReturn: 0.01, days: 80 },
+              },
+            },
+        ],
+      },
+      confirmation: {
+        status: 'shadow_observation',
+        latestMarketDay: '2026-07-15',
+        metrics: { annualExcessReturn: 0.03, informationRatio: 0.31, maxDrawdown: -0.09 },
+        verdict: { passed: true },
+      },
+      shadow: {
+        status: 'shadow_observation',
+        metrics: { tradingDays: 3, netExcessReturn: 0.01, maxDrawdown: -0.02, taskSuccessRatio: 1 },
+        verdict: { passed: false, remainingDays: 57 },
+      },
+      shadowDaily: {
+        status: 'development_failed',
+        reasonCode: 'inference_failed',
+        asOf: '2026-07-16',
+        inferenceSuccess: false,
+        appendedDays: 1,
+      },
+      mlflowExperiments: ['robust_csi800_development', 'robust_csi800_confirmation'],
+    },
     mlflow: {
       url: 'http://127.0.0.1:6606/',
       role: 'experiment_raw_records',
@@ -290,11 +358,11 @@ describe('BacktestPage', () => {
     expect(screen.getByText(/收益质量偏弱/)).toBeInTheDocument();
     expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
     expect(screen.getByText('现金仓位叠加回测')).toBeInTheDocument();
-    expect(screen.getByText('risk_off')).toBeInTheDocument();
+    expect(screen.getAllByText('risk_off').length).toBeGreaterThan(0);
     expect(screen.getByText('80.0%')).toBeInTheDocument();
     expect(screen.getByText('Baseline')).toBeInTheDocument();
     expect(screen.getByText('Cash-control')).toBeInTheDocument();
-    expect(screen.getByText('最大回撤')).toBeInTheDocument();
+    expect(screen.getAllByText('最大回撤').length).toBeGreaterThan(0);
     expect(screen.getByText('夏普比率')).toBeInTheDocument();
     expect(screen.getByText('0.95')).toBeInTheDocument();
     expect(screen.getByText('Qlib 预测摘要')).toBeInTheDocument();
@@ -309,6 +377,18 @@ describe('BacktestPage', () => {
     expect(screen.getByText('xgboost + low_turnover_weekly')).toBeInTheDocument();
     expect(screen.getByText('通过研究门槛')).toBeInTheDocument();
     expect(screen.getByText('20.2%')).toBeInTheDocument();
+    expect(screen.getByText('鲁棒策略矩阵')).toBeInTheDocument();
+    expect(screen.getByText('60日纸面跟踪中')).toBeInTheDocument();
+    expect(screen.getAllByText('full_risk_control').length).toBeGreaterThan(0);
+    expect(screen.getByText('模型稳定性')).toBeInTheDocument();
+    expect(screen.getByText('策略成本与延迟压力测试')).toBeInTheDocument();
+    expect(screen.getByText('季度样本外表现')).toBeInTheDocument();
+    expect(screen.getByText('2025Q4')).toBeInTheDocument();
+    expect(screen.getAllByText('确认期').length).toBeGreaterThan(0);
+    expect(screen.getByText('最近纸面任务失败')).toBeInTheDocument();
+    expect(screen.getByText(/2026-07-16.*inference_failed/)).toBeInTheDocument();
+    expect(screen.getByText('纸面跟踪 3 / 60 日')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看鲁棒实验' })).toHaveAttribute('href', '/experiments/#/experiments');
     expect(screen.getByText('实验复现与产物')).toBeInTheDocument();
     expect(screen.getByText('数据版本')).toBeInTheDocument();
     expect(screen.getByText('cleaned')).toBeInTheDocument();
@@ -420,7 +500,7 @@ describe('BacktestPage', () => {
       expect(screen.getAllByText('Qlib model/strategy backtest').length).toBeGreaterThan(1);
     });
     expect(screen.getAllByText('Model').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText('Strategy')).toBeInTheDocument();
+    expect(screen.getAllByText('Strategy').length).toBeGreaterThan(0);
     expect(screen.getByText('Latest training metrics')).toBeInTheDocument();
     expect(screen.getByText('Qlib prediction summary')).toBeInTheDocument();
     expect(screen.getByText('Reproducibility and artifacts')).toBeInTheDocument();

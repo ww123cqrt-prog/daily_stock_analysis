@@ -36,6 +36,21 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   optimize_strategy.py
   train_baseline_lgb.py
   run_candidate_pipeline.py
+  build_pit_csi800.py
+  download_robust_reference.py
+  preflight_robust_data.py
+  prepare_robust_provider.py
+  robust_backtest.py
+  robust_dataset.py
+  robust_evaluation.py
+  robust_market_data.py
+  robust_shadow_tracking.py
+  robust_strategy_core.py
+  run_robust_development.py
+  run_robust_strategy.py
+  run_robust_confirmation.py
+  run_robust_shadow_day.py
+  launch_robust_strategy.py
   run_daily_update.py
 )
 

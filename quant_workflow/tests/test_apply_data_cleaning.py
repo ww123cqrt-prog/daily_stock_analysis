@@ -65,7 +65,9 @@ class ApplyDataCleaningTest(unittest.TestCase):
         self.assertIn(pd.Timestamp("2024-01-03"), plan.event_dates_by_symbol["000002"])
         self.assertIn("000003", plan.volume_mask_symbols)
 
-    def test_clean_frame_masks_event_rows_and_non_positive_volume_without_dropping_prices(self):
+    def test_clean_frame_masks_event_rows_and_non_positive_volume_without_dropping_prices(
+        self,
+    ):
         module = load_script("apply_data_cleaning")
         plan = module.CleaningPlan(
             excluded_symbols=set(),
@@ -89,8 +91,12 @@ class ApplyDataCleaningTest(unittest.TestCase):
         self.assertIsNotNone(cleaned)
         assert cleaned is not None
         self.assertEqual(len(cleaned), 3)
-        volume_mask_date = cleaned.loc[cleaned["date"] == pd.Timestamp("2024-01-03"), "volume"].iloc[0]
-        event_open = cleaned.loc[cleaned["date"] == pd.Timestamp("2024-01-04"), "open"].iloc[0]
+        volume_mask_date = cleaned.loc[
+            cleaned["date"] == pd.Timestamp("2024-01-03"), "volume"
+        ].iloc[0]
+        event_open = cleaned.loc[
+            cleaned["date"] == pd.Timestamp("2024-01-04"), "open"
+        ].iloc[0]
         self.assertTrue(np.isnan(volume_mask_date))
         self.assertTrue(np.isnan(event_open))
         self.assertEqual(stats.masked_volume_rows, 1)
@@ -121,7 +127,9 @@ class ApplyDataCleaningTest(unittest.TestCase):
                 event_dates_by_symbol={},
             )
 
-            summary = module.build_cleaned_parquet(src_dir, dst_dir, plan, overwrite=True)
+            summary = module.build_cleaned_parquet(
+                src_dir, dst_dir, plan, overwrite=True
+            )
 
             self.assertFalse((dst_dir / "000001.parquet").exists())
             self.assertTrue((dst_dir / "000002.parquet").exists())
@@ -203,15 +211,20 @@ class ApplyDataCleaningTest(unittest.TestCase):
             self.assertEqual(summary["skipped_existing_symbols"], 1)
             self.assertEqual(summary["written_symbols"], 0)
 
-    def test_copy_benchmark_features_preserves_index_without_polluting_instruments(self):
+    def test_copy_benchmark_features_preserves_index_without_polluting_instruments(
+        self,
+    ):
         module = load_script("apply_data_cleaning")
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             source_provider = base / "source"
             target_provider = base / "target"
-            source_feature = source_provider / "features" / "sh000300"
-            source_feature.mkdir(parents=True)
-            (source_feature / "close.day.bin").write_bytes(np.array([0.0, 1.0], dtype="<f4").tobytes())
+            for symbol in ["sh000300", "sh000905", "sh000906"]:
+                source_feature = source_provider / "features" / symbol
+                source_feature.mkdir(parents=True)
+                (source_feature / "close.day.bin").write_bytes(
+                    np.array([0.0, 1.0], dtype="<f4").tobytes()
+                )
 
             for provider in [source_provider, target_provider]:
                 calendar = provider / "calendars" / "day.txt"
@@ -220,15 +233,32 @@ class ApplyDataCleaningTest(unittest.TestCase):
 
             instruments = target_provider / "instruments"
             instruments.mkdir(parents=True)
-            (instruments / "all.txt").write_text("SH000300\t2024-01-02\t2024-01-03\nSZ000001\t2024-01-02\t2024-01-03\n", encoding="utf-8")
-            (instruments / "csi300.txt").write_text("SH000300\t2024-01-02\t2024-01-03\nSZ000001\t2024-01-02\t2024-01-03\n", encoding="utf-8")
+            benchmark_lines = (
+                "SH000300\t2024-01-02\t2024-01-03\n"
+                "SH000905\t2024-01-02\t2024-01-03\n"
+                "SH000906\t2024-01-02\t2024-01-03\n"
+                "SZ000001\t2024-01-02\t2024-01-03\n"
+            )
+            for name in ["all.txt", "csi300.txt", "csi500.txt", "csi800.txt"]:
+                (instruments / name).write_text(benchmark_lines, encoding="utf-8")
 
-            copied = module.copy_benchmark_features(source_provider, target_provider, {"SH000300"})
+            copied = module.copy_benchmark_features(
+                source_provider,
+                target_provider,
+                {"SH000300", "SH000905", "SH000906"},
+            )
 
-            self.assertEqual(copied, ["SH000300"])
-            self.assertTrue((target_provider / "features" / "sh000300" / "close.day.bin").exists())
-            self.assertNotIn("SH000300", (target_provider / "instruments" / "all.txt").read_text(encoding="utf-8"))
-            self.assertNotIn("SH000300", (target_provider / "instruments" / "csi300.txt").read_text(encoding="utf-8"))
+            self.assertEqual(copied, ["SH000300", "SH000905", "SH000906"])
+            for symbol in ["SH000300", "SH000905", "SH000906"]:
+                self.assertTrue(
+                    (
+                        target_provider / "features" / symbol.lower() / "close.day.bin"
+                    ).exists()
+                )
+                for instrument_file in instruments.glob("*.txt"):
+                    self.assertNotIn(
+                        symbol, instrument_file.read_text(encoding="utf-8")
+                    )
 
 
 if __name__ == "__main__":

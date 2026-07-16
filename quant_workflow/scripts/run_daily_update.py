@@ -12,6 +12,7 @@ Chains the existing stable quant_workflow scripts into one auditable run:
     7. report_data_quality.py   cross-source validation
     8. check_qlib_data.py       final provider calendar/instrument sanity check
     9. sync_data_manifest.py    refresh quant_data/DATA_MANIFEST.json
+   10. run_robust_shadow_day.py active frozen-strategy paper observation
 
 Every stage runs the current interpreter (sys.executable) against the embedded
 quant_workflow scripts, so reports and providers resolve to the same canonical
@@ -113,13 +114,20 @@ def latest_source_date(directory: Path, sample: int = 40) -> str:
     return str(latest.date()) if latest is not None else ""
 
 
-def latest_any_source_date(source_dirs: dict[str, Path], sample: int = 40) -> tuple[str, dict[str, str]]:
-    by_source = {name: latest_source_date(directory, sample=sample) for name, directory in source_dirs.items()}
+def latest_any_source_date(
+    source_dirs: dict[str, Path], sample: int = 40
+) -> tuple[str, dict[str, str]]:
+    by_source = {
+        name: latest_source_date(directory, sample=sample)
+        for name, directory in source_dirs.items()
+    }
     latest = max((value for value in by_source.values() if value), default="")
     return latest, by_source
 
 
-def should_run_heavy(*, force: bool, download_ran: bool, before: str, after: str) -> bool:
+def should_run_heavy(
+    *, force: bool, download_ran: bool, before: str, after: str
+) -> bool:
     """Decide whether to rebuild merge/clean/report stages.
 
     Rebuild when forced, when the download step was skipped (caller wants a
@@ -138,6 +146,28 @@ def _python() -> str:
 
 def _script(name: str) -> list[str]:
     return [_python(), str(WORKFLOW_ROOT / "scripts" / name)]
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def robust_shadow_tracking_is_active(report_dir: Path) -> bool:
+    robust_dir = Path(report_dir) / "robust_strategy"
+    confirmation = _read_json_object(robust_dir / "confirmation_latest.json")
+    frozen = _read_json_object(robust_dir / "frozen_strategy_latest.json")
+    state = _read_json_object(robust_dir / "shadow_state_latest.json")
+    if state.get("status") in {"robust_strategy_qualified", "development_failed"}:
+        return False
+    return (
+        confirmation.get("status") == "shadow_observation"
+        and frozen.get("confirmation_status") == "shadow_observation"
+        and frozen.get("shadow_tracking_started") is True
+    )
 
 
 def build_stages(args: argparse.Namespace) -> "list[Stage]":
@@ -160,30 +190,53 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
                 continue
             dl = _script(script_name) + [
                 "--incremental",
-                "--overlap-days", str(args.overlap_days),
-                "--sleep", str(args.sleep),
-                "--timeout", str(args.timeout),
-                "--retries", str(args.retries),
-                "--max-consecutive-failures", str(args.max_consecutive_failures),
-                "--end", str(args.end),
+                "--overlap-days",
+                str(args.overlap_days),
+                "--sleep",
+                str(args.sleep),
+                "--timeout",
+                str(args.timeout),
+                "--retries",
+                str(args.retries),
+                "--max-consecutive-failures",
+                str(args.max_consecutive_failures),
+                "--end",
+                str(args.end),
             ]
             if args.limit > 0:
                 dl += ["--limit", str(args.limit)]
-            if stage_name in {"download_eastmoney", "download_akshare"} and args.use_system_proxy:
+            if (
+                stage_name in {"download_eastmoney", "download_akshare"}
+                and args.use_system_proxy
+            ):
                 dl += ["--use-system-proxy"]
             stages.append(Stage(stage_name, dl, heavy=False, required=required))
 
     stages.append(Stage("merge_to_qlib", _script("merge_to_qlib.py"), heavy=True))
-    stages.append(Stage("add_index_benchmark", _script("add_index_benchmark.py"), heavy=True))
+    stages.append(
+        Stage("add_index_benchmark", _script("add_index_benchmark.py"), heavy=True)
+    )
     if not args.skip_snapshot_validation:
         snapshot = _script("validate_latest_snapshot.py") + out
         if args.snapshot_limit > 0:
             snapshot += ["--limit", str(args.snapshot_limit)]
         if args.use_system_proxy:
             snapshot += ["--use-system-proxy"]
-        stages.append(Stage("validate_latest_snapshot", snapshot, heavy=True, required=False))
-    stages.append(Stage("report_data_anomalies", _script("report_data_anomalies.py") + out, heavy=True))
-    stages.append(Stage("apply_data_cleaning", _script("apply_data_cleaning.py") + out, heavy=True))
+        stages.append(
+            Stage("validate_latest_snapshot", snapshot, heavy=True, required=False)
+        )
+    stages.append(
+        Stage(
+            "report_data_anomalies",
+            _script("report_data_anomalies.py") + out,
+            heavy=True,
+        )
+    )
+    stages.append(
+        Stage(
+            "apply_data_cleaning", _script("apply_data_cleaning.py") + out, heavy=True
+        )
+    )
     quality = _script("report_data_quality.py") + out
     if args.overlap_sample > 0:
         quality += ["--overlap-sample", str(args.overlap_sample)]
@@ -191,7 +244,36 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
         quality += ["--merged-sample", str(args.merged_sample)]
     stages.append(Stage("report_data_quality", quality, heavy=True))
     stages.append(Stage("check_qlib_data", _script("check_qlib_data.py"), heavy=True))
-    stages.append(Stage("sync_data_manifest", _script("sync_data_manifest.py") + out, heavy=False, required=False))
+    stages.append(
+        Stage(
+            "sync_data_manifest",
+            _script("sync_data_manifest.py") + out,
+            heavy=False,
+            required=False,
+        )
+    )
+    if not args.skip_robust_shadow and robust_shadow_tracking_is_active(REPORTS_ROOT):
+        robust_dir = REPORTS_ROOT / "robust_strategy"
+        stages.append(
+            Stage(
+                "run_robust_shadow_day",
+                _script("run_robust_shadow_day.py")
+                + [
+                    "--report-dir",
+                    str(robust_dir),
+                    "--frozen",
+                    str(robust_dir / "frozen_strategy_latest.json"),
+                    "--confirmation-latest",
+                    str(robust_dir / "confirmation_latest.json"),
+                    "--provider-latest",
+                    str(robust_dir / "provider_latest.json"),
+                    "--as-of-date",
+                    str(args.end),
+                ],
+                heavy=False,
+                required=False,
+            )
+        )
     return stages
 
 
@@ -207,8 +289,10 @@ def source_refresh_failed_without_rebuild(results: list[StageResult]) -> bool:
     if not download_results or not all(r.status == "failed" for r in download_results):
         return False
     heavy_results = [
-        r for r in results
-        if r.name in {
+        r
+        for r in results
+        if r.name
+        in {
             "merge_to_qlib",
             "add_index_benchmark",
             "validate_latest_snapshot",
@@ -230,7 +314,9 @@ def run_stage(stage: "Stage", dry_run: bool) -> "StageResult":
     elapsed = time.time() - t0
     status = "ok" if proc.returncode == 0 else "failed"
     _log(f"stage {stage.name}: {status} rc={proc.returncode} in {elapsed / 60:.1f}m")
-    return StageResult(stage.name, status, elapsed, proc.returncode, required=stage.required)
+    return StageResult(
+        stage.name, status, elapsed, proc.returncode, required=stage.required
+    )
 
 
 def write_summary(results: "list[StageResult]", meta: dict) -> Path:
@@ -260,44 +346,118 @@ def write_summary(results: "list[StageResult]", meta: dict) -> Path:
     payload["status"] = status
 
     dated = REPORTS_ROOT / f"daily_update_summary_{ts}.json"
-    dated.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    dated.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     latest = REPORTS_ROOT / "daily_update_summary_latest.json"
-    latest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    latest.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return latest
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the daily A-share data update pipeline.")
-    parser.add_argument("--skip-download", action="store_true",
-                        help="Skip Baostock download; rebuild merge/clean/reports from existing parquet.")
-    parser.add_argument("--force", action="store_true",
-                        help="Run heavy rebuild stages even when no new trading day arrived.")
-    parser.add_argument("--overlap-days", type=int, default=45,
-                        help="Calendar-day overlap for incremental Baostock download.")
-    parser.add_argument("--sleep", type=float, default=0.3, help="Per-symbol sleep for Baostock.")
-    parser.add_argument("--timeout", type=int, default=60, help="Per-symbol Baostock query timeout (seconds).")
-    parser.add_argument("--retries", type=int, default=3, help="Baostock per-symbol retries.")
-    parser.add_argument("--max-consecutive-failures", type=int, default=50,
-                        help="Abort download after this many consecutive failures.")
-    parser.add_argument("--limit", type=int, default=0, help="Optional cap on symbols downloaded (0 = all).")
-    parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"),
-                        help="Download end date for source refreshes, YYYYMMDD or YYYY-MM-DD.")
-    parser.add_argument("--skip-eastmoney", action="store_true", help="Skip EastMoney public-source refresh.")
-    parser.add_argument("--skip-akshare", action="store_true", help="Skip AkShare public-source refresh.")
-    parser.add_argument("--skip-snapshot-validation", action="store_true",
-                        help="Skip Sina latest snapshot validation.")
-    parser.add_argument("--use-system-proxy", action="store_true",
-                        help="Let EastMoney/AkShare/Sina stages inherit macOS/system proxy settings.")
-    parser.add_argument("--snapshot-limit", type=int, default=50,
-                        help="Number of merged symbols sampled for Sina snapshot validation.")
-    parser.add_argument("--overlap-sample", type=int, default=0,
-                        help="Baostock/JQData overlap sample size for the quality report (0 = all).")
-    parser.add_argument("--merged-sample", type=int, default=0,
-                        help="Merged-file sample size for the quality report (0 = all).")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print the planned pipeline without executing any stage.")
-    parser.add_argument("--continue-on-error", action="store_true",
-                        help="Keep running later stages even if one fails (default stops).")
+    parser = argparse.ArgumentParser(
+        description="Run the daily A-share data update pipeline."
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip Baostock download; rebuild merge/clean/reports from existing parquet.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run heavy rebuild stages even when no new trading day arrived.",
+    )
+    parser.add_argument(
+        "--overlap-days",
+        type=int,
+        default=45,
+        help="Calendar-day overlap for incremental Baostock download.",
+    )
+    parser.add_argument(
+        "--sleep", type=float, default=0.3, help="Per-symbol sleep for Baostock."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="Per-symbol Baostock query timeout (seconds).",
+    )
+    parser.add_argument(
+        "--retries", type=int, default=3, help="Baostock per-symbol retries."
+    )
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=50,
+        help="Abort download after this many consecutive failures.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional cap on symbols downloaded (0 = all).",
+    )
+    parser.add_argument(
+        "--end",
+        default=datetime.now().strftime("%Y%m%d"),
+        help="Download end date for source refreshes, YYYYMMDD or YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--skip-eastmoney",
+        action="store_true",
+        help="Skip EastMoney public-source refresh.",
+    )
+    parser.add_argument(
+        "--skip-akshare",
+        action="store_true",
+        help="Skip AkShare public-source refresh.",
+    )
+    parser.add_argument(
+        "--skip-snapshot-validation",
+        action="store_true",
+        help="Skip Sina latest snapshot validation.",
+    )
+    parser.add_argument(
+        "--skip-robust-shadow",
+        action="store_true",
+        help="Skip the active frozen-strategy paper observation stage.",
+    )
+    parser.add_argument(
+        "--use-system-proxy",
+        action="store_true",
+        help="Let EastMoney/AkShare/Sina stages inherit macOS/system proxy settings.",
+    )
+    parser.add_argument(
+        "--snapshot-limit",
+        type=int,
+        default=50,
+        help="Number of merged symbols sampled for Sina snapshot validation.",
+    )
+    parser.add_argument(
+        "--overlap-sample",
+        type=int,
+        default=0,
+        help="Baostock/JQData overlap sample size for the quality report (0 = all).",
+    )
+    parser.add_argument(
+        "--merged-sample",
+        type=int,
+        default=0,
+        help="Merged-file sample size for the quality report (0 = all).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the planned pipeline without executing any stage.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep running later stages even if one fails (default stops).",
+    )
     args = parser.parse_args()
 
     _log(f"daily update start; reports={REPORTS_ROOT} quant_data={QUANT_DATA}")
@@ -320,27 +480,47 @@ def main() -> int:
                     after_by_source = before_by_source
                     heavy_enabled = True
                 else:
-                    after, after_by_source = latest_any_source_date(SOURCE_DIRS) if download_ran else (before, before_by_source)
-                    heavy_enabled = should_run_heavy(
-                        force=args.force, download_ran=download_ran, before=before, after=after
+                    after, after_by_source = (
+                        latest_any_source_date(SOURCE_DIRS)
+                        if download_ran
+                        else (before, before_by_source)
                     )
-                _log(f"latest source date after: {after or 'n/a'} {after_by_source}; "
-                     f"heavy stages {'enabled' if heavy_enabled else 'skipped (no new trading day)'}")
+                    heavy_enabled = should_run_heavy(
+                        force=args.force,
+                        download_ran=download_ran,
+                        before=before,
+                        after=after,
+                    )
+                _log(
+                    f"latest source date after: {after or 'n/a'} {after_by_source}; "
+                    f"heavy stages {'enabled' if heavy_enabled else 'skipped (no new trading day)'}"
+                )
             if not heavy_enabled:
                 _log(f"stage {stage.name}: skipped")
-                results.append(StageResult(stage.name, "skipped", 0.0, 0, required=stage.required))
+                results.append(
+                    StageResult(stage.name, "skipped", 0.0, 0, required=stage.required)
+                )
                 continue
 
         result = run_stage(stage, args.dry_run)
         results.append(result)
-        if result.status == "failed" and result.required and not args.continue_on_error and not args.dry_run:
-            _log(f"stage {stage.name} failed; stopping pipeline (use --continue-on-error to override)")
+        if (
+            result.status == "failed"
+            and result.required
+            and not args.continue_on_error
+            and not args.dry_run
+        ):
+            _log(
+                f"stage {stage.name} failed; stopping pipeline (use --continue-on-error to override)"
+            )
             break
         if result.status == "failed" and not result.required:
             _log(f"stage {stage.name} failed but is non-fatal; continuing")
 
     if source_refresh_failed_without_rebuild(results):
-        _log("all source downloads failed and rebuild stages were skipped; marking daily update failed")
+        _log(
+            "all source downloads failed and rebuild stages were skipped; marking daily update failed"
+        )
         results.append(
             StageResult(
                 "source_refresh_gate",

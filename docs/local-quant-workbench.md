@@ -87,11 +87,27 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 每个任务只能调用后端白名单脚本；网页不能提交任意 shell 命令。
 
-### 2.1 quant_workflow 脚本覆盖盘点
+### 2.1 鲁棒策略生命周期
+
+`/workflow` 的“鲁棒策略生命周期”是一条独立研究链路，不覆盖日常 `candidate_pipeline_latest` 或 `latest_training_result`。它以历史时点 CSI800 为股票池，要求按每个历史日期使用当时的 CSI300 与 CSI500 成分股，不能拿今天的成分股回看过去。行情、成员区间、行业、ST、停牌、上市日期和板块元数据先通过固定门槛；成员区间覆盖率低于 99%、有效行情覆盖率低于 98%，或存在重复日期、未来数据、基准缺口时，状态必须是 `blocked_data`，训练不会启动。
+
+网页按以下顺序使用：
+
+1. “运行鲁棒策略开发流程”：执行数据预检、不可变 provider 准备、五类模型的多窗口/多随机种子滚动样本外训练，以及五套交易规则的成本和延迟压力测试。开发期只允许输出 `development_failed` 或 `research_candidate_ready`。
+2. “运行冻结策略 2026 确认期”：只对已经冻结的配置、Git commit、数据清单哈希、模型文件哈希和预测文件哈希运行一次确认。2026 结果不能用于回头换冠军；未通过时输出 `development_failed`。
+3. “运行鲁棒策略当日纸面跟踪”：只加载冻结模型做当日推理，不重新训练，按交易日逐日记录任务成功、组合收益、基准收益、净超额和最大回撤。状态 `shadow_observation` 表示仍在观察，不等于合格；完成 60 个交易日且全部门槛通过后，才允许出现 `robust_strategy_qualified`。
+
+固定状态只有 `blocked_data`、`development_failed`、`research_candidate_ready`、`shadow_observation`、`robust_strategy_qualified`。网页会把策略生命周期和最近一次纸面任务分开显示：某天推理失败会显示日期和原因，但不会把一次运行故障伪装成 60 日最终结论；同一失败日期也不能重跑成成功。`/backtest` 展示模型稳定性、策略成本/延迟压力、季度样本外结果、市场状态归因、确认期和纸面跟踪；`/experiments/` 查看 `robust_csi800_development` 与 `robust_csi800_confirmation` 的 MLflow 原始 Runs。
+
+正式报告写入 `quant_workflow/reports/robust_strategy/`。核心入口包括 `build_pit_csi800.py`、`download_robust_reference.py`、`preflight_robust_data.py`、`prepare_robust_provider.py`、`run_robust_development.py`、`run_robust_strategy.py`、`run_robust_confirmation.py`、`run_robust_shadow_day.py` 和 `robust_shadow_tracking.py`。长训练必须通过 `launch_robust_strategy.py` 持久化启动，保留 PID、日志和 launch record，并在启动后复核进程与 CPU 占用；不能把正式训练作为 Codex 前台子进程裸跑。模型、行情、报告、MLflow 数据和运行日志不进入 Git。
+
+在真实数据预检通过之前，只能说“实现已就绪”或“数据阻断”，不能说训练完成；开发期与确认期通过后也只能叫“研究候选”，不能说“鲁棒策略合格”。整个流程不连接券商、不读取账号密码、不自动下单。
+
+### 2.2 quant_workflow 脚本覆盖盘点
 
 `quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到网页按钮里。当前网页任务中心已经覆盖核心日常链路：数据下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、数据治理盘点和 dry-run 清理预案、市场状态、现金仓位叠加、Qlib 研究增强、china-astock 技术指标报告、china-astock 对比、策略优化预演和 baseline 训练。
 
-### 2.2 每日数据更新全链路与自动调度
+### 2.3 每日数据更新全链路与自动调度
 
 `run_daily_update.py` 在 `/workflow` 中作为“运行每日数据更新全链路”任务出现，把已有稳定脚本按依赖顺序串成一条可审计的链路：
 
