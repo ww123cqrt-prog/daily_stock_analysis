@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import socket
 import threading
 import time
@@ -31,6 +30,7 @@ from api.v1.schemas.quant_jobs import (
     QuantStatusResponse,
 )
 from api.v1.endpoints.research_status import build_research_status_payload
+from src.safe_errors import sanitize_public_error
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
 from src.safe_urls import public_http_url
 
@@ -48,30 +48,6 @@ LOCAL_MLFLOW_HOSTS = {"127.0.0.1", "localhost", "::1"}
 LOCAL_MLFLOW_HEALTH_PORTS = {None, 6006, 6606}
 LOCAL_CATDESK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 LOCAL_CATDESK_HEALTH_PORTS = {8765}
-_POSIX_SENSITIVE_PATH_ROOTS = (
-    "Applications",
-    "Library",
-    "Users",
-    "Volumes",
-    "app",
-    "etc",
-    "home",
-    "opt",
-    "private",
-    "tmp",
-    "usr",
-    "var",
-)
-_POSIX_SENSITIVE_PATH_ROOT_PATTERN = "|".join(re.escape(root) for root in _POSIX_SENSITIVE_PATH_ROOTS)
-_WINDOWS_SENSITIVE_PATH_PATTERN = r"[A-Za-z]:(?:[\\/][^\s'\"<>]+|[^\s'\"<>\\/]+[\\/][^\s'\"<>]+)"
-_WINDOWS_QUOTED_SENSITIVE_PATH_PATTERN = r"[A-Za-z]:(?:[\\/][^\r\n'\"]+|[^\r\n'\"\\/]+[\\/][^\r\n'\"]+)"
-QUOTED_ABSOLUTE_PATH_RE = re.compile(
-    rf"(['\"])(/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\r\n'\"]*)?|{_WINDOWS_QUOTED_SENSITIVE_PATH_PATTERN})\1"
-)
-POSIX_ABSOLUTE_PATH_RE = re.compile(
-    rf"(?<![A-Za-z0-9_:/.-])/(?:{_POSIX_SENSITIVE_PATH_ROOT_PATTERN})(?:/[^\s'\"<>]+)*"
-)
-WINDOWS_ABSOLUTE_PATH_RE = re.compile(rf"(?<![A-Za-z0-9_]){_WINDOWS_SENSITIVE_PATH_PATTERN}")
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _QUANT_JOB_STREAM_LOCK = threading.Lock()
@@ -129,12 +105,7 @@ def _now_iso() -> str:
 
 
 def _sanitize_public_error(error: Optional[str]) -> Optional[str]:
-    if not error:
-        return error
-    sanitized = QUOTED_ABSOLUTE_PATH_RE.sub(r"\1[path]\1", str(error))
-    sanitized = WINDOWS_ABSOLUTE_PATH_RE.sub("[path]", sanitized)
-    sanitized = POSIX_ABSOLUTE_PATH_RE.sub("[path]", sanitized)
-    return sanitized
+    return sanitize_public_error(error)
 
 
 def _fresh_cached_mlflow_payload(url: str, now: float) -> Optional[Dict[str, Any]]:

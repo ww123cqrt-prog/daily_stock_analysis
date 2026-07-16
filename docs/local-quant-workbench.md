@@ -4,7 +4,7 @@
 
 ## 一句话架构
 
-当前框架是：组织上统一，代码上分层，数据上外置，入口统一到 DSA。`daily_stock_analysis` 是主网页和主操作台；仓内 `quant_workflow/` 是本地量化流水线；`Qlib` 是机器学习量化引擎；`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 只保留为实验原始记录页面。唯一 Python 虚拟环境是 `daily_stock_analysis/.venv`：DSA 后端、`quant_workflow` 稳定脚本、Qlib、JQData/AkShare 和 `china-astock-quant` 适配层都从这套环境运行。
+当前框架是：组织上统一，代码上分层，数据上外置，入口统一到 DSA。`daily_stock_analysis` 是主网页和主操作台；仓内 `quant_workflow/` 是本地量化流水线；`Qlib` 是机器学习量化引擎；`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 只保存实验原始记录，页面通过 DSA `/experiments/` 访问。唯一 Python 虚拟环境是 `daily_stock_analysis/.venv`：DSA 后端、`quant_workflow` 稳定脚本、Qlib、JQData/AkShare、MLflow 和 `china-astock-quant` 适配层都从这套环境运行。
 
 ## 本机入口
 
@@ -14,7 +14,7 @@
 | 工作流任务中心 | `/workflow` | 从网页运行白名单量化脚本、查看状态、日志和产物 |
 | 研究总览 | `/research` | 查看数据状态、项目关系、实验记录、能力边界和复用清单 |
 | 回测页 | `/backtest` | 查看 DSA 历史准确性回测和 Qlib 模型/策略回测摘要 |
-| MLflow | `http://127.0.0.1:6006/` | 查看实验原始 run、参数和 artifact，不作为主 UI |
+| 实验 | `/experiments/` | 查看 MLflow 实验、Run、参数、指标和 artifact，支持中文/English 切换 |
 
 如果 `8000` 被其他服务占用，以当前实际启动的 `8010` 为准；页面文案不应假定 `8000` 就是 DSA。
 
@@ -22,7 +22,7 @@
 
 本地研究默认只绑定 `127.0.0.1`。只要 `DSA_BIND_HOST`/`UVICORN_HOST` 指向非 localhost，或 `DSA_ENV=production`，后端就要求 `ADMIN_AUTH_ENABLED=true`；否则启动会直接拒绝。设置页也不能在这些暴露运行时关闭认证。需要局域网或公网访问时，先启用管理员认证，再配置明确的来源列表或反向代理。若绕过项目入口、手写 `uvicorn.Config(host=...)` 启动服务，必须先设置 `DSA_BIND_HOST` 或调用 `src.web_bind.publish_bind_host()`，否则应用工厂无法可靠感知真实绑定地址。
 
-`/api/v1/quant/*` 的任务创建/取消/SSE，以及 `/api/v1/research/experiments/*` 的实验记录变更，都要求请求带有本机 `Origin` 或本机 `Referer`。`/api/v1/quant/*` 的任务列表、日志、产物和状态读取，以及 `/api/v1/research/status` 也会拒绝跨站浏览器读取；无 `Origin` 的本机 CLI 健康检查仍可读取。浏览器里的 DSA 页面会自动满足这个条件；裸 `curl`/脚本调试 mutation API 时，应显式带上本机 `Referer: http://127.0.0.1:8010/workflow` 或 `Origin: http://127.0.0.1:8010`。`X-DSA-Local-Client` 不作为来源保护旁路；一旦绑定到 `0.0.0.0` 或生产环境，应启用管理员认证后按受控客户端方式接入。
+`/api/v1/quant/*` 的任务创建/取消/SSE、`/api/v1/research/experiments/*` 的实验记录变更和 `/experiments/*` 的 MLflow 写请求，都要求请求带有本机 `Origin` 或本机 `Referer`。`/api/v1/quant/*` 的任务列表、日志、产物和状态读取、`/api/v1/research/status` 以及 `/experiments/*` 读取也会拒绝跨站浏览器访问；无 `Origin` 的本机 CLI 健康检查仍可读取。浏览器里的 DSA 页面会自动满足这个条件；裸 `curl`/脚本调试 mutation API 时，应显式带上本机 `Referer: http://127.0.0.1:8010/workflow` 或 `Origin: http://127.0.0.1:8010`。`X-DSA-Local-Client` 不作为来源保护旁路；一旦绑定到 `0.0.0.0` 或生产环境，应启用管理员认证后按受控客户端方式接入。
 
 量化任务接口在本地模式下可以不启用登录认证，但安全边界是“只绑定 localhost + 来源校验 + 白名单脚本”。如果要给局域网或公网使用，必须启用 `ADMIN_AUTH_ENABLED=true`，并额外评估访问控制、反向代理和提交频率限制。
 
@@ -31,6 +31,10 @@
 JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依次尝试 `~/.agents/private/quant-workbench/jqdata.env` 和历史兼容位置 `WORKING_PROJECTS_ROOT/qlib/.env`。新安装和新 agent 维护时，应使用私有目录，不要把 `JQ_USERNAME` / `JQ_PASSWORD` 写回项目目录。
 
 `MLFLOW_URL` 只用于网页链接和本地 health check。health check 只探测 `127.0.0.1`、`localhost` 或 `::1`，并拒绝带用户名密码或路径穿越段的 URL；API 返回给前端的展示 URL 会移除 username/password、query 和 fragment。非本机 MLflow 地址只展示为外部链接，不主动探测。`MAX_QUANT_JOB_STREAMS` 可调节 `/workflow` SSE 连接上限，默认 8，最小值按 1 处理。
+
+本机 `MLFLOW_URL=http://127.0.0.1:6006/` 时，前端链接统一改写为 `/experiments/`。DSA 只缓冲 MLflow 的 HTML 首页以插入双语运行时；JS、CSS、API 和 artifact 按流转发。第一版只开放实验列表、训练 Run、对比、参数、指标和 artifact；GenAI、Prompt、AI Gateway、LLM Connections 和模型注册路由会隐藏并重定向回实验页。翻译目录由官方 MLflow 3.14.0 `zh-CN.json` 和本机已安装的 3.14.0 前端 bundle 生成，共 1235 条静态映射；实验名、Run ID、参数名、指标名和文件名保持原文。普通实验和 Run 页面仍可能残留少量英文，这属于已知显示差异，不能笼统写成仅 GenAI/AI Gateway 缺少中文。目录元数据中的 `upstreamCommit` 固定为 `86cd7f5a1dc25a1387ad07c87811bbc30f62951c`，生成器会拒绝版本不一致的 MLflow bundle。
+
+当 `6006` 未启动时，`/experiments/` 离线页可以启动固定的本机 MLflow 命令。该入口不接收命令、路径或端口参数，只使用当前 DSA Python、仓内 `quant_workflow/mlruns`（或显式 `QUANT_WORKFLOW_MLRUNS_DIR`）、`127.0.0.1:6006`，日志写入 `logs/mlflow_6006.log`，启动记录写入 `.local/services/mlflow-6006.json`。子进程环境采用最小白名单，不继承 LLM API Key、JQData 密码等业务凭据。
 
 任务状态 API 不返回真实 `cwd`、`job.log` 路径或 artifact 绝对路径；前端只拿 artifact 展示名和索引，下载/预览时仍由后端按 job id 与 artifact index 做路径边界检查。研究状态里的数据治理路径也只返回项目内标签或文件名，`.maintenance.lock` 只暴露锁定状态和更新时间，不暴露文件内容。
 
@@ -77,7 +81,7 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 4. 合并 Qlib：运行“合并并转换为 Qlib”，必要时先用小样本演练。
 5. 质量报告：运行“生成数据质量报告”、“生成异常股票和清洗策略”、“校验新浪最新快照”、“生成数据治理盘点和清理预案”和“生成工作台能力盘点”。
 6. 清洗预演：先用“只预演不写入”，确认影响范围后再考虑生成 cleaned provider。
-7. 训练+回测：运行“训练 Qlib LightGBM 基线”，再运行“生成 Qlib 预测摘要”、市场状态、现金仓位叠加、策略优化预演、DSA 分析准确性回测。
+7. 训练+回测：日常基线可运行“训练 Qlib LightGBM 基线”；完整候选研究运行“运行五模型完整量化流程”，依次训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择前两名及五套策略，再用 2026 留出期终审。随后可运行“生成 Qlib 预测摘要”、市场状态、现金仓位叠加、策略优化预演和 DSA 分析准确性回测。
 8. Qlib 研究增强：运行“生成 Qlib 模型解释报告”、“生成 Qlib 回测明细报告”、“生成 Qlib 多模型/多实验对比”、“生成 Qlib 因子分析报告”、“生成 Qlib 滚动训练计划”和“生成 Qlib 风险模型诊断”。
 9. 复用参考：运行“生成 china-astock 技术指标报告”和“生成 china-astock 策略对比”，只生成报告，不连接券商。
 
@@ -133,6 +137,8 @@ scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 pl
 `report_china_astock_indicators.py` 复用 `china-astock-quant/strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数，读取本地 cleaned 行情生成 `china_astock_indicator_report_latest.{json,md}`。这是只读研究报告，不连接券商、不读取账号密码、不自动下单。网页端和脚本端省略 `limit` 时都默认只抽样 50 只股票，避免误把“安全报告”跑成全市场重任务；需要扩大范围时必须显式填写数量上限。
 
 `report_qlib_research.py` 在 `/workflow` 中作为“Qlib 研究增强”的 6 个固定任务出现：模型效果深度解释、回测详细分解、多模型/多实验对比、因子挖掘辅助、滚动训练计划和风险模型集成诊断。每个网页按钮都固定传入对应 section，不能从网页提交任意 section 或 shell 命令。脚本读取本地 MLflow/Qlib 既有产物生成 `qlib_research_model_explainability_latest.{json,md}` 等报告；首版不重新训练、不计算无限制 SHAP、不接券商、不自动下单。
+
+`run_candidate_pipeline.py` 是完整候选流程的固定编排入口，配置真源为 `quant_workflow/configs/candidate_pipeline.yaml`。五个模型使用同一个 Alpha158、CSI300、训练期、验证期、交易成本和基准；模型与策略排名只读取 2024-2025，2026 指标只用于对已选组合做独立终审，不能根据 2026 成绩改选其他组合。每轮写入 `candidate_pipeline_latest.{json,md}`、进度 JSON 和同批次 MLflow runs；真实候选 Run 会保留在实验历史中以便追溯，但候选研究结束后会恢复运行前的 `latest_training_result.json`，不会自动替换日常模型、连接券商或下单。
 
 研究状态 API 只会对配置的 `quant_data/qlib` provider 根目录内的 Qlib 路径补充日历、标的和体量信息。`latest_training_result.json` 如果指向根目录之外的路径，页面会保留警告，不递归扫描该目录。
 

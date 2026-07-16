@@ -167,6 +167,7 @@ describe('WorkflowPage', () => {
         report_qlib_rolling_training: { label: '生成 Qlib 滚动训练计划', allowedParams: ['config', 'windows', 'train_years', 'valid_months', 'test_months', 'step_months'] },
         report_qlib_risk_model: { label: '生成 Qlib 风险模型诊断', allowedParams: ['run_id'] },
         train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config', 'experiment_name', 'provider'] },
+        run_candidate_pipeline: { label: '运行五模型完整量化流程', allowedParams: ['dry_run', 'provider'] },
         generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
         add_index_benchmark: { label: '预演添加沪深300 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
@@ -272,9 +273,9 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('CatDesk')).toBeInTheDocument();
     expect(screen.getByText('美股催化观察台')).toBeInTheDocument();
     expect(screen.getAllByText('可用').length).toBeGreaterThan(0);
-    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', '/experiments/');
     expect(screen.getByRole('link', { name: '打开 CatDesk，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:8765/');
-    expect(screen.getByRole('link', { name: 'MLflow' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.getByRole('link', { name: 'MLflow' })).toHaveAttribute('href', '/experiments/');
     expect(screen.queryByText('/Users/cq/WorkingProjects')).not.toBeInTheDocument();
     expect(screen.queryByText('/tmp/job.log')).not.toBeInTheDocument();
     expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
@@ -292,6 +293,11 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('应用清洗策略')).toBeInTheDocument();
     expect(screen.getAllByText('质量报告').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('训练+回测')).toBeInTheDocument();
+    expect(screen.getByText('运行五模型完整量化流程')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五模型完整量化流程');
+    expect(screen.getByLabelText('运行五模型完整量化流程 数据版本')).toBeInTheDocument();
+    expect(screen.getByLabelText('运行五模型完整量化流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
     expect(screen.getByText('生成现金仓位叠加回测')).toBeInTheDocument();
@@ -354,7 +360,7 @@ describe('WorkflowPage', () => {
     expect(await screen.findByText('MLflow 未启动')).toBeInTheDocument();
     expect(screen.getAllByText('未启动').length).toBeGreaterThan(0);
     expect(screen.getByText('connection refused')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:6006/');
+    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', '/experiments/');
   });
 
   it('localizes the MLflow status card in English mode', async () => {
@@ -385,7 +391,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('External Link')).toBeInTheDocument();
     expect(screen.queryByText('外部链接')).not.toBeInTheDocument();
     expect(screen.getByText('Health check skipped for non-local MLflow URL.')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', 'https://mlflow.example.com/');
+    expect(screen.getByRole('link', { name: 'Open MLflow in a new window' })).toHaveAttribute('href', 'https://mlflow.example.com/');
   });
 
   it('submits a whitelisted quant job from the workflow page', async () => {
@@ -1037,7 +1043,7 @@ describe('WorkflowPage', () => {
       </UiLanguageProvider>,
     );
 
-    await screen.findByText('当前数据可训练');
+    await screen.findByText('Data ready for training');
     expect(FakeEventSource.instances).toHaveLength(1);
 
     vi.useFakeTimers();

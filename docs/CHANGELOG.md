@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 量化任务中心新增五模型完整候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择前两名及五套策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常模型或下单。
+- [新功能] DSA 新增唯一实验入口 `/experiments/`：后端流式代理现有 MLflow 3.14.0 `6006` 服务，并在官方页面上叠加中文/English 即时切换；本机 MLflow 链接统一改写到 8010，6006 退为后台且不再需要 6007 或额外代理进程。
+- [修复] MLflow 双语层保护实验名、Run 名、参数名、指标名和 artifact 文件名，不再把与界面词汇同名的业务数据翻译；第一版隐藏 GenAI、Prompt、AI Gateway、LLM Connections 和模型注册入口，并把越界路由重定向回训练实验。
+- [修复] MLflow 离线页新增固定本机服务启动按钮和可追溯启动记录；补齐 DSA 研究、工作流、回测返回入口、IPv6 loopback 链接转换和翻译目录版本/上游 commit 校验。
+- [安全] `/experiments/*` 纳入 DSA 管理员认证和本机 Origin/Referer 保护；跨站浏览器读写均拒绝，JS、CSS、API 和 artifact 保持流式转发，只有 HTML 首页会为插入双语脚本而重写。
+- [维护] 新增基于官方 MLflow 3.14.0 `zh-CN.json` 的 1235 条紧凑翻译目录生成器、代理单测、前端链接测试和真实浏览器双语验收；普通实验和 Run 页面仍可能残留少量英文，按已知显示差异维护。
 - [文档] 记录当前多项目组织决策：入口统一到 DSA、代码分层维护、`quant_data` 外置，`ashare-live-research` 和 `a-share-us-catalyst` 保持独立只读观察/催化服务，不硬合并进主仓。
 - [文档] 明确九点猫研/CatDesk 的定位：负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。
 - [新功能] 新增 `report_catdesk_signal_validation.py`，可用九点猫研早报候选池结合 DSA 风控、手写因子均衡规则和 Qlib 模型分数生成一日事后验证报告，验证行情可走在线快照且不回写 `quant_data`；报告支持多策略交叉对比、主线题材桶和向前逐日滚动验证，缺失早报会明确标记而不伪造历史信号。

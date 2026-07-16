@@ -123,7 +123,7 @@ export default defineConfig({
           cwd: repoRoot,
           env: managedWebServerEnv,
           url: `http://127.0.0.1:${backendPort}/api/v1/auth/status`,
-          reuseExistingServer: !process.env.CI,
+          reuseExistingServer: false,
           timeout: 120_000,
         },
         {
@@ -131,7 +131,7 @@ export default defineConfig({
           cwd: currentDir,
           env: managedWebServerEnv,
           url: 'http://127.0.0.1:4173',
-          reuseExistingServer: !process.env.CI,
+          reuseExistingServer: false,
           timeout: 120_000,
         },
       ]

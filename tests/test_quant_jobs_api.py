@@ -2813,6 +2813,38 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("Param phase must be <= 4", str(phase_ctx.exception))
         self.assertIn("Param topk must be >= 1", str(topk_ctx.exception))
 
+    def test_candidate_pipeline_job_uses_fixed_script_and_safe_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            real_command = service._build_command("run_candidate_pipeline", {"provider": "canonical"})
+            dry_command = service._build_command(
+                "run_candidate_pipeline",
+                {"provider": "cleaned", "dry_run": True},
+            )
+            status = service.available_job_types()
+            spec = service.command_specs["run_candidate_pipeline"]
+
+        self.assertIn("run_candidate_pipeline.py", real_command[1])
+        self._assert_reports_dir_arg(real_command, "--output-dir")
+        self.assertIn("--provider", real_command)
+        self.assertIn("canonical", real_command)
+        self.assertNotIn("--dry-run", real_command)
+        self.assertIn("cleaned", dry_command)
+        self.assertIn("--dry-run", dry_command)
+        self.assertEqual(status["run_candidate_pipeline"]["label"], "运行五模型完整量化流程")
+        self.assertEqual(status["run_candidate_pipeline"]["allowed_params"], ["dry_run", "provider"])
+        self.assertTrue(any("candidate_pipeline_latest.json" in item for item in spec["artifact_patterns"]))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+            with self.assertRaises(ValueError) as provider_ctx:
+                service._build_command("run_candidate_pipeline", {"provider": "/tmp/other-provider"})
+            with self.assertRaises(ValueError) as unknown_ctx:
+                service._build_command("run_candidate_pipeline", {"spec": "other.yaml"})
+        self.assertIn("Provider must be one of", str(provider_ctx.exception))
+        self.assertIn("Unsupported params", str(unknown_ctx.exception))
+
     def test_numeric_job_params_are_rejected_before_subprocess_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(

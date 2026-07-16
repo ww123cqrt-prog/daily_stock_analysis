@@ -50,8 +50,9 @@ _FRONTEND_INDEX_NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 _CSRF_PROTECTED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_CSRF_PROTECTED_API_PREFIX = "/api/v1/"
+_CSRF_PROTECTED_PREFIXES = ("/api/v1/", "/experiments/")
 _CSRF_STRICT_ORIGIN_PREFIXES = (
+    "/experiments/",
     "/api/v1/alphasift/",
     "/api/v1/auth/",
     "/api/v1/alerts/",
@@ -64,6 +65,7 @@ _LOCAL_ORIGIN_PROTECTED_GET_PATHS = frozenset({
     "/api/v1/research/status",
 })
 _LOCAL_ORIGIN_PROTECTED_GET_PREFIXES = (
+    "/experiments/",
     # /api/v1/quant/status includes local job metadata, artifact names, data
     # readiness, and MLflow linkage, so it stays same-origin/local-only even
     # though it is also used by CLI health checks with no Origin header.
@@ -203,7 +205,7 @@ def _allows_local_origin_shortcut() -> bool:
 def _is_csrf_protected_request(request: Request) -> bool:
     if request.method.upper() not in _CSRF_PROTECTED_METHODS:
         return False
-    return request.url.path.startswith(_CSRF_PROTECTED_API_PREFIX)
+    return any(request.url.path.startswith(prefix) for prefix in _CSRF_PROTECTED_PREFIXES)
 
 
 def _requires_explicit_mutation_origin(request: Request) -> bool:
@@ -262,6 +264,7 @@ from api.v1.schemas.common import HealthResponse
 from src.auth import is_auth_enabled
 from src.data.stock_index_loader import find_existing_stock_index_path
 from src.services.system_config_service import SystemConfigService
+from src.services.mlflow_ui_proxy import create_mlflow_ui_router
 from src.services.stock_index_remote_service import (
     get_remote_stock_index_cache_path,
     refresh_remote_stock_index_cache,
@@ -411,6 +414,7 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     # ============================================================
     
     app.include_router(api_v1_router)
+    app.include_router(create_mlflow_ui_router(), prefix="/experiments")
     add_error_handlers(app)
     
     # ============================================================

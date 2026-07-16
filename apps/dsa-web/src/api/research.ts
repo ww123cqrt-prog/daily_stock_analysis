@@ -102,6 +102,53 @@ export type ResearchQlibPredictions = {
   artifacts?: Record<string, string>;
 };
 
+export type ResearchCandidateMetrics = {
+  annualReturn?: number | null;
+  benchmarkAnnualReturn?: number | null;
+  annualExcessReturn?: number | null;
+  informationRatio?: number | null;
+  sharpe?: number | null;
+  maxDrawdown?: number | null;
+  avgTurnover?: number | null;
+  rankIc?: number | null;
+};
+
+export type ResearchCandidateModel = {
+  id: string;
+  label?: string;
+  status: string;
+  runId?: string | null;
+  selection?: ResearchCandidateMetrics;
+  holdout?: ResearchCandidateMetrics;
+  error?: string;
+};
+
+export type ResearchCandidateStrategy = {
+  modelId: string;
+  strategyId: string;
+  strategyLabel?: string;
+  selection?: ResearchCandidateMetrics;
+  holdout?: ResearchCandidateMetrics;
+};
+
+export type ResearchCandidatePipeline = {
+  status: string;
+  batchId?: string;
+  experimentName?: string;
+  provider?: string;
+  providerLatestDay?: string;
+  latestPredictionDay?: string;
+  latestLabelDay?: string;
+  periods?: Record<string, string[]>;
+  selectedModels?: string[];
+  models?: ResearchCandidateModel[];
+  strategyEvaluations?: ResearchCandidateStrategy[];
+  selectedCombination?: ResearchCandidateStrategy | null;
+  partialDevelopmentLeader?: ResearchCandidateStrategy | null;
+  holdoutVerdict?: { status?: string; reason?: string; note?: string };
+  artifacts?: Record<string, string>;
+};
+
 export type ResearchQlibResearchSection = {
   section: string;
   title: string;
@@ -312,6 +359,7 @@ export type ResearchStatus = {
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
+  candidatePipeline?: ResearchCandidatePipeline | null;
   qlibResearch?: ResearchQlibResearch | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   mlflow?: ResearchMlflow | null;

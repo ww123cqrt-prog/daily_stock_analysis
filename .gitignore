@@ -77,6 +77,7 @@ Thumbs.db
 htmlcov/
 
 local/
+/.local/
 
 run.sh
 

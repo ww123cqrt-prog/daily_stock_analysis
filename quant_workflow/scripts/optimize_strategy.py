@@ -434,7 +434,7 @@ def validate_params(phase: int, topk: int) -> tuple[int, int]:
 def build_dry_run_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """Create deterministic tiny prediction/label data for web smoke checks."""
     dates = pd.bdate_range("2026-01-02", periods=90)
-    instruments = [f"SH600{i:03d}" for i in range(45)]
+    instruments = [f"SH600{i:03d}" for i in range(80)]
     index = pd.MultiIndex.from_product([dates, instruments], names=["datetime", "instrument"])
     rows = []
     labels = []
@@ -600,6 +600,11 @@ def write_reports(
         "phase": phase,
         "topk": topk,
         "dry_run": dry_run,
+        "metric_basis": {
+            "candidate_return": "absolute_net_return",
+            "base_metrics": "qlib_excess_return_vs_benchmark",
+            "direct_comparison_allowed": False,
+        },
         "base_metrics": base_metrics,
         "results": results,
         "summary": _summary_rows(results),
@@ -614,6 +619,8 @@ def write_reports(
         f"- Phase: {phase}",
         f"- TopK: {topk}",
         f"- Dry-run: {dry_run}",
+        "",
+        "口径：候选策略使用自定义模拟器计算绝对净收益；base_metrics 中的 Qlib excess_return 是相对沪深300的超额收益，两者不能直接横向比较。",
         "",
         "| 实验 | 年化收益 | Sharpe | 最大回撤 | 平均换手 | 平均仓位 | 成本占比 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",

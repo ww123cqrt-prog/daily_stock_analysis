@@ -97,6 +97,16 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         assert phrase in manual
 
 
+def test_mlflow_workbench_docs_keep_user_and_backend_ports_distinct() -> None:
+    install_doc = (ROOT_DIR / "docs" / "install-local-quant-workbench.md").read_text(encoding="utf-8")
+    manual = (ROOT_DIR / "docs" / "local-quant-workbench.md").read_text(encoding="utf-8")
+
+    assert "8010` 是 DSA 日常网页入口" in install_doc
+    assert "6006` 是 MLflow 后台数据服务" in install_doc
+    assert "普通实验和 Run 页面仍可能残留少量英文" in manual
+    assert "upstreamCommit" in manual
+
+
 def test_quant_workflow_runtime_data_doc_marks_embedded_runtime_canonical() -> None:
     runtime_doc = (ROOT_DIR / "quant_workflow" / "RUNTIME_DATA.md").read_text(encoding="utf-8")
 
@@ -135,6 +145,7 @@ def test_verification_script_quick_covers_schedule_mode_regression() -> None:
     assert "report_workbench_capabilities.py" in script
     assert "report_qlib_research.py" in script
     assert "train_baseline_lgb.py" in script
+    assert "run_candidate_pipeline.py" in script
     assert "Missing quant_workflow script(s)" in script
     assert "run_dsa_backtest is intentionally a DSA-native job" in script
     assert "Missing DSA backtest entrypoint" in script
@@ -162,6 +173,19 @@ def test_verification_script_opencode_review_fails_without_bridge() -> None:
     opencode_body = script.split("run_opencode_review() {", 1)[1].split("\n}\n", 1)[0]
     assert "return 2" in opencode_body
     assert "return 0" not in opencode_body
+
+
+def test_managed_browser_smoke_cannot_reuse_the_live_dsa_service() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(encoding="utf-8")
+    package_json = (ROOT_DIR / "apps" / "dsa-web" / "package.json").read_text(encoding="utf-8")
+    playwright_config = (ROOT_DIR / "apps" / "dsa-web" / "playwright.config.ts").read_text(encoding="utf-8")
+    fake_body = script.split("run_browser_fake() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert 'DSA_WEB_E2E_BASE_URL="http://127.0.0.1:4173"' in fake_body
+    assert 'DSA_WEB_SMOKE_BACKEND_PORT="${managed_backend_port}"' in fake_body
+    assert 'DSA_WEB_DEV_API_TARGET="http://127.0.0.1:${managed_backend_port}"' in fake_body
+    assert "DSA_WEB_SMOKE_BACKEND_PORT=${DSA_WEB_SMOKE_BACKEND_PORT:-18011}" in package_json
+    assert "reuseExistingServer: false" in playwright_config
 
 
 def test_web_package_exposes_local_workbench_smoke_entry() -> None:

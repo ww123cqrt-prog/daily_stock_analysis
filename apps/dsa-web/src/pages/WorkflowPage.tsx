@@ -24,6 +24,7 @@ import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { getParsedApiError } from '../api/error';
 import { parseQuantJobStreamEvent, quantApi, type QuantJob, type QuantJobTypeInfo, type QuantStatus } from '../api/quant';
 import { researchApi, type ResearchStatus } from '../api/research';
+import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
 
 type WorkflowJob = {
   type: string;
@@ -301,7 +302,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
   {
     title: '训练+回测',
-    description: '运行 Qlib Alpha158 + LightGBM baseline，并记录 MLflow 实验。',
+    description: '运行单模型基线或五模型完整候选流程，并记录 MLflow 实验。',
     icon: FlaskConical,
     jobs: [
       {
@@ -320,6 +321,24 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           },
           { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
           { key: 'experiment_name', label: '实验名称', kind: 'text', placeholder: 'baseline_lgb_alpha158' },
+        ],
+      },
+      {
+        type: 'run_candidate_pipeline',
+        label: '运行五模型完整量化流程',
+        description: '依次训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost；只用 2024-2025 选择前两名及五套交易方法，再用 2026 留出期终审。结果写入 MLflow 和候选流程报告，不自动下单。',
+        defaultParams: { provider: 'canonical', dry_run: false },
+        params: [
+          {
+            key: 'provider',
+            label: '数据版本',
+            kind: 'select',
+            options: [
+              { value: 'canonical', label: '原始合并数据' },
+              { value: 'cleaned', label: '清洗后数据' },
+            ],
+          },
+          { key: 'dry_run', label: '只做小样本预演', kind: 'checkbox' },
         ],
       },
       {
@@ -915,7 +934,7 @@ const WorkflowPage: React.FC = () => {
     status: 'unavailable',
     role: 'external_catalyst_dashboard',
   };
-  const mlflowUrl = mlflow?.url || 'http://127.0.0.1:6006/';
+  const mlflowUrl = resolveMlflowUiUrl(mlflow?.url || 'http://127.0.0.1:6006/');
   const catdeskUrl = catdeskService.url || 'http://127.0.0.1:8765/';
   const mlflowMeta = mlflowStatusMeta(mlflow?.status, language);
   const externalServiceRows = [
@@ -1221,10 +1240,17 @@ const WorkflowPage: React.FC = () => {
               <JobStatusBadge job={undefined} />
             </div>
             <p className="mt-3 text-lg font-semibold text-foreground">
-              {trainable ? '当前数据可训练' : loading ? '正在读取数据状态' : '数据暂不可训练'}
+              {trainable
+                ? (language === 'zh' ? '当前数据可训练' : 'Data ready for training')
+                : loading
+                  ? (language === 'zh' ? '正在读取数据状态' : 'Loading data status')
+                  : (language === 'zh' ? '数据暂不可训练' : 'Data not ready for training')}
             </p>
             <p className="mt-2 text-sm leading-5 text-secondary-text">
-              {workflowStatus?.trainingReadiness?.summary || '运行质量报告后，这里会显示训练准备状态。'}
+              {workflowStatus?.trainingReadiness?.summary
+                || (language === 'zh'
+                  ? '运行质量报告后，这里会显示训练准备状态。'
+                  : 'Run a data quality report to see training readiness here.')}
             </p>
           </Card>
 
@@ -1234,24 +1260,28 @@ const WorkflowPage: React.FC = () => {
               {workflowStatus?.qlibProvider?.calendarRange || '-'}
             </p>
             <p className="mt-2 text-sm text-secondary-text">
-              股票池 {formatNumber(workflowStatus?.qlibProvider?.instruments)} · 日历 {formatNumber(workflowStatus?.qlibProvider?.calendarDays)}
+              {language === 'zh' ? '股票池' : 'Universe'} {formatNumber(workflowStatus?.qlibProvider?.instruments)} · {language === 'zh' ? '日历' : 'Calendar'} {formatNumber(workflowStatus?.qlibProvider?.calendarDays)}
             </p>
           </Card>
 
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <span className="label-uppercase">Jobs</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
-              {quantStatus?.activeCount ?? 0} 个运行中
+              {language === 'zh'
+                ? `${quantStatus?.activeCount ?? 0} 个运行中`
+                : `${quantStatus?.activeCount ?? 0} running`}
             </p>
             <p className="mt-2 text-sm text-secondary-text">
-              最近任务 {jobs.length} 条，状态和日志保存在本地 reports/jobs。
+              {language === 'zh'
+                ? `最近任务 ${jobs.length} 条，状态和日志保存在本地 reports/jobs。`
+                : `${jobs.length} recent jobs; status and logs are stored locally under reports/jobs.`}
             </p>
           </Card>
 
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <span className="label-uppercase">Latest Training</span>
             <p className="mt-3 truncate text-lg font-semibold text-foreground">
-              {latestTraining?.experimentName || '暂无训练记录'}
+              {latestTraining?.experimentName || (language === 'zh' ? '暂无训练记录' : 'No training runs yet')}
             </p>
             <p className="mt-2 truncate text-sm text-secondary-text">
               Run ID: {latestTraining?.runId || '-'}
@@ -1263,10 +1293,10 @@ const WorkflowPage: React.FC = () => {
               <span className="label-uppercase">Services</span>
               <Badge variant={serviceStatusMeta(catdeskService.status, language).variant} size="sm" className="gap-1.5 shadow-none">
                 <StatusDot tone={serviceStatusMeta(catdeskService.status, language).tone} className="h-1.5 w-1.5" />
-                外部服务
+                {language === 'zh' ? '外部服务' : 'External'}
               </Badge>
             </div>
-            <p className="mt-3 text-lg font-semibold text-foreground">外部服务状态</p>
+            <p className="mt-3 text-lg font-semibold text-foreground">{language === 'zh' ? '外部服务状态' : 'External service status'}</p>
             <div className="mt-3 space-y-2">
               {externalServiceRows.map((item) => {
                 const meta = serviceStatusMeta(item.service?.status, language);
@@ -1289,7 +1319,7 @@ const WorkflowPage: React.FC = () => {
                           href={item.url}
                           target="_blank"
                           rel="noreferrer"
-                          aria-label={`打开 ${item.label}，新窗口`}
+                          aria-label={language === 'zh' ? `打开 ${item.label}，新窗口` : `Open ${item.label} in a new window`}
                           className="min-w-0 hover:text-cyan"
                         >
                           {row}

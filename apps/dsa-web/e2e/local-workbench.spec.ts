@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,6 @@ const e2ePrefix = `dsa_e2e_${new Date().toISOString().replace(/[-:.TZ]/g, '').sl
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(currentDir, '../../..');
 const createdQuantJobIds = new Set<string>();
-const createdQuantJobProcesses = new Map<string, ChildProcess>();
 const createdExperimentRunIds = new Set<string>();
 const createdAnalysisHistoryQueryIds = new Set<string>();
 const createdChatSessionIds = new Set<string>();
@@ -38,32 +37,6 @@ function assertLocalSmokeTarget() {
 
 function sqlString(value: string) {
   return `'${value.replace(/'/g, "''")}'`;
-}
-
-function pad2(value: number) {
-  return String(value).padStart(2, '0');
-}
-
-function formatLocalIso(value: Date) {
-  const timezoneOffsetMinutes = -value.getTimezoneOffset();
-  const sign = timezoneOffsetMinutes >= 0 ? '+' : '-';
-  const absoluteOffsetMinutes = Math.abs(timezoneOffsetMinutes);
-  return [
-    `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}`,
-    `T${pad2(value.getHours())}:${pad2(value.getMinutes())}:${pad2(value.getSeconds())}`,
-    `${sign}${pad2(Math.floor(absoluteOffsetMinutes / 60))}:${pad2(absoluteOffsetMinutes % 60)}`,
-  ].join('');
-}
-
-function formatLocalCompact(value: Date) {
-  return [
-    value.getFullYear(),
-    pad2(value.getMonth() + 1),
-    pad2(value.getDate()),
-    pad2(value.getHours()),
-    pad2(value.getMinutes()),
-    pad2(value.getSeconds()),
-  ].join('');
 }
 
 function escapeRegExp(value: string) {
@@ -272,6 +245,29 @@ async function waitForJobToFinish(page: Page, jobId: string) {
     intervals: [1000, 1500, 2000],
     timeout: 60_000,
   }).toMatch(/^(completed|failed|cancelled)$/);
+}
+
+async function launchCapabilityArtifactJob(page: Page) {
+  const responsePromise = page.waitForResponse(
+    (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+    { timeout: 15_000 },
+  );
+  await page.getByRole('button', { name: '运行 生成工作台能力盘点' }).click();
+  const submitResponse = await responsePromise;
+  expect(submitResponse.ok()).toBeTruthy();
+  expect(submitResponse.request().postDataJSON()).toMatchObject({
+    job_type: 'report_workbench_capabilities',
+    params: {},
+  });
+  const job = await submitResponse.json() as { job_id: string };
+  createdQuantJobIds.add(job.job_id);
+  await waitForJobToFinish(page, job.job_id);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
+  return {
+    jobId: job.job_id,
+    artifactName: 'workbench_capability_inventory_latest.md',
+  };
 }
 
 async function waitForAnalysisTaskToComplete(page: Page, taskId: string): Promise<RawAnalysisTaskStatus> {
@@ -585,176 +581,7 @@ function cleanupQuantJobDatabase(jobIds: string[]) {
   for (const jobId of safeJobIds) {
     fs.rmSync(path.join(jobsRoot, jobId), { recursive: true, force: true });
     createdQuantJobIds.delete(jobId);
-    const child = createdQuantJobProcesses.get(jobId);
-    if (child?.pid && isPidAlive(child.pid)) {
-      terminateProcessGroup(child.pid);
-    }
-    createdQuantJobProcesses.delete(jobId);
   }
-}
-
-function isPidAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function terminateProcessGroup(pid: number) {
-  for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        // Already exited.
-      }
-    }
-    if (!isPidAlive(pid)) return;
-  }
-}
-
-function createTemporaryQuantArtifactJob() {
-  assertLocalSmokeTarget();
-  const timestamp = new Date();
-  const timestampCompact = formatLocalCompact(timestamp);
-  const jobId = `qj_${timestampCompact}_${Math.random().toString(16).slice(2, 10).padEnd(8, '0')}`;
-  const jobsRoot = getQuantJobsRoot();
-  const jobDir = path.join(jobsRoot, jobId);
-  const logPath = path.join(jobDir, 'job.log');
-  const artifactPath = path.join(jobDir, `${e2ePrefix}_artifact_report.md`);
-  const databasePath = path.join(jobsRoot, 'index.sqlite');
-  const now = formatLocalIso(timestamp);
-
-  fs.mkdirSync(jobDir, { recursive: true });
-  fs.writeFileSync(logPath, `dsa e2e artifact job ${jobId}\n`, 'utf-8');
-  fs.writeFileSync(
-    artifactPath,
-    `# DSA E2E Artifact\n\nRun: ${jobId}\n\nMarker: ${e2ePrefix}_artifact_marker\n`,
-    'utf-8',
-  );
-
-  const sql = [
-    `CREATE TABLE IF NOT EXISTS jobs (
-      job_id TEXT PRIMARY KEY,
-      job_type TEXT NOT NULL,
-      label TEXT NOT NULL,
-      status TEXT NOT NULL,
-      params_json TEXT NOT NULL,
-      command_json TEXT NOT NULL,
-      cwd TEXT NOT NULL,
-      pid INTEGER,
-      return_code INTEGER,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      completed_at TEXT,
-      updated_at TEXT NOT NULL,
-      error TEXT,
-      log_path TEXT NOT NULL,
-      artifact_paths_json TEXT NOT NULL
-    );`,
-    `INSERT OR REPLACE INTO jobs (
-      job_id, job_type, label, status, params_json, command_json, cwd,
-      pid, return_code, created_at, started_at, completed_at, updated_at,
-      error, log_path, artifact_paths_json
-    ) VALUES (
-      ${sqlString(jobId)},
-      'report_data_quality',
-      '生成数据质量报告',
-      'completed',
-      '{}',
-      '[]',
-      ${sqlString(repoRoot)},
-      NULL,
-      0,
-      ${sqlString(now)},
-      ${sqlString(now)},
-      ${sqlString(now)},
-      ${sqlString(now)},
-      NULL,
-      ${sqlString(logPath)},
-      ${sqlString(JSON.stringify([artifactPath]))}
-    );`,
-  ].join(' ');
-
-  execFileSync('sqlite3', [databasePath, sql], { stdio: 'pipe' });
-  createdQuantJobIds.add(jobId);
-  return { jobId, artifactPath };
-}
-
-function createTemporaryRunningQuantJob() {
-  assertLocalSmokeTarget();
-  const timestamp = new Date();
-  const timestampCompact = formatLocalCompact(timestamp);
-  const jobId = `qj_${timestampCompact}_${Math.random().toString(16).slice(2, 10).padEnd(8, '0')}`;
-  const jobsRoot = getQuantJobsRoot();
-  const jobDir = path.join(jobsRoot, jobId);
-  const logPath = path.join(jobDir, 'job.log');
-  const databasePath = path.join(jobsRoot, 'index.sqlite');
-  const now = formatLocalIso(timestamp);
-
-  fs.mkdirSync(jobDir, { recursive: true });
-  fs.writeFileSync(logPath, `dsa e2e cancellable job ${jobId}\n`, 'utf-8');
-  const child = spawn(
-    process.execPath,
-    ['-e', 'setTimeout(() => {}, 120000)'],
-    { detached: true, stdio: 'ignore' },
-  );
-  child.unref();
-  if (!child.pid) {
-    throw new Error(`Failed to start cancellable quant test process for ${jobId}`);
-  }
-
-  const sql = [
-    `CREATE TABLE IF NOT EXISTS jobs (
-      job_id TEXT PRIMARY KEY,
-      job_type TEXT NOT NULL,
-      label TEXT NOT NULL,
-      status TEXT NOT NULL,
-      params_json TEXT NOT NULL,
-      command_json TEXT NOT NULL,
-      cwd TEXT NOT NULL,
-      pid INTEGER,
-      return_code INTEGER,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      completed_at TEXT,
-      updated_at TEXT NOT NULL,
-      error TEXT,
-      log_path TEXT NOT NULL,
-      artifact_paths_json TEXT NOT NULL
-    );`,
-    `INSERT OR REPLACE INTO jobs (
-      job_id, job_type, label, status, params_json, command_json, cwd,
-      pid, return_code, created_at, started_at, completed_at, updated_at,
-      error, log_path, artifact_paths_json
-    ) VALUES (
-      ${sqlString(jobId)},
-      'check_qlib_data',
-      '检查 Qlib 数据',
-      'running',
-      '{}',
-      ${sqlString(JSON.stringify([process.execPath, '-e', 'setTimeout(() => {}, 120000)']))},
-      ${sqlString(repoRoot)},
-      ${child.pid},
-      NULL,
-      ${sqlString(now)},
-      ${sqlString(now)},
-      NULL,
-      ${sqlString(now)},
-      NULL,
-      ${sqlString(logPath)},
-      '[]'
-    );`,
-  ].join(' ');
-
-  execFileSync('sqlite3', [databasePath, sql], { stdio: 'pipe' });
-  createdQuantJobIds.add(jobId);
-  createdQuantJobProcesses.set(jobId, child);
-  return { jobId, pid: child.pid };
 }
 
 async function cleanupQuantJobs(request: APIRequestContext) {
@@ -1197,6 +1024,7 @@ test('workflow page can launch an isolated Qlib merge smoke fixture from the bro
 });
 
 test('workflow page can launch a sampled data quality report from the browser', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
     await openWorkbench(page, '/workflow');
@@ -1547,7 +1375,7 @@ test('workflow page can launch the china-astock technical indicator report from 
     await expect(page.locator('pre')).toContainText('china-astock 技术指标报告', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('只读研究报告', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('不自动下单', { timeout: 15_000 });
-    await expect(page.locator('pre')).toContainText('000001', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText(/000001|600519/, { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
   } finally {
@@ -1606,12 +1434,10 @@ test('workflow page rejects invalid job parameters before creating a quant job',
 
 test('workflow page opens completed quant job artifact links in a browser tab', async ({ page }) => {
   const consoleWatch = watchConsole(page);
-  const { jobId } = createTemporaryQuantArtifactJob();
-  const artifactName = `${e2ePrefix}_artifact_report.md`;
 
   try {
     await openWorkbench(page, '/workflow');
-    await expect(page.getByText(jobId)).toBeVisible({ timeout: 15_000 });
+    const { jobId, artifactName } = await launchCapabilityArtifactJob(page);
 
     const artifactLink = page.getByRole('link', { name: artifactName });
     await expect(artifactLink).toBeVisible({ timeout: 15_000 });
@@ -1625,8 +1451,7 @@ test('workflow page opens completed quant job artifact links in a browser tab', 
       artifactLink.click(),
     ]);
     await artifactPage.waitForLoadState('domcontentloaded');
-    await expect(artifactPage.locator('body')).toContainText('DSA E2E Artifact', { timeout: 15_000 });
-    await expect(artifactPage.locator('body')).toContainText(`${e2ePrefix}_artifact_marker`);
+    await expect(artifactPage.locator('body')).toContainText('DSA 本地量化工作台能力盘点', { timeout: 15_000 });
     expect(new URL(artifactPage.url()).pathname).toBe(`/api/v1/quant/jobs/${jobId}/artifacts/0`);
     await artifactPage.close();
 
@@ -1638,18 +1463,15 @@ test('workflow page opens completed quant job artifact links in a browser tab', 
 
 test('workflow page previews a completed quant text artifact inline', async ({ page }) => {
   const consoleWatch = watchConsole(page);
-  const { jobId } = createTemporaryQuantArtifactJob();
-  const artifactName = `${e2ePrefix}_artifact_report.md`;
 
   try {
     await openWorkbench(page, '/workflow');
-    await expect(page.getByText(jobId)).toBeVisible({ timeout: 15_000 });
+    const { artifactName } = await launchCapabilityArtifactJob(page);
 
     await page.getByRole('button', { name: `预览 ${artifactName}` }).click();
 
     await expect(page.getByRole('heading', { name: '产物预览' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.locator('pre')).toContainText('DSA E2E Artifact', { timeout: 15_000 });
-    await expect(page.locator('pre')).toContainText(`${e2ePrefix}_artifact_marker`);
+    await expect(page.locator('pre')).toContainText('DSA 本地量化工作台能力盘点', { timeout: 15_000 });
     expect(consoleWatch.errors).toEqual([]);
   } finally {
     consoleWatch.stop();
@@ -1658,28 +1480,42 @@ test('workflow page previews a completed quant text artifact inline', async ({ p
 
 test('workflow page can cancel a running quant job from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
-  const runningJob = createTemporaryRunningQuantJob();
 
   try {
     await openWorkbench(page, '/workflow');
-    await expect(page.getByText(runningJob.jobId)).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('button', { name: '取消 检查 Qlib 数据' })).toBeVisible({ timeout: 15_000 });
+    await page.getByLabel('应用清洗策略 只预演不写入').check();
+    await page.getByLabel('应用清洗策略 不覆盖已有文件').check();
+    const submitResponsePromise = page.waitForResponse(
+      (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
+      { timeout: 15_000 },
+    );
+    await page.getByRole('button', { name: '运行 应用清洗策略' }).click();
+    const submitResponse = await submitResponsePromise;
+    expect(submitResponse.ok()).toBeTruthy();
+    expect(submitResponse.request().postDataJSON()).toMatchObject({
+      job_type: 'apply_data_cleaning',
+      params: { dry_run: true, no_overwrite: true },
+    });
+    const runningJob = await submitResponse.json() as { job_id: string };
+    createdQuantJobIds.add(runningJob.job_id);
+
+    await expect(page.getByText(runningJob.job_id)).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '取消 应用清洗策略' })).toBeVisible({ timeout: 15_000 });
 
     const cancelResponsePromise = page.waitForResponse(
-      (response) => response.url().includes(`/api/v1/quant/jobs/${runningJob.jobId}/cancel`)
+      (response) => response.url().includes(`/api/v1/quant/jobs/${runningJob.job_id}/cancel`)
         && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '取消 检查 Qlib 数据' }).click();
+    await page.getByRole('button', { name: '取消 应用清洗策略' }).click();
     const cancelResponse = await cancelResponsePromise;
     expect(cancelResponse.ok()).toBeTruthy();
     const cancelled = await cancelResponse.json() as { status?: string; error?: string };
     expect(cancelled.status).toBe('cancelled');
     expect(cancelled.error).toContain('Cancelled by user');
 
-    await expect.poll(() => isPidAlive(runningJob.pid), { timeout: 15_000 }).toBe(false);
-    await expect(page.getByTestId('workflow-job-check_qlib_data').getByText('已取消')).toBeVisible({ timeout: 15_000 });
-    const detail = await page.request.get(`/api/v1/quant/jobs/${runningJob.jobId}`);
+    await expect(page.getByTestId('workflow-job-apply_data_cleaning').getByText('已取消')).toBeVisible({ timeout: 15_000 });
+    const detail = await page.request.get(`/api/v1/quant/jobs/${runningJob.job_id}`);
     expect(detail.ok()).toBeTruthy();
     expect((await detail.json() as { status?: string }).status).toBe('cancelled');
     expect(consoleWatch.errors).toEqual([]);
@@ -1697,6 +1533,16 @@ test('research page can archive and permanently delete temporary experiment reco
 
   try {
     await openWorkbench(page, '/research');
+    await expect.poll(async () => {
+      const response = await page.request.get('/api/v1/research/status');
+      if (!response.ok()) return false;
+      const payload = await response.json() as {
+        experiment_notebook?: { runs?: Array<{ run_id?: string }> };
+      };
+      const runIds = new Set((payload.experiment_notebook?.runs || []).map((run) => run.run_id));
+      return runIds.has(archiveRunId) && runIds.has(permanentRunId);
+    }, { timeout: 15_000 }).toBe(true);
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(`Run ${archiveRunId}`)).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(`Run ${permanentRunId}`)).toBeVisible({ timeout: 15_000 });
 

@@ -758,6 +758,75 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["qlib_predictions"]["top"][0]["instrument"], "SZ000002")
         self.assertEqual(body["qlib_predictions"]["bottom"][0]["score"], -0.40)
 
+    def test_status_includes_latest_candidate_pipeline_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            static_dir = Path(temp_dir) / "static"
+            static_dir.mkdir()
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            candidate_path = Path(temp_dir) / "candidate_pipeline_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-15T18:00:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {"status": "trainable", "summary": "ready"},
+                        "data_sources": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            candidate_path.write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "batch_id": "candidate-alpha158-20260715_174713",
+                        "provider_uri": "/private/provider",
+                        "selected_models": ["catboost", "xgboost"],
+                        "selected_combination": {
+                            "model_id": "xgboost",
+                            "strategy_id": "low_turnover_weekly",
+                            "holdout": {
+                                "annual_excess_return": 0.20,
+                                "information_ratio": 1.5,
+                                "max_drawdown": -0.12,
+                            },
+                        },
+                        "holdout_verdict": {"status": "passed_research_gate"},
+                        "models": [
+                            {"id": "xgboost", "status": "completed"},
+                            {
+                                "id": "catboost",
+                                "status": "failed",
+                                "error": (
+                                    "FileNotFoundError: /Users/cq/private/provider/model.bin; "
+                                    "fallback=C:\\Users\\cq\\private\\model.bin"
+                                ),
+                            },
+                        ],
+                        "strategy_evaluations": [],
+                        "artifacts": {"json": "/private/candidate.json"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path):
+                client = TestClient(create_app(static_dir=static_dir), headers={"Origin": "http://127.0.0.1:8010"})
+                resp = client.get("/api/v1/research/status")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["candidate_pipeline"]
+        self.assertEqual(body["selected_models"], ["catboost", "xgboost"])
+        self.assertEqual(body["selected_combination"]["model_id"], "xgboost")
+        self.assertEqual(body["holdout_verdict"]["status"], "passed_research_gate")
+        self.assertEqual(
+            body["models"][1]["error"],
+            "FileNotFoundError: [path] fallback=[path]",
+        )
+        self.assertNotIn("/private/", str(body))
+        self.assertNotIn("/Users/", str(body))
+        self.assertNotIn("C:\\Users\\", str(body))
+
     def test_status_returns_missing_payload_when_artifact_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             static_dir = Path(temp_dir) / "static"

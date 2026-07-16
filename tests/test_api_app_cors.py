@@ -140,6 +140,33 @@ class AppCorsConfigTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"], "csrf_forbidden")
 
+    def test_cross_origin_mlflow_proxy_mutation_is_rejected_even_when_cors_is_open(self):
+        with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
+             patch("api.app.is_auth_enabled", return_value=False), \
+             patch("api.middlewares.auth.is_auth_enabled", return_value=False):
+            client = TestClient(self._build_app())
+            resp = client.post(
+                "/experiments/ajax-api/2.0/mlflow/runs/delete",
+                headers={"Origin": "https://evil.example"},
+                json={"run_id": "run-1"},
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "csrf_forbidden")
+
+    def test_cross_origin_mlflow_proxy_read_is_rejected_even_when_cors_is_open(self):
+        with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
+             patch("api.app.is_auth_enabled", return_value=False), \
+             patch("api.middlewares.auth.is_auth_enabled", return_value=False):
+            client = TestClient(self._build_app())
+            resp = client.get(
+                "/experiments/ajax-api/2.0/mlflow/experiments/search",
+                headers={"Origin": "https://evil.example"},
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "csrf_forbidden")
+
     def test_cross_origin_research_experiment_mutation_is_rejected_even_when_cors_is_open(self):
         with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
              patch("api.app.is_auth_enabled", return_value=False), \

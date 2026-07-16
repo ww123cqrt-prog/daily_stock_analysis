@@ -191,7 +191,8 @@ scripts/verify-local-quant-workbench.sh complete
 | 服务 | 地址 | 说明 |
 | --- | --- | --- |
 | DSA | `http://127.0.0.1:8010/` | 主网页和 API |
-| MLflow | `http://127.0.0.1:6006/` | 实验原始记录 |
+| DSA 实验入口 | `http://127.0.0.1:8010/experiments/` | MLflow 官方 UI 的双语用户入口 |
+| MLflow 后台 | `http://127.0.0.1:6006/` | 仅提供实验数据和官方静态资源，不作为日常入口 |
 
 启动 MLflow 时保留本地 file store 显式开关：
 
@@ -204,6 +205,8 @@ MLFLOW_ALLOW_FILE_STORE=true .venv/bin/python -m mlflow ui \
 ```
 
 长跑服务或下载任务应使用 `screen`、`tmux`、`nohup`、`launchd` 或项目持久任务机制，并写入日志。不要把正式长任务裸跑在一次性前台 shell 里。
+
+MLflow 双语层维护规则：不要 clone 或修改 `.venv` 中的 MLflow 源码；不要启动第二个 MLflow 端口；修改 `src/services/mlflow_ui_proxy.py` 或翻译目录后，至少运行 `tests/test_mlflow_ui_proxy.py`、`tests/test_mlflow_service.py`、目录生成器测试、前端链接测试和 `e2e/verify-mlflow-bilingual.spec.ts`。当前 MLflow `3.14.0` 对应上游 commit `86cd7f5a1dc25a1387ad07c87811bbc30f62951c`。升级时必须同时更新版本、上游 commit、翻译源 URL 和生成产物，并在浏览器核对实验列表、Run 详情、筛选和 artifact；生成器的版本检查不得绕过。
 
 如果 agent 或外部脚本绕过 `main.py` / `webui.py` / `server.py`，直接用 `uvicorn.Config(host=...)` 创建服务，必须先设置 `DSA_BIND_HOST` 或调用 `src.web_bind.publish_bind_host(host)`。否则应用工厂无法看到真实 host，公网绑定认证检查只能按 localhost 默认处理。
 

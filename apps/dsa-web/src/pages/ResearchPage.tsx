@@ -42,6 +42,7 @@ import type {
 } from '../api/research';
 import { AppPage, Badge, Button, Card, PageHeader, StatusDot } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
 
 type StatusTone = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
 type BadgeVariant = 'default' | 'success' | 'warning' | 'danger' | 'info' | 'history';
@@ -288,7 +289,7 @@ const RESEARCH_TEXT = {
     statusItems: [
       { label: 'DSA 服务', value: '当前页面', detail: '本地 WebUI', tone: 'success' },
       { label: '数据源', value: 'AkShare/JQData/本地数据', detail: '按现有链路获取', tone: 'info' },
-      { label: 'MLflow', value: '实验记录', detail: 'http://127.0.0.1:6006/（状态见工作流页）', tone: 'info' },
+      { label: 'MLflow', value: '实验记录', detail: '/experiments/（状态见工作流页）', tone: 'info' },
       { label: '端口', value: '跟随当前访问地址', detail: '不硬编码 8000', tone: 'warning' },
     ] satisfies StatusItem[],
     capabilities: [
@@ -547,7 +548,7 @@ const RESEARCH_TEXT = {
     statusItems: [
       { label: 'DSA service', value: 'Current page', detail: 'Local WebUI', tone: 'success' },
       { label: 'Data sources', value: 'AkShare/JQData/local data', detail: 'Existing workflow', tone: 'info' },
-      { label: 'MLflow', value: 'Experiment tracking', detail: 'http://127.0.0.1:6006/ (status on Workflow)', tone: 'info' },
+      { label: 'MLflow', value: 'Experiment tracking', detail: '/experiments/ (status on Workflow)', tone: 'info' },
       { label: 'Port', value: 'Current browser address', detail: 'No hard-coded 8000', tone: 'warning' },
     ] satisfies StatusItem[],
     capabilities: [
@@ -1021,7 +1022,7 @@ const ResearchPage: React.FC = () => {
   const experimentRuns = experimentNotebook?.runs ?? [];
   const experimentComparison = buildExperimentComparison(experimentRuns);
   const experimentRunCount = experimentNotebook?.totalRuns ?? experimentRuns.length;
-  const mlflowUrl = researchStatus?.mlflow?.url || DEFAULT_MLFLOW_URL;
+  const mlflowUrl = resolveMlflowUiUrl(researchStatus?.mlflow?.url || DEFAULT_MLFLOW_URL);
   const mlflowStatus = researchStatus?.mlflow?.status || 'linked';
   const mlflowStatusMeta = dataStatusMeta(mlflowStatus);
   const mlflowStatusLabel = dataStatusLabel(mlflowStatus, language);

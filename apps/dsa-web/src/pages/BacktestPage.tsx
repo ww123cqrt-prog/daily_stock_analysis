@@ -8,6 +8,7 @@ import {
   type ResearchCashControlBacktest,
   type ResearchExperimentRun,
   type ResearchQlibPredictions,
+  type ResearchCandidatePipeline,
   type ResearchStatus,
 } from '../api/research';
 import type { ParsedApiError } from '../api/error';
@@ -32,6 +33,7 @@ import type {
 } from '../types/backtest';
 import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/decisionAction';
 import { getMarketPhaseSummaryLabel } from '../utils/marketPhase';
+import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
 
 const BACKTEST_INPUT_CLASS =
   'input-surface input-focus-glow h-11 w-full rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
@@ -346,6 +348,111 @@ const QlibPredictionCard: React.FC<{ report?: ResearchQlibPredictions | null; te
   );
 };
 
+const CandidatePipelineCard: React.FC<{
+  report: ResearchCandidatePipeline;
+  text: BacktestText;
+}> = ({ report, text }) => {
+  const english = text.tabQlib === 'Qlib model/strategy backtest';
+  const champion = report.selectedCombination;
+  const holdout = champion?.holdout || {};
+  const verdict = report.holdoutVerdict?.status;
+  const verdictLabel = verdict === 'passed_research_gate'
+    ? (english ? 'Passed research gate' : '通过研究门槛')
+    : verdict === 'rejected_by_holdout'
+      ? (english ? 'Rejected by holdout' : '留出期未通过')
+      : (english ? 'No valid final verdict' : '暂无有效终审结论');
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">
+            {english ? 'Five-model candidate pipeline' : '五模型候选流程'}
+          </h3>
+          <p className="mt-1 text-xs text-muted-text">
+            {english
+              ? 'Models and strategies are selected on 2024-2025; the 2026 holdout is used only for the final check.'
+              : '模型和策略只按 2024-2025 选择；2026 留出期只做最终检验，不参与改选。'}
+          </p>
+        </div>
+        <Badge variant={verdict === 'passed_research_gate' ? 'success' : 'default'}>{verdictLabel}</Badge>
+      </div>
+
+      <div className="mt-4 grid gap-3 border-y border-subtle py-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Selected models' : '入围模型'}</p>
+          <p className="mt-1 text-sm text-foreground">{(report.selectedModels || []).join(', ') || '--'}</p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Selected combination' : '开发期选中组合'}</p>
+          <p className="mt-1 text-sm font-semibold text-foreground">
+            {champion ? `${champion.modelId} + ${champion.strategyId}` : '--'}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Latest prediction day' : '最新预测日'}</p>
+          <p className="mt-1 font-mono text-sm text-foreground">{report.latestPredictionDay || '--'}</p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Latest evaluable day' : '最新可验证日'}</p>
+          <p className="mt-1 font-mono text-sm text-foreground">{report.latestLabelDay || '--'}</p>
+        </div>
+      </div>
+
+      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Holdout excess return' : '留出期年化超额'}</p>
+          <p className="mt-1 font-mono text-base font-semibold text-foreground">
+            {formatRatioPct(holdout.annualExcessReturn)}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Holdout information ratio' : '留出期信息比率'}</p>
+          <p className="mt-1 font-mono text-base font-semibold text-foreground">
+            {formatRatioNumber(holdout.informationRatio)}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-muted-text">{english ? 'Holdout max drawdown' : '留出期最大回撤'}</p>
+          <p className="mt-1 font-mono text-base font-semibold text-foreground">
+            {formatRatioPct(holdout.maxDrawdown)}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-4 overflow-x-auto">
+        <table className="min-w-full text-left text-xs">
+          <thead className="text-muted-text">
+            <tr>
+              <th className="px-2 py-2 font-medium">{english ? 'Model' : '模型'}</th>
+              <th className="px-2 py-2 text-right font-medium">{english ? 'Selection IR' : '开发期 IR'}</th>
+              <th className="px-2 py-2 text-right font-medium">{english ? 'Holdout IR' : '留出期 IR'}</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-subtle">
+            {(report.models || []).map((model) => (
+              <tr key={model.id}>
+                <td className="px-2 py-2 font-mono text-foreground">{model.id}</td>
+                <td className="px-2 py-2 text-right font-mono text-foreground">
+                  {formatRatioNumber(model.selection?.informationRatio)}
+                </td>
+                <td className="px-2 py-2 text-right font-mono text-foreground">
+                  {formatRatioNumber(model.holdout?.informationRatio)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-3 text-xs text-muted-text">
+        {english
+          ? 'Research result only. It does not connect to a broker or place orders automatically.'
+          : '仅供研究复核；不连接券商，不自动下单。'}
+      </p>
+    </Card>
+  );
+};
+
 // ============ Performance Card ============
 
 const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; language: UiLanguage }> = ({ metrics, title, language }) => {
@@ -512,9 +619,10 @@ const QlibBacktestPanel: React.FC<{
   const latestTraining = status?.latestTraining;
   const cashControlBacktest = status?.cashControlBacktest;
   const qlibPredictions = status?.qlibPredictions;
+  const candidatePipeline = status?.candidatePipeline;
   const runs = status?.experimentNotebook?.runs || [];
   const metrics = Object.entries(latestTraining?.metrics || {}).slice(0, 8);
-  const mlflowUrl = status?.mlflow?.url || DEFAULT_MLFLOW_URL;
+  const mlflowUrl = resolveMlflowUiUrl(status?.mlflow?.url || DEFAULT_MLFLOW_URL);
 
   return (
     <main className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -558,7 +666,7 @@ const QlibBacktestPanel: React.FC<{
             <Card variant="bordered" padding="md">
               <span className="label-uppercase">Provider</span>
               <p className="mt-3 text-lg font-semibold text-foreground">{status?.qlibProvider?.calendarRange || '--'}</p>
-              <p className="mt-2 text-xs text-muted-text">股票池 {status?.qlibProvider?.instruments ?? '--'} · 日历 {status?.qlibProvider?.calendarDays ?? '--'}</p>
+              <p className="mt-2 text-xs text-muted-text">{text.qlibProviderInstruments} {status?.qlibProvider?.instruments ?? '--'} · {text.qlibProviderCalendarDays} {status?.qlibProvider?.calendarDays ?? '--'}</p>
             </Card>
             <Card variant="bordered" padding="md">
               <span className="label-uppercase">Experiment</span>
@@ -601,6 +709,8 @@ const QlibBacktestPanel: React.FC<{
           </Card>
 
           <QlibPredictionCard report={qlibPredictions} text={text} />
+
+          {candidatePipeline ? <CandidatePipelineCard report={candidatePipeline} text={text} /> : null}
 
           <QlibArtifactsCard status={status} text={text} />
 

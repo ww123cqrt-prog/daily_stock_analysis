@@ -81,7 +81,30 @@ class OptimizeStrategyTest(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertIn("phase4_combined", payload["results"])
             self.assertIn("phase4_conservative", payload["results"])
-            self.assertIn("只读策略优化预演", result_md.read_text(encoding="utf-8"))
+            report_text = result_md.read_text(encoding="utf-8")
+            self.assertIn("只读策略优化预演", report_text)
+            self.assertEqual(payload["metric_basis"]["candidate_return"], "absolute_net_return")
+            self.assertIn("不能直接横向比较", report_text)
+
+    def test_phase2_dry_run_supports_default_topk_and_returns_five_candidates(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "reports"
+
+            module.run_report(
+                phase=2,
+                topk=50,
+                skip_training=True,
+                dry_run=True,
+                output_dir=out_dir,
+                timestamp="20260715_130000",
+            )
+
+            payload = json.loads(
+                (out_dir / "optimization_results_latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(payload["results"]), 5)
+            self.assertEqual(len(payload["summary"]), 5)
 
     def test_rejects_invalid_web_safe_params(self):
         module = load_module()

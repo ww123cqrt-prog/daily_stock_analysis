@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BarChart3, Bell, BriefcaseBusiness, Compass, Home, LogOut, MessageSquareQuote, Search, Settings2, Workflow } from 'lucide-react';
+import { BarChart3, Bell, BriefcaseBusiness, Compass, FlaskConical, Home, LogOut, MessageSquareQuote, Search, Settings2, Workflow } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
@@ -35,6 +35,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'screening', labelKey: 'layout.nav.screening', to: '/screening', icon: Search },
   { key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
   { key: 'backtest', labelKey: 'layout.nav.backtest', to: '/backtest', icon: BarChart3 },
+  { key: 'experiments', labelKey: 'layout.nav.experiments', to: '/experiments/', icon: FlaskConical },
   { key: 'alerts', labelKey: 'layout.nav.alerts', to: '/alerts', icon: Bell },
   { key: 'settings', labelKey: 'layout.nav.settings', to: '/settings', icon: Settings2 },
 ];
@@ -116,6 +117,20 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       <nav className={cn('flex flex-col gap-1.5', isRail ? '' : 'flex-1')} aria-label={t('layout.mainNav')}>
         {navItems.map(({ key, labelKey, to, icon: Icon, exact, badge }) => {
           const label = t(labelKey);
+          if (key === 'experiments') {
+            return (
+              <a
+                key={key}
+                href={to}
+                onClick={onNavigate}
+                aria-label={label}
+                className={itemInteractiveClass}
+              >
+                <Icon className={cn(itemIconClass, 'text-current')} />
+                {!collapsed ? <span className={itemLabelClass}>{label}</span> : null}
+              </a>
+            );
+          }
           return (
           <NavLink
             key={key}

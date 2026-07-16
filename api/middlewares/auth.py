@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auth middleware: protect /api/v1/* when admin auth is enabled.
+Auth middleware: protect DSA APIs and the proxied MLflow UI when auth is enabled.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _path_exempt(path: str) -> bool:
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Require valid session for /api/v1/* when auth is enabled."""
+    """Require a valid session for protected DSA surfaces when auth is enabled."""
 
     async def dispatch(
         self,
@@ -49,7 +49,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if _path_exempt(path):
             return await call_next(request)
 
-        if not path.startswith("/api/v1/"):
+        if not (
+            path.startswith("/api/v1/")
+            or path == "/experiments"
+            or path.startswith("/experiments/")
+        ):
             return await call_next(request)
 
         cookie_val = request.cookies.get(COOKIE_NAME)

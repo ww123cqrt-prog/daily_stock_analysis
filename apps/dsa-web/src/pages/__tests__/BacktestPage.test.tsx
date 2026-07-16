@@ -167,6 +167,28 @@ beforeEach(() => {
       ],
       summary: { latestRows: 3 },
     },
+    candidatePipeline: {
+      status: 'completed',
+      batchId: 'candidate-alpha158-20260715_174713',
+      latestPredictionDay: '2026-07-13',
+      latestLabelDay: '2026-07-10',
+      selectedModels: ['catboost', 'xgboost'],
+      selectedCombination: {
+        modelId: 'xgboost',
+        strategyId: 'low_turnover_weekly',
+        holdout: {
+          annualExcessReturn: 0.2015,
+          informationRatio: 1.5088,
+          maxDrawdown: -0.1267,
+        },
+      },
+      holdoutVerdict: { status: 'passed_research_gate' },
+      models: [
+        { id: 'catboost', status: 'completed', selection: { informationRatio: 1.13 }, holdout: { informationRatio: 1.52 } },
+        { id: 'xgboost', status: 'completed', selection: { informationRatio: 0.80 }, holdout: { informationRatio: 0.19 } },
+      ],
+      strategyEvaluations: [],
+    },
     mlflow: {
       url: 'http://127.0.0.1:6606/',
       role: 'experiment_raw_records',
@@ -282,7 +304,11 @@ describe('BacktestPage', () => {
     expect(screen.getByText('0.2500')).toBeInTheDocument();
     expect(screen.getByText('-0.4000')).toBeInTheDocument();
     expect(screen.getByText(/只读模型评分摘要/)).toBeInTheDocument();
-    expect(screen.getByText(/不自动下单/)).toBeInTheDocument();
+    expect(screen.getAllByText(/不自动下单/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('五模型候选流程')).toBeInTheDocument();
+    expect(screen.getByText('xgboost + low_turnover_weekly')).toBeInTheDocument();
+    expect(screen.getByText('通过研究门槛')).toBeInTheDocument();
+    expect(screen.getByText('20.2%')).toBeInTheDocument();
     expect(screen.getByText('实验复现与产物')).toBeInTheDocument();
     expect(screen.getByText('数据版本')).toBeInTheDocument();
     expect(screen.getByText('cleaned')).toBeInTheDocument();
@@ -393,7 +419,7 @@ describe('BacktestPage', () => {
     await waitFor(() => {
       expect(screen.getAllByText('Qlib model/strategy backtest').length).toBeGreaterThan(1);
     });
-    expect(screen.getByText('Model')).toBeInTheDocument();
+    expect(screen.getAllByText('Model').length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText('Strategy')).toBeInTheDocument();
     expect(screen.getByText('Latest training metrics')).toBeInTheDocument();
     expect(screen.getByText('Qlib prediction summary')).toBeInTheDocument();

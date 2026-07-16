@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:

@@ -50,6 +50,13 @@ Naming convention:
 - `train_baseline_lgb.py` runs the canonical Qlib Alpha158 + LightGBM baseline.
   Use `--provider cleaned` to train against the cleaned provider while keeping
   the source YAML untouched.
+- `run_candidate_pipeline.py` runs the fixed five-model Alpha158 comparison
+  (`Linear OLS`, `Linear Ridge`, `LightGBM`, `XGBoost`, `CatBoost`). It selects
+  two models and their five strategy overlays only on 2024-2025 data, then
+  reports a separate 2026 holdout check. Every run is recorded in MLflow, but
+  the script restores the pre-existing `latest_training_result.json` and never
+  promotes a candidate or places an order automatically. Use `--dry-run` for a
+  deterministic small-sample pipeline check.
 - `report_market_regime.py` generates a read-only market regime and cash-ratio
   report from local merged Parquet data. It does not connect to broker software,
   place orders, or modify Qlib provider files.

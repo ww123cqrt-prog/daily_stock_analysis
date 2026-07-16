@@ -699,6 +699,13 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "experiment_name", "--experiment-name")
         return command
 
+    def run_candidate_pipeline(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("run_candidate_pipeline.py")
+        command.extend(["--output-dir", str(REPORTS_ROOT)])
+        command.extend(["--provider", _safe_provider(params.get("provider"))])
+        _append_flag(command, params, "dry_run", "--dry-run")
+        return command
+
     def run_daily_update(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("run_daily_update.py")
         for key, flag in (
@@ -1055,6 +1062,18 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "experiment_log.md"),
                 str(REPORTS_ROOT / "full_experiment_report.md"),
                 str(REPORTS_ROOT / "ic_ir_analysis.md"),
+            ],
+        },
+        "run_candidate_pipeline": {
+            "label": "运行五模型完整量化流程",
+            "command": run_candidate_pipeline,
+            "allowed_params": {"dry_run", "provider"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "candidate_pipeline_latest.json"),
+                str(REPORTS_ROOT / "candidate_pipeline_latest.md"),
+                str(REPORTS_ROOT / "candidate_pipeline_progress_latest.json"),
+                str(REPORTS_ROOT / "candidate_pipeline_*.json"),
+                str(REPORTS_ROOT / "candidate_pipeline_*.md"),
             ],
         },
         "run_dsa_backtest": {

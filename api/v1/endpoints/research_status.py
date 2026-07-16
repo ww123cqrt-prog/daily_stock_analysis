@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - msvcrt is only available on Windows.
 
 from fastapi import APIRouter, HTTPException, Query
 
+from src.safe_errors import sanitize_public_error
 from src.safe_urls import public_http_url
 from src.services.quant_workflow_paths import (
     dsa_root,
@@ -55,6 +56,7 @@ EXPERIMENT_LOCK_FILENAME = ".experiment.lock"
 LATEST_TRAINING_RESULT_FILENAME = "latest_training_result.json"
 CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
+CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
 QLIB_RESEARCH_REPORTS = {
     "model_explainability": ("模型效果深度解释", "qlib_research_model_explainability_latest.json"),
     "backtest_detail": ("回测详细分解", "qlib_research_backtest_detail_latest.json"),
@@ -179,6 +181,28 @@ def _public_artifacts(raw: Any) -> Dict[str, str]:
         if label:
             artifacts[str(key)] = label
     return artifacts
+
+
+def _sanitize_public_tree(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _sanitize_public_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_public_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_public_tree(item) for item in value)
+    if isinstance(value, str):
+        return sanitize_public_error(value)
+    return value
+
+
+def _candidate_pipeline_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
+    payload = _read_json_object(reports_dir / CANDIDATE_PIPELINE_FILENAME)
+    if payload is None:
+        return None
+    if payload.get("provider_uri"):
+        payload["provider_uri"] = _public_path_label(payload["provider_uri"])
+    payload["artifacts"] = _public_artifacts(payload.get("artifacts"))
+    return _sanitize_public_tree(payload)
 
 
 def _qlib_research_payload(reports_dir: Path) -> Dict[str, Any]:
@@ -1047,6 +1071,7 @@ def _missing_status_payload() -> Dict[str, Any]:
         "latest_training": _latest_training_payload(reports_dir),
         "cash_control_backtest": _cash_control_backtest_payload(reports_dir),
         "qlib_predictions": _qlib_predictions_payload(reports_dir),
+        "candidate_pipeline": _candidate_pipeline_payload(reports_dir),
         "experiment_notebook": _experiment_notebook_payload(reports_dir),
         "mlflow": _mlflow_payload(),
         "data_hygiene": _data_hygiene_payload(reports_dir),
@@ -1237,6 +1262,7 @@ def build_research_status_payload() -> Dict[str, Any]:
     if cash_control_backtest is not None:
         payload["cash_control_backtest"] = cash_control_backtest
     payload["qlib_predictions"] = _qlib_predictions_payload(reports_dir)
+    payload["candidate_pipeline"] = _candidate_pipeline_payload(reports_dir)
     payload["qlib_research"] = _qlib_research_payload(reports_dir)
     payload["experiment_notebook"] = _experiment_notebook_payload(reports_dir)
     payload["mlflow"] = _mlflow_payload()

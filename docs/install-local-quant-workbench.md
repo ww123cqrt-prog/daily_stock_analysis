@@ -57,11 +57,13 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-如果 Qlib、MLflow 或数据源包没有被 `requirements.txt` 覆盖，补装：
+如果 Qlib、MLflow、可选树模型或数据源包没有被 `requirements.txt` 覆盖，补装：
 
 ```bash
-pip install pyqlib mlflow akshare baostock
+pip install pyqlib mlflow xgboost catboost akshare baostock
 ```
+
+`xgboost` 和 `catboost` 只提供 Qlib 可选选股模型，不会启动新服务或占用新端口。
 
 JQData 的安装方式以聚宽官方说明为准。不要把账号密码写进命令行历史。
 
@@ -123,7 +125,7 @@ JQDATA_ENV_FILE=/absolute/path/to/jqdata.env
 
 ## 准备相关项目
 
-`quant_workflow` 已经随 DSA 仓库提供，不需要单独 clone。`china-astock-quant` 可以浅克隆，作为可选参考项目；浅克隆节省 Git 历史空间，但源码仍可正常读取和运行。
+`quant_workflow` 已经随 DSA 仓库提供，不需要单独 clone。MLflow 双语页面也不需要 clone MLflow 源码；DSA 直接代理已安装的 MLflow 3.14.0 页面。`china-astock-quant` 可以浅克隆，作为可选参考项目；浅克隆节省 Git 历史空间，但源码仍可正常读取和运行。
 
 ```bash
 cd /path/to
@@ -151,7 +153,7 @@ screen -dmS dsa-8010 zsh -lc '. .venv/bin/activate && python main.py --serve-onl
 curl -sS --max-time 5 -o /tmp/dsa-home.html -w '%{http_code} %{size_download}\n' http://127.0.0.1:8010/
 ```
 
-期望返回 `200`。
+期望返回 `200`。`8010` 是 DSA 日常网页入口；`6006` 是 MLflow 后台数据服务。
 
 ## 启动 MLflow
 
@@ -179,7 +181,21 @@ curl -I --max-time 5 http://127.0.0.1:6006/
 | 研究 | `http://127.0.0.1:8010/research` | 数据状态、能力边界、项目关系 |
 | 工作流 | `http://127.0.0.1:8010/workflow` | 数据更新、质量报告、Qlib 转换、训练、回测 |
 | 回测 | `http://127.0.0.1:8010/backtest` | DSA 历史准确性和 Qlib 模型/策略回测摘要 |
-| MLflow | `http://127.0.0.1:6006/` | 原始实验 run 和 artifact |
+| 实验 | `http://127.0.0.1:8010/experiments/` | MLflow 3.14.0 官方页面、中文/English 切换、Run 和 artifact |
+
+`6006` 继续运行，但只供 DSA 后端代理访问。不要再启动 `6007`，也不需要单独运行翻译代理进程。
+
+维护者需要重新生成 MLflow 翻译目录时，只下载官方 3.14.0 的单个 `zh-CN.json`，不要 clone 完整 MLflow 仓库：
+
+```bash
+curl -fsSLo /tmp/mlflow-zh-CN-3.14.0.json \
+  https://raw.githubusercontent.com/mlflow/mlflow/86cd7f5a1dc25a1387ad07c87811bbc30f62951c/mlflow/server/js/src/lang/zh-CN.json
+.venv/bin/python scripts/build_mlflow_i18n_catalog.py \
+  --zh-cn /tmp/mlflow-zh-CN-3.14.0.json
+```
+
+生成结果是约 90 KB 的英文到中文显示映射，不包含 MLflow 源码、实验数据或模型文件。
+生成脚本会核对已安装版本必须是 `3.14.0`，并在产物中记录上游 commit 和翻译源文件 SHA-256；版本不一致时直接停止，不能沿用旧版本标签。
 
 ## 验证
 
@@ -227,9 +243,9 @@ GitHub 仓库应只包含可复现的代码、测试、文档和示例配置。�
 
 普通使用不需要。PyPI 包已经包含运行所需源码和模块；完整 clone Qlib 只适合研究或开发 Qlib 本身。
 
-### 为什么 DSA 和 MLflow 是两个页面
+### DSA 和 MLflow 如何分工
 
-DSA 是主操作台，面向日常研究流程。MLflow 是实验原始记录系统，适合查看 run、参数和 artifact。DSA 可以读取或链接 MLflow，但不把 MLflow 改造成 DSA 页面。
+DSA 是主操作台，`/experiments/` 是日常使用的双语实验入口。它代理并翻译本机 MLflow 官方界面；MLflow 仍在后台 `6006` 保存和提供 run、参数与 artifact，不由 DSA 重写实验计算或存储逻辑。
 
 ### 为什么网页任务不能输入任意命令
 

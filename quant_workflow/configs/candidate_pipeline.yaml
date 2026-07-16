@@ -1,0 +1,121 @@
+version: 1
+base_config: baseline_lgb_alpha158.yaml
+training_period: ["2020-01-02", "2022-12-31"]
+validation_period: ["2023-01-01", "2023-12-31"]
+selection_period: ["2024-01-01", "2025-12-31"]
+holdout_period: ["2026-01-01", "provider_latest_label_day"]
+top_models: 2
+topk: 50
+cost_bps: 15
+
+models:
+  - id: linear_ols
+    label: Linear OLS
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ols
+      fit_intercept: false
+
+  - id: linear_ridge
+    label: Linear Ridge
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ridge
+      alpha: 0.01
+      fit_intercept: false
+
+  - id: lightgbm
+    label: LightGBM
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      early_stopping_rounds: 50
+      num_boost_round: 1000
+      colsample_bytree: 0.8879
+      learning_rate: 0.0421
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 8
+      seed: 42
+      bagging_seed: 42
+      feature_fraction_seed: 42
+
+  - id: xgboost
+    label: XGBoost
+    class: XGBModel
+    module_path: qlib.contrib.model.xgboost
+    kwargs:
+      objective: reg:squarederror
+      eval_metric: rmse
+      colsample_bytree: 0.8879
+      eta: 0.0421
+      max_depth: 8
+      subsample: 0.8789
+      nthread: 8
+      seed: 42
+
+  - id: catboost
+    label: CatBoost
+    class: CatBoostModel
+    module_path: qlib.contrib.model.catboost_model
+    kwargs:
+      loss_function: RMSE
+      learning_rate: 0.0421
+      depth: 6
+      l2_leaf_reg: 3.0
+      thread_count: 8
+      random_seed: 42
+      allow_writing_files: false
+
+strategies:
+  - id: baseline_daily
+    label: 每日 Top50 基线
+    kwargs:
+      rebalance_freq: 1
+      turnover_cap: 1.0
+      max_drawdown_stop: 0.0
+
+  - id: low_turnover_weekly
+    label: 每周低换手
+    kwargs:
+      rebalance_freq: 5
+      turnover_cap: 0.2
+      max_drawdown_stop: 0.0
+
+  - id: ma200_weekly
+    label: MA200 趋势减仓
+    kwargs:
+      rebalance_freq: 5
+      turnover_cap: 0.2
+      trend_filter: true
+      trend_ma: ma200
+      trend_reduce_pct: 0.5
+      max_drawdown_stop: 0.0
+
+  - id: volatility_weekly
+    label: 波动率仓位控制
+    kwargs:
+      rebalance_freq: 5
+      turnover_cap: 0.2
+      vol_sizing: true
+      vol_reduce_threshold: 0.8
+      max_drawdown_stop: 0.0
+
+  - id: combined_risk
+    label: 趋势与波动率组合风控
+    kwargs:
+      rebalance_freq: 5
+      turnover_cap: 0.15
+      trend_filter: true
+      trend_ma: ma200
+      trend_reduce_pct: 0.5
+      vol_sizing: true
+      vol_reduce_threshold: 0.8
+      max_drawdown_stop: -0.08
+      max_dd_cooldown_days: 20

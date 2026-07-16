@@ -72,6 +72,16 @@ describe('SidebarNav', () => {
     expect(workflowLink).toHaveClass('font-medium');
   });
 
+  it('opens the MLflow bilingual UI with a full-page navigation', () => {
+    render(
+      <MemoryRouter initialEntries={['/research']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: '实验' })).toHaveAttribute('href', '/experiments/');
+  });
+
   it('shows the screening navigation item when AlphaSift is enabled', async () => {
     mockGetAlphaSiftStatus.mockResolvedValueOnce({ enabled: true, available: false, installSpecIsDefault: false });
 

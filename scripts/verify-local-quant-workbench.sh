@@ -35,6 +35,7 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   report_china_astock_indicators.py
   optimize_strategy.py
   train_baseline_lgb.py
+  run_candidate_pipeline.py
   run_daily_update.py
 )
 
@@ -176,6 +177,10 @@ run_quick() {
   cd "${REPO_ROOT}"
   "${PYTHON_BIN}" -m pytest -q \
     tests/test_api_app_cors.py \
+    tests/test_auth_api.py \
+    tests/test_build_mlflow_i18n_catalog.py \
+    tests/test_mlflow_service.py \
+    tests/test_mlflow_ui_proxy.py \
     tests/test_auth.py \
     tests/test_web_bind.py \
     tests/test_main_schedule_mode.py \
@@ -197,7 +202,9 @@ run_quick() {
     src/pages/__tests__/WorkflowPage.test.tsx \
     src/pages/__tests__/ResearchPage.test.tsx \
     src/pages/__tests__/BacktestPage.test.tsx \
-    src/pages/__tests__/NotFoundPage.test.tsx
+    src/pages/__tests__/NotFoundPage.test.tsx \
+    src/components/layout/__tests__/SidebarNav.test.tsx \
+    src/utils/__tests__/mlflowUiUrl.test.ts
 
   run_quick_browser_hygiene
 }
@@ -242,13 +249,18 @@ run_browser_local() {
   section "Browser smoke against local DSA"
   cd "${WEB_ROOT}"
   npm run test:smoke:local
+  npx playwright test e2e/verify-mlflow-bilingual.spec.ts --config playwright.config.ts
 }
 
 run_browser_fake() {
   ensure_npx
   section "Managed fake-analysis browser smoke"
   cd "${WEB_ROOT}"
-  npm run test:smoke:fake-analysis
+  local managed_backend_port="${DSA_WEB_MANAGED_SMOKE_BACKEND_PORT:-18011}"
+  DSA_WEB_E2E_BASE_URL="http://127.0.0.1:4173" \
+  DSA_WEB_SMOKE_BACKEND_PORT="${managed_backend_port}" \
+  DSA_WEB_DEV_API_TARGET="http://127.0.0.1:${managed_backend_port}" \
+    npm run test:smoke:fake-analysis
 }
 
 run_browser_hygiene() {
