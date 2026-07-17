@@ -4,21 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
-from run_robust_strategy import DEFAULT_CONFIG, RUN_ID_RE  # noqa: E402
+from run_robust_strategy import DEFAULT_CONFIG, RUN_ID_RE, new_run_id  # noqa: E402
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -74,7 +76,43 @@ def _cpu_percent(pid: int) -> float | None:
     return value if completed.returncode == 0 else None
 
 
-def launch(
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+@contextmanager
+def _claim_launch_record(report_dir: Path, run_id: str) -> Iterator[None]:
+    lock_path = Path(report_dir) / "runner" / ".locks" / f"{run_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(f"robust strategy launch {run_id!r} is already running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _existing_runner_is_active(
+    runner_dir: Path, pid_alive: Callable[[int], bool]
+) -> bool:
+    launch_path = runner_dir / "launch.json"
+    pid_path = runner_dir / "pid"
+    try:
+        launch_record = json.loads(launch_path.read_text(encoding="utf-8"))
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return launch_record.get("status") in {"starting", "running"} and pid_alive(pid)
+
+
+def _launch_claimed(
     *,
     config: Path,
     quant_data_dir: Path,
@@ -165,6 +203,43 @@ def launch(
     return result
 
 
+def launch(
+    *,
+    config: Path,
+    quant_data_dir: Path,
+    report_dir: Path,
+    as_of_date: str,
+    run_id: str,
+    resume: bool,
+    skip_membership_build: bool,
+    warmup_seconds: float = 10.0,
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    cpu_probe: Callable[[int], float | None] = _cpu_percent,
+    pid_alive: Callable[[int], bool] = _pid_alive,
+) -> dict[str, Any]:
+    report_dir = Path(report_dir).expanduser().resolve()
+    runner_dir = report_dir / "runner" / run_id
+    with _claim_launch_record(report_dir, run_id):
+        if _existing_runner_is_active(runner_dir, pid_alive):
+            raise ValueError(f"robust strategy run {run_id!r} is already running")
+        if not resume and (report_dir / "runs" / run_id / "status.json").exists():
+            raise ValueError(f"robust strategy run {run_id!r} already exists; use resume")
+        return _launch_claimed(
+            config=config,
+            quant_data_dir=quant_data_dir,
+            report_dir=report_dir,
+            as_of_date=as_of_date,
+            run_id=run_id,
+            resume=resume,
+            skip_membership_build=skip_membership_build,
+            warmup_seconds=warmup_seconds,
+            popen_factory=popen_factory,
+            sleep_fn=sleep_fn,
+            cpu_probe=cpu_probe,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Launch robust strategy training outside the terminal session."
@@ -180,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-membership-build", action="store_true")
     parser.add_argument("--warmup-seconds", type=float, default=10.0)
     args = parser.parse_args(argv)
-    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = args.run_id or new_run_id()
     result = launch(
         config=args.config,
         quant_data_dir=args.quant_data_dir,

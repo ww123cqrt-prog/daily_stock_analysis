@@ -38,6 +38,15 @@ from robust_market_data import (
     load_benchmark_frame,
     load_market_panel,
 )  # noqa: E402
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
+from prepare_robust_provider import runtime_provider_identity  # noqa: E402
 from run_robust_strategy import (
     DEFAULT_CONFIG,
     file_sha256,
@@ -47,6 +56,29 @@ from run_robust_strategy import (
 
 
 TREE_MODELS = {"lightgbm", "xgboost", "catboost"}
+FROZEN_CONTEXT_KEYS = (
+    "status",
+    "as_of_date",
+    "config_hash",
+    "git_commit",
+    "data_manifest_hash",
+    "membership_source",
+    "membership_source_metadata",
+    "membership_snapshot_hash",
+    "reference_source_metadata",
+    "reference_snapshot_hash",
+    "provider_uri",
+    "provider_key",
+    "provider_tree_sha256",
+    "selected_models",
+    "selected_model_configs",
+    "selected_strategy",
+    "selection_hash",
+    "development_run_id",
+    "development_run_dir",
+    "development_context_hash",
+    "development_artifacts_hash",
+)
 SEED_ARGUMENTS = {"lightgbm": "seed", "xgboost": "seed", "catboost": "random_seed"}
 
 
@@ -231,12 +263,14 @@ def run_bounded_tuning(
     run_dir: Path,
     training_runner: Any = None,
     aggregator: Any = None,
+    context_hash: str | None = None,
 ) -> dict[str, Any]:
     training_runner = training_runner or run_training_jobs
     aggregator = aggregator or aggregate_training_artifacts
     maximum = int(config["training"]["bounded_tuning_trials_per_failed_model_max"])
     reports: list[dict[str, Any]] = []
     predictions: dict[str, pd.DataFrame] = {}
+    model_artifacts: dict[str, list[dict[str, Any]]] = {}
     tuning_summaries: list[dict[str, Any]] = []
     for model_id in model_ids:
         base_model = next(
@@ -260,6 +294,14 @@ def run_bounded_tuning(
                 run_dir=trial_dir,
                 mlflow_enabled=True,
                 resume=True,
+                context_hash=payload_sha256(
+                    {
+                        "parent_context_hash": context_hash,
+                        "trial": index,
+                        "model_id": model_id,
+                        "config": trial_config,
+                    }
+                ),
             )
             if any(
                 progress.get(job.key, {}).get("status") != "completed" for job in jobs
@@ -307,6 +349,15 @@ def run_bounded_tuning(
             run_dir=full_dir,
             mlflow_enabled=True,
             resume=True,
+            context_hash=payload_sha256(
+                {
+                    "parent_context_hash": context_hash,
+                    "trial": best["trial"],
+                    "model_id": model_id,
+                    "config": best_config,
+                    "phase": "best_full_matrix",
+                }
+            ),
         )
         if any(
             progress.get(job.key, {}).get("status") != "completed" for job in full_jobs
@@ -333,12 +384,16 @@ def run_bounded_tuning(
         }
         reports.append(report)
         predictions[model_id] = aggregate["model_predictions"][model_id]
+        model_artifacts[model_id] = _development_artifacts(
+            full_jobs, progress, [model_id]
+        )
         tuning_summaries.append(
             {"model_id": model_id, "status": "completed", **report["tuning"]}
         )
     return {
         "model_reports": reports,
         "model_predictions": predictions,
+        "model_artifacts": model_artifacts,
         "summaries": tuning_summaries,
     }
 
@@ -413,6 +468,7 @@ def build_dataset_config(split: RollingSplit) -> dict[str, Any]:
             },
             "normalize_within_board": True,
             "add_board_features": True,
+            "add_market_state_features": True,
         },
     }
 
@@ -504,7 +560,14 @@ def _split_record(split: RollingSplit) -> dict[str, str]:
     }
 
 
-def completed_job_artifact_is_valid(job: TrainingJob, state: Mapping[str, Any]) -> bool:
+def completed_job_artifact_is_valid(
+    job: TrainingJob,
+    state: Mapping[str, Any],
+    *,
+    run_dir: Path | None = None,
+    expected_split: Mapping[str, str] | None = None,
+    context_hash: str | None = None,
+) -> bool:
     if state.get("status") != "completed":
         return False
     if (
@@ -525,6 +588,10 @@ def completed_job_artifact_is_valid(job: TrainingJob, state: Mapping[str, Any]) 
     }
     if not isinstance(split, Mapping) or set(split) != split_keys:
         return False
+    if expected_split is not None and dict(split) != dict(expected_split):
+        return False
+    if context_hash is not None and state.get("context_hash") != context_hash:
+        return False
     try:
         if any(pd.isna(pd.Timestamp(split[key])) for key in split_keys):
             return False
@@ -534,6 +601,18 @@ def completed_job_artifact_is_valid(job: TrainingJob, state: Mapping[str, Any]) 
     prediction_path = Path(str(state.get("prediction_path") or ""))
     if not model_path.is_absolute() or not prediction_path.is_absolute():
         return False
+    if model_path.is_symlink() or prediction_path.is_symlink():
+        return False
+    if run_dir is not None:
+        expected_model = Path(run_dir).absolute() / "models" / f"{job.key}.pkl"
+        expected_prediction = (
+            Path(run_dir).absolute() / "predictions" / f"{job.key}.parquet"
+        )
+        if (
+            model_path.absolute() != expected_model
+            or prediction_path.absolute() != expected_prediction
+        ):
+            return False
     if not model_path.is_file() or not prediction_path.is_file():
         return False
     if not state.get("model_sha256") or not state.get("prediction_sha256"):
@@ -554,8 +633,14 @@ def completed_job_artifact_is_valid(job: TrainingJob, state: Mapping[str, Any]) 
         return False
     if len(frame) <= 0 or recorded_rows != len(frame):
         return False
-    if pd.to_datetime(frame["datetime"], errors="coerce").isna().any():
+    prediction_dates = pd.to_datetime(frame["datetime"], errors="coerce").dt.normalize()
+    if prediction_dates.isna().any():
         return False
+    if expected_split is not None:
+        test_start = pd.Timestamp(expected_split["test_start"]).normalize()
+        test_end = pd.Timestamp(expected_split["test_end"]).normalize()
+        if (prediction_dates < test_start).any() or (prediction_dates > test_end).any():
+            return False
     if (
         frame["instrument"].isna().any()
         or frame["instrument"].astype(str).str.len().eq(0).any()
@@ -569,12 +654,23 @@ def completed_job_artifact_is_valid(job: TrainingJob, state: Mapping[str, Any]) 
 
 
 def pending_jobs(
-    jobs: Sequence[TrainingJob], progress: Mapping[str, Mapping[str, Any]]
+    jobs: Sequence[TrainingJob],
+    progress: Mapping[str, Mapping[str, Any]],
+    *,
+    run_dir: Path | None = None,
+    expected_splits: Mapping[str, Mapping[str, str]] | None = None,
+    context_hash: str | None = None,
 ) -> list[TrainingJob]:
     return [
         job
         for job in jobs
-        if not completed_job_artifact_is_valid(job, progress.get(job.key) or {})
+        if not completed_job_artifact_is_valid(
+            job,
+            progress.get(job.key) or {},
+            run_dir=run_dir,
+            expected_split=(expected_splits or {}).get(job.key),
+            context_hash=context_hash,
+        )
     ]
 
 
@@ -708,12 +804,56 @@ def run_training_jobs(
     dataset_config_factory: Any = build_dataset_config,
     phase: str = "development",
     experiment_name: str = "robust_csi800_development",
+    context_hash: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     run_dir = Path(run_dir)
+    if context_hash is None:
+        context_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "config": config,
+                    "provider_uri": str(Path(provider_uri).resolve()),
+                    "phase": phase,
+                    "experiment_name": experiment_name,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
     progress_path = run_dir / "progress.json"
     progress = _load_progress(progress_path, resume=resume)
+    if progress.get("context_hash") != context_hash:
+        progress = {"context_hash": context_hash, "jobs": {}}
+    else:
+        progress["context_hash"] = context_hash
     job_progress: dict[str, dict[str, Any]] = progress["jobs"]
-    pending = pending_jobs(jobs, job_progress)
+    expected_splits: dict[str, dict[str, str]] = {}
+    split_objects: dict[tuple[str, int], RollingSplit] = {}
+    for job in jobs:
+        group_key = (job.quarter, job.window_days)
+        if group_key not in split_objects:
+            split_objects[group_key] = (
+                split_factory(job.quarter, job.window_days)
+                if split_factory is not None
+                else make_job_split(
+                    calendar,
+                    job.quarter,
+                    window_days=job.window_days,
+                    validation_days=int(
+                        config["rolling_validation"]["validation_days"]
+                    ),
+                    label_horizon_days=5,
+                )
+            )
+        expected_splits[job.key] = _split_record(split_objects[group_key])
+    pending = pending_jobs(
+        jobs,
+        job_progress,
+        run_dir=run_dir,
+        expected_splits=expected_splits,
+        context_hash=context_hash,
+    )
     if not pending:
         return job_progress
     dataset_factory = dataset_factory or _default_dataset_factory
@@ -728,19 +868,7 @@ def run_training_jobs(
         groups.setdefault((job.quarter, job.window_days), []).append(job)
     for (quarter, window_days), group_jobs in groups.items():
         try:
-            split = (
-                split_factory(quarter, window_days)
-                if split_factory is not None
-                else make_job_split(
-                    calendar,
-                    quarter,
-                    window_days=window_days,
-                    validation_days=int(
-                        config["rolling_validation"]["validation_days"]
-                    ),
-                    label_horizon_days=5,
-                )
-            )
+            split = split_objects[(quarter, window_days)]
             dataset_config = dataset_config_factory(split)
             dataset = dataset_factory(provider_uri, dataset_config, split, group_jobs)
         except Exception as exc:
@@ -795,6 +923,7 @@ def run_training_jobs(
                     "model_path": str(model_path.resolve()),
                     "model_sha256": file_sha256(model_path),
                     "prediction_sha256": file_sha256(prediction_path),
+                    "context_hash": context_hash,
                     "split": _split_record(split),
                     **result,
                 }
@@ -892,6 +1021,68 @@ def selection_contract_hash(
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def payload_sha256(payload: Any) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def frozen_context_hash(payload: Mapping[str, Any]) -> str:
+    return payload_sha256({key: payload.get(key) for key in FROZEN_CONTEXT_KEYS})
+
+
+def _development_artifacts(
+    jobs: Sequence[TrainingJob],
+    progress: Mapping[str, Mapping[str, Any]],
+    selected_models: Sequence[str],
+) -> list[dict[str, Any]]:
+    selected = set(selected_models)
+    artifacts = []
+    for job in sorted(jobs, key=lambda item: item.key):
+        if job.model_id not in selected:
+            continue
+        state = progress[job.key]
+        artifacts.append(
+            {
+                "status": "completed",
+                "job_key": job.key,
+                "model_id": job.model_id,
+                "window_days": job.window_days,
+                "quarter": job.quarter,
+                "seed": job.seed,
+                "model_path": state["model_path"],
+                "model_sha256": state["model_sha256"],
+                "prediction_path": state["prediction_path"],
+                "prediction_sha256": state["prediction_sha256"],
+                "rows": state["rows"],
+                "split": copy.deepcopy(state["split"]),
+                "context_hash": state["context_hash"],
+            }
+        )
+    return artifacts
+
+
+def select_development_artifacts(
+    selected_reports: Sequence[Mapping[str, Any]],
+    *,
+    fixed_artifacts_by_model: Mapping[str, Sequence[Mapping[str, Any]]],
+    tuned_artifacts_by_model: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Bind every selected model to the matrix that produced its selected report."""
+    selected: list[dict[str, Any]] = []
+    for report in selected_reports:
+        model_id = str(report["model_id"])
+        source = (
+            tuned_artifacts_by_model
+            if isinstance(report.get("tuning"), Mapping)
+            else fixed_artifacts_by_model
+        )
+        artifacts = source.get(model_id)
+        if not artifacts:
+            raise ValueError(f"selected model artifacts are missing: {model_id}")
+        selected.extend(copy.deepcopy([dict(item) for item in artifacts]))
+    return sorted(selected, key=lambda item: str(item.get("job_key", "")))
+
+
 def _externalize_frames(value: Any, output_dir: Path, prefix: str) -> Any:
     if isinstance(value, pd.DataFrame):
         path = output_dir / f"{prefix}.parquet"
@@ -961,6 +1152,9 @@ def _run_development_impl(
     report_dir = Path(report_dir).resolve()
     provider_state_path = Path(provider_state_path).resolve()
     config = load_config(config_path)
+    paths = config["paths"]
+    pit_dir = quant_data_dir / paths["pit_membership"]
+    reference_dir = quant_data_dir / Path(paths["security_master"]).parent
     provider_state = _read_provider_state(provider_state_path)
     provider_uri = Path(str(provider_state.get("provider_uri") or ""))
     if provider_state.get("status") != "completed" or not provider_uri.is_dir():
@@ -972,6 +1166,12 @@ def _run_development_impl(
         payload = _failure_report("provider_identity_missing", as_of_date=as_of_date)
         _write_json(report_dir / "development_latest.json", payload)
         return payload
+    provider_identity = runtime_provider_identity(provider_uri, provider_key)
+    if provider_identity is None:
+        payload = _failure_report("provider_snapshot_invalid", as_of_date=as_of_date)
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
+    provider_tree_sha256 = provider_identity["provider_tree_sha256"]
     calendar_path = provider_uri / "calendars" / "day.txt"
     if not calendar_path.is_file():
         payload = _failure_report("provider_calendar_missing", as_of_date=as_of_date)
@@ -997,6 +1197,31 @@ def _run_development_impl(
         return payload
     initial_config_hash = file_sha256(config_path)
     initial_manifest_hash = file_sha256(manifest_path)
+    try:
+        with membership_read_lock(pit_dir) as membership_snapshot:
+            membership_snapshot.ensure_transaction_clean()
+            membership_source_metadata = membership_snapshot.validate_source(
+                start_date="2023-01-01",
+                end_date="2025-12-31",
+            )
+            membership_snapshot_hash = membership_snapshot.fingerprint()
+    except MembershipIntegrityError as exc:
+        payload = _failure_report(exc.reason_code, as_of_date=as_of_date)
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
+    try:
+        with reference_read_lock(reference_dir) as reference_snapshot:
+            reference_snapshot.ensure_transaction_clean()
+            reference_source_metadata = reference_snapshot.validate_source(
+                start_date="2023-01-01",
+                end_date="2025-12-31",
+                expected_membership_snapshot_hash=membership_snapshot_hash,
+            )
+            reference_snapshot_hash = reference_snapshot.fingerprint()
+    except ReferenceIntegrityError as exc:
+        payload = _failure_report(exc.reason_code, as_of_date=as_of_date)
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
     calendar = pd.DatetimeIndex(
         pd.to_datetime(
             calendar_path.read_text(encoding="utf-8").splitlines(), errors="coerce"
@@ -1012,7 +1237,14 @@ def _run_development_impl(
         "provider_uri": str(provider_uri.resolve()),
         "provider_key": provider_key,
         "as_of_date": str(as_of_date),
+        "membership_source_metadata": membership_source_metadata,
+        "membership_snapshot_hash": membership_snapshot_hash,
+        "reference_source_metadata": reference_source_metadata,
+        "reference_snapshot_hash": reference_snapshot_hash,
+        "provider_tree_sha256": provider_tree_sha256,
     }
+    development_context_hash = payload_sha256(expected_context)
+    expected_context["context_hash"] = development_context_hash
     if resume:
         stored_context = _read_provider_state(context_path)
         if not stored_context:
@@ -1022,8 +1254,13 @@ def _run_development_impl(
         mismatches = [
             key
             for key, value in expected_context.items()
-            if stored_context.get(key) != value
+            if key != "context_hash" and stored_context.get(key) != value
         ]
+        if (
+            not mismatches
+            and stored_context.get("context_hash") != development_context_hash
+        ):
+            mismatches.append("context_hash")
         if mismatches:
             payload = _failure_report(
                 "resume_context_mismatch",
@@ -1061,6 +1298,7 @@ def _run_development_impl(
         run_dir=run_dir,
         mlflow_enabled=True,
         resume=resume,
+        context_hash=development_context_hash,
     )
     incomplete = [
         job.key
@@ -1099,6 +1337,7 @@ def _run_development_impl(
         maximum=int(config["training"]["ensemble_models_max"]),
     )
     tuning_summaries: list[dict[str, Any]] = []
+    tuned_artifacts_by_model: dict[str, list[dict[str, Any]]] = {}
     if len(selected_reports) < int(config["training"]["ensemble_models_min"]):
         failed_model_ids = [
             str(item["model_id"])
@@ -1111,8 +1350,13 @@ def _run_development_impl(
             provider_uri=provider_uri,
             calendar=calendar,
             run_dir=run_dir / "tuning",
+            context_hash=development_context_hash,
         )
         tuning_summaries = list(tuned.get("summaries") or [])
+        tuned_artifacts_by_model = {
+            str(model_id): [dict(item) for item in artifacts]
+            for model_id, artifacts in (tuned.get("model_artifacts") or {}).items()
+        }
         reports_by_model = {
             str(item["model_id"]): item for item in aggregated["model_reports"]
         }
@@ -1147,10 +1391,6 @@ def _run_development_impl(
             for model_id in selected_ids
         }
     )
-    paths = config["paths"]
-    pit_dir = quant_data_dir / paths["pit_membership"]
-    membership_source_metadata = _read_membership_source_metadata(pit_dir)
-    reference_dir = quant_data_dir / Path(paths["security_master"]).parent
     price_dir = quant_data_dir / paths["price_parquet"]
     market = market_loader(
         pit_dir=pit_dir,
@@ -1158,7 +1398,63 @@ def _run_development_impl(
         reference_dir=reference_dir,
         start_date="2023-01-01",
         end_date="2025-12-31",
+        ohlcv_coverage_min=float(config["data_gates"]["ohlcv_coverage_min"]),
     )
+    market_reference_source = market.attrs.get("reference_source_metadata")
+    market_reference_hash = market.attrs.get("reference_snapshot_hash")
+    if market_reference_source is None or market_reference_hash is None:
+        try:
+            with reference_read_lock(reference_dir) as reference_snapshot:
+                reference_snapshot.ensure_transaction_clean()
+                market_reference_source = reference_snapshot.validate_source(
+                    start_date="2023-01-01",
+                    end_date="2025-12-31",
+                    expected_membership_snapshot_hash=membership_snapshot_hash,
+                )
+                market_reference_hash = reference_snapshot.fingerprint()
+        except ReferenceIntegrityError:
+            market_reference_source = None
+            market_reference_hash = None
+    if (
+        market_reference_source != reference_source_metadata
+        or market_reference_hash != reference_snapshot_hash
+    ):
+        payload = _failure_report(
+            "reference_snapshot_changed",
+            as_of_date=as_of_date,
+            started=len(jobs),
+            reference_source_metadata=reference_source_metadata,
+            reference_snapshot_hash=reference_snapshot_hash,
+        )
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
+    market_membership_source = market.attrs.get("membership_source_metadata")
+    market_membership_hash = market.attrs.get("membership_snapshot_hash")
+    if market_membership_source is None or market_membership_hash is None:
+        try:
+            with membership_read_lock(pit_dir) as membership_snapshot:
+                membership_snapshot.ensure_transaction_clean()
+                market_membership_source = membership_snapshot.validate_source(
+                    start_date="2023-01-01",
+                    end_date="2025-12-31",
+                )
+                market_membership_hash = membership_snapshot.fingerprint()
+        except MembershipIntegrityError:
+            market_membership_source = None
+            market_membership_hash = None
+    if (
+        market_membership_source != membership_source_metadata
+        or market_membership_hash != membership_snapshot_hash
+    ):
+        payload = _failure_report(
+            "membership_snapshot_changed",
+            as_of_date=as_of_date,
+            started=len(jobs),
+            membership_source_metadata=membership_source_metadata,
+            membership_snapshot_hash=membership_snapshot_hash,
+        )
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
     benchmark = benchmark_loader(
         provider_uri, start_date="2023-01-01", end_date="2025-12-31"
     )
@@ -1195,6 +1491,11 @@ def _run_development_impl(
         reproducibility_failures.append("provider_uri")
     if final_provider_state.get("provider_key") != provider_key:
         reproducibility_failures.append("provider_key")
+    final_provider_identity = runtime_provider_identity(provider_uri, provider_key)
+    if final_provider_identity is None:
+        reproducibility_failures.append("provider_snapshot")
+    elif final_provider_identity.get("provider_tree_sha256") != provider_tree_sha256:
+        reproducibility_failures.append("provider_tree_sha256")
     if reproducibility_failures:
         payload = _failure_report(
             "reproducibility_state_changed_during_development",
@@ -1218,8 +1519,13 @@ def _run_development_impl(
         "data_manifest_hash": initial_manifest_hash,
         "membership_source": str(pit_dir / "membership_intervals.parquet"),
         "membership_source_metadata": membership_source_metadata,
+        "membership_snapshot_hash": membership_snapshot_hash,
+        "reference_source_metadata": reference_source_metadata,
+        "reference_snapshot_hash": reference_snapshot_hash,
         "provider_uri": str(provider_uri),
         "provider_key": provider_key,
+        "provider_tree_sha256": provider_tree_sha256,
+        "development_context_hash": development_context_hash,
         "training_job_count": len(jobs),
         "selected_models": selected_ids,
         "selected_strategy": (
@@ -1233,9 +1539,7 @@ def _run_development_impl(
             evaluation, run_dir / "backtests", "development"
         ),
     }
-    _write_json(run_dir / "development.json", payload)
-    _write_json(report_dir / "development_latest.json", payload)
-    _atomic_write(report_dir / "development_latest.md", _development_markdown(payload))
+    frozen: dict[str, Any] | None = None
     if payload["status"] == "research_candidate_ready":
         base_models = {str(item["id"]): item for item in config["models"]}
         selected_model_configs = {}
@@ -1250,16 +1554,32 @@ def _run_development_impl(
                     or {}
                 ),
             }
+        fixed_artifacts = _development_artifacts(jobs, progress, selected_ids)
+        fixed_artifacts_by_model: dict[str, list[dict[str, Any]]] = {}
+        for artifact in fixed_artifacts:
+            fixed_artifacts_by_model.setdefault(
+                str(artifact["model_id"]), []
+            ).append(artifact)
+        development_artifacts = select_development_artifacts(
+            selected_reports,
+            fixed_artifacts_by_model=fixed_artifacts_by_model,
+            tuned_artifacts_by_model=tuned_artifacts_by_model,
+        )
         frozen = {
             "status": "research_candidate_ready",
             "frozen_at": payload["generated_at"],
+            "as_of_date": payload["as_of_date"],
             "config_hash": payload["config_hash"],
             "git_commit": payload["git_commit"],
             "data_manifest_hash": payload["data_manifest_hash"],
             "membership_source": payload["membership_source"],
             "membership_source_metadata": payload["membership_source_metadata"],
+            "membership_snapshot_hash": payload["membership_snapshot_hash"],
+            "reference_source_metadata": payload["reference_source_metadata"],
+            "reference_snapshot_hash": payload["reference_snapshot_hash"],
             "provider_uri": payload["provider_uri"],
             "provider_key": payload["provider_key"],
+            "provider_tree_sha256": payload["provider_tree_sha256"],
             "selected_models": selected_ids,
             "selected_model_configs": selected_model_configs,
             "selected_strategy": payload["selected_strategy"],
@@ -1269,9 +1589,18 @@ def _run_development_impl(
                 str(payload["selected_strategy"]),
             ),
             "development_run_id": run_id,
+            "development_run_dir": str(run_dir.resolve()),
+            "development_context_hash": development_context_hash,
+            "development_artifacts": development_artifacts,
+            "development_artifacts_hash": payload_sha256(development_artifacts),
             "confirmation_run_started": False,
             "shadow_tracking_started": False,
         }
+        frozen["frozen_context_hash"] = frozen_context_hash(frozen)
+    _write_json(run_dir / "development.json", payload)
+    _write_json(report_dir / "development_latest.json", payload)
+    _atomic_write(report_dir / "development_latest.md", _development_markdown(payload))
+    if frozen is not None:
         _write_json(run_dir / "frozen_strategy.json", frozen)
         _write_json(report_dir / "frozen_strategy_latest.json", frozen)
     return payload
@@ -1283,13 +1612,20 @@ def run_development(**kwargs: Any) -> dict[str, Any]:
         return _run_development_impl(**kwargs)
     except Exception as exc:
         report_dir = Path(kwargs["report_dir"]).resolve()
+        run_id = str(kwargs.get("run_id") or "")
         payload = _failure_report(
             "development_execution_failed",
             as_of_date=str(kwargs.get("as_of_date") or ""),
-            run_id=str(kwargs.get("run_id") or ""),
+            run_id=run_id,
             error_type=type(exc).__name__,
         )
+        if run_id:
+            _write_json(
+                report_dir / "runs" / run_id / "development" / "development.json",
+                payload,
+            )
         _write_json(report_dir / "development_latest.json", payload)
+        _atomic_write(report_dir / "development_latest.md", _development_markdown(payload))
         return payload
 
 

@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+from contextlib import ExitStack, contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple
+from uuid import uuid4
 
 import yaml
 
@@ -21,6 +24,17 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
+from prepare_robust_provider import (  # noqa: E402
+    runtime_provider_identity,
+)
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -35,11 +49,89 @@ FINAL_STATUSES = {
     "shadow_observation",
     "robust_strategy_qualified",
 }
+STAGE_REPORT_FILENAMES = {
+    "build_pit_csi800": "build_status_latest.json",
+    "download_robust_reference": "download_robust_reference_latest.json",
+    "preflight_robust_data": "preflight_latest.json",
+    "prepare_robust_provider": "provider_latest.json",
+    "run_robust_development": "development.json",
+}
+STAGE_SUCCESS_STATUSES = {
+    "build_pit_csi800": "completed",
+    "download_robust_reference": "completed",
+    "preflight_robust_data": "ready",
+    "prepare_robust_provider": "completed",
+    "run_robust_development": "research_candidate_ready",
+}
+STAGE_ACCEPTED_STATUSES = {
+    **{name: {status} for name, status in STAGE_SUCCESS_STATUSES.items()},
+    "run_robust_development": {
+        "research_candidate_ready",
+        "development_failed",
+    },
+}
+PIPELINE_CONTEXT_KEYS = (
+    "run_id",
+    "config_hash",
+    "git_commit",
+    "data_manifest_hash",
+    "as_of_date",
+    "membership_snapshot_hash",
+    "reference_snapshot_hash",
+    "provider_uri",
+    "provider_key",
+    "provider_tree_sha256",
+)
+CANONICAL_EVIDENCE_SOURCES = {"run_scoped", "run_status"}
+BASE_EVIDENCE_CONTEXT_KEYS = (
+    "run_id",
+    "config_hash",
+    "git_commit",
+    "data_manifest_hash",
+    "as_of_date",
+)
+STAGE_REQUIRED_CONTEXT_KEYS = {
+    "build_pit_csi800": BASE_EVIDENCE_CONTEXT_KEYS,
+    "download_robust_reference": BASE_EVIDENCE_CONTEXT_KEYS
+    + ("membership_snapshot_hash",),
+    "preflight_robust_data": BASE_EVIDENCE_CONTEXT_KEYS
+    + ("membership_snapshot_hash", "reference_snapshot_hash"),
+    "prepare_robust_provider": BASE_EVIDENCE_CONTEXT_KEYS
+    + ("membership_snapshot_hash", "reference_snapshot_hash"),
+    "run_robust_development": PIPELINE_CONTEXT_KEYS,
+}
 
 
 class Stage(NamedTuple):
     name: str
     argv: list[str]
+
+
+def new_run_id() -> str:
+    """Return a readable run id with enough entropy for concurrent launches."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{timestamp}_{uuid4().hex[:8]}"
+
+
+@contextmanager
+def _claim_run(report_dir: Path, run_id: str, *, resume: bool) -> Iterator[None]:
+    runs_dir = Path(report_dir) / "runs"
+    lock_path = runs_dir / ".locks" / f"{run_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(f"robust strategy run {run_id!r} is already running") from exc
+        try:
+            status_path = runs_dir / run_id / "status.json"
+            if not resume and status_path.exists():
+                raise ValueError(
+                    f"robust strategy run {run_id!r} already exists; use resume"
+                )
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def file_sha256(path: Path) -> str:
@@ -95,6 +187,12 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         "baostock",
     }:
         raise ValueError("universe.membership_source must be a verified PIT source")
+    if payload.get("universe", {}).get("reference_source") not in {
+        "auto",
+        "jqdata",
+        "baostock",
+    }:
+        raise ValueError("universe.reference_source must be a verified PIT source")
     if payload.get("statuses") != [
         "blocked_data",
         "development_failed",
@@ -168,6 +266,13 @@ def build_stages(
     price_dir = _resolved_data_path(quant_data_dir, paths["price_parquet"])
     provider_dir = _resolved_data_path(quant_data_dir, paths["qlib_provider"])
     runtime_root = quant_data_dir / "runtime" / "robust_strategy"
+    stage_report_root = (
+        report_dir / "runs" / run_id / "stage_reports" if run_id else report_dir
+    )
+
+    def stage_report_dir(stage_name: str) -> Path:
+        return stage_report_root / stage_name if run_id else stage_report_root
+
     python = sys.executable
     stages: list[Stage] = []
     if not skip_membership_build:
@@ -184,7 +289,7 @@ def build_stages(
                     "--output-dir",
                     str(pit_dir),
                     "--status-out-dir",
-                    str(report_dir),
+                    str(stage_report_dir("build_pit_csi800")),
                     "--membership-source",
                     str(universe["membership_source"]),
                 ],
@@ -205,7 +310,22 @@ def build_stages(
                 "--end-date",
                 as_of_date,
                 "--status-out-dir",
-                str(report_dir),
+                str(stage_report_dir("download_robust_reference")),
+                "--reference-source",
+                str(universe["reference_source"]),
+            ],
+        )
+    )
+    stages.append(
+        Stage(
+            "add_robust_benchmarks",
+            [
+                python,
+                str(SCRIPT_DIR / "add_index_benchmark.py"),
+                "--provider-dir",
+                str(provider_dir),
+                "--required-start-date",
+                str(universe["start_date"]),
             ],
         )
     )
@@ -236,7 +356,7 @@ def build_stages(
                 "--ohlcv-coverage-min",
                 str(gates["ohlcv_coverage_min"]),
                 "--out-dir",
-                str(report_dir),
+                str(stage_report_dir("preflight_robust_data")),
             ],
         )
     )
@@ -255,7 +375,7 @@ def build_stages(
                 "--data-manifest",
                 str((quant_data_dir / "DATA_MANIFEST.json").resolve()),
                 "--status-out-dir",
-                str(report_dir),
+                str(stage_report_dir("prepare_robust_provider")),
             ],
         )
     )
@@ -269,7 +389,11 @@ def build_stages(
         "--report-dir",
         str(report_dir),
         "--provider-state",
-        str(report_dir / "provider_latest.json"),
+        str(
+            report_dir / "runs" / run_id / "evidence" / "prepare_robust_provider.json"
+            if run_id
+            else report_dir / "provider_latest.json"
+        ),
         "--as-of-date",
         as_of_date,
     ]
@@ -339,24 +463,279 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _stage_evidence(
-    stage: Stage, report_dir: Path, quant_data_dir: Path, config: dict[str, Any]
-) -> dict[str, Any]:
-    if stage.name == "build_pit_csi800":
-        report_payload = _read_json(report_dir / "build_status_latest.json")
-        if report_payload:
-            return report_payload
-        pit_dir = _resolved_data_path(quant_data_dir, config["paths"]["pit_membership"])
-        return _read_json(pit_dir / "build_status_latest.json")
-    if stage.name == "download_robust_reference":
-        return _read_json(report_dir / "download_robust_reference_latest.json")
-    if stage.name == "preflight_robust_data":
-        return _read_json(report_dir / "preflight_latest.json")
-    if stage.name == "prepare_robust_provider":
-        return _read_json(report_dir / "provider_latest.json")
+def _stage_option(stage: Stage, option: str) -> str | None:
+    try:
+        return stage.argv[stage.argv.index(option) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _payload_sha256(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _run_scoped_report_path(stage: Stage, report_dir: Path, run_id: str) -> Path:
     if stage.name == "run_robust_development":
-        return _read_json(report_dir / "development_latest.json")
-    return {}
+        return report_dir / "runs" / run_id / "development" / "development.json"
+    return (
+        report_dir
+        / "runs"
+        / run_id
+        / "stage_reports"
+        / stage.name
+        / STAGE_REPORT_FILENAMES[stage.name]
+    )
+
+
+def _canonical_evidence_path(stage: Stage, report_dir: Path, run_id: str) -> Path:
+    return report_dir / "runs" / run_id / "evidence" / f"{stage.name}.json"
+
+
+def _invalid_stage_evidence(reason_code: str) -> dict[str, Any]:
+    return {"status": "blocked_data", "reason_code": reason_code}
+
+
+def _pipeline_context(state: dict[str, Any] | None, run_id: str) -> dict[str, Any]:
+    context = {"run_id": run_id}
+    if state is not None:
+        context.update(
+            {key: state[key] for key in PIPELINE_CONTEXT_KEYS if key in state}
+        )
+    return context
+
+
+def _provider_report_identity_matches(payload: dict[str, Any]) -> bool:
+    provider_uri = payload.get("provider_uri")
+    provider_key = payload.get("provider_key")
+    provider_tree_sha256 = payload.get("provider_tree_sha256")
+    if not all(
+        isinstance(value, str) and value
+        for value in (provider_uri, provider_key, provider_tree_sha256)
+    ):
+        return False
+    identity = runtime_provider_identity(Path(provider_uri), provider_key)
+    return bool(
+        identity and identity.get("provider_tree_sha256") == provider_tree_sha256
+    )
+
+
+def _evidence_context_matches(
+    payload: dict[str, Any],
+    *,
+    stage: Stage,
+    report_dir: Path,
+    quant_data_dir: Path,
+    config: dict[str, Any],
+    run_id: str,
+    state: dict[str, Any] | None,
+    require_persisted_identity: bool = False,
+) -> bool:
+    if payload.get("run_id") != run_id:
+        return False
+    if require_persisted_identity:
+        if payload.get("evidence_stage") != stage.name:
+            return False
+        if payload.get("evidence_source") not in CANONICAL_EVIDENCE_SOURCES:
+            return False
+        persisted_context = payload.get("pipeline_context")
+        required_keys = STAGE_REQUIRED_CONTEXT_KEYS.get(stage.name, ())
+        if not isinstance(persisted_context, dict) or any(
+            key not in persisted_context for key in required_keys
+        ):
+            return False
+    elif payload.get("evidence_stage", stage.name) != stage.name:
+        return False
+
+    expected = state or {}
+    aliases = {
+        "config_hash": "config_hash",
+        "git_commit": "git_commit",
+        "data_manifest_hash": "data_manifest_hash",
+        "data_manifest_sha256": "data_manifest_hash",
+        "as_of_date": "as_of_date",
+        "membership_snapshot_hash": "membership_snapshot_hash",
+        "reference_snapshot_hash": "reference_snapshot_hash",
+        "provider_uri": "provider_uri",
+        "provider_key": "provider_key",
+        "provider_tree_sha256": "provider_tree_sha256",
+        "context_hash": "context_hash",
+    }
+    introduced_provider_identity = False
+    for report_key, state_key in aliases.items():
+        if report_key not in payload:
+            continue
+        if state_key in expected:
+            if payload[report_key] != expected[state_key]:
+                return False
+            continue
+        if stage.name == "prepare_robust_provider" and state_key in {
+            "provider_uri",
+            "provider_key",
+            "provider_tree_sha256",
+        }:
+            if not introduced_provider_identity:
+                introduced_provider_identity = _provider_report_identity_matches(
+                    payload
+                )
+            if not introduced_provider_identity:
+                return False
+            continue
+        if stage.name == "build_pit_csi800" and state_key == "membership_snapshot_hash":
+            try:
+                current_hash = _membership_snapshot_hash(
+                    _resolved_data_path(
+                        quant_data_dir, config["paths"]["pit_membership"]
+                    ),
+                    start_date=str(config["universe"]["start_date"]),
+                    end_date=str(expected.get("as_of_date") or ""),
+                )
+            except MembershipIntegrityError:
+                return False
+            if payload[report_key] != current_hash:
+                return False
+            continue
+        if (
+            stage.name == "download_robust_reference"
+            and state_key == "reference_snapshot_hash"
+        ):
+            membership_hash = expected.get("membership_snapshot_hash")
+            if not membership_hash:
+                return False
+            try:
+                current_hash = _reference_snapshot_hash(
+                    _resolved_data_path(
+                        quant_data_dir,
+                        str(Path(config["paths"]["security_master"]).parent),
+                    ),
+                    start_date=str(config["universe"]["start_date"]),
+                    end_date=str(expected.get("as_of_date") or ""),
+                    membership_snapshot_hash=str(membership_hash),
+                )
+            except ReferenceIntegrityError:
+                return False
+            if payload[report_key] != current_hash:
+                return False
+            continue
+        return False
+
+    development_context_hash = payload.get("development_context_hash")
+    if development_context_hash is not None:
+        development_context = _read_json(
+            report_dir / "runs" / run_id / "development" / "development_context.json"
+        )
+        if development_context.get("context_hash") != development_context_hash:
+            return False
+
+    persisted_context = payload.get("pipeline_context")
+    if persisted_context is not None:
+        if not isinstance(persisted_context, dict):
+            return False
+        if payload.get("pipeline_context_hash") != _payload_sha256(persisted_context):
+            return False
+        current_context = _pipeline_context(state, run_id)
+        if any(
+            current_context.get(key) != value
+            for key, value in persisted_context.items()
+        ):
+            return False
+    return True
+
+
+def _persist_stage_evidence(
+    payload: dict[str, Any],
+    *,
+    stage: Stage,
+    report_dir: Path,
+    run_id: str,
+    state: dict[str, Any] | None,
+    source: str,
+) -> dict[str, Any]:
+    persisted = dict(payload)
+    persisted["run_id"] = run_id
+    persisted["evidence_stage"] = stage.name
+    persisted["evidence_source"] = source
+    persisted_context = _pipeline_context(state, run_id)
+    persisted["pipeline_context"] = persisted_context
+    persisted["pipeline_context_hash"] = _payload_sha256(persisted_context)
+    _atomic_write(
+        _canonical_evidence_path(stage, report_dir, run_id),
+        json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    return persisted
+
+
+def _clear_run_scoped_stage_evidence(
+    stage: Stage, report_dir: Path, run_id: str
+) -> None:
+    if stage.name not in STAGE_REPORT_FILENAMES:
+        return
+    for path in (
+        _canonical_evidence_path(stage, report_dir, run_id),
+        _run_scoped_report_path(stage, report_dir, run_id),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+
+
+def _stage_evidence(
+    stage: Stage,
+    report_dir: Path,
+    quant_data_dir: Path,
+    config: dict[str, Any],
+    *,
+    run_id: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if stage.name not in STAGE_REPORT_FILENAMES:
+        return {}
+    run_id = run_id or _stage_option(stage, "--run-id")
+    if not run_id:
+        return _invalid_stage_evidence("stage_evidence_unverified")
+
+    canonical_path = _canonical_evidence_path(stage, report_dir, run_id)
+    run_scoped_path = _run_scoped_report_path(stage, report_dir, run_id)
+    if canonical_path.is_file():
+        payload = _read_json(canonical_path)
+        source = "canonical"
+    elif run_scoped_path.is_file():
+        payload = _read_json(run_scoped_path)
+        if payload.get("run_id", run_id) != run_id:
+            return _invalid_stage_evidence("stage_evidence_unverified")
+        payload["run_id"] = run_id
+        source = "run_scoped"
+    else:
+        return _invalid_stage_evidence("stage_evidence_unverified")
+
+    if not payload:
+        return _invalid_stage_evidence("stage_evidence_unverified")
+    if payload.get("evidence_source") == "shared_latest":
+        return _invalid_stage_evidence("stage_evidence_context_mismatch")
+    if not _evidence_context_matches(
+        payload,
+        stage=stage,
+        report_dir=report_dir,
+        quant_data_dir=quant_data_dir,
+        config=config,
+        run_id=run_id,
+        state=state,
+        require_persisted_identity=source == "canonical",
+    ):
+        return _invalid_stage_evidence("stage_evidence_context_mismatch")
+    if payload.get("status") not in STAGE_ACCEPTED_STATUSES[stage.name]:
+        return _invalid_stage_evidence("stage_evidence_status_invalid")
+    if source == "canonical":
+        return payload
+    return _persist_stage_evidence(
+        payload,
+        stage=stage,
+        report_dir=report_dir,
+        run_id=run_id,
+        state=state,
+        source=source,
+    )
 
 
 def _default_stage_runner(stage: Stage) -> int:
@@ -370,7 +749,112 @@ def _save_state(state: dict[str, Any], run_dir: Path, report_dir: Path) -> None:
     _atomic_write(report_dir / "robust_strategy_status_latest.json", serialized)
 
 
-def run_pipeline(
+def _membership_snapshot_hash(pit_dir: Path, *, start_date: str, end_date: str) -> str:
+    with membership_read_lock(pit_dir) as snapshot:
+        snapshot.ensure_transaction_clean()
+        snapshot.validate_source(start_date=start_date, end_date=end_date)
+        return snapshot.fingerprint()
+
+
+def _reference_snapshot_hash(
+    reference_dir: Path,
+    *,
+    start_date: str,
+    end_date: str,
+    membership_snapshot_hash: str,
+) -> str:
+    with reference_read_lock(reference_dir) as snapshot:
+        snapshot.ensure_transaction_clean()
+        snapshot.validate_source(
+            start_date=start_date,
+            end_date=end_date,
+            expected_membership_snapshot_hash=membership_snapshot_hash,
+        )
+        return snapshot.fingerprint()
+
+
+@contextmanager
+def _final_identity_guard(
+    *,
+    state: dict[str, Any],
+    config_path: Path,
+    quant_data_dir: Path,
+    pit_dir: Path,
+    reference_dir: Path,
+    membership_start: str,
+    as_of_date: str,
+    git_state_provider: Callable[[], dict[str, Any]],
+) -> Iterator[str | None]:
+    reason: str | None = None
+    stack = ExitStack()
+    try:
+        membership_snapshot = stack.enter_context(membership_read_lock(pit_dir))
+        membership_snapshot.ensure_transaction_clean()
+        membership_snapshot.validate_source(
+            start_date=membership_start,
+            end_date=as_of_date,
+        )
+        membership_hash = membership_snapshot.fingerprint()
+        if membership_hash != state.get("membership_snapshot_hash"):
+            reason = "membership_snapshot_changed"
+        reference_snapshot = stack.enter_context(reference_read_lock(reference_dir))
+        reference_snapshot.ensure_transaction_clean()
+        reference_snapshot.validate_source(
+            start_date=membership_start,
+            end_date=as_of_date,
+            expected_membership_snapshot_hash=str(
+                state.get("membership_snapshot_hash") or ""
+            ),
+        )
+        reference_hash = reference_snapshot.fingerprint()
+        if reason is None and reference_hash != state.get("reference_snapshot_hash"):
+            reason = "reference_snapshot_changed"
+
+        try:
+            latest_git = dict(git_state_provider())
+        except Exception:
+            latest_git = {}
+        if reason is None and (
+            latest_git.get("clean") is not True
+            or latest_git.get("changes") != []
+            or latest_git.get("commit") != state.get("git_commit")
+        ):
+            reason = "git_worktree_changed"
+        try:
+            current_config_hash = file_sha256(config_path)
+        except OSError:
+            current_config_hash = None
+        if reason is None and current_config_hash != state.get("config_hash"):
+            reason = "config_changed"
+        manifest = quant_data_dir / "DATA_MANIFEST.json"
+        current_manifest_hash = file_sha256(manifest) if manifest.is_file() else None
+        if reason is None and current_manifest_hash != state.get("data_manifest_hash"):
+            reason = "data_manifest_changed"
+        provider_uri = str(state.get("provider_uri") or "")
+        provider_key = str(state.get("provider_key") or "")
+        provider_identity = (
+            runtime_provider_identity(Path(provider_uri), provider_key)
+            if provider_uri and provider_key
+            else None
+        )
+        if reason is None and (
+            not provider_identity
+            or provider_identity.get("provider_tree_sha256")
+            != state.get("provider_tree_sha256")
+        ):
+            reason = "provider_snapshot_changed"
+    except MembershipIntegrityError:
+        reason = "membership_snapshot_changed"
+    except ReferenceIntegrityError:
+        if reason is None:
+            reason = "reference_snapshot_changed"
+    try:
+        yield reason
+    finally:
+        stack.close()
+
+
+def _run_pipeline_claimed(
     config_path: Path = DEFAULT_CONFIG,
     *,
     quant_data_dir: Path = DEFAULT_QUANT_DATA,
@@ -387,7 +871,7 @@ def run_pipeline(
     as_of_date = str(as_of_date or date.today().isoformat())
     if as_of_date > date.today().isoformat():
         raise ValueError("as_of_date must not be in the future")
-    run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = run_id or new_run_id()
     if not RUN_ID_RE.fullmatch(run_id):
         raise ValueError("run_id contains unsupported characters")
     quant_data_dir = Path(quant_data_dir).expanduser().resolve()
@@ -396,11 +880,33 @@ def run_pipeline(
     status_path = run_dir / "status.json"
     config_hash = file_sha256(config_path)
     current_git = dict(git_state_provider())
+    current_commit = current_git.get("commit")
+    if (
+        current_git.get("clean") is not True
+        or not isinstance(current_commit, str)
+        or not current_commit
+        or current_git.get("changes") != []
+    ):
+        raise ValueError(
+            "robust strategy pipeline requires a clean git worktree, "
+            "a non-empty commit, and no changes"
+        )
     manifest = quant_data_dir / "DATA_MANIFEST.json"
     current_manifest_hash = file_sha256(manifest) if manifest.is_file() else None
+    pit_dir = _resolved_data_path(quant_data_dir, config["paths"]["pit_membership"])
+    reference_dir = _resolved_data_path(
+        quant_data_dir, str(Path(config["paths"]["security_master"]).parent)
+    )
+    membership_start = str(config["universe"]["start_date"])
+    resume_verified_stages: set[str] = set()
+    completed_stages: dict[str, Any] = {}
 
     if resume and status_path.is_file():
         state = _read_json(status_path)
+        if state.get("git_clean") is not True:
+            raise ValueError("cannot resume state without git_clean=True")
+        if state.get("run_id") != run_id:
+            raise ValueError("cannot resume state from a different run id")
         if state.get("config_hash") != config_hash:
             raise ValueError("cannot resume a run with a different config hash")
         if state.get("git_commit") != current_git.get("commit"):
@@ -409,6 +915,80 @@ def run_pipeline(
             raise ValueError("cannot resume a run with a different data manifest")
         if state.get("as_of_date") != as_of_date:
             raise ValueError("cannot resume a run with a different as-of date")
+        completed_stages = (
+            state.get("stages") if isinstance(state.get("stages"), dict) else {}
+        )
+        membership_completed = skip_membership_build or (
+            isinstance(completed_stages.get("build_pit_csi800"), dict)
+            and completed_stages["build_pit_csi800"].get("status") == "completed"
+        )
+        reference_completed = (
+            isinstance(completed_stages.get("download_robust_reference"), dict)
+            and completed_stages["download_robust_reference"].get("status")
+            == "completed"
+        )
+        provider_completed = (
+            isinstance(completed_stages.get("prepare_robust_provider"), dict)
+            and completed_stages["prepare_robust_provider"].get("status") == "completed"
+        )
+        if membership_completed:
+            recorded_membership_hash = state.get("membership_snapshot_hash")
+            if not recorded_membership_hash:
+                raise ValueError("cannot resume without membership snapshot hash")
+            try:
+                current_membership_hash = _membership_snapshot_hash(
+                    pit_dir, start_date=membership_start, end_date=as_of_date
+                )
+            except MembershipIntegrityError as exc:
+                raise ValueError(
+                    "cannot resume with unavailable membership snapshot"
+                ) from exc
+            if recorded_membership_hash != current_membership_hash:
+                raise ValueError("cannot resume with a different membership snapshot")
+            if (
+                isinstance(completed_stages.get("build_pit_csi800"), dict)
+                and completed_stages["build_pit_csi800"].get("status") == "completed"
+            ):
+                resume_verified_stages.add("build_pit_csi800")
+        if reference_completed:
+            recorded_membership_hash = state.get("membership_snapshot_hash")
+            if not recorded_membership_hash:
+                raise ValueError("cannot resume without membership snapshot hash")
+            recorded_reference_hash = state.get("reference_snapshot_hash")
+            if not recorded_reference_hash:
+                raise ValueError("cannot resume without reference snapshot hash")
+            try:
+                current_reference_hash = _reference_snapshot_hash(
+                    reference_dir,
+                    start_date=membership_start,
+                    end_date=as_of_date,
+                    membership_snapshot_hash=str(recorded_membership_hash),
+                )
+            except ReferenceIntegrityError as exc:
+                raise ValueError(
+                    "cannot resume with unavailable reference snapshot"
+                ) from exc
+            if recorded_reference_hash != current_reference_hash:
+                raise ValueError("cannot resume with a different reference snapshot")
+            resume_verified_stages.add("download_robust_reference")
+        if provider_completed:
+            provider_uri = str(state.get("provider_uri") or "")
+            provider_key = str(state.get("provider_key") or "")
+            provider_identity = (
+                runtime_provider_identity(Path(provider_uri), provider_key)
+                if provider_uri and provider_key
+                else None
+            )
+            recorded_provider_tree = state.get("provider_tree_sha256")
+            if not provider_identity or (
+                recorded_provider_tree
+                and recorded_provider_tree
+                != provider_identity.get("provider_tree_sha256")
+            ):
+                raise ValueError(
+                    "cannot resume with an unavailable or changed provider"
+                )
+            state["provider_tree_sha256"] = provider_identity["provider_tree_sha256"]
     else:
         state = {
             "run_id": run_id,
@@ -418,11 +998,25 @@ def run_pipeline(
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "config_path": str(config_path),
             "config_hash": config_hash,
-            "git_commit": current_git.get("commit"),
+            "git_commit": current_commit,
+            "git_clean": True,
             "data_manifest_hash": current_manifest_hash,
             "as_of_date": as_of_date,
             "stages": {},
         }
+        if skip_membership_build:
+            try:
+                state["membership_snapshot_hash"] = _membership_snapshot_hash(
+                    pit_dir, start_date=membership_start, end_date=as_of_date
+                )
+            except MembershipIntegrityError as exc:
+                state["reason_code"] = exc.reason_code
+                state["lifecycle_status"] = "stopped"
+                state["updated_at"] = (
+                    datetime.now().astimezone().isoformat(timespec="seconds")
+                )
+                _save_state(state, run_dir, report_dir)
+                return state
     state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     _save_state(state, run_dir, report_dir)
 
@@ -436,15 +1030,101 @@ def run_pipeline(
         run_id=run_id,
         resume=resume,
     )
+    if resume:
+        provider_stage = next(
+            stage for stage in stages if stage.name == "prepare_robust_provider"
+        )
+        previous_provider = completed_stages.get(provider_stage.name)
+        if (
+            isinstance(previous_provider, dict)
+            and previous_provider.get("status") == "completed"
+        ):
+            canonical_provider_evidence = _canonical_evidence_path(
+                provider_stage, report_dir, run_id
+            )
+            if canonical_provider_evidence.is_file():
+                provider_evidence = _stage_evidence(
+                    provider_stage,
+                    report_dir,
+                    quant_data_dir,
+                    config,
+                    run_id=run_id,
+                    state=state,
+                )
+                if provider_evidence.get("status") != "blocked_data":
+                    resume_verified_stages.add(provider_stage.name)
+            else:
+                previous_evidence = previous_provider.get("evidence")
+                provider_evidence = (
+                    dict(previous_evidence)
+                    if isinstance(previous_evidence, dict)
+                    else {}
+                )
+                if provider_evidence.get("run_id") not in {None, run_id}:
+                    raise ValueError("cannot resume provider evidence from another run")
+                provider_evidence.update(
+                    {
+                        "status": "completed",
+                        "run_id": run_id,
+                        "provider_uri": state["provider_uri"],
+                        "provider_key": state["provider_key"],
+                        "provider_tree_sha256": state["provider_tree_sha256"],
+                    }
+                )
+                if not _evidence_context_matches(
+                    provider_evidence,
+                    stage=provider_stage,
+                    report_dir=report_dir,
+                    quant_data_dir=quant_data_dir,
+                    config=config,
+                    run_id=run_id,
+                    state=state,
+                ):
+                    raise ValueError("cannot resume with mismatched provider evidence")
+                _persist_stage_evidence(
+                    provider_evidence,
+                    stage=provider_stage,
+                    report_dir=report_dir,
+                    run_id=run_id,
+                    state=state,
+                    source="run_status",
+                )
+                _save_state(state, run_dir, report_dir)
+                resume_verified_stages.add(provider_stage.name)
     runner = stage_runner or _default_stage_runner
     for stage in stages:
         previous = state.get("stages", {}).get(stage.name)
-        if (
+        previously_completed = (
             resume
             and isinstance(previous, dict)
             and previous.get("status") == "completed"
-        ):
-            continue
+            and previous.get("return_code") == 0
+        )
+        if previously_completed:
+            runtime_verified = (
+                stage.name
+                not in {
+                    "build_pit_csi800",
+                    "download_robust_reference",
+                    "prepare_robust_provider",
+                }
+                or stage.name in resume_verified_stages
+            )
+            if runtime_verified and stage.name == "add_robust_benchmarks":
+                continue
+            if runtime_verified and stage.name in STAGE_REPORT_FILENAMES:
+                resume_evidence = _stage_evidence(
+                    stage,
+                    report_dir,
+                    quant_data_dir,
+                    config,
+                    run_id=run_id,
+                    state=state,
+                )
+                if resume_evidence.get("status") != "blocked_data":
+                    previous["evidence"] = resume_evidence
+                    _save_state(state, run_dir, report_dir)
+                    continue
         started_at = datetime.now().astimezone().isoformat(timespec="seconds")
         state.setdefault("stages", {})[stage.name] = {
             "status": "running",
@@ -454,6 +1134,8 @@ def run_pipeline(
         state["current_stage"] = stage.name
         state["updated_at"] = started_at
         _save_state(state, run_dir, report_dir)
+        if stage.name in STAGE_REPORT_FILENAMES:
+            _clear_run_scoped_stage_evidence(stage, report_dir, run_id)
         try:
             return_code = int(runner(stage))
         except (OSError, subprocess.SubprocessError) as exc:
@@ -463,11 +1145,20 @@ def run_pipeline(
                 "error_type": type(exc).__name__,
             }
         else:
-            evidence = _stage_evidence(stage, report_dir, quant_data_dir, config)
+            evidence = _stage_evidence(
+                stage,
+                report_dir,
+                quant_data_dir,
+                config,
+                run_id=run_id,
+                state=state,
+            )
 
         stage_status = "completed" if return_code == 0 else "failed"
         if evidence.get("status") == "blocked_data":
             stage_status = "blocked_data"
+        elif evidence.get("status") == "development_failed":
+            stage_status = "development_failed"
         state["stages"][stage.name].update(
             {
                 "status": stage_status,
@@ -478,7 +1169,10 @@ def run_pipeline(
                 "evidence": evidence,
             }
         )
-        if return_code != 0 or evidence.get("status") == "blocked_data":
+        if return_code != 0 or evidence.get("status") in {
+            "blocked_data",
+            "development_failed",
+        }:
             state["status"] = (
                 "blocked_data"
                 if stage.name != "run_robust_development"
@@ -497,6 +1191,37 @@ def run_pipeline(
             _save_state(state, run_dir, report_dir)
             return state
 
+        try:
+            if stage.name == "build_pit_csi800":
+                state["membership_snapshot_hash"] = _membership_snapshot_hash(
+                    pit_dir, start_date=membership_start, end_date=as_of_date
+                )
+            elif stage.name == "download_robust_reference":
+                state["reference_snapshot_hash"] = _reference_snapshot_hash(
+                    reference_dir,
+                    start_date=membership_start,
+                    end_date=as_of_date,
+                    membership_snapshot_hash=str(state["membership_snapshot_hash"]),
+                )
+        except (MembershipIntegrityError, ReferenceIntegrityError) as exc:
+            state["stages"][stage.name]["status"] = "blocked_data"
+            state["status"] = "blocked_data"
+            state["lifecycle_status"] = "stopped"
+            state["failed_stage"] = stage.name
+            state["reason_code"] = exc.reason_code
+            state["updated_at"] = (
+                datetime.now().astimezone().isoformat(timespec="seconds")
+            )
+            _save_state(state, run_dir, report_dir)
+            return state
+        if stage.name in {"build_pit_csi800", "download_robust_reference"}:
+            _save_state(state, run_dir, report_dir)
+        if stage.name == "prepare_robust_provider":
+            state["provider_uri"] = evidence.get("provider_uri")
+            state["provider_key"] = evidence.get("provider_key")
+            state["provider_tree_sha256"] = evidence.get("provider_tree_sha256")
+            _save_state(state, run_dir, report_dir)
+
         if stage.name == "preflight_robust_data" and evidence.get("status") not in {
             None,
             "ready",
@@ -508,23 +1233,78 @@ def run_pipeline(
             _save_state(state, run_dir, report_dir)
             return state
 
-    development = _stage_evidence(stages[-1], report_dir, quant_data_dir, config)
+    development = _stage_evidence(
+        stages[-1],
+        report_dir,
+        quant_data_dir,
+        config,
+        run_id=run_id,
+        state=state,
+    )
     final_status = development.get("status")
     if final_status not in FINAL_STATUSES or final_status in {
         "blocked_data",
         "development_failed",
     }:
         final_status = "development_failed"
-    state["status"] = final_status
-    state["lifecycle_status"] = (
-        "completed" if final_status != "development_failed" else "stopped"
-    )
-    state["reason_code"] = development.get("reason_code")
-    state.pop("failed_stage", None)
-    state.pop("current_stage", None)
-    state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-    _save_state(state, run_dir, report_dir)
+    with _final_identity_guard(
+        state=state,
+        config_path=config_path,
+        quant_data_dir=quant_data_dir,
+        pit_dir=pit_dir,
+        reference_dir=reference_dir,
+        membership_start=membership_start,
+        as_of_date=as_of_date,
+        git_state_provider=git_state_provider,
+    ) as identity_failure:
+        if identity_failure is not None:
+            state["status"] = "blocked_data"
+            state["lifecycle_status"] = "stopped"
+            state["reason_code"] = identity_failure
+            state["failed_stage"] = "final_identity_check"
+        else:
+            state["status"] = final_status
+            state["lifecycle_status"] = (
+                "completed" if final_status != "development_failed" else "stopped"
+            )
+            state["reason_code"] = development.get("reason_code")
+            state.pop("failed_stage", None)
+        state.pop("current_stage", None)
+        state["updated_at"] = (
+            datetime.now().astimezone().isoformat(timespec="seconds")
+        )
+        _save_state(state, run_dir, report_dir)
     return state
+
+
+def run_pipeline(
+    config_path: Path = DEFAULT_CONFIG,
+    *,
+    quant_data_dir: Path = DEFAULT_QUANT_DATA,
+    report_dir: Path = DEFAULT_REPORT_DIR,
+    as_of_date: str | None = None,
+    run_id: str | None = None,
+    skip_membership_build: bool = False,
+    resume: bool = False,
+    stage_runner: Callable[[Stage], int] | None = None,
+    git_state_provider: Callable[[], dict[str, Any]] = git_worktree_state,
+) -> dict[str, Any]:
+    claimed_run_id = run_id or new_run_id()
+    if not RUN_ID_RE.fullmatch(claimed_run_id):
+        raise ValueError("run_id contains unsupported characters")
+    resolved_report_dir = Path(report_dir).expanduser().resolve()
+    with _claim_run(resolved_report_dir, claimed_run_id, resume=resume):
+        return _run_pipeline_claimed(
+            config_path,
+            quant_data_dir=quant_data_dir,
+            report_dir=resolved_report_dir,
+            as_of_date=as_of_date,
+            run_id=claimed_run_id,
+            skip_membership_build=skip_membership_build,
+            resume=resume,
+            stage_runner=stage_runner,
+            git_state_provider=git_state_provider,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -159,20 +159,14 @@ def build_strategy_target(
     selected = (
         selected.sort_values("_rank").drop_duplicates("symbol").drop(columns="_rank")
     )
-    if strategy_id in {"sector_constrained", "full_risk_control"}:
-        return build_constrained_portfolio(
-            selected,
-            target_position=target_position,
-            topk=topk,
-            single_stock_max=single_stock_max,
-            industry_max=industry_max,
-            growth_star_max=growth_star_max,
-        )
-    if selected.empty:
-        selected["weight"] = pd.Series(dtype=float)
-        return selected
-    selected["weight"] = float(target_position) / len(selected)
-    return selected
+    return build_constrained_portfolio(
+        selected,
+        target_position=target_position,
+        topk=topk,
+        single_stock_max=single_stock_max,
+        industry_max=industry_max,
+        growth_star_max=growth_star_max,
+    )
 
 
 def performance_metrics(daily: pd.DataFrame) -> dict[str, float | int]:
@@ -269,6 +263,7 @@ def simulate_strategy(
     slippage_bps: float = 0.0,
     all_in_round_trip_bps: float | None = None,
     additional_execution_delay_days: int = 0,
+    defer_unfilled_open_orders: bool = True,
 ) -> dict[str, Any]:
     if strategy_id not in STRATEGIES:
         raise ValueError(f"unknown strategy: {strategy_id}")
@@ -303,9 +298,12 @@ def simulate_strategy(
     cash = float(initial_cash)
     holdings: dict[str, int] = {}
     last_prices: dict[str, float] = {}
+    last_boards: dict[str, str] = {}
     previous_value = float(initial_cash)
     previous_benchmark: float | None = None
     records: list[dict[str, Any]] = []
+    pending_desired: dict[str, int] = {}
+    pending_weights: dict[str, float] = {}
 
     def order_costs(
         side: str, notional: float, trade_day: pd.Timestamp
@@ -330,6 +328,9 @@ def simulate_strategy(
     for day in calendar:
         day_prices = price_by_day.get(day, pd.DataFrame())
         for symbol, row in day_prices.iterrows():
+            board = str(row.get("board") or "")
+            if board:
+                last_boards[str(symbol)] = board
             if math.isfinite(float(row["open"])) and float(row["open"]) > 0:
                 last_prices[str(symbol)] = float(row["open"])
         value_before = cash + sum(
@@ -386,6 +387,10 @@ def simulate_strategy(
                     transaction_cost += costs["total"]
                     turnover_notional += notional
                     trade_count += 1
+                for symbol in list(pending_desired):
+                    pending_desired[symbol] = min(
+                        pending_desired[symbol], holdings.get(symbol, 0)
+                    )
         if (
             signal_day is not None
             and signal_day in prediction_by_day
@@ -438,11 +443,21 @@ def simulate_strategy(
                 desired[symbol] = (
                     int(max(0.0, value_before * weight) // (open_price * 100)) * 100
                 )
+            pending_desired = {
+                symbol: desired.get(symbol, 0)
+                for symbol in set(holdings) | set(desired)
+            }
+            pending_weights = target_weights
 
-            for symbol in sorted(set(holdings) | set(desired)):
+        if pending_desired and not day_prices.empty:
+            completed_orders: set[str] = set()
+            for symbol in sorted(pending_desired):
                 current = holdings.get(symbol, 0)
-                target_quantity = desired.get(symbol, 0)
-                if target_quantity >= current or symbol not in day_prices.index:
+                target_quantity = pending_desired[symbol]
+                if target_quantity == current:
+                    completed_orders.add(symbol)
+                    continue
+                if target_quantity > current or symbol not in day_prices.index:
                     continue
                 row = day_prices.loc[symbol]
                 limit = price_limit_ratio(symbol, day, is_st=bool(row["is_st"]))
@@ -462,12 +477,18 @@ def simulate_strategy(
                 transaction_cost += costs["total"]
                 turnover_notional += notional
                 trade_count += 1
+                completed_orders.add(symbol)
 
             for symbol, target_quantity in sorted(
-                desired.items(), key=lambda item: target_weights[item[0]], reverse=True
+                pending_desired.items(),
+                key=lambda item: pending_weights.get(item[0], 0.0),
+                reverse=True,
             ):
                 current = holdings.get(symbol, 0)
-                if target_quantity <= current or symbol not in day_prices.index:
+                if target_quantity == current:
+                    completed_orders.add(symbol)
+                    continue
+                if target_quantity < current or symbol not in day_prices.index:
                     continue
                 row = day_prices.loc[symbol]
                 limit = price_limit_ratio(symbol, day, is_st=bool(row["is_st"]))
@@ -494,6 +515,15 @@ def simulate_strategy(
                 transaction_cost += costs["total"]
                 turnover_notional += notional
                 trade_count += 1
+                if holdings[symbol] >= target_quantity:
+                    completed_orders.add(symbol)
+
+            for symbol in completed_orders:
+                pending_desired.pop(symbol, None)
+                pending_weights.pop(symbol, None)
+            if not defer_unfilled_open_orders:
+                pending_desired.clear()
+                pending_weights.clear()
 
         holdings = {
             symbol: quantity for symbol, quantity in holdings.items() if quantity > 0
@@ -511,6 +541,11 @@ def simulate_strategy(
             if portfolio_value > 0
             else 0.0
         )
+        board_values = {"main": 0.0, "growth": 0.0, "star": 0.0}
+        for symbol, quantity in holdings.items():
+            board = last_boards.get(symbol)
+            if board in board_values:
+                board_values[board] += quantity * last_prices.get(symbol, 0.0)
         portfolio_return = (
             portfolio_value / previous_value - 1.0 if previous_value > 0 else 0.0
         )
@@ -527,12 +562,19 @@ def simulate_strategy(
                 "cash": cash,
                 "holding_count": len(holdings),
                 "gross_position": gross_position,
+                **{
+                    f"board_exposure_{board}": value / portfolio_value
+                    if portfolio_value > 0
+                    else 0.0
+                    for board, value in board_values.items()
+                },
                 "trade_count": trade_count,
                 "transaction_cost": transaction_cost,
                 "turnover": turnover_notional / value_before
                 if value_before > 0
                 else 0.0,
                 "signal_date": signal_day,
+                "pending_order_count": len(pending_desired),
             }
         )
         previous_value = portfolio_value

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
+import json
+import threading
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "robust_market_data.py"
@@ -19,6 +23,8 @@ def load_module():
 
 
 def build_fixture(root: Path) -> tuple[Path, Path, Path]:
+    from _robust_membership_integrity import membership_read_lock
+
     dates = pd.bdate_range("2025-01-02", periods=4)
     pit_dir = root / "pit" / "daily"
     pit_dir.mkdir(parents=True)
@@ -29,6 +35,35 @@ def build_fixture(root: Path) -> tuple[Path, Path, Path]:
             "index_code": ["000300.XSHG", "000300.XSHG", "000905.XSHG", "000905.XSHG"],
         }
     ).to_parquet(pit_dir / "2025.parquet", index=False)
+    pit_root = root / "pit"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000", "SZ000001"],
+            "index_code": ["000300.XSHG", "000905.XSHG"],
+            "start_date": [dates[1], dates[2]],
+            "end_date": [dates[2], dates[3]],
+        }
+    ).to_parquet(pit_root / "membership_intervals.parquet", index=False)
+    (pit_root / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": str(dates[0].date()),
+                    "end_date": str(dates[-1].date()),
+                },
+                "indices": {
+                    "csi300": "000300.XSHG",
+                    "csi500": "000905.XSHG",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with membership_read_lock(pit_root) as snapshot:
+        membership_snapshot_hash = snapshot.fingerprint()
     price_dir = root / "prices"
     price_dir.mkdir()
     for symbol, code, base in [
@@ -47,6 +82,22 @@ def build_fixture(root: Path) -> tuple[Path, Path, Path]:
         ).to_parquet(price_dir / f"{code}.parquet", index=False)
     reference = root / "reference"
     reference.mkdir()
+    (reference / "REFERENCE_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": str(dates[0].date()),
+                    "end_date": str(dates[-1].date()),
+                },
+                "industry_classification": "CSRC",
+                "membership_snapshot_hash": membership_snapshot_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
     pd.DataFrame(
         {
             "symbol": ["SH600000", "SZ000001"],
@@ -117,6 +168,198 @@ def test_market_panel_uses_only_pit_member_days_and_historical_metadata(
     assert bool(sz_st["is_st"]) is True
     assert bool(sz_paused["suspended"]) is True
     assert sh_old["previous_close"] == 10.5
+    assert panel.attrs["reference_source_metadata"]["selected"] == "baostock"
+    assert (
+        panel.attrs["reference_source_metadata"]["fallback_reason"]
+        == "jqdata_permission_denied"
+    )
+    assert len(panel.attrs["reference_snapshot_hash"]) == 64
+    assert panel.attrs["membership_source_metadata"]["selected"] == "baostock"
+    assert (
+        panel.attrs["membership_source_metadata"]["fallback_reason"]
+        == "jqdata_permission_denied"
+    )
+    assert len(panel.attrs["membership_snapshot_hash"]) == 64
+
+
+def test_market_panel_allows_missing_prices_on_verified_suspension_day(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    path = price_dir / "000001.parquet"
+    prices = pd.read_parquet(path)
+    paused = prices["date"].eq(pd.Timestamp("2025-01-07"))
+    prices.loc[paused, ["open", "close", "high", "low"]] = np.nan
+    prices.to_parquet(path, index=False)
+
+    panel = module.load_market_panel(
+        pit_dir=pit_dir,
+        price_dir=price_dir,
+        reference_dir=reference,
+        start_date="2025-01-03",
+        end_date="2025-01-07",
+    )
+
+    row = panel[
+        (panel["date"] == pd.Timestamp("2025-01-07"))
+        & (panel["symbol"] == "SZ000001")
+    ].iloc[0]
+    assert bool(row["suspended"]) is True
+    assert pd.isna(row["open"])
+
+
+def test_reference_read_lock_blocks_writer_after_integrity_check(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    _, _, reference = build_fixture(tmp_path)
+    lock_path = reference.parent / f".{reference.name}.download_robust_reference.lock"
+    writer_attempting = threading.Event()
+    writer_acquired = threading.Event()
+
+    def writer() -> None:
+        with lock_path.open("a+b") as handle:
+            writer_attempting.set()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            writer_acquired.set()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    thread = threading.Thread(target=writer)
+    with module.reference_read_lock(reference) as snapshot:
+        snapshot.ensure_transaction_clean()
+        snapshot.validate_source(start_date="2025-01-03", end_date="2025-01-07")
+        thread.start()
+        assert writer_attempting.wait(timeout=1.0)
+        assert writer_acquired.wait(timeout=0.1) is False
+        assert len(snapshot.fingerprint()) == 64
+
+    assert writer_acquired.wait(timeout=1.0)
+    thread.join(timeout=1.0)
+    assert thread.is_alive() is False
+
+
+def test_market_panel_rejects_dirty_reference_transaction_before_any_parquet_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    (reference / ".download_robust_reference.transaction.json").write_text(
+        '{"state": "prepared"}\n', encoding="utf-8"
+    )
+    parquet_reads: list[object] = []
+
+    def reject_parquet_read(*args, **kwargs):
+        parquet_reads.append(args[0] if args else None)
+        raise AssertionError("no parquet may be read while the journal exists")
+
+    monkeypatch.setattr(module.pd, "read_parquet", reject_parquet_read)
+
+    with pytest.raises(ValueError, match="reference transaction"):
+        module.load_market_panel(
+            pit_dir=pit_dir,
+            price_dir=price_dir,
+            reference_dir=reference,
+            start_date="2025-01-03",
+            end_date="2025-01-07",
+        )
+
+    assert parquet_reads == []
+
+
+def test_market_panel_rejects_reference_source_range_before_reading_parquet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    source_path = reference / "REFERENCE_SOURCE.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["date_range"]["end_date"] = "2025-01-06"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    parquet_reads: list[object] = []
+    monkeypatch.setattr(
+        module.pd,
+        "read_parquet",
+        lambda *args, **kwargs: parquet_reads.append(args[0] if args else None),
+    )
+
+    with pytest.raises(ValueError, match="reference source range"):
+        module.load_market_panel(
+            pit_dir=pit_dir,
+            price_dir=price_dir,
+            reference_dir=reference,
+            start_date="2025-01-03",
+            end_date="2025-01-07",
+        )
+
+    assert parquet_reads == []
+
+
+def test_market_panel_rejects_reference_from_different_membership_snapshot(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    source_path = reference / "REFERENCE_SOURCE.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["membership_snapshot_hash"] = "f" * 64
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different membership snapshot"):
+        module.load_market_panel(
+            pit_dir=pit_dir,
+            price_dir=price_dir,
+            reference_dir=reference,
+            start_date="2025-01-03",
+            end_date="2025-01-07",
+        )
+
+
+def test_reference_fingerprint_rejects_symlinked_snapshot_file(tmp_path: Path) -> None:
+    module = load_module()
+    _, _, reference = build_fixture(tmp_path)
+    external = tmp_path / "external-security.parquet"
+    target = reference / "security_master.parquet"
+    target.replace(external)
+    target.symlink_to(external)
+
+    with pytest.raises(ValueError, match="snapshot files are incomplete"):
+        with module.reference_read_lock(reference) as snapshot:
+            snapshot.fingerprint()
+
+
+@pytest.mark.parametrize("changed_snapshot", ["membership", "reference"])
+def test_market_panel_rechecks_snapshots_before_return(
+    tmp_path: Path, monkeypatch, changed_snapshot: str
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    original_industry_lookup = module._industry_for_members
+    changed = False
+
+    def changing_industry_lookup(members, intervals):
+        nonlocal changed
+        result = original_industry_lookup(members, intervals)
+        if not changed:
+            path = (
+                pit_dir / "daily" / "2025.parquet"
+                if changed_snapshot == "membership"
+                else reference / "security_master.parquet"
+            )
+            path.write_bytes(path.read_bytes() + b"changed-after-read")
+            changed = True
+        return result
+
+    monkeypatch.setattr(module, "_industry_for_members", changing_industry_lookup)
+
+    with pytest.raises(ValueError, match=f"{changed_snapshot} snapshot changed"):
+        module.load_market_panel(
+            pit_dir=pit_dir,
+            price_dir=price_dir,
+            reference_dir=reference,
+            start_date="2025-01-03",
+            end_date="2025-01-07",
+        )
 
 
 def test_qlib_binary_reader_uses_calendar_start_offset(tmp_path: Path) -> None:

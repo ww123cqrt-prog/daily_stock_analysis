@@ -21,6 +21,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root  # noqa: E402
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
 from robust_backtest import simulate_strategy  # noqa: E402
 from robust_evaluation import (
     aggregate_prediction_frames,
@@ -33,6 +41,7 @@ from robust_market_data import (
     load_market_panel,
 )  # noqa: E402
 from robust_strategy_core import make_confirmation_split  # noqa: E402
+from prepare_robust_provider import runtime_provider_identity  # noqa: E402
 from run_robust_development import (  # noqa: E402
     TREE_MODELS,
     TrainingJob,
@@ -40,9 +49,13 @@ from run_robust_development import (  # noqa: E402
     _artifact_records,
     _split_record,
     build_dataset_config,
+    build_training_jobs,
     load_config,
+    make_job_split,
     completed_job_artifact_is_valid,
     run_training_jobs,
+    frozen_context_hash,
+    payload_sha256,
     selection_contract_hash,
 )
 from run_robust_strategy import DEFAULT_CONFIG, file_sha256, git_worktree_state  # noqa: E402
@@ -187,6 +200,38 @@ def _failure(reason_code: str, *, run_id: str) -> dict[str, Any]:
     }
 
 
+def _current_membership_snapshot_hash(
+    config: Mapping[str, Any], quant_data_dir: Path
+) -> str:
+    pit_dir = quant_data_dir / str(config["paths"]["pit_membership"])
+    with membership_read_lock(pit_dir) as snapshot:
+        snapshot.ensure_transaction_clean()
+        snapshot.validate_source(
+            start_date=str(config["universe"]["start_date"]),
+            end_date="2025-12-31",
+        )
+        return snapshot.fingerprint()
+
+
+def _current_reference_snapshot_hash(
+    config: Mapping[str, Any],
+    quant_data_dir: Path,
+    *,
+    membership_snapshot_hash: str,
+) -> str:
+    reference_dir = (
+        quant_data_dir / Path(str(config["paths"]["security_master"])).parent
+    )
+    with reference_read_lock(reference_dir) as snapshot:
+        snapshot.ensure_transaction_clean()
+        snapshot.validate_source(
+            start_date=str(config["universe"]["start_date"]),
+            end_date="2025-12-31",
+            expected_membership_snapshot_hash=membership_snapshot_hash,
+        )
+        return snapshot.fingerprint()
+
+
 def _confirmation_model_artifacts(
     jobs: Sequence[TrainingJob], progress: Mapping[str, Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -255,6 +300,17 @@ def run_confirmation(
         payload = _failure("frozen_candidate_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
+    if frozen.get("frozen_context_hash") != frozen_context_hash(frozen):
+        payload = _failure("frozen_context_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    development_artifacts = frozen.get("development_artifacts")
+    if not isinstance(development_artifacts, list) or frozen.get(
+        "development_artifacts_hash"
+    ) != payload_sha256(development_artifacts):
+        payload = _failure("frozen_development_artifacts_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
     current_git = dict(git_state_provider())
     if current_git.get("clean") is not True or current_git.get("commit") != frozen.get(
         "git_commit"
@@ -271,6 +327,32 @@ def run_confirmation(
     )
     if frozen.get("selection_hash") != expected_selection_hash:
         payload = _failure("frozen_selection_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    try:
+        membership_snapshot_hash = _current_membership_snapshot_hash(
+            config, quant_data_dir
+        )
+    except MembershipIntegrityError:
+        payload = _failure("frozen_membership_snapshot_unavailable", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    if membership_snapshot_hash != frozen.get("membership_snapshot_hash"):
+        payload = _failure("frozen_membership_snapshot_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    try:
+        reference_snapshot_hash = _current_reference_snapshot_hash(
+            config,
+            quant_data_dir,
+            membership_snapshot_hash=membership_snapshot_hash,
+        )
+    except ReferenceIntegrityError:
+        payload = _failure("frozen_reference_snapshot_unavailable", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    if reference_snapshot_hash != frozen.get("reference_snapshot_hash"):
+        payload = _failure("frozen_reference_snapshot_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
     manifest_path = quant_data_dir / "DATA_MANIFEST.json"
@@ -296,6 +378,15 @@ def run_confirmation(
         payload = _failure("frozen_provider_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
+    provider_identity = runtime_provider_identity(
+        provider_uri, str(frozen["provider_key"])
+    )
+    if provider_identity is None or provider_identity.get(
+        "provider_tree_sha256"
+    ) != frozen.get("provider_tree_sha256"):
+        payload = _failure("frozen_provider_content_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
     calendar_path = provider_uri / "calendars" / "day.txt"
     if not calendar_path.is_file():
         payload = _failure("provider_calendar_missing", run_id=run_id)
@@ -309,6 +400,44 @@ def run_confirmation(
     confirmation_days = calendar[calendar >= pd.Timestamp("2026-01-01")]
     if len(confirmation_days) < 7:
         payload = _failure("confirmation_labels_unavailable", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    selected_models = set(str(value) for value in frozen.get("selected_models") or [])
+    development_jobs = [
+        job for job in build_training_jobs(config) if job.model_id in selected_models
+    ]
+    artifacts_by_key = {
+        str(item.get("job_key")): item
+        for item in development_artifacts
+        if isinstance(item, Mapping)
+    }
+    expected_keys = {job.key for job in development_jobs}
+    development_run_dir = Path(str(frozen.get("development_run_dir") or ""))
+    development_context_hash = str(frozen.get("development_context_hash") or "")
+    invalid_development_artifacts = []
+    if set(artifacts_by_key) != expected_keys:
+        invalid_development_artifacts.append("development_artifact_job_set")
+    else:
+        for job in development_jobs:
+            split = make_job_split(
+                calendar,
+                job.quarter,
+                window_days=job.window_days,
+                validation_days=int(config["rolling_validation"]["validation_days"]),
+                label_horizon_days=5,
+            )
+            if not completed_job_artifact_is_valid(
+                job,
+                artifacts_by_key[job.key],
+                run_dir=development_run_dir,
+                expected_split=_split_record(split),
+                context_hash=development_context_hash,
+            ):
+                invalid_development_artifacts.append(job.key)
+    if invalid_development_artifacts:
+        payload = _failure("frozen_development_artifacts_mismatch", run_id=run_id)
+        payload["invalid_artifact_count"] = len(invalid_development_artifacts)
+        payload["invalid_artifact_sample"] = invalid_development_artifacts[:20]
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
     try:
@@ -415,6 +544,9 @@ def run_confirmation(
         minimum_commission=float(costs["minimum_commission_cny"]),
         slippage_bps=0.0,
         all_in_round_trip_bps=float(costs["scenarios"]["baseline_total_bps"]),
+        defer_unfilled_open_orders=bool(
+            config["execution_rules"]["defer_unfilled_open_orders"]
+        ),
     )
     verdict = confirmation_verdict(
         annual_excess_return=float(result["metrics"]["annual_excess_return"]),
@@ -438,88 +570,199 @@ def run_confirmation(
             final_frozen["shadow_tracking_started"] = False
             _write_json(frozen_path, final_frozen)
         return payload
-    final_git = dict(git_state_provider())
-    final_frozen = _read_json(frozen_path)
-    final_provider_state = _read_json(Path(provider_state_path))
-    reproducibility_failures: list[str] = []
-    if final_git.get("clean") is not True or final_git.get("commit") != frozen.get(
-        "git_commit"
-    ):
-        reproducibility_failures.append("git_state")
-    if file_sha256(config_path) != frozen.get("config_hash"):
-        reproducibility_failures.append("config_hash")
-    if not manifest_path.is_file() or file_sha256(manifest_path) != frozen.get(
-        "data_manifest_hash"
-    ):
-        reproducibility_failures.append("data_manifest_hash")
-    final_selection_hash = selection_contract_hash(
-        [str(value) for value in final_frozen.get("selected_models") or []],
-        final_frozen.get("selected_model_configs") or {},
-        str(final_frozen.get("selected_strategy") or ""),
-    )
-    if final_frozen.get("selection_hash") != frozen.get(
-        "selection_hash"
-    ) or final_selection_hash != frozen.get("selection_hash"):
-        reproducibility_failures.append("selection_hash")
-    if final_provider_state.get("status") != "completed":
-        reproducibility_failures.append("provider_status")
-    final_provider_uri = str(final_provider_state.get("provider_uri") or "")
-    if (
-        not final_provider_uri
-        or Path(final_provider_uri).resolve() != provider_uri.resolve()
-    ):
-        reproducibility_failures.append("provider_uri")
-    if final_provider_state.get("provider_key") != frozen.get("provider_key"):
-        reproducibility_failures.append("provider_key")
-    if reproducibility_failures:
+    pit_dir = quant_data_dir / str(paths["pit_membership"])
+    reference_dir = quant_data_dir / Path(str(paths["security_master"])).parent
+    try:
+        with membership_read_lock(pit_dir) as final_membership:
+            membership_integrity_failure: str | None = None
+            final_membership_snapshot_hash: str | None = None
+            try:
+                final_membership.ensure_transaction_clean()
+                final_membership.validate_source(
+                    start_date=str(config["universe"]["start_date"]),
+                    end_date="2025-12-31",
+                )
+                final_membership_snapshot_hash = final_membership.fingerprint()
+            except MembershipIntegrityError as exc:
+                membership_integrity_failure = exc.reason_code
+
+            with reference_read_lock(reference_dir) as final_reference:
+                reference_integrity_failure: str | None = None
+                final_reference_snapshot_hash: str | None = None
+                try:
+                    final_reference.ensure_transaction_clean()
+                    if final_membership_snapshot_hash is None:
+                        raise ReferenceIntegrityError(
+                            "reference_membership_snapshot_unavailable",
+                            "membership snapshot is unavailable for reference validation",
+                        )
+                    final_reference.validate_source(
+                        start_date=str(config["universe"]["start_date"]),
+                        end_date="2025-12-31",
+                        expected_membership_snapshot_hash=final_membership_snapshot_hash,
+                    )
+                    final_reference_snapshot_hash = final_reference.fingerprint()
+                except ReferenceIntegrityError as exc:
+                    reference_integrity_failure = exc.reason_code
+
+                with _claim_lock(frozen_path.parent):
+                    final_git = dict(git_state_provider())
+                    final_frozen = _read_json(frozen_path)
+                    final_provider_state = _read_json(Path(provider_state_path))
+                    reproducibility_failures: list[str] = []
+                    if final_git.get("clean") is not True or final_git.get(
+                        "commit"
+                    ) != frozen.get("git_commit"):
+                        reproducibility_failures.append("git_state")
+                    if file_sha256(config_path) != frozen.get("config_hash"):
+                        reproducibility_failures.append("config_hash")
+                    if not manifest_path.is_file() or file_sha256(
+                        manifest_path
+                    ) != frozen.get("data_manifest_hash"):
+                        reproducibility_failures.append("data_manifest_hash")
+                    final_selection_hash = selection_contract_hash(
+                        [
+                            str(value)
+                            for value in final_frozen.get("selected_models") or []
+                        ],
+                        final_frozen.get("selected_model_configs") or {},
+                        str(final_frozen.get("selected_strategy") or ""),
+                    )
+                    if final_frozen.get("selection_hash") != frozen.get(
+                        "selection_hash"
+                    ) or final_selection_hash != frozen.get("selection_hash"):
+                        reproducibility_failures.append("selection_hash")
+                    if final_frozen.get("frozen_context_hash") != frozen.get(
+                        "frozen_context_hash"
+                    ) or frozen_context_hash(final_frozen) != frozen.get(
+                        "frozen_context_hash"
+                    ):
+                        reproducibility_failures.append("frozen_context_hash")
+                    final_development_artifacts = final_frozen.get(
+                        "development_artifacts"
+                    )
+                    if (
+                        not isinstance(final_development_artifacts, list)
+                        or final_frozen.get("development_artifacts_hash")
+                        != frozen.get("development_artifacts_hash")
+                        or payload_sha256(final_development_artifacts)
+                        != frozen.get("development_artifacts_hash")
+                    ):
+                        reproducibility_failures.append("development_artifacts_hash")
+                    if final_provider_state.get("status") != "completed":
+                        reproducibility_failures.append("provider_status")
+                    final_provider_uri = str(
+                        final_provider_state.get("provider_uri") or ""
+                    )
+                    if (
+                        not final_provider_uri
+                        or Path(final_provider_uri).resolve() != provider_uri.resolve()
+                    ):
+                        reproducibility_failures.append("provider_uri")
+                    if final_provider_state.get("provider_key") != frozen.get(
+                        "provider_key"
+                    ):
+                        reproducibility_failures.append("provider_key")
+                    final_provider_identity = runtime_provider_identity(
+                        provider_uri, str(frozen.get("provider_key") or "")
+                    )
+                    if final_provider_identity is None:
+                        reproducibility_failures.append("provider_snapshot")
+                    elif final_provider_identity.get(
+                        "provider_tree_sha256"
+                    ) != frozen.get("provider_tree_sha256"):
+                        reproducibility_failures.append("provider_tree_sha256")
+                    if (
+                        membership_integrity_failure is not None
+                        or final_membership_snapshot_hash
+                        != frozen.get("membership_snapshot_hash")
+                    ):
+                        reproducibility_failures.append("membership_snapshot_hash")
+                    if (
+                        reference_integrity_failure is not None
+                        or final_reference_snapshot_hash
+                        != frozen.get("reference_snapshot_hash")
+                    ):
+                        reproducibility_failures.append("reference_snapshot_hash")
+                    if reproducibility_failures:
+                        payload = _failure(
+                            "reproducibility_state_changed_during_confirmation",
+                            run_id=run_id,
+                        )
+                        payload["reproducibility_failures"] = reproducibility_failures
+                        _write_json(
+                            state_path, {**payload, "lifecycle_status": "completed"}
+                        )
+                        _write_json(report_dir / "confirmation_latest.json", payload)
+                        final_frozen["confirmation_status"] = "development_failed"
+                        final_frozen["shadow_tracking_started"] = False
+                        _write_json(frozen_path, final_frozen)
+                        return payload
+
+                    status = (
+                        "shadow_observation"
+                        if verdict["passed"]
+                        else "development_failed"
+                    )
+                    daily_path = run_dir / "confirmation_backtest.parquet"
+                    _atomic_write_parquet(result["daily"], daily_path)
+                    payload = {
+                        "status": status,
+                        "reason_code": None
+                        if verdict["passed"]
+                        else "confirmation_failed",
+                        "run_id": run_id,
+                        "generated_at": datetime.now()
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
+                        "config_hash": frozen["config_hash"],
+                        "development_git_commit": frozen.get("git_commit"),
+                        "selected_models": selected_ids,
+                        "selected_strategy": strategy_id,
+                        "confirmation_start": str(confirmation_days[0].date()),
+                        "latest_signal_day": str(latest_signal_day.date()),
+                        "latest_market_day": str(latest_market_day.date()),
+                        "confirmation_model_artifact_count": len(model_artifacts),
+                        "confirmation_ensemble_prediction_path": str(ensemble_path),
+                        "confirmation_ensemble_prediction_hash": ensemble_hash,
+                        "metrics": result["metrics"],
+                        "verdict": verdict,
+                        "backtest_artifact": str(daily_path.resolve()),
+                    }
+                    _write_json(run_dir / "confirmation.json", payload)
+                    _write_json(report_dir / "confirmation_latest.json", payload)
+                    _write_json(
+                        state_path, {**payload, "lifecycle_status": "completed"}
+                    )
+                    final_frozen["confirmation_status"] = status
+                    final_frozen["confirmation_run_id"] = run_id
+                    final_frozen["shadow_tracking_started"] = verdict["passed"]
+                    if verdict["passed"]:
+                        final_frozen["confirmation_model_artifacts"] = model_artifacts
+                        final_frozen["confirmation_ensemble_prediction_path"] = str(
+                            ensemble_path
+                        )
+                        final_frozen["confirmation_ensemble_prediction_hash"] = (
+                            ensemble_hash
+                        )
+                        final_frozen["shadow_start_after"] = str(
+                            latest_market_day.date()
+                        )
+                    _write_json(frozen_path, final_frozen)
+                    return payload
+    except (MembershipIntegrityError, ReferenceIntegrityError) as exc:
         payload = _failure(
             "reproducibility_state_changed_during_confirmation", run_id=run_id
         )
-        payload["reproducibility_failures"] = reproducibility_failures
-        _write_json(state_path, {**payload, "lifecycle_status": "completed"})
-        _write_json(report_dir / "confirmation_latest.json", payload)
+        payload["reproducibility_failures"] = [exc.reason_code]
         with _claim_lock(frozen_path.parent):
             final_frozen = _read_json(frozen_path)
+            _write_json(state_path, {**payload, "lifecycle_status": "completed"})
+            _write_json(report_dir / "confirmation_latest.json", payload)
             final_frozen["confirmation_status"] = "development_failed"
             final_frozen["shadow_tracking_started"] = False
             _write_json(frozen_path, final_frozen)
         return payload
-    status = "shadow_observation" if verdict["passed"] else "development_failed"
-    daily_path = run_dir / "confirmation_backtest.parquet"
-    _atomic_write_parquet(result["daily"], daily_path)
-    payload = {
-        "status": status,
-        "reason_code": None if verdict["passed"] else "confirmation_failed",
-        "run_id": run_id,
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "config_hash": frozen["config_hash"],
-        "development_git_commit": frozen.get("git_commit"),
-        "selected_models": selected_ids,
-        "selected_strategy": strategy_id,
-        "confirmation_start": str(confirmation_days[0].date()),
-        "latest_signal_day": str(latest_signal_day.date()),
-        "latest_market_day": str(latest_market_day.date()),
-        "confirmation_model_artifact_count": len(model_artifacts),
-        "confirmation_ensemble_prediction_path": str(ensemble_path),
-        "confirmation_ensemble_prediction_hash": ensemble_hash,
-        "metrics": result["metrics"],
-        "verdict": verdict,
-        "backtest_artifact": str(daily_path.resolve()),
-    }
-    _write_json(run_dir / "confirmation.json", payload)
-    _write_json(report_dir / "confirmation_latest.json", payload)
-    _write_json(state_path, {**payload, "lifecycle_status": "completed"})
-    frozen_after = _read_json(frozen_path)
-    frozen_after["confirmation_status"] = status
-    frozen_after["confirmation_run_id"] = run_id
-    frozen_after["shadow_tracking_started"] = verdict["passed"]
-    if verdict["passed"]:
-        frozen_after["confirmation_model_artifacts"] = model_artifacts
-        frozen_after["confirmation_ensemble_prediction_path"] = str(ensemble_path)
-        frozen_after["confirmation_ensemble_prediction_hash"] = ensemble_hash
-        frozen_after["shadow_start_after"] = str(latest_market_day.date())
-    _write_json(frozen_path, frozen_after)
-    return payload
 
 
 def main(argv: list[str] | None = None) -> int:

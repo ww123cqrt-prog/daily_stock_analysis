@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "launch_robust_strategy.py"
@@ -113,3 +115,34 @@ def test_launch_fails_when_process_exits_during_warmup(tmp_path: Path) -> None:
         )
     )
     assert record["status"] == "failed_to_start"
+
+
+def test_duplicate_active_launch_preserves_original_pid_and_record(tmp_path: Path) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    runner_dir = report_dir / "runner" / "same-run"
+    runner_dir.mkdir(parents=True)
+    (runner_dir / "pid").write_text("111\n", encoding="utf-8")
+    original = {"status": "running", "run_id": "same-run", "pid": 111}
+    (runner_dir / "launch.json").write_text(json.dumps(original), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already running"):
+        module.launch(
+            config=tmp_path / "config.yaml",
+            quant_data_dir=tmp_path / "quant_data",
+            report_dir=report_dir,
+            as_of_date="2026-07-15",
+            run_id="same-run",
+            resume=False,
+            skip_membership_build=False,
+            warmup_seconds=0,
+            popen_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("must not spawn")
+            ),
+            sleep_fn=lambda _: None,
+            cpu_probe=lambda pid: 0.0,
+            pid_alive=lambda pid: pid == 111,
+        )
+
+    assert (runner_dir / "pid").read_text(encoding="utf-8") == "111\n"
+    assert json.loads((runner_dir / "launch.json").read_text(encoding="utf-8")) == original

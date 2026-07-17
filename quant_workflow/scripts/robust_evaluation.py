@@ -295,13 +295,34 @@ def _regime_metrics(
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
     regime_series = regimes.copy()
     regime_series.index = pd.to_datetime(regime_series.index).normalize()
-    frame["regime"] = frame["date"].map(regime_series)
+    regime_for_next_open = regime_series.sort_index().shift(1)
+    frame["regime"] = frame["date"].map(regime_for_next_open)
     result: dict[str, dict[str, Any]] = {}
     for regime in ("risk_on", "neutral", "defensive", "risk_off"):
         selected = frame[frame["regime"] == regime]
         metrics = dict(performance_metrics(selected))
         metrics["days"] = int(len(selected))
         result[regime] = metrics
+    return result
+
+
+def _board_attribution(daily: pd.DataFrame) -> dict[str, dict[str, float | int]]:
+    result: dict[str, dict[str, float | int]] = {}
+    for board in ("main", "growth", "star"):
+        column = f"board_exposure_{board}"
+        if column not in daily:
+            values = pd.Series(dtype=float)
+        else:
+            values = (
+                pd.to_numeric(daily[column], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
+        result[board] = {
+            "average_exposure": float(values.mean()) if not values.empty else 0.0,
+            "max_exposure": float(values.max()) if not values.empty else 0.0,
+            "days": int(len(values)),
+        }
     return result
 
 
@@ -337,6 +358,9 @@ def evaluate_strategy_candidates(
         "commission_rate": float(costs["commission_rate_each_side"]),
         "minimum_commission": float(costs["minimum_commission_cny"]),
         "slippage_bps": 0.0,
+        "defer_unfilled_open_orders": bool(
+            config["execution_rules"]["defer_unfilled_open_orders"]
+        ),
     }
     rank_correlations = [
         float(item.get("stability", {}).get("rank_correlation_median", float("nan")))
@@ -349,6 +373,12 @@ def evaluate_strategy_candidates(
     reports: list[dict[str, Any]] = []
     for strategy in config["strategies"]:
         strategy_id = str(strategy["id"])
+        low_cost = simulator(
+            **common,
+            strategy_id=strategy_id,
+            all_in_round_trip_bps=float(costs["scenarios"]["low_total_bps"]),
+            additional_execution_delay_days=0,
+        )
         baseline = simulator(
             **common,
             strategy_id=strategy_id,
@@ -372,11 +402,13 @@ def evaluate_strategy_candidates(
             for quarter in config["rolling_validation"]["test_quarters"]
         ]
         regime_metrics = _regime_metrics(baseline["daily"], regimes)
+        board_attribution = _board_attribution(baseline["daily"])
         acceptance = evaluate_development_acceptance(
             quarter_metrics=quarter_metrics,
             aggregate_annual_excess_return=float(
                 baseline["metrics"]["annual_excess_return"]
             ),
+            aggregate_max_drawdown=float(baseline["metrics"]["max_drawdown"]),
             window_rank_correlations=rank_correlations,
             top50_overlaps=topk_overlaps,
             stress_excess_return=float(stress["metrics"]["annual_excess_return"]),
@@ -386,11 +418,13 @@ def evaluate_strategy_candidates(
         reports.append(
             {
                 "strategy_id": strategy_id,
+                "low_cost": low_cost,
                 "baseline": baseline,
                 "stress": stress,
                 "delayed": delayed,
                 "quarter_metrics": quarter_metrics,
                 "regime_metrics": regime_metrics,
+                "board_attribution": board_attribution,
                 "acceptance": acceptance,
             }
         )

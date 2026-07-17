@@ -148,6 +148,72 @@ def test_prepare_runtime_provider_is_content_addressed_and_reusable(
     assert third["provider_uri"] != first["provider_uri"]
 
 
+def test_reuse_check_rejects_modified_feature_even_after_restoring_read_only_mode(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    canonical = tmp_path / "canonical"
+    (canonical / "calendars").mkdir(parents=True)
+    (canonical / "features").mkdir()
+    (canonical / "features" / "sample.bin").write_bytes(b"original")
+    (canonical / "calendars" / "day.txt").write_text(
+        "2023-01-02\n2023-01-03\n", encoding="utf-8"
+    )
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    manifest = write_manifest(tmp_path)
+    result = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=manifest,
+    )
+    provider = Path(result["provider_uri"])
+    feature = provider / "features" / "sample.bin"
+    feature.chmod(0o644)
+    feature.write_bytes(b"tampered")
+    feature.chmod(0o444)
+
+    assert module._snapshot_is_reusable(provider, result["provider_key"]) is False
+
+
+def test_reuse_check_rejects_group_or_other_writable_snapshot(tmp_path: Path) -> None:
+    module = load_module()
+    canonical = tmp_path / "canonical"
+    (canonical / "calendars").mkdir(parents=True)
+    (canonical / "features").mkdir()
+    (canonical / "features" / "sample.bin").write_bytes(b"original")
+    (canonical / "calendars" / "day.txt").write_text(
+        "2023-01-02\n2023-01-03\n", encoding="utf-8"
+    )
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    manifest = write_manifest(tmp_path)
+    result = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=manifest,
+    )
+    provider = Path(result["provider_uri"])
+    feature = provider / "features" / "sample.bin"
+    feature.chmod(0o464)
+
+    assert module._snapshot_is_reusable(provider, result["provider_key"]) is False
+
+
 def test_main_can_write_status_to_reports_without_moving_provider_data(
     tmp_path: Path,
 ) -> None:

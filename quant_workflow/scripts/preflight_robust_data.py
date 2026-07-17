@@ -20,6 +20,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import qlib_provider_uri, quant_data_root, reports_root  # noqa: E402
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
 
 
 QUANT_DATA = quant_data_root()
@@ -394,6 +402,118 @@ def run_preflight(
         raise ValueError("coverage thresholds must be in (0, 1]")
 
     checks: list[dict[str, Any]] = []
+    pit_dir = Path(pit_dir)
+    reference_dir = Path(reference_dir)
+    try:
+        with membership_read_lock(pit_dir) as membership_snapshot:
+            membership_snapshot.ensure_transaction_clean()
+            membership_source = membership_snapshot.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+            )
+            membership_snapshot_hash = membership_snapshot.fingerprint()
+            with reference_read_lock(reference_dir) as reference_precheck:
+                reference_precheck.ensure_transaction_clean()
+                reference_precheck.validate_source(
+                    start_date=str(start.date()),
+                    end_date=str(end.date()),
+                    expected_membership_snapshot_hash=membership_snapshot_hash,
+                )
+            membership, membership_error = _read_membership(pit_dir)
+    except MembershipIntegrityError as exc:
+        check_id = (
+            "membership_provenance"
+            if exc.reason_code.startswith("membership_source_")
+            else "membership_snapshot_integrity"
+        )
+        checks.append(
+            _check(
+                check_id,
+                False,
+                "membership snapshot is unavailable or unverified",
+                reason_code=exc.reason_code,
+            )
+        )
+        return {
+            "status": "blocked_data",
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "range": {
+                "start_date": str(start.date()),
+                "end_date": str(end.date()),
+                "as_of_date": str(as_of.date()),
+            },
+            "inputs": {
+                "pit_dir": str(pit_dir.resolve()),
+                "price_dir": str(Path(price_dir).resolve()),
+                "provider_dir": str(Path(provider_dir).resolve()),
+                "reference_dir": str(Path(reference_dir).resolve()),
+            },
+            "membership_source": {},
+            "membership_snapshot_hash": None,
+            "reference_source": {},
+            "reference_snapshot_hash": None,
+            "summary": {
+                "trading_days": 0,
+                "membership_coverage": 0.0,
+                "ohlcv_coverage": 0.0,
+                "failed_checks": [check_id],
+            },
+            "checks": checks,
+        }
+    except ReferenceIntegrityError as exc:
+        check_id = (
+            "reference_transaction_clean"
+            if exc.reason_code == "reference_transaction_incomplete"
+            else "reference_provenance"
+        )
+        checks.append(
+            _check(
+                check_id,
+                False,
+                "reference snapshot is unavailable or unverified",
+                reason_code=exc.reason_code,
+            )
+        )
+        return {
+            "status": "blocked_data",
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "range": {
+                "start_date": str(start.date()),
+                "end_date": str(end.date()),
+                "as_of_date": str(as_of.date()),
+            },
+            "inputs": {
+                "pit_dir": str(pit_dir.resolve()),
+                "price_dir": str(Path(price_dir).resolve()),
+                "provider_dir": str(Path(provider_dir).resolve()),
+                "reference_dir": str(reference_dir.resolve()),
+            },
+            "membership_source": membership_source,
+            "membership_snapshot_hash": None,
+            "reference_source": {},
+            "reference_snapshot_hash": None,
+            "summary": {
+                "trading_days": 0,
+                "membership_coverage": 0.0,
+                "ohlcv_coverage": 0.0,
+                "failed_checks": [check_id],
+            },
+            "checks": checks,
+        }
+    checks.append(
+        _check(
+            "membership_snapshot_integrity",
+            True,
+            "membership snapshot lock, journal, and files are verified",
+        )
+    )
+    checks.append(
+        _check(
+            "reference_transaction_clean",
+            True,
+            "no incomplete reference publication transaction",
+        )
+    )
     calendar, calendar_error = _read_calendar(Path(provider_dir), start, end)
     checks.append(
         _check(
@@ -403,7 +523,6 @@ def run_preflight(
         )
     )
 
-    membership, membership_error = _read_membership(Path(pit_dir))
     checks.append(
         _check(
             "pit_membership_files",
@@ -411,17 +530,12 @@ def run_preflight(
             membership_error or "PIT membership files are readable",
         )
     )
-    provenance_ok, provenance_details, membership_source = (
-        _membership_source_provenance(Path(pit_dir), start, end)
-    )
     checks.append(
         _check(
             "membership_provenance",
-            provenance_ok,
-            "historical membership source and range are verified"
-            if provenance_ok
-            else "historical membership source is missing, invalid, or incomplete",
-            **provenance_details,
+            True,
+            "historical membership source and range are verified",
+            reason_code=None,
         )
     )
 
@@ -530,9 +644,36 @@ def run_preflight(
         ["date", "symbol"]
     ]
     joined = expected_membership.merge(prices, on=["date", "symbol"], how="left")
-    valid_ohlcv_rows = (
-        int(joined["valid_ohlcv"].eq(True).sum()) if not joined.empty else 0
-    )
+    try:
+        with reference_read_lock(reference_dir) as coverage_reference:
+            coverage_reference.ensure_transaction_clean()
+            coverage_reference.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+                expected_membership_snapshot_hash=membership_snapshot_hash,
+            )
+            suspension_coverage = pd.read_parquet(
+                reference_dir / "suspension_status.parquet",
+                columns=["date", "symbol", "is_suspended"],
+            )
+        suspension_coverage["date"] = pd.to_datetime(
+            suspension_coverage["date"], errors="coerce"
+        ).dt.normalize()
+        suspension_coverage["symbol"] = (
+            suspension_coverage["symbol"].astype(str).str.upper()
+        )
+        joined = joined.merge(
+            suspension_coverage,
+            on=["date", "symbol"],
+            how="left",
+            validate="one_to_one",
+        )
+        covered_rows = joined["valid_ohlcv"].eq(True) | joined[
+            "is_suspended"
+        ].eq(True)
+    except (OSError, ValueError, ReferenceIntegrityError):
+        covered_rows = joined["valid_ohlcv"].eq(True)
+    valid_ohlcv_rows = int(covered_rows.sum()) if not joined.empty else 0
     expected_member_days = len(expected_dates) * expected_members_per_day
     ohlcv_coverage = _ratio(valid_ohlcv_rows, expected_member_days)
     checks.append(
@@ -559,7 +700,56 @@ def run_preflight(
         )
     )
 
-    metadata_ok, metadata_details = _metadata_check(Path(reference_dir), selected)
+    reference_source: dict[str, Any] = {}
+    reference_snapshot_hash: str | None = None
+    provenance_error: str | None = None
+    metadata_ok = False
+    metadata_details: dict[str, Any] = {
+        "missing_files": [],
+        "invalid_tables": [],
+        "member_symbol_gaps": {},
+        "member_day_gaps": {},
+    }
+    try:
+        with reference_read_lock(reference_dir) as reference_snapshot:
+            reference_snapshot.ensure_transaction_clean()
+            reference_source = reference_snapshot.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+                expected_membership_snapshot_hash=membership_snapshot_hash,
+            )
+            metadata_ok, metadata_details = _metadata_check(reference_dir, selected)
+            try:
+                reference_snapshot_hash = reference_snapshot.fingerprint()
+            except ReferenceIntegrityError as exc:
+                if exc.reason_code != "reference_snapshot_invalid":
+                    raise
+                metadata_ok = False
+                metadata_details["reason_code"] = exc.reason_code
+    except ReferenceIntegrityError as exc:
+        provenance_error = exc.reason_code
+        reference_source = {}
+        reference_snapshot_hash = None
+        metadata_details["reason_code"] = exc.reason_code
+        if exc.reason_code == "reference_transaction_incomplete":
+            transaction_check = next(
+                item for item in checks if item["id"] == "reference_transaction_clean"
+            )
+            transaction_check["passed"] = False
+            transaction_check["message"] = (
+                "reference publication transaction is incomplete"
+            )
+            transaction_check["details"]["reason_code"] = exc.reason_code
+    checks.append(
+        _check(
+            "reference_provenance",
+            provenance_error is None,
+            "reference source and requested range are verified"
+            if provenance_error is None
+            else "reference source is missing, invalid, or incomplete",
+            reason_code=provenance_error,
+        )
+    )
     checks.append(
         _check(
             "reference_metadata",
@@ -568,6 +758,46 @@ def run_preflight(
             if metadata_ok
             else "required reference metadata is missing or incomplete",
             **metadata_details,
+        )
+    )
+
+    stability_reason: str | None = None
+    try:
+        with membership_read_lock(pit_dir) as final_membership:
+            final_membership.ensure_transaction_clean()
+            final_membership.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+            )
+            final_membership_hash = final_membership.fingerprint()
+            with reference_read_lock(reference_dir) as final_reference:
+                final_reference.ensure_transaction_clean()
+                if final_membership_hash != membership_snapshot_hash:
+                    raise MembershipIntegrityError(
+                        "membership_snapshot_changed",
+                        "membership snapshot changed during preflight",
+                    )
+                final_reference.validate_source(
+                    start_date=str(start.date()),
+                    end_date=str(end.date()),
+                    expected_membership_snapshot_hash=final_membership_hash,
+                )
+                final_reference_hash = final_reference.fingerprint()
+                if final_reference_hash != reference_snapshot_hash:
+                    raise ReferenceIntegrityError(
+                        "reference_snapshot_changed",
+                        "reference snapshot changed during preflight",
+                    )
+    except (MembershipIntegrityError, ReferenceIntegrityError) as exc:
+        stability_reason = exc.reason_code
+    checks.append(
+        _check(
+            "snapshot_stability",
+            stability_reason is None,
+            "membership and reference snapshots remained stable through preflight"
+            if stability_reason is None
+            else "membership or reference snapshot changed during preflight",
+            reason_code=stability_reason,
         )
     )
 
@@ -589,6 +819,9 @@ def run_preflight(
             "reference_dir": str(Path(reference_dir).resolve()),
         },
         "membership_source": membership_source,
+        "membership_snapshot_hash": membership_snapshot_hash,
+        "reference_source": reference_source,
+        "reference_snapshot_hash": reference_snapshot_hash,
         "summary": {
             "trading_days": len(expected_dates),
             "membership_coverage": membership_coverage,

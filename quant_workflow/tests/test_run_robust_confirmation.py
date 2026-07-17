@@ -26,13 +26,63 @@ def load_module():
     return module
 
 
+def seal_provider(provider: Path, key: str = "provider-v1") -> str:
+    from prepare_robust_provider import (
+        PROVIDER_CONTENT_FILENAME,
+        PROVIDER_CONTENT_VERSION,
+        PROVIDER_FORMAT_VERSION,
+        PROVIDER_METADATA_FILENAME,
+        _content_entries,
+        _content_tree_sha256,
+        _make_tree_read_only,
+        file_sha256,
+    )
+
+    (provider / "features").mkdir(parents=True, exist_ok=True)
+    (provider / "instruments").mkdir(parents=True, exist_ok=True)
+    (provider / "instruments" / "csi800.txt").write_text("", encoding="utf-8")
+    entries = _content_entries(provider)
+    tree_hash = _content_tree_sha256(entries)
+    content_path = provider / PROVIDER_CONTENT_FILENAME
+    content_path.write_text(
+        json.dumps(
+            {
+                "version": PROVIDER_CONTENT_VERSION,
+                "provider_key": key,
+                "tree_sha256": tree_hash,
+                "files": entries,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (provider / PROVIDER_METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "format_version": PROVIDER_FORMAT_VERSION,
+                "provider_key": key,
+                "provider_tree_sha256": tree_hash,
+                "content_manifest_sha256": file_sha256(content_path),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    _make_tree_read_only(provider)
+    return tree_hash
+
+
 def frozen_fixture(module, root: Path) -> tuple[Path, Path, Path]:
+    from _robust_membership_integrity import membership_read_lock
+    from _robust_reference_integrity import reference_read_lock
+
     provider = root / "provider"
     (provider / "calendars").mkdir(parents=True)
     calendar = pd.bdate_range("2018-01-01", "2026-07-15")
     (provider / "calendars" / "day.txt").write_text(
         "\n".join(str(day.date()) for day in calendar) + "\n", encoding="utf-8"
     )
+    provider_tree_sha256 = seal_provider(provider)
     config = module.load_config(CONFIG_PATH)
     selected = ["linear_ridge", "lightgbm"]
     model_map = {item["id"]: item for item in config["models"]}
@@ -57,20 +107,126 @@ def frozen_fixture(module, root: Path) -> tuple[Path, Path, Path]:
     quant_data.mkdir()
     manifest = quant_data / "DATA_MANIFEST.json"
     manifest.write_text('{"version": 1}\n', encoding="utf-8")
+    pit_dir = quant_data / "reference" / "pit_csi800"
+    (pit_dir / "daily").mkdir(parents=True)
+    (pit_dir / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": "2014-01-02",
+                    "end_date": "2026-07-15",
+                },
+                "indices": {
+                    "csi300": "000300.XSHG",
+                    "csi500": "000905.XSHG",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (pit_dir / "membership_intervals.parquet").write_bytes(b"membership intervals")
+    (pit_dir / "daily" / "2026.parquet").write_bytes(b"membership daily")
+    with membership_read_lock(pit_dir) as membership_snapshot:
+        membership_snapshot_hash = membership_snapshot.fingerprint()
+
+    reference = quant_data / "reference"
+    (reference / "REFERENCE_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": "2014-01-02",
+                    "end_date": "2026-07-15",
+                },
+                "industry_classification": "CSRC",
+                "membership_snapshot_hash": membership_snapshot_hash,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for file_name in (
+        "security_master.parquet",
+        "industry_intervals.parquet",
+        "st_status.parquet",
+        "suspension_status.parquet",
+    ):
+        (reference / file_name).write_bytes(file_name.encode("ascii"))
+    with reference_read_lock(reference) as reference_snapshot:
+        reference_snapshot_hash = reference_snapshot.fingerprint()
+    development_run_dir = root / "development"
+    (development_run_dir / "models").mkdir(parents=True)
+    (development_run_dir / "predictions").mkdir(parents=True)
+    development_context_hash = "d" * 64
+    development_artifacts = []
+    for job in module.build_training_jobs(config):
+        if job.model_id not in selected:
+            continue
+        split = module.make_job_split(
+            calendar,
+            job.quarter,
+            window_days=job.window_days,
+            validation_days=int(config["rolling_validation"]["validation_days"]),
+            label_horizon_days=5,
+        )
+        model_path = development_run_dir / "models" / f"{job.key}.pkl"
+        prediction_path = development_run_dir / "predictions" / f"{job.key}.parquet"
+        model_path.write_bytes(
+            pickle.dumps({"model_id": job.model_id, "seed": job.seed})
+        )
+        pd.DataFrame(
+            {
+                "datetime": [split.test_start],
+                "instrument": ["SH600000"],
+                "score": [1.0],
+                "label": [0.01],
+            }
+        ).to_parquet(prediction_path, index=False)
+        development_artifacts.append(
+            {
+                "status": "completed",
+                "job_key": job.key,
+                "model_id": job.model_id,
+                "window_days": job.window_days,
+                "quarter": job.quarter,
+                "seed": job.seed,
+                "model_path": str(model_path.resolve()),
+                "model_sha256": module.file_sha256(model_path),
+                "prediction_path": str(prediction_path.resolve()),
+                "prediction_sha256": module.file_sha256(prediction_path),
+                "rows": 1,
+                "split": module._split_record(split),
+                "context_hash": development_context_hash,
+            }
+        )
     frozen = {
         "status": "research_candidate_ready",
+        "as_of_date": "2026-07-15",
         "config_hash": module.file_sha256(CONFIG_PATH),
         "git_commit": "a" * 40,
         "data_manifest_hash": module.file_sha256(manifest),
         "provider_uri": str(provider),
         "provider_key": "provider-v1",
+        "provider_tree_sha256": provider_tree_sha256,
+        "membership_snapshot_hash": membership_snapshot_hash,
+        "reference_snapshot_hash": reference_snapshot_hash,
         "selected_models": selected,
         "selected_model_configs": selection_contract["selected_model_configs"],
         "selected_strategy": "full_risk_control",
         "selection_hash": selection_hash,
+        "development_run_id": "development-one",
+        "development_run_dir": str(development_run_dir.resolve()),
+        "development_context_hash": development_context_hash,
+        "development_artifacts": development_artifacts,
+        "development_artifacts_hash": module.payload_sha256(development_artifacts),
         "confirmation_run_started": False,
         "shadow_tracking_started": False,
     }
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
     frozen_path = root / "frozen.json"
     frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
     provider_state = root / "provider_state.json"
@@ -389,6 +545,166 @@ def test_passing_confirmation_enters_shadow_without_changing_selection(
     assert "confirmation_model_artifacts" not in latest
 
 
+def test_confirmation_publishes_final_result_under_snapshot_and_claim_locks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    report_dir = tmp_path / "reports"
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2026-01-05"]), ["A", "B", "C"]],
+        names=["datetime", "instrument"],
+    )
+    prediction = pd.DataFrame(
+        {"score": [3.0, 2.0, 1.0], "label": [0.03, 0.02, 0.01]}, index=index
+    )
+    active = {"membership": 0, "reference": 0, "claim": 0}
+    observed_publications: list[tuple[int, int, int]] = []
+    original_membership_lock = module.membership_read_lock
+    original_reference_lock = module.reference_read_lock
+    original_claim_lock = module._claim_lock
+    original_write_json = module._write_json
+
+    @contextmanager
+    def tracking_membership_lock(path):
+        with original_membership_lock(path) as snapshot:
+            active["membership"] += 1
+            try:
+                yield snapshot
+            finally:
+                active["membership"] -= 1
+
+    @contextmanager
+    def tracking_reference_lock(path):
+        with original_reference_lock(path) as snapshot:
+            active["reference"] += 1
+            try:
+                yield snapshot
+            finally:
+                active["reference"] -= 1
+
+    @contextmanager
+    def tracking_claim_lock(path):
+        with original_claim_lock(path):
+            active["claim"] += 1
+            try:
+                yield
+            finally:
+                active["claim"] -= 1
+
+    def tracking_write_json(path, payload):
+        is_final_report = payload.get("status") == "shadow_observation"
+        is_final_frozen = (
+            Path(path) == frozen_path
+            and payload.get("confirmation_status") == "shadow_observation"
+        )
+        if is_final_report or is_final_frozen:
+            observed_publications.append(
+                (active["membership"], active["reference"], active["claim"])
+            )
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(module, "membership_read_lock", tracking_membership_lock)
+    monkeypatch.setattr(module, "reference_read_lock", tracking_reference_lock)
+    monkeypatch.setattr(module, "_claim_lock", tracking_claim_lock)
+    monkeypatch.setattr(module, "_write_json", tracking_write_json)
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=report_dir,
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-lock-publication",
+        training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
+            module, jobs, tmp_path / "artifacts"
+        ),
+        aggregator=lambda records, topk: {
+            "model_reports": [],
+            "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
+            "window_predictions": {},
+        },
+        market_loader=lambda **kwargs: pd.DataFrame({"date": []}),
+        benchmark_loader=lambda *args, **kwargs: pd.DataFrame({"date": [], "open": []}),
+        regime_builder=lambda panel: pd.Series(dtype="object"),
+        strategy_runner=lambda **kwargs: {
+            "strategy_id": kwargs["strategy_id"],
+            "daily": pd.DataFrame(),
+            "metrics": {
+                "annual_excess_return": 0.02,
+                "information_ratio": 0.3,
+                "max_drawdown": -0.10,
+            },
+        },
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["status"] == "shadow_observation"
+    assert observed_publications
+    assert all(depths == (1, 1, 1) for depths in observed_publications)
+
+
+def test_confirmation_rechecks_membership_snapshot_before_publishing_shadow(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2026-01-05"]), ["A", "B", "C"]],
+        names=["datetime", "instrument"],
+    )
+    prediction = pd.DataFrame(
+        {"score": [3.0, 2.0, 1.0], "label": [0.03, 0.02, 0.01]}, index=index
+    )
+
+    def mutate_membership_and_simulate(**kwargs):
+        daily = (
+            tmp_path
+            / "quant_data"
+            / "reference"
+            / "pit_csi800"
+            / "daily"
+            / "2026.parquet"
+        )
+        daily.write_bytes(daily.read_bytes() + b"changed-during-confirmation")
+        return {
+            "strategy_id": kwargs["strategy_id"],
+            "daily": pd.DataFrame(),
+            "metrics": {
+                "annual_excess_return": 0.02,
+                "information_ratio": 0.3,
+                "max_drawdown": -0.10,
+            },
+        }
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-membership-recheck",
+        training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
+            module, jobs, tmp_path / "artifacts"
+        ),
+        aggregator=lambda records, topk: {
+            "model_reports": [],
+            "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
+            "window_predictions": {},
+        },
+        market_loader=lambda **kwargs: pd.DataFrame({"date": []}),
+        benchmark_loader=lambda *args, **kwargs: pd.DataFrame({"date": [], "open": []}),
+        regime_builder=lambda panel: pd.Series(dtype="object"),
+        strategy_runner=mutate_membership_and_simulate,
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "reproducibility_state_changed_during_confirmation"
+    assert "membership_snapshot_hash" in result["reproducibility_failures"]
+    assert frozen["shadow_tracking_started"] is False
+
+
 def test_confirmation_rejects_completed_jobs_with_missing_model_or_invalid_split(
     tmp_path: Path,
 ) -> None:
@@ -563,6 +879,7 @@ def test_confirmation_refuses_modified_frozen_selection_contract(
     frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     frozen["selected_strategy"] = "weekly_top50"
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
     frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
 
     result = module.run_confirmation(
@@ -741,6 +1058,101 @@ def test_confirmation_refuses_provider_identity_change_before_claim(
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     assert result["reason_code"] == "frozen_provider_mismatch"
     assert frozen["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_changed_membership_snapshot_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    daily = (
+        tmp_path / "quant_data" / "reference" / "pit_csi800" / "daily" / "2026.parquet"
+    )
+    daily.write_bytes(daily.read_bytes() + b"changed")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-membership-changed",
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_membership_snapshot_mismatch"
+    assert frozen["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_changed_reference_snapshot_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    security = tmp_path / "quant_data" / "reference" / "security_master.parquet"
+    security.write_bytes(security.read_bytes() + b"changed")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-reference-changed",
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_reference_snapshot_mismatch"
+    assert frozen["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_tampered_frozen_context_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    frozen["development_run_id"] = "substituted-run"
+    frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-frozen-context-tampered",
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_context_mismatch"
+    assert frozen_after["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_tampered_development_artifact_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    Path(frozen["development_artifacts"][0]["model_path"]).write_bytes(b"tampered")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-development-artifact-tampered",
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_development_artifacts_mismatch"
+    assert frozen_after["confirmation_run_started"] is False
 
 
 def test_confirmation_recomputes_selection_hash_before_publishing(

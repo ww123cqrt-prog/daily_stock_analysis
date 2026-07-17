@@ -269,7 +269,7 @@ def test_strategy_candidates_run_baseline_stress_delay_and_choose_only_passing_d
         simulator=simulator,
     )
 
-    assert len(calls) == 15
+    assert len(calls) == 20
     assert len(result["strategies"]) == 5
     assert result["status"] == "research_candidate_ready"
     assert result["selected_strategy"]["acceptance"]["passed"] is True
@@ -277,3 +277,54 @@ def test_strategy_candidates_run_baseline_stress_delay_and_choose_only_passing_d
         item["stress"]["metrics"]["annual_excess_return"] > 0
         for item in result["strategies"]
     )
+    assert all("low_cost" in item for item in result["strategies"])
+    assert all(
+        set(item["board_attribution"]) == {"main", "growth", "star"}
+        for item in result["strategies"]
+    )
+
+
+def test_regime_attribution_uses_previous_close_regime_for_next_open_return() -> None:
+    module = load_module()
+    dates = pd.bdate_range("2025-01-02", periods=4)
+    daily = pd.DataFrame(
+        {
+            "date": dates,
+            "portfolio_return": [0.0, 0.01, 0.02, 0.03],
+            "benchmark_return": [0.0] * 4,
+            "transaction_cost": [0.0] * 4,
+            "turnover": [0.0] * 4,
+        }
+    )
+    regimes = pd.Series(
+        ["risk_on", "neutral", "defensive", "risk_off"], index=dates
+    )
+
+    result = module._regime_metrics(daily, regimes)
+
+    assert result["risk_on"]["days"] == 1
+    assert result["risk_on"]["annual_return"] > 0
+    assert result["neutral"]["days"] == 1
+    assert result["defensive"]["days"] == 1
+    assert result["risk_off"]["days"] == 0
+
+
+def test_board_attribution_reports_average_and_peak_exposure() -> None:
+    module = load_module()
+    daily = pd.DataFrame(
+        {
+            "board_exposure_main": [0.5, 0.4],
+            "board_exposure_growth": [0.2, 0.3],
+            "board_exposure_star": [0.1, 0.0],
+        }
+    )
+
+    result = module._board_attribution(daily)
+
+    assert result["main"] == {
+        "average_exposure": 0.45,
+        "max_exposure": 0.5,
+        "days": 2,
+    }
+    assert result["growth"]["max_exposure"] == 0.3
+    assert result["star"]["average_exposure"] == 0.05

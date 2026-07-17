@@ -15,6 +15,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from report_market_regime import classify_regime  # noqa: E402
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
 
 
 def _symbol_file(price_dir: Path, symbol: str) -> Path | None:
@@ -125,18 +133,48 @@ def load_market_panel(
     reference_dir: Path,
     start_date: str,
     end_date: str,
+    ohlcv_coverage_min: float = 0.98,
 ) -> pd.DataFrame:
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize()
     if start > end:
         raise ValueError("start_date must not be after end_date")
-    members = _read_membership(Path(pit_dir), start, end)
+    if not 0 < float(ohlcv_coverage_min) <= 1:
+        raise ValueError("ohlcv_coverage_min must be in (0, 1]")
+    pit_dir = Path(pit_dir)
+    with membership_read_lock(pit_dir) as membership_snapshot:
+        membership_snapshot.ensure_transaction_clean()
+        membership_source_metadata = membership_snapshot.validate_source(
+            start_date=str(start.date()),
+            end_date=str(end.date()),
+        )
+        membership_snapshot_hash = membership_snapshot.fingerprint()
+        reference_dir = Path(reference_dir)
+        with reference_read_lock(reference_dir) as reference_precheck:
+            reference_precheck.ensure_transaction_clean()
+            reference_precheck.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+                expected_membership_snapshot_hash=membership_snapshot_hash,
+            )
+        members = _read_membership(pit_dir, start, end)
     prices = _read_prices(Path(price_dir), set(members["symbol"]))
+    with reference_read_lock(reference_dir) as reference_snapshot:
+        reference_snapshot.ensure_transaction_clean()
+        reference_source_metadata = reference_snapshot.validate_source(
+            start_date=str(start.date()),
+            end_date=str(end.date()),
+            expected_membership_snapshot_hash=membership_snapshot_hash,
+        )
+        security = pd.read_parquet(reference_dir / "security_master.parquet")
+        industries = pd.read_parquet(reference_dir / "industry_intervals.parquet")
+        st = pd.read_parquet(reference_dir / "st_status.parquet")
+        suspension = pd.read_parquet(reference_dir / "suspension_status.parquet")
+        reference_snapshot_hash = reference_snapshot.fingerprint()
+
     panel = members.merge(
         prices, on=["date", "symbol"], how="left", validate="one_to_one"
     )
-
-    security = pd.read_parquet(Path(reference_dir) / "security_master.parquet")
     security["symbol"] = security["symbol"].astype(str).str.upper()
     if security.duplicated("symbol").any():
         raise ValueError("security master contains duplicate symbols")
@@ -146,11 +184,8 @@ def load_market_panel(
         how="left",
         validate="many_to_one",
     )
-    industries = pd.read_parquet(Path(reference_dir) / "industry_intervals.parquet")
     panel["industry"] = _industry_for_members(panel, industries)
 
-    st = pd.read_parquet(Path(reference_dir) / "st_status.parquet")
-    suspension = pd.read_parquet(Path(reference_dir) / "suspension_status.parquet")
     for frame in (st, suspension):
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
         frame["symbol"] = frame["symbol"].astype(str).str.upper()
@@ -170,23 +205,60 @@ def load_market_panel(
     ).rename(columns={"is_suspended": "suspended"})
     panel["is_st"] = panel["is_st"].astype("boolean")
     panel["suspended"] = panel["suspended"].astype("boolean")
-    required = [
-        "open",
-        "close",
-        "previous_close",
-        "board",
-        "industry",
-        "is_st",
-        "suspended",
-    ]
-    if panel[required].isna().any(axis=None):
+    metadata_required = ["board", "industry", "is_st", "suspended"]
+    if panel[metadata_required].isna().any(axis=None):
         missing = {
             column: int(panel[column].isna().sum())
-            for column in required
+            for column in metadata_required
             if panel[column].isna().any()
         }
-        raise ValueError(f"market panel metadata or prices are incomplete: {missing}")
-    return panel.sort_values(["date", "symbol"]).reset_index(drop=True)
+        raise ValueError(f"market panel metadata is incomplete: {missing}")
+    price_columns = ["open", "close", "previous_close"]
+    panel["price_available"] = panel[price_columns].notna().all(axis=1)
+    covered = panel["price_available"] | panel["suspended"].astype(bool)
+    price_coverage = float(covered.mean()) if len(panel) else 0.0
+    if price_coverage < float(ohlcv_coverage_min):
+        missing = {
+            column: int(panel.loc[~covered, column].isna().sum())
+            for column in price_columns
+            if panel.loc[~covered, column].isna().any()
+        }
+        raise ValueError(
+            "market panel price coverage is below the configured gate: "
+            f"{price_coverage:.4f} < {float(ohlcv_coverage_min):.4f}; {missing}"
+        )
+    with membership_read_lock(pit_dir) as final_membership:
+        final_membership.ensure_transaction_clean()
+        final_membership.validate_source(
+            start_date=str(start.date()),
+            end_date=str(end.date()),
+        )
+        final_membership_hash = final_membership.fingerprint()
+        with reference_read_lock(reference_dir) as final_reference:
+            final_reference.ensure_transaction_clean()
+            if final_membership_hash != membership_snapshot_hash:
+                raise MembershipIntegrityError(
+                    "membership_snapshot_changed",
+                    "membership snapshot changed while loading market panel",
+                )
+            final_reference.validate_source(
+                start_date=str(start.date()),
+                end_date=str(end.date()),
+                expected_membership_snapshot_hash=final_membership_hash,
+            )
+            final_reference_hash = final_reference.fingerprint()
+            if final_reference_hash != reference_snapshot_hash:
+                raise ReferenceIntegrityError(
+                    "reference_snapshot_changed",
+                    "reference snapshot changed while loading market panel",
+                )
+    result = panel.sort_values(["date", "symbol"]).reset_index(drop=True)
+    result.attrs["reference_source_metadata"] = reference_source_metadata
+    result.attrs["reference_snapshot_hash"] = reference_snapshot_hash
+    result.attrs["membership_source_metadata"] = membership_source_metadata
+    result.attrs["membership_snapshot_hash"] = membership_snapshot_hash
+    result.attrs["ohlcv_coverage"] = price_coverage
+    return result
 
 
 def read_qlib_feature(provider: Path, symbol: str, field: str) -> pd.Series:

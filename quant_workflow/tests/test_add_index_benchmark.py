@@ -18,6 +18,67 @@ def load_module():
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
+    def test_download_rejects_baostock_error_code(self):
+        module = load_module()
+
+        class ErrorResult:
+            error_code = "10002007"
+            error_msg = "network error"
+
+            def next(self):
+                return False
+
+        class FakeBaostock:
+            def query_history_k_data_plus(self, *args, **kwargs):
+                return ErrorResult()
+
+        with self.assertRaisesRegex(RuntimeError, "baostock benchmark query failed"):
+            module._download_index_data(
+                FakeBaostock(), "sh.000300", "2026-01-02", "2026-01-05"
+            )
+
+    def test_missing_required_trading_day_is_not_forward_or_back_filled(self):
+        module = load_module()
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+
+            def __init__(self):
+                self.done = False
+
+            def next(self):
+                if self.done:
+                    return False
+                self.done = True
+                return True
+
+            def get_row_data(self):
+                return ["2026-01-05", "10", "11", "9", "10.5", "1000"]
+
+        class FakeBaostock:
+            def login(self):
+                return type("Login", (), {"error_code": "0", "error_msg": ""})()
+
+            def logout(self):
+                return None
+
+            def query_history_k_data_plus(self, *args, **kwargs):
+                return Result()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "provider"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text(
+                "2026-01-02\n2026-01-05\n2026-01-06\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "missing required trading days"):
+                module.add_benchmark(provider, baostock_module=FakeBaostock())
+
+            self.assertFalse((provider / "features" / "sh000300").exists())
+
     def test_dry_run_does_not_write_or_call_baostock(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

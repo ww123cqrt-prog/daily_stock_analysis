@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "robust_backtest.py"
@@ -92,10 +93,14 @@ def test_backtest_buys_at_next_open_and_only_earns_later_open_to_open_move() -> 
     after_move = pd.Timestamp("2025-01-14")
     assert daily.loc[daily["date"] < execution_day, "portfolio_return"].eq(0.0).all()
     assert daily.loc[daily["date"] == execution_day, "trade_count"].iloc[0] == 1
-    assert daily.loc[daily["date"] == after_move, "portfolio_return"].iloc[0] > 0.15
+    assert daily.loc[daily["date"] == after_move, "portfolio_return"].iloc[0] > 0.005
+    assert (
+        daily.loc[daily["date"] == execution_day, "gross_position"].iloc[0]
+        <= 0.03 + 1e-12
+    )
 
 
-def test_limit_up_open_blocks_buy_and_keeps_cash() -> None:
+def test_limit_up_open_defers_buy_until_next_tradable_open() -> None:
     module = load_module()
     market, benchmark, predictions = market_fixture(limit_up_on_execution=True)
 
@@ -112,8 +117,14 @@ def test_limit_up_open_blocks_buy_and_keeps_cash() -> None:
         slippage_bps=0.0,
     )
 
-    assert result["daily"]["trade_count"].sum() == 0
-    assert result["daily"]["portfolio_value"].eq(100000.0).all()
+    daily = result["daily"]
+    blocked_day = pd.Timestamp("2025-01-13")
+    retry_day = pd.Timestamp("2025-01-14")
+    assert daily.loc[daily["date"] == blocked_day, "trade_count"].iloc[0] == 0
+    assert daily.loc[daily["date"] == blocked_day, "pending_order_count"].iloc[0] == 1
+    assert daily.loc[daily["date"] == retry_day, "trade_count"].iloc[0] == 1
+    assert daily.loc[daily["date"] == retry_day, "pending_order_count"].iloc[0] == 0
+    assert daily["trade_count"].sum() == 1
 
 
 def test_flat_market_loses_exactly_recorded_transaction_costs() -> None:
@@ -191,6 +202,48 @@ def test_full_risk_control_applies_regime_and_sector_caps() -> None:
     assert target["weight"].sum() <= 0.5 + 1e-12
     assert target["weight"].max() <= 0.03 + 1e-12
     assert target.groupby("industry")["weight"].sum().max() <= 0.25 + 1e-12
+
+
+@pytest.mark.parametrize(
+    "strategy_id",
+    [
+        "weekly_top50",
+        "low_turnover",
+        "regime_scaled",
+        "sector_constrained",
+        "full_risk_control",
+    ],
+)
+def test_every_candidate_strategy_obeys_portfolio_caps(strategy_id: str) -> None:
+    module = load_module()
+    candidates = pd.DataFrame(
+        {
+            "symbol": [f"SZ300{i:03d}" for i in range(20)]
+            + [f"SH600{i:03d}" for i in range(20)],
+            "score": list(range(40, 0, -1)),
+            "industry": ["tech"] * 25 + ["other"] * 15,
+            "board": ["growth"] * 20 + ["main"] * 20,
+            "tradable": [True] * 40,
+        }
+    )
+
+    target = module.build_strategy_target(
+        candidates,
+        strategy_id=strategy_id,
+        current_symbols=set(),
+        topk=40,
+        target_position=0.9,
+        single_stock_max=0.03,
+        industry_max=0.25,
+        growth_star_max=0.30,
+    )
+
+    assert target["weight"].max() <= 0.03 + 1e-12
+    assert target.groupby("industry")["weight"].sum().max() <= 0.25 + 1e-12
+    assert (
+        target.loc[target["board"].isin(["growth", "star"]), "weight"].sum()
+        <= 0.30 + 1e-12
+    )
 
 
 def test_full_risk_control_can_reduce_next_day_without_daily_reranking() -> None:

@@ -339,6 +339,339 @@ def test_baostock_provider_reads_historical_calendar_and_members() -> None:
     assert fake.logged_out is True
 
 
+def test_baostock_provider_reconnects_after_a_failed_membership_request() -> None:
+    module = load_module()
+
+    class Result:
+        error_msg = "test response"
+
+        def __init__(self, rows, *, error_code="0"):
+            self.error_code = error_code
+            self.rows = list(rows)
+            self.offset = 0
+
+        def next(self):
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0", "error_msg": "success"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0", "error_msg": "success"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            assert date == "2014-07-09"
+            self.member_calls += 1
+            if self.member_calls == 1:
+                return Result([], error_code="10002007")
+            return Result([["2014-07-07", "sz.000001", "name"]])
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    members = provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert members == ["SZ000001"]
+    assert fake.member_calls == 2
+    assert fake.login_calls == 2
+    assert fake.logout_calls == 2
+
+
+def test_baostock_provider_retries_when_query_raises_connection_error() -> None:
+    module = load_module()
+
+    class Result:
+        error_code = "0"
+
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.offset = 0
+
+        def next(self):
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            assert date == "2014-07-09"
+            self.member_calls += 1
+            if self.member_calls == 1:
+                raise ConnectionError("private transport details")
+            return Result([["2014-07-07", "sz.000001", "name"]])
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    members = provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert members == ["SZ000001"]
+    assert fake.member_calls == 2
+    assert fake.login_calls == 2
+    assert fake.logout_calls == 2
+
+
+def test_baostock_provider_retries_when_error_code_changes_during_iteration() -> None:
+    module = load_module()
+
+    class Result:
+        def __init__(self, rows, *, fail_during_iteration=False):
+            self.error_code = "0"
+            self.rows = list(rows)
+            self.offset = 0
+            self.fail_during_iteration = fail_during_iteration
+
+        def next(self):
+            if self.fail_during_iteration:
+                self.fail_during_iteration = False
+                self.error_code = "10002007"
+                return False
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            assert date == "2014-07-09"
+            self.member_calls += 1
+            if self.member_calls == 1:
+                return Result([], fail_during_iteration=True)
+            return Result([["2014-07-07", "sz.000001", "name"]])
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    members = provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert members == ["SZ000001"]
+    assert fake.member_calls == 2
+    assert fake.login_calls == 2
+    assert fake.logout_calls == 2
+
+
+@pytest.mark.parametrize("failure_stage", ["next", "get_row_data"])
+def test_baostock_provider_retries_transport_errors_during_iteration(
+    failure_stage: str,
+) -> None:
+    module = load_module()
+
+    class Result:
+        error_code = "0"
+
+        def __init__(self, rows, *, transport_failure=None):
+            self.rows = list(rows)
+            self.offset = 0
+            self.transport_failure = transport_failure
+
+        def next(self):
+            if self.transport_failure == "next":
+                raise ConnectionError("private transport details")
+            if self.offset >= len(self.rows):
+                return False
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            if self.transport_failure == "get_row_data":
+                raise ConnectionError("private transport details")
+            return self.rows[self.offset - 1]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            assert date == "2014-07-09"
+            self.member_calls += 1
+            return Result(
+                [["2014-07-07", "sz.000001", "name"]],
+                transport_failure=failure_stage if self.member_calls == 1 else None,
+            )
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    members = provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert members == ["SZ000001"]
+    assert fake.member_calls == 2
+    assert fake.login_calls == 2
+    assert fake.logout_calls == 2
+
+
+@pytest.mark.parametrize("failure_stage", ["query", "next", "get_row_data"])
+def test_baostock_provider_does_not_retry_non_network_exceptions(
+    failure_stage: str,
+) -> None:
+    module = load_module()
+
+    class Result:
+        error_code = "0"
+
+        def __init__(self):
+            self.offset = 0
+
+        def next(self):
+            if failure_stage == "next":
+                raise ValueError("malformed provider data")
+            self.offset += 1
+            return True
+
+        def get_row_data(self):
+            if failure_stage == "get_row_data":
+                raise ValueError("malformed provider data")
+            return ["2014-07-07", "sz.000001", "name"]
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            assert date == "2014-07-09"
+            self.member_calls += 1
+            if failure_stage == "query":
+                raise ValueError("malformed provider data")
+            return Result()
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    with pytest.raises(ValueError, match="malformed provider data"):
+        provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert fake.member_calls == 1
+    assert fake.login_calls == 1
+    assert fake.logout_calls == 1
+
+
+def test_baostock_provider_does_not_retry_a_non_transport_error() -> None:
+    module = load_module()
+
+    class Result:
+        error_code = "10001001"
+        error_msg = "invalid parameter"
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+            self.member_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return type("Login", (), {"error_code": "0", "error_msg": "success"})()
+
+        def logout(self):
+            self.logout_calls += 1
+            return type("Logout", (), {"error_code": "0", "error_msg": "success"})()
+
+        def query_hs300_stocks(self, *, date):
+            raise AssertionError("the CSI300 endpoint must not be called")
+
+        def query_zz500_stocks(self, *, date):
+            self.member_calls += 1
+            return Result()
+
+    fake = FakeBaostock()
+    provider = module.BaostockProvider(fake)
+
+    with pytest.raises(module.ProviderQueryError, match="baostock_fetch_failed"):
+        provider.get_index_members(CSI500, date(2014, 7, 9))
+    provider.close()
+
+    assert fake.member_calls == 1
+    assert fake.login_calls == 1
+    assert fake.logout_calls == 1
+
+
 def test_auto_source_falls_back_to_baostock_after_jqdata_permission_denial() -> None:
     module = load_module()
 
@@ -1419,6 +1752,53 @@ def test_parquet_transaction_rolls_back_installed_files_on_commit_error(
     )
 
 
+def test_membership_publish_fsyncs_before_and_after_install(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    daily_path = tmp_path / "daily" / "2025.parquet"
+    source_path = tmp_path / module.SOURCE_FILENAME
+    events: list[tuple[str, str]] = []
+    real_fsync = module.os.fsync
+    real_replace = module.os.replace
+
+    def record_fsync(descriptor):
+        events.append(("fsync", str(descriptor)))
+        return real_fsync(descriptor)
+
+    def record_replace(source, destination):
+        destination_path = Path(destination)
+        if destination_path.name == module.TRANSACTION_JOURNAL_FILENAME:
+            events.append(("journal", destination_path.name))
+        elif Path(source).name.endswith(".stage"):
+            events.append(("install", destination_path.name))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "fsync", record_fsync)
+    monkeypatch.setattr(module.os, "replace", record_replace)
+
+    module._commit_file_transaction(
+        {daily_path: normalized_daily_membership(["2025-01-02"])},
+        {source_path: {"selected": "baostock"}},
+        output_dir=tmp_path,
+    )
+
+    journal_events = [
+        index for index, event in enumerate(events) if event[0] == "journal"
+    ]
+    install_events = [
+        index for index, event in enumerate(events) if event[0] == "install"
+    ]
+    fsync_events = [index for index, event in enumerate(events) if event[0] == "fsync"]
+    assert len(journal_events) == 2
+    assert install_events
+    assert any(index < journal_events[0] for index in fsync_events)
+    assert journal_events[0] < min(install_events)
+    assert any(
+        max(install_events) < index < journal_events[1] for index in fsync_events
+    )
+
+
 def test_next_build_recovers_crashed_transaction_journal(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1566,6 +1946,86 @@ def test_transaction_recovery_is_reentrant_after_crash_during_rollback(
     assert daily_path.read_bytes() == original_daily
     assert intervals_path.read_bytes() == original_intervals
     assert not journal_path.exists()
+
+
+def test_recovery_rejects_crafted_internal_entry_without_deleting_target(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    output_dir = tmp_path / "pit"
+    output_dir.mkdir()
+    unrelated = output_dir / "unrelated.txt"
+    unrelated.write_text("keep me", encoding="utf-8")
+    transaction_id = "a" * 32
+    journal_path = output_dir / module.TRANSACTION_JOURNAL_FILENAME
+    journal_path.write_text(
+        json.dumps(
+            {
+                "transaction_id": transaction_id,
+                "state": "prepared",
+                "entries": [
+                    {
+                        "target": str(unrelated),
+                        "stage": str(output_dir / ".wrong.stage"),
+                        "backup": str(output_dir / ".wrong.backup"),
+                        "had_original": False,
+                        "installed_sha256": "0" * 64,
+                        "transaction_id": transaction_id,
+                        "external_owner_path": "",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.BuildBlocked) as exc_info:
+        module._recover_transaction(output_dir)
+
+    assert exc_info.value.reason_code == "transaction_recovery_failed"
+    assert unrelated.read_text(encoding="utf-8") == "keep me"
+    assert journal_path.is_file()
+
+
+def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path) -> None:
+    module = load_module()
+    output_dir = tmp_path / "pit"
+    output_dir.mkdir()
+    target = output_dir / "membership_intervals.parquet"
+    transaction_id = "b" * 32
+    stage = target.with_name(f".{target.name}.{transaction_id}.stage")
+    backup = target.with_name(f".{target.name}.{transaction_id}.backup")
+    external_journal = tmp_path / "external-journal.json"
+    external_journal.write_text(
+        json.dumps(
+            {
+                "version": module.TRANSACTION_JOURNAL_VERSION,
+                "transaction_id": transaction_id,
+                "state": "committed",
+                "entries": [
+                    {
+                        "target": str(target),
+                        "stage": str(stage),
+                        "backup": str(backup),
+                        "had_original": False,
+                        "installed_sha256": "0" * 64,
+                        "transaction_id": transaction_id,
+                        "external_owner_path": "",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal_path = output_dir / module.TRANSACTION_JOURNAL_FILENAME
+    journal_path.symlink_to(external_journal)
+
+    with pytest.raises(module.BuildBlocked) as exc_info:
+        module._recover_transaction(output_dir)
+
+    assert exc_info.value.reason_code == "transaction_recovery_failed"
+    assert journal_path.is_symlink()
+    assert external_journal.is_file()
 
 
 def test_recovery_preserves_external_status_replaced_by_later_transaction(

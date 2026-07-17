@@ -10,6 +10,11 @@ from qlib.data.dataset import DatasetH
 
 
 BOARD_NAMES = ("main", "growth", "star", "other")
+MARKET_STATE_FEATURES = (
+    "MARKET_STATE_MEAN",
+    "MARKET_STATE_BREADTH",
+    "MARKET_STATE_DISPERSION",
+)
 
 
 def board_from_symbol(symbol: Any) -> str:
@@ -30,7 +35,10 @@ def _index_values(frame: pd.DataFrame, name: str) -> pd.Index:
 
 
 def normalize_feature_frame(
-    features: pd.DataFrame, *, add_board_features: bool = True
+    features: pd.DataFrame,
+    *,
+    add_board_features: bool = True,
+    add_market_state_features: bool = True,
 ) -> pd.DataFrame:
     if features.empty:
         return features.copy()
@@ -48,6 +56,18 @@ def normalize_feature_frame(
     variances = centered.pow(2).groupby(keys, sort=False).transform("mean")
     scales = np.sqrt(variances).replace(0.0, np.nan)
     normalized = (centered / scales).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if add_market_state_features:
+        row_mean = numeric.mean(axis=1).fillna(0.0)
+        row_breadth = numeric.gt(0.0).mean(axis=1).fillna(0.0)
+        normalized["MARKET_STATE_MEAN"] = row_mean.groupby(dates, sort=False).transform(
+            "mean"
+        )
+        normalized["MARKET_STATE_BREADTH"] = row_breadth.groupby(
+            dates, sort=False
+        ).transform("mean")
+        normalized["MARKET_STATE_DISPERSION"] = row_mean.groupby(
+            dates, sort=False
+        ).transform(lambda values: values.std(ddof=0))
     if add_board_features:
         for board in BOARD_NAMES:
             normalized[f"BOARD_{board.upper()}"] = (boards == board).astype(float)
@@ -60,6 +80,7 @@ def transform_prepared_frame(
     col_set: Any,
     normalize_within_board: bool = True,
     add_board_features: bool = True,
+    add_market_state_features: bool = True,
 ) -> pd.DataFrame:
     if not normalize_within_board or frame.empty:
         return frame.copy()
@@ -68,7 +89,9 @@ def transform_prepared_frame(
     ) and "feature" in frame.columns.get_level_values(0):
         feature_block = frame.xs("feature", axis=1, level=0, drop_level=True)
         normalized = normalize_feature_frame(
-            feature_block, add_board_features=add_board_features
+            feature_block,
+            add_board_features=add_board_features,
+            add_market_state_features=add_market_state_features,
         )
         normalized.columns = pd.MultiIndex.from_tuples(
             [("feature", str(column)) for column in normalized.columns]
@@ -79,7 +102,11 @@ def transform_prepared_frame(
         col_set == "feature" or col_set == ["feature"] or col_set == ("feature",)
     )
     if feature_only:
-        return normalize_feature_frame(frame, add_board_features=add_board_features)
+        return normalize_feature_frame(
+            frame,
+            add_board_features=add_board_features,
+            add_market_state_features=add_market_state_features,
+        )
     return frame.copy()
 
 
@@ -91,10 +118,12 @@ class BoardAwareDataset(DatasetH):
         *args: Any,
         normalize_within_board: bool = True,
         add_board_features: bool = True,
+        add_market_state_features: bool = True,
         **kwargs: Any,
     ) -> None:
         self.normalize_within_board = bool(normalize_within_board)
         self.add_board_features = bool(add_board_features)
+        self.add_market_state_features = bool(add_market_state_features)
         super().__init__(*args, **kwargs)
 
     def prepare(
@@ -114,6 +143,7 @@ class BoardAwareDataset(DatasetH):
                 col_set=col_set,
                 normalize_within_board=self.normalize_within_board,
                 add_board_features=self.add_board_features,
+                add_market_state_features=self.add_market_state_features,
             )
 
         if isinstance(prepared, list):

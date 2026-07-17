@@ -13,7 +13,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -31,6 +31,10 @@ DEFAULT_INTERVALS = (
 DEFAULT_RUNTIME_ROOT = quant_data_root() / "runtime" / "robust_strategy"
 DEFAULT_DATA_MANIFEST = quant_data_root() / "DATA_MANIFEST.json"
 REQUIRED_COLUMNS = {"symbol", "start_date", "end_date"}
+PROVIDER_METADATA_FILENAME = "ROBUST_PROVIDER.json"
+PROVIDER_CONTENT_FILENAME = "ROBUST_PROVIDER_CONTENT.json"
+PROVIDER_FORMAT_VERSION = 3
+PROVIDER_CONTENT_VERSION = 1
 
 
 def file_sha256(path: Path) -> str:
@@ -39,6 +43,39 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _content_entries(
+    root: Path, *, prefixes: Sequence[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    root = Path(root)
+    allowed = (
+        None if prefixes is None else {str(value).strip("/") for value in prefixes}
+    )
+    entries: dict[str, dict[str, Any]] = {}
+    for path in sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    ):
+        relative = path.relative_to(root).as_posix()
+        if allowed is not None and relative.split("/", 1)[0] not in allowed:
+            continue
+        if path.is_symlink():
+            raise ValueError("provider content must not contain symlinks")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError("provider content contains a non-regular file")
+        entries[relative] = {
+            "size": int(path.stat().st_size),
+            "sha256": file_sha256(path),
+        }
+    return entries
+
+
+def _content_tree_sha256(entries: Mapping[str, Mapping[str, Any]]) -> str:
+    return hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -138,7 +175,10 @@ def _provider_key(
         "calendar_sha256": calendar_hash,
         "intervals_sha256": file_sha256(intervals_path),
         "data_manifest_sha256": file_sha256(data_manifest_path),
-        "format_version": 2,
+        "canonical_tree_sha256": _content_tree_sha256(
+            _content_entries(canonical_provider, prefixes=("calendars", "features"))
+        ),
+        "format_version": PROVIDER_FORMAT_VERSION,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -221,12 +261,14 @@ def _remove_tree(root: Path) -> None:
 
 
 def _snapshot_is_reusable(provider: Path, key: str) -> bool:
-    metadata_path = provider / "ROBUST_PROVIDER.json"
+    metadata_path = provider / PROVIDER_METADATA_FILENAME
+    content_path = provider / PROVIDER_CONTENT_FILENAME
     instrument_path = provider / "instruments" / "csi800.txt"
     if (
         provider.is_symlink()
         or not provider.is_dir()
         or not metadata_path.is_file()
+        or not content_path.is_file()
         or not instrument_path.is_file()
     ):
         return False
@@ -234,14 +276,66 @@ def _snapshot_is_reusable(provider: Path, key: str) -> bool:
         return False
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        content = json.loads(content_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if metadata.get("format_version") != 2 or metadata.get("provider_key") != key:
+    if (
+        metadata.get("format_version") != PROVIDER_FORMAT_VERSION
+        or metadata.get("provider_key") != key
+        or metadata.get("content_manifest_sha256") != file_sha256(content_path)
+        or not isinstance(content, dict)
+        or content.get("version") != PROVIDER_CONTENT_VERSION
+        or content.get("provider_key") != key
+        or not isinstance(content.get("files"), dict)
+    ):
         return False
-    return all(
-        not (path.stat().st_mode & stat.S_IWUSR)
-        for path in [provider, *provider.rglob("*")]
-    )
+    files = content["files"]
+    if content.get("tree_sha256") != _content_tree_sha256(files):
+        return False
+    expected_paths = set(files) | {
+        PROVIDER_METADATA_FILENAME,
+        PROVIDER_CONTENT_FILENAME,
+    }
+    actual_paths = {
+        path.relative_to(provider).as_posix()
+        for path in provider.rglob("*")
+        if path.is_file()
+    }
+    if actual_paths != expected_paths:
+        return False
+    write_mask = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    if any(
+        path.stat().st_mode & write_mask for path in [provider, *provider.rglob("*")]
+    ):
+        return False
+    try:
+        for relative, expected in files.items():
+            path = provider / relative
+            if path.is_symlink() or not path.is_file():
+                return False
+            if int(expected.get("size", -1)) != path.stat().st_size:
+                return False
+            if expected.get("sha256") != file_sha256(path):
+                return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def runtime_provider_identity(provider: Path, key: str) -> dict[str, str] | None:
+    provider = Path(provider)
+    if not _snapshot_is_reusable(provider, key):
+        return None
+    try:
+        metadata = json.loads(
+            (provider / PROVIDER_METADATA_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    tree_hash = metadata.get("provider_tree_sha256")
+    if not isinstance(tree_hash, str) or len(tree_hash) != 64:
+        return None
+    return {"provider_key": key, "provider_tree_sha256": tree_hash}
 
 
 def prepare_runtime_provider(
@@ -293,9 +387,28 @@ def prepare_runtime_provider(
                 canonical_provider / "features", temporary / "features"
             )
             _write_instruments(temporary / "instruments" / "csi800.txt", intervals)
-            metadata = {
-                "format_version": 2,
+            content_entries = _content_entries(temporary)
+            provider_tree_sha256 = _content_tree_sha256(content_entries)
+            content_payload = {
+                "version": PROVIDER_CONTENT_VERSION,
                 "provider_key": key,
+                "tree_sha256": provider_tree_sha256,
+                "files": content_entries,
+            }
+            (temporary / PROVIDER_CONTENT_FILENAME).write_text(
+                json.dumps(
+                    content_payload, ensure_ascii=False, indent=2, sort_keys=True
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            metadata = {
+                "format_version": PROVIDER_FORMAT_VERSION,
+                "provider_key": key,
+                "provider_tree_sha256": provider_tree_sha256,
+                "content_manifest_sha256": file_sha256(
+                    temporary / PROVIDER_CONTENT_FILENAME
+                ),
                 "canonical_provider": str(canonical_provider),
                 "canonical_calendar_sha256": file_sha256(
                     canonical_provider / "calendars" / "day.txt"
@@ -312,7 +425,7 @@ def prepare_runtime_provider(
                 "intervals": int(len(intervals)),
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
-            (temporary / "ROBUST_PROVIDER.json").write_text(
+            (temporary / PROVIDER_METADATA_FILENAME).write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True)
                 + "\n",
                 encoding="utf-8",
@@ -335,6 +448,9 @@ def prepare_runtime_provider(
         "canonical_provider": str(canonical_provider),
         "membership_intervals": str(intervals_path),
         "provider_key": key,
+        "provider_tree_sha256": json.loads(
+            (provider / PROVIDER_METADATA_FILENAME).read_text(encoding="utf-8")
+        )["provider_tree_sha256"],
         "data_manifest": str(data_manifest_path),
         "data_manifest_sha256": file_sha256(data_manifest_path),
         "reused": reused,

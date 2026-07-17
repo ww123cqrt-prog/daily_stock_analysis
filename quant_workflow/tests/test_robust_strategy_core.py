@@ -175,6 +175,20 @@ def test_open_execution_is_fail_closed_for_suspension_and_blocked_limits() -> No
         limit_ratio=0.10,
         suspended=False,
     )
+    assert not module.can_execute_open(
+        side="buy",
+        previous_close=10.01,
+        open_price=11.01,
+        limit_ratio=0.10,
+        suspended=False,
+    )
+    assert not module.can_execute_open(
+        side="sell",
+        previous_close=10.01,
+        open_price=9.01,
+        limit_ratio=0.10,
+        suspended=False,
+    )
 
 
 def test_order_costs_apply_minimum_commission_and_date_specific_stamp_tax() -> None:
@@ -228,6 +242,7 @@ def test_acceptance_requires_every_development_gate() -> None:
     verdict = module.evaluate_development_acceptance(
         quarter_metrics=quarters,
         aggregate_annual_excess_return=0.07,
+        aggregate_max_drawdown=-0.15,
         window_rank_correlations=[0.75, 0.8],
         top50_overlaps=[0.65, 0.7],
         stress_excess_return=0.01,
@@ -239,6 +254,7 @@ def test_acceptance_requires_every_development_gate() -> None:
     failed = module.evaluate_development_acceptance(
         quarter_metrics=quarters,
         aggregate_annual_excess_return=0.07,
+        aggregate_max_drawdown=-0.15,
         window_rank_correlations=[0.75, 0.8],
         top50_overlaps=[0.65, 0.7],
         stress_excess_return=-0.001,
@@ -247,6 +263,20 @@ def test_acceptance_requires_every_development_gate() -> None:
     )
     assert failed["passed"] is False
     assert "stress_cost_positive_excess" in failed["failed_gates"]
+
+    cross_quarter_drawdown = module.evaluate_development_acceptance(
+        quarter_metrics=quarters,
+        aggregate_annual_excess_return=0.07,
+        aggregate_max_drawdown=-0.25,
+        window_rank_correlations=[0.75, 0.8],
+        top50_overlaps=[0.65, 0.7],
+        stress_excess_return=0.01,
+        delayed_excess_return=0.005,
+        regime_metrics=regimes,
+    )
+    assert cross_quarter_drawdown["passed"] is False
+    assert "maximum_drawdown" in cross_quarter_drawdown["failed_gates"]
+    assert cross_quarter_drawdown["values"]["aggregate_max_drawdown_abs"] == 0.25
 
 
 def test_model_selection_uses_development_metrics_only() -> None:

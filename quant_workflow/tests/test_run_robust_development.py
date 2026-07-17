@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 SCRIPT_PATH = (
@@ -21,6 +22,189 @@ def load_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def seal_provider(provider: Path, key: str = "provider-v1") -> str:
+    from prepare_robust_provider import (
+        PROVIDER_CONTENT_FILENAME,
+        PROVIDER_CONTENT_VERSION,
+        PROVIDER_FORMAT_VERSION,
+        PROVIDER_METADATA_FILENAME,
+        _content_entries,
+        _content_tree_sha256,
+        _make_tree_read_only,
+        _make_tree_writable,
+        file_sha256,
+    )
+
+    if provider.exists():
+        _make_tree_writable(provider)
+        for filename in (PROVIDER_METADATA_FILENAME, PROVIDER_CONTENT_FILENAME):
+            provider.joinpath(filename).unlink(missing_ok=True)
+    (provider / "features").mkdir(parents=True, exist_ok=True)
+    (provider / "instruments").mkdir(parents=True, exist_ok=True)
+    (provider / "instruments" / "csi800.txt").write_text("", encoding="utf-8")
+    entries = _content_entries(provider)
+    tree_hash = _content_tree_sha256(entries)
+    content_path = provider / PROVIDER_CONTENT_FILENAME
+    content_path.write_text(
+        json.dumps(
+            {
+                "version": PROVIDER_CONTENT_VERSION,
+                "provider_key": key,
+                "tree_sha256": tree_hash,
+                "files": entries,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (provider / PROVIDER_METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "format_version": PROVIDER_FORMAT_VERSION,
+                "provider_key": key,
+                "provider_tree_sha256": tree_hash,
+                "content_manifest_sha256": file_sha256(content_path),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    _make_tree_read_only(provider)
+    return tree_hash
+
+
+def write_reference_source(quant_data: Path) -> dict:
+    from _robust_membership_integrity import membership_read_lock
+
+    metadata = {
+        "requested": "auto",
+        "selected": "baostock",
+        "fallback_reason": "jqdata_permission_denied",
+        "date_range": {
+            "start_date": "2023-01-01",
+            "end_date": "2025-12-31",
+        },
+        "industry_classification": "CSRC",
+    }
+    reference = quant_data / "reference"
+    reference.mkdir(parents=True, exist_ok=True)
+    pit_dir = reference / "pit_csi800"
+    (pit_dir / "daily").mkdir(parents=True, exist_ok=True)
+    (pit_dir / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps(
+            {
+                "requested": "auto",
+                "selected": "baostock",
+                "fallback_reason": "jqdata_permission_denied",
+                "date_range": {
+                    "start_date": "2023-01-01",
+                    "end_date": "2025-12-31",
+                },
+                "indices": {
+                    "csi300": "000300.XSHG",
+                    "csi500": "000905.XSHG",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (pit_dir / "membership_intervals.parquet").write_bytes(b"membership intervals")
+    (pit_dir / "daily" / "2023.parquet").write_bytes(b"daily membership")
+    with membership_read_lock(pit_dir) as snapshot:
+        metadata["membership_snapshot_hash"] = snapshot.fingerprint()
+    (reference / "REFERENCE_SOURCE.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    for file_name in (
+        "security_master.parquet",
+        "industry_intervals.parquet",
+        "st_status.parquet",
+        "suspension_status.parquet",
+    ):
+        (reference / file_name).write_bytes(f"fixture:{file_name}".encode("ascii"))
+    return metadata
+
+
+def reference_context_fields(module, quant_data: Path) -> dict:
+    reference = quant_data / "reference"
+    with module.reference_read_lock(reference) as snapshot:
+        snapshot.ensure_transaction_clean()
+        metadata = snapshot.validate_source(
+            start_date="2023-01-01", end_date="2025-12-31"
+        )
+        fingerprint = snapshot.fingerprint()
+    return {
+        "reference_source_metadata": metadata,
+        "reference_snapshot_hash": fingerprint,
+    }
+
+
+def membership_context_fields(module, quant_data: Path) -> dict:
+    pit_dir = quant_data / "reference" / "pit_csi800"
+    with module.membership_read_lock(pit_dir) as snapshot:
+        snapshot.ensure_transaction_clean()
+        metadata = snapshot.validate_source(
+            start_date="2023-01-01", end_date="2025-12-31"
+        )
+        fingerprint = snapshot.fingerprint()
+    return {
+        "membership_source_metadata": metadata,
+        "membership_snapshot_hash": fingerprint,
+    }
+
+
+def build_resume_fixture(module, root: Path, *, run_id: str) -> dict:
+    provider = root / "provider"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars" / "day.txt").write_text(
+        "2018-01-02\n2023-01-03\n2025-12-31\n2026-07-15\n",
+        encoding="utf-8",
+    )
+    provider_tree_sha256 = seal_provider(provider)
+    provider_state = root / "provider.json"
+    provider_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "provider_uri": str(provider),
+                "provider_key": "provider-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    quant_data = root / "quant_data"
+    quant_data.mkdir()
+    manifest = quant_data / "DATA_MANIFEST.json"
+    manifest.write_text('{"version": 1}\n', encoding="utf-8")
+    write_reference_source(quant_data)
+    report_dir = root / "reports"
+    context_path = (
+        report_dir / "runs" / run_id / "development" / "development_context.json"
+    )
+    context_path.parent.mkdir(parents=True)
+    context = {
+        "config_hash": module.file_sha256(CONFIG_PATH),
+        "git_commit": "a" * 40,
+        "data_manifest_hash": module.file_sha256(manifest),
+        "provider_uri": str(provider.resolve()),
+        "provider_key": "provider-v1",
+        "as_of_date": "2026-07-15",
+        **reference_context_fields(module, quant_data),
+        **membership_context_fields(module, quant_data),
+    }
+    context["provider_tree_sha256"] = provider_tree_sha256
+    context["context_hash"] = module.payload_sha256(context)
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    return {
+        "provider": provider,
+        "provider_state": provider_state,
+        "quant_data": quant_data,
+        "report_dir": report_dir,
+        "context_path": context_path,
+        "context": context,
+    }
 
 
 def test_membership_source_metadata_keeps_only_public_provenance(
@@ -173,6 +357,7 @@ def test_build_dataset_config_uses_pit_csi800_five_day_open_label_and_purged_spl
     ]
     assert dataset["class"] == "BoardAwareDataset"
     assert dataset["module_path"] == "robust_dataset"
+    assert dataset["kwargs"]["add_market_state_features"] is True
     assert dataset["kwargs"]["segments"]["test"] == [
         str(split.test_start.date()),
         str(split.test_end.date()),
@@ -447,10 +632,30 @@ def test_run_training_jobs_resume_skips_completed_artifact(tmp_path: Path) -> No
     module = load_module()
     config = module.load_config(CONFIG_PATH)
     job = module.build_training_jobs(config)[0]
-    state = completed_artifact_state(module, tmp_path / "run" / "artifacts", job)
-    (tmp_path / "run").mkdir(parents=True, exist_ok=True)
+    run_dir = tmp_path / "run"
+    state = completed_artifact_state(module, tmp_path / "staging", job)
+    model_path = run_dir / "models" / f"{job.key}.pkl"
+    prediction_path = run_dir / "predictions" / f"{job.key}.parquet"
+    model_path.parent.mkdir(parents=True)
+    prediction_path.parent.mkdir(parents=True)
+    Path(state["model_path"]).replace(model_path)
+    Path(state["prediction_path"]).replace(prediction_path)
+    state["model_path"] = str(model_path.resolve())
+    state["prediction_path"] = str(prediction_path.resolve())
+    state["model_sha256"] = module.file_sha256(model_path)
+    state["prediction_sha256"] = module.file_sha256(prediction_path)
+    calendar = pd.bdate_range("2019-01-01", "2025-12-31")
+    split = module.make_job_split(
+        calendar,
+        job.quarter,
+        window_days=job.window_days,
+        validation_days=int(config["rolling_validation"]["validation_days"]),
+        label_horizon_days=5,
+    )
+    state["split"] = module._split_record(split)
+    state["context_hash"] = "a" * 64
     (tmp_path / "run" / "progress.json").write_text(
-        json.dumps({"jobs": {job.key: state}}),
+        json.dumps({"context_hash": "a" * 64, "jobs": {job.key: state}}),
         encoding="utf-8",
     )
 
@@ -458,8 +663,8 @@ def test_run_training_jobs_resume_skips_completed_artifact(tmp_path: Path) -> No
         config,
         [job],
         provider_uri=tmp_path / "provider",
-        calendar=pd.bdate_range("2019-01-01", "2025-12-31"),
-        run_dir=tmp_path / "run",
+        calendar=calendar,
+        run_dir=run_dir,
         dataset_factory=lambda *args: (_ for _ in ()).throw(
             AssertionError("dataset must not rebuild")
         ),
@@ -468,6 +673,7 @@ def test_run_training_jobs_resume_skips_completed_artifact(tmp_path: Path) -> No
         ),
         mlflow_enabled=False,
         resume=True,
+        context_hash="a" * 64,
     )
 
     assert progress[job.key]["status"] == "completed"
@@ -552,6 +758,77 @@ def test_pending_jobs_rejects_corrupt_or_unverified_prediction_artifact(
     assert module.pending_jobs(jobs, progress) == jobs
 
 
+def test_completed_artifact_requires_expected_run_paths_and_context(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(CONFIG_PATH)
+    job = module.build_training_jobs(config)[0]
+    state = completed_artifact_state(module, tmp_path / "outside", job)
+    state["context_hash"] = "a" * 64
+
+    assert (
+        module.completed_job_artifact_is_valid(
+            job,
+            state,
+            run_dir=tmp_path / "run",
+            expected_split=state["split"],
+            context_hash="a" * 64,
+        )
+        is False
+    )
+
+
+def test_completed_artifact_requires_exact_split_and_prediction_dates(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(CONFIG_PATH)
+    job = module.build_training_jobs(config)[0]
+    run_dir = tmp_path / "run"
+    state = completed_artifact_state(module, tmp_path / "staging", job)
+    expected_model = run_dir / "models" / f"{job.key}.pkl"
+    expected_prediction = run_dir / "predictions" / f"{job.key}.parquet"
+    expected_model.parent.mkdir(parents=True)
+    expected_prediction.parent.mkdir(parents=True)
+    Path(state["model_path"]).replace(expected_model)
+    Path(state["prediction_path"]).replace(expected_prediction)
+    state["model_path"] = str(expected_model.resolve())
+    state["prediction_path"] = str(expected_prediction.resolve())
+    state["context_hash"] = "a" * 64
+    state["model_sha256"] = module.file_sha256(expected_model)
+    state["prediction_sha256"] = module.file_sha256(expected_prediction)
+    expected_split = dict(state["split"])
+
+    wrong_split = dict(expected_split)
+    wrong_split["test_end"] = "2023-06-30"
+    assert (
+        module.completed_job_artifact_is_valid(
+            job,
+            state,
+            run_dir=run_dir,
+            expected_split=wrong_split,
+            context_hash="a" * 64,
+        )
+        is False
+    )
+
+    frame = pd.read_parquet(expected_prediction)
+    frame["datetime"] = pd.Timestamp("2024-01-03")
+    frame.to_parquet(expected_prediction, index=False)
+    state["prediction_sha256"] = module.file_sha256(expected_prediction)
+    assert (
+        module.completed_job_artifact_is_valid(
+            job,
+            state,
+            run_dir=run_dir,
+            expected_split=expected_split,
+            context_hash="a" * 64,
+        )
+        is False
+    )
+
+
 def test_pending_jobs_treats_malformed_recorded_rows_as_invalid(tmp_path: Path) -> None:
     module = load_module()
     config = module.load_config(CONFIG_PATH)
@@ -573,6 +850,7 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
         + "\n",
         encoding="utf-8",
     )
+    seal_provider(provider)
     provider_state = tmp_path / "provider.json"
     provider_state.write_text(
         json.dumps(
@@ -587,6 +865,7 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     quant_data = tmp_path / "quant_data"
     quant_data.mkdir()
     (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
+    reference_source = write_reference_source(quant_data)
     report_dir = tmp_path / "reports"
     index = pd.MultiIndex.from_product(
         [pd.to_datetime(["2025-01-02"]), ["A", "B", "C"]],
@@ -595,16 +874,48 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     model_prediction = pd.DataFrame(
         {"score": [3.0, 2.0, 1.0], "label": [0.03, 0.02, 0.01]}, index=index
     )
+    calendar = pd.bdate_range("2018-01-01", "2026-07-15")
 
     def training_runner(config, jobs, **kwargs):
         assert len(jobs) == 396
-        return {
-            job.key: {
+        run_dir = Path(kwargs["run_dir"])
+        progress = {}
+        for job in jobs:
+            split = module.make_job_split(
+                calendar,
+                job.quarter,
+                window_days=job.window_days,
+                validation_days=int(config["rolling_validation"]["validation_days"]),
+                label_horizon_days=5,
+            )
+            model_path = run_dir / "models" / f"{job.key}.pkl"
+            prediction_path = run_dir / "predictions" / f"{job.key}.parquet"
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            prediction_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path.write_bytes(pickle.dumps({"model_id": job.model_id}))
+            pd.DataFrame(
+                {
+                    "datetime": [split.test_start] * 3,
+                    "instrument": ["A", "B", "C"],
+                    "score": [3.0, 2.0, 1.0],
+                    "label": [0.03, 0.02, 0.01],
+                }
+            ).to_parquet(prediction_path, index=False)
+            progress[job.key] = {
                 "status": "completed",
-                "prediction_path": str(tmp_path / f"{job.key}.parquet"),
+                "model_id": job.model_id,
+                "window_days": job.window_days,
+                "quarter": job.quarter,
+                "seed": job.seed,
+                "model_path": str(model_path.resolve()),
+                "model_sha256": module.file_sha256(model_path),
+                "prediction_path": str(prediction_path.resolve()),
+                "prediction_sha256": module.file_sha256(prediction_path),
+                "rows": 3,
+                "split": module._split_record(split),
+                "context_hash": kwargs["context_hash"],
             }
-            for job in jobs
-        }
+        return progress
 
     def aggregator(records, topk):
         assert len(records) == 396
@@ -672,12 +983,56 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     frozen = json.loads(
         (report_dir / "frozen_strategy_latest.json").read_text(encoding="utf-8")
     )
+    context = json.loads(
+        (
+            report_dir
+            / "runs"
+            / "ready-test"
+            / "development"
+            / "development_context.json"
+        ).read_text(encoding="utf-8")
+    )
     assert result["status"] == "research_candidate_ready"
     assert latest["config_hash"]
     assert latest["data_manifest_hash"]
+    assert latest["reference_source_metadata"] == reference_source
+    assert len(latest["reference_snapshot_hash"]) == 64
+    assert latest["membership_source_metadata"]["selected"] == "baostock"
+    assert len(latest["membership_snapshot_hash"]) == 64
     assert frozen["selected_models"] == ["lightgbm", "linear_ridge"]
     assert frozen["selected_strategy"] == "full_risk_control"
+    assert frozen["reference_source_metadata"] == reference_source
+    assert frozen["reference_snapshot_hash"] == latest["reference_snapshot_hash"]
+    assert frozen["membership_source_metadata"] == latest["membership_source_metadata"]
+    assert frozen["membership_snapshot_hash"] == latest["membership_snapshot_hash"]
+    artifacts = frozen["development_artifacts"]
+    assert len(artifacts) == 144
+    assert [item["job_key"] for item in artifacts] == sorted(
+        item["job_key"] for item in artifacts
+    )
+    assert {item["model_id"] for item in artifacts} == {"lightgbm", "linear_ridge"}
+    assert frozen["development_artifacts_hash"] == module.payload_sha256(artifacts)
+    assert frozen["frozen_context_hash"] == module.frozen_context_hash(frozen)
+    assert frozen["development_run_id"] == "ready-test"
+    assert frozen["development_context_hash"] == context["context_hash"]
+    run_dir = Path(frozen["development_run_dir"])
+    assert run_dir == (report_dir / "runs" / "ready-test" / "development").resolve()
+    assert all(
+        Path(item["model_path"]).is_relative_to(run_dir)
+        and Path(item["prediction_path"]).is_relative_to(run_dir)
+        and Path(item["model_path"]).is_file()
+        and Path(item["prediction_path"]).is_file()
+        and item["model_sha256"] == module.file_sha256(Path(item["model_path"]))
+        and item["prediction_sha256"]
+        == module.file_sha256(Path(item["prediction_path"]))
+        and item["context_hash"] == context["context_hash"]
+        for item in artifacts
+    )
     assert frozen["confirmation_run_started"] is False
+    assert context["reference_source_metadata"] == reference_source
+    assert context["reference_snapshot_hash"] == latest["reference_snapshot_hash"]
+    assert context["membership_source_metadata"] == latest["membership_source_metadata"]
+    assert context["membership_snapshot_hash"] == latest["membership_snapshot_hash"]
 
 
 def test_run_development_rechecks_provider_before_freezing_candidate(
@@ -691,6 +1046,7 @@ def test_run_development_rechecks_provider_before_freezing_candidate(
         + "\n",
         encoding="utf-8",
     )
+    seal_provider(provider)
     provider_state = tmp_path / "provider.json"
     provider_state.write_text(
         json.dumps(
@@ -705,6 +1061,7 @@ def test_run_development_rechecks_provider_before_freezing_candidate(
     quant_data = tmp_path / "quant_data"
     quant_data.mkdir()
     (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
+    write_reference_source(quant_data)
     report_dir = tmp_path / "reports"
     index = pd.MultiIndex.from_product(
         [pd.to_datetime(["2025-01-02"]), ["A", "B", "C"]],
@@ -790,6 +1147,7 @@ def test_run_development_refuses_dirty_worktree_before_training(tmp_path: Path) 
         + "\n",
         encoding="utf-8",
     )
+    seal_provider(provider)
     provider_state = tmp_path / "provider.json"
     provider_state.write_text(
         json.dumps(
@@ -831,40 +1189,14 @@ def test_run_development_resume_rejects_artifacts_from_different_commit(
     tmp_path: Path,
 ) -> None:
     module = load_module()
-    provider = tmp_path / "provider"
-    (provider / "calendars").mkdir(parents=True)
-    (provider / "calendars" / "day.txt").write_text(
-        "\n".join(str(day.date()) for day in pd.bdate_range("2018-01-01", "2026-07-15"))
-        + "\n",
-        encoding="utf-8",
-    )
-    provider_state = tmp_path / "provider.json"
-    provider_state.write_text(
+    fixture = build_resume_fixture(module, tmp_path, run_id="resume-test")
+    seal_provider(fixture["provider"], key="provider-v2")
+    fixture["provider_state"].write_text(
         json.dumps(
             {
                 "status": "completed",
-                "provider_uri": str(provider),
+                "provider_uri": str(fixture["provider"]),
                 "provider_key": "provider-v2",
-            }
-        ),
-        encoding="utf-8",
-    )
-    quant_data = tmp_path / "quant_data"
-    quant_data.mkdir()
-    manifest = quant_data / "DATA_MANIFEST.json"
-    manifest.write_text('{"version": 1}\n', encoding="utf-8")
-    report_dir = tmp_path / "reports"
-    run_dir = report_dir / "runs" / "resume-test" / "development"
-    run_dir.mkdir(parents=True)
-    (run_dir / "development_context.json").write_text(
-        json.dumps(
-            {
-                "config_hash": module.file_sha256(CONFIG_PATH),
-                "git_commit": "a" * 40,
-                "data_manifest_hash": module.file_sha256(manifest),
-                "provider_uri": str(provider.resolve()),
-                "provider_key": "provider-v1",
-                "as_of_date": "2026-07-15",
             }
         ),
         encoding="utf-8",
@@ -872,9 +1204,9 @@ def test_run_development_resume_rejects_artifacts_from_different_commit(
 
     result = module.run_development(
         config_path=CONFIG_PATH,
-        quant_data_dir=quant_data,
-        report_dir=report_dir,
-        provider_state_path=provider_state,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
         as_of_date="2026-07-15",
         run_id="resume-test",
         resume=True,
@@ -889,6 +1221,150 @@ def test_run_development_resume_rejects_artifacts_from_different_commit(
     assert result["context_mismatches"] == ["git_commit", "provider_key"]
 
 
+def test_run_development_resume_accepts_matching_reference_context(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    fixture = build_resume_fixture(module, tmp_path, run_id="matching-reference")
+    calls: list[bool] = []
+
+    def training_runner(config, jobs, **kwargs):
+        calls.append(bool(kwargs["resume"]))
+        return {}
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
+        as_of_date="2026-07-15",
+        run_id="matching-reference",
+        resume=True,
+        training_runner=training_runner,
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert calls == [True]
+    assert result["reason_code"] == "training_jobs_incomplete"
+
+
+def test_run_development_resume_rejects_reference_snapshot_hash_change(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    fixture = build_resume_fixture(module, tmp_path, run_id="changed-hash")
+    reference = fixture["quant_data"] / "reference"
+    (reference / "security_master.parquet").write_bytes(b"changed snapshot")
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
+        as_of_date="2026-07-15",
+        run_id="changed-hash",
+        resume=True,
+        training_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training must not start after reference hash change")
+        ),
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["reason_code"] == "resume_context_mismatch"
+    assert result["context_mismatches"] == ["reference_snapshot_hash"]
+    assert result["training_jobs_started"] == 0
+
+
+def test_run_development_resume_rejects_reference_source_metadata_change(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    fixture = build_resume_fixture(module, tmp_path, run_id="changed-source")
+    reference = fixture["quant_data"] / "reference"
+    source_path = reference / "REFERENCE_SOURCE.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source.update(requested="auto", selected="jqdata")
+    source.pop("fallback_reason")
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    stored_context = fixture["context"]
+    stored_context["reference_snapshot_hash"] = reference_context_fields(
+        module, fixture["quant_data"]
+    )["reference_snapshot_hash"]
+    fixture["context_path"].write_text(json.dumps(stored_context), encoding="utf-8")
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
+        as_of_date="2026-07-15",
+        run_id="changed-source",
+        resume=True,
+        training_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training must not start after reference source change")
+        ),
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["reason_code"] == "resume_context_mismatch"
+    assert result["context_mismatches"] == ["reference_source_metadata"]
+    assert result["training_jobs_started"] == 0
+
+
+def test_run_development_resume_rejects_membership_snapshot_hash_change_before_training(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    fixture = build_resume_fixture(module, tmp_path, run_id="changed-membership-hash")
+    daily_path = (
+        fixture["quant_data"] / "reference" / "pit_csi800" / "daily" / "2023.parquet"
+    )
+    daily_path.write_bytes(daily_path.read_bytes() + b"changed")
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
+        as_of_date="2026-07-15",
+        run_id="changed-membership-hash",
+        resume=True,
+        training_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training must not start after membership hash change")
+        ),
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["reason_code"] == "reference_membership_snapshot_mismatch"
+    assert result["training_jobs_started"] == 0
+
+
+def test_run_development_rejects_reference_from_different_membership_snapshot(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    fixture = build_resume_fixture(module, tmp_path, run_id="fixture-context")
+    source_path = fixture["quant_data"] / "reference" / "REFERENCE_SOURCE.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["membership_snapshot_hash"] = "f" * 64
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=fixture["quant_data"],
+        report_dir=fixture["report_dir"],
+        provider_state_path=fixture["provider_state"],
+        as_of_date="2026-07-15",
+        run_id="wrong-reference-binding",
+        training_runner=lambda *args, **kwargs: {},
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["status"] == "development_failed"
+    assert result["reason_code"] == "reference_membership_snapshot_mismatch"
+    assert result["training_jobs_started"] == 0
+
+
 def test_development_exception_overwrites_stale_ready_report_with_failure(
     tmp_path: Path,
 ) -> None:
@@ -900,6 +1376,7 @@ def test_development_exception_overwrites_stale_ready_report_with_failure(
         + "\n",
         encoding="utf-8",
     )
+    seal_provider(provider)
     provider_state = tmp_path / "provider.json"
     provider_state.write_text(
         json.dumps(
@@ -914,6 +1391,7 @@ def test_development_exception_overwrites_stale_ready_report_with_failure(
     quant_data = tmp_path / "quant_data"
     quant_data.mkdir()
     (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
+    write_reference_source(quant_data)
     report_dir = tmp_path / "reports"
     report_dir.mkdir()
     (report_dir / "development_latest.json").write_text(
@@ -949,6 +1427,163 @@ def test_development_exception_overwrites_stale_ready_report_with_failure(
     assert result["reason_code"] == "development_execution_failed"
     assert result["error_type"] == "RuntimeError"
     assert latest["run_id"] == "exception-test"
+
+
+def test_run_development_rejects_invalid_reference_source_before_training(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    provider = tmp_path / "provider"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars" / "day.txt").write_text(
+        "2023-01-03\n2025-12-31\n", encoding="utf-8"
+    )
+    seal_provider(provider)
+    provider_state = tmp_path / "provider.json"
+    provider_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "provider_uri": str(provider),
+                "provider_key": "provider-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
+    write_reference_source(quant_data)
+    (quant_data / "reference" / "REFERENCE_SOURCE.json").unlink()
+    report_dir = tmp_path / "reports"
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=quant_data,
+        report_dir=report_dir,
+        provider_state_path=provider_state,
+        as_of_date="2026-07-15",
+        run_id="invalid-reference-source",
+        training_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training must not start with invalid reference provenance")
+        ),
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    latest = json.loads(
+        (report_dir / "development_latest.json").read_text(encoding="utf-8")
+    )
+    assert result["status"] == "development_failed"
+    assert result["reason_code"] == "reference_source_missing"
+    assert result["training_jobs_started"] == 0
+    assert "error" not in result
+    assert latest == result
+    assert not (report_dir / "frozen_strategy_latest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("changed_path", "reason_code"),
+    [
+        (("reference", "security_master.parquet"), "reference_snapshot_changed"),
+        (
+            ("reference", "pit_csi800", "daily", "2023.parquet"),
+            "membership_snapshot_changed",
+        ),
+    ],
+)
+def test_run_development_detects_snapshot_change_before_evaluation(
+    tmp_path: Path,
+    monkeypatch,
+    changed_path: tuple[str, ...],
+    reason_code: str,
+) -> None:
+    module = load_module()
+    provider = tmp_path / "provider"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars" / "day.txt").write_text(
+        "2023-01-03\n2025-12-31\n", encoding="utf-8"
+    )
+    seal_provider(provider)
+    provider_state = tmp_path / "provider.json"
+    provider_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "provider_uri": str(provider),
+                "provider_key": "provider-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
+    write_reference_source(quant_data)
+    report_dir = tmp_path / "reports"
+    jobs = [
+        module.TrainingJob("2025Q1", 504, "lightgbm", 42),
+        module.TrainingJob("2025Q1", 504, "linear_ridge", None),
+    ]
+    monkeypatch.setattr(module, "build_training_jobs", lambda config: jobs)
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2025-01-02"]), ["A", "B"]],
+        names=["datetime", "instrument"],
+    )
+    prediction = pd.DataFrame({"score": [2.0, 1.0], "label": [0.02, 0.01]}, index=index)
+
+    def training_runner(config, selected_jobs, **kwargs):
+        return {
+            job.key: {
+                "status": "completed",
+                "prediction_path": str(tmp_path / f"{job.key}.parquet"),
+            }
+            for job in selected_jobs
+        }
+
+    def aggregator(records, topk):
+        reports = [
+            {"model_id": "lightgbm", "eligible": True, "development_score": 1.0},
+            {"model_id": "linear_ridge", "eligible": True, "development_score": 0.9},
+        ]
+        return {
+            "model_reports": reports,
+            "model_predictions": {
+                "lightgbm": prediction,
+                "linear_ridge": prediction,
+            },
+            "window_predictions": {},
+        }
+
+    def changing_market_loader(**kwargs):
+        quant_data.joinpath(*changed_path).write_bytes(b"changed-after-training")
+        return pd.DataFrame({"date": []})
+
+    result = module.run_development(
+        config_path=CONFIG_PATH,
+        quant_data_dir=quant_data,
+        report_dir=report_dir,
+        provider_state_path=provider_state,
+        as_of_date="2026-07-15",
+        run_id="reference-change",
+        training_runner=training_runner,
+        aggregator=aggregator,
+        market_loader=changing_market_loader,
+        benchmark_loader=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("benchmark loading must not start after snapshot drift")
+        ),
+        regime_builder=lambda panel: (_ for _ in ()).throw(
+            AssertionError("regime evaluation must not start after snapshot drift")
+        ),
+        strategy_evaluator=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("strategy evaluation must not start after snapshot drift")
+        ),
+        git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
+    )
+
+    assert result["status"] == "development_failed"
+    assert result["reason_code"] == reason_code
+    assert result["training_jobs_started"] == 2
+    assert not (report_dir / "frozen_strategy_latest.json").exists()
 
 
 def test_bounded_tuning_trials_are_deterministic_capped_and_within_ranges() -> None:
@@ -1009,13 +1644,27 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
 
     def training_runner(trial_config, jobs, **kwargs):
         calls.append((len(jobs), kwargs["run_dir"]))
-        return {
-            job.key: {
+        progress = {}
+        for job in jobs:
+            model_path = Path(kwargs["run_dir"]) / "models" / f"{job.key}.pkl"
+            prediction_path = (
+                Path(kwargs["run_dir"]) / "predictions" / f"{job.key}.parquet"
+            )
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            prediction_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path.write_bytes(b"model")
+            prediction_path.write_bytes(b"prediction")
+            progress[job.key] = {
                 "status": "completed",
-                "prediction_path": str(tmp_path / f"{job.key}.parquet"),
+                "model_path": str(model_path),
+                "model_sha256": module.file_sha256(model_path),
+                "prediction_path": str(prediction_path),
+                "prediction_sha256": module.file_sha256(prediction_path),
+                "rows": 3,
+                "split": {},
+                "context_hash": str(kwargs.get("context_hash") or "test-context"),
             }
-            for job in jobs
-        }
+        return progress
 
     def aggregator(records, topk):
         nonlocal aggregate_calls
@@ -1055,3 +1704,33 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
     assert result["model_reports"][0]["eligible"] is True
     assert result["model_reports"][0]["tuning"]["screened_trials"] == 20
     assert "xgboost" in result["model_predictions"]
+
+
+def test_selected_development_artifacts_use_tuned_matrix_for_tuned_model() -> None:
+    module = load_module()
+    fixed = {
+        "linear_ridge": [{"model_id": "linear_ridge", "model_path": "fixed-ridge"}],
+        "xgboost": [{"model_id": "xgboost", "model_path": "fixed-xgb"}],
+    }
+    tuned = {
+        "xgboost": [{"model_id": "xgboost", "model_path": "tuned-xgb"}],
+    }
+    reports = [
+        {"model_id": "linear_ridge", "eligible": True},
+        {
+            "model_id": "xgboost",
+            "eligible": True,
+            "tuning": {"selected_trial": 3, "selected_kwargs": {"max_depth": 6}},
+        },
+    ]
+
+    artifacts = module.select_development_artifacts(
+        reports,
+        fixed_artifacts_by_model=fixed,
+        tuned_artifacts_by_model=tuned,
+    )
+
+    assert [item["model_path"] for item in artifacts] == [
+        "fixed-ridge",
+        "tuned-xgb",
+    ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping, NamedTuple, Sequence
 
 import numpy as np
@@ -270,10 +271,22 @@ def can_execute_open(
         or limit_ratio <= 0
     ):
         return False
-    tolerance = 1e-10
+    close = Decimal(str(previous_close))
+    ratio = Decimal(str(limit_ratio))
+    upper_limit = float(
+        (close * (Decimal("1") + ratio)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    )
+    lower_limit = float(
+        (close * (Decimal("1") - ratio)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    )
+    tolerance = 1e-8
     if side == "buy":
-        return open_price < previous_close * (1.0 + limit_ratio) - tolerance
-    return open_price > previous_close * (1.0 - limit_ratio) + tolerance
+        return open_price < upper_limit - tolerance
+    return open_price > lower_limit + tolerance
 
 
 def calculate_order_costs(
@@ -334,6 +347,7 @@ def evaluate_development_acceptance(
     *,
     quarter_metrics: Sequence[Mapping[str, Any]],
     aggregate_annual_excess_return: float,
+    aggregate_max_drawdown: float,
     window_rank_correlations: Sequence[float],
     top50_overlaps: Sequence[float],
     stress_excess_return: float,
@@ -380,6 +394,7 @@ def evaluate_development_acceptance(
         "worst_max_drawdown_abs": max(
             (abs(value) for value in drawdowns), default=math.inf
         ),
+        "aggregate_max_drawdown_abs": abs(float(aggregate_max_drawdown)),
         "stress_excess_return": float(stress_excess_return),
         "delayed_excess_return": float(delayed_excess_return),
         "positive_regime_count": regime_positive,
@@ -393,7 +408,11 @@ def evaluate_development_acceptance(
         "positive_rank_ic_intervals": values["positive_rank_ic_interval_ratio"] >= 0.70,
         "window_rank_stability": values["window_rank_correlation_median"] >= 0.70,
         "top50_stability": values["top50_overlap_mean"] >= 0.60,
-        "maximum_drawdown": values["worst_max_drawdown_abs"] <= 0.20,
+        "maximum_drawdown": max(
+            values["worst_max_drawdown_abs"],
+            values["aggregate_max_drawdown_abs"],
+        )
+        <= 0.20,
         "stress_cost_positive_excess": values["stress_excess_return"] > 0,
         "delayed_execution_positive_excess": values["delayed_excess_return"] > 0,
         "market_regime_coverage": values["positive_regime_count"] >= 3

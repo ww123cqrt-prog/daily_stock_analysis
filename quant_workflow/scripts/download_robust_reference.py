@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import importlib
 import json
 import os
 import re
 import shutil
+import stat
 import sys
+import unicodedata
 import uuid
 from datetime import date
 from pathlib import Path
@@ -23,13 +27,23 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root  # noqa: E402
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
 from download_jqdata import _load_jq_module, authenticate  # noqa: E402
 
 
 DEFAULT_START_DATE = "2014-01-02"
 STATUS_FILENAME = "download_robust_reference_latest.json"
+SOURCE_FILENAME = "REFERENCE_SOURCE.json"
+TRANSACTION_JOURNAL_FILENAME = ".download_robust_reference.transaction.json"
+WRITER_LOCK_FILENAME = ".download_robust_reference.lock"
+TRANSACTION_JOURNAL_VERSION = 1
 BLOCKED_RETURN_CODE = 2
 SYMBOL_CHUNK_SIZE = 200
+BAOSTOCK_MAX_ATTEMPTS = 2
+BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
     "industry_intervals.parquet": ("symbol", "industry_code", "start_date", "end_date"),
@@ -38,8 +52,15 @@ TABLE_COLUMNS = {
 }
 QLIB_SYMBOL_PATTERN = re.compile(r"^(SH|SZ|BJ)(\d{6})$")
 JQ_SYMBOL_PATTERN = re.compile(r"^(\d{6})\.(XSHG|XSHE|XBSE)$")
+BAOSTOCK_SYMBOL_PATTERN = re.compile(r"^(sh|sz|bj)\.(\d{6})$", re.IGNORECASE)
 EXCHANGE_TO_JQ = {"SH": "XSHG", "SZ": "XSHE", "BJ": "XBSE"}
 JQ_TO_EXCHANGE = {value: key for key, value in EXCHANGE_TO_JQ.items()}
+JQDATA_FALLBACK_REASONS = {
+    "jqdata_auth_failed",
+    "jqdata_sdk_unavailable",
+    "jqdata_permission_denied",
+    "jqdata_quota_exceeded",
+}
 
 
 class BlockedData(Exception):
@@ -72,6 +93,22 @@ def jq_to_qlib_symbol(value: Any) -> str:
         raise BlockedData("invalid_provider_symbol")
     digits, exchange = matched.groups()
     return f"{JQ_TO_EXCHANGE[exchange]}{digits}"
+
+
+def qlib_to_baostock_symbol(value: Any) -> str:
+    matched = QLIB_SYMBOL_PATTERN.fullmatch(str(value).strip().upper())
+    if matched is None:
+        raise BlockedData("invalid_pit_symbol")
+    exchange, digits = matched.groups()
+    return f"{exchange.lower()}.{digits}"
+
+
+def baostock_to_qlib_symbol(value: Any) -> str:
+    matched = BAOSTOCK_SYMBOL_PATTERN.fullmatch(str(value).strip())
+    if matched is None:
+        raise BlockedData("invalid_provider_symbol")
+    exchange, digits = matched.groups()
+    return f"{exchange.upper()}{digits}"
 
 
 def board_from_symbol(value: Any) -> str:
@@ -153,6 +190,15 @@ def _read_pit_membership(
 
 def _provider_reason(exc: Exception) -> str:
     text = str(exc).lower()
+    auth_markers = (
+        "authentication",
+        "credential",
+        "login failed",
+        "not logged in",
+        "用户名",
+        "密码",
+        "登录",
+    )
     permission_markers = (
         "permission",
         "not authorized",
@@ -170,6 +216,8 @@ def _provider_reason(exc: Exception) -> str:
         "调用次数",
         "超过限制",
     )
+    if any(marker in text for marker in auth_markers):
+        return "jqdata_auth_failed"
     if isinstance(exc, PermissionError) or any(
         marker in text for marker in permission_markers
     ):
@@ -467,11 +515,356 @@ def _fetch_suspension_status(provider: Any, membership: pd.DataFrame) -> pd.Data
     return pd.DataFrame(rows, columns=TABLE_COLUMNS["suspension_status.parquet"])
 
 
+class _BaostockResponseError(Exception):
+    """Internal signal for a retryable nonzero Baostock response."""
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
+
+
+def _baostock_response_frame(response: Any) -> pd.DataFrame:
+    error_code = "" if response is None else str(getattr(response, "error_code", ""))
+    if error_code != "0":
+        raise _BaostockResponseError(error_code)
+    fields = list(getattr(response, "fields", []))
+    if not fields or len(fields) != len(set(fields)):
+        raise BlockedData("invalid_baostock_schema")
+    rows: list[list[Any]] = []
+    try:
+        while response.next():
+            row = list(response.get_row_data())
+            if len(row) != len(fields):
+                raise BlockedData("invalid_baostock_schema")
+            rows.append(row)
+    except BlockedData:
+        raise
+    except Exception as exc:
+        raise BlockedData("baostock_fetch_failed") from exc
+    error_code = str(getattr(response, "error_code", ""))
+    if error_code != "0":
+        raise _BaostockResponseError(error_code)
+    return pd.DataFrame(rows, columns=fields)
+
+
+def _require_baostock_columns(
+    frame: pd.DataFrame, required: Sequence[str], reason_code: str
+) -> None:
+    if not set(required).issubset(frame.columns):
+        raise BlockedData(reason_code)
+
+
+def _required_text(value: Any, reason_code: str) -> str:
+    if value is None or pd.isna(value):
+        raise BlockedData(reason_code)
+    normalized = unicodedata.normalize("NFKC", str(value)).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized:
+        raise BlockedData(reason_code)
+    return normalized
+
+
+def _industry_component(value: Any) -> str:
+    normalized = _required_text(value, "missing_industry_member_day").casefold()
+    return normalized.replace(":", "_").replace(" ", "_")
+
+
+class JQDataAdapter:
+    source = "jqdata"
+    industry_classification = "sw_l1"
+
+    def __init__(self, provider: Any) -> None:
+        self.provider = provider
+
+    def probe(self, membership: pd.DataFrame, today: date) -> None:
+        probe_membership = membership.iloc[[0]].copy()
+        _build_security_master(self.provider, probe_membership, today)
+        _fetch_daily_industries(self.provider, probe_membership)
+        _fetch_st_status(self.provider, probe_membership)
+        _fetch_suspension_status(self.provider, probe_membership)
+
+    def build(self, membership: pd.DataFrame, today: date) -> dict[str, pd.DataFrame]:
+        security = _build_security_master(self.provider, membership, today)
+        daily_industry = _fetch_daily_industries(self.provider, membership)
+        industry = _compress_industry_intervals(
+            daily_industry, membership["date"].unique()
+        )
+        return {
+            "security_master.parquet": security,
+            "industry_intervals.parquet": industry,
+            "st_status.parquet": _fetch_st_status(self.provider, membership),
+            "suspension_status.parquet": _fetch_suspension_status(
+                self.provider, membership
+            ),
+        }
+
+    def close(self) -> None:
+        return None
+
+
+class BaostockAdapter:
+    source = "baostock"
+
+    def __init__(self, provider: Any) -> None:
+        self.provider = provider
+        self.industry_classification: str | None = None
+        self._logged_in = False
+
+    def login(self) -> None:
+        try:
+            response = self.provider.login()
+        except Exception as exc:
+            raise BlockedData("baostock_login_failed") from exc
+        if response is None or str(getattr(response, "error_code", "")) != "0":
+            raise BlockedData("baostock_login_failed")
+        self._logged_in = True
+
+    def close(self) -> None:
+        if not self._logged_in:
+            return
+        self._logged_in = False
+        try:
+            self.provider.logout()
+        except Exception:
+            pass
+
+    def _relogin(self) -> None:
+        self.close()
+        self.login()
+
+    def _query(self, method: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        for attempt in range(BAOSTOCK_MAX_ATTEMPTS):
+            try:
+                response = method(*args, **kwargs)
+            except Exception as exc:
+                raise BlockedData("baostock_fetch_failed") from exc
+            try:
+                return _baostock_response_frame(response)
+            except _BaostockResponseError as exc:
+                if (
+                    exc.error_code not in BAOSTOCK_RELOGIN_ERROR_CODES
+                    or attempt + 1 >= BAOSTOCK_MAX_ATTEMPTS
+                ):
+                    raise BlockedData("baostock_query_failed")
+                self._relogin()
+        raise BlockedData("baostock_query_failed")  # pragma: no cover
+
+    def _build_security_master(
+        self, membership: pd.DataFrame, today: date
+    ) -> pd.DataFrame:
+        frame = self._query(self.provider.query_stock_basic, code="", code_name="")
+        required = ("code", "code_name", "ipoDate", "outDate", "type", "status")
+        _require_baostock_columns(frame, required, "invalid_security_master_schema")
+        member_bounds = membership.groupby("symbol")["date"].agg(["min", "max"])
+        expected = set(member_bounds.index)
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in frame.loc[:, required].itertuples(index=False, name=None):
+            code, code_name, ipo_raw, out_raw, security_type, status = raw
+            try:
+                symbol = baostock_to_qlib_symbol(code)
+            except BlockedData:
+                continue
+            if symbol not in expected:
+                continue
+            if symbol in seen:
+                raise BlockedData("duplicate_security_master_member")
+            _required_text(code_name, "invalid_security_master_member")
+            if str(security_type).strip() != "1" or str(status).strip() not in {
+                "0",
+                "1",
+            }:
+                raise BlockedData("invalid_security_master_member")
+            list_date = _normalize_timestamp(ipo_raw)
+            if out_raw is None or pd.isna(out_raw) or not str(out_raw).strip():
+                delist_date = pd.NaT
+            else:
+                delist_date = _normalize_timestamp(out_raw)
+            if pd.notna(delist_date) and delist_date.date() > today:
+                if delist_date.year >= 2200:
+                    delist_date = pd.NaT
+                else:
+                    raise BlockedData("future_security_master_date")
+            if list_date > member_bounds.loc[symbol, "min"]:
+                raise BlockedData("invalid_security_master_member_day")
+            if pd.notna(delist_date) and delist_date < member_bounds.loc[symbol, "max"]:
+                raise BlockedData("invalid_security_master_member_day")
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "list_date": list_date,
+                    "delist_date": delist_date,
+                    "board": board_from_symbol(symbol),
+                }
+            )
+            seen.add(symbol)
+        if seen != expected:
+            raise BlockedData("missing_security_master_member")
+        return pd.DataFrame(
+            sorted(rows, key=lambda row: row["symbol"]),
+            columns=TABLE_COLUMNS["security_master.parquet"],
+        )
+
+    def _fetch_daily_industries(self, membership: pd.DataFrame) -> pd.DataFrame:
+        required = (
+            "updateDate",
+            "code",
+            "code_name",
+            "industry",
+            "industryClassification",
+        )
+        classifications: set[str] = set()
+        industry_codes = np.empty(len(membership), dtype=object)
+        industry_codes[:] = None
+        date_groups = membership.groupby("date", sort=True).indices
+        for timestamp, positions in date_groups.items():
+            day = timestamp.date().isoformat()
+            day_symbols = membership.iloc[positions]["symbol"].to_numpy(copy=False)
+            symbols = set(day_symbols)
+            frame = self._query(self.provider.query_stock_industry, code="", date=day)
+            _require_baostock_columns(frame, required, "invalid_industry_schema")
+            found: dict[str, str] = {}
+            for raw in frame.loc[:, required].itertuples(index=False, name=None):
+                update_raw, code, code_name, industry, classification = raw
+                try:
+                    update_date = _normalize_timestamp(update_raw)
+                except BlockedData as exc:
+                    raise BlockedData("invalid_industry_update_date") from exc
+                if update_date > timestamp:
+                    raise BlockedData("future_industry_update_date")
+                try:
+                    symbol = baostock_to_qlib_symbol(code)
+                except BlockedData:
+                    continue
+                if symbol not in symbols:
+                    continue
+                if symbol in found:
+                    raise BlockedData("duplicate_industry_member_day")
+                _required_text(code_name, "missing_industry_member_day")
+                classification_text = _required_text(
+                    classification, "missing_industry_member_day"
+                )
+                industry_code = (
+                    f"{_industry_component(classification)}:"
+                    f"{_industry_component(industry)}"
+                )
+                classifications.add(classification_text)
+                found[symbol] = industry_code
+            for position, symbol in zip(positions, day_symbols):
+                industry_code = found.get(symbol)
+                if industry_code is None:
+                    raise BlockedData("missing_industry_member_day")
+                industry_codes[position] = industry_code
+        if len(classifications) != 1:
+            raise BlockedData("inconsistent_industry_classification")
+        self.industry_classification = next(iter(classifications))
+        return pd.DataFrame(
+            {
+                "date": membership["date"].to_numpy(copy=False),
+                "symbol": membership["symbol"].to_numpy(copy=False),
+                "industry_code": industry_codes,
+            },
+            index=membership.index,
+        )
+
+    def _fetch_status_tables(
+        self, membership: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        required = ("date", "tradestatus", "isST")
+        start_date = membership["date"].min().date().isoformat()
+        end_date = membership["date"].max().date().isoformat()
+        st_values = np.empty(len(membership), dtype=np.bool_)
+        paused_values = np.empty(len(membership), dtype=np.bool_)
+        symbol_groups = membership.groupby("symbol", sort=True).indices
+        for symbol, positions in symbol_groups.items():
+            frame = self._query(
+                self.provider.query_history_k_data_plus,
+                qlib_to_baostock_symbol(symbol),
+                "date,tradestatus,isST",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3",
+            )
+            _require_baostock_columns(
+                frame, required, "invalid_baostock_history_schema"
+            )
+            try:
+                history_dates = pd.to_datetime(
+                    frame["date"], errors="raise"
+                ).dt.normalize()
+            except (TypeError, ValueError) as exc:
+                raise BlockedData("invalid_provider_date") from exc
+            if (
+                history_dates.isna().any()
+                or getattr(history_dates.dt, "tz", None) is not None
+            ):
+                raise BlockedData("invalid_provider_date")
+            if history_dates.duplicated().any():
+                raise BlockedData("duplicate_reference_member_day")
+            trade_status = frame["tradestatus"].astype(str).str.strip()
+            is_st = frame["isST"].astype(str).str.strip()
+            if (
+                not trade_status.isin(("0", "1")).all()
+                or not is_st.isin(("0", "1")).all()
+            ):
+                raise BlockedData("invalid_baostock_history_schema")
+            history = pd.DataFrame(
+                {
+                    "is_st": is_st.eq("1").to_numpy(),
+                    "is_suspended": trade_status.eq("0").to_numpy(),
+                },
+                index=pd.DatetimeIndex(history_dates),
+            )
+            member_dates = pd.DatetimeIndex(
+                membership.iloc[positions]["date"].to_numpy(copy=False)
+            )
+            aligned = history.reindex(member_dates)
+            if aligned["is_st"].isna().any():
+                raise BlockedData("missing_st_member_day")
+            if aligned["is_suspended"].isna().any():
+                raise BlockedData("missing_paused_member_day")
+            st_values[positions] = aligned["is_st"].to_numpy(dtype=np.bool_)
+            paused_values[positions] = aligned["is_suspended"].to_numpy(dtype=np.bool_)
+        dates = membership["date"].to_numpy(copy=False)
+        symbols = membership["symbol"].to_numpy(copy=False)
+        return (
+            pd.DataFrame(
+                {"date": dates, "symbol": symbols, "is_st": st_values},
+                index=membership.index,
+                columns=TABLE_COLUMNS["st_status.parquet"],
+            ),
+            pd.DataFrame(
+                {
+                    "date": dates,
+                    "symbol": symbols,
+                    "is_suspended": paused_values,
+                },
+                index=membership.index,
+                columns=TABLE_COLUMNS["suspension_status.parquet"],
+            ),
+        )
+
+    def build(self, membership: pd.DataFrame, today: date) -> dict[str, pd.DataFrame]:
+        security = self._build_security_master(membership, today)
+        daily_industry = self._fetch_daily_industries(membership)
+        industry = _compress_industry_intervals(
+            daily_industry, membership["date"].unique()
+        )
+        st, suspension = self._fetch_status_tables(membership)
+        return {
+            "security_master.parquet": security,
+            "industry_intervals.parquet": industry,
+            "st_status.parquet": st,
+            "suspension_status.parquet": suspension,
+        }
+
+
 def _validate_tables(
     tables: Mapping[str, pd.DataFrame], membership: pd.DataFrame, today: date
 ) -> None:
-    expected_keys = set(
-        membership[["date", "symbol"]].itertuples(index=False, name=None)
+    expected_keys = membership.loc[:, ["date", "symbol"]].sort_values(
+        ["date", "symbol"], kind="mergesort", ignore_index=True
     )
     for name, columns in TABLE_COLUMNS.items():
         frame = tables.get(name)
@@ -532,27 +925,31 @@ def _validate_tables(
         frame = tables[name]
         if frame.duplicated(["date", "symbol"]).any():
             raise BlockedData("duplicate_reference_member_day")
-        keys = set(frame[["date", "symbol"]].itertuples(index=False, name=None))
-        if keys != expected_keys:
+        available_keys = frame.loc[:, ["date", "symbol"]].sort_values(
+            ["date", "symbol"], kind="mergesort", ignore_index=True
+        )
+        same_keys = (
+            len(available_keys) == len(expected_keys)
+            and np.array_equal(
+                available_keys["date"].to_numpy(copy=False),
+                expected_keys["date"].to_numpy(copy=False),
+            )
+            and np.array_equal(
+                available_keys["symbol"].to_numpy(copy=False),
+                expected_keys["symbol"].to_numpy(copy=False),
+            )
+        )
+        if not same_keys:
             raise BlockedData("incomplete_reference_member_day")
         if (frame["date"].dt.date > today).any():
             raise BlockedData("future_reference_date")
 
 
 def build_reference_tables(
-    provider: Any, membership: pd.DataFrame, today: date
+    adapter: Any, membership: pd.DataFrame, today: date
 ) -> dict[str, pd.DataFrame]:
-    security = _build_security_master(provider, membership, today)
-    daily_industry = _fetch_daily_industries(provider, membership)
-    industry = _compress_industry_intervals(daily_industry, membership["date"].unique())
-    st = _fetch_st_status(provider, membership)
-    suspension = _fetch_suspension_status(provider, membership)
-    tables = {
-        "security_master.parquet": security,
-        "industry_intervals.parquet": industry,
-        "st_status.parquet": st,
-        "suspension_status.parquet": suspension,
-    }
+    active_adapter = adapter if hasattr(adapter, "build") else JQDataAdapter(adapter)
+    tables = active_adapter.build(membership, today)
     _validate_tables(tables, membership, today)
     return tables
 
@@ -567,9 +964,14 @@ def _status_payload(
     member_count: int = 0,
     member_day_count: int = 0,
     table_counts: Mapping[str, int] | None = None,
+    requested: str = "auto",
+    selected: str | None = None,
+    fallback_reason: str | None = None,
+    industry_classification: str | None = None,
+    membership_snapshot_hash: str | None = None,
 ) -> dict[str, Any]:
     counts = table_counts or {}
-    return {
+    payload = {
         "status": status,
         "reason_code": reason_code,
         "date_range": {
@@ -583,7 +985,38 @@ def _status_payload(
         "industry_interval_count": int(counts.get("industry_intervals.parquet", 0)),
         "st_status_count": int(counts.get("st_status.parquet", 0)),
         "suspension_status_count": int(counts.get("suspension_status.parquet", 0)),
+        "requested": requested,
+        "selected": selected,
+        "industry_classification": industry_classification,
+        "membership_snapshot_hash": membership_snapshot_hash,
     }
+    if fallback_reason is not None:
+        payload["fallback_reason"] = fallback_reason
+    return payload
+
+
+def _source_payload(
+    requested: str,
+    selected: str,
+    start_date: date,
+    end_date: date,
+    industry_classification: str,
+    membership_snapshot_hash: str,
+    fallback_reason: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "requested": requested,
+        "selected": selected,
+        "date_range": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+        "industry_classification": industry_classification,
+        "membership_snapshot_hash": membership_snapshot_hash,
+    }
+    if fallback_reason is not None:
+        payload["fallback_reason"] = fallback_reason
+    return payload
 
 
 def _write_json_stage(payload: Mapping[str, Any], path: Path) -> None:
@@ -615,13 +1048,208 @@ def _restore_backup(backup: Path, target: Path) -> None:
         rollback.unlink(missing_ok=True)
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directories(paths: Sequence[Path]) -> None:
+    for path in sorted({Path(value).resolve() for value in paths}, key=str):
+        _fsync_directory(path)
+
+
+def _write_transaction_journal(payload: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _serialize_transaction_entries(
+    entries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "target": str(Path(entry["target"]).resolve()),
+            "stage": str(Path(entry["stage"]).resolve()),
+            "backup": (
+                None
+                if entry["backup"] is None
+                else str(Path(entry["backup"]).resolve())
+            ),
+            "had_original": bool(entry["had_original"]),
+        }
+        for entry in entries
+    ]
+
+
+def _transaction_journal_payload(
+    transaction_id: str,
+    state: str,
+    entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "version": TRANSACTION_JOURNAL_VERSION,
+        "transaction_id": transaction_id,
+        "state": state,
+        "entries": _serialize_transaction_entries(entries),
+    }
+
+
+def _validated_transaction_entries(
+    payload: Any, allowed_targets: Sequence[Path]
+) -> tuple[str, list[dict[str, Any]]]:
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("version") != TRANSACTION_JOURNAL_VERSION
+        or payload.get("state") not in {"prepared", "committed"}
+        or not isinstance(payload.get("transaction_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", payload["transaction_id"]) is None
+        or not isinstance(payload.get("entries"), list)
+        or not payload["entries"]
+    ):
+        raise BlockedData("transaction_recovery_failed")
+    allowed = {path.resolve() for path in allowed_targets}
+    transaction_id = str(payload["transaction_id"])
+    entries: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for raw in payload["entries"]:
+        if not isinstance(raw, Mapping) or type(raw.get("had_original")) is not bool:
+            raise BlockedData("transaction_recovery_failed")
+        try:
+            target = Path(raw["target"]).resolve()
+            stage = Path(raw["stage"]).resolve()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BlockedData("transaction_recovery_failed") from exc
+        had_original = raw["had_original"]
+        backup_raw = raw.get("backup")
+        if had_original:
+            if not isinstance(backup_raw, str):
+                raise BlockedData("transaction_recovery_failed")
+            backup: Path | None = Path(backup_raw).resolve()
+        elif backup_raw is None:
+            backup = None
+        else:
+            raise BlockedData("transaction_recovery_failed")
+        if (
+            target not in allowed
+            or target in seen
+            or stage != target.with_name(f".{target.name}.{transaction_id}.stage")
+            or (
+                backup is not None
+                and backup
+                != target.with_name(f".{target.name}.{transaction_id}.backup")
+            )
+            or target == stage
+            or target == backup
+            or stage == backup
+        ):
+            raise BlockedData("transaction_recovery_failed")
+        entries.append(
+            {
+                "target": target,
+                "stage": stage,
+                "backup": backup,
+                "had_original": had_original,
+            }
+        )
+        seen.add(target)
+    return str(payload["state"]), entries
+
+
+def _cleanup_transaction_artifacts(
+    entries: Sequence[Mapping[str, Any]], journal_path: Path
+) -> None:
+    directories = {journal_path.parent}
+    for entry in entries:
+        stage = Path(entry["stage"])
+        stage.unlink(missing_ok=True)
+        directories.add(stage.parent)
+        backup = entry["backup"]
+        if backup is not None:
+            backup = Path(backup)
+            backup.unlink(missing_ok=True)
+            directories.add(backup.parent)
+    journal_path.unlink(missing_ok=True)
+    for directory in directories:
+        _fsync_directory(directory)
+
+
+def _recover_transaction(journal_path: Path, allowed_targets: Sequence[Path]) -> None:
+    try:
+        journal_mode = journal_path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if journal_path.is_symlink() or not stat.S_ISREG(journal_mode):
+        raise BlockedData("transaction_recovery_failed")
+    try:
+        payload = json.loads(journal_path.read_text(encoding="utf-8"))
+        state, entries = _validated_transaction_entries(payload, allowed_targets)
+        if state == "prepared":
+            for entry in reversed(entries):
+                target = entry["target"]
+                if entry["had_original"]:
+                    backup = entry["backup"]
+                    if backup is None or not backup.is_file():
+                        raise FileNotFoundError("transaction backup missing")
+                    _restore_backup(backup, target)
+                else:
+                    target.unlink(missing_ok=True)
+        _cleanup_transaction_artifacts(entries, journal_path)
+    except BlockedData:
+        raise
+    except Exception as exc:
+        raise BlockedData("transaction_recovery_failed") from exc
+
+
+def _acquire_writer_lock(reference_dir: Path) -> Any:
+    reference_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = reference_dir.parent / f".{reference_dir.name}{WRITER_LOCK_FILENAME}"
+    handle = lock_path.open("a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_writer_lock(handle: Any) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def _publish_transaction(
     tables: Mapping[str, pd.DataFrame],
     reference_dir: Path,
+    source_payload: Mapping[str, Any],
+    source_path: Path,
     status_payload: Mapping[str, Any],
-    status_path: Path,
 ) -> None:
     transaction_id = uuid.uuid4().hex
+    journal_path = reference_dir / TRANSACTION_JOURNAL_FILENAME
+    status_path = reference_dir / STATUS_FILENAME
     entries: list[dict[str, Any]] = []
     try:
         reference_dir.mkdir(parents=True, exist_ok=True)
@@ -629,7 +1257,6 @@ def _publish_transaction(
         for name in TABLE_COLUMNS:
             target = reference_dir / name
             stage = target.with_name(f".{target.name}.{transaction_id}.stage")
-            tables[name].to_parquet(stage, index=False)
             entries.append(
                 {
                     "target": target,
@@ -638,10 +1265,22 @@ def _publish_transaction(
                     "had_original": target.is_file(),
                 }
             )
+            tables[name].to_parquet(stage, index=False)
+        source_stage = source_path.with_name(
+            f".{source_path.name}.{transaction_id}.stage"
+        )
+        entries.append(
+            {
+                "target": source_path,
+                "stage": source_stage,
+                "backup": None,
+                "had_original": source_path.is_file(),
+            }
+        )
+        _write_json_stage(source_payload, source_stage)
         status_stage = status_path.with_name(
             f".{status_path.name}.{transaction_id}.stage"
         )
-        _write_json_stage(status_payload, status_stage)
         entries.append(
             {
                 "target": status_path,
@@ -650,6 +1289,7 @@ def _publish_transaction(
                 "had_original": status_path.is_file(),
             }
         )
+        _write_json_stage(status_payload, status_stage)
         for entry in entries:
             if entry["had_original"]:
                 target = entry["target"]
@@ -659,54 +1299,78 @@ def _publish_transaction(
                 except OSError:
                     shutil.copy2(target, backup)
                 entry["backup"] = backup
+        artifact_directories: set[Path] = set()
         for entry in entries:
-            os.replace(entry["stage"], entry["target"])
-    except Exception:
-        rollback_error: Exception | None = None
-        for entry in reversed(entries):
-            try:
-                if entry["had_original"]:
-                    backup = entry["backup"]
-                    if backup is None or not backup.is_file():
-                        raise FileNotFoundError("transaction backup missing")
-                    _restore_backup(backup, entry["target"])
-                else:
-                    entry["target"].unlink(missing_ok=True)
-            except (
-                Exception
-            ) as exc:  # pragma: no cover - catastrophic rollback failure.
-                rollback_error = rollback_error or exc
-        if rollback_error is not None:
-            raise RuntimeError(
-                "reference transaction rollback failed"
-            ) from rollback_error
-        raise
-    finally:
-        for entry in entries:
-            entry["stage"].unlink(missing_ok=True)
+            stage = Path(entry["stage"])
+            _fsync_file(stage)
+            artifact_directories.add(stage.parent)
             backup = entry["backup"]
             if backup is not None:
-                backup.unlink(missing_ok=True)
+                backup = Path(backup)
+                _fsync_file(backup)
+                artifact_directories.add(backup.parent)
+        _fsync_directories(list(artifact_directories))
+        _write_transaction_journal(
+            _transaction_journal_payload(transaction_id, "prepared", entries),
+            journal_path,
+        )
+        for entry in entries:
+            os.replace(entry["stage"], entry["target"])
+        _fsync_directories([Path(entry["target"]).parent for entry in entries])
+        _write_transaction_journal(
+            _transaction_journal_payload(transaction_id, "committed", entries),
+            journal_path,
+        )
+        _cleanup_transaction_artifacts(entries, journal_path)
+    except Exception:
+        if journal_path.is_file():
+            try:
+                _recover_transaction(
+                    journal_path,
+                    [entry["target"] for entry in entries],
+                )
+            except BlockedData as exc:
+                raise RuntimeError("reference transaction rollback failed") from exc
+        else:
+            for entry in entries:
+                Path(entry["stage"]).unlink(missing_ok=True)
+                backup = entry["backup"]
+                if backup is not None:
+                    Path(backup).unlink(missing_ok=True)
+        raise
 
 
 def _create_default_provider(
     env_file: Path | None,
     environ: MutableMapping[str, str],
 ) -> Any:
-    jq_module = _load_jq_module()
-    authenticated = (
-        authenticate(jq_module, environ, env_file=env_file)
-        if env_file is not None
-        else authenticate(jq_module, environ)
-    )
+    try:
+        jq_module = _load_jq_module()
+    except Exception as exc:
+        raise BlockedData("jqdata_sdk_unavailable") from exc
+    try:
+        authenticated = (
+            authenticate(jq_module, environ, env_file=env_file)
+            if env_file is not None
+            else authenticate(jq_module, environ)
+        )
+    except Exception as exc:
+        raise BlockedData("jqdata_auth_failed") from exc
     if not authenticated:
         raise BlockedData("jqdata_auth_failed")
     return jq_module
 
 
+def _create_default_baostock_provider() -> Any:
+    try:
+        return importlib.import_module("baostock")
+    except Exception as exc:
+        raise BlockedData("baostock_sdk_unavailable") from exc
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download strict PIT reference metadata from JQData."
+        description="Download strict PIT reference metadata from one selected source."
     )
     parser.add_argument("--pit-dir", type=Path, default=None)
     parser.add_argument("--reference-dir", type=Path, default=None)
@@ -714,6 +1378,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--status-out-dir", type=Path, default=None)
     parser.add_argument("--env-file", type=Path, default=None)
+    parser.add_argument(
+        "--reference-source",
+        choices=("auto", "jqdata", "baostock"),
+        default="auto",
+    )
     return parser
 
 
@@ -721,6 +1390,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     provider: Any | None = None,
+    baostock_provider: Any | None = None,
     today: date | None = None,
     environ: MutableMapping[str, str] | None = None,
 ) -> int:
@@ -734,9 +1404,18 @@ def main(
     pit_dir = default_pit_dir() if args.pit_dir is None else args.pit_dir
     status_dir = reference_dir if args.status_out_dir is None else args.status_out_dir
     status_path = status_dir / STATUS_FILENAME
+    canonical_status_path = reference_dir / STATUS_FILENAME
+    source_path = reference_dir / SOURCE_FILENAME
+    journal_path = reference_dir / TRANSACTION_JOURNAL_FILENAME
     pit_file_count = 0
     member_count = 0
     member_day_count = 0
+    requested = args.reference_source
+    selected: str | None = None
+    fallback_reason: str | None = None
+    industry_classification: str | None = None
+    membership_snapshot_hash: str | None = None
+    cleanup_adapters: list[Any] = []
 
     def blocked(reason_code: str) -> int:
         payload = _status_payload(
@@ -747,6 +1426,11 @@ def main(
             pit_file_count=pit_file_count,
             member_count=member_count,
             member_day_count=member_day_count,
+            requested=requested,
+            selected=selected,
+            fallback_reason=fallback_reason,
+            industry_classification=industry_classification,
+            membership_snapshot_hash=membership_snapshot_hash,
         )
         try:
             _atomic_write_status(payload, status_path)
@@ -761,46 +1445,199 @@ def main(
         )
         return BLOCKED_RETURN_CODE
 
-    if start_date > end_date:
-        return blocked("invalid_date_range")
-    if end_date > current_date:
-        return blocked("future_requested_date")
+    allowed_transaction_targets = [
+        *(reference_dir / name for name in TABLE_COLUMNS),
+        source_path,
+        canonical_status_path,
+    ]
+    recovery_lock = None
     try:
-        membership, pit_file_count = _read_pit_membership(
-            pit_dir, start_date, end_date, current_date
-        )
-        member_count = int(membership["symbol"].nunique())
-        member_day_count = len(membership)
-        active_provider = provider
-        if active_provider is None:
-            active_provider = _create_default_provider(
-                args.env_file, os.environ if environ is None else environ
-            )
-        tables = build_reference_tables(active_provider, membership, current_date)
-    except BlockedData as exc:
-        return blocked(exc.reason_code)
-    except Exception as exc:
-        return blocked(_provider_reason(exc))
-
-    counts = {name: len(frame) for name, frame in tables.items()}
-    completed = _status_payload(
-        "completed",
-        "completed",
-        start_date,
-        end_date,
-        pit_file_count=pit_file_count,
-        member_count=member_count,
-        member_day_count=member_day_count,
-        table_counts=counts,
-    )
-    try:
-        _publish_transaction(tables, reference_dir, completed, status_path)
+        recovery_lock = _acquire_writer_lock(reference_dir)
+        _recover_transaction(journal_path, allowed_transaction_targets)
+    except BlockedData:
+        return blocked("transaction_recovery_failed")
     except Exception:
-        return blocked("atomic_publish_failed")
-    print(
-        f"download_robust_reference: completed; members={member_count}; member_days={member_day_count}"
-    )
-    return 0
+        return blocked("writer_lock_failed")
+    finally:
+        if recovery_lock is not None:
+            _release_writer_lock(recovery_lock)
+
+    try:
+        if start_date > end_date:
+            return blocked("invalid_date_range")
+        if end_date > current_date:
+            return blocked("future_requested_date")
+        try:
+            with membership_read_lock(pit_dir) as membership_snapshot:
+                membership_snapshot.ensure_transaction_clean()
+                membership_snapshot.validate_source(
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                )
+                membership, pit_file_count = _read_pit_membership(
+                    pit_dir, start_date, end_date, current_date
+                )
+                member_count = int(membership["symbol"].nunique())
+                member_day_count = len(membership)
+                membership_snapshot_hash = membership_snapshot.fingerprint()
+
+            if requested == "baostock":
+                selected = "baostock"
+                raw_baostock = baostock_provider
+                if raw_baostock is None:
+                    raw_baostock = (
+                        provider
+                        if provider is not None
+                        else _create_default_baostock_provider()
+                    )
+                active_adapter: Any = BaostockAdapter(raw_baostock)
+                cleanup_adapters.append(active_adapter)
+                active_adapter.login()
+            elif requested == "jqdata":
+                selected = "jqdata"
+                raw_jqdata = provider
+                if raw_jqdata is None:
+                    raw_jqdata = _create_default_provider(
+                        args.env_file, os.environ if environ is None else environ
+                    )
+                active_adapter = JQDataAdapter(raw_jqdata)
+            else:
+                selected = "jqdata"
+                try:
+                    raw_jqdata = provider
+                    if raw_jqdata is None:
+                        raw_jqdata = _create_default_provider(
+                            args.env_file,
+                            os.environ if environ is None else environ,
+                        )
+                    active_adapter = JQDataAdapter(raw_jqdata)
+                    active_adapter.probe(membership, current_date)
+                except BlockedData as exc:
+                    if exc.reason_code not in JQDATA_FALLBACK_REASONS:
+                        raise
+                    # A lone injected provider retains the historical JQData-only
+                    # test contract; production auto and dual-provider tests fall back.
+                    if provider is not None and baostock_provider is None:
+                        raise
+                    fallback_reason = exc.reason_code
+                    selected = "baostock"
+                    raw_baostock = (
+                        baostock_provider
+                        if baostock_provider is not None
+                        else _create_default_baostock_provider()
+                    )
+                    active_adapter = BaostockAdapter(raw_baostock)
+                    cleanup_adapters.append(active_adapter)
+                    active_adapter.login()
+
+            try:
+                tables = build_reference_tables(
+                    active_adapter, membership, current_date
+                )
+            except BlockedData as exc:
+                can_fallback = (
+                    requested == "auto"
+                    and selected == "jqdata"
+                    and exc.reason_code in JQDATA_FALLBACK_REASONS
+                    and (provider is None or baostock_provider is not None)
+                )
+                if not can_fallback:
+                    raise
+                fallback_reason = exc.reason_code
+                selected = "baostock"
+                raw_baostock = (
+                    baostock_provider
+                    if baostock_provider is not None
+                    else _create_default_baostock_provider()
+                )
+                active_adapter = BaostockAdapter(raw_baostock)
+                cleanup_adapters.append(active_adapter)
+                active_adapter.login()
+                tables = build_reference_tables(
+                    active_adapter, membership, current_date
+                )
+            industry_classification = active_adapter.industry_classification
+            if not industry_classification:
+                raise BlockedData("missing_industry_classification")
+        except MembershipIntegrityError as exc:
+            return blocked(exc.reason_code)
+        except BlockedData as exc:
+            return blocked(exc.reason_code)
+        except Exception as exc:
+            reason_code = (
+                "baostock_fetch_failed"
+                if selected == "baostock"
+                else _provider_reason(exc)
+            )
+            return blocked(reason_code)
+
+        counts = {name: len(frame) for name, frame in tables.items()}
+        completed = _status_payload(
+            "completed",
+            "completed",
+            start_date,
+            end_date,
+            pit_file_count=pit_file_count,
+            member_count=member_count,
+            member_day_count=member_day_count,
+            table_counts=counts,
+            requested=requested,
+            selected=selected,
+            fallback_reason=fallback_reason,
+            industry_classification=industry_classification,
+            membership_snapshot_hash=membership_snapshot_hash,
+        )
+        source = _source_payload(
+            requested,
+            selected,
+            start_date,
+            end_date,
+            industry_classification,
+            membership_snapshot_hash,
+            fallback_reason,
+        )
+        publish_lock = None
+        try:
+            with membership_read_lock(pit_dir) as final_membership_snapshot:
+                final_membership_snapshot.ensure_transaction_clean()
+                final_membership_snapshot.validate_source(
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                )
+                if final_membership_snapshot.fingerprint() != membership_snapshot_hash:
+                    raise BlockedData("membership_snapshot_changed")
+                publish_lock = _acquire_writer_lock(reference_dir)
+                _recover_transaction(journal_path, allowed_transaction_targets)
+                _publish_transaction(
+                    tables,
+                    reference_dir,
+                    source,
+                    source_path,
+                    completed,
+                )
+        except BlockedData as exc:
+            return blocked(exc.reason_code)
+        except Exception:
+            return blocked("atomic_publish_failed")
+        finally:
+            if publish_lock is not None:
+                _release_writer_lock(publish_lock)
+        if status_path.resolve() != canonical_status_path.resolve():
+            try:
+                _atomic_write_status(completed, status_path)
+            except Exception:
+                return blocked("status_publish_failed")
+        print(
+            "download_robust_reference: completed; "
+            f"members={member_count}; member_days={member_day_count}"
+        )
+        return 0
+    finally:
+        for adapter in reversed(cleanup_adapters):
+            try:
+                adapter.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

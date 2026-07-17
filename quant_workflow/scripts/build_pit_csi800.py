@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import uuid
 from contextlib import ExitStack, contextmanager
@@ -37,11 +39,30 @@ DEFAULT_START_DATE = "2007-01-15"
 STATUS_FILENAME = "build_status_latest.json"
 SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
 TRANSACTION_JOURNAL_FILENAME = ".build_pit_csi800.transaction.json"
+TRANSACTION_JOURNAL_VERSION = 1
 REQUIRED_DAILY_COLUMNS = ("date", "symbol", "index_code")
 REQUIRED_INTERVAL_COLUMNS = ("symbol", "index_code", "start_date", "end_date")
 NORMALIZED_SYMBOL_PATTERN = re.compile(r"^(?:SH|SZ|BJ)\d{6}$")
 BLOCKED_RETURN_CODE = 2
 SUMMARY_SAMPLE_LIMIT = 20
+BAOSTOCK_QUERY_ATTEMPTS = 3
+BAOSTOCK_TRANSPORT_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
+BAOSTOCK_NETWORK_ERRNOS = {
+    value
+    for value in (
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EHOSTDOWN", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETRESET", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ETIMEDOUT", None),
+    )
+    if value is not None
+}
 
 
 class BuildBlocked(Exception):
@@ -79,9 +100,10 @@ class ExistingPartitionError(Exception):
 class ProviderQueryError(Exception):
     """A sanitized source-specific provider failure."""
 
-    def __init__(self, reason_code: str) -> None:
+    def __init__(self, reason_code: str, *, retryable: bool = False) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
+        self.retryable = retryable
 
 
 class JQDataProvider:
@@ -108,18 +130,66 @@ class BaostockProvider:
 
     def __init__(self, baostock_module: Any) -> None:
         self.baostock_module = baostock_module
-        login = baostock_module.login()
+        self._closed = False
+        self._login()
+
+    def _login(self) -> None:
+        login = self.baostock_module.login()
         if str(getattr(login, "error_code", "0")) != "0":
             raise ProviderQueryError("baostock_login_failed")
-        self._closed = False
+
+    def _reconnect(self) -> None:
+        try:
+            self.baostock_module.logout()
+        except Exception:
+            pass
+        self._login()
+
+    def _query_rows(self, query: Any) -> list[list[str]]:
+        for attempt in range(BAOSTOCK_QUERY_ATTEMPTS):
+            try:
+                return self._rows(query())
+            except ProviderQueryError as exc:
+                provider_error = exc
+            except OSError as exc:
+                if not self._is_transport_exception(exc):
+                    raise
+                provider_error = ProviderQueryError(
+                    "baostock_fetch_failed",
+                    retryable=True,
+                )
+            if not provider_error.retryable or attempt + 1 >= BAOSTOCK_QUERY_ATTEMPTS:
+                raise provider_error from None
+            self._reconnect()
+        raise ProviderQueryError("baostock_fetch_failed")
 
     @staticmethod
-    def _rows(result: Any) -> list[list[str]]:
-        if str(getattr(result, "error_code", "0")) != "0":
-            raise ProviderQueryError("baostock_fetch_failed")
+    def _is_transport_exception(exc: OSError) -> bool:
+        return isinstance(exc, (ConnectionError, TimeoutError)) or (
+            exc.errno in BAOSTOCK_NETWORK_ERRNOS
+        )
+
+    @staticmethod
+    def _raise_for_result_error(result: Any) -> None:
+        error_code = str(getattr(result, "error_code", "0"))
+        if error_code != "0":
+            raise ProviderQueryError(
+                "baostock_fetch_failed",
+                retryable=error_code in BAOSTOCK_TRANSPORT_ERROR_CODES,
+            )
+
+    @classmethod
+    def _rows(cls, result: Any) -> list[list[str]]:
+        cls._raise_for_result_error(result)
         rows: list[list[str]] = []
-        while result.next():
-            rows.append(result.get_row_data())
+        while True:
+            has_row = result.next()
+            cls._raise_for_result_error(result)
+            if not has_row:
+                break
+            row = result.get_row_data()
+            cls._raise_for_result_error(result)
+            rows.append(row)
         return rows
 
     @staticmethod
@@ -132,8 +202,8 @@ class BaostockProvider:
         return f"{exchange}{code}"
 
     def get_trading_days(self, start_date: date, end_date: date) -> list[date]:
-        rows = self._rows(
-            self.baostock_module.query_trade_dates(
+        rows = self._query_rows(
+            lambda: self.baostock_module.query_trade_dates(
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
             )
@@ -151,7 +221,7 @@ class BaostockProvider:
         query = query_by_index.get(index_code)
         if query is None:
             raise ProviderQueryError("baostock_index_unsupported")
-        rows = self._rows(query(date=on_date.isoformat()))
+        rows = self._query_rows(lambda: query(date=on_date.isoformat()))
         try:
             effective_dates = {date.fromisoformat(row[0]) for row in rows}
             members = [self._symbol(row[1]) for row in rows]
@@ -241,11 +311,14 @@ def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -266,12 +339,56 @@ def _owner_matches(path: Path, transaction_id: str) -> bool:
     return payload.get("transaction_id") == transaction_id
 
 
+def _regular_or_missing(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return True
+    return stat.S_ISREG(mode) and not path.is_symlink()
+
+
+def _allowed_internal_transaction_target(path: Path, root: Path) -> bool:
+    if path in {
+        root / "membership_intervals.parquet",
+        root / SOURCE_FILENAME,
+        root / STATUS_FILENAME,
+        _transaction_owner_path(root / STATUS_FILENAME),
+    }:
+        return True
+    daily_dir = root / "daily"
+    return (
+        path.parent == daily_dir
+        and re.fullmatch(r"\d{4}\.parquet", path.name) is not None
+    )
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directories(paths: Sequence[Path]) -> None:
+    for path in sorted({Path(value).resolve() for value in paths}, key=str):
+        _fsync_directory(path)
 
 
 def _restore_transaction_backup(backup: Path, target: Path) -> None:
@@ -302,12 +419,18 @@ def _rollback_transaction_entries(entries: Sequence[dict[str, Any]]) -> None:
             rollback_errors.append(exc)
     if rollback_errors:
         raise RuntimeError("transaction rollback failed") from rollback_errors[0]
+    _fsync_directories([Path(entry["target"]).parent for entry in entries])
 
 
 def _cleanup_transaction_entries(entries: Sequence[dict[str, Any]]) -> None:
+    directories: set[Path] = set()
     for entry in entries:
-        Path(entry["stage"]).unlink(missing_ok=True)
-        Path(entry["backup"]).unlink(missing_ok=True)
+        stage = Path(entry["stage"])
+        backup = Path(entry["backup"])
+        stage.unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
+        directories.update((stage.parent, backup.parent))
+    _fsync_directories(list(directories))
 
 
 def _commit_file_transaction(
@@ -376,8 +499,20 @@ def _commit_file_transaction(
                 }
             )
 
+        artifact_directories: set[Path] = set()
+        for entry in entries:
+            stage = Path(entry["stage"])
+            _fsync_file(stage)
+            artifact_directories.add(stage.parent)
+            backup = Path(entry["backup"])
+            if backup.exists():
+                _fsync_file(backup)
+                artifact_directories.add(backup.parent)
+        _fsync_directories(list(artifact_directories))
+
         _atomic_write_json(
             {
+                "version": TRANSACTION_JOURNAL_VERSION,
                 "transaction_id": transaction_id,
                 "state": "prepared",
                 "entries": entries,
@@ -386,13 +521,32 @@ def _commit_file_transaction(
         )
         for entry in entries:
             os.replace(entry["stage"], entry["target"])
-        journal.unlink()
+        _fsync_directories([Path(entry["target"]).parent for entry in entries])
+        _atomic_write_json(
+            {
+                "version": TRANSACTION_JOURNAL_VERSION,
+                "transaction_id": transaction_id,
+                "state": "committed",
+                "entries": entries,
+            },
+            journal,
+        )
     except Exception:
-        _rollback_transaction_entries(entries)
-        journal.unlink(missing_ok=True)
-        _cleanup_transaction_entries(entries)
+        if journal.is_file():
+            _recover_transaction(
+                output_dir,
+                allowed_external_targets=tuple(
+                    target
+                    for target in set(parquet_payloads) | set(json_payloads)
+                    if not Path(target).resolve().is_relative_to(root)
+                ),
+            )
+        else:
+            _cleanup_transaction_entries(entries)
         raise
     _cleanup_transaction_entries(entries)
+    journal.unlink(missing_ok=True)
+    _fsync_directory(journal.parent)
 
 
 def _commit_parquet_transaction(payloads: Mapping[Path, pd.DataFrame]) -> None:
@@ -410,30 +564,62 @@ def _recover_transaction(
     allowed_external_targets: Sequence[Path] = (),
 ) -> None:
     journal = _journal_path(output_dir)
-    if not journal.is_file():
+    try:
+        journal_mode = journal.lstat().st_mode
+    except FileNotFoundError:
         return
     try:
+        if journal.is_symlink() or not stat.S_ISREG(journal_mode):
+            raise ValueError("transaction journal is not a regular file")
         payload = json.loads(journal.read_text(encoding="utf-8"))
         entries = payload["entries"]
+        transaction_id = payload.get("transaction_id")
+        if (
+            payload.get("version") != TRANSACTION_JOURNAL_VERSION
+            or not isinstance(transaction_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
+            or payload.get("state") not in {"prepared", "committed"}
+            or not isinstance(entries, list)
+            or not entries
+        ):
+            raise ValueError("transaction journal is invalid")
         allowed = {path.resolve() for path in allowed_external_targets}
         allowed_owners = {_transaction_owner_path(path).resolve() for path in allowed}
         root = output_dir.resolve()
         rollback_entries: list[dict[str, Any]] = []
+        seen_targets: set[Path] = set()
         for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or type(entry.get("had_original")) is not bool
+            ):
+                raise ValueError("transaction entry is invalid")
             target = Path(entry["target"]).resolve()
             stage = Path(entry["stage"]).resolve()
             backup = Path(entry["backup"]).resolve()
             is_internal = target.is_relative_to(root)
+            if is_internal and not _allowed_internal_transaction_target(target, root):
+                raise ValueError("transaction target is not a workflow artifact")
             if not (is_internal or target in allowed or target in allowed_owners):
                 raise ValueError("transaction target is outside allowed roots")
-            if stage.parent != target.parent or backup.parent != target.parent:
+            expected_stage = target.with_name(f".{target.name}.{transaction_id}.stage")
+            expected_backup = target.with_name(
+                f".{target.name}.{transaction_id}.backup"
+            )
+            if (
+                target in seen_targets
+                or entry.get("transaction_id") != transaction_id
+                or stage != expected_stage
+                or backup != expected_backup
+                or not all(
+                    _regular_or_missing(path) for path in (target, stage, backup)
+                )
+            ):
                 raise ValueError("transaction artifact path is invalid")
+            seen_targets.add(target)
             if is_internal:
                 rollback_entries.append(entry)
                 continue
-            transaction_id = str(
-                entry.get("transaction_id") or payload.get("transaction_id") or ""
-            )
             owner_text = str(entry.get("external_owner_path") or "")
             owner_path = Path(owner_text).resolve() if owner_text else None
             if owner_path is not None and _owner_matches(owner_path, transaction_id):
@@ -448,9 +634,11 @@ def _recover_transaction(
             ):
                 if _file_sha256(target) == installed_sha256:
                     rollback_entries.append(entry)
-        _rollback_transaction_entries(rollback_entries)
+        if payload["state"] == "prepared":
+            _rollback_transaction_entries(rollback_entries)
         journal.unlink()
         _cleanup_transaction_entries(entries)
+        _fsync_directory(journal.parent)
     except Exception as exc:
         raise BuildBlocked(
             "transaction_recovery_failed",

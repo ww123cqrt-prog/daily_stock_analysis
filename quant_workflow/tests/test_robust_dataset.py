@@ -54,6 +54,51 @@ def test_normalize_feature_frame_operates_within_same_date_and_board() -> None:
     assert normalized["BOARD_STAR"].eq(0.0).all()
 
 
+def test_market_state_features_use_only_same_day_cross_section() -> None:
+    module = load_module()
+    first_day = pd.Timestamp("2026-01-05")
+    second_day = pd.Timestamp("2026-01-06")
+    index = pd.MultiIndex.from_product(
+        [[first_day, second_day], ["SH600000", "SZ300001"]],
+        names=["datetime", "instrument"],
+    )
+    features = pd.DataFrame(
+        {"F1": [1.0, 3.0, 100.0, 300.0], "F2": [2.0, 4.0, -100.0, -300.0]},
+        index=index,
+    )
+
+    normalized = module.normalize_feature_frame(
+        features, add_board_features=True, add_market_state_features=True
+    )
+    first = normalized.loc[first_day]
+    assert first["MARKET_STATE_MEAN"].nunique() == 1
+    assert first["MARKET_STATE_MEAN"].iloc[0] == 2.5
+    assert first["MARKET_STATE_BREADTH"].iloc[0] == 1.0
+    assert first["MARKET_STATE_DISPERSION"].iloc[0] == 1.0
+
+    without_future = module.normalize_feature_frame(
+        features.loc[[first_day]],
+        add_board_features=True,
+        add_market_state_features=True,
+    )
+    assert np.allclose(
+        first[
+            [
+                "MARKET_STATE_MEAN",
+                "MARKET_STATE_BREADTH",
+                "MARKET_STATE_DISPERSION",
+            ]
+        ].values,
+        without_future[
+            [
+                "MARKET_STATE_MEAN",
+                "MARKET_STATE_BREADTH",
+                "MARKET_STATE_DISPERSION",
+            ]
+        ].values,
+    )
+
+
 def test_transform_prepared_frame_preserves_label_and_feature_column_groups() -> None:
     module = load_module()
     index = pd.MultiIndex.from_tuples(

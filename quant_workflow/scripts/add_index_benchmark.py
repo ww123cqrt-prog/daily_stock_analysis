@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import tempfile
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -87,9 +89,24 @@ def _download_index_data(
         frequency="d",
         adjustflag="3",
     )
+
+    def raise_for_error() -> None:
+        error_code = str(getattr(rs, "error_code", "0"))
+        if error_code != "0":
+            raise RuntimeError(
+                "baostock benchmark query failed: "
+                f"{error_code} {getattr(rs, 'error_msg', '')}"
+            )
+
+    raise_for_error()
     rows: list[list[str]] = []
-    while rs.next():
+    while True:
+        has_row = rs.next()
+        raise_for_error()
+        if not has_row:
+            break
         rows.append(rs.get_row_data())
+        raise_for_error()
     frame = pd.DataFrame(
         rows, columns=["date", "open", "high", "low", "close", "volume"]
     )
@@ -128,6 +145,7 @@ def add_benchmark(
     *,
     dry_run: bool = False,
     baostock_module=None,
+    required_start_date: str = "2014-01-02",
 ) -> dict[str, str | int]:
     paths = BenchmarkPaths(provider_dir)
     try:
@@ -163,29 +181,81 @@ def add_benchmark(
     downloaded = _download_benchmarks(bs, calendar[0], calendar[-1])
     downloaded_days: dict[str, int] = {}
     calendar_index = pd.Index(calendar)
+    required_start = max(pd.Timestamp(calendar[0]), pd.Timestamp(required_start_date))
+    required_calendar = calendar_index[
+        pd.to_datetime(calendar_index, errors="coerce") >= required_start
+    ]
+    if required_calendar.empty:
+        raise RuntimeError("Qlib calendar has no dates in the required benchmark period")
+    aligned_by_symbol: dict[str, pd.DataFrame] = {}
     for symbol, frame in downloaded.items():
         if frame.empty:
             raise RuntimeError(f"no benchmark data returned for {symbol}")
         aligned = frame.reindex(calendar_index)
         price_fields = ["open", "high", "low", "close"]
-        aligned[price_fields] = aligned[price_fields].ffill().bfill()
-        aligned["volume"] = aligned["volume"].fillna(0.0)
-        if aligned[price_fields].isna().any(axis=None) or (
-            aligned[price_fields] <= 0
-        ).any(axis=None):
-            raise RuntimeError(f"benchmark OHLC is incomplete for {symbol}")
-        feature_dir = paths.feature_dir(symbol)
-        for field in ["open", "high", "low", "close", "volume"]:
-            _write_bin(
-                feature_dir / f"{field}.day.bin",
-                0,
-                aligned[field].to_numpy(dtype="<f4"),
+        required = aligned.loc[required_calendar]
+        missing_dates = required.index[
+            required[price_fields + ["volume"]].isna().any(axis=1)
+        ].tolist()
+        if missing_dates:
+            raise RuntimeError(
+                f"benchmark {symbol} is missing required trading days: "
+                f"{missing_dates[:10]}"
             )
-        _write_bin(
-            feature_dir / "factor.day.bin", 0, np.ones(len(calendar), dtype="<f4")
-        )
+        if (required[price_fields] <= 0).any(axis=None) or (
+            required["volume"] < 0
+        ).any(axis=None):
+            raise RuntimeError(f"benchmark OHLCV is invalid for {symbol}")
+        aligned_by_symbol[symbol] = aligned
         downloaded_days[symbol] = int(len(frame))
-        print(f"Written {symbol}: {len(frame)} downloaded days -> {feature_dir}")
+
+    features_root = paths.provider_dir / "features"
+    features_root.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=".benchmark-stage-", dir=features_root))
+    backup_root = Path(tempfile.mkdtemp(prefix=".benchmark-backup-", dir=features_root))
+    installed: list[tuple[Path, Path | None]] = []
+    try:
+        for symbol, aligned in aligned_by_symbol.items():
+            feature_dir = staging_root / symbol.lower()
+            for field in ["open", "high", "low", "close", "volume"]:
+                _write_bin(
+                    feature_dir / f"{field}.day.bin",
+                    0,
+                    aligned[field].to_numpy(dtype="<f4"),
+                )
+            _write_bin(
+                feature_dir / "factor.day.bin",
+                0,
+                np.ones(len(calendar), dtype="<f4"),
+            )
+        for symbol in aligned_by_symbol:
+            target = paths.feature_dir(symbol)
+            backup = backup_root / symbol.lower()
+            previous = backup if target.exists() else None
+            if previous is not None:
+                os.replace(target, previous)
+            try:
+                os.replace(staging_root / symbol.lower(), target)
+            except Exception:
+                if previous is not None and previous.exists():
+                    os.replace(previous, target)
+                raise
+            installed.append((target, previous))
+    except Exception:
+        for target, previous in reversed(installed):
+            shutil.rmtree(target, ignore_errors=True)
+            if previous is not None and previous.exists():
+                os.replace(previous, target)
+        raise
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        shutil.rmtree(backup_root, ignore_errors=True)
+
+    for symbol, frame in downloaded.items():
+        print(
+            f"Written {symbol}: {len(frame)} downloaded days -> "
+            f"{paths.feature_dir(symbol)}"
+        )
 
     # Benchmarks are features only and must never enter any stock training pool.
     for instrument_file in paths.instruments_dir.glob("*.txt"):
@@ -208,13 +278,18 @@ def main(argv: list[str] | None = None) -> int:
         description="Add CSI300/CSI500/CSI800 benchmark features to a Qlib provider."
     )
     parser.add_argument("--provider-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--required-start-date", default="2014-01-02")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate paths and calendar without network or writes.",
     )
     args = parser.parse_args(argv)
-    add_benchmark(args.provider_dir, dry_run=args.dry_run)
+    add_benchmark(
+        args.provider_dir,
+        dry_run=args.dry_run,
+        required_start_date=args.required_start_date,
+    )
     return 0
 
 

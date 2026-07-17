@@ -584,6 +584,9 @@ def _run_replay(
         minimum_commission=float(costs["minimum_commission_cny"]),
         slippage_bps=0.0,
         all_in_round_trip_bps=float(costs["scenarios"]["baseline_total_bps"]),
+        defer_unfilled_open_orders=bool(
+            config["execution_rules"]["defer_unfilled_open_orders"]
+        ),
     )
     return _normalize_daily_returns(result["daily"], as_of_date=as_of_date)
 

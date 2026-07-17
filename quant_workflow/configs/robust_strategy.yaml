@@ -28,6 +28,7 @@ paths:
 universe:
   kind: pit_csi800
   membership_source: auto
+  reference_source: auto
   start_date: '2014-01-02'
   indices:
     - id: csi300
