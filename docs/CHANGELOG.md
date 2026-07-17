@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] `/workflow` 新增鲁棒开发、冻结确认和当日纸面跟踪入口，`/backtest` 新增模型稳定性、策略压力、季度/市场状态、确认期与纸面跟踪矩阵，`/experiments/` 可直达对应 MLflow Runs；鲁棒报告独立写入 `quant_workflow/reports/robust_strategy/`，不覆盖日常候选流程。
 - [修复] 鲁棒纸面跟踪现在严格核对交易日日历、禁止失败日期被重跑成成功，并用线程锁和进程锁保护信号与状态文件；研究状态 API 按报告内时间选择最新生命周期，单独展示最近一次纸面任务，限制超大报告/列表并补齐跨平台路径脱敏。
 - [测试] 新增历史股票池防前视、数据预检、标签切分、模型/策略稳定性、确认期冻结、影子跟踪、并发持久化、API 脱敏、工作流与回测页面测试；正式训练仍须先通过真实数据预检。
+- [修复] 鲁棒开发长任务改由 macOS `launchd` 托管，监督进程会同步 PID、退出码和最终状态；网页启动不再把 DSA 服务自己的临时子进程当作正式训练进程，僵尸 launch record 会按实际 run 状态纠正。
+- [修复] PIT CSI800 构建按完整年度保存断点并发布 run 专属进度，构建标记存在时所有读取方拒绝半成品；`/workflow` 显示已完成/总交易日进度，后续年度失败不再丢失此前完整年度。
+- [修复] 历史指数成分按 99% 单日数量底线接受真实的短暂 299/499 缺口并记录异常，不用相邻日期或今天成分补造历史；最终 99% 完整交易日覆盖门槛保持不变，低于底线仍阻断。
+- [修复] 鲁棒主编排保留数据阶段报告中的真实 `blocked_data` 原因，不再把 `membership_validation_failed` 等可核对原因改写成笼统的 `stage_evidence_status_invalid`。
 - [新功能] 量化任务中心新增五模型完整候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择前两名及五套策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常模型或下单。
 - [新功能] DSA 新增唯一实验入口 `/experiments/`：后端流式代理现有 MLflow 3.14.0 `6006` 服务，并在官方页面上叠加中文/English 即时切换；本机 MLflow 链接统一改写到 8010，6006 退为后台且不再需要 6007 或额外代理进程。
 - [修复] MLflow 双语层保护实验名、Run 名、参数名、指标名和 artifact 文件名，不再把与界面词汇同名的业务数据翻译；第一版隐藏 GenAI、Prompt、AI Gateway、LLM Connections 和模型注册入口，并把越界路由重定向回训练实验。

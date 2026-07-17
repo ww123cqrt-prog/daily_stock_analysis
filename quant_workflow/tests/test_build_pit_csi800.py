@@ -259,6 +259,7 @@ def test_builds_normalized_daily_membership_intervals_and_separate_status(
     assert status["missing_summary"]["count"] == 0
     assert status["anomaly_summary"]["count"] == 0
     assert status["membership_source"]["selected"] == "test_fixture"
+    assert not (output_dir / module.BUILD_IN_PROGRESS_FILENAME).exists()
     source = json.loads(
         (output_dir / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
     )
@@ -895,10 +896,10 @@ def test_blocks_when_complete_intermediate_year_calendar_is_empty(
     assert not (output_dir / "membership_intervals.parquet").exists()
 
 
-def test_blocks_when_constituent_count_is_not_300_and_500(tmp_path: Path) -> None:
+def test_blocks_when_constituent_count_falls_below_99_percent(tmp_path: Path) -> None:
     module = load_module()
     members = valid_members()
-    members[CSI300] = members[CSI300][:-1]
+    members[CSI300] = members[CSI300][:-4]
     provider = FakeProvider(["2025-01-02"], members)
 
     return_code, output_dir, status_dir = run_main(
@@ -915,9 +916,42 @@ def test_blocks_when_constituent_count_is_not_300_and_500(tmp_path: Path) -> Non
     assert status["reason_code"] == "membership_validation_failed"
     assert status["completed_date_count"] == 0
     assert status["missing_summary"]["count"] == 1
-    assert status["anomaly_summary"]["items"][0]["csi300_count"] == 299
+    assert status["anomaly_summary"]["items"][0]["csi300_count"] == 296
     assert not (output_dir / "daily" / "2025.parquet").exists()
     assert "Traceback" not in status_text
+
+
+def test_accepts_temporary_499_member_csi500_gap_without_imputation(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    members = valid_members()
+    members[CSI500] = members[CSI500][:-1]
+    provider = FakeProvider(["2019-01-07"], members)
+
+    return_code, output_dir, status_dir = run_main(
+        module,
+        tmp_path,
+        provider,
+        start_date="2019-01-07",
+        end_date="2019-01-07",
+    )
+
+    daily = pd.read_parquet(output_dir / "daily" / "2019.parquet")
+    status = json.loads(
+        (status_dir / "build_status_latest.json").read_text(encoding="utf-8")
+    )
+    assert return_code == 0
+    assert len(daily) == 799
+    assert daily.groupby("index_code").size().to_dict() == {
+        CSI300: 300,
+        CSI500: 499,
+    }
+    assert status["status"] == "completed"
+    assert status["anomaly_summary"]["count"] == 1
+    assert status["anomaly_summary"]["items"][0]["reason_code"] == (
+        "membership_count_below_nominal"
+    )
 
 
 def test_blocks_when_csi300_and_csi500_overlap(tmp_path: Path) -> None:
@@ -1195,8 +1229,9 @@ def test_force_refetches_an_existing_complete_year(tmp_path: Path) -> None:
     assert len(forced_provider.member_calls) == 2
 
 
-def test_later_year_failure_does_not_commit_earlier_year_or_intervals(
+def test_later_year_failure_keeps_completed_year_checkpoint_but_not_intervals(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     module = load_module()
     output_dir = tmp_path / "pit"
@@ -1219,6 +1254,18 @@ def test_later_year_failure_does_not_commit_earlier_year_or_intervals(
     original_2024 = path_2024.read_bytes()
     original_2025 = path_2025.read_bytes()
     original_intervals = intervals_path.read_bytes()
+    published_statuses: list[dict] = []
+    commit = module._commit_file_transaction
+
+    def record_commit(parquet_payloads, json_payloads, *, output_dir):
+        published_statuses.extend(
+            payload
+            for target, payload in json_payloads.items()
+            if target.name == module.STATUS_FILENAME
+        )
+        return commit(parquet_payloads, json_payloads, output_dir=output_dir)
+
+    monkeypatch.setattr(module, "_commit_file_transaction", record_commit)
     provider = FakeProvider(
         ["2024-12-30", "2024-12-31", "2025-01-02", "2025-01-03"],
         member_errors_by_date={
@@ -1247,9 +1294,21 @@ def test_later_year_failure_does_not_commit_earlier_year_or_intervals(
     assert return_code != 0
     assert status["status"] == "blocked_data"
     assert status["reason_code"] == "jqdata_permission_denied"
-    assert path_2024.read_bytes() == original_2024
+    assert path_2024.read_bytes() != original_2024
+    assert sorted(pd.read_parquet(path_2024)["date"].dt.date.unique()) == [
+        date(2024, 12, 30),
+        date(2024, 12, 31),
+    ]
     assert path_2025.read_bytes() == original_2025
     assert intervals_path.read_bytes() == original_intervals
+    assert status["completed_date_count"] == 2
+    assert (output_dir / module.BUILD_IN_PROGRESS_FILENAME).is_file()
+    assert any(
+        item["status"] == "running"
+        and item["completed_date_count"] == 1
+        and item["expected_date_count"] == 3
+        for item in published_statuses
+    )
 
 
 def test_concurrent_incremental_builds_do_not_lose_dates(tmp_path: Path) -> None:
@@ -1419,14 +1478,16 @@ def test_status_write_failure_returns_nonzero_without_committing_data(
     assert not (output_dir / "membership_intervals.parquet").exists()
 
 
-def test_incomplete_existing_date_blocks_before_fetch_or_write(tmp_path: Path) -> None:
+def test_existing_date_below_99_percent_blocks_before_fetch_or_write(
+    tmp_path: Path,
+) -> None:
     module = load_module()
     output_dir = tmp_path / "pit"
     status_dir = tmp_path / "status"
     daily_path = output_dir / "daily" / "2025.parquet"
     intervals_path = output_dir / "membership_intervals.parquet"
     daily_path.parent.mkdir(parents=True)
-    incomplete = normalized_daily_membership(["2025-01-02"]).iloc[:-1]
+    incomplete = normalized_daily_membership(["2025-01-02"]).iloc[:-9]
     incomplete.to_parquet(daily_path, index=False)
     pd.DataFrame({"sentinel": [1]}).to_parquet(intervals_path, index=False)
     original_daily = daily_path.read_bytes()

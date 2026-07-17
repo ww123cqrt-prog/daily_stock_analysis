@@ -2316,7 +2316,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "run_robust_strategy", {"run_id": invalid_run_id}
                     )
 
-        self.assertIn("run_robust_strategy.py", development[1])
+        self.assertIn("launch_robust_strategy.py", development[1])
         self.assertEqual(
             development[development.index("--report-dir") + 1],
             str(REPORTS_ROOT / "robust_strategy"),

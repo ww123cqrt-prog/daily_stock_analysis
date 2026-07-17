@@ -113,6 +113,13 @@ vi.mock('../../api/research', () => ({
         runId: 'robust_20260716',
         failedStage: 'build_pit_csi800',
         updatedAt: '2026-07-16T08:10:00+08:00',
+        progress: {
+          stage: 'build_pit_csi800',
+          status: 'running',
+          completedDateCount: 1250,
+          expectedDateCount: 3047,
+          generatedAt: '2026-07-16T08:09:30+08:00',
+        },
         stages: [
           { name: 'build_pit_csi800', status: 'blocked_data', reasonCode: 'jqdata_permission_denied' },
           { name: 'download_robust_reference', status: 'pending' },
@@ -329,6 +336,8 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('数据阻断')).toBeInTheDocument();
     expect(screen.getAllByText('jqdata_permission_denied').length).toBeGreaterThan(0);
     expect(screen.getAllByText('build_pit_csi800').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('robust-stage-progress')).toHaveTextContent('1250 / 3047');
+    expect(screen.getByRole('progressbar', { name: '历史股票池构建进度' })).toHaveAttribute('aria-valuenow', '41');
     expect(screen.getByText('最近纸面任务')).toBeInTheDocument();
     expect(screen.getByText('2026-07-16')).toBeInTheDocument();
     expect(screen.getAllByText('inference_failed').length).toBeGreaterThan(0);

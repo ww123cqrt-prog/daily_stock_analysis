@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
+import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -23,11 +26,31 @@ from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
 from run_robust_strategy import DEFAULT_CONFIG, RUN_ID_RE, new_run_id  # noqa: E402
 
 
+LAUNCHCTL = "/bin/launchctl"
+ACTIVE_LAUNCH_STATUSES = {"starting", "running"}
+TERMINAL_LIFECYCLE_STATUSES = {"completed", "stopped"}
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(content, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def build_command(
@@ -99,17 +122,216 @@ def _claim_launch_record(report_dir: Path, run_id: str) -> Iterator[None]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _existing_runner_is_active(
-    runner_dir: Path, pid_alive: Callable[[int], bool]
+def _launchd_label(run_id: str) -> str:
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+    return f"com.dsa.robust-strategy.{digest}"
+
+
+def _launchd_job_info(
+    domain: str,
+    label: str,
+    *,
+    launchctl_runner: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any] | None:
+    completed = launchctl_runner(
+        [LAUNCHCTL, "print", f"{domain}/{label}"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if int(completed.returncode) != 0:
+        return None
+    output = str(completed.stdout or "")
+    state_match = re.search(r"(?m)^\s*state\s*=\s*([^\s]+)\s*$", output)
+    pid_match = re.search(r"(?m)^\s*pid\s*=\s*(\d+)\s*$", output)
+    return {
+        "state": state_match.group(1) if state_match else None,
+        "pid": int(pid_match.group(1)) if pid_match else None,
+    }
+
+
+def _write_pipeline_state(path: Path, state: dict[str, Any]) -> None:
+    _atomic_write(
+        path,
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _reconcile_existing_runner(
+    runner_dir: Path,
+    *,
+    report_dir: Path,
+    run_id: str,
+    pid_alive: Callable[[int], bool],
+    launchd_probe: Callable[[str, str], dict[str, Any] | None],
 ) -> bool:
     launch_path = runner_dir / "launch.json"
+    launch_record = _read_json(launch_path)
+    if launch_record.get("status") not in ACTIVE_LAUNCH_STATUSES:
+        return False
     pid_path = runner_dir / "pid"
     try:
-        launch_record = json.loads(launch_path.read_text(encoding="utf-8"))
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
-    return launch_record.get("status") in {"starting", "running"} and pid_alive(pid)
+        recorded_pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        recorded_pid = int(launch_record.get("pid") or 0)
+
+    job_label = launch_record.get("job_label")
+    domain = launch_record.get("launchd_domain")
+    if isinstance(job_label, str) and isinstance(domain, str):
+        job = launchd_probe(domain, job_label)
+        launchd_pid = int((job or {}).get("pid") or 0)
+        active = bool(
+            job
+            and job.get("state") == "running"
+            and (
+                (recorded_pid > 0 and pid_alive(recorded_pid))
+                or (launchd_pid > 0 and pid_alive(launchd_pid))
+            )
+        )
+    else:
+        active = recorded_pid > 0 and pid_alive(recorded_pid)
+    if active:
+        return True
+
+    run_state_path = report_dir / "runs" / run_id / "status.json"
+    run_state = _read_json(run_state_path)
+    lifecycle = run_state.get("lifecycle_status")
+    reconciled_status = lifecycle if lifecycle in TERMINAL_LIFECYCLE_STATUSES else "stale"
+    reconciled = {
+        **launch_record,
+        "status": reconciled_status,
+        "reconciled_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    _write_pipeline_state(launch_path, reconciled)
+
+    if run_state and lifecycle not in TERMINAL_LIFECYCLE_STATUSES:
+        run_state.update(
+            {
+                "lifecycle_status": "stopped",
+                "status": "blocked_data",
+                "reason_code": "runner_process_missing",
+                "updated_at": datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds"),
+            }
+        )
+        _write_pipeline_state(run_state_path, run_state)
+        latest_path = report_dir / "robust_strategy_status_latest.json"
+        if _read_json(latest_path).get("run_id") == run_id:
+            _write_pipeline_state(latest_path, run_state)
+    return False
+
+
+def _worker_program_arguments(
+    *,
+    launch_path: Path,
+    pid_path: Path,
+    report_dir: Path,
+    run_id: str,
+    command: list[str],
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--launchd-worker",
+        "--launch-path",
+        str(launch_path),
+        "--pid-path",
+        str(pid_path),
+        "--report-dir",
+        str(report_dir),
+        "--run-id",
+        run_id,
+        "--",
+        *command,
+    ]
+
+
+def _write_launchd_plist(
+    path: Path,
+    *,
+    label: str,
+    program_arguments: list[str],
+    log_path: Path,
+    error_log_path: Path,
+) -> None:
+    payload = {
+        "Label": label,
+        "ProgramArguments": program_arguments,
+        "WorkingDirectory": str(workflow_root()),
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "LaunchOnlyOnce": True,
+        "ProcessType": "Standard",
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(error_log_path),
+    }
+    _atomic_write_bytes(path, plistlib.dumps(payload, sort_keys=True))
+
+
+def run_launchd_worker(
+    *,
+    launch_path: Path,
+    pid_path: Path,
+    report_dir: Path,
+    run_id: str,
+    command: list[str],
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+) -> int:
+    launch_record = _read_json(launch_path)
+    try:
+        process = popen_factory(
+            command,
+            cwd=str(workflow_root()),
+            stdin=subprocess.DEVNULL,
+            start_new_session=False,
+            close_fds=True,
+            shell=False,
+        )
+    except OSError as exc:
+        _write_pipeline_state(
+            launch_path,
+            {
+                **launch_record,
+                "status": "failed_to_start",
+                "error_type": type(exc).__name__,
+                "finished_at": datetime.now()
+                .astimezone()
+                .isoformat(timespec="seconds"),
+            },
+        )
+        return 127
+
+    child_pid = int(process.pid)
+    _atomic_write(pid_path, f"{child_pid}\n")
+    _write_pipeline_state(
+        launch_path,
+        {
+            **launch_record,
+            "status": "running",
+            "pid": child_pid,
+            "worker_pid": os.getpid(),
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+    )
+    return_code = int(process.wait())
+    run_state = _read_json(report_dir / "runs" / run_id / "status.json")
+    lifecycle = run_state.get("lifecycle_status")
+    if lifecycle in TERMINAL_LIFECYCLE_STATUSES:
+        status = str(lifecycle)
+    else:
+        status = "completed" if return_code == 0 else "failed"
+    _write_pipeline_state(
+        launch_path,
+        {
+            **_read_json(launch_path),
+            "status": status,
+            "return_code": return_code,
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+    )
+    return return_code
 
 
 def _launch_claimed(
@@ -122,9 +344,11 @@ def _launch_claimed(
     resume: bool,
     skip_membership_build: bool,
     warmup_seconds: float = 10.0,
-    popen_factory: Callable[..., Any] = subprocess.Popen,
+    launchctl_runner: Callable[..., Any] = subprocess.run,
     sleep_fn: Callable[[float], None] = time.sleep,
     cpu_probe: Callable[[int], float | None] = _cpu_percent,
+    pid_alive: Callable[[int], bool] = _pid_alive,
+    uid: int | None = None,
 ) -> dict[str, Any]:
     if not RUN_ID_RE.fullmatch(run_id):
         raise ValueError("run_id contains unsupported characters")
@@ -134,8 +358,12 @@ def _launch_claimed(
     runner_dir = report_dir / "runner" / run_id
     runner_dir.mkdir(parents=True, exist_ok=True)
     log_path = runner_dir / "runner.log"
+    error_log_path = runner_dir / "runner.err.log"
     pid_path = runner_dir / "pid"
     launch_path = runner_dir / "launch.json"
+    plist_path = runner_dir / "launchd.plist"
+    domain = f"gui/{os.getuid() if uid is None else int(uid)}"
+    job_label = _launchd_label(run_id)
     command = build_command(
         config=config,
         quant_data_dir=quant_data_dir,
@@ -151,55 +379,83 @@ def _launch_claimed(
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "command": command,
         "log_path": str(log_path),
+        "error_log_path": str(error_log_path),
         "pid_path": str(pid_path),
+        "plist_path": str(plist_path),
+        "launch_backend": "launchd",
+        "launchd_domain": domain,
+        "job_label": job_label,
     }
     _atomic_write(
         launch_path,
         json.dumps(initial, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
-    log_handle = log_path.open("ab", buffering=0)
-    try:
-        process = popen_factory(
-            command,
-            cwd=str(workflow_root()),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            shell=False,
-        )
-    finally:
-        log_handle.close()
-    _atomic_write(pid_path, f"{int(process.pid)}\n")
-    sleep_fn(float(warmup_seconds))
-    return_code = process.poll()
-    if return_code is not None:
+    log_path.touch(exist_ok=True)
+    error_log_path.touch(exist_ok=True)
+    _write_launchd_plist(
+        plist_path,
+        label=job_label,
+        program_arguments=_worker_program_arguments(
+            launch_path=launch_path,
+            pid_path=pid_path,
+            report_dir=report_dir,
+            run_id=run_id,
+            command=command,
+        ),
+        log_path=log_path,
+        error_log_path=error_log_path,
+    )
+    completed = launchctl_runner(
+        [LAUNCHCTL, "bootstrap", domain, str(plist_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    if int(completed.returncode) != 0:
         failed = {
             **initial,
             "status": "failed_to_start",
-            "pid": int(process.pid),
-            "return_code": int(return_code),
+            "launchctl_return_code": int(completed.returncode),
             "verified_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
-        _atomic_write(
-            launch_path,
-            json.dumps(failed, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        )
-        raise RuntimeError(
-            f"robust strategy process exited during warmup with code {return_code}"
-        )
+        _write_pipeline_state(launch_path, failed)
+        raise RuntimeError("launchd rejected the robust strategy job")
+
+    sleep_fn(float(warmup_seconds))
+    current = _read_json(launch_path)
+    if current.get("status") not in ACTIVE_LAUNCH_STATUSES:
+        return current
+    job = _launchd_job_info(domain, job_label, launchctl_runner=launchctl_runner)
+    launchd_pid = int((job or {}).get("pid") or 0)
+    try:
+        child_pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        child_pid = launchd_pid
+    if (
+        not job
+        or job.get("state") != "running"
+        or child_pid <= 0
+        or not pid_alive(child_pid)
+    ):
+        failed = {
+            **initial,
+            "status": "failed_to_start",
+            "pid": child_pid or None,
+            "verified_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        _write_pipeline_state(launch_path, failed)
+        raise RuntimeError("launchd job was not running after warmup")
     result = {
-        **initial,
+        **current,
         "status": "running",
-        "pid": int(process.pid),
-        "cpu_percent": cpu_probe(int(process.pid)),
+        "pid": child_pid,
+        "launchd_pid": launchd_pid,
+        "cpu_percent": cpu_probe(child_pid),
         "verified_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    _atomic_write(
-        launch_path,
-        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
+    _atomic_write(pid_path, f"{child_pid}\n")
+    _write_pipeline_state(launch_path, result)
     return result
 
 
@@ -213,18 +469,42 @@ def launch(
     resume: bool,
     skip_membership_build: bool,
     warmup_seconds: float = 10.0,
-    popen_factory: Callable[..., Any] = subprocess.Popen,
+    launchctl_runner: Callable[..., Any] = subprocess.run,
     sleep_fn: Callable[[float], None] = time.sleep,
     cpu_probe: Callable[[int], float | None] = _cpu_percent,
     pid_alive: Callable[[int], bool] = _pid_alive,
+    uid: int | None = None,
 ) -> dict[str, Any]:
     report_dir = Path(report_dir).expanduser().resolve()
     runner_dir = report_dir / "runner" / run_id
+
+    def launchd_probe(domain: str, label: str) -> dict[str, Any] | None:
+        return _launchd_job_info(
+            domain, label, launchctl_runner=launchctl_runner
+        )
+
     with _claim_launch_record(report_dir, run_id):
-        if _existing_runner_is_active(runner_dir, pid_alive):
+        if _reconcile_existing_runner(
+            runner_dir,
+            report_dir=report_dir,
+            run_id=run_id,
+            pid_alive=pid_alive,
+            launchd_probe=launchd_probe,
+        ):
             raise ValueError(f"robust strategy run {run_id!r} is already running")
         if not resume and (report_dir / "runs" / run_id / "status.json").exists():
             raise ValueError(f"robust strategy run {run_id!r} already exists; use resume")
+        previous = _read_json(runner_dir / "launch.json")
+        previous_label = previous.get("job_label")
+        previous_domain = previous.get("launchd_domain")
+        if isinstance(previous_label, str) and isinstance(previous_domain, str):
+            launchctl_runner(
+                [LAUNCHCTL, "bootout", f"{previous_domain}/{previous_label}"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
         return _launch_claimed(
             config=config,
             quant_data_dir=quant_data_dir,
@@ -234,13 +514,40 @@ def launch(
             resume=resume,
             skip_membership_build=skip_membership_build,
             warmup_seconds=warmup_seconds,
-            popen_factory=popen_factory,
+            launchctl_runner=launchctl_runner,
             sleep_fn=sleep_fn,
             cpu_probe=cpu_probe,
+            pid_alive=pid_alive,
+            uid=uid,
         )
 
 
+def _launchd_worker_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--launch-path", type=Path, required=True)
+    parser.add_argument("--pid-path", type=Path, required=True)
+    parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise ValueError("launchd worker command is required")
+    return run_launchd_worker(
+        launch_path=args.launch_path,
+        pid_path=args.pid_path,
+        report_dir=args.report_dir,
+        run_id=args.run_id,
+        command=command,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--launchd-worker":
+        return _launchd_worker_main(argv[1:])
     parser = argparse.ArgumentParser(
         description="Launch robust strategy training outside the terminal session."
     )

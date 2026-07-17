@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -82,6 +83,10 @@ ROBUST_REPORT_MAX_BYTES = 8 * 1024 * 1024
 ROBUST_LIST_PREVIEW_LIMIT = 100
 ROBUST_MAPPING_PREVIEW_LIMIT = 100
 ROBUST_TREE_MAX_DEPTH = 8
+ROBUST_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+ROBUST_STAGE_PROGRESS_REPORTS = {
+    "build_pit_csi800": "build_status_latest.json",
+}
 TONGHUASHUN_CANDIDATE_PATHS = (
     Path("/Applications/同花顺.app"),
     Path("/Applications/同花顺远航版.app"),
@@ -466,6 +471,55 @@ def _robust_shadow_daily_payload(raw: Any) -> Dict[str, Any]:
     return result
 
 
+def _robust_stage_progress(
+    robust_dir: Path, orchestration: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(orchestration, dict):
+        return None
+    run_id = orchestration.get("run_id")
+    stage = orchestration.get("current_stage")
+    if (
+        not isinstance(run_id, str)
+        or not ROBUST_RUN_ID_RE.fullmatch(run_id)
+        or not isinstance(stage, str)
+        or stage not in ROBUST_STAGE_PROGRESS_REPORTS
+    ):
+        return None
+    report = _read_robust_json_object(
+        robust_dir
+        / "runs"
+        / run_id
+        / "stage_reports"
+        / stage
+        / ROBUST_STAGE_PROGRESS_REPORTS[stage]
+    )
+    if not isinstance(report, dict):
+        return None
+    completed = report.get("completed_date_count")
+    expected = report.get("expected_date_count")
+    if (
+        isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or completed < 0
+        or expected <= 0
+        or completed > expected
+    ):
+        return None
+    return {
+        key: _sanitize_robust_tree(value)
+        for key, value in {
+            "stage": stage,
+            "status": report.get("status"),
+            "completed_date_count": completed,
+            "expected_date_count": expected,
+            "generated_at": report.get("generated_at"),
+        }.items()
+        if value is not None
+    }
+
+
 def _robust_strategy_payload(reports_dir: Path) -> Dict[str, Any]:
     robust_dir = reports_dir / ROBUST_STRATEGY_DIRNAME
     orchestration_path = robust_dir / "robust_strategy_status_latest.json"
@@ -481,6 +535,7 @@ def _robust_strategy_payload(reports_dir: Path) -> Dict[str, Any]:
     shadow_raw = _read_robust_json_object(shadow_path)
     shadow_daily_raw = _read_robust_json_object(shadow_daily_path)
     shadow_daily = _robust_shadow_daily_payload(shadow_daily_raw)
+    progress = _robust_stage_progress(robust_dir, orchestration)
     lifecycle_reports = [
         (orchestration_path, orchestration),
         (preflight_path, preflight_raw),
@@ -673,6 +728,7 @@ def _robust_strategy_payload(reports_dir: Path) -> Dict[str, Any]:
             "confirmation": confirmation,
             "shadow": shadow,
             "shadow_daily": shadow_daily,
+            "progress": progress,
             "mlflow_experiments": [
                 "robust_csi800_development",
                 "robust_csi800_confirmation",

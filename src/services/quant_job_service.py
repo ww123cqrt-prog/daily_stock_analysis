@@ -24,7 +24,7 @@ import glob
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from src.services.quant_workflow_paths import (
     dsa_root,
@@ -824,7 +824,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         return command
 
     def run_robust_strategy(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("run_robust_strategy.py")
+        command = _script_command("launch_robust_strategy.py")
         command.extend(["--report-dir", str(REPORTS_ROOT / "robust_strategy")])
         as_of_date = _safe_iso_date(params.get("as_of_date"), "as_of_date")
         if as_of_date:

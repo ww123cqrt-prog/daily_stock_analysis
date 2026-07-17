@@ -8,6 +8,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -35,10 +36,17 @@ CSI300 = "000300.XSHG"
 CSI500 = "000905.XSHG"
 INDEX_SIZES = {CSI300: 300, CSI500: 500}
 EXPECTED_UNION_SIZE = 800
+MEMBERSHIP_DAY_COVERAGE_MIN = 0.99
+MIN_INDEX_SIZES = {
+    index_code: math.ceil(size * MEMBERSHIP_DAY_COVERAGE_MIN)
+    for index_code, size in INDEX_SIZES.items()
+}
+MIN_UNION_SIZE = math.ceil(EXPECTED_UNION_SIZE * MEMBERSHIP_DAY_COVERAGE_MIN)
 DEFAULT_START_DATE = "2007-01-15"
 STATUS_FILENAME = "build_status_latest.json"
 SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
 TRANSACTION_JOURNAL_FILENAME = ".build_pit_csi800.transaction.json"
+BUILD_IN_PROGRESS_FILENAME = ".build_pit_csi800.in-progress.json"
 TRANSACTION_JOURNAL_VERSION = 1
 REQUIRED_DAILY_COLUMNS = ("date", "symbol", "index_code")
 REQUIRED_INTERVAL_COLUMNS = ("symbol", "index_code", "start_date", "end_date")
@@ -352,6 +360,7 @@ def _allowed_internal_transaction_target(path: Path, root: Path) -> bool:
         root / "membership_intervals.parquet",
         root / SOURCE_FILENAME,
         root / STATUS_FILENAME,
+        root / BUILD_IN_PROGRESS_FILENAME,
         _transaction_owner_path(root / STATUS_FILENAME),
     }:
         return True
@@ -709,6 +718,19 @@ def _membership_details(
     }
 
 
+def _membership_counts_are_valid(details: Mapping[str, Any]) -> bool:
+    csi300_count = int(details["csi300_count"])
+    csi500_count = int(details["csi500_count"])
+    union_count = int(details["union_count"])
+    return bool(
+        MIN_INDEX_SIZES[CSI300] <= csi300_count <= INDEX_SIZES[CSI300]
+        and MIN_INDEX_SIZES[CSI500] <= csi500_count <= INDEX_SIZES[CSI500]
+        and int(details["overlap_count"]) == 0
+        and MIN_UNION_SIZE <= union_count <= EXPECTED_UNION_SIZE
+        and union_count == csi300_count + csi500_count
+    )
+
+
 def build_daily_membership(
     on_date: date,
     csi300_values: Sequence[Any],
@@ -726,12 +748,7 @@ def build_daily_membership(
         ) from exc
 
     details = _membership_details(on_date, csi300_members, csi500_members)
-    if (
-        details["csi300_count"] != INDEX_SIZES[CSI300]
-        or details["csi500_count"] != INDEX_SIZES[CSI500]
-        or details["overlap_count"] != 0
-        or details["union_count"] != EXPECTED_UNION_SIZE
-    ):
+    if not _membership_counts_are_valid(details):
         raise MembershipValidationError(details)
 
     records = [
@@ -744,12 +761,37 @@ def build_daily_membership(
 
 def _validate_partition_day(frame: pd.DataFrame, on_date: date) -> bool:
     day_frame = frame.loc[frame["date"] == pd.Timestamp(on_date)]
-    if len(day_frame) != EXPECTED_UNION_SIZE:
+    if not MIN_UNION_SIZE <= len(day_frame) <= EXPECTED_UNION_SIZE:
         return False
     counts = day_frame.groupby("index_code").size().to_dict()
-    if counts != INDEX_SIZES:
+    if set(counts) != set(INDEX_SIZES):
         return False
-    return day_frame["symbol"].nunique() == EXPECTED_UNION_SIZE
+    details = _membership_details(
+        on_date,
+        set(day_frame.loc[day_frame["index_code"] == CSI300, "symbol"]),
+        set(day_frame.loc[day_frame["index_code"] == CSI500, "symbol"]),
+    )
+    return _membership_counts_are_valid(details)
+
+
+def _membership_count_anomalies(
+    frame: pd.DataFrame, expected_dates: Sequence[date]
+) -> list[dict[str, Any]]:
+    anomalies: list[dict[str, Any]] = []
+    for on_date in sorted(set(expected_dates)):
+        day_frame = frame.loc[frame["date"] == pd.Timestamp(on_date)]
+        details = _membership_details(
+            on_date,
+            set(day_frame.loc[day_frame["index_code"] == CSI300, "symbol"]),
+            set(day_frame.loc[day_frame["index_code"] == CSI500, "symbol"]),
+        )
+        if (
+            details["csi300_count"] != INDEX_SIZES[CSI300]
+            or details["csi500_count"] != INDEX_SIZES[CSI500]
+        ):
+            details["reason_code"] = "membership_count_below_nominal"
+            anomalies.append(details)
+    return anomalies
 
 
 def _read_existing_partition(path: Path) -> pd.DataFrame:
@@ -957,6 +999,32 @@ def _build_status(
     if membership_source is not None:
         payload["membership_source"] = dict(membership_source)
     return payload
+
+
+def _progress_payload(
+    *,
+    start_date: date,
+    end_date: date,
+    expected_dates: Sequence[date],
+    completed_dates: Sequence[date],
+    membership_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": "running",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "date_range": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+        "expected_date_count": len(set(expected_dates)),
+        "completed_date_count": len(set(completed_dates) & set(expected_dates)),
+        "membership_source": dict(membership_source),
+    }
+
+
+def _remove_in_progress_marker(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
 
 
 def _membership_source_payload(
@@ -1189,7 +1257,29 @@ def _build_pit_csi800_locked(
             ) from None
         existing_partitions[year] = existing
 
-    changed_partitions: dict[Path, pd.DataFrame] = {}
+    marker_path = output_dir / BUILD_IN_PROGRESS_FILENAME
+    running_status = _build_status(
+        "running",
+        start_date,
+        end_date,
+        expected_dates=trading_days,
+        completed_dates=completed_dates,
+        membership_source=source_payload,
+    )
+    initial_json_payloads = {
+        marker_path: _progress_payload(
+            start_date=start_date,
+            end_date=end_date,
+            expected_dates=trading_days,
+            completed_dates=completed_dates,
+            membership_source=source_payload,
+        ),
+        output_dir / SOURCE_FILENAME: source_payload,
+    }
+    if status_path is not None:
+        initial_json_payloads[status_path] = running_status
+    _commit_file_transaction({}, initial_json_payloads, output_dir=output_dir)
+
     years = sorted(requested_years)
     for year in years:
         year_days = [value for value in trading_days if value.year == year]
@@ -1209,6 +1299,30 @@ def _build_pit_csi800_locked(
         )
         if not days_to_fetch:
             skipped_years.append(year)
+            progress_status = _build_status(
+                "running",
+                start_date,
+                end_date,
+                expected_dates=trading_days,
+                completed_dates=completed_dates,
+                skipped_years=skipped_years,
+                membership_source=source_payload,
+            )
+            progress_json_payloads = {
+                marker_path: _progress_payload(
+                    start_date=start_date,
+                    end_date=end_date,
+                    expected_dates=trading_days,
+                    completed_dates=completed_dates,
+                    membership_source=source_payload,
+                ),
+                output_dir / SOURCE_FILENAME: source_payload,
+            }
+            if status_path is not None:
+                progress_json_payloads[status_path] = progress_status
+            _commit_file_transaction(
+                {}, progress_json_payloads, output_dir=output_dir
+            )
             continue
 
         replacements: list[pd.DataFrame] = []
@@ -1262,23 +1376,36 @@ def _build_pit_csi800_locked(
                 skipped_years=skipped_years,
             ) from None
         existing_partitions[year] = updated
-        changed_partitions[partition_path] = updated
+        completed_dates.update(year_days)
+        progress_status = _build_status(
+            "running",
+            start_date,
+            end_date,
+            expected_dates=trading_days,
+            completed_dates=completed_dates,
+            skipped_years=skipped_years,
+            membership_source=source_payload,
+        )
+        progress_json_payloads = {
+            marker_path: _progress_payload(
+                start_date=start_date,
+                end_date=end_date,
+                expected_dates=trading_days,
+                completed_dates=completed_dates,
+                membership_source=source_payload,
+            ),
+            output_dir / SOURCE_FILENAME: source_payload,
+        }
+        if status_path is not None:
+            progress_json_payloads[status_path] = progress_status
+        _commit_file_transaction(
+            {partition_path: updated},
+            progress_json_payloads,
+            output_dir=output_dir,
+        )
 
     intervals_path = output_dir / "membership_intervals.parquet"
     completed_dates.update(trading_days)
-    status = _build_status(
-        "completed",
-        start_date,
-        end_date,
-        expected_dates=trading_days,
-        completed_dates=completed_dates,
-        skipped_years=skipped_years,
-        membership_source=source_payload,
-    )
-    status_payloads = {output_dir / SOURCE_FILENAME: source_payload}
-    if status_path is not None:
-        status_payloads[status_path] = status
-
     try:
         all_daily = _combine_daily_partitions(
             existing_partitions,
@@ -1317,22 +1444,37 @@ def _build_pit_csi800_locked(
             skipped_years=skipped_years,
         ) from None
 
-    if not changed_partitions and _intervals_content_matches(intervals_path, intervals):
+    tolerated_anomalies = _membership_count_anomalies(all_daily, trading_days)
+    status = _build_status(
+        "completed",
+        start_date,
+        end_date,
+        expected_dates=trading_days,
+        completed_dates=completed_dates,
+        anomalies=tolerated_anomalies,
+        skipped_years=skipped_years,
+        membership_source=source_payload,
+    )
+    status_payloads = {output_dir / SOURCE_FILENAME: source_payload}
+    if status_path is not None:
+        status_payloads[status_path] = status
+
+    if _intervals_content_matches(intervals_path, intervals):
         if status_payloads:
             _commit_file_transaction(
                 {},
                 status_payloads,
                 output_dir=output_dir,
             )
+        _remove_in_progress_marker(marker_path)
         return status
 
-    transaction_payloads = dict(changed_partitions)
-    transaction_payloads[intervals_path] = intervals
     _commit_file_transaction(
-        transaction_payloads,
+        {intervals_path: intervals},
         status_payloads,
         output_dir=output_dir,
     )
+    _remove_in_progress_marker(marker_path)
     return status
 
 

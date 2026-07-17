@@ -653,7 +653,7 @@ def test_pipeline_stops_at_membership_permission_block_and_writes_latest_status(
     assert calls == ["build_pit_csi800"]
     assert result["status"] == "blocked_data"
     assert latest["status"] == "blocked_data"
-    assert latest["reason_code"] == "stage_evidence_status_invalid"
+    assert latest["reason_code"] == "jqdata_permission_denied"
     assert not (report_dir.parent / "candidate_pipeline_latest.json").exists()
     assert not (report_dir.parent / "latest_training_result.json").exists()
 

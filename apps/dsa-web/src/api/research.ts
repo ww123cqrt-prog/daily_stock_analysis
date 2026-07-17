@@ -188,6 +188,13 @@ export type ResearchRobustStrategy = {
   currentStage?: string;
   failedStage?: string;
   updatedAt?: string;
+  progress?: {
+    stage: string;
+    status?: string;
+    completedDateCount: number;
+    expectedDateCount: number;
+    generatedAt?: string;
+  } | null;
   stages: ResearchRobustStage[];
   preflight?: {
     status?: string;

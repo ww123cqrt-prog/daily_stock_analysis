@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import plistlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,21 +43,21 @@ def test_build_command_targets_foreground_orchestrator_and_preserves_resume(
     assert "--skip-membership-build" in command
 
 
-def test_launch_writes_pid_log_and_cpu_verified_record(tmp_path: Path) -> None:
+def test_launch_registers_launchd_job_and_writes_verified_record(tmp_path: Path) -> None:
     module = load_module()
+    commands: list[list[str]] = []
 
-    class FakeProcess:
-        pid = 43210
-
-        def poll(self):
-            return None
-
-    captured = {}
-
-    def popen_factory(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return FakeProcess()
+    def launchctl_runner(command, **kwargs):
+        commands.append(command)
+        if command[1] == "bootstrap":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[1] == "print":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="state = running\n\tpid = 43210\n",
+                stderr="",
+            )
+        raise AssertionError(command)
 
     result = module.launch(
         config=tmp_path / "config.yaml",
@@ -66,9 +68,11 @@ def test_launch_writes_pid_log_and_cpu_verified_record(tmp_path: Path) -> None:
         resume=False,
         skip_membership_build=False,
         warmup_seconds=0,
-        popen_factory=popen_factory,
+        launchctl_runner=launchctl_runner,
         sleep_fn=lambda _: None,
         cpu_probe=lambda pid: 612.5,
+        pid_alive=lambda pid: pid == 43210,
+        uid=501,
     )
 
     runner_dir = tmp_path / "reports" / "runner" / "robust-run"
@@ -78,18 +82,27 @@ def test_launch_writes_pid_log_and_cpu_verified_record(tmp_path: Path) -> None:
     assert record["cpu_percent"] == 612.5
     assert (runner_dir / "pid").read_text(encoding="utf-8").strip() == "43210"
     assert Path(record["log_path"]).is_file()
-    assert captured["kwargs"]["start_new_session"] is True
-    assert captured["kwargs"]["shell"] is False
+    assert record["launch_backend"] == "launchd"
+    assert record["launchd_domain"] == "gui/501"
+    assert record["job_label"].startswith("com.dsa.robust-strategy.")
+    plist_path = Path(record["plist_path"])
+    payload = plistlib.loads(plist_path.read_bytes())
+    assert payload["Label"] == record["job_label"]
+    assert payload["RunAtLoad"] is True
+    assert payload["KeepAlive"] is False
+    assert payload["LaunchOnlyOnce"] is True
+    assert payload["ProgramArguments"][1].endswith("launch_robust_strategy.py")
+    assert payload["ProgramArguments"][2] == "--launchd-worker"
+    assert commands[0][:3] == ["/bin/launchctl", "bootstrap", "gui/501"]
+    assert commands[1] == [
+        "/bin/launchctl",
+        "print",
+        f"gui/501/{record['job_label']}",
+    ]
 
 
-def test_launch_fails_when_process_exits_during_warmup(tmp_path: Path) -> None:
+def test_launch_fails_when_launchd_rejects_job(tmp_path: Path) -> None:
     module = load_module()
-
-    class FakeProcess:
-        pid = 54321
-
-        def poll(self):
-            return 2
 
     try:
         module.launch(
@@ -101,14 +114,19 @@ def test_launch_fails_when_process_exits_during_warmup(tmp_path: Path) -> None:
             resume=False,
             skip_membership_build=False,
             warmup_seconds=0,
-            popen_factory=lambda *args, **kwargs: FakeProcess(),
+            launchctl_runner=lambda *args, **kwargs: SimpleNamespace(
+                returncode=5,
+                stdout="",
+                stderr="bootstrap failed",
+            ),
             sleep_fn=lambda _: None,
             cpu_probe=lambda pid: 0.0,
+            uid=501,
         )
     except RuntimeError as exc:
-        assert "warmup" in str(exc)
+        assert "launchd" in str(exc)
     else:
-        raise AssertionError("early process exit was reported as running")
+        raise AssertionError("launchd rejection was reported as running")
     record = json.loads(
         (tmp_path / "reports" / "runner" / "failed-run" / "launch.json").read_text(
             encoding="utf-8"
@@ -136,8 +154,8 @@ def test_duplicate_active_launch_preserves_original_pid_and_record(tmp_path: Pat
             resume=False,
             skip_membership_build=False,
             warmup_seconds=0,
-            popen_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("must not spawn")
+            launchctl_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("must not register launchd job")
             ),
             sleep_fn=lambda _: None,
             cpu_probe=lambda pid: 0.0,
@@ -146,3 +164,115 @@ def test_duplicate_active_launch_preserves_original_pid_and_record(tmp_path: Pat
 
     assert (runner_dir / "pid").read_text(encoding="utf-8") == "111\n"
     assert json.loads((runner_dir / "launch.json").read_text(encoding="utf-8")) == original
+
+
+def test_reconcile_marks_dead_runner_and_running_pipeline_as_stopped(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "stale-run"
+    runner_dir = report_dir / "runner" / run_id
+    run_dir = report_dir / "runs" / run_id
+    runner_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True)
+    (runner_dir / "pid").write_text("222\n", encoding="utf-8")
+    (runner_dir / "launch.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "pid": 222,
+                "job_label": "com.dsa.robust-strategy.stale",
+                "launchd_domain": "gui/501",
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        "status": "blocked_data",
+        "lifecycle_status": "running",
+        "reason_code": "preflight_not_completed",
+        "run_id": run_id,
+    }
+    (run_dir / "status.json").write_text(json.dumps(state), encoding="utf-8")
+    (report_dir / "robust_strategy_status_latest.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+
+    active = module._reconcile_existing_runner(
+        runner_dir,
+        report_dir=report_dir,
+        run_id=run_id,
+        pid_alive=lambda _: False,
+        launchd_probe=lambda domain, label: None,
+    )
+
+    assert active is False
+    launch = json.loads((runner_dir / "launch.json").read_text(encoding="utf-8"))
+    stopped = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    latest = json.loads(
+        (report_dir / "robust_strategy_status_latest.json").read_text(encoding="utf-8")
+    )
+    assert launch["status"] == "stale"
+    assert stopped["lifecycle_status"] == "stopped"
+    assert stopped["reason_code"] == "runner_process_missing"
+    assert latest == stopped
+
+
+def test_launchd_worker_records_child_and_terminal_pipeline_state(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "worker-run"
+    launch_path = report_dir / "runner" / run_id / "launch.json"
+    pid_path = launch_path.parent / "pid"
+    launch_path.parent.mkdir(parents=True)
+    launch_path.write_text(
+        json.dumps({"status": "starting", "run_id": run_id}),
+        encoding="utf-8",
+    )
+    run_state_path = report_dir / "runs" / run_id / "status.json"
+    run_state_path.parent.mkdir(parents=True)
+    run_state_path.write_text(
+        json.dumps(
+            {
+                "status": "blocked_data",
+                "lifecycle_status": "stopped",
+                "reason_code": "membership_validation_failed",
+                "run_id": run_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeProcess:
+        pid = 9876
+
+        def wait(self):
+            return 2
+
+    def popen_factory(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    return_code = module.run_launchd_worker(
+        launch_path=launch_path,
+        pid_path=pid_path,
+        report_dir=report_dir,
+        run_id=run_id,
+        command=["python", "run.py"],
+        popen_factory=popen_factory,
+    )
+
+    record = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert return_code == 2
+    assert pid_path.read_text(encoding="utf-8").strip() == "9876"
+    assert record["status"] == "stopped"
+    assert record["return_code"] == 2
+    assert captured["command"] == ["python", "run.py"]
+    assert captured["kwargs"]["start_new_session"] is False
+    assert captured["kwargs"]["shell"] is False

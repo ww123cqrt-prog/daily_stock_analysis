@@ -1254,6 +1254,10 @@ const WorkflowPage: React.FC = () => {
   const latestTraining = workflowStatus?.latestTraining;
   const robustStrategy = workflowStatus?.robustStrategy;
   const robustMeta = robustStatusLabel(robustStrategy?.status, language);
+  const robustProgress = robustStrategy?.progress;
+  const robustProgressPercent = robustProgress && robustProgress.expectedDateCount > 0
+    ? Math.min(100, Math.round((robustProgress.completedDateCount / robustProgress.expectedDateCount) * 100))
+    : null;
   const shadowDaily = robustStrategy?.shadowDaily;
   const shadowDailyFailed = shadowDaily?.status === 'development_failed';
   const dailyGuideSteps = useMemo(
@@ -1430,6 +1434,31 @@ const WorkflowPage: React.FC = () => {
                   <p className="mt-1 break-words font-mono text-sm text-foreground">{robustStrategy?.reasonCode || '-'}</p>
                 </div>
               </div>
+              {robustProgress && robustProgressPercent !== null ? (
+                <div data-testid="robust-stage-progress" className="mt-4 border-y border-subtle py-3">
+                  <div className="flex items-center justify-between gap-3 text-xs">
+                    <span className="text-secondary-text">
+                      {language === 'zh' ? '历史股票池构建进度' : 'Historical universe progress'}
+                    </span>
+                    <span className="font-mono text-foreground">
+                      {robustProgress.completedDateCount} / {robustProgress.expectedDateCount}
+                    </span>
+                  </div>
+                  <div
+                    role="progressbar"
+                    aria-label={language === 'zh' ? '历史股票池构建进度' : 'Historical universe progress'}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={robustProgressPercent}
+                    className="mt-2 h-2 overflow-hidden rounded-full bg-subtle"
+                  >
+                    <div
+                      className="h-full bg-cyan transition-[width] duration-300"
+                      style={{ width: `${robustProgressPercent}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
               {(robustStrategy?.stages || []).length > 0 ? (
                 <div className="mt-4 divide-y divide-subtle border-y border-subtle">
                   {(robustStrategy?.stages || []).map((stage) => (

@@ -724,7 +724,14 @@ def _stage_evidence(
         require_persisted_identity=source == "canonical",
     ):
         return _invalid_stage_evidence("stage_evidence_context_mismatch")
-    if payload.get("status") not in STAGE_ACCEPTED_STATUSES[stage.name]:
+    evidence_status = payload.get("status")
+    if evidence_status == "blocked_data" and not re.fullmatch(
+        r"[a-z][a-z0-9_]*", str(payload.get("reason_code") or "")
+    ):
+        return _invalid_stage_evidence("stage_evidence_status_invalid")
+    if evidence_status != "blocked_data" and (
+        evidence_status not in STAGE_ACCEPTED_STATUSES[stage.name]
+    ):
         return _invalid_stage_evidence("stage_evidence_status_invalid")
     if source == "canonical":
         return payload

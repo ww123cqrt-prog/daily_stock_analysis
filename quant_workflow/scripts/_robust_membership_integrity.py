@@ -16,6 +16,7 @@ MEMBERSHIP_SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
 MEMBERSHIP_INTERVALS_FILENAME = "membership_intervals.parquet"
 MEMBERSHIP_LOCK_FILENAME = ".build_pit_csi800.lock"
 MEMBERSHIP_TRANSACTION_FILENAME = ".build_pit_csi800.transaction.json"
+MEMBERSHIP_BUILD_IN_PROGRESS_FILENAME = ".build_pit_csi800.in-progress.json"
 EXPECTED_INDICES = {
     "csi300": "000300.XSHG",
     "csi500": "000905.XSHG",
@@ -58,6 +59,11 @@ class LockedMembershipSnapshot:
 
     def ensure_transaction_clean(self) -> None:
         self._require_active()
+        if (self.pit_dir / MEMBERSHIP_BUILD_IN_PROGRESS_FILENAME).exists():
+            raise MembershipIntegrityError(
+                "membership_build_in_progress",
+                "membership build is still in progress",
+            )
         if (self.pit_dir / MEMBERSHIP_TRANSACTION_FILENAME).exists():
             raise MembershipIntegrityError(
                 "membership_transaction_incomplete",

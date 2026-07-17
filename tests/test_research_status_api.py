@@ -20,6 +20,71 @@ from api.app import create_app
 
 
 class ResearchStatusApiTestCase(unittest.TestCase):
+    def test_robust_status_exposes_run_scoped_membership_progress(self) -> None:
+        from api.v1.endpoints.research_status import _robust_strategy_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            robust_dir = reports_dir / "robust_strategy"
+            run_id = "robust_20260717_progress"
+            robust_dir.mkdir()
+            (robust_dir / "robust_strategy_status_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "blocked_data",
+                        "lifecycle_status": "running",
+                        "reason_code": "preflight_not_completed",
+                        "run_id": run_id,
+                        "current_stage": "build_pit_csi800",
+                        "updated_at": "2026-07-17T10:00:00+08:00",
+                        "stages": {
+                            "build_pit_csi800": {
+                                "status": "running",
+                                "started_at": "2026-07-17T09:00:00+08:00",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            progress_dir = (
+                robust_dir
+                / "runs"
+                / run_id
+                / "stage_reports"
+                / "build_pit_csi800"
+            )
+            progress_dir.mkdir(parents=True)
+            (progress_dir / "build_status_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "completed_date_count": 1250,
+                        "expected_date_count": 3047,
+                        "generated_at": "2026-07-17T09:59:00+08:00",
+                        "membership_source": {
+                            "selected": "baostock",
+                            "private_path": "/Users/cq/private/data",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = _robust_strategy_payload(reports_dir)
+
+        self.assertEqual(
+            payload["progress"],
+            {
+                "stage": "build_pit_csi800",
+                "status": "running",
+                "completed_date_count": 1250,
+                "expected_date_count": 3047,
+                "generated_at": "2026-07-17T09:59:00+08:00",
+            },
+        )
+        self.assertNotIn("/Users/", json.dumps(payload))
+
     def test_status_exposes_sanitized_robust_strategy_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
