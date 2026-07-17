@@ -16,19 +16,32 @@ import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import mlruns_root, quant_data_root, reports_root, workflow_root  # noqa: E402
 from run_robust_strategy import DEFAULT_CONFIG, RUN_ID_RE, new_run_id  # noqa: E402
 
 
 LAUNCHCTL = "/bin/launchctl"
 ACTIVE_LAUNCH_STATUSES = {"starting", "running"}
 TERMINAL_LIFECYCLE_STATUSES = {"completed", "stopped"}
+WORKER_ENV_NAMES = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "NO_COLOR",
+    "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "TMPDIR",
+    "TZ",
+)
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -230,8 +243,12 @@ def _worker_program_arguments(
     report_dir: Path,
     run_id: str,
     command: list[str],
+    environment: dict[str, str],
 ) -> list[str]:
     return [
+        "/usr/bin/env",
+        "-i",
+        *(f"{key}={value}" for key, value in sorted(environment.items())),
         sys.executable,
         str(Path(__file__).resolve()),
         "--launchd-worker",
@@ -246,6 +263,30 @@ def _worker_program_arguments(
         "--",
         *command,
     ]
+
+
+def _sanitized_worker_environment(
+    source: Mapping[str, str] | None = None,
+    *,
+    mlruns_dir: Path | None = None,
+) -> dict[str, str]:
+    current = os.environ if source is None else source
+    environment = {
+        name: str(current[name])
+        for name in WORKER_ENV_NAMES
+        if current.get(name)
+    }
+    environment.setdefault("HOME", str(Path.home()))
+    environment.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    environment.setdefault("PYTHONIOENCODING", "utf-8")
+    environment.setdefault("PYTHONUNBUFFERED", "1")
+    configured_mlruns = mlruns_dir or Path(
+        current.get("QUANT_WORKFLOW_MLRUNS_DIR") or mlruns_root()
+    )
+    environment["QUANT_WORKFLOW_MLRUNS_DIR"] = str(
+        Path(configured_mlruns).expanduser().resolve()
+    )
+    return environment
 
 
 def _write_launchd_plist(
@@ -284,6 +325,7 @@ def run_launchd_worker(
         process = popen_factory(
             command,
             cwd=str(workflow_root()),
+            env=_sanitized_worker_environment(),
             stdin=subprocess.DEVNULL,
             start_new_session=False,
             close_fds=True,
@@ -339,6 +381,7 @@ def _launch_claimed(
     config: Path,
     quant_data_dir: Path,
     report_dir: Path,
+    mlruns_dir: Path,
     as_of_date: str,
     run_id: str,
     resume: bool,
@@ -401,6 +444,7 @@ def _launch_claimed(
             report_dir=report_dir,
             run_id=run_id,
             command=command,
+            environment=_sanitized_worker_environment(mlruns_dir=mlruns_dir),
         ),
         log_path=log_path,
         error_log_path=error_log_path,
@@ -464,6 +508,7 @@ def launch(
     config: Path,
     quant_data_dir: Path,
     report_dir: Path,
+    mlruns_dir: Path | None = None,
     as_of_date: str,
     run_id: str,
     resume: bool,
@@ -476,6 +521,7 @@ def launch(
     uid: int | None = None,
 ) -> dict[str, Any]:
     report_dir = Path(report_dir).expanduser().resolve()
+    resolved_mlruns_dir = Path(mlruns_dir or mlruns_root()).expanduser().resolve()
     runner_dir = report_dir / "runner" / run_id
 
     def launchd_probe(domain: str, label: str) -> dict[str, Any] | None:
@@ -509,6 +555,7 @@ def launch(
             config=config,
             quant_data_dir=quant_data_dir,
             report_dir=report_dir,
+            mlruns_dir=resolved_mlruns_dir,
             as_of_date=as_of_date,
             run_id=run_id,
             resume=resume,
@@ -556,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--report-dir", type=Path, default=reports_root() / "robust_strategy"
     )
+    parser.add_argument("--mlruns-dir", type=Path, default=mlruns_root())
     parser.add_argument("--as-of-date", default=date.today().isoformat())
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--resume", action="store_true")
@@ -567,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         config=args.config,
         quant_data_dir=args.quant_data_dir,
         report_dir=args.report_dir,
+        mlruns_dir=args.mlruns_dir,
         as_of_date=args.as_of_date,
         run_id=run_id,
         resume=args.resume,

@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from src.services.quant_job_service import (
+    MLRUNS_ROOT,
     QUANT_WORKFLOW_PYTHON,
     QuantJob,
     QuantJobService,
@@ -2320,6 +2321,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(
             development[development.index("--report-dir") + 1],
             str(REPORTS_ROOT / "robust_strategy"),
+        )
+        self.assertEqual(
+            development[development.index("--mlruns-dir") + 1],
+            str(MLRUNS_ROOT),
         )
         self.assertEqual(
             development[development.index("--as-of-date") + 1], "2026-07-15"

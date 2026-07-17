@@ -43,8 +43,11 @@ def test_build_command_targets_foreground_orchestrator_and_preserves_resume(
     assert "--skip-membership-build" in command
 
 
-def test_launch_registers_launchd_job_and_writes_verified_record(tmp_path: Path) -> None:
+def test_launch_registers_launchd_job_and_writes_verified_record(
+    tmp_path: Path, monkeypatch
+) -> None:
     module = load_module()
+    monkeypatch.setenv("GITHUB_PAT_TOKEN", "must-not-reach-launchd-worker")
     commands: list[list[str]] = []
 
     def launchctl_runner(command, **kwargs):
@@ -63,6 +66,7 @@ def test_launch_registers_launchd_job_and_writes_verified_record(tmp_path: Path)
         config=tmp_path / "config.yaml",
         quant_data_dir=tmp_path / "quant_data",
         report_dir=tmp_path / "reports",
+        mlruns_dir=tmp_path / "mlruns",
         as_of_date="2026-07-15",
         run_id="robust-run",
         resume=False,
@@ -91,8 +95,16 @@ def test_launch_registers_launchd_job_and_writes_verified_record(tmp_path: Path)
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is False
     assert payload["LaunchOnlyOnce"] is True
-    assert payload["ProgramArguments"][1].endswith("launch_robust_strategy.py")
-    assert payload["ProgramArguments"][2] == "--launchd-worker"
+    program_arguments = payload["ProgramArguments"]
+    assert program_arguments[:2] == ["/usr/bin/env", "-i"]
+    assert f"QUANT_WORKFLOW_MLRUNS_DIR={tmp_path / 'mlruns'}" in program_arguments
+    assert "must-not-reach-launchd-worker" not in " ".join(program_arguments)
+    launcher_index = next(
+        index
+        for index, value in enumerate(program_arguments)
+        if value.endswith("launch_robust_strategy.py")
+    )
+    assert program_arguments[launcher_index + 1] == "--launchd-worker"
     assert commands[0][:3] == ["/bin/launchctl", "bootstrap", "gui/501"]
     assert commands[1] == [
         "/bin/launchctl",
@@ -222,8 +234,11 @@ def test_reconcile_marks_dead_runner_and_running_pipeline_as_stopped(
 
 def test_launchd_worker_records_child_and_terminal_pipeline_state(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     module = load_module()
+    monkeypatch.setenv("GITHUB_PAT_TOKEN", "must-not-reach-child")
+    monkeypatch.setenv("QUANT_WORKFLOW_MLRUNS_DIR", str(tmp_path / "mlruns"))
     report_dir = tmp_path / "reports"
     run_id = "worker-run"
     launch_path = report_dir / "runner" / run_id / "launch.json"
@@ -276,3 +291,7 @@ def test_launchd_worker_records_child_and_terminal_pipeline_state(
     assert captured["command"] == ["python", "run.py"]
     assert captured["kwargs"]["start_new_session"] is False
     assert captured["kwargs"]["shell"] is False
+    assert "GITHUB_PAT_TOKEN" not in captured["kwargs"]["env"]
+    assert captured["kwargs"]["env"]["QUANT_WORKFLOW_MLRUNS_DIR"] == str(
+        tmp_path / "mlruns"
+    )

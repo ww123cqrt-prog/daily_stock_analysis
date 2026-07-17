@@ -28,6 +28,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from src.services.quant_workflow_paths import (
     dsa_root,
+    mlruns_root,
     projects_root,
     reports_root,
     workflow_root,
@@ -46,6 +47,7 @@ DSA_ROOT = dsa_root()
 PROJECTS_ROOT = projects_root(DSA_ROOT)
 QUANT_WORKFLOW_ROOT = workflow_root(DSA_ROOT)
 REPORTS_ROOT = reports_root(DSA_ROOT)
+MLRUNS_ROOT = mlruns_root(DSA_ROOT)
 DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
 DSA_VENV_PYTHON = DSA_ROOT / ".venv" / "bin" / "python"
 QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
@@ -826,6 +828,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
     def run_robust_strategy(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("launch_robust_strategy.py")
         command.extend(["--report-dir", str(REPORTS_ROOT / "robust_strategy")])
+        command.extend(["--mlruns-dir", str(MLRUNS_ROOT)])
         as_of_date = _safe_iso_date(params.get("as_of_date"), "as_of_date")
         if as_of_date:
             command.extend(["--as-of-date", as_of_date])
