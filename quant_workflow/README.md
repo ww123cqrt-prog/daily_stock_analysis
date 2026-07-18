@@ -64,6 +64,12 @@ Parquet or Qlib provider root moves.
 - Cleaned merged Parquet: `quant_data/parquet/ashare_1d/merged_baostock_jqdata_cleaned`
 - Cleaned Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata_cleaned`
 
+The canonical storage, schema, merge, and handoff rules are documented in
+[`docs/quant-data-contract.md`](docs/quant-data-contract.md). The live local
+paths and readiness state remain authoritative in
+`${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
+`preflight_robust_data.py`.
+
 ## Notes
 
 - JQData credentials live in the local project `.env`; never print them in job
