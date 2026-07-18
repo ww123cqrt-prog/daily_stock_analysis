@@ -340,6 +340,7 @@ def run_main(
     baostock_provider: FakeBaostockProvider | None = None,
     reference_source: str | None = None,
     run_id: str | None = None,
+    reuse_existing: bool = False,
     today: date = date(2025, 1, 3),
 ):
     pit_dir = tmp_path / "pit"
@@ -363,6 +364,8 @@ def run_main(
         argv.extend(["--reference-source", reference_source])
     if run_id is not None:
         argv.extend(["--run-id", run_id])
+    if reuse_existing:
+        argv.append("--reuse-existing")
     main_kwargs = {"provider": provider, "today": today}
     if baostock_provider is not None:
         main_kwargs["baostock_provider"] = baostock_provider
@@ -480,6 +483,70 @@ def test_builds_all_tables_and_compresses_industry_changes_and_membership_breaks
         "requested": "auto",
         "selected": "jqdata",
     }
+
+
+def test_reuses_verified_snapshot_without_calling_provider(tmp_path: Path) -> None:
+    module = load_module()
+    return_code, reference_dir, _ = run_main(module, tmp_path, FakeProvider())
+    assert return_code == 0
+    source_before = (reference_dir / SOURCE_FILENAME).read_bytes()
+    tables_before = {
+        name: (reference_dir / name).read_bytes() for name in TABLE_NAMES
+    }
+
+    class ProviderMustNotBeCalled:
+        def __getattr__(self, name):
+            raise AssertionError(f"provider must not be called: {name}")
+
+    return_code, _, status_dir = run_main(
+        module,
+        tmp_path,
+        ProviderMustNotBeCalled(),
+        reuse_existing=True,
+        run_id="reuse-test",
+    )
+
+    status = json.loads(
+        (status_dir / "download_robust_reference_latest.json").read_text()
+    )
+    assert return_code == 0
+    assert status["status"] == "completed"
+    assert status["reason_code"] == "reused_existing"
+    assert status["build_run_id"] == "reuse-test"
+    assert (reference_dir / SOURCE_FILENAME).read_bytes() == source_before
+    assert {
+        name: (reference_dir / name).read_bytes() for name in TABLE_NAMES
+    } == tables_before
+
+
+def test_reuse_rejects_reference_bound_to_different_membership(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    return_code, reference_dir, _ = run_main(module, tmp_path, FakeProvider())
+    assert return_code == 0
+    source_path = reference_dir / SOURCE_FILENAME
+    source = json.loads(source_path.read_text())
+    source["membership_snapshot_hash"] = "0" * 64
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    class ProviderMustNotBeCalled:
+        def __getattr__(self, name):
+            raise AssertionError(f"provider must not be called: {name}")
+
+    return_code, _, status_dir = run_main(
+        module,
+        tmp_path,
+        ProviderMustNotBeCalled(),
+        reuse_existing=True,
+    )
+
+    status = json.loads(
+        (status_dir / "download_robust_reference_latest.json").read_text()
+    )
+    assert return_code == module.BLOCKED_RETURN_CODE
+    assert status["status"] == "blocked_data"
+    assert status["reason_code"] == "reference_membership_snapshot_mismatch"
 
 
 def test_jqdata_keeps_post_delist_index_days_and_marks_them_untradable(
@@ -721,6 +788,29 @@ def test_baostock_nonzero_response_relogs_and_retries_once(tmp_path: Path) -> No
     assert [call[0] for call in provider.calls].count("basic") == 2
     assert provider.login_count == 2
     assert provider.logout_count == 2
+
+
+def test_real_baostock_socket_receives_bounded_timeout() -> None:
+    module = load_module()
+
+    class FakeSocket:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+    socket = FakeSocket()
+    context = SimpleNamespace(default_socket=socket)
+    provider = SimpleNamespace(__name__="baostock")
+
+    configured = module._configure_baostock_socket_timeout(
+        provider,
+        import_module=lambda name: context,
+    )
+
+    assert configured is True
+    assert socket.timeouts == [module.BAOSTOCK_SOCKET_TIMEOUT_SECONDS]
 
 
 def test_baostock_business_error_does_not_relogin_or_retry(tmp_path: Path) -> None:

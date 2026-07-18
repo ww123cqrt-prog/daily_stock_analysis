@@ -203,6 +203,38 @@ class AddIndexBenchmarkTest(unittest.TestCase):
                 self.assertNotIn("SH000906", text)
                 self.assertIn("SH600000", text)
 
+            class ProviderMustNotBeCalled:
+                def __getattr__(self, name):
+                    raise AssertionError(f"baostock must not be called: {name}")
+
+            reused = module.add_benchmark(
+                provider,
+                reuse_existing=True,
+                baostock_module=ProviderMustNotBeCalled(),
+                required_start_date="2026-01-02",
+            )
+            self.assertEqual(reused["status"], "reused-existing")
+            self.assertEqual(
+                set(reused["benchmark_symbols"]),
+                {"SH000300", "SH000905", "SH000906"},
+            )
+
+    def test_reuse_existing_rejects_incomplete_benchmark_bins(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "provider"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-01-02\n2026-01-05\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "existing benchmark"):
+                module.add_benchmark(
+                    provider,
+                    reuse_existing=True,
+                    baostock_module=object(),
+                    required_start_date="2026-01-02",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

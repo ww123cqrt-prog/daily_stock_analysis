@@ -34,6 +34,10 @@ from _robust_membership_integrity import (  # noqa: E402
 from _robust_reference_policy import (  # noqa: E402
     MAX_POST_DELIST_MEMBERSHIP_LAG_DAYS,
 )
+from _robust_reference_integrity import (  # noqa: E402
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
 from download_jqdata import _load_jq_module, authenticate  # noqa: E402
 
 
@@ -49,6 +53,7 @@ BAOSTOCK_MAX_ATTEMPTS = 2
 BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
 BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
 BAOSTOCK_CACHE_SCHEMA_VERSION = 2
+BAOSTOCK_SOCKET_TIMEOUT_SECONDS = 60.0
 IS_WINDOWS = os.name == "nt"
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
@@ -671,6 +676,22 @@ def _require_baostock_columns(
         raise BlockedData(reason_code)
 
 
+def _configure_baostock_socket_timeout(
+    provider: Any,
+    *,
+    import_module=importlib.import_module,
+) -> bool:
+    if getattr(provider, "__name__", None) != "baostock":
+        return False
+    try:
+        context = import_module("baostock.common.context")
+        active_socket = getattr(context, "default_socket")
+        active_socket.settimeout(BAOSTOCK_SOCKET_TIMEOUT_SECONDS)
+    except Exception as exc:
+        raise BlockedData("baostock_socket_timeout_failed") from exc
+    return True
+
+
 def _required_text(value: Any, reason_code: str) -> str:
     if value is None or pd.isna(value):
         raise BlockedData(reason_code)
@@ -775,6 +796,11 @@ class BaostockAdapter:
         if response is None or error_code != "0":
             raise BlockedData("baostock_login_failed")
         self._logged_in = True
+        try:
+            _configure_baostock_socket_timeout(self.provider)
+        except BlockedData:
+            self.close()
+            raise
 
     def close(self) -> None:
         if not self._logged_in:
@@ -878,7 +904,10 @@ class BaostockAdapter:
         industry_codes = np.empty(len(membership), dtype=object)
         industry_codes[:] = None
         date_groups = membership.groupby("date", sort=True).indices
-        for timestamp, positions in date_groups.items():
+        total_dates = len(date_groups)
+        for completed, (timestamp, positions) in enumerate(
+            date_groups.items(), start=1
+        ):
             day = timestamp.date().isoformat()
             day_symbols = membership.iloc[positions]["symbol"].to_numpy(copy=False)
             symbols = set(day_symbols)
@@ -916,6 +945,13 @@ class BaostockAdapter:
                 if industry_code is None:
                     raise BlockedData("missing_industry_member_day")
                 industry_codes[position] = industry_code
+            if completed % 25 == 0 or completed == total_dates:
+                print(
+                    "download_robust_reference: industry date "
+                    f"{completed}/{total_dates} year={timestamp.year} "
+                    f"last_date={day}",
+                    flush=True,
+                )
         if len(classifications) != 1:
             raise BlockedData("inconsistent_industry_classification")
         classification = next(iter(classifications))
@@ -1336,6 +1372,16 @@ def build_reference_tables(
     active_adapter = adapter if hasattr(adapter, "build") else JQDataAdapter(adapter)
     tables = active_adapter.build(membership, today)
     _validate_tables(tables, membership, today)
+    return tables
+
+
+def _read_existing_reference_tables(reference_dir: Path) -> dict[str, pd.DataFrame]:
+    tables: dict[str, pd.DataFrame] = {}
+    try:
+        for name in TABLE_COLUMNS:
+            tables[name] = pd.read_parquet(reference_dir / name)
+    except Exception as exc:
+        raise BlockedData("reference_snapshot_invalid") from exc
     return tables
 
 
@@ -1782,6 +1828,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         choices=("auto", "jqdata", "baostock"),
         default="auto",
     )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Validate and reuse an existing reference snapshot without network calls.",
+    )
     return parser
 
 
@@ -1880,6 +1931,66 @@ def main(
                 member_count = int(membership["symbol"].nunique())
                 member_day_count = len(membership)
                 membership_snapshot_hash = membership_snapshot.fingerprint()
+
+            if args.reuse_existing:
+                try:
+                    with reference_read_lock(reference_dir) as reference_snapshot:
+                        reference_snapshot.ensure_transaction_clean()
+                        existing_source = reference_snapshot.validate_source(
+                            start_date=start_date.isoformat(),
+                            end_date=end_date.isoformat(),
+                            expected_membership_snapshot_hash=membership_snapshot_hash,
+                        )
+                        tables = _read_existing_reference_tables(reference_dir)
+                        _validate_tables(tables, membership, current_date)
+                        reference_snapshot.fingerprint()
+                    with membership_read_lock(pit_dir) as final_membership:
+                        final_membership.ensure_transaction_clean()
+                        final_membership.validate_source(
+                            start_date=start_date.isoformat(),
+                            end_date=end_date.isoformat(),
+                        )
+                        if (
+                            final_membership.fingerprint()
+                            != membership_snapshot_hash
+                        ):
+                            raise BlockedData("membership_snapshot_changed")
+                except ReferenceIntegrityError as exc:
+                    return blocked(exc.reason_code)
+                except BlockedData as exc:
+                    return blocked(exc.reason_code)
+                selected = str(existing_source["selected"])
+                fallback_reason = existing_source.get("fallback_reason")
+                industry_classification = str(
+                    existing_source["industry_classification"]
+                )
+                counts = {name: len(frame) for name, frame in tables.items()}
+                completed = _status_payload(
+                    "completed",
+                    "reused_existing",
+                    start_date,
+                    end_date,
+                    pit_file_count=pit_file_count,
+                    member_count=member_count,
+                    member_day_count=member_day_count,
+                    table_counts=counts,
+                    requested=requested,
+                    selected=selected,
+                    fallback_reason=fallback_reason,
+                    industry_classification=industry_classification,
+                    membership_snapshot_hash=membership_snapshot_hash,
+                    build_run_id=args.run_id,
+                )
+                try:
+                    _atomic_write_status(completed, status_path)
+                except Exception:
+                    return blocked("status_publish_failed")
+                print(
+                    "download_robust_reference: reused existing snapshot; "
+                    f"members={member_count}; member_days={member_day_count}"
+                )
+                return 0
+
             baostock_cache_dir = (
                 reference_dir.parent
                 / "cache"

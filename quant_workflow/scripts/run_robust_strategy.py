@@ -195,6 +195,16 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         "baostock",
     }:
         raise ValueError("universe.reference_source must be a verified PIT source")
+    if payload.get("universe", {}).get("reference_mode", "download") not in {
+        "download",
+        "reuse_existing",
+    }:
+        raise ValueError("universe.reference_mode must be download or reuse_existing")
+    if payload.get("universe", {}).get("benchmark_mode", "download") not in {
+        "download",
+        "reuse_existing",
+    }:
+        raise ValueError("universe.benchmark_mode must be download or reuse_existing")
     if payload.get("statuses") != [
         "blocked_data",
         "development_failed",
@@ -355,20 +365,20 @@ def build_stages(
     ]
     if run_id:
         reference_argv += ["--run-id", str(run_id)]
+    if universe.get("reference_mode", "download") == "reuse_existing":
+        reference_argv.append("--reuse-existing")
     stages.append(Stage("download_robust_reference", reference_argv))
-    stages.append(
-        Stage(
-            "add_robust_benchmarks",
-            [
-                python,
-                str(SCRIPT_DIR / "add_index_benchmark.py"),
-                "--provider-dir",
-                str(provider_dir),
-                "--required-start-date",
-                str(universe["start_date"]),
-            ],
-        )
-    )
+    benchmark_argv = [
+        python,
+        str(SCRIPT_DIR / "add_index_benchmark.py"),
+        "--provider-dir",
+        str(provider_dir),
+        "--required-start-date",
+        str(universe["start_date"]),
+    ]
+    if universe.get("benchmark_mode", "download") == "reuse_existing":
+        benchmark_argv.append("--reuse-existing")
+    stages.append(Stage("add_robust_benchmarks", benchmark_argv))
     stages.append(
         Stage(
             "preflight_robust_data",

@@ -29,6 +29,8 @@ universe:
   kind: pit_csi800
   membership_source: auto
   reference_source: auto
+  reference_mode: reuse_existing
+  benchmark_mode: reuse_existing
   start_date: '2014-01-02'
   indices:
     - id: csi300

@@ -78,6 +78,72 @@ def _read_calendar(path: Path) -> list[str]:
     return calendar
 
 
+def _read_qlib_bin(path: Path) -> tuple[int, np.ndarray]:
+    try:
+        raw = np.fromfile(path, dtype="<f4")
+    except OSError as exc:
+        raise RuntimeError(f"existing benchmark bin is unreadable: {path.name}") from exc
+    if len(raw) < 2 or not np.isfinite(raw[0]) or raw[0] != int(raw[0]):
+        raise RuntimeError(f"existing benchmark bin is invalid: {path.name}")
+    return int(raw[0]), raw[1:]
+
+
+def _validate_existing_benchmarks(
+    paths: BenchmarkPaths,
+    calendar: list[str],
+    required_start_date: str,
+) -> dict[str, int]:
+    calendar_index = pd.Index(calendar)
+    parsed_calendar = pd.to_datetime(calendar_index, errors="raise")
+    if parsed_calendar.has_duplicates or not parsed_calendar.is_monotonic_increasing:
+        raise RuntimeError("existing benchmark calendar is invalid")
+    required_start = max(parsed_calendar[0], pd.Timestamp(required_start_date))
+    required_positions = np.flatnonzero(parsed_calendar >= required_start)
+    if not len(required_positions):
+        raise RuntimeError("existing benchmark calendar has no required dates")
+    first_required = int(required_positions[0])
+    fields = ("open", "high", "low", "close", "volume", "factor")
+    available_days: dict[str, int] = {}
+    for symbol in BENCHMARKS:
+        feature_dir = paths.feature_dir(symbol)
+        for field in fields:
+            start_index, values = _read_qlib_bin(
+                feature_dir / f"{field}.day.bin"
+            )
+            end_index = start_index + len(values)
+            if start_index > first_required or end_index < len(calendar):
+                raise RuntimeError(
+                    f"existing benchmark {symbol} does not cover required dates"
+                )
+            required = values[first_required - start_index : len(calendar) - start_index]
+            if not len(required) or not np.isfinite(required).all():
+                raise RuntimeError(
+                    f"existing benchmark {symbol} contains invalid {field} values"
+                )
+            if field in {"open", "high", "low", "close", "factor"}:
+                valid = (required > 0).all()
+            else:
+                valid = (required >= 0).all()
+            if not valid:
+                raise RuntimeError(
+                    f"existing benchmark {symbol} contains invalid {field} values"
+                )
+        available_days[symbol] = len(calendar) - first_required
+    for instrument_file in paths.instruments_dir.glob("*.txt"):
+        instruments = {
+            line.split("\t", 1)[0].strip().upper()
+            for line in instrument_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        polluted = sorted(set(BENCHMARKS).intersection(instruments))
+        if polluted:
+            raise RuntimeError(
+                "existing benchmark symbols pollute stock instrument pools: "
+                + ",".join(polluted)
+            )
+    return available_days
+
+
 def _download_index_data(
     baostock_module, code: str, start_date: str, end_date: str
 ) -> pd.DataFrame:
@@ -144,6 +210,7 @@ def add_benchmark(
     provider_dir: Path = DATA_DIR,
     *,
     dry_run: bool = False,
+    reuse_existing: bool = False,
     baostock_module=None,
     required_start_date: str = "2014-01-02",
 ) -> dict[str, str | int]:
@@ -174,6 +241,19 @@ def add_benchmark(
             "status": "dry-run",
             "provider_dir": str(paths.provider_dir),
             "calendar_days": len(calendar),
+            "benchmark_symbols": list(BENCHMARKS),
+        }
+
+    if reuse_existing:
+        available_days = _validate_existing_benchmarks(
+            paths, calendar, required_start_date
+        )
+        print("Existing benchmark features passed strict offline validation")
+        return {
+            "status": "reused-existing",
+            "provider_dir": str(paths.provider_dir),
+            "calendar_days": len(calendar),
+            "downloaded_days": available_days,
             "benchmark_symbols": list(BENCHMARKS),
         }
 
@@ -284,10 +364,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Validate paths and calendar without network or writes.",
     )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Strictly validate existing benchmark bins without network access.",
+    )
     args = parser.parse_args(argv)
     add_benchmark(
         args.provider_dir,
         dry_run=args.dry_run,
+        reuse_existing=args.reuse_existing,
         required_start_date=args.required_start_date,
     )
     return 0

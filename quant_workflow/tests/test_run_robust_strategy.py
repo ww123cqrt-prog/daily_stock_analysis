@@ -148,6 +148,10 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
         "prepare_robust_provider",
         "run_robust_development",
     ]
+    reference_stage = next(
+        stage for stage in stages if stage.name == "download_robust_reference"
+    )
+    assert "--reuse-existing" in reference_stage.argv
     benchmark_stage = next(
         stage for stage in stages if stage.name == "add_robust_benchmarks"
     )
@@ -157,6 +161,7 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
     )
     required_start_index = benchmark_stage.argv.index("--required-start-date")
     assert benchmark_stage.argv[required_start_index + 1] == "2014-01-02"
+    assert "--reuse-existing" in benchmark_stage.argv
     provider_stage = next(
         stage for stage in stages if stage.name == "prepare_robust_provider"
     )
