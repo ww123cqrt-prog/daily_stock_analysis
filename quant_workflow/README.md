@@ -70,6 +70,10 @@ paths and readiness state remain authoritative in
 `${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
 `preflight_robust_data.py`.
 
+The robust strategy configuration uses verified offline reuse for the one-time
+reference snapshot and the three Qlib benchmarks. It does not silently redownload
+when local data is missing or mismatched; the correct state is `blocked_data`.
+
 ## Notes
 
 - JQData credentials live in the local project `.env`; never print them in job

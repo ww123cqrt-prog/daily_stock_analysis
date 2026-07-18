@@ -69,6 +69,17 @@ README 说明存储规则，manifest 记录当前磁盘实况，preflight 证明
 不能用今天的成分股回填历史，不能直接从 `cache/` 训练，不能因为数据不完整降低
 验收门槛。
 
+## 下载与复用
+
+正式鲁棒策略配置默认使用：
+
+- `universe.reference_mode: reuse_existing`：只验证并复用已经发布的参考快照，不再次访问 Baostock/JQData；
+- `universe.benchmark_mode: reuse_existing`：只验证三个基准的 Qlib bin 是否覆盖完整日历，不再次访问网络。
+
+参考数据的首次全量下载必须在隔离 staging 中完成，再校验来源、日期范围、成员股票池哈希、字段、主键和内容哈希，最后事务发布到 `reference/`。指数基准也必须先完成下载和校验，再写入 Qlib provider。校验失败时状态为 `blocked_data`，不能自动退回联网下载，也不能用部分缓存训练。
+
+后续日常更新只补新增交易日；如果 PIT 股票池历史分区发生变化，成员哈希会变化，相关参考数据必须重新生成，旧快照不能继续复用。
+
 ## 变更规则
 
 - 新增正式数据时，同步更新数据根 README、子目录 README 和 `DATA_MANIFEST.json`
