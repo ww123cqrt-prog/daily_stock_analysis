@@ -38,6 +38,8 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   run_candidate_pipeline.py
   build_pit_csi800.py
   download_robust_reference.py
+  validate_robust_price_bundle.py
+  import_robust_price_bundle.py
   preflight_robust_data.py
   prepare_robust_provider.py
   robust_backtest.py
