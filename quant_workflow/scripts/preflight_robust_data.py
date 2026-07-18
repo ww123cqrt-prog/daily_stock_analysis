@@ -311,11 +311,28 @@ def _metadata_check(
             how="left",
             validate="many_to_one",
         )
+        if "suspension_status" in tables:
+            suspension = tables["suspension_status"].copy()
+            suspension["date"] = pd.to_datetime(
+                suspension["date"], errors="coerce"
+            ).dt.normalize()
+            suspension["symbol"] = suspension["symbol"].astype(str).str.upper()
+            joined = joined.merge(
+                suspension[["date", "symbol", "is_suspended"]],
+                on=["date", "symbol"],
+                how="left",
+                validate="many_to_one",
+            )
+        else:
+            joined["is_suspended"] = False
+        post_delist = joined["delist_date"].notna() & (
+            joined["delist_date"] < joined["date"]
+        )
         valid = (
             joined["list_date"].notna()
             & joined["board"].notna()
             & (joined["list_date"] <= joined["date"])
-            & (joined["delist_date"].isna() | (joined["delist_date"] >= joined["date"]))
+            & (~post_delist | joined["is_suspended"].eq(True))
         )
         gap = int((~valid).sum())
         if gap:

@@ -270,8 +270,6 @@ def _build_security_master(
                 raise BlockedData("future_security_master_date")
         if list_date > member_bounds.loc[symbol, "min"]:
             raise BlockedData("invalid_security_master_member_day")
-        if pd.notna(delist_date) and delist_date < member_bounds.loc[symbol, "max"]:
-            raise BlockedData("invalid_security_master_member_day")
         rows.append(
             {
                 "symbol": symbol,
@@ -281,6 +279,58 @@ def _build_security_master(
             }
         )
     return pd.DataFrame(rows, columns=TABLE_COLUMNS["security_master.parquet"])
+
+
+def _security_delist_dates(
+    security: pd.DataFrame | None,
+) -> dict[str, pd.Timestamp]:
+    if security is None:
+        return {}
+    if not {"symbol", "delist_date"}.issubset(security.columns):
+        raise BlockedData("invalid_security_master_schema")
+    normalized = security.loc[:, ["symbol", "delist_date"]].copy()
+    normalized["symbol"] = normalized["symbol"].astype(str).str.strip().str.upper()
+    if normalized.duplicated("symbol").any():
+        raise BlockedData("duplicate_security_master_member")
+    return {
+        row.symbol: _normalize_timestamp(row.delist_date)
+        for row in normalized.itertuples(index=False)
+        if pd.notna(row.delist_date)
+    }
+
+
+def _materialize_daily_status(
+    membership: pd.DataFrame,
+    lookup: Mapping[tuple[pd.Timestamp, str], bool],
+    security: pd.DataFrame | None,
+    *,
+    missing_reason: str,
+    forced_post_delist_value: bool | None,
+) -> np.ndarray:
+    delist_dates = _security_delist_dates(security)
+    values = np.empty(len(membership), dtype=np.bool_)
+    ordered = membership.loc[:, ["date", "symbol"]].copy()
+    ordered["position"] = np.arange(len(ordered), dtype=np.int64)
+    last_observed: dict[str, bool] = {}
+    for timestamp, symbol, position in ordered.sort_values(
+        ["date", "symbol"], kind="mergesort"
+    ).itertuples(index=False, name=None):
+        key = (timestamp, symbol)
+        delist_date = delist_dates.get(symbol)
+        post_delist = delist_date is not None and timestamp > delist_date
+        if key in lookup:
+            value = bool(lookup[key])
+            if post_delist and forced_post_delist_value is True and not value:
+                raise BlockedData("tradable_after_delist")
+            last_observed[symbol] = value
+        elif post_delist and forced_post_delist_value is not None:
+            value = forced_post_delist_value
+        elif post_delist and symbol in last_observed:
+            value = last_observed[symbol]
+        else:
+            raise BlockedData(missing_reason)
+        values[position] = value
+    return values
 
 
 def _industry_code(entry: Any) -> str | None:
@@ -408,7 +458,11 @@ def _normalize_st_matrix(
     return lookup
 
 
-def _fetch_st_status(provider: Any, membership: pd.DataFrame) -> pd.DataFrame:
+def _fetch_st_status(
+    provider: Any,
+    membership: pd.DataFrame,
+    security: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     lookup: dict[tuple[pd.Timestamp, str], bool] = {}
     for year_members, start_date, end_date in _year_groups(membership):
         symbols = sorted(year_members["symbol"].unique())
@@ -426,13 +480,21 @@ def _fetch_st_status(provider: Any, membership: pd.DataFrame) -> pd.DataFrame:
             if set(lookup).intersection(chunk_lookup):
                 raise BlockedData("duplicate_st_member_day")
             lookup.update(chunk_lookup)
-    rows = []
-    for row in membership.itertuples(index=False):
-        key = (row.date, row.symbol)
-        if key not in lookup:
-            raise BlockedData("missing_st_member_day")
-        rows.append({"date": row.date, "symbol": row.symbol, "is_st": lookup[key]})
-    return pd.DataFrame(rows, columns=TABLE_COLUMNS["st_status.parquet"])
+    values = _materialize_daily_status(
+        membership,
+        lookup,
+        security,
+        missing_reason="missing_st_member_day",
+        forced_post_delist_value=None,
+    )
+    return pd.DataFrame(
+        {
+            "date": membership["date"].to_numpy(copy=False),
+            "symbol": membership["symbol"].to_numpy(copy=False),
+            "is_st": values,
+        },
+        columns=TABLE_COLUMNS["st_status.parquet"],
+    )
 
 
 def _normalize_paused_frame(
@@ -483,7 +545,11 @@ def _normalize_paused_frame(
     return lookup
 
 
-def _fetch_suspension_status(provider: Any, membership: pd.DataFrame) -> pd.DataFrame:
+def _fetch_suspension_status(
+    provider: Any,
+    membership: pd.DataFrame,
+    security: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     lookup: dict[tuple[pd.Timestamp, str], bool] = {}
     for year_members, start_date, end_date in _year_groups(membership):
         symbols = sorted(year_members["symbol"].unique())
@@ -504,15 +570,21 @@ def _fetch_suspension_status(provider: Any, membership: pd.DataFrame) -> pd.Data
             if set(lookup).intersection(chunk_lookup):
                 raise BlockedData("duplicate_paused_member_day")
             lookup.update(chunk_lookup)
-    rows = []
-    for row in membership.itertuples(index=False):
-        key = (row.date, row.symbol)
-        if key not in lookup:
-            raise BlockedData("missing_paused_member_day")
-        rows.append(
-            {"date": row.date, "symbol": row.symbol, "is_suspended": lookup[key]}
-        )
-    return pd.DataFrame(rows, columns=TABLE_COLUMNS["suspension_status.parquet"])
+    values = _materialize_daily_status(
+        membership,
+        lookup,
+        security,
+        missing_reason="missing_paused_member_day",
+        forced_post_delist_value=True,
+    )
+    return pd.DataFrame(
+        {
+            "date": membership["date"].to_numpy(copy=False),
+            "symbol": membership["symbol"].to_numpy(copy=False),
+            "is_suspended": values,
+        },
+        columns=TABLE_COLUMNS["suspension_status.parquet"],
+    )
 
 
 class _BaostockResponseError(Exception):
@@ -578,10 +650,10 @@ class JQDataAdapter:
 
     def probe(self, membership: pd.DataFrame, today: date) -> None:
         probe_membership = membership.iloc[[0]].copy()
-        _build_security_master(self.provider, probe_membership, today)
+        security = _build_security_master(self.provider, probe_membership, today)
         _fetch_daily_industries(self.provider, probe_membership)
-        _fetch_st_status(self.provider, probe_membership)
-        _fetch_suspension_status(self.provider, probe_membership)
+        _fetch_st_status(self.provider, probe_membership, security)
+        _fetch_suspension_status(self.provider, probe_membership, security)
 
     def build(self, membership: pd.DataFrame, today: date) -> dict[str, pd.DataFrame]:
         security = _build_security_master(self.provider, membership, today)
@@ -592,9 +664,11 @@ class JQDataAdapter:
         return {
             "security_master.parquet": security,
             "industry_intervals.parquet": industry,
-            "st_status.parquet": _fetch_st_status(self.provider, membership),
+            "st_status.parquet": _fetch_st_status(
+                self.provider, membership, security
+            ),
             "suspension_status.parquet": _fetch_suspension_status(
-                self.provider, membership
+                self.provider, membership, security
             ),
         }
 
@@ -687,8 +761,6 @@ class BaostockAdapter:
                     raise BlockedData("future_security_master_date")
             if list_date > member_bounds.loc[symbol, "min"]:
                 raise BlockedData("invalid_security_master_member_day")
-            if pd.notna(delist_date) and delist_date < member_bounds.loc[symbol, "max"]:
-                raise BlockedData("invalid_security_master_member_day")
             rows.append(
                 {
                     "symbol": symbol,
@@ -768,13 +840,16 @@ class BaostockAdapter:
         )
 
     def _fetch_status_tables(
-        self, membership: pd.DataFrame
+        self,
+        membership: pd.DataFrame,
+        security: pd.DataFrame | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         required = ("date", "tradestatus", "isST")
         start_date = membership["date"].min().date().isoformat()
         end_date = membership["date"].max().date().isoformat()
         st_values = np.empty(len(membership), dtype=np.bool_)
         paused_values = np.empty(len(membership), dtype=np.bool_)
+        delist_dates = _security_delist_dates(security)
         symbol_groups = membership.groupby("symbol", sort=True).indices
         for symbol, positions in symbol_groups.items():
             frame = self._query(
@@ -820,6 +895,24 @@ class BaostockAdapter:
                 membership.iloc[positions]["date"].to_numpy(copy=False)
             )
             aligned = history.reindex(member_dates)
+            delist_date = delist_dates.get(symbol)
+            if delist_date is not None:
+                post_delist = member_dates > delist_date
+                if post_delist.any():
+                    observed_post_delist = aligned.loc[post_delist, "is_suspended"]
+                    if (
+                        observed_post_delist.notna()
+                        & ~observed_post_delist.astype("boolean").fillna(False)
+                    ).any():
+                        raise BlockedData("tradable_after_delist")
+                    carried_st = history["is_st"].sort_index().reindex(
+                        member_dates, method="ffill"
+                    )
+                    missing_post_delist_st = post_delist & aligned["is_st"].isna()
+                    aligned.loc[missing_post_delist_st, "is_st"] = carried_st.loc[
+                        missing_post_delist_st
+                    ]
+                    aligned.loc[post_delist, "is_suspended"] = True
             if aligned["is_st"].isna().any():
                 raise BlockedData("missing_st_member_day")
             if aligned["is_suspended"].isna().any():
@@ -851,7 +944,7 @@ class BaostockAdapter:
         industry = _compress_industry_intervals(
             daily_industry, membership["date"].unique()
         )
-        st, suspension = self._fetch_status_tables(membership)
+        st, suspension = self._fetch_status_tables(membership, security)
         return {
             "security_master.parquet": security,
             "industry_intervals.parquet": industry,

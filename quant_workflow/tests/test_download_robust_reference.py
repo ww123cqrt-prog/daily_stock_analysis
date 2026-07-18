@@ -479,6 +479,42 @@ def test_builds_all_tables_and_compresses_industry_changes_and_membership_breaks
     }
 
 
+def test_jqdata_keeps_post_delist_index_days_and_marks_them_untradable(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    provider = FakeProvider()
+    provider.security["600000.XSHG"] = SimpleNamespace(
+        start_date=date(2000, 1, 1),
+        end_date=date(2025, 1, 2),
+    )
+    del provider.st[("2025-01-03", "600000.XSHG")]
+    del provider.paused[("2025-01-03", "600000.XSHG")]
+    provider.st[("2025-01-02", "600000.XSHG")] = True
+
+    return_code, reference_dir, _ = run_main(module, tmp_path, provider)
+
+    security = pd.read_parquet(reference_dir / "security_master.parquet")
+    st = pd.read_parquet(reference_dir / "st_status.parquet")
+    suspension = pd.read_parquet(reference_dir / "suspension_status.parquet")
+    security_row = security.loc[security["symbol"] == "SH600000"].iloc[0]
+    post_delist_st = st.loc[
+        (st["symbol"] == "SH600000")
+        & (st["date"] == pd.Timestamp("2025-01-03")),
+        "is_st",
+    ]
+    post_delist_suspension = suspension.loc[
+        (suspension["symbol"] == "SH600000")
+        & (suspension["date"] == pd.Timestamp("2025-01-03")),
+        "is_suspended",
+    ]
+
+    assert return_code == 0
+    assert security_row["delist_date"] == pd.Timestamp("2025-01-02")
+    assert post_delist_st.tolist() == [True]
+    assert post_delist_suspension.tolist() == [True]
+
+
 def test_cli_reference_source_defaults_to_auto_and_rejects_unknown_value() -> None:
     module = load_module()
     parser = module._argument_parser()
@@ -708,6 +744,49 @@ def test_baostock_industry_update_date_must_be_valid_as_of_requested_day(
     assert return_code != 0
     assert status["reason_code"] == reason_code
     assert not (reference_dir / SOURCE_FILENAME).exists()
+
+
+def test_baostock_keeps_post_delist_index_days_and_marks_them_untradable(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    provider = FakeBaostockProvider()
+    provider.basic[0] = [
+        "sh.600000",
+        "PFB",
+        "2000-01-01",
+        "2025-01-02",
+        "1",
+        "0",
+    ]
+    provider.history["sh.600000"] = [["2025-01-02", "0", "1"]]
+
+    return_code, reference_dir, _ = run_main(
+        module,
+        tmp_path,
+        baostock_provider=provider,
+        reference_source="baostock",
+    )
+
+    security = pd.read_parquet(reference_dir / "security_master.parquet")
+    st = pd.read_parquet(reference_dir / "st_status.parquet")
+    suspension = pd.read_parquet(reference_dir / "suspension_status.parquet")
+    security_row = security.loc[security["symbol"] == "SH600000"].iloc[0]
+    post_delist_st = st.loc[
+        (st["symbol"] == "SH600000")
+        & (st["date"] == pd.Timestamp("2025-01-03")),
+        "is_st",
+    ]
+    post_delist_suspension = suspension.loc[
+        (suspension["symbol"] == "SH600000")
+        & (suspension["date"] == pd.Timestamp("2025-01-03")),
+        "is_suspended",
+    ]
+
+    assert return_code == 0
+    assert security_row["delist_date"] == pd.Timestamp("2025-01-02")
+    assert post_delist_st.tolist() == [True]
+    assert post_delist_suspension.tolist() == [True]
 
 
 def test_baostock_100k_member_days_stay_memory_bounded_and_exact() -> None:
