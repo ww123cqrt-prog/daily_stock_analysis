@@ -116,6 +116,13 @@ def _date_bound(value: str, label: str) -> pd.Timestamp:
     return parsed
 
 
+def _snapshot_hash(value: str, label: str) -> str:
+    normalized = str(value).strip().lower()
+    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+        raise PriceBundleError("invalid_membership_snapshot_hash", f"invalid {label}")
+    return normalized
+
+
 def _validate_frame(
     path: Path,
     symbol: str,
@@ -209,6 +216,7 @@ def build_bundle_manifest(
     expected_symbol_count: int,
     source: str,
     adjustment: str,
+    membership_snapshot_hash: str,
 ) -> dict[str, Any]:
     start = _date_bound(start_date, "start_date")
     end = _date_bound(end_date, "end_date")
@@ -224,6 +232,9 @@ def build_bundle_manifest(
         )
     files = _actual_price_files(Path(price_dir))
     _assert_symbol_set(symbols, files)
+    membership_hash = _snapshot_hash(
+        membership_snapshot_hash, "membership_snapshot_hash"
+    )
     entries = [
         _validate_frame(files[symbol], symbol, start_date=start, end_date=end)
         for symbol in symbols
@@ -233,6 +244,7 @@ def build_bundle_manifest(
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source": str(source),
         "adjustment": str(adjustment),
+        "membership_snapshot_hash": membership_hash,
         "requested_range": {"start_date": str(start.date()), "end_date": str(end.date())},
         "expected_symbol_count": len(symbols),
         "file_count": len(entries),
@@ -257,12 +269,27 @@ def verify_bundle_manifest(
     manifest_path: Path,
     expected_source: str | None = None,
     expected_adjustment: str | None = None,
+    expected_membership_snapshot_hash: str | None = None,
 ) -> dict[str, Any]:
     manifest = _read_manifest(Path(manifest_path))
     if expected_source is not None and manifest.get("source") != expected_source:
         raise PriceBundleError("manifest_source_mismatch", "price bundle source mismatch")
     if expected_adjustment is not None and manifest.get("adjustment") != expected_adjustment:
         raise PriceBundleError("manifest_adjustment_mismatch", "price bundle adjustment mismatch")
+    manifest_membership_hash = _snapshot_hash(
+        str(manifest.get("membership_snapshot_hash", "")),
+        "manifest membership_snapshot_hash",
+    )
+    if expected_membership_snapshot_hash is not None:
+        expected_membership_hash = _snapshot_hash(
+            expected_membership_snapshot_hash,
+            "expected membership_snapshot_hash",
+        )
+        if manifest_membership_hash != expected_membership_hash:
+            raise PriceBundleError(
+                "membership_snapshot_hash_mismatch",
+                "price bundle membership snapshot hash mismatch",
+            )
     requested = manifest.get("requested_range") or {}
     start = _date_bound(str(requested.get("start_date", "")), "manifest start_date")
     end = _date_bound(str(requested.get("end_date", "")), "manifest end_date")
@@ -323,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-symbol-count", type=int, default=0)
     parser.add_argument("--source", default="baostock")
     parser.add_argument("--adjustment", default="qfq")
+    parser.add_argument("--membership-snapshot-hash", required=True)
     parser.add_argument("--manifest-out", type=Path, required=True)
     parser.add_argument("--status-out", type=Path, required=True)
     parser.add_argument("--verify-manifest", type=Path)
@@ -334,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_path=args.verify_manifest,
                 expected_source=args.source,
                 expected_adjustment=args.adjustment,
+                expected_membership_snapshot_hash=args.membership_snapshot_hash,
             )
             payload = {"status": "completed", "reason_code": None, **result}
         else:
@@ -347,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_symbol_count=args.expected_symbol_count,
                 source=args.source,
                 adjustment=args.adjustment,
+                membership_snapshot_hash=args.membership_snapshot_hash,
             )
             write_manifest(args.manifest_out, manifest)
             payload = {

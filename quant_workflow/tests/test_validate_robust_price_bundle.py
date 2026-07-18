@@ -11,6 +11,7 @@ SCRIPT_PATH = (
     / "scripts"
     / "validate_robust_price_bundle.py"
 )
+MEMBERSHIP_HASH = "8be0b74b3e836e9073fc786937b5d9ece8e36494e530cbd07c6e5a608b681cbc"
 
 
 def load_module():
@@ -64,6 +65,7 @@ def test_builds_and_reverifies_semantic_hash_manifest(tmp_path: Path) -> None:
         expected_symbol_count=2,
         source="baostock",
         adjustment="qfq",
+        membership_snapshot_hash=MEMBERSHIP_HASH,
     )
     module.write_manifest(manifest_path, manifest)
     verified = module.verify_bundle_manifest(
@@ -71,6 +73,7 @@ def test_builds_and_reverifies_semantic_hash_manifest(tmp_path: Path) -> None:
         manifest_path=manifest_path,
         expected_source="baostock",
         expected_adjustment="qfq",
+        expected_membership_snapshot_hash=MEMBERSHIP_HASH,
     )
 
     assert manifest["file_count"] == 2
@@ -94,6 +97,7 @@ def test_rejects_missing_and_unexpected_symbols(tmp_path: Path) -> None:
             expected_symbol_count=2,
             source="baostock",
             adjustment="qfq",
+            membership_snapshot_hash=MEMBERSHIP_HASH,
         )
 
     assert exc_info.value.reason_code == "symbol_set_mismatch"
@@ -118,6 +122,7 @@ def test_rejects_duplicate_dates_and_out_of_range_rows(tmp_path: Path) -> None:
             expected_symbol_count=2,
             source="baostock",
             adjustment="qfq",
+            membership_snapshot_hash=MEMBERSHIP_HASH,
         )
 
     assert exc_info.value.reason_code in {
@@ -138,6 +143,7 @@ def test_verify_rejects_tampered_parquet(tmp_path: Path) -> None:
         expected_symbol_count=2,
         source="baostock",
         adjustment="qfq",
+        membership_snapshot_hash=MEMBERSHIP_HASH,
     )
     module.write_manifest(manifest_path, manifest)
     write_price(price_dir / "000001.parquet", ["2020-01-02"])
@@ -148,6 +154,7 @@ def test_verify_rejects_tampered_parquet(tmp_path: Path) -> None:
             manifest_path=manifest_path,
             expected_source="baostock",
             expected_adjustment="qfq",
+            expected_membership_snapshot_hash=MEMBERSHIP_HASH,
         )
 
     assert exc_info.value.reason_code == "file_hash_mismatch"
@@ -165,6 +172,7 @@ def test_verify_rejects_duplicate_manifest_symbols(tmp_path: Path) -> None:
         expected_symbol_count=2,
         source="baostock",
         adjustment="qfq",
+        membership_snapshot_hash=MEMBERSHIP_HASH,
     )
     manifest["files"][1] = dict(manifest["files"][0])
     module.write_manifest(manifest_path, manifest)
@@ -175,6 +183,7 @@ def test_verify_rejects_duplicate_manifest_symbols(tmp_path: Path) -> None:
             manifest_path=manifest_path,
             expected_source="baostock",
             expected_adjustment="qfq",
+            expected_membership_snapshot_hash=MEMBERSHIP_HASH,
         )
 
     assert exc_info.value.reason_code == "manifest_invalid"
@@ -197,6 +206,7 @@ def test_build_rejects_symlinked_parquet(tmp_path: Path) -> None:
             expected_symbol_count=2,
             source="baostock",
             adjustment="qfq",
+            membership_snapshot_hash=MEMBERSHIP_HASH,
         )
 
     assert exc_info.value.reason_code == "symlink_forbidden"
@@ -221,6 +231,8 @@ def test_main_writes_fail_closed_status_without_manifest(tmp_path: Path) -> None
             "2020-12-31",
             "--expected-symbol-count",
             "2",
+            "--membership-snapshot-hash",
+            MEMBERSHIP_HASH,
             "--manifest-out",
             str(manifest_path),
             "--status-out",
@@ -233,3 +245,31 @@ def test_main_writes_fail_closed_status_without_manifest(tmp_path: Path) -> None
     assert status["status"] == "failed"
     assert status["reason_code"] == "symbol_set_mismatch"
     assert not manifest_path.exists()
+
+
+def test_verify_rejects_membership_snapshot_mismatch(tmp_path: Path) -> None:
+    module = load_module()
+    price_dir, symbols_file = build_valid_fixture(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = module.build_bundle_manifest(
+        price_dir=price_dir,
+        symbols_file=symbols_file,
+        start_date="2020-01-01",
+        end_date="2020-12-31",
+        expected_symbol_count=2,
+        source="baostock",
+        adjustment="qfq",
+        membership_snapshot_hash=MEMBERSHIP_HASH,
+    )
+    module.write_manifest(manifest_path, manifest)
+
+    with pytest.raises(module.PriceBundleError) as exc_info:
+        module.verify_bundle_manifest(
+            price_dir=price_dir,
+            manifest_path=manifest_path,
+            expected_source="baostock",
+            expected_adjustment="qfq",
+            expected_membership_snapshot_hash="0" * 64,
+        )
+
+    assert exc_info.value.reason_code == "membership_snapshot_hash_mismatch"
