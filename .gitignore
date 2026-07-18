@@ -44,6 +44,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# This repository is requirements.txt-based; ignore uv's empty local lock artifact.
+/uv.lock
+
 # 虚拟环境
 venv/
 ENV/
