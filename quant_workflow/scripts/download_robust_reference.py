@@ -47,6 +47,7 @@ BLOCKED_RETURN_CODE = 2
 SYMBOL_CHUNK_SIZE = 200
 BAOSTOCK_MAX_ATTEMPTS = 2
 BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
+BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
 BAOSTOCK_CACHE_SCHEMA_VERSION = 2
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
@@ -767,7 +768,10 @@ class BaostockAdapter:
             response = self.provider.login()
         except Exception as exc:
             raise BlockedData("baostock_login_failed") from exc
-        if response is None or str(getattr(response, "error_code", "")) != "0":
+        error_code = str(getattr(response, "error_code", ""))
+        if error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+            raise BlockedData("baostock_blacklisted")
+        if response is None or error_code != "0":
             raise BlockedData("baostock_login_failed")
         self._logged_in = True
 
@@ -793,6 +797,8 @@ class BaostockAdapter:
             try:
                 return _baostock_response_frame(response)
             except _BaostockResponseError as exc:
+                if exc.error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+                    raise BlockedData("baostock_blacklisted") from exc
                 if (
                     exc.error_code not in BAOSTOCK_RELOGIN_ERROR_CODES
                     or attempt + 1 >= BAOSTOCK_MAX_ATTEMPTS

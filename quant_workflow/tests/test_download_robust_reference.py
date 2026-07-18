@@ -1138,6 +1138,33 @@ def test_baostock_missing_member_day_fails_closed_and_preserves_old_source(
     assert provider.logout_count == 1
 
 
+@pytest.mark.parametrize("failure_stage", ["login", "basic"])
+def test_baostock_blacklist_is_reported_with_safe_reason(
+    tmp_path: Path, capsys, failure_stage: str
+) -> None:
+    module = load_module()
+    provider = FakeBaostockProvider()
+    secret = "private-server-detail"
+    provider.failures[failure_stage] = [("10001011", secret)]
+
+    return_code, reference_dir, status_dir = run_main(
+        module,
+        tmp_path,
+        baostock_provider=provider,
+        reference_source="baostock",
+    )
+
+    status_text = (status_dir / "download_robust_reference_latest.json").read_text()
+    status = json.loads(status_text)
+    captured = capsys.readouterr()
+    assert return_code != 0
+    assert status["reason_code"] == "baostock_blacklisted"
+    assert not (reference_dir / SOURCE_FILENAME).exists()
+    assert secret not in status_text
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
 @pytest.mark.parametrize("missing_kind", ["industry", "st", "paused"])
 def test_missing_member_day_blocks_and_preserves_all_old_tables(
     tmp_path: Path, missing_kind: str
