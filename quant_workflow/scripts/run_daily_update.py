@@ -249,7 +249,7 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
             "sync_data_manifest",
             _script("sync_data_manifest.py") + out,
             heavy=False,
-            required=False,
+            required=True,
         )
     )
     if not args.skip_robust_shadow and robust_shadow_tracking_is_active(REPORTS_ROOT):

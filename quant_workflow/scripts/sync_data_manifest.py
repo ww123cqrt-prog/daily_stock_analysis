@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -32,6 +33,15 @@ from _robust_reference_integrity import (  # noqa: E402
 
 REFERENCE_PARQUET_FILES = tuple(
     name for name in REFERENCE_SNAPSHOT_FILES if name.endswith(".parquet")
+)
+DATA_READ_ERRORS = (
+    KeyError,
+    TypeError,
+    ValueError,
+    OSError,
+    UnicodeError,
+    json.JSONDecodeError,
+    pa.ArrowException,
 )
 
 
@@ -109,7 +119,52 @@ def parquet_row_count(path: Path) -> int:
     return int(pq.ParquetFile(path).metadata.num_rows)
 
 
-def pit_manifest_entry(pit_dir: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _pit_manifest_entry_locked(pit_dir: Path, snapshot) -> dict[str, Any]:
+    snapshot.ensure_transaction_clean()
+    raw_source = json.loads(
+        (pit_dir / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
+    )
+    date_range = raw_source["date_range"]
+    if not isinstance(date_range, dict):
+        raise TypeError("membership date_range must be a mapping")
+    source = snapshot.validate_source(
+        start_date=str(date_range["start_date"]),
+        end_date=str(date_range["end_date"]),
+    )
+    daily_files = snapshot.daily_files()
+    membership_hash = snapshot.fingerprint()
+    member_day_count = sum(parquet_row_count(path) for path in daily_files)
+    symbols: set[str] = set()
+    for path in daily_files:
+        symbols.update(
+            str(value)
+            for value in pq.read_table(path, columns=["symbol"])
+            .column("symbol")
+            .to_pylist()
+        )
+    entry = {
+        "path": str(pit_dir),
+        "role": "Official point-in-time CSI800 membership snapshot.",
+        "status": "do_not_move",
+        "date_range": source["date_range"],
+        "requested_source": source["requested"],
+        "selected_source": source["selected"],
+        "daily_file_count": len(daily_files),
+        "member_day_count": member_day_count,
+        "symbol_count": len(symbols),
+        "interval_row_count": parquet_row_count(
+            pit_dir / "membership_intervals.parquet"
+        ),
+        "membership_snapshot_hash": membership_hash,
+    }
+    if "fallback_reason" in source:
+        entry["fallback_reason"] = source["fallback_reason"]
+    return entry
+
+
+def pit_manifest_entry(
+    pit_dir: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if not pit_dir.is_dir():
         return None, {
             "path": str(pit_dir),
@@ -118,51 +173,8 @@ def pit_manifest_entry(pit_dir: Path) -> tuple[dict[str, Any] | None, dict[str, 
         }
     try:
         with membership_read_lock(pit_dir) as snapshot:
-            snapshot.ensure_transaction_clean()
-            raw_source = json.loads(
-                (pit_dir / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
-            )
-            date_range = raw_source["date_range"]
-            source = snapshot.validate_source(
-                start_date=str(date_range["start_date"]),
-                end_date=str(date_range["end_date"]),
-            )
-            daily_files = snapshot.daily_files()
-            membership_hash = snapshot.fingerprint()
-            member_day_count = sum(parquet_row_count(path) for path in daily_files)
-            symbols: set[str] = set()
-            for path in daily_files:
-                symbols.update(
-                    str(value)
-                    for value in pq.read_table(path, columns=["symbol"])
-                    .column("symbol")
-                    .to_pylist()
-                )
-            entry = {
-                "path": str(pit_dir),
-                "role": "Official point-in-time CSI800 membership snapshot.",
-                "status": "do_not_move",
-                "date_range": source["date_range"],
-                "requested_source": source["requested"],
-                "selected_source": source["selected"],
-                "daily_file_count": len(daily_files),
-                "member_day_count": member_day_count,
-                "symbol_count": len(symbols),
-                "interval_row_count": parquet_row_count(
-                    pit_dir / "membership_intervals.parquet"
-                ),
-                "membership_snapshot_hash": membership_hash,
-            }
-            if "fallback_reason" in source:
-                entry["fallback_reason"] = source["fallback_reason"]
-            return entry, None
-    except (
-        KeyError,
-        OSError,
-        UnicodeError,
-        json.JSONDecodeError,
-        MembershipIntegrityError,
-    ) as exc:
+            return _pit_manifest_entry_locked(pit_dir, snapshot), None
+    except (*DATA_READ_ERRORS, MembershipIntegrityError) as exc:
         reason_code = getattr(exc, "reason_code", "membership_snapshot_invalid")
         return None, {
             "path": str(pit_dir),
@@ -223,13 +235,49 @@ def reference_manifest_entry(
             if "build_run_id" in source:
                 entry["build_run_id"] = source["build_run_id"]
             return entry, None
-    except (KeyError, OSError, ReferenceIntegrityError) as exc:
+    except (*DATA_READ_ERRORS, ReferenceIntegrityError) as exc:
         reason_code = getattr(exc, "reason_code", "reference_snapshot_invalid")
         return None, {
             "path": str(reference_dir),
             "status": "not_ready",
             "reason_code": reason_code,
         }
+
+
+def robust_manifest_entries(reference_dir: Path) -> tuple[
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    pit_dir = reference_dir / "pit_csi800"
+    if not pit_dir.is_dir():
+        pit_entry, pit_pending = pit_manifest_entry(pit_dir)
+        _, reference_pending = reference_manifest_entry(reference_dir, None)
+        return pit_entry, pit_pending, None, reference_pending
+    try:
+        with membership_read_lock(pit_dir) as snapshot:
+            pit_entry = _pit_manifest_entry_locked(pit_dir, snapshot)
+            reference_entry, reference_pending = reference_manifest_entry(
+                reference_dir, pit_entry
+            )
+            return pit_entry, None, reference_entry, reference_pending
+    except (*DATA_READ_ERRORS, MembershipIntegrityError) as exc:
+        reason_code = getattr(exc, "reason_code", "membership_snapshot_invalid")
+        return (
+            None,
+            {
+                "path": str(pit_dir),
+                "status": "not_ready",
+                "reason_code": reason_code,
+            },
+            None,
+            {
+                "path": str(reference_dir),
+                "status": "not_ready",
+                "reason_code": "membership_snapshot_not_ready",
+            },
+        )
 
 
 def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, Any]:
@@ -242,9 +290,8 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     cleaned_provider = qlib_root / "cn_data_baostock_jqdata_cleaned"
     canonical_provider = qlib_root / "cn_data_baostock_jqdata"
     reference_root = quant_data / "reference"
-    pit_entry, pit_pending = pit_manifest_entry(reference_root / "pit_csi800")
-    reference_entry, reference_pending = reference_manifest_entry(
-        reference_root, pit_entry
+    pit_entry, pit_pending, reference_entry, reference_pending = (
+        robust_manifest_entries(reference_root)
     )
 
     official_entries: dict[str, Any] = {
@@ -349,11 +396,16 @@ def sync_data_manifest(*, quant_data_root: Path | None = None, reports_root: Pat
     path = quant_data / "DATA_MANIFEST.json"
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary.unlink(missing_ok=True)
     return path

@@ -161,7 +161,7 @@ class BuildStagesTest(unittest.TestCase):
         )
         manifest = next(s for s in stages if s.name == "sync_data_manifest")
         self.assertFalse(manifest.heavy)
-        self.assertFalse(manifest.required)
+        self.assertTrue(manifest.required)
 
     def test_source_downloads_can_be_individually_disabled(self):
         stages = self.module.build_stages(
@@ -484,7 +484,7 @@ class DryRunMainTest(unittest.TestCase):
             )
         )
 
-    def test_manifest_sync_failure_is_warning_not_daily_update_failure(self):
+    def test_manifest_sync_failure_fails_daily_update(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
@@ -520,12 +520,12 @@ class DryRunMainTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["status"], "failed")
         self.assertTrue(
             any(
                 s["name"] == "sync_data_manifest"
-                and not s["required"]
+                and s["required"]
                 and s["status"] == "failed"
                 for s in summary["stages"]
             )

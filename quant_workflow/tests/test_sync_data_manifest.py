@@ -1,9 +1,12 @@
+import fcntl
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -187,6 +190,114 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(entry["row_counts"]["st_status.parquet"], 2)
         self.assertEqual(len(entry["reference_snapshot_hash"]), 64)
         self.assertNotIn("robust_reference", manifest.get("pending_entries", {}))
+
+    def test_pit_lock_remains_held_during_reference_validation(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            pit_dir = seed_pit_membership(quant_data)
+            with module.membership_read_lock(pit_dir) as snapshot:
+                membership_hash = snapshot.fingerprint()
+            seed_reference_snapshot(quant_data, membership_hash)
+            original_reference_lock = module.reference_read_lock
+            exclusive_lock_acquired: list[bool] = []
+
+            @contextmanager
+            def probing_reference_lock(reference_dir):
+                with (pit_dir / ".build_pit_csi800.lock").open("a+b") as handle:
+                    try:
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    except BlockingIOError:
+                        exclusive_lock_acquired.append(False)
+                    else:
+                        exclusive_lock_acquired.append(True)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                with original_reference_lock(reference_dir) as snapshot:
+                    yield snapshot
+
+            with patch.object(
+                module, "reference_read_lock", probing_reference_lock
+            ):
+                manifest = module.build_manifest(
+                    quant_data_root=quant_data,
+                    reports_root=root / "reports",
+                )
+
+        self.assertIn("robust_reference", manifest["official_entries"])
+        self.assertEqual(exclusive_lock_acquired, [False])
+
+    def test_corrupt_membership_source_becomes_pending(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            pit_dir = seed_pit_membership(quant_data)
+            source_path = pit_dir / "MEMBERSHIP_SOURCE.json"
+            source = json.loads(source_path.read_text(encoding="utf-8"))
+            source["date_range"] = None
+            source_path.write_text(json.dumps(source), encoding="utf-8")
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        self.assertNotIn("pit_csi800", manifest["official_entries"])
+        self.assertEqual(
+            manifest["pending_entries"]["pit_csi800"]["reason_code"],
+            "membership_snapshot_invalid",
+        )
+
+    def test_corrupt_membership_parquet_becomes_pending(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            pit_dir = seed_pit_membership(quant_data)
+            (pit_dir / "daily" / "2025.parquet").write_bytes(b"not parquet")
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        self.assertNotIn("pit_csi800", manifest["official_entries"])
+        self.assertEqual(
+            manifest["pending_entries"]["pit_csi800"]["reason_code"],
+            "membership_snapshot_invalid",
+        )
+
+    def test_manifest_write_fsyncs_file_before_replace_and_directory_after(self):
+        module = load_module()
+        events: list[str] = []
+        original_fsync = module.os.fsync
+        original_replace = module.os.replace
+
+        def record_fsync(descriptor):
+            events.append("fsync")
+            return original_fsync(descriptor)
+
+        def record_replace(source, destination):
+            events.append("replace")
+            return original_replace(source, destination)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(module.os, "fsync", record_fsync),
+                patch.object(module.os, "replace", record_replace),
+            ):
+                module.sync_data_manifest(
+                    quant_data_root=root / "quant_data",
+                    reports_root=root / "reports",
+                )
+
+        replace_index = events.index("replace")
+        self.assertIn("fsync", events[:replace_index])
+        self.assertIn("fsync", events[replace_index + 1 :])
 
 
 if __name__ == "__main__":
