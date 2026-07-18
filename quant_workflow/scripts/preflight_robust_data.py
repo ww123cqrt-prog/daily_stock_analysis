@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_bool_dtype
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -363,6 +364,7 @@ def _metadata_check(
                 and str(value).strip()
             )
         )
+        invalid_industry_code_count = int((~industry["valid_industry_code"]).sum())
         covered = pd.Series(False, index=membership.index)
         overlap = False
         for symbol, indices in membership.groupby("symbol").groups.items():
@@ -382,17 +384,31 @@ def _metadata_check(
                 interval_index.get_indexer(membership.loc[member_indices, "date"]) >= 0
             )
         gap = int((~covered).sum())
-        if gap or overlap:
-            member_day_gaps["industry_intervals"] = max(gap, 1 if overlap else 0)
+        if gap or overlap or invalid_industry_code_count:
+            member_day_gaps["industry_intervals"] = max(
+                gap,
+                invalid_industry_code_count,
+                1 if overlap else 0,
+            )
     expected_keys = (
         pd.MultiIndex.from_frame(membership[["date", "symbol"]])
         if not membership.empty
         else pd.MultiIndex.from_arrays([[], []])
     )
-    for name in ("st_status", "suspension_status"):
+    status_columns = {
+        "st_status": "is_st",
+        "suspension_status": "is_suspended",
+    }
+    for name, value_column in status_columns.items():
         if name not in tables or membership.empty:
             continue
         daily = tables[name].copy()
+        if not is_bool_dtype(daily[value_column].dtype) or daily[
+            value_column
+        ].isna().any():
+            invalid.append(
+                f"{REFERENCE_TABLES[name][0]}: {value_column} must be boolean"
+            )
         daily["date"] = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
         daily["symbol"] = daily["symbol"].astype(str).str.upper()
         duplicate_count = int(daily.duplicated(["date", "symbol"]).sum())

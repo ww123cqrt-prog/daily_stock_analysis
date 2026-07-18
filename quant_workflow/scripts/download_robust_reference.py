@@ -938,6 +938,8 @@ class BaostockAdapter:
             ).dt.normalize()
         except (TypeError, ValueError) as exc:
             raise BlockedData("invalid_reference_cache") from exc
+        if getattr(cached["date"].dt, "tz", None) is not None:
+            raise BlockedData("invalid_reference_cache")
         cached["symbol"] = cached["symbol"].astype(str).str.strip().str.upper()
         if (
             cached[["date", "symbol", "industry_code"]].isna().any(axis=None)
@@ -1041,6 +1043,8 @@ class BaostockAdapter:
             ).dt.normalize()
         except (TypeError, ValueError) as exc:
             raise BlockedData("invalid_reference_cache") from exc
+        if getattr(cached["date"].dt, "tz", None) is not None:
+            raise BlockedData("invalid_reference_cache")
         if cached["date"].isna().any() or cached.duplicated("date").any():
             raise BlockedData("invalid_reference_cache")
         for column in ("is_st", "is_suspended"):
@@ -1285,21 +1289,30 @@ def _validate_tables(
             raise BlockedData("invalid_reference_schema")
 
     delist_dates = _security_delist_dates(security)
-    suspension = membership.loc[:, ["date", "symbol"]].merge(
-        tables["suspension_status.parquet"],
-        on=["date", "symbol"],
-        how="left",
-        sort=False,
-        validate="one_to_one",
-    )
-    suspension["delist_date"] = pd.to_datetime(
-        suspension["symbol"].map(delist_dates), errors="coerce"
-    ).dt.normalize()
-    post_delist = suspension["delist_date"].notna() & (
-        suspension["date"] >= suspension["delist_date"]
-    )
-    if (post_delist & ~suspension["is_suspended"]).any():
-        raise BlockedData("tradable_after_delist")
+    if delist_dates:
+        delisted_symbols = set(delist_dates)
+        residual = membership.loc[
+            membership["symbol"].isin(delisted_symbols), ["date", "symbol"]
+        ].copy()
+        residual["delist_date"] = pd.to_datetime(
+            residual["symbol"].map(delist_dates), errors="raise"
+        ).dt.normalize()
+        residual = residual.loc[residual["date"] >= residual["delist_date"]]
+        if not residual.empty:
+            suspension = tables["suspension_status.parquet"]
+            suspension = suspension.loc[
+                suspension["symbol"].isin(delisted_symbols),
+                ["date", "symbol", "is_suspended"],
+            ]
+            residual = residual.merge(
+                suspension,
+                on=["date", "symbol"],
+                how="left",
+                sort=False,
+                validate="one_to_one",
+            )
+            if not residual["is_suspended"].eq(True).all():
+                raise BlockedData("tradable_after_delist")
 
 
 def build_reference_tables(

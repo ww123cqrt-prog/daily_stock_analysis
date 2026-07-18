@@ -858,6 +858,44 @@ def test_baostock_100k_member_days_stay_memory_bounded_and_exact() -> None:
     assert len(st) == len(suspension) == len(membership) == 100_000
 
 
+def test_final_validation_100k_member_days_stays_memory_bounded() -> None:
+    module = load_module()
+    dates = pd.date_range("2020-01-01", periods=500, freq="D")
+    symbols = [f"SH{600000 + offset:06d}" for offset in range(200)]
+    membership = pd.MultiIndex.from_product(
+        [dates, symbols], names=["date", "symbol"]
+    ).to_frame(index=False)
+    tables = {
+        "security_master.parquet": pd.DataFrame(
+            {
+                "symbol": symbols,
+                "list_date": pd.Timestamp("2000-01-01"),
+                "delist_date": pd.NaT,
+                "board": "main",
+            }
+        ),
+        "industry_intervals.parquet": pd.DataFrame(
+            {
+                "symbol": symbols,
+                "industry_code": "801010",
+                "start_date": dates[0],
+                "end_date": dates[-1],
+            }
+        ),
+        "st_status.parquet": membership.assign(is_st=False),
+        "suspension_status.parquet": membership.assign(is_suspended=False),
+    }
+
+    tracemalloc.start()
+    try:
+        module._validate_tables(tables, membership, dates[-1].date())
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 64 * 1024 * 1024
+
+
 def test_baostock_reuses_valid_industry_partition_cache(tmp_path: Path) -> None:
     module = load_module()
     membership = pd.DataFrame(
@@ -1003,6 +1041,39 @@ def test_baostock_rejects_status_cache_for_different_symbol(
             "date": membership["date"],
             "is_st": [False, True],
             "is_suspended": [False, False],
+        }
+    ).to_parquet(cache_path, index=False)
+    adapter = module.BaostockAdapter(FakeBaostockProvider(), cache_dir=cache_dir)
+
+    with pytest.raises(module.BlockedData, match="invalid_reference_cache"):
+        adapter._fetch_status_tables(membership, security)
+
+
+def test_baostock_rejects_timezone_aware_status_cache(tmp_path: Path) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02"]),
+            "symbol": ["SH600000"],
+        }
+    )
+    security = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "list_date": pd.to_datetime(["2000-01-01"]),
+            "delist_date": [pd.NaT],
+            "board": ["main"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "status" / "SH600000.parquet"
+    cache_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "date": pd.to_datetime(["2025-01-02"], utc=True),
+            "is_st": [False],
+            "is_suspended": [False],
         }
     ).to_parquet(cache_path, index=False)
     adapter = module.BaostockAdapter(FakeBaostockProvider(), cache_dir=cache_dir)
@@ -1946,7 +2017,7 @@ def test_final_validation_rejects_unbounded_post_delist_membership() -> None:
     module = load_module()
     membership = pd.DataFrame(
         {
-            "date": pd.to_datetime(["2025-01-02", "2025-06-29"]),
+            "date": pd.to_datetime(["2025-01-02", "2025-01-10"]),
             "symbol": ["SH600000", "SH600000"],
         }
     )
@@ -1964,7 +2035,7 @@ def test_final_validation_rejects_unbounded_post_delist_membership() -> None:
                 "symbol": ["SH600000"],
                 "industry_code": ["801010"],
                 "start_date": pd.to_datetime(["2025-01-02"]),
-                "end_date": pd.to_datetime(["2025-06-29"]),
+                "end_date": pd.to_datetime(["2025-01-10"]),
             }
         ),
         "st_status.parquet": membership.assign(is_st=False),
@@ -1972,7 +2043,39 @@ def test_final_validation_rejects_unbounded_post_delist_membership() -> None:
     }
 
     with pytest.raises(module.BlockedData, match="security_master"):
-        module._validate_tables(tables, membership, date(2025, 6, 29))
+        module._validate_tables(tables, membership, date(2025, 1, 10))
+
+
+def test_final_validation_accepts_suspended_seventh_post_delist_day() -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-09"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    tables = {
+        "security_master.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "list_date": pd.to_datetime(["2000-01-01"]),
+                "delist_date": pd.to_datetime(["2025-01-02"]),
+                "board": ["main"],
+            }
+        ),
+        "industry_intervals.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "industry_code": ["801010"],
+                "start_date": pd.to_datetime(["2025-01-02"]),
+                "end_date": pd.to_datetime(["2025-01-09"]),
+            }
+        ),
+        "st_status.parquet": membership.assign(is_st=False),
+        "suspension_status.parquet": membership.assign(is_suspended=True),
+    }
+
+    module._validate_tables(tables, membership, date(2025, 1, 9))
 
 
 def test_final_validation_rejects_tradable_bounded_post_delist_membership() -> None:

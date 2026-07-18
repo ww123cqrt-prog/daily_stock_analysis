@@ -802,7 +802,7 @@ def test_metadata_check_blocks_unbounded_post_delist_membership(
     reference.mkdir()
     membership = pd.DataFrame(
         {
-            "date": pd.to_datetime(["2025-01-02", "2025-06-29"]),
+            "date": pd.to_datetime(["2025-01-02", "2025-01-10"]),
             "symbol": ["SH600000", "SH600000"],
         }
     )
@@ -819,7 +819,7 @@ def test_metadata_check_blocks_unbounded_post_delist_membership(
             "symbol": ["SH600000"],
             "industry_code": ["801010"],
             "start_date": pd.to_datetime(["2025-01-02"]),
-            "end_date": pd.to_datetime(["2025-06-29"]),
+            "end_date": pd.to_datetime(["2025-01-10"]),
         }
     ).to_parquet(reference / "industry_intervals.parquet", index=False)
     membership.assign(is_st=False).to_parquet(
@@ -835,6 +835,47 @@ def test_metadata_check_blocks_unbounded_post_delist_membership(
     assert details["member_day_gaps"]["security_master"] == 1
 
 
+def test_metadata_check_accepts_suspended_seventh_post_delist_day(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-09"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "list_date": pd.to_datetime(["2000-01-01"]),
+            "delist_date": pd.to_datetime(["2025-01-02"]),
+            "board": ["main"],
+        }
+    ).to_parquet(reference / "security_master.parquet", index=False)
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "industry_code": ["801010"],
+            "start_date": pd.to_datetime(["2025-01-02"]),
+            "end_date": pd.to_datetime(["2025-01-09"]),
+        }
+    ).to_parquet(reference / "industry_intervals.parquet", index=False)
+    membership.assign(is_st=False).to_parquet(
+        reference / "st_status.parquet", index=False
+    )
+    membership.assign(is_suspended=True).to_parquet(
+        reference / "suspension_status.parquet", index=False
+    )
+
+    passed, details = module._metadata_check(reference, membership)
+
+    assert passed is True
+    assert details["member_day_gaps"] == {}
+
+
 def test_metadata_check_blocks_empty_industry_code(tmp_path: Path) -> None:
     module = load_module()
     pit_dir, _, _ = build_small_valid_fixture(tmp_path)
@@ -848,6 +889,42 @@ def test_metadata_check_blocks_empty_industry_code(tmp_path: Path) -> None:
 
     assert passed is False
     assert details["member_day_gaps"]["industry_intervals"] == len(membership)
+
+
+def test_metadata_check_blocks_extra_empty_industry_interval(tmp_path: Path) -> None:
+    module = load_module()
+    pit_dir, _, _ = build_small_valid_fixture(tmp_path)
+    membership = pd.read_parquet(pit_dir / "daily" / "2026.parquet")
+    industry_path = tmp_path / "reference" / "industry_intervals.parquet"
+    industry = pd.read_parquet(industry_path)
+    invalid = industry.iloc[[0]].copy()
+    invalid["industry_code"] = ""
+    pd.concat([industry, invalid], ignore_index=True).to_parquet(
+        industry_path, index=False
+    )
+
+    passed, details = module._metadata_check(tmp_path / "reference", membership)
+
+    assert passed is False
+    assert details["member_day_gaps"]["industry_intervals"] >= 1
+
+
+def test_metadata_check_blocks_non_boolean_status_column(tmp_path: Path) -> None:
+    module = load_module()
+    pit_dir, _, _ = build_small_valid_fixture(tmp_path)
+    membership = pd.read_parquet(pit_dir / "daily" / "2026.parquet")
+    suspension_path = tmp_path / "reference" / "suspension_status.parquet"
+    suspension = pd.read_parquet(suspension_path)
+    suspension["is_suspended"] = suspension["is_suspended"].astype("int64")
+    suspension.to_parquet(suspension_path, index=False)
+
+    passed, details = module._metadata_check(tmp_path / "reference", membership)
+
+    assert passed is False
+    assert any(
+        "is_suspended must be boolean" in value
+        for value in details["invalid_tables"]
+    )
 
 
 def test_preflight_blocks_duplicate_and_future_membership_without_reading_future_prices(
