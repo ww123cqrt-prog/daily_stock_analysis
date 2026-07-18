@@ -14,7 +14,7 @@ import stat
 import sys
 import unicodedata
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
@@ -31,6 +31,9 @@ from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
 )
+from _robust_reference_policy import (  # noqa: E402
+    MAX_POST_DELIST_MEMBERSHIP_LAG_DAYS,
+)
 from download_jqdata import _load_jq_module, authenticate  # noqa: E402
 
 
@@ -44,7 +47,7 @@ BLOCKED_RETURN_CODE = 2
 SYMBOL_CHUNK_SIZE = 200
 BAOSTOCK_MAX_ATTEMPTS = 2
 BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
-BAOSTOCK_CACHE_SCHEMA_VERSION = 1
+BAOSTOCK_CACHE_SCHEMA_VERSION = 2
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
     "industry_intervals.parquet": ("symbol", "industry_code", "start_date", "end_date"),
@@ -279,7 +282,11 @@ def _build_security_master(
                 "board": board_from_symbol(symbol),
             }
         )
-    return pd.DataFrame(rows, columns=TABLE_COLUMNS["security_master.parquet"])
+    security = pd.DataFrame(
+        rows, columns=TABLE_COLUMNS["security_master.parquet"]
+    )
+    _validate_security_membership_bounds(membership, security)
+    return security
 
 
 def _security_delist_dates(
@@ -298,6 +305,33 @@ def _security_delist_dates(
         for row in normalized.itertuples(index=False)
         if pd.notna(row.delist_date)
     }
+
+
+def _validate_security_membership_bounds(
+    membership: pd.DataFrame, security: pd.DataFrame
+) -> None:
+    if not {"symbol", "list_date", "delist_date"}.issubset(security.columns):
+        raise BlockedData("invalid_security_master_schema")
+    normalized = security.loc[:, ["symbol", "list_date", "delist_date"]].copy()
+    normalized["symbol"] = normalized["symbol"].astype(str).str.strip().str.upper()
+    if normalized.duplicated("symbol").any():
+        raise BlockedData("duplicate_security_master_member")
+    normalized["list_date"] = normalized["list_date"].map(_normalize_timestamp)
+    normalized["delist_date"] = normalized["delist_date"].map(
+        lambda value: _normalize_timestamp(value, allow_none=True)
+    )
+    by_symbol = normalized.set_index("symbol")
+    member_bounds = membership.groupby("symbol")["date"].agg(["min", "max"])
+    if set(member_bounds.index) != set(by_symbol.index):
+        raise BlockedData("invalid_security_master_coverage")
+    maximum_lag = timedelta(days=MAX_POST_DELIST_MEMBERSHIP_LAG_DAYS)
+    for symbol, bounds in member_bounds.iterrows():
+        row = by_symbol.loc[symbol]
+        if row["list_date"] > bounds["min"]:
+            raise BlockedData("invalid_security_master_member_day")
+        delist_date = row["delist_date"]
+        if pd.notna(delist_date) and bounds["max"] > delist_date + maximum_lag:
+            raise BlockedData("invalid_security_master_member_day")
 
 
 def _materialize_daily_status(
@@ -808,10 +842,12 @@ class BaostockAdapter:
             seen.add(symbol)
         if seen != expected:
             raise BlockedData("missing_security_master_member")
-        return pd.DataFrame(
+        security = pd.DataFrame(
             sorted(rows, key=lambda row: row["symbol"]),
             columns=TABLE_COLUMNS["security_master.parquet"],
         )
+        _validate_security_membership_bounds(membership, security)
+        return security
 
     def _fetch_industry_partition(
         self, membership: pd.DataFrame
@@ -915,6 +951,20 @@ class BaostockAdapter:
         }
         if len(classifications) != 1:
             raise BlockedData("invalid_reference_cache")
+        classification = next(iter(classifications))
+        expected_component = _industry_component(classification)
+        normalized_codes: list[str] = []
+        for value in cached["industry_code"]:
+            code = _required_text(value, "invalid_reference_cache")
+            components = code.split(":")
+            if (
+                len(components) != 2
+                or components[0].casefold() != expected_component
+                or not components[1].strip()
+            ):
+                raise BlockedData("invalid_reference_cache")
+            normalized_codes.append(code)
+        cached["industry_code"] = normalized_codes
         ordered = membership.loc[:, ["date", "symbol"]].merge(
             cached.loc[:, ["date", "symbol", "industry_code"]],
             on=["date", "symbol"],
@@ -926,7 +976,7 @@ class BaostockAdapter:
             raise BlockedData("invalid_reference_cache")
         return (
             ordered,
-            next(iter(classifications)),
+            classification,
         )
 
     def _fetch_daily_industries(self, membership: pd.DataFrame) -> pd.DataFrame:
@@ -973,15 +1023,18 @@ class BaostockAdapter:
             index=membership.index,
         )
 
-    def _read_status_cache(self, path: Path) -> pd.DataFrame:
+    def _read_status_cache(self, path: Path, expected_symbol: str) -> pd.DataFrame:
         try:
             cached = pd.read_parquet(path)
         except Exception as exc:
             raise BlockedData("invalid_reference_cache") from exc
-        required = ("date", "is_st", "is_suspended")
+        required = ("symbol", "date", "is_st", "is_suspended")
         if not set(required).issubset(cached.columns):
             raise BlockedData("invalid_reference_cache")
         cached = cached.loc[:, required].copy()
+        cached["symbol"] = cached["symbol"].astype(str).str.strip().str.upper()
+        if set(cached["symbol"].unique()) != {expected_symbol}:
+            raise BlockedData("invalid_reference_cache")
         try:
             cached["date"] = pd.to_datetime(
                 cached["date"], errors="raise"
@@ -994,7 +1047,7 @@ class BaostockAdapter:
             if not cached[column].map(lambda value: isinstance(value, (bool, np.bool_))).all():
                 raise BlockedData("invalid_reference_cache")
             cached[column] = cached[column].astype(bool)
-        return cached.set_index("date")
+        return cached.set_index("date").loc[:, ["is_st", "is_suspended"]]
 
     def _fetch_status_tables(
         self,
@@ -1014,7 +1067,7 @@ class BaostockAdapter:
             cache_path = self._status_cache_path(symbol)
             cache_hit = cache_path is not None and cache_path.is_file()
             if cache_hit:
-                history = self._read_status_cache(cache_path)
+                history = self._read_status_cache(cache_path, symbol)
             else:
                 frame = self._query(
                     self.provider.query_history_k_data_plus,
@@ -1083,7 +1136,11 @@ class BaostockAdapter:
                 raise BlockedData("missing_paused_member_day")
             if not cache_hit and cache_path is not None:
                 self._write_cache(
-                    history.rename_axis("date").reset_index(), cache_path
+                    history.rename_axis("date")
+                    .reset_index()
+                    .assign(symbol=symbol)
+                    .loc[:, ["symbol", "date", "is_st", "is_suspended"]],
+                    cache_path,
                 )
             st_values[positions] = aligned["is_st"].to_numpy(dtype=np.bool_)
             paused_values[positions] = aligned["is_suspended"].to_numpy(dtype=np.bool_)
@@ -1145,10 +1202,17 @@ def _validate_tables(
         membership["symbol"]
     ):
         raise BlockedData("invalid_security_master_coverage")
+    _validate_security_membership_bounds(membership, security)
     industry = tables["industry_intervals.parquet"]
     if industry.duplicated(["symbol", "start_date", "end_date"]).any():
         raise BlockedData("duplicate_industry_interval")
     industry = industry.copy()
+    try:
+        industry["industry_code"] = industry["industry_code"].map(
+            lambda value: _required_text(value, "invalid_industry_interval")
+        )
+    except BlockedData as exc:
+        raise BlockedData("invalid_industry_interval") from exc
     for column in ("start_date", "end_date"):
         industry[column] = pd.to_datetime(
             industry[column], errors="coerce"

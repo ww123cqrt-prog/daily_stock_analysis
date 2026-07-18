@@ -28,6 +28,9 @@ from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
 )
+from _robust_reference_policy import (  # noqa: E402
+    MAX_POST_DELIST_MEMBERSHIP_LAG_DAYS,
+)
 
 
 QUANT_DATA = quant_data_root()
@@ -328,11 +331,18 @@ def _metadata_check(
         post_delist = joined["delist_date"].notna() & (
             joined["delist_date"] <= joined["date"]
         )
+        post_delist_lag_days = (joined["date"] - joined["delist_date"]).dt.days
+        bounded_post_delist = post_delist_lag_days.between(
+            0, MAX_POST_DELIST_MEMBERSHIP_LAG_DAYS, inclusive="both"
+        )
         valid = (
             joined["list_date"].notna()
             & joined["board"].notna()
             & (joined["list_date"] <= joined["date"])
-            & (~post_delist | joined["is_suspended"].eq(True))
+            & (
+                ~post_delist
+                | (bounded_post_delist & joined["is_suspended"].eq(True))
+            )
         )
         gap = int((~valid).sum())
         if gap:
@@ -346,12 +356,19 @@ def _metadata_check(
         industry["end_date"] = pd.to_datetime(
             industry["end_date"], errors="coerce"
         ).dt.normalize()
+        industry["valid_industry_code"] = industry["industry_code"].map(
+            lambda value: bool(
+                value is not None
+                and not pd.isna(value)
+                and str(value).strip()
+            )
+        )
         covered = pd.Series(False, index=membership.index)
         overlap = False
         for symbol, indices in membership.groupby("symbol").groups.items():
-            ranges = industry[industry["symbol"] == symbol].sort_values(
-                ["start_date", "end_date"]
-            )
+            ranges = industry[
+                (industry["symbol"] == symbol) & industry["valid_industry_code"]
+            ].sort_values(["start_date", "end_date"])
             if ranges.empty:
                 continue
             interval_index = pd.IntervalIndex.from_arrays(

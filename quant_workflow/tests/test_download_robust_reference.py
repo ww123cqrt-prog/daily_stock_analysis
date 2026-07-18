@@ -913,6 +913,31 @@ def test_baostock_realigns_reordered_industry_partition_cache(
     assert actual["industry_code"].tolist() == ["CSRC:Technology", "CSRC:Bank"]
 
 
+def test_baostock_rejects_empty_industry_code_in_cache(tmp_path: Path) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02"]),
+            "symbol": ["SH600000"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "industry" / "2025.parquet"
+    cache_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "date": membership["date"],
+            "symbol": membership["symbol"],
+            "industry_code": [""],
+            "industry_classification": ["CSRC"],
+        }
+    ).to_parquet(cache_path, index=False)
+    adapter = module.BaostockAdapter(FakeBaostockProvider(), cache_dir=cache_dir)
+
+    with pytest.raises(module.BlockedData, match="invalid_reference_cache"):
+        adapter._fetch_daily_industries(membership)
+
+
 def test_baostock_reuses_valid_symbol_status_cache(tmp_path: Path) -> None:
     module = load_module()
     membership = pd.DataFrame(
@@ -949,6 +974,41 @@ def test_baostock_reuses_valid_symbol_status_cache(tmp_path: Path) -> None:
     pd.testing.assert_frame_equal(actual_st, expected_st)
     pd.testing.assert_frame_equal(actual_suspension, expected_suspension)
     assert not [call for call in second_provider.calls if call[0] == "history"]
+
+
+def test_baostock_rejects_status_cache_for_different_symbol(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-03"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    security = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "list_date": pd.to_datetime(["2000-01-01"]),
+            "delist_date": [pd.NaT],
+            "board": ["main"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    cache_path = cache_dir / "status" / "SH600000.parquet"
+    cache_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["SZ000001", "SZ000001"],
+            "date": membership["date"],
+            "is_st": [False, True],
+            "is_suspended": [False, False],
+        }
+    ).to_parquet(cache_path, index=False)
+    adapter = module.BaostockAdapter(FakeBaostockProvider(), cache_dir=cache_dir)
+
+    with pytest.raises(module.BlockedData, match="invalid_reference_cache"):
+        adapter._fetch_status_tables(membership, security)
 
 
 def test_baostock_missing_member_day_fails_closed_and_preserves_old_source(
@@ -1847,3 +1907,69 @@ def test_final_validation_rejects_industry_gap_overlap_or_future_interval() -> N
     )
     with pytest.raises(module.BlockedData, match="future"):
         module._validate_tables(future, membership, date(2025, 1, 3))
+
+
+def test_final_validation_rejects_empty_industry_code() -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02"]),
+            "symbol": ["SH600000"],
+        }
+    )
+    tables = {
+        "security_master.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "list_date": pd.to_datetime(["2000-01-01"]),
+                "delist_date": [pd.NaT],
+                "board": ["main"],
+            }
+        ),
+        "industry_intervals.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "industry_code": [""],
+                "start_date": membership["date"],
+                "end_date": membership["date"],
+            }
+        ),
+        "st_status.parquet": membership.assign(is_st=False),
+        "suspension_status.parquet": membership.assign(is_suspended=False),
+    }
+
+    with pytest.raises(module.BlockedData, match="industry"):
+        module._validate_tables(tables, membership, date(2025, 1, 2))
+
+
+def test_final_validation_rejects_unbounded_post_delist_membership() -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-06-29"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    tables = {
+        "security_master.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "list_date": pd.to_datetime(["2000-01-01"]),
+                "delist_date": pd.to_datetime(["2025-01-02"]),
+                "board": ["main"],
+            }
+        ),
+        "industry_intervals.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "industry_code": ["801010"],
+                "start_date": pd.to_datetime(["2025-01-02"]),
+                "end_date": pd.to_datetime(["2025-06-29"]),
+            }
+        ),
+        "st_status.parquet": membership.assign(is_st=False),
+        "suspension_status.parquet": membership.assign(is_suspended=True),
+    }
+
+    with pytest.raises(module.BlockedData, match="security_master"):
+        module._validate_tables(tables, membership, date(2025, 6, 29))
