@@ -1253,7 +1253,11 @@ def _validate_tables(
             previous_end = end
         if covered != member_dates:
             raise BlockedData("invalid_industry_coverage")
-    for name in ("st_status.parquet", "suspension_status.parquet"):
+    status_columns = {
+        "st_status.parquet": "is_st",
+        "suspension_status.parquet": "is_suspended",
+    }
+    for name, value_column in status_columns.items():
         frame = tables[name]
         if frame.duplicated(["date", "symbol"]).any():
             raise BlockedData("duplicate_reference_member_day")
@@ -1275,6 +1279,27 @@ def _validate_tables(
             raise BlockedData("incomplete_reference_member_day")
         if (frame["date"].dt.date > today).any():
             raise BlockedData("future_reference_date")
+        if not frame[value_column].map(
+            lambda value: isinstance(value, (bool, np.bool_))
+        ).all():
+            raise BlockedData("invalid_reference_schema")
+
+    delist_dates = _security_delist_dates(security)
+    suspension = membership.loc[:, ["date", "symbol"]].merge(
+        tables["suspension_status.parquet"],
+        on=["date", "symbol"],
+        how="left",
+        sort=False,
+        validate="one_to_one",
+    )
+    suspension["delist_date"] = pd.to_datetime(
+        suspension["symbol"].map(delist_dates), errors="coerce"
+    ).dt.normalize()
+    post_delist = suspension["delist_date"].notna() & (
+        suspension["date"] >= suspension["delist_date"]
+    )
+    if (post_delist & ~suspension["is_suspended"]).any():
+        raise BlockedData("tradable_after_delist")
 
 
 def build_reference_tables(

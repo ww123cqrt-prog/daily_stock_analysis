@@ -1973,3 +1973,36 @@ def test_final_validation_rejects_unbounded_post_delist_membership() -> None:
 
     with pytest.raises(module.BlockedData, match="security_master"):
         module._validate_tables(tables, membership, date(2025, 6, 29))
+
+
+def test_final_validation_rejects_tradable_bounded_post_delist_membership() -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-09"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    tables = {
+        "security_master.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "list_date": pd.to_datetime(["2000-01-01"]),
+                "delist_date": pd.to_datetime(["2025-01-02"]),
+                "board": ["main"],
+            }
+        ),
+        "industry_intervals.parquet": pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "industry_code": ["801010"],
+                "start_date": pd.to_datetime(["2025-01-02"]),
+                "end_date": pd.to_datetime(["2025-01-09"]),
+            }
+        ),
+        "st_status.parquet": membership.assign(is_st=False),
+        "suspension_status.parquet": membership.assign(is_suspended=False),
+    }
+
+    with pytest.raises(module.BlockedData, match="tradable_after_delist"):
+        module._validate_tables(tables, membership, date(2025, 1, 9))
