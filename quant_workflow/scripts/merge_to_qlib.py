@@ -250,7 +250,13 @@ def run_smoke_fixture(base_dir: Path, overwrite: bool = True) -> int:
     return convert_to_bin(merged_dir, qlib_dir, overwrite=overwrite)
 
 
-def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields: list[str] | None = None) -> int:
+def convert_to_bin(
+    src_dir: Path,
+    dst_dir: Path,
+    overwrite: bool,
+    dropna_fields: list[str] | None = None,
+    calendar_path: Path | None = None,
+) -> int:
     if overwrite and dst_dir.exists():
         shutil.rmtree(dst_dir)
 
@@ -287,7 +293,31 @@ def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields:
         if i % 1000 == 0:
             print(f"  read {i}/{len(pq_files)}")
 
-    calendar = sorted(all_dates)
+    if calendar_path is not None:
+        calendar_path = Path(calendar_path)
+        try:
+            calendar = [
+                value.strip()
+                for value in calendar_path.read_text(encoding="utf-8").splitlines()
+                if value.strip()
+            ]
+        except OSError as exc:
+            raise ValueError("verified calendar file is unavailable") from exc
+        parsed_calendar = pd.to_datetime(calendar, errors="coerce")
+        if (
+            not calendar
+            or parsed_calendar.isna().any()
+            or len(set(calendar)) != len(calendar)
+            or calendar != sorted(calendar)
+        ):
+            raise ValueError("verified calendar file is invalid")
+        missing_dates = sorted(all_dates - set(calendar))
+        if missing_dates:
+            raise ValueError(
+                f"price dates are absent from verified calendar: {missing_dates[:10]}"
+            )
+    else:
+        calendar = sorted(all_dates)
     if not calendar:
         print("ERROR: Empty calendar")
         return 1
@@ -303,8 +333,11 @@ def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields:
         path = cal_dir / name
         if not overwrite and path.exists():
             continue
-        with path.open("w", encoding="utf-8") as handle:
-            handle.write("\n".join(calendar) + "\n")
+        if calendar_path is not None:
+            shutil.copy2(calendar_path, path)
+        else:
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write("\n".join(calendar) + "\n")
 
     instruments_path = inst_dir / "all.txt"
     if overwrite or not instruments_path.exists():
@@ -356,6 +389,12 @@ def main() -> int:
     parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
     parser.add_argument("--qlib-dir", type=Path, default=QLIB_BIN_DIR)
     parser.add_argument(
+        "--calendar-file",
+        type=Path,
+        default=None,
+        help="Use this verified Qlib calendar verbatim when writing feature bins.",
+    )
+    parser.add_argument(
         "--no-overwrite",
         action="store_true",
         help="Skip replacing existing output files; missing output files may still be created.",
@@ -382,7 +421,12 @@ def main() -> int:
     )
     if merged_count == 0:
         return 1
-    return convert_to_bin(args.merged_dir, args.qlib_dir, overwrite)
+    return convert_to_bin(
+        args.merged_dir,
+        args.qlib_dir,
+        overwrite,
+        calendar_path=args.calendar_file,
+    )
 
 
 if __name__ == "__main__":

@@ -251,6 +251,49 @@ class MergeToQlibTest(unittest.TestCase):
         self.assertEqual(values[1], 1000.0)
         self.assertTrue(np.isnan(values[2]))
 
+    def test_convert_to_bin_can_align_to_verified_external_calendar(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            src_dir = base / "merged"
+            dst_dir = base / "qlib"
+            calendar_path = base / "verified_day.txt"
+            src_dir.mkdir()
+            calendar_path.write_text(
+                "2019-12-31\n2020-01-02\n2020-01-03\n2020-01-06\n",
+                encoding="utf-8",
+            )
+            pd.DataFrame(
+                {
+                    "date": ["2020-01-02", "2020-01-03"],
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1100.0],
+                    "factor": [1.0, 1.0],
+                }
+            ).to_parquet(src_dir / "000001.parquet", index=False)
+
+            result = module.convert_to_bin(
+                src_dir,
+                dst_dir,
+                overwrite=True,
+                calendar_path=calendar_path,
+            )
+
+            close_bin = np.fromfile(
+                dst_dir / "features" / "sz000001" / "close.day.bin",
+                dtype="<f4",
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                (dst_dir / "calendars" / "day.txt").read_bytes(),
+                calendar_path.read_bytes(),
+            )
+            self.assertEqual(float(close_bin[0]), 1.0)
+            np.testing.assert_allclose(close_bin[1:], [10.1, 10.2])
+
 
 if __name__ == "__main__":
     unittest.main()
