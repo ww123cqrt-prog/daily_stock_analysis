@@ -168,6 +168,9 @@ def test_market_panel_uses_only_pit_member_days_and_historical_metadata(
     assert bool(sz_st["is_st"]) is True
     assert bool(sz_paused["suspended"]) is True
     assert sh_old["previous_close"] == 10.5
+    assert sh_old["list_date"] == pd.Timestamp("1999-01-01")
+    assert sh_old["listing_trading_day"] > 5
+    assert bool(sh_old["listing_history_complete"]) is False
     assert panel.attrs["reference_source_metadata"]["selected"] == "baostock"
     assert (
         panel.attrs["reference_source_metadata"]["fallback_reason"]
@@ -202,11 +205,36 @@ def test_market_panel_allows_missing_prices_on_verified_suspension_day(
     )
 
     row = panel[
-        (panel["date"] == pd.Timestamp("2025-01-07"))
-        & (panel["symbol"] == "SZ000001")
+        (panel["date"] == pd.Timestamp("2025-01-07")) & (panel["symbol"] == "SZ000001")
     ].iloc[0]
     assert bool(row["suspended"]) is True
     assert pd.isna(row["open"])
+
+
+def test_market_panel_rejects_price_history_missing_listing_start(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    pit_dir, price_dir, reference = build_fixture(tmp_path)
+    path = price_dir / "600000.parquet"
+    prices = pd.read_parquet(path).iloc[1:].reset_index(drop=True)
+    prices.to_parquet(path, index=False)
+    security_path = reference / "security_master.parquet"
+    security = pd.read_parquet(security_path)
+    security["list_date"] = pd.to_datetime(security["list_date"])
+    security.loc[security["symbol"] == "SH600000", "list_date"] = pd.Timestamp(
+        "2025-01-02"
+    )
+    security.to_parquet(security_path, index=False)
+
+    with pytest.raises(ValueError, match="listing date"):
+        module.load_market_panel(
+            pit_dir=pit_dir,
+            price_dir=price_dir,
+            reference_dir=reference,
+            start_date="2025-01-03",
+            end_date="2025-01-07",
+        )
 
 
 def test_reference_read_lock_blocks_writer_after_integrity_check(

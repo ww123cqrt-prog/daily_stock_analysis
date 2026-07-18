@@ -23,6 +23,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from robust_evaluation import shadow_verdict  # noqa: E402
+from run_robust_strategy import DEFAULT_CONFIG, load_config  # noqa: E402
 
 try:
     import fcntl
@@ -188,17 +189,30 @@ def append_signal_predictions(
 
 
 def new_shadow_state(
-    *, confirmation_run_id: str, frozen_config_hash: str, start_after: str
+    *,
+    confirmation_run_id: str,
+    frozen_config_hash: str,
+    start_after: str,
+    acceptance_thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
     start = pd.Timestamp(start_after).normalize()
     if not confirmation_run_id or len(str(frozen_config_hash)) != 64:
         raise ValueError("confirmation_run_id and frozen_config_hash are required")
+    thresholds = copy.deepcopy(dict(acceptance_thresholds))
+    initial_verdict = shadow_verdict(
+        trading_days=0,
+        net_excess_return=0.0,
+        max_drawdown=0.0,
+        task_success_ratio=0.0,
+        thresholds=thresholds,
+    )
     return {
         "status": "shadow_observation",
         "confirmation_run_id": str(confirmation_run_id),
         "frozen_config_hash": str(frozen_config_hash),
         "start_after": str(start.date()),
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "acceptance_thresholds": thresholds,
         "observations": [],
         "metrics": {
             "trading_days": 0,
@@ -206,12 +220,7 @@ def new_shadow_state(
             "max_drawdown": 0.0,
             "task_success_ratio": 0.0,
         },
-        "verdict": shadow_verdict(
-            trading_days=0,
-            net_excess_return=0.0,
-            max_drawdown=0.0,
-            task_success_ratio=0.0,
-        ),
+        "verdict": initial_verdict,
     }
 
 
@@ -281,6 +290,7 @@ def append_observation(
         net_excess_return=metrics["net_excess_return"],
         max_drawdown=metrics["max_drawdown"],
         task_success_ratio=metrics["task_success_ratio"],
+        thresholds=result["acceptance_thresholds"],
     )
     result["metrics"] = metrics
     result["verdict"] = verdict
@@ -296,6 +306,7 @@ def update_shadow_state_file(
     frozen_config_hash: str,
     start_after: str,
     observation: Mapping[str, Any],
+    acceptance_thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
     path = Path(path)
     with _file_guard(path):
@@ -305,7 +316,10 @@ def update_shadow_state_file(
                 confirmation_run_id=confirmation_run_id,
                 frozen_config_hash=frozen_config_hash,
                 start_after=start_after,
+                acceptance_thresholds=acceptance_thresholds,
             )
+        elif state.get("acceptance_thresholds") != dict(acceptance_thresholds):
+            raise ValueError("shadow acceptance thresholds changed")
         updated = append_observation(state, observation)
         _atomic_write(
             path,
@@ -322,7 +336,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--observation", type=Path, required=True)
     parser.add_argument("--confirmation", type=Path, required=True)
     parser.add_argument("--frozen", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args(argv)
+    config = load_config(args.config)
     confirmation = _read_json(args.confirmation)
     frozen = _read_json(args.frozen)
     if (
@@ -337,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         frozen_config_hash=str(frozen["config_hash"]),
         start_after=str(confirmation["latest_market_day"]),
         observation=observation,
+        acceptance_thresholds=config["acceptance"],
     )
     print(json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True))
     return (

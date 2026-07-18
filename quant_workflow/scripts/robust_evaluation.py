@@ -15,8 +15,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from robust_backtest import performance_metrics, simulate_strategy
-from robust_strategy_core import evaluate_development_acceptance
+from robust_backtest import performance_metrics, simulate_strategy  # noqa: E402
+from robust_strategy_core import evaluate_development_acceptance  # noqa: E402
 
 
 def _validate_prediction_frame(frame: pd.DataFrame, name: str) -> pd.DataFrame:
@@ -139,6 +139,7 @@ def model_signal_report(
     model_id: str,
     quarter_metrics: Sequence[Mapping[str, Any]],
     stability: Mapping[str, Any],
+    thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
     rank_ics: list[float] = []
     for item in quarter_metrics:
@@ -154,10 +155,24 @@ def model_signal_report(
     )
     rank_corr = float(stability.get("rank_correlation_median", float("nan")))
     overlap = float(stability.get("topk_overlap_mean", float("nan")))
+    limits = {
+        "positive_rank_ic_interval_ratio_min": float(
+            thresholds["positive_rank_ic_interval_ratio_min"]
+        ),
+        "window_rank_correlation_median_min": float(
+            thresholds["window_rank_correlation_median_min"]
+        ),
+        "top50_overlap_mean_min": float(thresholds["top50_overlap_mean_min"]),
+    }
+    if not all(math.isfinite(value) for value in limits.values()):
+        raise ValueError("model acceptance thresholds must be finite")
     gates = {
-        "positive_rank_ic_intervals": positive_ratio >= 0.70,
-        "window_rank_correlation": math.isfinite(rank_corr) and rank_corr >= 0.70,
-        "top50_overlap": math.isfinite(overlap) and overlap >= 0.60,
+        "positive_rank_ic_intervals": positive_ratio
+        >= limits["positive_rank_ic_interval_ratio_min"],
+        "window_rank_correlation": math.isfinite(rank_corr)
+        and rank_corr >= limits["window_rank_correlation_median_min"],
+        "top50_overlap": math.isfinite(overlap)
+        and overlap >= limits["top50_overlap_mean_min"],
     }
     mean_rank_ic = float(np.mean(rank_ics)) if rank_ics else -math.inf
     development_score = (
@@ -175,6 +190,7 @@ def model_signal_report(
         "stability": dict(stability),
         "quarter_metrics": [dict(item) for item in quarter_metrics],
         "development_score": development_score,
+        "thresholds": limits,
     }
 
 
@@ -207,7 +223,7 @@ def _rank_ic(frame: pd.DataFrame) -> float:
 
 
 def aggregate_training_artifacts(
-    records: Sequence[Mapping[str, Any]], *, topk: int = 50
+    records: Sequence[Mapping[str, Any]], *, topk: int, thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
     if not records:
         raise ValueError("training artifact records are empty")
@@ -257,7 +273,10 @@ def aggregate_training_artifacts(
             quarter_metrics.append({"quarter": quarter, "rank_ic": _rank_ic(aggregate)})
             quarter_aggregates.append(aggregate)
         report = model_signal_report(
-            model_id=model_id, quarter_metrics=quarter_metrics, stability=stability
+            model_id=model_id,
+            quarter_metrics=quarter_metrics,
+            stability=stability,
+            thresholds=thresholds,
         )
         model_reports.append(report)
         combined = pd.concat(quarter_aggregates).sort_index()
@@ -307,23 +326,162 @@ def _regime_metrics(
 
 
 def _board_attribution(daily: pd.DataFrame) -> dict[str, dict[str, float | int]]:
+    required = {"portfolio_return", "benchmark_return"}
+    for board in ("main", "growth", "star"):
+        required.update(
+            {
+                f"board_exposure_{board}",
+                f"board_start_exposure_{board}",
+                f"board_return_contribution_{board}",
+                f"board_excess_contribution_{board}",
+            }
+        )
+    missing = required - set(daily.columns)
+    if missing:
+        raise ValueError(
+            f"daily backtest is missing attribution columns: {', '.join(sorted(missing))}"
+        )
+
+    portfolio_returns = pd.to_numeric(
+        daily["portfolio_return"], errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
+    benchmark_returns = pd.to_numeric(
+        daily["benchmark_return"], errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
+    if (
+        portfolio_returns.isna().any()
+        or benchmark_returns.isna().any()
+        or (portfolio_returns <= -1.0).any()
+        or (benchmark_returns <= -1.0).any()
+    ):
+        raise ValueError("daily attribution returns must be finite and greater than -1")
+    portfolio_wealth_before = (
+        (1.0 + portfolio_returns).cumprod().shift(1, fill_value=1.0)
+    )
+    benchmark_wealth_before = (
+        (1.0 + benchmark_returns).cumprod().shift(1, fill_value=1.0)
+    )
     result: dict[str, dict[str, float | int]] = {}
     for board in ("main", "growth", "star"):
-        column = f"board_exposure_{board}"
-        if column not in daily:
-            values = pd.Series(dtype=float)
-        else:
-            values = (
+
+        def clean(column: str) -> pd.Series:
+            if column not in daily:
+                return pd.Series(dtype=float)
+            return (
                 pd.to_numeric(daily[column], errors="coerce")
                 .replace([np.inf, -np.inf], np.nan)
                 .dropna()
             )
+
+        values = clean(f"board_exposure_{board}")
+        returns = clean(f"board_return_contribution_{board}")
+        starting_exposure = clean(f"board_start_exposure_{board}")
+        if not (len(returns) == len(daily) and len(starting_exposure) == len(daily)):
+            raise ValueError("daily board attribution contains non-finite values")
+        compounded_return_contribution = float(
+            (portfolio_wealth_before * returns).sum()
+        )
+        compounded_excess_contribution = float(
+            (
+                portfolio_wealth_before * returns
+                - benchmark_wealth_before * starting_exposure * benchmark_returns
+            ).sum()
+        )
         result[board] = {
             "average_exposure": float(values.mean()) if not values.empty else 0.0,
             "max_exposure": float(values.max()) if not values.empty else 0.0,
             "days": int(len(values)),
+            "return_contribution": compounded_return_contribution,
+            "excess_contribution": compounded_excess_contribution,
         }
     return result
+
+
+def _attribution_reconciliation(
+    daily: pd.DataFrame, board_attribution: Mapping[str, Mapping[str, Any]]
+) -> dict[str, float | bool]:
+    required = {
+        "portfolio_return",
+        "benchmark_return",
+        "cash_start_exposure",
+        "cash_excess_contribution",
+    }
+    for board in ("main", "growth", "star"):
+        required.update(
+            {
+                f"board_return_contribution_{board}",
+                f"board_excess_contribution_{board}",
+            }
+        )
+    missing = required - set(daily.columns)
+    if missing:
+        raise ValueError(
+            f"daily backtest is missing reconciliation columns: {', '.join(sorted(missing))}"
+        )
+    portfolio_returns = pd.to_numeric(daily["portfolio_return"], errors="raise")
+    benchmark_returns = pd.to_numeric(daily["benchmark_return"], errors="raise")
+    benchmark_wealth_before = (
+        (1.0 + benchmark_returns).cumprod().shift(1, fill_value=1.0)
+    )
+    cash_start_exposure = pd.to_numeric(daily["cash_start_exposure"], errors="raise")
+    cash_excess_contribution = float(
+        (-benchmark_wealth_before * cash_start_exposure * benchmark_returns).sum()
+    )
+    daily_board_return = sum(
+        pd.to_numeric(daily[f"board_return_contribution_{board}"], errors="raise")
+        for board in ("main", "growth", "star")
+    )
+    daily_board_excess = sum(
+        pd.to_numeric(daily[f"board_excess_contribution_{board}"], errors="raise")
+        for board in ("main", "growth", "star")
+    )
+    daily_cash_excess = pd.to_numeric(daily["cash_excess_contribution"], errors="raise")
+    max_daily_return_residual = float(
+        (portfolio_returns - daily_board_return).abs().max()
+    )
+    max_daily_excess_residual = float(
+        (portfolio_returns - benchmark_returns - daily_board_excess - daily_cash_excess)
+        .abs()
+        .max()
+    )
+    cumulative_portfolio_return = float((1.0 + portfolio_returns).prod() - 1.0)
+    cumulative_benchmark_return = float((1.0 + benchmark_returns).prod() - 1.0)
+    cumulative_excess_return = cumulative_portfolio_return - cumulative_benchmark_return
+    board_return_sum = sum(
+        float(board_attribution[board]["return_contribution"])
+        for board in ("main", "growth", "star")
+    )
+    board_excess_sum = sum(
+        float(board_attribution[board]["excess_contribution"])
+        for board in ("main", "growth", "star")
+    )
+    return_residual = cumulative_portfolio_return - board_return_sum
+    excess_residual = (
+        cumulative_excess_return - board_excess_sum - cash_excess_contribution
+    )
+    tolerance = 1e-10
+    reconciled = all(
+        abs(value) <= tolerance
+        for value in (
+            max_daily_return_residual,
+            max_daily_excess_residual,
+            return_residual,
+            excess_residual,
+        )
+    )
+    return {
+        "reconciled": reconciled,
+        "cumulative_portfolio_return": cumulative_portfolio_return,
+        "cumulative_benchmark_return": cumulative_benchmark_return,
+        "cumulative_excess_return": cumulative_excess_return,
+        "board_return_contribution_sum": board_return_sum,
+        "board_excess_contribution_sum": board_excess_sum,
+        "cash_excess_contribution": cash_excess_contribution,
+        "return_residual": return_residual,
+        "excess_residual": excess_residual,
+        "max_daily_return_residual": max_daily_return_residual,
+        "max_daily_excess_residual": max_daily_excess_residual,
+    }
 
 
 def evaluate_strategy_candidates(
@@ -373,6 +531,9 @@ def evaluate_strategy_candidates(
     reports: list[dict[str, Any]] = []
     for strategy in config["strategies"]:
         strategy_id = str(strategy["id"])
+        eligible_for_final_selection = bool(
+            strategy.get("eligible_for_final_selection", False)
+        )
         low_cost = simulator(
             **common,
             strategy_id=strategy_id,
@@ -403,6 +564,11 @@ def evaluate_strategy_candidates(
         ]
         regime_metrics = _regime_metrics(baseline["daily"], regimes)
         board_attribution = _board_attribution(baseline["daily"])
+        attribution_reconciliation = _attribution_reconciliation(
+            baseline["daily"], board_attribution
+        )
+        if attribution_reconciliation["reconciled"] is not True:
+            raise ValueError("portfolio attribution does not reconcile")
         acceptance = evaluate_development_acceptance(
             quarter_metrics=quarter_metrics,
             aggregate_annual_excess_return=float(
@@ -414,10 +580,12 @@ def evaluate_strategy_candidates(
             stress_excess_return=float(stress["metrics"]["annual_excess_return"]),
             delayed_excess_return=float(delayed["metrics"]["annual_excess_return"]),
             regime_metrics=regime_metrics,
+            thresholds=config["acceptance"],
         )
         reports.append(
             {
                 "strategy_id": strategy_id,
+                "eligible_for_final_selection": eligible_for_final_selection,
                 "low_cost": low_cost,
                 "baseline": baseline,
                 "stress": stress,
@@ -425,10 +593,15 @@ def evaluate_strategy_candidates(
                 "quarter_metrics": quarter_metrics,
                 "regime_metrics": regime_metrics,
                 "board_attribution": board_attribution,
+                "attribution_reconciliation": attribution_reconciliation,
                 "acceptance": acceptance,
             }
         )
-    passing = [item for item in reports if item["acceptance"]["passed"]]
+    passing = [
+        item
+        for item in reports
+        if item["acceptance"]["passed"] and item["eligible_for_final_selection"]
+    ]
     passing.sort(
         key=lambda item: (
             float(item["baseline"]["metrics"]["annual_excess_return"]),
@@ -471,16 +644,34 @@ def confirmation_verdict(
     annual_excess_return: float,
     information_ratio: float,
     max_drawdown: float,
+    thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
+    limits = {
+        "confirmation_excess_return_min_exclusive": float(
+            thresholds["confirmation_excess_return_min_exclusive"]
+        ),
+        "confirmation_information_ratio_min_exclusive": float(
+            thresholds["confirmation_information_ratio_min_exclusive"]
+        ),
+        "confirmation_max_drawdown_abs_max": float(
+            thresholds["confirmation_max_drawdown_abs_max"]
+        ),
+    }
+    if not all(math.isfinite(value) for value in limits.values()):
+        raise ValueError("confirmation acceptance thresholds must be finite")
     gates = {
-        "positive_net_excess": float(annual_excess_return) > 0,
-        "positive_information_ratio": float(information_ratio) > 0,
-        "maximum_drawdown": abs(float(max_drawdown)) <= 0.20,
+        "positive_net_excess": float(annual_excess_return)
+        > limits["confirmation_excess_return_min_exclusive"],
+        "positive_information_ratio": float(information_ratio)
+        > limits["confirmation_information_ratio_min_exclusive"],
+        "maximum_drawdown": abs(float(max_drawdown))
+        <= limits["confirmation_max_drawdown_abs_max"],
     }
     return {
         "passed": all(gates.values()),
         "gates": gates,
         "failed_gates": [name for name, passed in gates.items() if not passed],
+        "thresholds": limits,
     }
 
 
@@ -490,18 +681,37 @@ def shadow_verdict(
     net_excess_return: float,
     max_drawdown: float,
     task_success_ratio: float,
+    thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if int(trading_days) < 60:
+    limits = {
+        "shadow_days": int(thresholds["shadow_days"]),
+        "shadow_net_excess_return_min_exclusive": float(
+            thresholds["shadow_net_excess_return_min_exclusive"]
+        ),
+        "shadow_max_drawdown_abs_max": float(thresholds["shadow_max_drawdown_abs_max"]),
+        "shadow_task_success_ratio_min": float(
+            thresholds["shadow_task_success_ratio_min"]
+        ),
+    }
+    if limits["shadow_days"] <= 0 or not all(
+        math.isfinite(value) for key, value in limits.items() if key != "shadow_days"
+    ):
+        raise ValueError("shadow acceptance thresholds are invalid")
+    if int(trading_days) < limits["shadow_days"]:
         return {
             "status": "shadow_observation",
             "passed": False,
-            "remaining_days": 60 - int(trading_days),
+            "remaining_days": limits["shadow_days"] - int(trading_days),
             "gates": {},
+            "thresholds": limits,
         }
     gates = {
-        "positive_net_excess": float(net_excess_return) > 0,
-        "maximum_drawdown": abs(float(max_drawdown)) <= 0.12,
-        "task_success_ratio": float(task_success_ratio) >= 0.95,
+        "positive_net_excess": float(net_excess_return)
+        > limits["shadow_net_excess_return_min_exclusive"],
+        "maximum_drawdown": abs(float(max_drawdown))
+        <= limits["shadow_max_drawdown_abs_max"],
+        "task_success_ratio": float(task_success_ratio)
+        >= limits["shadow_task_success_ratio_min"],
     }
     return {
         "status": "robust_strategy_qualified"
@@ -511,4 +721,5 @@ def shadow_verdict(
         "remaining_days": 0,
         "gates": gates,
         "failed_gates": [name for name, passed in gates.items() if not passed],
+        "thresholds": limits,
     }

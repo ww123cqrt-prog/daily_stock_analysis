@@ -93,13 +93,15 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 网页按以下顺序使用：
 
-1. “运行鲁棒策略开发流程”：执行数据预检、不可变 provider 准备、五类模型的多窗口/多随机种子滚动样本外训练，以及五套交易规则的低成本、基准成本、40bp 压力成本和延迟执行测试。五套候选无论采用哪种选股或换手规则，都必须执行单股 3%、单一行业 25%、创业板与科创板合计 30% 的上限；市场状态归因使用前一交易日收盘后已知的状态，报告同时给出主板、创业板、科创板的平均与峰值仓位暴露。开发期只允许输出 `development_failed` 或 `research_candidate_ready`。
+1. “运行鲁棒策略开发流程”：执行数据预检、不可变 provider 准备、五类模型的多窗口/多随机种子滚动样本外训练，以及五套交易规则的低成本、基准成本、40bp 压力成本和延迟执行测试。`weekly_top50`、`low_turnover`、`regime_scaled` 和 `sector_constrained` 是用于衡量各模块作用的消融对照，只有同时包含低换手、市场状态减仓、行业与板块分散的 `full_risk_control` 可以成为冻结候选。五套规则都执行单股 3%、单一行业 25%、创业板与科创板合计 30% 的硬上限；卖出因停牌或涨跌停失败时，买入会按实际残留仓位重新计算容量和市场状态总仓位。市场状态归因使用前一交易日收盘后已知的状态，板块归因同时给出主板、创业板、科创板的平均/峰值仓位、组合收益贡献和相对 CSI800 基准的超额贡献；现金相对基准的贡献单独记录，板块与现金贡献按复利财富变化口径与组合总收益和总超额严格对账。开发期只允许输出 `development_failed` 或 `research_candidate_ready`。
 2. “运行冻结策略 2026 确认期”：只对已经冻结的配置、Git commit、数据清单哈希、模型文件哈希和预测文件哈希运行一次确认。2026 结果不能用于回头换冠军；未通过时输出 `development_failed`。
-3. “运行鲁棒策略当日纸面跟踪”：只加载冻结模型做当日推理，不重新训练，按交易日逐日记录任务成功、组合收益、基准收益、净超额和最大回撤。状态 `shadow_observation` 表示仍在观察，不等于合格；完成 60 个交易日且全部门槛通过后，才允许出现 `robust_strategy_qualified`。
+3. “运行鲁棒策略当日纸面跟踪”：只加载冻结模型做当日推理，不重新训练，按交易日逐日记录任务成功、组合收益、基准收益、净超额和最大回撤。状态 `shadow_observation` 表示仍在观察，不等于合格；完成配置中冻结的 60 个交易日且全部门槛通过后，才允许出现 `robust_strategy_qualified`。开发期、2026 确认期和纸面跟踪的所有数值门槛均读取同一份 `robust_strategy.yaml`，判定结果会保存实际使用的门槛，不使用脚本内另一套隐藏数字。
 
 开发期一旦产生 `research_candidate_ready`，会冻结入选模型在全部 12 个季度、全部训练窗口和全部随机种子上的模型文件与预测文件。固定参数入选模型只能绑定固定参数矩阵；经有界调参入选的模型只能绑定最佳调参配置重新训练得到的完整矩阵，不能把调参参数和固定参数模型混在同一冻结记录中。冻结记录保存本次开发 run 目录、每个任务的时间切分、上下文哈希、绝对路径和 SHA256，并对完整产物矩阵再计算总哈希；2026 确认期会在开始前和发布结果前核对这套冻结上下文，不能从其他 run、共享 `latest` 文件或后来改写的模型文件中替换证据。三个指数基准必须覆盖 2014 年以来每个必需交易日。历史指数在成分退出和替补生效之间可能短暂少于名义数量；构建器只接受单个指数和 CSI800 并集均不低于名义数量 99% 的原始记录，保留短缺异常，不用前向或后向填充伪造成分，低于 99% 时立即阻断。最终预检仍要求至少 99% 的交易日达到完整 800 只。
 
 固定状态只有 `blocked_data`、`development_failed`、`research_candidate_ready`、`shadow_observation`、`robust_strategy_qualified`。网页会把策略生命周期和最近一次纸面任务分开显示：某天推理失败会显示日期和原因，但不会把一次运行故障伪装成 60 日最终结论；同一失败日期也不能重跑成成功。`/backtest` 展示模型稳定性、策略成本/延迟压力、季度样本外结果、市场状态归因、确认期和纸面跟踪；`/experiments/` 查看 `robust_csi800_development` 与 `robust_csi800_confirmation` 的 MLflow 原始 Runs。
+
+回测市场面板从证券主表读取 `list_date`，并从每只股票的完整日线按真实有成交记录计算 `listing_trading_day`。科创板、注册制创业板和注册制主板上市前五个交易日，以及北交所首个交易日，按当时无涨跌幅限制处理；注册制前主板上市首日保留上涨 44%/下跌 36% 的方向差异，成熟科创板和注册制创业板风险警示股票仍按 20% 处理。价格文件若在上市后 30 天内才开始且缺失上市首日，市场面板直接拒绝；对于远晚于上市日才开始的旧历史文件，只标记为成熟股票，不得误判成上市前五日。缺少上市日期或可交易日年龄时回测拒绝继续，不用自然日或默认 10% 猜测。
 
 正式报告写入 `quant_workflow/reports/robust_strategy/`。核心入口包括 `build_pit_csi800.py`、`download_robust_reference.py`、`preflight_robust_data.py`、`prepare_robust_provider.py`、`run_robust_development.py`、`run_robust_strategy.py`、`run_robust_confirmation.py`、`run_robust_shadow_day.py` 和 `robust_shadow_tracking.py`。网页和命令行的长开发流程统一通过 `launch_robust_strategy.py` 注册为当前 macOS 用户的 `launchd` 一次性任务；监督进程先用 `/usr/bin/env -i` 清空图形会话继承环境，再只传递非敏感运行白名单，主流程不会继承 GitHub/LLM/API token。启动命令必须显式固定 `--mlruns-dir` 到 DSA 正式 `quant_workflow/mlruns/`，不能写入隔离 worktree 的空目录。监督进程记录主流程 PID、标准输出、错误日志、launch record、退出码和最终状态，并在启动后复核进程与 CPU 占用。历史股票池每完成一个完整年度就事务提交该年度分区和进度；总成员区间只在全部年度完成后发布。`.build_pit_csi800.in-progress.json` 存在期间，读取方固定拒绝半成品。`/workflow` 从当前 run 的专属报告显示 `completed_date_count / expected_date_count`，不读取其他 run 的共享旧进度。不能把正式训练作为 Codex 前台子进程裸跑。模型、行情、报告、MLflow 数据和运行日志不进入 Git。
 

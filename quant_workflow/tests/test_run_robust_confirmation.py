@@ -445,7 +445,7 @@ def test_passing_confirmation_enters_shadow_without_changing_selection(
     def training_runner(config, jobs, **kwargs):
         return confirmation_artifact_progress(module, jobs, tmp_path / "artifacts")
 
-    def aggregator(records, topk):
+    def aggregator(records, topk, thresholds):
         return {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
@@ -619,7 +619,7 @@ def test_confirmation_publishes_final_result_under_snapshot_and_claim_locks(
         training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
             module, jobs, tmp_path / "artifacts"
         ),
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},
@@ -687,7 +687,7 @@ def test_confirmation_rechecks_membership_snapshot_before_publishing_shadow(
         training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
             module, jobs, tmp_path / "artifacts"
         ),
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},
@@ -731,7 +731,7 @@ def test_confirmation_rejects_completed_jobs_with_missing_model_or_invalid_split
             provider_state_path=provider_state,
             run_id=f"confirmation-invalid-{invalid_field}",
             training_runner=lambda *args, _progress=progress, **kwargs: _progress,
-            aggregator=lambda records, topk: (_ for _ in ()).throw(
+            aggregator=lambda records, topk, thresholds: (_ for _ in ()).throw(
                 AssertionError("invalid artifacts reached aggregation")
             ),
             git_state_provider=lambda: {
@@ -770,7 +770,7 @@ def test_confirmation_rejects_completed_job_with_damaged_model_hash(
         provider_state_path=provider_state,
         run_id="confirmation-damaged-model",
         training_runner=lambda *args, **kwargs: progress,
-        aggregator=lambda records, topk: (_ for _ in ()).throw(
+        aggregator=lambda records, topk, thresholds: (_ for _ in ()).throw(
             AssertionError("invalid artifacts reached aggregation")
         ),
         git_state_provider=lambda: {"commit": "a" * 40, "clean": True, "changes": []},
@@ -821,7 +821,7 @@ def test_confirmation_rechecks_model_artifacts_before_publishing_shadow(
         provider_state_path=provider_state,
         run_id="confirmation-artifact-recheck",
         training_runner=training_runner,
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},
@@ -948,7 +948,7 @@ def test_confirmation_rechecks_git_state_before_publishing_shadow_result(
         training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
             module, jobs, tmp_path / "artifacts"
         ),
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},
@@ -1016,7 +1016,7 @@ def test_confirmation_rechecks_full_provider_identity_before_publishing_shadow(
         training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
             module, jobs, tmp_path / "artifacts"
         ),
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},
@@ -1192,7 +1192,7 @@ def test_confirmation_recomputes_selection_hash_before_publishing(
         training_runner=lambda config, jobs, **kwargs: confirmation_artifact_progress(
             module, jobs, tmp_path / "artifacts"
         ),
-        aggregator=lambda records, topk: {
+        aggregator=lambda records, topk, thresholds: {
             "model_reports": [],
             "model_predictions": {"linear_ridge": prediction, "lightgbm": prediction},
             "window_predictions": {},

@@ -40,7 +40,7 @@ def write_provider(
     (root / "ROBUST_PROVIDER.json").write_text(
         json.dumps(
             {
-                "format_version": 2,
+                "format_version": 3,
                 "provider_key": root.name,
                 "canonical_provider": str((canonical_provider or root).resolve()),
             }
@@ -544,6 +544,7 @@ def test_runner_and_state_cli_share_one_state_file_lock(
                     "benchmark_return": 0.0002,
                     "task_success": True,
                 },
+                acceptance_thresholds=module.load_config(CONFIG_PATH)["acceptance"],
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)

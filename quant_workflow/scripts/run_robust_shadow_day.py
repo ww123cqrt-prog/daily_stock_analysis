@@ -21,13 +21,16 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root  # noqa: E402
-from prepare_robust_provider import prepare_runtime_provider  # noqa: E402
+from prepare_robust_provider import (  # noqa: E402
+    PROVIDER_FORMAT_VERSION,
+    prepare_runtime_provider,
+)
 from robust_backtest import simulate_strategy  # noqa: E402
-from robust_market_data import (
+from robust_market_data import (  # noqa: E402
     build_market_regimes,
     load_benchmark_frame,
     load_market_panel,
-)  # noqa: E402
+)
 from robust_shadow_tracking import (  # noqa: E402
     _atomic_write,
     _file_guard,
@@ -37,17 +40,17 @@ from robust_shadow_tracking import (  # noqa: E402
     new_shadow_state,
 )
 from robust_strategy_core import RollingSplit  # noqa: E402
-from run_robust_development import (
+from run_robust_development import (  # noqa: E402
     TREE_MODELS,
     build_dataset_config,
     selection_contract_hash,
-)  # noqa: E402
-from run_robust_strategy import (
+)
+from run_robust_strategy import (  # noqa: E402
     DEFAULT_CONFIG,
     file_sha256,
     git_worktree_state,
     load_config,
-)  # noqa: E402
+)
 
 
 REPLAY_START = "2026-01-01"
@@ -129,7 +132,9 @@ def _write_daily(report_dir: Path, payload: Mapping[str, Any]) -> dict[str, Any]
 
 def _read_provider_metadata(provider: Path) -> dict[str, Any]:
     metadata = _read_json(Path(provider) / "ROBUST_PROVIDER.json")
-    if metadata.get("format_version") != 2 or not metadata.get("canonical_provider"):
+    if metadata.get("format_version") != PROVIDER_FORMAT_VERSION or not metadata.get(
+        "canonical_provider"
+    ):
         raise ShadowBlocked("frozen_provider_metadata_invalid")
     return metadata
 
@@ -499,7 +504,11 @@ def _load_replay_predictions(
     )
 
 
-def _load_state(report_dir: Path, frozen: Mapping[str, Any]) -> dict[str, Any]:
+def _load_state(
+    report_dir: Path,
+    frozen: Mapping[str, Any],
+    acceptance_thresholds: Mapping[str, Any],
+) -> dict[str, Any]:
     path = report_dir / "shadow_state_latest.json"
     state = _read_json(path)
     if not state:
@@ -507,11 +516,13 @@ def _load_state(report_dir: Path, frozen: Mapping[str, Any]) -> dict[str, Any]:
             confirmation_run_id=str(frozen["confirmation_run_id"]),
             frozen_config_hash=str(frozen["config_hash"]),
             start_after=str(frozen["shadow_start_after"]),
+            acceptance_thresholds=acceptance_thresholds,
         )
     if (
         state.get("confirmation_run_id") != frozen.get("confirmation_run_id")
         or state.get("frozen_config_hash") != frozen.get("config_hash")
         or state.get("start_after") != frozen.get("shadow_start_after")
+        or state.get("acceptance_thresholds") != dict(acceptance_thresholds)
     ):
         raise ShadowBlocked("shadow_state_contract_mismatch")
     return state
@@ -756,7 +767,7 @@ def run_shadow_day(
             )
 
         try:
-            state = _load_state(report_dir, frozen)
+            state = _load_state(report_dir, frozen, config["acceptance"])
         except ShadowBlocked as exc:
             return _write_daily(
                 report_dir,

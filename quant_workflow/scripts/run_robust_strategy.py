@@ -122,7 +122,9 @@ def _claim_run(report_dir: Path, run_id: str, *, resume: bool) -> Iterator[None]
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise ValueError(f"robust strategy run {run_id!r} is already running") from exc
+            raise ValueError(
+                f"robust strategy run {run_id!r} is already running"
+            ) from exc
         try:
             status_path = runs_dir / run_id / "status.json"
             if not resume and status_path.exists():
@@ -218,6 +220,29 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         payload, ("acceptance", "window_rank_correlation_median_min"), 0.70
     )
     _require_at_least(payload, ("acceptance", "top50_overlap_mean_min"), 0.60)
+    _require_at_least(
+        payload, ("acceptance", "stress_cost_excess_return_min_exclusive"), 0.0
+    )
+    _require_at_least(
+        payload,
+        ("acceptance", "delayed_execution_excess_return_min_exclusive"),
+        0.0,
+    )
+    _require_at_least(payload, ("acceptance", "positive_regime_count_min"), 3)
+    _require_at_least(payload, ("acceptance", "regime_days_for_floor"), 60)
+    _require_at_least(payload, ("acceptance", "regime_annual_excess_floor"), -0.05)
+    _require_at_least(
+        payload, ("acceptance", "confirmation_excess_return_min_exclusive"), 0.0
+    )
+    _require_at_least(
+        payload,
+        ("acceptance", "confirmation_information_ratio_min_exclusive"),
+        0.0,
+    )
+    _require_at_least(payload, ("acceptance", "shadow_days"), 60)
+    _require_at_least(
+        payload, ("acceptance", "shadow_net_excess_return_min_exclusive"), 0.0
+    )
     _require_at_least(payload, ("acceptance", "shadow_task_success_ratio_min"), 0.95)
     _require_at_most(payload, ("acceptance", "development_max_drawdown_abs_max"), 0.20)
     _require_at_most(payload, ("acceptance", "confirmation_max_drawdown_abs_max"), 0.20)
@@ -228,6 +253,23 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("training.tree_seeds must remain [42, 2026, 3407]")
     if len(payload.get("rolling_validation", {}).get("test_quarters") or []) != 12:
         raise ValueError("rolling_validation must contain 12 development quarters")
+    strategies = payload.get("strategies") or []
+    expected_strategy_ids = [
+        "weekly_top50",
+        "low_turnover",
+        "regime_scaled",
+        "sector_constrained",
+        "full_risk_control",
+    ]
+    if [str(item.get("id")) for item in strategies] != expected_strategy_ids:
+        raise ValueError("strategies must keep the five approved candidate rules")
+    eligible = [
+        str(item["id"])
+        for item in strategies
+        if item.get("eligible_for_final_selection") is True
+    ]
+    if eligible != ["full_risk_control"]:
+        raise ValueError("only full_risk_control may be eligible for final selection")
     return payload
 
 
@@ -1275,9 +1317,7 @@ def _run_pipeline_claimed(
             state["reason_code"] = development.get("reason_code")
             state.pop("failed_stage", None)
         state.pop("current_stage", None)
-        state["updated_at"] = (
-            datetime.now().astimezone().isoformat(timespec="seconds")
-        )
+        state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         _save_state(state, run_dir, report_dir)
     return state
 

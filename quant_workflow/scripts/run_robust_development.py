@@ -33,11 +33,11 @@ from robust_evaluation import (  # noqa: E402
     evaluate_strategy_candidates,
     select_development_models,
 )
-from robust_market_data import (
+from robust_market_data import (  # noqa: E402
     build_market_regimes,
     load_benchmark_frame,
     load_market_panel,
-)  # noqa: E402
+)
 from _robust_reference_integrity import (  # noqa: E402
     ReferenceIntegrityError,
     reference_read_lock,
@@ -47,12 +47,12 @@ from _robust_membership_integrity import (  # noqa: E402
     membership_read_lock,
 )
 from prepare_robust_provider import runtime_provider_identity  # noqa: E402
-from run_robust_strategy import (
+from run_robust_strategy import (  # noqa: E402
     DEFAULT_CONFIG,
     file_sha256,
     git_worktree_state,
     load_config,
-)  # noqa: E402
+)
 
 
 TREE_MODELS = {"lightgbm", "xgboost", "catboost"}
@@ -309,7 +309,9 @@ def run_bounded_tuning(
                 screened.append({"trial": index, "kwargs": kwargs, "status": "failed"})
                 continue
             aggregate = aggregator(
-                _artifact_records(jobs, progress), topk=int(config["portfolio"]["topk"])
+                _artifact_records(jobs, progress),
+                topk=int(config["portfolio"]["topk"]),
+                thresholds=config["acceptance"],
             )
             report = aggregate["model_reports"][0]
             score = (
@@ -374,6 +376,7 @@ def run_bounded_tuning(
         aggregate = aggregator(
             _artifact_records(full_jobs, progress),
             topk=int(config["portfolio"]["topk"]),
+            thresholds=config["acceptance"],
         )
         report = copy.deepcopy(aggregate["model_reports"][0])
         report["tuning"] = {
@@ -516,17 +519,21 @@ def fit_predict_job(model: Any, dataset: Any, artifact_path: Path) -> dict[str, 
             "instrument",
         }.issubset(value.index.names):
             raise ValueError(f"{name} index must contain datetime and instrument")
-    aligned = pd.concat(
-        [
-            pd.to_numeric(prediction, errors="coerce").rename("score"),
-            pd.to_numeric(label, errors="coerce").rename("label"),
-        ],
-        axis=1,
-        join="inner",
-    ).dropna()
-    if aligned.empty:
-        raise ValueError("prediction and label indexes have no evaluable overlap")
-    daily_rank_ic = aligned.groupby(level="datetime", sort=True).apply(
+        if not value.index.is_unique:
+            raise ValueError(f"{name} index must be unique")
+    unexpected_labels = label.index.difference(prediction.index)
+    if not unexpected_labels.empty:
+        raise ValueError("label index contains rows outside prediction index")
+    saved_frame = pd.to_numeric(prediction, errors="coerce").rename("score").to_frame()
+    saved_frame = saved_frame.join(
+        pd.to_numeric(label, errors="coerce").rename("label"), how="left"
+    )
+    saved_frame = saved_frame.replace([float("inf"), float("-inf")], pd.NA)
+    saved_frame = saved_frame.dropna(subset=["score"])
+    if saved_frame.empty:
+        raise ValueError("prediction contains no valid scores")
+    evaluable = saved_frame.dropna(subset=["label"])
+    daily_rank_ic = evaluable.groupby(level="datetime", sort=True).apply(
         lambda group: group["score"].corr(group["label"], method="spearman")
     )
     clean_rank_ic = (
@@ -534,10 +541,13 @@ def fit_predict_job(model: Any, dataset: Any, artifact_path: Path) -> dict[str, 
         .replace([float("inf"), float("-inf")], pd.NA)
         .dropna()
     )
-    saved = aligned.reset_index().loc[:, ["datetime", "instrument", "score", "label"]]
+    saved = saved_frame.reset_index().loc[
+        :, ["datetime", "instrument", "score", "label"]
+    ]
     _atomic_write_parquet(saved, Path(artifact_path))
     return {
         "rows": int(len(saved)),
+        "evaluable_rows": int(len(evaluable)),
         "dates": int(saved["datetime"].nunique()),
         "rank_ic_mean": float(clean_rank_ic.mean())
         if not clean_rank_ic.empty
@@ -1330,7 +1340,11 @@ def _run_development_impl(
         }
         for job in jobs
     ]
-    aggregated = aggregator(records, topk=int(config["portfolio"]["topk"]))
+    aggregated = aggregator(
+        records,
+        topk=int(config["portfolio"]["topk"]),
+        thresholds=config["acceptance"],
+    )
     selected_reports = select_development_models(
         aggregated["model_reports"],
         minimum=int(config["training"]["ensemble_models_min"]),
@@ -1557,9 +1571,9 @@ def _run_development_impl(
         fixed_artifacts = _development_artifacts(jobs, progress, selected_ids)
         fixed_artifacts_by_model: dict[str, list[dict[str, Any]]] = {}
         for artifact in fixed_artifacts:
-            fixed_artifacts_by_model.setdefault(
-                str(artifact["model_id"]), []
-            ).append(artifact)
+            fixed_artifacts_by_model.setdefault(str(artifact["model_id"]), []).append(
+                artifact
+            )
         development_artifacts = select_development_artifacts(
             selected_reports,
             fixed_artifacts_by_model=fixed_artifacts_by_model,
@@ -1625,7 +1639,9 @@ def run_development(**kwargs: Any) -> dict[str, Any]:
                 payload,
             )
         _write_json(report_dir / "development_latest.json", payload)
-        _atomic_write(report_dir / "development_latest.md", _development_markdown(payload))
+        _atomic_write(
+            report_dir / "development_latest.md", _development_markdown(payload)
+        )
         return payload
 
 

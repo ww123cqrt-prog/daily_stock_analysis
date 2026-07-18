@@ -543,6 +543,42 @@ def test_fit_predict_job_rejects_prediction_label_index_mismatch(
         raise AssertionError("mismatched prediction and label indexes were accepted")
 
 
+def test_fit_predict_job_preserves_scores_without_future_labels(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    prediction_index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2025-03-31"), "SH600000"),
+            (pd.Timestamp("2025-03-31"), "SZ000001"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    label_index = prediction_index[:1]
+
+    class Model:
+        def fit(self, dataset):
+            return None
+
+        def predict(self, dataset, segment):
+            assert segment == "test"
+            return pd.Series([2.0, 1.0], index=prediction_index)
+
+    class Dataset:
+        def prepare(self, segment, col_set, data_key):
+            assert (segment, col_set, data_key) == ("test", "label", "learn")
+            return pd.DataFrame({"LABEL0": [0.1]}, index=label_index)
+
+    artifact = tmp_path / "prediction.parquet"
+    result = module.fit_predict_job(Model(), Dataset(), artifact)
+    saved = pd.read_parquet(artifact)
+
+    assert result["rows"] == 2
+    assert result["evaluable_rows"] == 1
+    assert saved["instrument"].tolist() == ["SH600000", "SZ000001"]
+    assert saved.loc[saved["instrument"] == "SZ000001", "label"].isna().all()
+
+
 def test_run_training_jobs_reuses_dataset_per_quarter_window_and_checkpoints(
     tmp_path: Path,
 ) -> None:
@@ -917,7 +953,7 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
             }
         return progress
 
-    def aggregator(records, topk):
+    def aggregator(records, topk, thresholds):
         assert len(records) == 396
         reports = [
             {
@@ -1080,7 +1116,7 @@ def test_run_development_rechecks_provider_before_freezing_candidate(
             for job in jobs
         }
 
-    def aggregator(records, topk):
+    def aggregator(records, topk, thresholds):
         reports = [
             {"model_id": "lightgbm", "eligible": True, "development_score": 1.0},
             {"model_id": "linear_ridge", "eligible": True, "development_score": 0.9},
@@ -1540,7 +1576,7 @@ def test_run_development_detects_snapshot_change_before_evaluation(
             for job in selected_jobs
         }
 
-    def aggregator(records, topk):
+    def aggregator(records, topk, thresholds):
         reports = [
             {"model_id": "lightgbm", "eligible": True, "development_score": 1.0},
             {"model_id": "linear_ridge", "eligible": True, "development_score": 0.9},
@@ -1666,7 +1702,7 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
             }
         return progress
 
-    def aggregator(records, topk):
+    def aggregator(records, topk, thresholds):
         nonlocal aggregate_calls
         aggregate_calls += 1
         full = len({record["window_days"] for record in records}) == 3

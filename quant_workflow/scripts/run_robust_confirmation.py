@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -30,16 +30,16 @@ from _robust_reference_integrity import (  # noqa: E402
     reference_read_lock,
 )
 from robust_backtest import simulate_strategy  # noqa: E402
-from robust_evaluation import (
+from robust_evaluation import (  # noqa: E402
     aggregate_prediction_frames,
     aggregate_training_artifacts,
     confirmation_verdict,
-)  # noqa: E402
-from robust_market_data import (
+)
+from robust_market_data import (  # noqa: E402
     build_market_regimes,
     load_benchmark_frame,
     load_market_panel,
-)  # noqa: E402
+)
 from robust_strategy_core import make_confirmation_split  # noqa: E402
 from prepare_robust_provider import runtime_provider_identity  # noqa: E402
 from run_robust_development import (  # noqa: E402
@@ -48,7 +48,6 @@ from run_robust_development import (  # noqa: E402
     _atomic_write_parquet,
     _artifact_records,
     _split_record,
-    build_dataset_config,
     build_training_jobs,
     load_config,
     make_job_split,
@@ -490,7 +489,9 @@ def run_confirmation(
         return payload
     model_artifacts = _confirmation_model_artifacts(jobs, progress)
     aggregate = aggregator(
-        _artifact_records(jobs, progress), topk=int(config["portfolio"]["topk"])
+        _artifact_records(jobs, progress),
+        topk=int(config["portfolio"]["topk"]),
+        thresholds=config["acceptance"],
     )
     selected_ids = [str(value) for value in frozen["selected_models"]]
     if set(aggregate["model_predictions"]) != set(selected_ids):
@@ -552,6 +553,7 @@ def run_confirmation(
         annual_excess_return=float(result["metrics"]["annual_excess_return"]),
         information_ratio=float(result["metrics"]["information_ratio"]),
         max_drawdown=float(result["metrics"]["max_drawdown"]),
+        thresholds=config["acceptance"],
     )
     final_invalid_artifacts = _invalid_confirmation_artifacts(
         jobs, progress, split_factory

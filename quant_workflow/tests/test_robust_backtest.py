@@ -42,6 +42,8 @@ def market_fixture(
                     "symbol": symbol,
                     "open": open_price,
                     "previous_close": previous,
+                    "list_date": pd.Timestamp("1990-01-01"),
+                    "listing_trading_day": 100 + index,
                     "industry": "bank" if symbol == "SH600000" else "consumer",
                     "board": "main",
                     "is_st": False,
@@ -127,6 +129,122 @@ def test_limit_up_open_defers_buy_until_next_tradable_open() -> None:
     assert daily["trade_count"].sum() == 1
 
 
+def test_blocked_sell_prevents_same_industry_buy_from_breaching_cap() -> None:
+    module = load_module()
+    dates = pd.bdate_range("2025-01-06", periods=12)
+    rows = []
+    for symbol in ("SH600000", "SH600001"):
+        for index, day in enumerate(dates):
+            open_price = 10.0
+            previous_close = 10.0
+            rows.append(
+                {
+                    "date": day,
+                    "symbol": symbol,
+                    "open": open_price,
+                    "previous_close": previous_close,
+                    "list_date": pd.Timestamp("1990-01-01"),
+                    "listing_trading_day": 100 + index,
+                    "industry": "technology",
+                    "board": "main",
+                    "is_st": False,
+                    "suspended": symbol == "SH600000"
+                    and day == pd.Timestamp("2025-01-20"),
+                }
+            )
+    market = pd.DataFrame(rows)
+    benchmark = pd.DataFrame({"date": dates, "open": [100.0] * len(dates)})
+    predictions = pd.DataFrame(
+        {
+            "datetime": [pd.Timestamp("2025-01-10"), pd.Timestamp("2025-01-17")],
+            "instrument": ["SH600000", "SH600001"],
+            "score": [2.0, 2.0],
+        }
+    )
+
+    result = module.simulate_strategy(
+        predictions=predictions,
+        market=market,
+        benchmark=benchmark,
+        strategy_id="full_risk_control",
+        initial_cash=100_000.0,
+        topk=1,
+        fixed_position=0.9,
+        single_stock_max=0.25,
+        industry_max=0.25,
+        growth_star_max=0.30,
+        commission_rate=0.0,
+        minimum_commission=0.0,
+        slippage_bps=0.0,
+    )
+
+    daily = result["daily"].set_index("date")
+    blocked_rebalance = daily.loc[pd.Timestamp("2025-01-20")]
+    assert blocked_rebalance["trade_count"] == 0
+    assert blocked_rebalance["pending_order_count"] == 2
+    assert blocked_rebalance["gross_position"] <= 0.25 + 1e-12
+
+
+def test_blocked_sell_prevents_buy_above_current_regime_position_limit() -> None:
+    module = load_module()
+    dates = pd.bdate_range("2025-01-06", periods=12)
+    rows = []
+    for symbol, industry in (("SH600000", "bank"), ("SH600001", "technology")):
+        for index, day in enumerate(dates):
+            rows.append(
+                {
+                    "date": day,
+                    "symbol": symbol,
+                    "open": 10.0,
+                    "previous_close": 10.0,
+                    "list_date": pd.Timestamp("1990-01-01"),
+                    "listing_trading_day": 100 + index,
+                    "industry": industry,
+                    "board": "main",
+                    "is_st": False,
+                    "suspended": symbol == "SH600000"
+                    and day == pd.Timestamp("2025-01-20"),
+                }
+            )
+    predictions = pd.DataFrame(
+        {
+            "datetime": [pd.Timestamp("2025-01-10"), pd.Timestamp("2025-01-17")],
+            "instrument": ["SH600000", "SH600001"],
+            "score": [2.0, 2.0],
+        }
+    )
+    benchmark = pd.DataFrame({"date": dates, "open": [100.0] * len(dates)})
+    regimes = pd.Series("risk_on", index=dates)
+    regimes.loc[pd.Timestamp("2025-01-17")] = "risk_off"
+
+    result = module.simulate_strategy(
+        predictions=predictions,
+        market=pd.DataFrame(rows),
+        benchmark=benchmark,
+        strategy_id="full_risk_control",
+        initial_cash=100_000.0,
+        topk=1,
+        fixed_position=0.9,
+        regimes=regimes,
+        regime_positions={
+            "risk_on": 0.9,
+            "neutral": 0.7,
+            "defensive": 0.5,
+            "risk_off": 0.2,
+        },
+        single_stock_max=0.9,
+        industry_max=0.9,
+        growth_star_max=0.9,
+        commission_rate=0.0,
+        minimum_commission=0.0,
+        slippage_bps=0.0,
+    )
+
+    blocked_rebalance = result["daily"].set_index("date").loc["2025-01-20"]
+    assert blocked_rebalance["trade_count"] == 0
+    assert 0.89 <= blocked_rebalance["gross_position"] <= 0.91
+
+
 def test_flat_market_loses_exactly_recorded_transaction_costs() -> None:
     module = load_module()
     market, benchmark, predictions = market_fixture(flat=True)
@@ -152,6 +270,57 @@ def test_flat_market_loses_exactly_recorded_transaction_costs() -> None:
     assert result["metrics"]["annual_excess_return"] < 0
 
 
+def test_board_return_contribution_uses_carried_position_open_to_open_pnl() -> None:
+    module = load_module()
+    dates = pd.bdate_range("2025-01-06", periods=7)
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": ["SZ300001"] * len(dates),
+            "open": [10.0] * 6 + [11.0],
+            "previous_close": [10.0] * len(dates),
+            "list_date": [pd.Timestamp("2020-01-01")] * len(dates),
+            "listing_trading_day": list(range(100, 100 + len(dates))),
+            "industry": ["technology"] * len(dates),
+            "board": ["growth"] * len(dates),
+            "is_st": [False] * len(dates),
+            "suspended": [False] * len(dates),
+        }
+    )
+    benchmark = pd.DataFrame({"date": dates, "open": [100.0] * len(dates)})
+    predictions = pd.DataFrame(
+        {
+            "datetime": [dates[4]],
+            "instrument": ["SZ300001"],
+            "score": [1.0],
+        }
+    )
+
+    result = module.simulate_strategy(
+        predictions=predictions,
+        market=market,
+        benchmark=benchmark,
+        strategy_id="weekly_top50",
+        initial_cash=100_000.0,
+        topk=1,
+        fixed_position=0.9,
+        single_stock_max=0.9,
+        industry_max=0.9,
+        growth_star_max=0.9,
+        commission_rate=0.0,
+        minimum_commission=0.0,
+        slippage_bps=0.0,
+    )
+
+    move_day = result["daily"].set_index("date").loc[dates[6]]
+    assert move_day["board_return_contribution_growth"] > 0.08
+    assert np.isclose(
+        move_day["board_excess_contribution_growth"],
+        move_day["board_return_contribution_growth"],
+    )
+    assert move_day["board_return_contribution_main"] == 0.0
+
+
 def test_low_turnover_keeps_existing_stock_within_dropout_buffer() -> None:
     module = load_module()
     candidates = pd.DataFrame(
@@ -173,6 +342,41 @@ def test_low_turnover_keeps_existing_stock_within_dropout_buffer() -> None:
     )
 
     assert selected == ["A", "C"]
+
+
+def test_sector_and_full_control_have_distinct_selection_rules() -> None:
+    module = load_module()
+    candidates = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "C", "D", "E", "F", "G", "H"],
+            "score": list(range(8, 0, -1)),
+            "industry": ["tech"] * 4 + ["bank", "consumer", "health", "energy"],
+            "board": ["growth"] * 4 + ["main"] * 4,
+            "tradable": [True] * 8,
+        }
+    )
+    common = {
+        "candidates": candidates,
+        "current_symbols": {"F"},
+        "topk": 4,
+        "target_position": 0.8,
+        "single_stock_max": 0.25,
+        "industry_max": 0.25,
+        "growth_star_max": 0.25,
+        "dropout_buffer": 4,
+    }
+
+    weekly = module.build_strategy_target(strategy_id="weekly_top50", **common)
+    low_turnover = module.build_strategy_target(strategy_id="low_turnover", **common)
+    sector = module.build_strategy_target(strategy_id="sector_constrained", **common)
+    full = module.build_strategy_target(strategy_id="full_risk_control", **common)
+
+    assert weekly["symbol"].tolist() == ["A", "B", "C", "D"]
+    assert "F" in set(low_turnover["symbol"])
+    assert set(sector["symbol"]) != set(weekly["symbol"])
+    assert sector["industry"].nunique() >= 3
+    assert "F" in set(full["symbol"])
+    assert set(full["symbol"]) != set(low_turnover["symbol"])
 
 
 def test_full_risk_control_applies_regime_and_sector_caps() -> None:

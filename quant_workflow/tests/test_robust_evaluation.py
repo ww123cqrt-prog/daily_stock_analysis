@@ -9,6 +9,8 @@ import yaml
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "robust_evaluation.py"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+ACCEPTANCE = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["acceptance"]
 
 
 def load_module():
@@ -79,6 +81,7 @@ def test_model_signal_report_requires_rankic_and_both_stability_gates() -> None:
         model_id="lightgbm",
         quarter_metrics=quarters,
         stability={"rank_correlation_median": 0.75, "topk_overlap_mean": 0.65},
+        thresholds=ACCEPTANCE,
     )
 
     assert report["eligible"] is True
@@ -86,9 +89,21 @@ def test_model_signal_report_requires_rankic_and_both_stability_gates() -> None:
         model_id="unstable",
         quarter_metrics=quarters,
         stability={"rank_correlation_median": 0.69, "topk_overlap_mean": 0.65},
+        thresholds=ACCEPTANCE,
     )
     assert failed["eligible"] is False
     assert "window_rank_correlation" in failed["failed_gates"]
+
+    stricter = dict(ACCEPTANCE)
+    stricter["positive_rank_ic_interval_ratio_min"] = 0.80
+    strict = module.model_signal_report(
+        model_id="strict",
+        quarter_metrics=quarters,
+        stability={"rank_correlation_median": 0.75, "topk_overlap_mean": 0.65},
+        thresholds=stricter,
+    )
+    assert strict["eligible"] is False
+    assert "positive_rank_ic_intervals" in strict["failed_gates"]
 
 
 def test_model_selection_uses_only_eligible_development_score() -> None:
@@ -132,11 +147,15 @@ def test_confirmation_and_shadow_gates_fail_closed() -> None:
         annual_excess_return=0.01,
         information_ratio=0.2,
         max_drawdown=-0.10,
+        thresholds=ACCEPTANCE,
     )
     assert confirmation["passed"] is True
     assert (
         module.confirmation_verdict(
-            annual_excess_return=0.0, information_ratio=0.2, max_drawdown=-0.10
+            annual_excess_return=0.0,
+            information_ratio=0.2,
+            max_drawdown=-0.10,
+            thresholds=ACCEPTANCE,
         )["passed"]
         is False
     )
@@ -146,6 +165,7 @@ def test_confirmation_and_shadow_gates_fail_closed() -> None:
         net_excess_return=0.01,
         max_drawdown=-0.08,
         task_success_ratio=0.97,
+        thresholds=ACCEPTANCE,
     )
     assert shadow["status"] == "robust_strategy_qualified"
     assert (
@@ -154,9 +174,33 @@ def test_confirmation_and_shadow_gates_fail_closed() -> None:
             net_excess_return=0.02,
             max_drawdown=-0.05,
             task_success_ratio=1.0,
+            thresholds=ACCEPTANCE,
         )["status"]
         == "shadow_observation"
     )
+
+    stricter_confirmation = dict(ACCEPTANCE)
+    stricter_confirmation["confirmation_excess_return_min_exclusive"] = 0.02
+    assert (
+        module.confirmation_verdict(
+            annual_excess_return=0.01,
+            information_ratio=0.2,
+            max_drawdown=-0.10,
+            thresholds=stricter_confirmation,
+        )["passed"]
+        is False
+    )
+    longer_shadow = dict(ACCEPTANCE)
+    longer_shadow["shadow_days"] = 61
+    strict_shadow = module.shadow_verdict(
+        trading_days=60,
+        net_excess_return=0.01,
+        max_drawdown=-0.08,
+        task_success_ratio=0.97,
+        thresholds=longer_shadow,
+    )
+    assert strict_shadow["status"] == "shadow_observation"
+    assert strict_shadow["remaining_days"] == 1
 
 
 def test_aggregate_training_artifacts_builds_model_windows_and_quarter_reports(
@@ -178,7 +222,7 @@ def test_aggregate_training_artifacts_builds_model_windows_and_quarter_reports(
                 }
             )
 
-    result = module.aggregate_training_artifacts(records, topk=2)
+    result = module.aggregate_training_artifacts(records, topk=2, thresholds=ACCEPTANCE)
 
     assert set(result["model_predictions"]) == {"lightgbm"}
     assert result["model_reports"][0]["model_id"] == "lightgbm"
@@ -237,8 +281,24 @@ def test_strategy_candidates_run_baseline_stress_delay_and_choose_only_passing_d
                 "benchmark_return": [0.0001] * len(dates),
                 "transaction_cost": [0.0] * len(dates),
                 "turnover": [0.1] * len(dates),
+                "board_exposure_main": [1.0] * len(dates),
+                "board_exposure_growth": [0.0] * len(dates),
+                "board_exposure_star": [0.0] * len(dates),
+                "board_start_exposure_main": [1.0] * len(dates),
+                "board_start_exposure_growth": [0.0] * len(dates),
+                "board_start_exposure_star": [0.0] * len(dates),
+                "cash_start_exposure": [0.0] * len(dates),
             }
         )
+        daily["board_return_contribution_main"] = daily["portfolio_return"]
+        daily["board_return_contribution_growth"] = 0.0
+        daily["board_return_contribution_star"] = 0.0
+        daily["board_excess_contribution_main"] = (
+            daily["portfolio_return"] - daily["benchmark_return"]
+        )
+        daily["board_excess_contribution_growth"] = 0.0
+        daily["board_excess_contribution_star"] = 0.0
+        daily["cash_excess_contribution"] = 0.0
         from robust_backtest import performance_metrics
 
         return {
@@ -273,6 +333,11 @@ def test_strategy_candidates_run_baseline_stress_delay_and_choose_only_passing_d
     assert len(result["strategies"]) == 5
     assert result["status"] == "research_candidate_ready"
     assert result["selected_strategy"]["acceptance"]["passed"] is True
+    assert result["selected_strategy"]["strategy_id"] == "full_risk_control"
+    assert (
+        sum(bool(item["eligible_for_final_selection"]) for item in result["strategies"])
+        == 1
+    )
     assert all(
         item["stress"]["metrics"]["annual_excess_return"] > 0
         for item in result["strategies"]
@@ -280,6 +345,10 @@ def test_strategy_candidates_run_baseline_stress_delay_and_choose_only_passing_d
     assert all("low_cost" in item for item in result["strategies"])
     assert all(
         set(item["board_attribution"]) == {"main", "growth", "star"}
+        for item in result["strategies"]
+    )
+    assert all(
+        item["attribution_reconciliation"]["reconciled"] is True
         for item in result["strategies"]
     )
 
@@ -296,9 +365,7 @@ def test_regime_attribution_uses_previous_close_regime_for_next_open_return() ->
             "turnover": [0.0] * 4,
         }
     )
-    regimes = pd.Series(
-        ["risk_on", "neutral", "defensive", "risk_off"], index=dates
-    )
+    regimes = pd.Series(["risk_on", "neutral", "defensive", "risk_off"], index=dates)
 
     result = module._regime_metrics(daily, regimes)
 
@@ -316,15 +383,34 @@ def test_board_attribution_reports_average_and_peak_exposure() -> None:
             "board_exposure_main": [0.5, 0.4],
             "board_exposure_growth": [0.2, 0.3],
             "board_exposure_star": [0.1, 0.0],
+            "board_start_exposure_main": [0.5, 0.4],
+            "board_start_exposure_growth": [0.2, 0.3],
+            "board_start_exposure_star": [0.1, 0.0],
+            "cash_start_exposure": [0.2, 0.3],
+            "cash_excess_contribution": [-0.0008, -0.0015],
+            "portfolio_return": [0.012, 0.002],
+            "benchmark_return": [0.004, 0.005],
+            "board_return_contribution_main": [0.01, -0.002],
+            "board_return_contribution_growth": [0.003, 0.004],
+            "board_return_contribution_star": [-0.001, 0.0],
+            "board_excess_contribution_main": [0.008, -0.004],
+            "board_excess_contribution_growth": [0.0022, 0.0025],
+            "board_excess_contribution_star": [-0.0014, 0.0],
         }
     )
 
     result = module._board_attribution(daily)
 
-    assert result["main"] == {
-        "average_exposure": 0.45,
-        "max_exposure": 0.5,
-        "days": 2,
-    }
+    assert result["main"]["average_exposure"] == 0.45
+    assert result["main"]["max_exposure"] == 0.5
+    assert result["main"]["days"] == 2
+    assert np.isclose(result["main"]["return_contribution"], 0.007976)
+    assert np.isclose(result["main"]["excess_contribution"], 0.003968)
     assert result["growth"]["max_exposure"] == 0.3
     assert result["star"]["average_exposure"] == 0.05
+
+    reconciliation = module._attribution_reconciliation(daily, result)
+    assert reconciliation["reconciled"] is True
+    assert np.isclose(reconciliation["cash_excess_contribution"], -0.002306)
+    assert np.isclose(reconciliation["cumulative_excess_return"], 0.005004)
+    assert abs(reconciliation["excess_residual"]) < 1e-12

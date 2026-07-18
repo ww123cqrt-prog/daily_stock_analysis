@@ -5,11 +5,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "robust_strategy_core.py"
 )
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+ACCEPTANCE = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["acceptance"]
 
 
 def load_module():
@@ -142,6 +145,88 @@ def test_a_share_price_limits_change_by_board_date_and_st_status() -> None:
     assert module.price_limit_ratio("SH688001", "2020-01-02", is_st=False) == 0.20
     assert module.price_limit_ratio("SH600000", "2026-01-02", is_st=False) == 0.10
     assert module.price_limit_ratio("SH600000", "2026-01-02", is_st=True) == 0.05
+    assert (
+        module.price_limit_ratio(
+            "SH688001",
+            "2025-01-02",
+            is_st=False,
+            list_date="2025-01-02",
+            listing_trading_day=1,
+        )
+        is None
+    )
+    assert (
+        module.price_limit_ratio(
+            "SH600001",
+            "2020-01-02",
+            is_st=False,
+            list_date="2020-01-02",
+            listing_trading_day=1,
+            side="buy",
+        )
+        == 0.44
+    )
+    assert (
+        module.price_limit_ratio(
+            "SH600001",
+            "2020-01-02",
+            is_st=False,
+            list_date="2020-01-02",
+            listing_trading_day=1,
+            side="sell",
+        )
+        == 0.36
+    )
+    assert (
+        module.price_limit_ratio(
+            "SH688001",
+            "2025-01-09",
+            is_st=True,
+            list_date="2025-01-02",
+            listing_trading_day=6,
+        )
+        == 0.20
+    )
+    assert (
+        module.price_limit_ratio(
+            "SZ300001",
+            "2025-01-09",
+            is_st=True,
+            list_date="2025-01-02",
+            listing_trading_day=6,
+        )
+        == 0.20
+    )
+    assert (
+        module.price_limit_ratio(
+            "SZ300001",
+            "2025-01-08",
+            is_st=False,
+            list_date="2025-01-02",
+            listing_trading_day=5,
+        )
+        is None
+    )
+    assert (
+        module.price_limit_ratio(
+            "SZ300001",
+            "2025-01-09",
+            is_st=False,
+            list_date="2025-01-02",
+            listing_trading_day=6,
+        )
+        == 0.20
+    )
+    assert (
+        module.price_limit_ratio(
+            "SH600001",
+            "2025-01-02",
+            is_st=False,
+            list_date="2025-01-02",
+            listing_trading_day=1,
+        )
+        is None
+    )
 
 
 def test_open_execution_is_fail_closed_for_suspension_and_blocked_limits() -> None:
@@ -173,6 +258,13 @@ def test_open_execution_is_fail_closed_for_suspension_and_blocked_limits() -> No
         previous_close=10.0,
         open_price=10.5,
         limit_ratio=0.10,
+        suspended=False,
+    )
+    assert module.can_execute_open(
+        side="buy",
+        previous_close=float("nan"),
+        open_price=25.0,
+        limit_ratio=None,
         suspended=False,
     )
     assert not module.can_execute_open(
@@ -248,6 +340,7 @@ def test_acceptance_requires_every_development_gate() -> None:
         stress_excess_return=0.01,
         delayed_excess_return=0.005,
         regime_metrics=regimes,
+        thresholds=ACCEPTANCE,
     )
 
     assert verdict["passed"] is True
@@ -260,6 +353,7 @@ def test_acceptance_requires_every_development_gate() -> None:
         stress_excess_return=-0.001,
         delayed_excess_return=0.005,
         regime_metrics=regimes,
+        thresholds=ACCEPTANCE,
     )
     assert failed["passed"] is False
     assert "stress_cost_positive_excess" in failed["failed_gates"]
@@ -273,10 +367,27 @@ def test_acceptance_requires_every_development_gate() -> None:
         stress_excess_return=0.01,
         delayed_excess_return=0.005,
         regime_metrics=regimes,
+        thresholds=ACCEPTANCE,
     )
     assert cross_quarter_drawdown["passed"] is False
     assert "maximum_drawdown" in cross_quarter_drawdown["failed_gates"]
     assert cross_quarter_drawdown["values"]["aggregate_max_drawdown_abs"] == 0.25
+
+    stricter = dict(ACCEPTANCE)
+    stricter["annual_excess_return_min"] = 0.08
+    strict_verdict = module.evaluate_development_acceptance(
+        quarter_metrics=quarters,
+        aggregate_annual_excess_return=0.07,
+        aggregate_max_drawdown=-0.15,
+        window_rank_correlations=[0.75, 0.8],
+        top50_overlaps=[0.65, 0.7],
+        stress_excess_return=0.01,
+        delayed_excess_return=0.005,
+        regime_metrics=regimes,
+        thresholds=stricter,
+    )
+    assert strict_verdict["passed"] is False
+    assert "aggregate_annual_excess" in strict_verdict["failed_gates"]
 
 
 def test_model_selection_uses_development_metrics_only() -> None:

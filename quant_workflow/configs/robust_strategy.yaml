@@ -159,10 +159,15 @@ rolling_validation:
 
 strategies:
   - id: weekly_top50
+    eligible_for_final_selection: false
   - id: low_turnover
+    eligible_for_final_selection: false
   - id: regime_scaled
+    eligible_for_final_selection: false
   - id: sector_constrained
+    eligible_for_final_selection: false
   - id: full_risk_control
+    eligible_for_final_selection: true
 
 rebalance:
   frequency: weekly

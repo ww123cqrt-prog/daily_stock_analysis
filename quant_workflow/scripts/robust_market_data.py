@@ -5,8 +5,6 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any
-
 import numpy as np
 import pandas as pd
 
@@ -70,6 +68,12 @@ def _read_prices(price_dir: Path, symbols: set[str]) -> pd.DataFrame:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame = frame.sort_values("date").drop_duplicates("date", keep=False)
         frame["previous_close"] = frame["close"].shift(1)
+        traded = frame[["open", "close"]].notna().all(axis=1)
+        frame["listing_trading_day"] = traded.cumsum().where(traded).astype("Int64")
+        valid_trade_dates = frame.loc[traded, "date"]
+        frame["price_history_start"] = (
+            valid_trade_dates.iloc[0] if not valid_trade_dates.empty else pd.NaT
+        )
         frame["symbol"] = symbol
         frames.append(frame)
     if not frames:
@@ -83,6 +87,8 @@ def _read_prices(price_dir: Path, symbols: set[str]) -> pd.DataFrame:
                 "low",
                 "volume",
                 "previous_close",
+                "listing_trading_day",
+                "price_history_start",
             ]
         )
     return pd.concat(frames, ignore_index=True)
@@ -176,15 +182,33 @@ def load_market_panel(
         prices, on=["date", "symbol"], how="left", validate="one_to_one"
     )
     security["symbol"] = security["symbol"].astype(str).str.upper()
+    security["list_date"] = pd.to_datetime(
+        security["list_date"], errors="coerce"
+    ).dt.normalize()
     if security.duplicated("symbol").any():
         raise ValueError("security master contains duplicate symbols")
     panel = panel.merge(
-        security.loc[:, ["symbol", "board"]],
+        security.loc[:, ["symbol", "list_date", "board"]],
         on="symbol",
         how="left",
         validate="many_to_one",
     )
     panel["industry"] = _industry_for_members(panel, industries)
+    panel["price_history_start"] = pd.to_datetime(
+        panel["price_history_start"], errors="coerce"
+    ).dt.normalize()
+    history_gap_days = (panel["price_history_start"] - panel["list_date"]).dt.days
+    invalid_history_order = history_gap_days < 0
+    incomplete_near_listing = history_gap_days.between(1, 29, inclusive="both")
+    if invalid_history_order.any() or incomplete_near_listing.any():
+        raise ValueError("price history start does not match the security listing date")
+    panel["listing_history_complete"] = history_gap_days.eq(0)
+    mature_truncated_history = history_gap_days >= 30
+    panel.loc[mature_truncated_history, "listing_trading_day"] = (
+        panel.loc[mature_truncated_history, "listing_trading_day"]
+        .clip(lower=6)
+        .astype("Int64")
+    )
 
     for frame in (st, suspension):
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
@@ -205,7 +229,7 @@ def load_market_panel(
     ).rename(columns={"is_suspended": "suspended"})
     panel["is_st"] = panel["is_st"].astype("boolean")
     panel["suspended"] = panel["suspended"].astype("boolean")
-    metadata_required = ["board", "industry", "is_st", "suspended"]
+    metadata_required = ["list_date", "board", "industry", "is_st", "suspended"]
     if panel[metadata_required].isna().any(axis=None):
         missing = {
             column: int(panel[column].isna().sum())
@@ -215,6 +239,11 @@ def load_market_panel(
         raise ValueError(f"market panel metadata is incomplete: {missing}")
     price_columns = ["open", "close", "previous_close"]
     panel["price_available"] = panel[price_columns].notna().all(axis=1)
+    missing_listing_age = panel["price_available"] & panel["listing_trading_day"].isna()
+    if missing_listing_age.any():
+        raise ValueError(
+            "market panel listing trading-day age is missing for available prices"
+        )
     covered = panel["price_available"] | panel["suspended"].astype(bool)
     price_coverage = float(covered.mean()) if len(panel) else 0.0
     if price_coverage < float(ohlcv_coverage_min):

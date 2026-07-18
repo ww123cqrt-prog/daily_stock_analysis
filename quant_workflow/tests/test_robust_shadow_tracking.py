@@ -7,11 +7,14 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "robust_shadow_tracking.py"
 )
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+ACCEPTANCE = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["acceptance"]
 
 
 def load_module():
@@ -42,6 +45,7 @@ def test_shadow_observations_are_unique_chronological_and_forward_only() -> None
         confirmation_run_id="confirmation-one",
         frozen_config_hash="a" * 64,
         start_after="2026-07-15",
+        acceptance_thresholds=ACCEPTANCE,
     )
 
     state = module.append_observation(state, observation("2026-07-16"))
@@ -63,6 +67,7 @@ def test_60_successful_days_with_positive_excess_qualify() -> None:
         confirmation_run_id="confirmation-one",
         frozen_config_hash="a" * 64,
         start_after="2026-07-15",
+        acceptance_thresholds=ACCEPTANCE,
     )
     for day in pd.bdate_range("2026-07-16", periods=60):
         state = module.append_observation(state, observation(str(day.date())))
@@ -80,6 +85,7 @@ def test_60_days_fail_when_task_success_ratio_is_below_95_percent() -> None:
         confirmation_run_id="confirmation-one",
         frozen_config_hash="a" * 64,
         start_after="2026-07-15",
+        acceptance_thresholds=ACCEPTANCE,
     )
     for index, day in enumerate(pd.bdate_range("2026-07-16", periods=60)):
         state = module.append_observation(
@@ -97,6 +103,7 @@ def test_drawdown_gate_uses_compounded_paper_portfolio() -> None:
         confirmation_run_id="confirmation-one",
         frozen_config_hash="a" * 64,
         start_after="2026-07-15",
+        acceptance_thresholds=ACCEPTANCE,
     )
     days = pd.bdate_range("2026-07-16", periods=60)
     for index, day in enumerate(days):
@@ -264,6 +271,7 @@ def test_concurrent_state_updates_do_not_lose_observations(
                 frozen_config_hash="a" * 64,
                 start_after="2026-07-15",
                 observation=observation(day),
+                acceptance_thresholds=ACCEPTANCE,
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)

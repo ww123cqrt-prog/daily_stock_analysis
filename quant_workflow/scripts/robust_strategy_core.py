@@ -238,18 +238,66 @@ def build_constrained_portfolio(
 
 
 def price_limit_ratio(
-    symbol: str, trade_date: str | pd.Timestamp, *, is_st: bool
-) -> float:
+    symbol: str,
+    trade_date: str | pd.Timestamp,
+    *,
+    is_st: bool,
+    list_date: str | pd.Timestamp | None = None,
+    listing_trading_day: int | None = None,
+    side: str | None = None,
+) -> float | None:
     symbol = str(symbol).upper()
     day = pd.Timestamp(trade_date).normalize()
-    if is_st:
-        return 0.05
+    try:
+        listed = pd.Timestamp(list_date) if list_date is not None else pd.NaT
+        if not pd.isna(listed):
+            listed = listed.normalize()
+    except (TypeError, ValueError):
+        listed = pd.NaT
+    try:
+        listing_day = (
+            None
+            if listing_trading_day is None or pd.isna(listing_trading_day)
+            else int(listing_trading_day)
+        )
+    except (TypeError, ValueError):
+        listing_day = None
+    if listing_day is not None and listing_day > 0:
+        if symbol.startswith("SH68") and listing_day <= 5:
+            return None
+        if (
+            symbol.startswith("SZ30")
+            and not pd.isna(listed)
+            and listed >= pd.Timestamp("2020-08-24")
+            and listing_day <= 5
+        ):
+            return None
+        if (
+            symbol.startswith(("SH60", "SZ00"))
+            and not pd.isna(listed)
+            and listed >= pd.Timestamp("2023-04-10")
+            and listing_day <= 5
+        ):
+            return None
+        if symbol.startswith(("BJ", "NEEQ")) and listing_day == 1:
+            return None
+        if (
+            symbol.startswith(("SH60", "SZ00"))
+            and not pd.isna(listed)
+            and listed < pd.Timestamp("2023-04-10")
+            and listing_day == 1
+        ):
+            return 0.36 if side == "sell" else 0.44
     if symbol.startswith("SH68"):
         return 0.20
     if symbol.startswith("SZ30"):
-        return 0.20 if day >= pd.Timestamp("2020-08-24") else 0.10
+        if day >= pd.Timestamp("2020-08-24"):
+            return 0.20
+        return 0.05 if is_st else 0.10
     if symbol.startswith(("BJ", "NEEQ")):
         return 0.30
+    if is_st:
+        return 0.05
     return 0.10
 
 
@@ -258,18 +306,19 @@ def can_execute_open(
     side: str,
     previous_close: float,
     open_price: float,
-    limit_ratio: float,
+    limit_ratio: float | None,
     suspended: bool,
 ) -> bool:
     if suspended or side not in {"buy", "sell"}:
         return False
-    values = (previous_close, open_price, limit_ratio)
-    if (
-        not all(math.isfinite(float(value)) for value in values)
-        or previous_close <= 0
-        or open_price <= 0
-        or limit_ratio <= 0
-    ):
+    if not math.isfinite(float(open_price)) or open_price <= 0:
+        return False
+    if limit_ratio is None:
+        return True
+    values = (previous_close, limit_ratio)
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    if previous_close <= 0 or limit_ratio <= 0:
         return False
     close = Decimal(str(previous_close))
     ratio = Decimal(str(limit_ratio))
@@ -353,7 +402,25 @@ def evaluate_development_acceptance(
     stress_excess_return: float,
     delayed_excess_return: float,
     regime_metrics: Mapping[str, Mapping[str, Any]],
+    thresholds: Mapping[str, Any],
 ) -> dict[str, Any]:
+    required_thresholds = (
+        "positive_excess_quarter_ratio_min",
+        "annual_excess_return_min",
+        "median_quarter_information_ratio_min",
+        "positive_rank_ic_interval_ratio_min",
+        "window_rank_correlation_median_min",
+        "top50_overlap_mean_min",
+        "development_max_drawdown_abs_max",
+        "stress_cost_excess_return_min_exclusive",
+        "delayed_execution_excess_return_min_exclusive",
+        "positive_regime_count_min",
+        "regime_days_for_floor",
+        "regime_annual_excess_floor",
+    )
+    limits = {key: float(thresholds[key]) for key in required_thresholds}
+    if not all(math.isfinite(value) for value in limits.values()):
+        raise ValueError("development acceptance thresholds must be finite")
     quarter_count = len(quarter_metrics)
     positive_excess = sum(
         float(item.get("annual_excess_return", float("nan"))) > 0
@@ -371,8 +438,9 @@ def evaluate_development_acceptance(
         for item in regime_metrics.values()
     )
     regime_floor_ok = all(
-        int(item.get("days", 0)) < 60
-        or float(item.get("annual_excess_return", -math.inf)) >= -0.05
+        int(item.get("days", 0)) < int(limits["regime_days_for_floor"])
+        or float(item.get("annual_excess_return", -math.inf))
+        >= limits["regime_annual_excess_floor"]
         for item in regime_metrics.values()
     )
     values = {
@@ -401,21 +469,29 @@ def evaluate_development_acceptance(
         "regime_floor_ok": regime_floor_ok,
     }
     gates = {
-        "positive_excess_quarters": values["positive_excess_quarter_ratio"] >= 0.70,
-        "aggregate_annual_excess": values["aggregate_annual_excess_return"] >= 0.05,
+        "positive_excess_quarters": values["positive_excess_quarter_ratio"]
+        >= limits["positive_excess_quarter_ratio_min"],
+        "aggregate_annual_excess": values["aggregate_annual_excess_return"]
+        >= limits["annual_excess_return_min"],
         "median_quarter_information_ratio": values["median_quarter_information_ratio"]
-        >= 0.5,
-        "positive_rank_ic_intervals": values["positive_rank_ic_interval_ratio"] >= 0.70,
-        "window_rank_stability": values["window_rank_correlation_median"] >= 0.70,
-        "top50_stability": values["top50_overlap_mean"] >= 0.60,
+        >= limits["median_quarter_information_ratio_min"],
+        "positive_rank_ic_intervals": values["positive_rank_ic_interval_ratio"]
+        >= limits["positive_rank_ic_interval_ratio_min"],
+        "window_rank_stability": values["window_rank_correlation_median"]
+        >= limits["window_rank_correlation_median_min"],
+        "top50_stability": values["top50_overlap_mean"]
+        >= limits["top50_overlap_mean_min"],
         "maximum_drawdown": max(
             values["worst_max_drawdown_abs"],
             values["aggregate_max_drawdown_abs"],
         )
-        <= 0.20,
-        "stress_cost_positive_excess": values["stress_excess_return"] > 0,
-        "delayed_execution_positive_excess": values["delayed_excess_return"] > 0,
-        "market_regime_coverage": values["positive_regime_count"] >= 3
+        <= limits["development_max_drawdown_abs_max"],
+        "stress_cost_positive_excess": values["stress_excess_return"]
+        > limits["stress_cost_excess_return_min_exclusive"],
+        "delayed_execution_positive_excess": values["delayed_excess_return"]
+        > limits["delayed_execution_excess_return_min_exclusive"],
+        "market_regime_coverage": values["positive_regime_count"]
+        >= int(limits["positive_regime_count_min"])
         and regime_floor_ok,
     }
     return {
@@ -423,6 +499,7 @@ def evaluate_development_acceptance(
         "gates": gates,
         "failed_gates": [name for name, passed in gates.items() if not passed],
         "values": values,
+        "thresholds": limits,
     }
 
 
