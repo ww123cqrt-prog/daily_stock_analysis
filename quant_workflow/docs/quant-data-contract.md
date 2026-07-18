@@ -78,6 +78,23 @@ README 说明存储规则，manifest 记录当前磁盘实况，preflight 证明
 
 参考数据的首次全量下载必须在隔离 staging 中完成，再校验来源、日期范围、成员股票池哈希、字段、主键和内容哈希，最后事务发布到 `reference/`。指数基准也必须先完成下载和校验，再写入 Qlib provider。校验失败时状态为 `blocked_data`，不能自动退回联网下载，也不能用部分缓存训练。
 
+远端工作站生成的数据传回本机后仍然只是 staging，不能用 `cp`/`rsync` 直接覆盖正式目录。标准导入入口是：
+
+```bash
+python quant_workflow/scripts/download_robust_reference.py \
+  --pit-dir "${QUANT_DATA_ROOT}/reference/pit_csi800" \
+  --reference-dir "${QUANT_DATA_ROOT}/reference" \
+  --start-date 2014-01-02 --end-date 2026-07-16 \
+  --import-dir <本机参考数据暂存目录>
+
+python quant_workflow/scripts/add_index_benchmark.py \
+  --provider-dir "${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned" \
+  --required-start-date 2014-01-02 \
+  --import-provider-dir <本机基准指数暂存 provider>
+```
+
+第一条命令重新核对本机 PIT 股票池哈希、参考表结构和时点内容，再复用参考数据下载器已有的可恢复事务发布。第二条命令要求暂存 provider 与正式 provider 的日历文件字节完全一致，验证三个指数的六个 Qlib bin 及股票池隔离后，再用可恢复目录事务安装。两条导入路径都不访问 Baostock/JQData；失败时不得改走联网下载。
+
 后续日常更新只补新增交易日；如果 PIT 股票池历史分区发生变化，成员哈希会变化，相关参考数据必须重新生成，旧快照不能继续复用。
 
 ## 变更规则

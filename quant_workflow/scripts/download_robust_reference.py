@@ -1828,10 +1828,20 @@ def _argument_parser() -> argparse.ArgumentParser:
         choices=("auto", "jqdata", "baostock"),
         default="auto",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--reuse-existing",
         action="store_true",
         help="Validate and reuse an existing reference snapshot without network calls.",
+    )
+    mode.add_argument(
+        "--import-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Validate a separate reference snapshot against the local PIT universe "
+            "and transactionally publish it without network calls."
+        ),
     )
     return parser
 
@@ -1931,6 +1941,93 @@ def main(
                 member_count = int(membership["symbol"].nunique())
                 member_day_count = len(membership)
                 membership_snapshot_hash = membership_snapshot.fingerprint()
+
+            if args.import_dir is not None:
+                import_dir = args.import_dir.expanduser()
+                try:
+                    if import_dir.resolve() == reference_dir.resolve():
+                        raise BlockedData("invalid_import_source")
+                    with reference_read_lock(import_dir) as imported_snapshot:
+                        imported_snapshot.ensure_transaction_clean()
+                        imported_source = imported_snapshot.validate_source(
+                            start_date=start_date.isoformat(),
+                            end_date=end_date.isoformat(),
+                            expected_membership_snapshot_hash=membership_snapshot_hash,
+                        )
+                        imported_fingerprint = imported_snapshot.fingerprint()
+                        tables = _read_existing_reference_tables(import_dir)
+                        _validate_tables(tables, membership, current_date)
+                        if imported_snapshot.fingerprint() != imported_fingerprint:
+                            raise BlockedData("reference_snapshot_changed")
+
+                        requested = str(imported_source["requested"])
+                        selected = str(imported_source["selected"])
+                        fallback_reason = imported_source.get("fallback_reason")
+                        industry_classification = str(
+                            imported_source["industry_classification"]
+                        )
+                        imported_run_id = imported_source.get("build_run_id")
+                        counts = {name: len(frame) for name, frame in tables.items()}
+                        completed = _status_payload(
+                            "completed",
+                            "imported_existing",
+                            start_date,
+                            end_date,
+                            pit_file_count=pit_file_count,
+                            member_count=member_count,
+                            member_day_count=member_day_count,
+                            table_counts=counts,
+                            requested=requested,
+                            selected=selected,
+                            fallback_reason=fallback_reason,
+                            industry_classification=industry_classification,
+                            membership_snapshot_hash=membership_snapshot_hash,
+                            build_run_id=imported_run_id,
+                        )
+                        publish_lock = None
+                        try:
+                            with membership_read_lock(pit_dir) as final_membership:
+                                final_membership.ensure_transaction_clean()
+                                final_membership.validate_source(
+                                    start_date=start_date.isoformat(),
+                                    end_date=end_date.isoformat(),
+                                )
+                                if (
+                                    final_membership.fingerprint()
+                                    != membership_snapshot_hash
+                                ):
+                                    raise BlockedData("membership_snapshot_changed")
+                                publish_lock = _acquire_writer_lock(reference_dir)
+                                _recover_transaction(
+                                    journal_path, allowed_transaction_targets
+                                )
+                                _publish_transaction(
+                                    tables,
+                                    reference_dir,
+                                    imported_source,
+                                    source_path,
+                                    completed,
+                                )
+                        finally:
+                            if publish_lock is not None:
+                                _release_writer_lock(publish_lock)
+                except ReferenceIntegrityError as exc:
+                    return blocked(exc.reason_code)
+                except BlockedData as exc:
+                    return blocked(exc.reason_code)
+                except Exception:
+                    return blocked("atomic_publish_failed")
+
+                if status_path.resolve() != canonical_status_path.resolve():
+                    try:
+                        _atomic_write_status(completed, status_path)
+                    except Exception:
+                        return blocked("status_publish_failed")
+                print(
+                    "download_robust_reference: imported existing snapshot; "
+                    f"members={member_count}; member_days={member_day_count}"
+                )
+                return 0
 
             if args.reuse_existing:
                 try:

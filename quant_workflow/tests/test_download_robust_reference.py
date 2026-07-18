@@ -341,6 +341,7 @@ def run_main(
     reference_source: str | None = None,
     run_id: str | None = None,
     reuse_existing: bool = False,
+    import_dir: Path | None = None,
     today: date = date(2025, 1, 3),
 ):
     pit_dir = tmp_path / "pit"
@@ -366,6 +367,8 @@ def run_main(
         argv.extend(["--run-id", run_id])
     if reuse_existing:
         argv.append("--reuse-existing")
+    if import_dir is not None:
+        argv.extend(["--import-dir", str(import_dir)])
     main_kwargs = {"provider": provider, "today": today}
     if baostock_provider is not None:
         main_kwargs["baostock_provider"] = baostock_provider
@@ -547,6 +550,101 @@ def test_reuse_rejects_reference_bound_to_different_membership(
     assert return_code == module.BLOCKED_RETURN_CODE
     assert status["status"] == "blocked_data"
     assert status["reason_code"] == "reference_membership_snapshot_mismatch"
+
+
+def test_imports_verified_snapshot_without_calling_provider(tmp_path: Path) -> None:
+    module = load_module()
+    source_root = tmp_path / "source"
+    return_code, source_dir, _ = run_main(module, source_root, FakeProvider())
+    assert return_code == 0
+
+    class ProviderMustNotBeCalled:
+        def __getattr__(self, name):
+            raise AssertionError(f"provider must not be called: {name}")
+
+    target_root = tmp_path / "target"
+    target_pit = target_root / "pit"
+    write_pit(target_pit, valid_rows())
+    status_dir = target_root / "status"
+    target_dir = target_root / "reference"
+    return_code = module.main(
+        [
+            "--pit-dir",
+            str(target_pit),
+            "--reference-dir",
+            str(target_dir),
+            "--status-out-dir",
+            str(status_dir),
+            "--start-date",
+            "2025-01-02",
+            "--end-date",
+            "2025-01-03",
+            "--import-dir",
+            str(source_dir),
+        ],
+        provider=ProviderMustNotBeCalled(),
+        today=date(2025, 1, 3),
+    )
+
+    status = json.loads(
+        (status_dir / "download_robust_reference_latest.json").read_text()
+    )
+    assert return_code == 0
+    assert status["status"] == "completed"
+    assert status["reason_code"] == "imported_existing"
+    assert status["selected"] == "jqdata"
+    assert json.loads((target_dir / SOURCE_FILENAME).read_text()) == json.loads(
+        (source_dir / SOURCE_FILENAME).read_text()
+    )
+    for name in TABLE_NAMES:
+        pd.testing.assert_frame_equal(
+            pd.read_parquet(target_dir / name),
+            pd.read_parquet(source_dir / name),
+        )
+
+
+def test_import_rejects_wrong_membership_and_preserves_target(tmp_path: Path) -> None:
+    module = load_module()
+    source_root = tmp_path / "source"
+    return_code, source_dir, _ = run_main(module, source_root, FakeProvider())
+    assert return_code == 0
+    source_path = source_dir / SOURCE_FILENAME
+    source = json.loads(source_path.read_text())
+    source["membership_snapshot_hash"] = "0" * 64
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    target_root = tmp_path / "target"
+    target_pit = target_root / "pit"
+    write_pit(target_pit, valid_rows())
+    target_dir = target_root / "reference"
+    old_tables = seed_old_tables(target_dir)
+    old_source = seed_old_source(target_dir)
+    status_dir = target_root / "status"
+    return_code = module.main(
+        [
+            "--pit-dir",
+            str(target_pit),
+            "--reference-dir",
+            str(target_dir),
+            "--status-out-dir",
+            str(status_dir),
+            "--start-date",
+            "2025-01-02",
+            "--end-date",
+            "2025-01-03",
+            "--import-dir",
+            str(source_dir),
+        ],
+        today=date(2025, 1, 3),
+    )
+
+    status = json.loads(
+        (status_dir / "download_robust_reference_latest.json").read_text()
+    )
+    assert return_code == module.BLOCKED_RETURN_CODE
+    assert status["reason_code"] == "reference_membership_snapshot_mismatch"
+    assert_old_tables_unchanged(target_dir, old_tables)
+    assert (target_dir / SOURCE_FILENAME).read_bytes() == old_source
 
 
 def test_jqdata_keeps_post_delist_index_days_and_marks_them_untradable(

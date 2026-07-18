@@ -73,6 +73,11 @@ paths and readiness state remain authoritative in
 The robust strategy configuration uses verified offline reuse for the one-time
 reference snapshot and the three Qlib benchmarks. It does not silently redownload
 when local data is missing or mismatched; the correct state is `blocked_data`.
+Remote artifacts remain staging until they are imported locally with
+`download_robust_reference.py --import-dir` and
+`add_index_benchmark.py --import-provider-dir`. Both commands revalidate local
+identity and use recoverable transactions; direct copies into canonical data
+directories are not supported.
 
 ## Notes
 

@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import shutil
+import stat
 import sys
 import tempfile
+import uuid
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -17,6 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import qlib_provider_uri, quant_data_root, workflow_root  # noqa: E402
+from _file_lock import lock_file, unlock_file  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -28,6 +34,10 @@ BENCHMARKS = {
     "SH000906": "sh.000906",
 }
 BENCHMARK_SYMBOL = "SH000300"
+BENCHMARK_TRANSACTION_FILENAME = ".add_index_benchmark.transaction.json"
+BENCHMARK_LOCK_FILENAME = ".add_index_benchmark.lock"
+BENCHMARK_TRANSACTION_VERSION = 1
+BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
 
 
 class BenchmarkPaths:
@@ -92,7 +102,14 @@ def _validate_existing_benchmarks(
     paths: BenchmarkPaths,
     calendar: list[str],
     required_start_date: str,
+    *,
+    allow_incomplete_transaction: bool = False,
 ) -> dict[str, int]:
+    if (
+        not allow_incomplete_transaction
+        and (paths.provider_dir / BENCHMARK_TRANSACTION_FILENAME).exists()
+    ):
+        raise RuntimeError("benchmark transaction is incomplete")
     calendar_index = pd.Index(calendar)
     parsed_calendar = pd.to_datetime(calendar_index, errors="raise")
     if parsed_calendar.has_duplicates or not parsed_calendar.is_monotonic_increasing:
@@ -102,11 +119,10 @@ def _validate_existing_benchmarks(
     if not len(required_positions):
         raise RuntimeError("existing benchmark calendar has no required dates")
     first_required = int(required_positions[0])
-    fields = ("open", "high", "low", "close", "volume", "factor")
     available_days: dict[str, int] = {}
     for symbol in BENCHMARKS:
         feature_dir = paths.feature_dir(symbol)
-        for field in fields:
+        for field in BENCHMARK_FIELDS:
             start_index, values = _read_qlib_bin(
                 feature_dir / f"{field}.day.bin"
             )
@@ -129,7 +145,12 @@ def _validate_existing_benchmarks(
                     f"existing benchmark {symbol} contains invalid {field} values"
                 )
         available_days[symbol] = len(calendar) - first_required
-    for instrument_file in paths.instruments_dir.glob("*.txt"):
+    if paths.instruments_dir.is_symlink() or not paths.instruments_dir.is_dir():
+        raise RuntimeError("existing benchmark instrument pools are unavailable")
+    instrument_files = sorted(paths.instruments_dir.glob("*.txt"))
+    if not instrument_files:
+        raise RuntimeError("existing benchmark instrument pools are unavailable")
+    for instrument_file in instrument_files:
         instruments = {
             line.split("\t", 1)[0].strip().upper()
             for line in instrument_file.read_text(encoding="utf-8").splitlines()
@@ -141,6 +162,334 @@ def _validate_existing_benchmarks(
                 "existing benchmark symbols pollute stock instrument pools: "
                 + ",".join(polluted)
             )
+    return available_days
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    directories = [root]
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError("benchmark feature tree must not contain symlinks")
+        if path.is_dir():
+            directories.append(path)
+            continue
+        if not path.is_file():
+            raise RuntimeError("benchmark feature tree contains a non-regular file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _validate_feature_tree(feature_dir: Path) -> None:
+    if feature_dir.is_symlink() or not feature_dir.is_dir():
+        raise RuntimeError("benchmark feature directory is invalid")
+    expected = {f"{field}.day.bin" for field in BENCHMARK_FIELDS}
+    actual: set[str] = set()
+    for path in feature_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("benchmark feature directory contains invalid entries")
+        actual.add(path.name)
+    if actual != expected:
+        raise RuntimeError("benchmark feature directory has an unexpected schema")
+
+
+def _regular_file_sha256(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("benchmark provider contains an invalid file")
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _feature_tree_fingerprint(feature_dir: Path) -> str:
+    _validate_feature_tree(feature_dir)
+    digest = hashlib.sha256()
+    for name in sorted(f"{field}.day.bin" for field in BENCHMARK_FIELDS):
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(bytes.fromhex(_regular_file_sha256(feature_dir / name)))
+    return digest.hexdigest()
+
+
+def _source_provider_fingerprint(paths: BenchmarkPaths) -> str:
+    digest = hashlib.sha256()
+    files = [
+        paths.calendar_file,
+        *sorted(paths.instruments_dir.glob("*.txt"), key=lambda value: value.name),
+    ]
+    for path in files:
+        relative = path.relative_to(paths.provider_dir).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(_regular_file_sha256(path)))
+    for symbol in BENCHMARKS:
+        encoded = symbol.encode("ascii")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(
+            bytes.fromhex(_feature_tree_fingerprint(paths.feature_dir(symbol)))
+        )
+    return digest.hexdigest()
+
+
+def _write_transaction_journal(payload: dict[str, object], path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=True, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _transaction_entries(
+    paths: BenchmarkPaths, transaction_id: str
+) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for symbol in BENCHMARKS:
+        target = paths.feature_dir(symbol)
+        entries.append(
+            {
+                "symbol": symbol,
+                "target": str(target.resolve()),
+                "stage": str(
+                    target.with_name(f".{target.name}.{transaction_id}.stage").resolve()
+                ),
+                "backup": str(
+                    target.with_name(f".{target.name}.{transaction_id}.backup").resolve()
+                ),
+                "had_original": target.exists(),
+            }
+        )
+    return entries
+
+
+def _validated_journal_entries(
+    paths: BenchmarkPaths, payload: object
+) -> tuple[str, list[dict[str, object]]]:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != BENCHMARK_TRANSACTION_VERSION
+        or payload.get("state") not in {"prepared", "committed"}
+        or not isinstance(payload.get("transaction_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", str(payload["transaction_id"])) is None
+        or not isinstance(payload.get("entries"), list)
+    ):
+        raise RuntimeError("benchmark transaction journal is invalid")
+    transaction_id = str(payload["transaction_id"])
+    expected = {
+        str(entry["symbol"]): entry
+        for entry in _transaction_entries(paths, transaction_id)
+    }
+    raw_entries = payload["entries"]
+    if len(raw_entries) != len(expected):
+        raise RuntimeError("benchmark transaction journal is invalid")
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, dict) or type(raw.get("had_original")) is not bool:
+            raise RuntimeError("benchmark transaction journal is invalid")
+        symbol = raw.get("symbol")
+        expected_entry = expected.get(str(symbol))
+        if expected_entry is None or str(symbol) in seen:
+            raise RuntimeError("benchmark transaction journal is invalid")
+        if any(
+            raw.get(key) != expected_entry[key]
+            for key in ("target", "stage", "backup")
+        ):
+            raise RuntimeError("benchmark transaction journal is invalid")
+        entries.append(dict(raw))
+        seen.add(str(symbol))
+    return str(payload["state"]), entries
+
+
+def _cleanup_transaction(entries: list[dict[str, object]], journal: Path) -> None:
+    for entry in entries:
+        _remove_path(Path(str(entry["stage"])))
+        _remove_path(Path(str(entry["backup"])))
+    journal.unlink(missing_ok=True)
+    _fsync_directory(journal.parent)
+
+
+def _recover_transaction(paths: BenchmarkPaths) -> None:
+    journal = paths.provider_dir / BENCHMARK_TRANSACTION_FILENAME
+    try:
+        mode = journal.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if journal.is_symlink() or not stat.S_ISREG(mode):
+        raise RuntimeError("benchmark transaction journal is invalid")
+    try:
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("benchmark transaction journal is invalid") from exc
+    state, entries = _validated_journal_entries(paths, payload)
+    if state == "prepared":
+        for entry in reversed(entries):
+            target = Path(str(entry["target"]))
+            backup = Path(str(entry["backup"]))
+            if bool(entry["had_original"]):
+                if backup.is_dir() and not backup.is_symlink():
+                    _remove_path(target)
+                    os.replace(backup, target)
+                elif not (target.is_dir() and not target.is_symlink()):
+                    raise RuntimeError("benchmark transaction recovery failed")
+            else:
+                _remove_path(target)
+    else:
+        for entry in entries:
+            target = Path(str(entry["target"]))
+            if target.is_symlink() or not target.is_dir():
+                raise RuntimeError("benchmark transaction recovery failed")
+    _cleanup_transaction(entries, journal)
+
+
+def _acquire_benchmark_lock(paths: BenchmarkPaths):
+    paths.provider_dir.parent.mkdir(parents=True, exist_ok=True)
+    handle = (
+        paths.provider_dir.parent
+        / f".{paths.provider_dir.name}{BENCHMARK_LOCK_FILENAME}"
+    ).open("a+b")
+    try:
+        lock_file(handle, exclusive=True)
+    except Exception:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_benchmark_lock(handle) -> None:
+    try:
+        unlock_file(handle)
+    finally:
+        handle.close()
+
+
+def _import_benchmark_features(
+    source_paths: BenchmarkPaths,
+    target_paths: BenchmarkPaths,
+    calendar: list[str],
+    required_start_date: str,
+) -> dict[str, int]:
+    if source_paths.provider_dir.resolve() == target_paths.provider_dir.resolve():
+        raise RuntimeError("benchmark import provider must differ from target provider")
+    try:
+        source_calendar_bytes = source_paths.calendar_file.read_bytes()
+        target_calendar_bytes = target_paths.calendar_file.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("benchmark import calendar is unavailable") from exc
+    if source_calendar_bytes != target_calendar_bytes:
+        raise RuntimeError("benchmark import calendar differs from target calendar")
+    source_calendar = _read_calendar(source_paths.calendar_file)
+    if source_calendar != calendar:
+        raise RuntimeError("benchmark import calendar differs from target calendar")
+    source_fingerprint = _source_provider_fingerprint(source_paths)
+    available_days = _validate_existing_benchmarks(
+        source_paths, source_calendar, required_start_date
+    )
+    for symbol in BENCHMARKS:
+        _validate_feature_tree(source_paths.feature_dir(symbol))
+
+    lock = _acquire_benchmark_lock(target_paths)
+    try:
+        _recover_transaction(target_paths)
+        transaction_id = uuid.uuid4().hex
+        entries = _transaction_entries(target_paths, transaction_id)
+        journal = target_paths.provider_dir / BENCHMARK_TRANSACTION_FILENAME
+        try:
+            for entry in entries:
+                target = Path(str(entry["target"]))
+                if target.is_symlink() or (
+                    target.exists() and not target.is_dir()
+                ):
+                    raise RuntimeError("existing benchmark feature directory is invalid")
+            for entry in entries:
+                symbol = str(entry["symbol"])
+                stage = Path(str(entry["stage"]))
+                _remove_path(stage)
+                shutil.copytree(source_paths.feature_dir(symbol), stage)
+                _validate_feature_tree(stage)
+                if _feature_tree_fingerprint(stage) != _feature_tree_fingerprint(
+                    source_paths.feature_dir(symbol)
+                ):
+                    raise RuntimeError("benchmark feature copy verification failed")
+                _fsync_tree(stage)
+            if _source_provider_fingerprint(source_paths) != source_fingerprint:
+                raise RuntimeError("benchmark import source changed during validation")
+            _write_transaction_journal(
+                {
+                    "version": BENCHMARK_TRANSACTION_VERSION,
+                    "transaction_id": transaction_id,
+                    "state": "prepared",
+                    "entries": entries,
+                },
+                journal,
+            )
+            for entry in entries:
+                target = Path(str(entry["target"]))
+                backup = Path(str(entry["backup"]))
+                stage = Path(str(entry["stage"]))
+                if bool(entry["had_original"]):
+                    if target.is_symlink() or not target.is_dir():
+                        raise RuntimeError("existing benchmark feature directory is invalid")
+                    os.replace(target, backup)
+                os.replace(stage, target)
+                _fsync_directory(target.parent)
+            _validate_existing_benchmarks(
+                target_paths,
+                calendar,
+                required_start_date,
+                allow_incomplete_transaction=True,
+            )
+            _write_transaction_journal(
+                {
+                    "version": BENCHMARK_TRANSACTION_VERSION,
+                    "transaction_id": transaction_id,
+                    "state": "committed",
+                    "entries": entries,
+                },
+                journal,
+            )
+            _cleanup_transaction(entries, journal)
+        except Exception:
+            _recover_transaction(target_paths)
+            raise
+    finally:
+        _release_benchmark_lock(lock)
     return available_days
 
 
@@ -211,9 +560,14 @@ def add_benchmark(
     *,
     dry_run: bool = False,
     reuse_existing: bool = False,
+    import_provider_dir: Path | None = None,
     baostock_module=None,
     required_start_date: str = "2014-01-02",
 ) -> dict[str, str | int]:
+    if sum((bool(dry_run), bool(reuse_existing), import_provider_dir is not None)) > 1:
+        raise ValueError(
+            "dry_run, reuse_existing, and import_provider_dir are mutually exclusive"
+        )
     paths = BenchmarkPaths(provider_dir)
     try:
         calendar = _read_calendar(paths.calendar_file)
@@ -251,6 +605,22 @@ def add_benchmark(
         print("Existing benchmark features passed strict offline validation")
         return {
             "status": "reused-existing",
+            "provider_dir": str(paths.provider_dir),
+            "calendar_days": len(calendar),
+            "downloaded_days": available_days,
+            "benchmark_symbols": list(BENCHMARKS),
+        }
+
+    if import_provider_dir is not None:
+        available_days = _import_benchmark_features(
+            BenchmarkPaths(import_provider_dir),
+            paths,
+            calendar,
+            required_start_date,
+        )
+        print("Imported benchmark features from a verified offline provider")
+        return {
+            "status": "imported-existing",
             "provider_dir": str(paths.provider_dir),
             "calendar_days": len(calendar),
             "downloaded_days": available_days,
@@ -359,21 +729,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--provider-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--required-start-date", default="2014-01-02")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate paths and calendar without network or writes.",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--reuse-existing",
         action="store_true",
         help="Strictly validate existing benchmark bins without network access.",
+    )
+    mode.add_argument(
+        "--import-provider-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Validate benchmark bins in a separate provider with an identical "
+            "calendar and transactionally install them without network access."
+        ),
     )
     args = parser.parse_args(argv)
     add_benchmark(
         args.provider_dir,
         dry_run=args.dry_run,
         reuse_existing=args.reuse_existing,
+        import_provider_dir=args.import_provider_dir,
         required_start_date=args.required_start_date,
     )
     return 0

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -15,6 +16,34 @@ def load_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def write_complete_provider(
+    provider: Path,
+    *,
+    calendar_text: str = "2026-01-02\n2026-01-05\n",
+    price: float = 10.0,
+) -> None:
+    calendar = provider / "calendars" / "day.txt"
+    calendar.parent.mkdir(parents=True, exist_ok=True)
+    calendar.write_text(calendar_text, encoding="utf-8")
+    instruments = provider / "instruments"
+    instruments.mkdir(parents=True, exist_ok=True)
+    (instruments / "all.txt").write_text(
+        "SH600000\t2026-01-02\t2026-01-05\n", encoding="utf-8"
+    )
+    day_count = len(calendar_text.strip().splitlines())
+    for symbol in ("sh000300", "sh000905", "sh000906"):
+        feature_dir = provider / "features" / symbol
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        for field in ("open", "high", "low", "close", "factor"):
+            values = np.array([0.0] + [price] * day_count, dtype="<f4")
+            if field == "factor":
+                values[1:] = 1.0
+            values.tofile(feature_dir / f"{field}.day.bin")
+        np.array([0.0] + [1000.0] * day_count, dtype="<f4").tofile(
+            feature_dir / "volume.day.bin"
+        )
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
@@ -234,6 +263,108 @@ class AddIndexBenchmarkTest(unittest.TestCase):
                     baostock_module=object(),
                     required_start_date="2026-01-02",
                 )
+
+    def test_imports_validated_benchmarks_with_identical_calendar(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            write_complete_provider(source, price=12.0)
+            write_complete_provider(target, price=8.0)
+
+            status = module.add_benchmark(
+                target,
+                import_provider_dir=source,
+                required_start_date="2026-01-02",
+            )
+
+            self.assertEqual(status["status"], "imported-existing")
+            for symbol in ("sh000300", "sh000905", "sh000906"):
+                raw = np.fromfile(
+                    target / "features" / symbol / "open.day.bin", dtype="<f4"
+                )
+                np.testing.assert_allclose(raw, [0.0, 12.0, 12.0])
+            self.assertFalse(
+                (target / module.BENCHMARK_TRANSACTION_FILENAME).exists()
+            )
+
+    def test_import_rejects_calendar_mismatch_without_writes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            write_complete_provider(
+                source,
+                calendar_text="2026-01-02\n2026-01-06\n",
+                price=12.0,
+            )
+            write_complete_provider(target, price=8.0)
+            before = {
+                path.relative_to(target).as_posix(): path.read_bytes()
+                for path in (target / "features").rglob("*.bin")
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "calendar differs"):
+                module.add_benchmark(
+                    target,
+                    import_provider_dir=source,
+                    required_start_date="2026-01-02",
+                )
+
+            after = {
+                path.relative_to(target).as_posix(): path.read_bytes()
+                for path in (target / "features").rglob("*.bin")
+            }
+            self.assertEqual(after, before)
+
+    def test_import_recovers_interrupted_directory_transaction(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            write_complete_provider(source, price=12.0)
+            write_complete_provider(target, price=8.0)
+            real_replace = module.os.replace
+            crashed = False
+
+            def crash_after_first_stage(source_path, target_path):
+                nonlocal crashed
+                result = real_replace(source_path, target_path)
+                if str(source_path).endswith(".stage") and not crashed:
+                    crashed = True
+                    raise SystemExit("simulated benchmark publish crash")
+                return result
+
+            with mock.patch.object(module.os, "replace", crash_after_first_stage):
+                with self.assertRaisesRegex(
+                    SystemExit, "simulated benchmark publish crash"
+                ):
+                    module.add_benchmark(
+                        target,
+                        import_provider_dir=source,
+                        required_start_date="2026-01-02",
+                    )
+
+            self.assertTrue(
+                (target / module.BENCHMARK_TRANSACTION_FILENAME).is_file()
+            )
+            status = module.add_benchmark(
+                target,
+                import_provider_dir=source,
+                required_start_date="2026-01-02",
+            )
+            self.assertEqual(status["status"], "imported-existing")
+            self.assertFalse(
+                (target / module.BENCHMARK_TRANSACTION_FILENAME).exists()
+            )
+            for symbol in ("sh000300", "sh000905", "sh000906"):
+                raw = np.fromfile(
+                    target / "features" / symbol / "open.day.bin", dtype="<f4"
+                )
+                np.testing.assert_allclose(raw, [0.0, 12.0, 12.0])
 
 
 if __name__ == "__main__":
