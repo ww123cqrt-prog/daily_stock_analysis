@@ -101,6 +101,7 @@ class LockedReferenceSnapshot:
         selected = raw.get("selected")
         industry = raw.get("industry_classification")
         fallback_reason = raw.get("fallback_reason")
+        build_run_id = raw.get("build_run_id")
         membership_snapshot_hash = raw.get("membership_snapshot_hash")
         fields_valid = (
             requested in ALLOWED_REQUESTED_SOURCES
@@ -109,6 +110,13 @@ class LockedReferenceSnapshot:
             and bool(industry.strip())
             and isinstance(membership_snapshot_hash, str)
             and SHA256_HEX.fullmatch(membership_snapshot_hash) is not None
+            and (
+                build_run_id is None
+                or (
+                    isinstance(build_run_id, str)
+                    and SAFE_REASON.fullmatch(build_run_id) is not None
+                )
+            )
             and (
                 fallback_reason is None
                 or (
@@ -181,6 +189,8 @@ class LockedReferenceSnapshot:
         }
         if fallback_reason is not None:
             sanitized["fallback_reason"] = fallback_reason
+        if build_run_id is not None:
+            sanitized["build_run_id"] = build_run_id
         return sanitized
 
     def fingerprint(self) -> str:

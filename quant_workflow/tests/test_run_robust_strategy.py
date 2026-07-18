@@ -224,6 +224,10 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
         reference_stage.argv[reference_stage.argv.index("--reference-source") + 1]
         == "auto"
     )
+    assert (
+        reference_stage.argv[reference_stage.argv.index("--run-id") + 1]
+        == "resume-me"
+    )
     assert "candidate_pipeline_latest" not in joined
     assert "latest_training_result" not in joined
 

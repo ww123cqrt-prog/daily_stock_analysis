@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -16,6 +19,20 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root as default_quant_data_root, reports_root as default_reports_root  # noqa: E402
+from _robust_membership_integrity import (  # noqa: E402
+    MembershipIntegrityError,
+    membership_read_lock,
+)
+from _robust_reference_integrity import (  # noqa: E402
+    REFERENCE_SNAPSHOT_FILES,
+    ReferenceIntegrityError,
+    reference_read_lock,
+)
+
+
+REFERENCE_PARQUET_FILES = tuple(
+    name for name in REFERENCE_SNAPSHOT_FILES if name.endswith(".parquet")
+)
 
 
 def count_lines(path: Path) -> int:
@@ -88,6 +105,133 @@ def qlib_entry(path: Path, role: str) -> dict[str, Any]:
     }
 
 
+def parquet_row_count(path: Path) -> int:
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def pit_manifest_entry(pit_dir: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not pit_dir.is_dir():
+        return None, {
+            "path": str(pit_dir),
+            "status": "not_ready",
+            "reason_code": "membership_snapshot_missing",
+        }
+    try:
+        with membership_read_lock(pit_dir) as snapshot:
+            snapshot.ensure_transaction_clean()
+            raw_source = json.loads(
+                (pit_dir / "MEMBERSHIP_SOURCE.json").read_text(encoding="utf-8")
+            )
+            date_range = raw_source["date_range"]
+            source = snapshot.validate_source(
+                start_date=str(date_range["start_date"]),
+                end_date=str(date_range["end_date"]),
+            )
+            daily_files = snapshot.daily_files()
+            membership_hash = snapshot.fingerprint()
+            member_day_count = sum(parquet_row_count(path) for path in daily_files)
+            symbols: set[str] = set()
+            for path in daily_files:
+                symbols.update(
+                    str(value)
+                    for value in pq.read_table(path, columns=["symbol"])
+                    .column("symbol")
+                    .to_pylist()
+                )
+            entry = {
+                "path": str(pit_dir),
+                "role": "Official point-in-time CSI800 membership snapshot.",
+                "status": "do_not_move",
+                "date_range": source["date_range"],
+                "requested_source": source["requested"],
+                "selected_source": source["selected"],
+                "daily_file_count": len(daily_files),
+                "member_day_count": member_day_count,
+                "symbol_count": len(symbols),
+                "interval_row_count": parquet_row_count(
+                    pit_dir / "membership_intervals.parquet"
+                ),
+                "membership_snapshot_hash": membership_hash,
+            }
+            if "fallback_reason" in source:
+                entry["fallback_reason"] = source["fallback_reason"]
+            return entry, None
+    except (
+        KeyError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        MembershipIntegrityError,
+    ) as exc:
+        reason_code = getattr(exc, "reason_code", "membership_snapshot_invalid")
+        return None, {
+            "path": str(pit_dir),
+            "status": "not_ready",
+            "reason_code": reason_code,
+        }
+
+
+def reference_manifest_entry(
+    reference_dir: Path,
+    pit_entry: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    missing = [
+        name for name in REFERENCE_SNAPSHOT_FILES if not (reference_dir / name).is_file()
+    ]
+    if missing:
+        return None, {
+            "path": str(reference_dir),
+            "status": "not_ready",
+            "reason_code": "reference_snapshot_incomplete",
+            "missing_files": missing,
+        }
+    if pit_entry is None:
+        return None, {
+            "path": str(reference_dir),
+            "status": "not_ready",
+            "reason_code": "membership_snapshot_not_ready",
+        }
+    try:
+        with reference_read_lock(reference_dir) as snapshot:
+            snapshot.ensure_transaction_clean()
+            date_range = pit_entry["date_range"]
+            source = snapshot.validate_source(
+                start_date=str(date_range["start_date"]),
+                end_date=str(date_range["end_date"]),
+                expected_membership_snapshot_hash=str(
+                    pit_entry["membership_snapshot_hash"]
+                ),
+            )
+            reference_hash = snapshot.fingerprint()
+            entry = {
+                "path": str(reference_dir),
+                "role": "Official PIT security, industry, ST, and suspension metadata.",
+                "status": "do_not_move",
+                "date_range": source["date_range"],
+                "requested_source": source["requested"],
+                "selected_source": source["selected"],
+                "industry_classification": source["industry_classification"],
+                "membership_snapshot_hash": source["membership_snapshot_hash"],
+                "reference_snapshot_hash": reference_hash,
+                "row_counts": {
+                    name: parquet_row_count(reference_dir / name)
+                    for name in REFERENCE_PARQUET_FILES
+                },
+            }
+            if "fallback_reason" in source:
+                entry["fallback_reason"] = source["fallback_reason"]
+            if "build_run_id" in source:
+                entry["build_run_id"] = source["build_run_id"]
+            return entry, None
+    except (KeyError, OSError, ReferenceIntegrityError) as exc:
+        reason_code = getattr(exc, "reason_code", "reference_snapshot_invalid")
+        return None, {
+            "path": str(reference_dir),
+            "status": "not_ready",
+            "reason_code": reason_code,
+        }
+
+
 def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, Any]:
     quant_data = Path(quant_data_root).expanduser()
     reports = Path(reports_root).expanduser()
@@ -97,6 +241,37 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     cleaned_parquet = parquet_root / "merged_baostock_jqdata_cleaned"
     cleaned_provider = qlib_root / "cn_data_baostock_jqdata_cleaned"
     canonical_provider = qlib_root / "cn_data_baostock_jqdata"
+    reference_root = quant_data / "reference"
+    pit_entry, pit_pending = pit_manifest_entry(reference_root / "pit_csi800")
+    reference_entry, reference_pending = reference_manifest_entry(
+        reference_root, pit_entry
+    )
+
+    official_entries: dict[str, Any] = {
+        "cleaned_parquet": {
+            **parquet_entry(
+                cleaned_parquet,
+                "Official cleaned A-share daily parquet dataset for DSA and Qlib conversion.",
+            ),
+            "status": "do_not_move",
+        },
+        "cleaned_qlib_provider": {
+            **qlib_entry(
+                cleaned_provider,
+                "Official Qlib provider for current training and backtesting.",
+            ),
+            "status": "do_not_move",
+        },
+    }
+    if pit_entry is not None:
+        official_entries["pit_csi800"] = pit_entry
+    if reference_entry is not None:
+        official_entries["robust_reference"] = reference_entry
+    pending_entries: dict[str, Any] = {}
+    if pit_pending is not None:
+        pending_entries["pit_csi800"] = pit_pending
+    if reference_pending is not None:
+        pending_entries["robust_reference"] = reference_pending
 
     manifest = {
         "schema_version": 1,
@@ -111,22 +286,8 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
             "do_not_store_secrets": True,
             "data_root": str(quant_data),
         },
-        "official_entries": {
-            "cleaned_parquet": {
-                **parquet_entry(
-                    cleaned_parquet,
-                    "Official cleaned A-share daily parquet dataset for DSA and Qlib conversion.",
-                ),
-                "status": "do_not_move",
-            },
-            "cleaned_qlib_provider": {
-                **qlib_entry(
-                    cleaned_provider,
-                    "Official Qlib provider for current training and backtesting.",
-                ),
-                "status": "do_not_move",
-            },
-        },
+        "official_entries": official_entries,
+        "pending_entries": pending_entries,
         "documented_inputs": {
             "baostock_qfq": parquet_entry(
                 parquet_root / "baostock_qfq",
@@ -186,7 +347,15 @@ def sync_data_manifest(*, quant_data_root: Path | None = None, reports_root: Pat
     manifest = build_manifest(quant_data_root=quant_data, reports_root=reports)
     quant_data.mkdir(parents=True, exist_ok=True)
     path = quant_data / "DATA_MANIFEST.json"
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 

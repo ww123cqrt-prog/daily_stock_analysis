@@ -339,6 +339,7 @@ def run_main(
     *,
     baostock_provider: FakeBaostockProvider | None = None,
     reference_source: str | None = None,
+    run_id: str | None = None,
     today: date = date(2025, 1, 3),
 ):
     pit_dir = tmp_path / "pit"
@@ -360,6 +361,8 @@ def run_main(
     ]
     if reference_source is not None:
         argv.extend(["--reference-source", reference_source])
+    if run_id is not None:
+        argv.extend(["--run-id", run_id])
     main_kwargs = {"provider": provider, "today": today}
     if baostock_provider is not None:
         main_kwargs["baostock_provider"] = baostock_provider
@@ -527,6 +530,30 @@ def test_cli_reference_source_defaults_to_auto_and_rejects_unknown_value() -> No
         )
     with pytest.raises(SystemExit):
         parser.parse_args(["--reference-source", "mixed"])
+    assert parser.parse_args(["--run-id", "reference_20260718_cache_v2"]).run_id == (
+        "reference_20260718_cache_v2"
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--run-id", "../escape"])
+
+
+def test_reference_source_records_build_run_id(tmp_path: Path) -> None:
+    module = load_module()
+
+    return_code, reference_dir, status_dir = run_main(
+        module,
+        tmp_path,
+        FakeProvider(),
+        run_id="reference_20260718_cache_v2",
+    )
+
+    source = json.loads((reference_dir / SOURCE_FILENAME).read_text())
+    status = json.loads(
+        (status_dir / "download_robust_reference_latest.json").read_text()
+    )
+    assert return_code == 0
+    assert source["build_run_id"] == "reference_20260718_cache_v2"
+    assert status["build_run_id"] == "reference_20260718_cache_v2"
 
 
 def test_auto_falls_back_as_a_whole_when_jqdata_industry_probe_is_denied(

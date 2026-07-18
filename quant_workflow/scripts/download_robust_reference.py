@@ -57,6 +57,7 @@ TABLE_COLUMNS = {
 QLIB_SYMBOL_PATTERN = re.compile(r"^(SH|SZ|BJ)(\d{6})$")
 JQ_SYMBOL_PATTERN = re.compile(r"^(\d{6})\.(XSHG|XSHE|XBSE)$")
 BAOSTOCK_SYMBOL_PATTERN = re.compile(r"^(sh|sz|bj)\.(\d{6})$", re.IGNORECASE)
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 EXCHANGE_TO_JQ = {"SH": "XSHG", "SZ": "XSHE", "BJ": "XBSE"}
 JQ_TO_EXCHANGE = {value: key for key, value in EXCHANGE_TO_JQ.items()}
 JQDATA_FALLBACK_REASONS = {
@@ -131,6 +132,13 @@ def _parse_date(value: str, reason_code: str = "invalid_date") -> date:
         return date.fromisoformat(value)
     except (TypeError, ValueError) as exc:
         raise BlockedData(reason_code) from exc
+
+
+def _parse_run_id(value: str) -> str:
+    normalized = str(value).strip()
+    if RUN_ID_PATTERN.fullmatch(normalized) is None:
+        raise argparse.ArgumentTypeError("run id contains unsupported characters")
+    return normalized
 
 
 def _normalize_timestamp(value: Any, *, allow_none: bool = False) -> pd.Timestamp:
@@ -1339,6 +1347,7 @@ def _status_payload(
     fallback_reason: str | None = None,
     industry_classification: str | None = None,
     membership_snapshot_hash: str | None = None,
+    build_run_id: str | None = None,
 ) -> dict[str, Any]:
     counts = table_counts or {}
     payload = {
@@ -1362,6 +1371,8 @@ def _status_payload(
     }
     if fallback_reason is not None:
         payload["fallback_reason"] = fallback_reason
+    if build_run_id is not None:
+        payload["build_run_id"] = build_run_id
     return payload
 
 
@@ -1373,6 +1384,7 @@ def _source_payload(
     industry_classification: str,
     membership_snapshot_hash: str,
     fallback_reason: str | None,
+    build_run_id: str | None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "requested": requested,
@@ -1386,6 +1398,8 @@ def _source_payload(
     }
     if fallback_reason is not None:
         payload["fallback_reason"] = fallback_reason
+    if build_run_id is not None:
+        payload["build_run_id"] = build_run_id
     return payload
 
 
@@ -1747,6 +1761,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--status-out-dir", type=Path, default=None)
+    parser.add_argument("--run-id", type=_parse_run_id, default=None)
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument(
         "--reference-source",
@@ -1801,6 +1816,7 @@ def main(
             fallback_reason=fallback_reason,
             industry_classification=industry_classification,
             membership_snapshot_hash=membership_snapshot_hash,
+            build_run_id=args.run_id,
         )
         try:
             _atomic_write_status(payload, status_path)
@@ -1971,6 +1987,7 @@ def main(
             fallback_reason=fallback_reason,
             industry_classification=industry_classification,
             membership_snapshot_hash=membership_snapshot_hash,
+            build_run_id=args.run_id,
         )
         source = _source_payload(
             requested,
@@ -1980,6 +1997,7 @@ def main(
             industry_classification,
             membership_snapshot_hash,
             fallback_reason,
+            args.run_id,
         )
         publish_lock = None
         try:

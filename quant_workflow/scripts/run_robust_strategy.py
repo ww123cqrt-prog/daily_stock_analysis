@@ -295,27 +295,25 @@ def build_stages(
                 ],
             )
         )
-    stages.append(
-        Stage(
-            "download_robust_reference",
-            [
-                python,
-                str(SCRIPT_DIR / "download_robust_reference.py"),
-                "--pit-dir",
-                str(pit_dir),
-                "--reference-dir",
-                str(reference_dir),
-                "--start-date",
-                str(universe["start_date"]),
-                "--end-date",
-                as_of_date,
-                "--status-out-dir",
-                str(stage_report_dir("download_robust_reference")),
-                "--reference-source",
-                str(universe["reference_source"]),
-            ],
-        )
-    )
+    reference_argv = [
+        python,
+        str(SCRIPT_DIR / "download_robust_reference.py"),
+        "--pit-dir",
+        str(pit_dir),
+        "--reference-dir",
+        str(reference_dir),
+        "--start-date",
+        str(universe["start_date"]),
+        "--end-date",
+        as_of_date,
+        "--status-out-dir",
+        str(stage_report_dir("download_robust_reference")),
+        "--reference-source",
+        str(universe["reference_source"]),
+    ]
+    if run_id:
+        reference_argv += ["--run-id", str(run_id)]
+    stages.append(Stage("download_robust_reference", reference_argv))
     stages.append(
         Stage(
             "add_robust_benchmarks",
