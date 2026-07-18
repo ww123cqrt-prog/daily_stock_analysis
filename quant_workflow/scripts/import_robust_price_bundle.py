@@ -178,7 +178,7 @@ def _tree_is_read_only(root: Path) -> bool:
         return False
 
 
-def _verify_imported_bundle(
+def verify_imported_bundle(
     *,
     bundle_dir: Path,
     bundle_key: str,
@@ -266,7 +266,7 @@ def import_price_bundle(
         membership_snapshot_hash=membership_snapshot_hash,
     )
     bundle_dir = destination_root / key[:16]
-    existing = _verify_imported_bundle(
+    existing = verify_imported_bundle(
         bundle_dir=bundle_dir,
         bundle_key=key,
         source_manifest_sha256=source_manifest_sha256,
@@ -314,7 +314,7 @@ def import_price_bundle(
             )
             _make_tree_read_only(temporary)
             if (
-                _verify_imported_bundle(
+                verify_imported_bundle(
                     bundle_dir=temporary,
                     bundle_key=key,
                     source_manifest_sha256=source_manifest_sha256,
@@ -330,7 +330,7 @@ def import_price_bundle(
         finally:
             if temporary.exists():
                 _remove_tree(temporary)
-        existing = _verify_imported_bundle(
+        existing = verify_imported_bundle(
             bundle_dir=bundle_dir,
             bundle_key=key,
             source_manifest_sha256=source_manifest_sha256,

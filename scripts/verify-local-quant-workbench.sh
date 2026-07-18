@@ -40,6 +40,7 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   download_robust_reference.py
   validate_robust_price_bundle.py
   import_robust_price_bundle.py
+  build_robust_price_provider.py
   preflight_robust_data.py
   prepare_robust_provider.py
   robust_backtest.py
