@@ -705,7 +705,7 @@ def test_preflight_allows_post_delist_index_day_when_suspension_is_true(
     suspension = pd.read_parquet(suspension_path)
     suspension.loc[
         (suspension["symbol"] == "SH600000")
-        & (suspension["date"] == pd.Timestamp("2026-01-06")),
+        & (suspension["date"] >= pd.Timestamp("2026-01-05")),
         "is_suspended",
     ] = True
     suspension.to_parquet(suspension_path, index=False)
@@ -735,6 +735,43 @@ def test_preflight_blocks_tradable_post_delist_index_day(tmp_path: Path) -> None
     security = pd.read_parquet(security_path)
     security.loc[security["symbol"] == "SH600000", "delist_date"] = pd.Timestamp(
         "2026-01-05"
+    )
+    security.to_parquet(security_path, index=False)
+    suspension_path = tmp_path / "reference" / "suspension_status.parquet"
+    suspension = pd.read_parquet(suspension_path)
+    suspension.loc[
+        (suspension["symbol"] == "SH600000")
+        & (suspension["date"] == pd.Timestamp("2026-01-05")),
+        "is_suspended",
+    ] = True
+    suspension.to_parquet(suspension_path, index=False)
+
+    result = module.run_preflight(
+        pit_dir=pit_dir,
+        price_dir=price_dir,
+        provider_dir=provider,
+        reference_dir=tmp_path / "reference",
+        start_date="2026-01-05",
+        end_date="2026-01-06",
+        as_of_date="2026-01-06",
+        expected_members_per_day=2,
+    )
+
+    check = next(
+        item for item in result["checks"] if item["id"] == "reference_metadata"
+    )
+    assert result["status"] == "blocked_data"
+    assert check["passed"] is False
+    assert check["details"]["member_day_gaps"]["security_master"] == 1
+
+
+def test_preflight_blocks_tradable_delist_day(tmp_path: Path) -> None:
+    module = load_module()
+    pit_dir, price_dir, provider = build_small_valid_fixture(tmp_path)
+    security_path = tmp_path / "reference" / "security_master.parquet"
+    security = pd.read_parquet(security_path)
+    security.loc[security["symbol"] == "SH600000", "delist_date"] = pd.Timestamp(
+        "2026-01-06"
     )
     security.to_parquet(security_path, index=False)
 

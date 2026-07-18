@@ -491,6 +491,7 @@ def test_jqdata_keeps_post_delist_index_days_and_marks_them_untradable(
     del provider.st[("2025-01-03", "600000.XSHG")]
     del provider.paused[("2025-01-03", "600000.XSHG")]
     provider.st[("2025-01-02", "600000.XSHG")] = True
+    provider.paused[("2025-01-02", "600000.XSHG")] = True
 
     return_code, reference_dir, _ = run_main(module, tmp_path, provider)
 
@@ -789,6 +790,44 @@ def test_baostock_keeps_post_delist_index_days_and_marks_them_untradable(
     assert post_delist_suspension.tolist() == [True]
 
 
+def test_baostock_marks_missing_delist_day_untradable(tmp_path: Path) -> None:
+    module = load_module()
+    provider = FakeBaostockProvider()
+    provider.basic[0] = [
+        "sh.600000",
+        "PFB",
+        "2000-01-01",
+        "2025-01-03",
+        "1",
+        "0",
+    ]
+    provider.history["sh.600000"] = [["2025-01-02", "0", "1"]]
+
+    return_code, reference_dir, _ = run_main(
+        module,
+        tmp_path,
+        baostock_provider=provider,
+        reference_source="baostock",
+    )
+
+    st = pd.read_parquet(reference_dir / "st_status.parquet")
+    suspension = pd.read_parquet(reference_dir / "suspension_status.parquet")
+    delist_day_st = st.loc[
+        (st["symbol"] == "SH600000")
+        & (st["date"] == pd.Timestamp("2025-01-03")),
+        "is_st",
+    ]
+    delist_day_suspension = suspension.loc[
+        (suspension["symbol"] == "SH600000")
+        & (suspension["date"] == pd.Timestamp("2025-01-03")),
+        "is_suspended",
+    ]
+
+    assert return_code == 0
+    assert delist_day_st.tolist() == [True]
+    assert delist_day_suspension.tolist() == [True]
+
+
 def test_baostock_100k_member_days_stay_memory_bounded_and_exact() -> None:
     module = load_module()
     dates = pd.date_range("2020-01-01", periods=500, freq="D")
@@ -817,6 +856,99 @@ def test_baostock_100k_member_days_stay_memory_bounded_and_exact() -> None:
     assert np.array_equal(st["is_st"].to_numpy(), expected_st)
     assert np.array_equal(suspension["is_suspended"].to_numpy(), expected_suspended)
     assert len(st) == len(suspension) == len(membership) == 100_000
+
+
+def test_baostock_reuses_valid_industry_partition_cache(tmp_path: Path) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-03"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    first_provider = FakeBaostockProvider()
+    first_adapter = module.BaostockAdapter(first_provider, cache_dir=cache_dir)
+
+    expected = first_adapter._fetch_daily_industries(membership)
+
+    second_provider = FakeBaostockProvider()
+    second_provider.exceptions["industry"] = [
+        RuntimeError("cache should avoid provider access")
+    ]
+    second_adapter = module.BaostockAdapter(second_provider, cache_dir=cache_dir)
+    actual = second_adapter._fetch_daily_industries(membership)
+
+    pd.testing.assert_frame_equal(actual, expected)
+    assert not [call for call in second_provider.calls if call[0] == "industry"]
+    assert second_adapter.industry_classification == "CSRC"
+
+
+def test_baostock_realigns_reordered_industry_partition_cache(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "symbol": ["SH600000", "SZ000001"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    adapter = module.BaostockAdapter(FakeBaostockProvider(), cache_dir=cache_dir)
+    cache_path = cache_dir / "industry" / "2025.parquet"
+    cache_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "symbol": ["SZ000001", "SH600000"],
+            "industry_code": ["CSRC:Bank", "CSRC:Technology"],
+            "industry_classification": ["CSRC", "CSRC"],
+        }
+    ).to_parquet(cache_path, index=False)
+
+    actual = adapter._fetch_daily_industries(membership)
+
+    assert actual[["date", "symbol"]].equals(membership)
+    assert actual["industry_code"].tolist() == ["CSRC:Technology", "CSRC:Bank"]
+
+
+def test_baostock_reuses_valid_symbol_status_cache(tmp_path: Path) -> None:
+    module = load_module()
+    membership = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-03"]),
+            "symbol": ["SH600000", "SH600000"],
+        }
+    )
+    security = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "list_date": pd.to_datetime(["2000-01-01"]),
+            "delist_date": [pd.NaT],
+            "board": ["main"],
+        }
+    )
+    cache_dir = tmp_path / "cache"
+    first_provider = FakeBaostockProvider()
+    first_adapter = module.BaostockAdapter(first_provider, cache_dir=cache_dir)
+
+    expected_st, expected_suspension = first_adapter._fetch_status_tables(
+        membership, security
+    )
+
+    second_provider = FakeBaostockProvider()
+    second_provider.exceptions["history"] = [
+        RuntimeError("cache should avoid provider access")
+    ]
+    second_adapter = module.BaostockAdapter(second_provider, cache_dir=cache_dir)
+    actual_st, actual_suspension = second_adapter._fetch_status_tables(
+        membership, security
+    )
+
+    pd.testing.assert_frame_equal(actual_st, expected_st)
+    pd.testing.assert_frame_equal(actual_suspension, expected_suspension)
+    assert not [call for call in second_provider.calls if call[0] == "history"]
 
 
 def test_baostock_missing_member_day_fails_closed_and_preserves_old_source(

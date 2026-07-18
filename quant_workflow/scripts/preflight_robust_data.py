@@ -326,7 +326,7 @@ def _metadata_check(
         else:
             joined["is_suspended"] = False
         post_delist = joined["delist_date"].notna() & (
-            joined["delist_date"] < joined["date"]
+            joined["delist_date"] <= joined["date"]
         )
         valid = (
             joined["list_date"].notna()

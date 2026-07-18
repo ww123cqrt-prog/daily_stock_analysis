@@ -44,6 +44,7 @@ BLOCKED_RETURN_CODE = 2
 SYMBOL_CHUNK_SIZE = 200
 BAOSTOCK_MAX_ATTEMPTS = 2
 BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
+BAOSTOCK_CACHE_SCHEMA_VERSION = 1
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
     "industry_intervals.parquet": ("symbol", "industry_code", "start_date", "end_date"),
@@ -317,7 +318,7 @@ def _materialize_daily_status(
     ).itertuples(index=False, name=None):
         key = (timestamp, symbol)
         delist_date = delist_dates.get(symbol)
-        post_delist = delist_date is not None and timestamp > delist_date
+        post_delist = delist_date is not None and timestamp >= delist_date
         if key in lookup:
             value = bool(lookup[key])
             if post_delist and forced_post_delist_value is True and not value:
@@ -679,10 +680,45 @@ class JQDataAdapter:
 class BaostockAdapter:
     source = "baostock"
 
-    def __init__(self, provider: Any) -> None:
+    def __init__(self, provider: Any, *, cache_dir: Path | None = None) -> None:
         self.provider = provider
+        self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self.industry_classification: str | None = None
         self._logged_in = False
+
+    @staticmethod
+    def _write_cache(frame: pd.DataFrame, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            frame.to_parquet(temporary, index=False)
+            _fsync_file(temporary)
+            os.replace(temporary, path)
+            _fsync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _same_member_keys(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+        left_keys = left.loc[:, ["date", "symbol"]].sort_values(
+            ["date", "symbol"], kind="mergesort", ignore_index=True
+        )
+        right_keys = right.loc[:, ["date", "symbol"]].sort_values(
+            ["date", "symbol"], kind="mergesort", ignore_index=True
+        )
+        return len(left_keys) == len(right_keys) and np.array_equal(
+            left_keys.to_numpy(copy=False), right_keys.to_numpy(copy=False)
+        )
+
+    def _industry_cache_path(self, year: int) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / "industry" / f"{year}.parquet"
+
+    def _status_cache_path(self, symbol: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / "status" / f"{symbol}.parquet"
 
     def login(self) -> None:
         try:
@@ -777,7 +813,9 @@ class BaostockAdapter:
             columns=TABLE_COLUMNS["security_master.parquet"],
         )
 
-    def _fetch_daily_industries(self, membership: pd.DataFrame) -> pd.DataFrame:
+    def _fetch_industry_partition(
+        self, membership: pd.DataFrame
+    ) -> tuple[pd.DataFrame, str]:
         required = (
             "updateDate",
             "code",
@@ -829,15 +867,134 @@ class BaostockAdapter:
                 industry_codes[position] = industry_code
         if len(classifications) != 1:
             raise BlockedData("inconsistent_industry_classification")
+        classification = next(iter(classifications))
+        return (
+            pd.DataFrame(
+                {
+                    "date": membership["date"].to_numpy(copy=False),
+                    "symbol": membership["symbol"].to_numpy(copy=False),
+                    "industry_code": industry_codes,
+                },
+                index=membership.index,
+            ),
+            classification,
+        )
+
+    def _read_industry_cache(
+        self, path: Path, membership: pd.DataFrame
+    ) -> tuple[pd.DataFrame, str]:
+        try:
+            cached = pd.read_parquet(path)
+        except Exception as exc:
+            raise BlockedData("invalid_reference_cache") from exc
+        required = {
+            "date",
+            "symbol",
+            "industry_code",
+            "industry_classification",
+        }
+        if not required.issubset(cached.columns):
+            raise BlockedData("invalid_reference_cache")
+        cached = cached.loc[:, sorted(required)].copy()
+        try:
+            cached["date"] = pd.to_datetime(
+                cached["date"], errors="raise"
+            ).dt.normalize()
+        except (TypeError, ValueError) as exc:
+            raise BlockedData("invalid_reference_cache") from exc
+        cached["symbol"] = cached["symbol"].astype(str).str.strip().str.upper()
+        if (
+            cached[["date", "symbol", "industry_code"]].isna().any(axis=None)
+            or cached.duplicated(["date", "symbol"]).any()
+            or not self._same_member_keys(cached, membership)
+        ):
+            raise BlockedData("invalid_reference_cache")
+        classifications = {
+            _required_text(value, "invalid_reference_cache")
+            for value in cached["industry_classification"].unique()
+        }
+        if len(classifications) != 1:
+            raise BlockedData("invalid_reference_cache")
+        ordered = membership.loc[:, ["date", "symbol"]].merge(
+            cached.loc[:, ["date", "symbol", "industry_code"]],
+            on=["date", "symbol"],
+            how="left",
+            sort=False,
+            validate="one_to_one",
+        )
+        if ordered["industry_code"].isna().any():
+            raise BlockedData("invalid_reference_cache")
+        return (
+            ordered,
+            next(iter(classifications)),
+        )
+
+    def _fetch_daily_industries(self, membership: pd.DataFrame) -> pd.DataFrame:
+        partitions: list[pd.DataFrame] = []
+        classifications: set[str] = set()
+        year_groups = list(membership.groupby(membership["date"].dt.year, sort=True))
+        for completed, (year, raw_partition) in enumerate(year_groups, start=1):
+            partition_members = raw_partition.reset_index(drop=True)
+            cache_path = self._industry_cache_path(int(year))
+            cache_hit = cache_path is not None and cache_path.is_file()
+            if cache_hit:
+                partition, classification = self._read_industry_cache(
+                    cache_path, partition_members
+                )
+            else:
+                partition, classification = self._fetch_industry_partition(
+                    partition_members
+                )
+                if cache_path is not None:
+                    self._write_cache(
+                        partition.assign(industry_classification=classification),
+                        cache_path,
+                    )
+            partitions.append(partition)
+            classifications.add(classification)
+            print(
+                "download_robust_reference: industry "
+                f"{completed}/{len(year_groups)} year={year} "
+                f"cache={'hit' if cache_hit else 'miss'}",
+                flush=True,
+            )
+        if len(classifications) != 1:
+            raise BlockedData("inconsistent_industry_classification")
         self.industry_classification = next(iter(classifications))
+        combined = pd.concat(partitions, ignore_index=True)
+        if not self._same_member_keys(combined, membership):
+            raise BlockedData("invalid_reference_cache")
         return pd.DataFrame(
             {
-                "date": membership["date"].to_numpy(copy=False),
-                "symbol": membership["symbol"].to_numpy(copy=False),
-                "industry_code": industry_codes,
+                "date": combined["date"].to_numpy(copy=False),
+                "symbol": combined["symbol"].to_numpy(copy=False),
+                "industry_code": combined["industry_code"].to_numpy(copy=False),
             },
             index=membership.index,
         )
+
+    def _read_status_cache(self, path: Path) -> pd.DataFrame:
+        try:
+            cached = pd.read_parquet(path)
+        except Exception as exc:
+            raise BlockedData("invalid_reference_cache") from exc
+        required = ("date", "is_st", "is_suspended")
+        if not set(required).issubset(cached.columns):
+            raise BlockedData("invalid_reference_cache")
+        cached = cached.loc[:, required].copy()
+        try:
+            cached["date"] = pd.to_datetime(
+                cached["date"], errors="raise"
+            ).dt.normalize()
+        except (TypeError, ValueError) as exc:
+            raise BlockedData("invalid_reference_cache") from exc
+        if cached["date"].isna().any() or cached.duplicated("date").any():
+            raise BlockedData("invalid_reference_cache")
+        for column in ("is_st", "is_suspended"):
+            if not cached[column].map(lambda value: isinstance(value, (bool, np.bool_))).all():
+                raise BlockedData("invalid_reference_cache")
+            cached[column] = cached[column].astype(bool)
+        return cached.set_index("date")
 
     def _fetch_status_tables(
         self,
@@ -851,53 +1008,60 @@ class BaostockAdapter:
         paused_values = np.empty(len(membership), dtype=np.bool_)
         delist_dates = _security_delist_dates(security)
         symbol_groups = membership.groupby("symbol", sort=True).indices
-        for symbol, positions in symbol_groups.items():
-            frame = self._query(
-                self.provider.query_history_k_data_plus,
-                qlib_to_baostock_symbol(symbol),
-                "date,tradestatus,isST",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="3",
-            )
-            _require_baostock_columns(
-                frame, required, "invalid_baostock_history_schema"
-            )
-            try:
-                history_dates = pd.to_datetime(
-                    frame["date"], errors="raise"
-                ).dt.normalize()
-            except (TypeError, ValueError) as exc:
-                raise BlockedData("invalid_provider_date") from exc
-            if (
-                history_dates.isna().any()
-                or getattr(history_dates.dt, "tz", None) is not None
-            ):
-                raise BlockedData("invalid_provider_date")
-            if history_dates.duplicated().any():
-                raise BlockedData("duplicate_reference_member_day")
-            trade_status = frame["tradestatus"].astype(str).str.strip()
-            is_st = frame["isST"].astype(str).str.strip()
-            if (
-                not trade_status.isin(("0", "1")).all()
-                or not is_st.isin(("0", "1")).all()
-            ):
-                raise BlockedData("invalid_baostock_history_schema")
-            history = pd.DataFrame(
-                {
-                    "is_st": is_st.eq("1").to_numpy(),
-                    "is_suspended": trade_status.eq("0").to_numpy(),
-                },
-                index=pd.DatetimeIndex(history_dates),
-            )
+        for completed, (symbol, positions) in enumerate(
+            symbol_groups.items(), start=1
+        ):
+            cache_path = self._status_cache_path(symbol)
+            cache_hit = cache_path is not None and cache_path.is_file()
+            if cache_hit:
+                history = self._read_status_cache(cache_path)
+            else:
+                frame = self._query(
+                    self.provider.query_history_k_data_plus,
+                    qlib_to_baostock_symbol(symbol),
+                    "date,tradestatus,isST",
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency="d",
+                    adjustflag="3",
+                )
+                _require_baostock_columns(
+                    frame, required, "invalid_baostock_history_schema"
+                )
+                try:
+                    history_dates = pd.to_datetime(
+                        frame["date"], errors="raise"
+                    ).dt.normalize()
+                except (TypeError, ValueError) as exc:
+                    raise BlockedData("invalid_provider_date") from exc
+                if (
+                    history_dates.isna().any()
+                    or getattr(history_dates.dt, "tz", None) is not None
+                ):
+                    raise BlockedData("invalid_provider_date")
+                if history_dates.duplicated().any():
+                    raise BlockedData("duplicate_reference_member_day")
+                trade_status = frame["tradestatus"].astype(str).str.strip()
+                is_st = frame["isST"].astype(str).str.strip()
+                if (
+                    not trade_status.isin(("0", "1")).all()
+                    or not is_st.isin(("0", "1")).all()
+                ):
+                    raise BlockedData("invalid_baostock_history_schema")
+                history = pd.DataFrame(
+                    {
+                        "is_st": is_st.eq("1").to_numpy(),
+                        "is_suspended": trade_status.eq("0").to_numpy(),
+                    },
+                    index=pd.DatetimeIndex(history_dates),
+                )
             member_dates = pd.DatetimeIndex(
                 membership.iloc[positions]["date"].to_numpy(copy=False)
             )
             aligned = history.reindex(member_dates)
             delist_date = delist_dates.get(symbol)
             if delist_date is not None:
-                post_delist = member_dates > delist_date
+                post_delist = member_dates >= delist_date
                 if post_delist.any():
                     observed_post_delist = aligned.loc[post_delist, "is_suspended"]
                     if (
@@ -917,8 +1081,19 @@ class BaostockAdapter:
                 raise BlockedData("missing_st_member_day")
             if aligned["is_suspended"].isna().any():
                 raise BlockedData("missing_paused_member_day")
+            if not cache_hit and cache_path is not None:
+                self._write_cache(
+                    history.rename_axis("date").reset_index(), cache_path
+                )
             st_values[positions] = aligned["is_st"].to_numpy(dtype=np.bool_)
             paused_values[positions] = aligned["is_suspended"].to_numpy(dtype=np.bool_)
+            if completed % 100 == 0 or completed == len(symbol_groups):
+                print(
+                    "download_robust_reference: status "
+                    f"{completed}/{len(symbol_groups)} "
+                    f"last_symbol={symbol} cache={'hit' if cache_hit else 'miss'}",
+                    flush=True,
+                )
         dates = membership["date"].to_numpy(copy=False)
         symbols = membership["symbol"].to_numpy(copy=False)
         return (
@@ -940,11 +1115,11 @@ class BaostockAdapter:
 
     def build(self, membership: pd.DataFrame, today: date) -> dict[str, pd.DataFrame]:
         security = self._build_security_master(membership, today)
+        st, suspension = self._fetch_status_tables(membership, security)
         daily_industry = self._fetch_daily_industries(membership)
         industry = _compress_industry_intervals(
             daily_industry, membership["date"].unique()
         )
-        st, suspension = self._fetch_status_tables(membership, security)
         return {
             "security_master.parquet": security,
             "industry_intervals.parquet": industry,
@@ -1573,6 +1748,15 @@ def main(
                 member_count = int(membership["symbol"].nunique())
                 member_day_count = len(membership)
                 membership_snapshot_hash = membership_snapshot.fingerprint()
+            baostock_cache_dir = (
+                reference_dir.parent
+                / "cache"
+                / "robust_reference"
+                / f"v{BAOSTOCK_CACHE_SCHEMA_VERSION}"
+                / "baostock"
+                / membership_snapshot_hash
+                / f"{start_date.isoformat()}_{end_date.isoformat()}"
+            )
 
             if requested == "baostock":
                 selected = "baostock"
@@ -1583,7 +1767,9 @@ def main(
                         if provider is not None
                         else _create_default_baostock_provider()
                     )
-                active_adapter: Any = BaostockAdapter(raw_baostock)
+                active_adapter: Any = BaostockAdapter(
+                    raw_baostock, cache_dir=baostock_cache_dir
+                )
                 cleanup_adapters.append(active_adapter)
                 active_adapter.login()
             elif requested == "jqdata":
@@ -1619,7 +1805,9 @@ def main(
                         if baostock_provider is not None
                         else _create_default_baostock_provider()
                     )
-                    active_adapter = BaostockAdapter(raw_baostock)
+                    active_adapter = BaostockAdapter(
+                        raw_baostock, cache_dir=baostock_cache_dir
+                    )
                     cleanup_adapters.append(active_adapter)
                     active_adapter.login()
 
@@ -1643,7 +1831,9 @@ def main(
                     if baostock_provider is not None
                     else _create_default_baostock_provider()
                 )
-                active_adapter = BaostockAdapter(raw_baostock)
+                active_adapter = BaostockAdapter(
+                    raw_baostock, cache_dir=baostock_cache_dir
+                )
                 cleanup_adapters.append(active_adapter)
                 active_adapter.login()
                 tables = build_reference_tables(
