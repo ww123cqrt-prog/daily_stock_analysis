@@ -172,12 +172,20 @@ export type ResearchRobustModelReport = {
 
 export type ResearchRobustStrategyEvaluation = {
   strategyId?: string;
-  acceptance?: { passed?: boolean; failedGates?: string[] };
+  eligibleForFinalSelection?: boolean;
+  acceptance?: {
+    passed?: boolean;
+    failedGates?: string[];
+    values?: ResearchRobustMetricMap;
+    thresholds?: ResearchRobustMetricMap;
+  };
   baseline?: { metrics?: ResearchRobustMetricMap };
   stress?: { metrics?: ResearchRobustMetricMap };
   delayed?: { metrics?: ResearchRobustMetricMap };
   quarterMetrics?: ResearchRobustMetricMap[];
   regimeMetrics?: Record<string, ResearchRobustMetricMap>;
+  boardAttribution?: Record<string, ResearchRobustMetricMap>;
+  attributionReconciliation?: ResearchRobustMetricMap;
 };
 
 export type ResearchRobustStrategy = {

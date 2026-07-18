@@ -402,11 +402,15 @@ def _robust_strategy_row(raw: Any) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {}
     if raw.get("strategy_id") is not None:
         result["strategy_id"] = str(raw["strategy_id"])
+    if isinstance(raw.get("eligible_for_final_selection"), bool):
+        result["eligible_for_final_selection"] = raw[
+            "eligible_for_final_selection"
+        ]
     acceptance = raw.get("acceptance")
     if isinstance(acceptance, dict):
         result["acceptance"] = {
             key: _sanitize_robust_tree(acceptance[key])
-            for key in ("passed", "failed_gates")
+            for key in ("passed", "failed_gates", "values", "thresholds")
             if key in acceptance
         }
     for scenario in ("baseline", "stress", "delayed"):
@@ -436,6 +440,9 @@ def _robust_strategy_row(raw: Any) -> Optional[Dict[str, Any]]:
         result["regime_metrics_truncated"] = (
             len(regime_items) > ROBUST_MAPPING_PREVIEW_LIMIT
         )
+    for key in ("board_attribution", "attribution_reconciliation"):
+        if isinstance(raw.get(key), dict):
+            result[key] = _sanitize_robust_tree(raw[key])
     return _sanitize_robust_tree(result)
 
 

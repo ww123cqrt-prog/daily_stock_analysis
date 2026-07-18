@@ -216,6 +216,7 @@ beforeEach(() => {
         strategyMatrix: [
             {
               strategyId: 'weekly_top50',
+              eligibleForFinalSelection: false,
               acceptance: { passed: false },
               baseline: { metrics: { annualExcessReturn: 0.04, informationRatio: 0.42, maxDrawdown: -0.18 } },
               stress: { metrics: { annualExcessReturn: -0.01 } },
@@ -223,7 +224,18 @@ beforeEach(() => {
             },
             {
               strategyId: 'full_risk_control',
-              acceptance: { passed: true },
+              eligibleForFinalSelection: true,
+              acceptance: {
+                passed: true,
+                values: {
+                  aggregateAnnualExcessReturn: 0.08,
+                  positiveExcessQuarterRatio: 0.75,
+                },
+                thresholds: {
+                  annualExcessReturnMin: 0.05,
+                  positiveExcessQuarterRatioMin: 0.70,
+                },
+              },
               baseline: { metrics: { annualExcessReturn: 0.08, informationRatio: 0.81, maxDrawdown: -0.12 } },
               stress: { metrics: { annualExcessReturn: 0.02 } },
               delayed: { metrics: { annualExcessReturn: 0.01 } },
@@ -233,6 +245,17 @@ beforeEach(() => {
               regimeMetrics: {
                 risk_on: { annualExcessReturn: 0.09, days: 120 },
                 risk_off: { annualExcessReturn: 0.01, days: 80 },
+              },
+              boardAttribution: {
+                main: { averageExposure: 0.55, maxExposure: 0.68, returnContribution: 0.12, excessContribution: 0.03, days: 756 },
+                growth: { averageExposure: 0.18, maxExposure: 0.25, returnContribution: 0.04, excessContribution: 0.01, days: 756 },
+                star: { averageExposure: 0.08, maxExposure: 0.12, returnContribution: 0.02, excessContribution: 0.005, days: 756 },
+              },
+              attributionReconciliation: {
+                reconciled: true,
+                cashExcessContribution: -0.01,
+                cumulativeExcessReturn: 0.035,
+                excessResidual: 0,
               },
             },
         ],
@@ -382,8 +405,17 @@ describe('BacktestPage', () => {
     expect(screen.getAllByText('full_risk_control').length).toBeGreaterThan(0);
     expect(screen.getByText('模型稳定性')).toBeInTheDocument();
     expect(screen.getByText('策略成本与延迟压力测试')).toBeInTheDocument();
+    expect(screen.getByText('可冻结')).toBeInTheDocument();
+    expect(screen.getByText('对照')).toBeInTheDocument();
     expect(screen.getByText('季度样本外表现')).toBeInTheDocument();
     expect(screen.getByText('2025Q4')).toBeInTheDocument();
+    expect(screen.getByText('验收数值与门槛')).toBeInTheDocument();
+    expect(screen.getByText('板块与现金归因')).toBeInTheDocument();
+    expect(screen.getByText('主板')).toBeInTheDocument();
+    expect(screen.getByText('创业板')).toBeInTheDocument();
+    expect(screen.getByText('科创板')).toBeInTheDocument();
+    expect(screen.getByText('复利对账通过')).toBeInTheDocument();
+    expect(screen.getByText(/现金超额贡献.*-1\.0%/)).toBeInTheDocument();
     expect(screen.getAllByText('确认期').length).toBeGreaterThan(0);
     expect(screen.getByText('最近纸面任务失败')).toBeInTheDocument();
     expect(screen.getByText(/2026-07-16.*inference_failed/)).toBeInTheDocument();

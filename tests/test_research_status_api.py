@@ -156,7 +156,19 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                             "strategies": [
                                 {
                                     "strategy_id": "full_risk_control",
-                                    "acceptance": {"passed": True, "failed_gates": []},
+                                    "eligible_for_final_selection": True,
+                                    "acceptance": {
+                                        "passed": True,
+                                        "failed_gates": [],
+                                        "values": {
+                                            "aggregate_annual_excess_return": 0.08,
+                                            "positive_excess_quarter_ratio": 0.75,
+                                        },
+                                        "thresholds": {
+                                            "annual_excess_return_min": 0.05,
+                                            "positive_excess_quarter_ratio_min": 0.70,
+                                        },
+                                    },
                                     "baseline": {
                                         "metrics": {"annual_excess_return": 0.08}
                                     },
@@ -174,6 +186,21 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                                             "annual_excess_return": 0.09,
                                             "days": 120,
                                         }
+                                    },
+                                    "board_attribution": {
+                                        "main": {
+                                            "average_exposure": 0.55,
+                                            "max_exposure": 0.68,
+                                            "return_contribution": 0.12,
+                                            "excess_contribution": 0.03,
+                                            "days": 756,
+                                        }
+                                    },
+                                    "attribution_reconciliation": {
+                                        "reconciled": True,
+                                        "cash_excess_contribution": -0.01,
+                                        "cumulative_excess_return": 0.02,
+                                        "excess_residual": 0.0,
                                     },
                                 }
                             ],
@@ -244,6 +271,20 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(
             robust["development"]["strategy_matrix"][0]["strategy_id"],
             "full_risk_control",
+        )
+        strategy = robust["development"]["strategy_matrix"][0]
+        self.assertTrue(strategy["eligible_for_final_selection"])
+        self.assertEqual(
+            strategy["acceptance"]["thresholds"]["annual_excess_return_min"],
+            0.05,
+        )
+        self.assertEqual(
+            strategy["board_attribution"]["main"]["excess_contribution"], 0.03
+        )
+        self.assertTrue(strategy["attribution_reconciliation"]["reconciled"])
+        self.assertEqual(
+            strategy["attribution_reconciliation"]["cash_excess_contribution"],
+            -0.01,
         )
         self.assertEqual(
             robust["development"]["strategy_matrix"][0]["quarter_metrics"][0][

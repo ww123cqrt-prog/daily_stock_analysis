@@ -497,6 +497,89 @@ const RobustStrategyCard: React.FC<{
     || null;
   const quarters = selectedStrategy?.quarterMetrics || [];
   const regimes = Object.entries(selectedStrategy?.regimeMetrics || {});
+  const boardNames: Record<string, string> = english
+    ? { main: 'Main board', growth: 'ChiNext', star: 'STAR Market' }
+    : { main: '主板', growth: '创业板', star: '科创板' };
+  const boards = ['main', 'growth', 'star']
+    .map((name) => [name, selectedStrategy?.boardAttribution?.[name]] as const)
+    .filter((entry): entry is readonly [string, ResearchRobustMetricMap] => Boolean(entry[1]));
+  const acceptanceValues = selectedStrategy?.acceptance?.values;
+  const acceptanceThresholds = selectedStrategy?.acceptance?.thresholds;
+  const drawdownValue = Math.max(
+    robustMetric(acceptanceValues, 'worstMaxDrawdownAbs') ?? 0,
+    robustMetric(acceptanceValues, 'aggregateMaxDrawdownAbs') ?? 0,
+  );
+  const acceptanceRows = [
+    {
+      label: english ? 'Positive excess quarters' : '正超额季度比例',
+      value: robustMetric(acceptanceValues, 'positiveExcessQuarterRatio'),
+      threshold: robustMetric(acceptanceThresholds, 'positiveExcessQuarterRatioMin'),
+      kind: 'pct',
+      relation: '≥',
+    },
+    {
+      label: english ? 'Annual excess return' : '年化超额收益',
+      value: robustMetric(acceptanceValues, 'aggregateAnnualExcessReturn'),
+      threshold: robustMetric(acceptanceThresholds, 'annualExcessReturnMin'),
+      kind: 'pct',
+      relation: '≥',
+    },
+    {
+      label: english ? 'Median quarterly IR' : '季度 IR 中位数',
+      value: robustMetric(acceptanceValues, 'medianQuarterInformationRatio'),
+      threshold: robustMetric(acceptanceThresholds, 'medianQuarterInformationRatioMin'),
+      kind: 'number',
+      relation: '≥',
+    },
+    {
+      label: english ? 'Positive RankIC intervals' : 'RankIC 为正区间比例',
+      value: robustMetric(acceptanceValues, 'positiveRankIcIntervalRatio'),
+      threshold: robustMetric(acceptanceThresholds, 'positiveRankIcIntervalRatioMin'),
+      kind: 'pct',
+      relation: '≥',
+    },
+    {
+      label: english ? 'Window rank correlation' : '窗口排名相关性',
+      value: robustMetric(acceptanceValues, 'windowRankCorrelationMedian'),
+      threshold: robustMetric(acceptanceThresholds, 'windowRankCorrelationMedianMin'),
+      kind: 'number',
+      relation: '≥',
+    },
+    {
+      label: 'Top50 overlap',
+      value: robustMetric(acceptanceValues, 'top50OverlapMean'),
+      threshold: robustMetric(acceptanceThresholds, 'top50OverlapMeanMin'),
+      kind: 'pct',
+      relation: '≥',
+    },
+    {
+      label: english ? 'Maximum drawdown' : '最大回撤',
+      value: drawdownValue || null,
+      threshold: robustMetric(acceptanceThresholds, 'developmentMaxDrawdownAbsMax'),
+      kind: 'pct',
+      relation: '≤',
+    },
+    {
+      label: english ? '40bp stress excess' : '40bp 压力超额',
+      value: robustMetric(acceptanceValues, 'stressExcessReturn'),
+      threshold: robustMetric(acceptanceThresholds, 'stressCostExcessReturnMinExclusive'),
+      kind: 'pct',
+      relation: '>',
+    },
+    {
+      label: english ? 'Delayed execution excess' : '延迟执行超额',
+      value: robustMetric(acceptanceValues, 'delayedExcessReturn'),
+      threshold: robustMetric(acceptanceThresholds, 'delayedExecutionExcessReturnMinExclusive'),
+      kind: 'pct',
+      relation: '>',
+    },
+  ].filter((row) => row.value !== null && row.threshold !== null);
+  const formatAcceptanceMetric = (value: number | null, kind: string) => (
+    kind === 'pct' ? formatRatioPct(value) : formatRatioNumber(value)
+  );
+  const marketTone = (value: number | null) => (
+    value == null || value === 0 ? 'text-foreground' : value > 0 ? 'text-danger' : 'text-success'
+  );
   const shadowDays = robustMetric(report.shadow?.metrics, 'tradingDays') ?? 0;
   const remainingDays = report.shadow?.verdict?.remainingDays;
   const shadowDailyFailed = report.shadowDaily?.status === 'development_failed';
@@ -597,6 +680,7 @@ const RobustStrategyCard: React.FC<{
             <thead className="text-muted-text">
               <tr>
                 <th className="px-2 py-2 font-medium">{english ? 'Strategy' : '策略'}</th>
+                <th className="px-2 py-2 font-medium">{english ? 'Role' : '角色'}</th>
                 <th className="px-2 py-2 text-right font-medium">{english ? 'Base excess' : '基准成本超额'}</th>
                 <th className="px-2 py-2 text-right font-medium">{english ? '40bp stress' : '40bp 压力'}</th>
                 <th className="px-2 py-2 text-right font-medium">{english ? 'One-day delay' : '延迟一日'}</th>
@@ -607,6 +691,11 @@ const RobustStrategyCard: React.FC<{
               {strategies.map((strategy, index) => (
                 <tr key={strategy.strategyId || index}>
                   <td className="px-2 py-2 font-mono text-foreground">{strategy.strategyId || '--'}</td>
+                  <td className="px-2 py-2 text-foreground">
+                    {strategy.eligibleForFinalSelection
+                      ? (english ? 'Final candidate' : '可冻结')
+                      : (english ? 'Ablation' : '对照')}
+                  </td>
                   <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.baseline?.metrics, 'annualExcessReturn'))}</td>
                   <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.stress?.metrics, 'annualExcessReturn'))}</td>
                   <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(strategy.delayed?.metrics, 'annualExcessReturn'))}</td>
@@ -617,6 +706,32 @@ const RobustStrategyCard: React.FC<{
           </table>
         </div>
       </div>
+
+      {acceptanceRows.length > 0 ? (
+        <div className="mt-5">
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Acceptance values and thresholds' : '验收数值与门槛'}</h4>
+          <div className="mt-2 overflow-x-auto">
+            <table className="min-w-full text-left text-xs">
+              <thead className="text-muted-text">
+                <tr>
+                  <th className="px-2 py-2 font-medium">{english ? 'Gate' : '指标'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Actual' : '实际值'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Threshold' : '门槛'}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-subtle">
+                {acceptanceRows.map((row) => (
+                  <tr key={row.label}>
+                    <td className="px-2 py-2 text-foreground">{row.label}</td>
+                    <td className="px-2 py-2 text-right font-mono text-foreground">{formatAcceptanceMetric(row.value, row.kind)}</td>
+                    <td className="px-2 py-2 text-right font-mono text-muted-text">{row.relation} {formatAcceptanceMetric(row.threshold, row.kind)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
 
       {quarters.length > 0 ? (
         <div className="mt-5">
@@ -658,6 +773,54 @@ const RobustStrategyCard: React.FC<{
               </div>
             ))}
           </div>
+        </div>
+      ) : null}
+
+      {boards.length > 0 ? (
+        <div className="mt-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="text-xs font-semibold text-foreground">{english ? 'Board and cash attribution' : '板块与现金归因'}</h4>
+            <Badge
+              variant={selectedStrategy?.attributionReconciliation?.reconciled ? 'success' : 'danger'}
+              size="sm"
+              className="max-w-full whitespace-normal break-words text-center leading-4 shadow-none"
+            >
+              {selectedStrategy?.attributionReconciliation?.reconciled
+                ? (english ? 'Compounded reconciliation passed' : '复利对账通过')
+                : (english ? 'Reconciliation failed' : '对账失败')}
+            </Badge>
+          </div>
+          <div className="mt-2 overflow-x-auto">
+            <table className="min-w-full text-left text-xs">
+              <thead className="text-muted-text">
+                <tr>
+                  <th className="px-2 py-2 font-medium">{english ? 'Board' : '板块'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Avg. exposure' : '平均仓位'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Peak exposure' : '峰值仓位'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Return contribution' : '收益贡献'}</th>
+                  <th className="px-2 py-2 text-right font-medium">{english ? 'Excess contribution' : '超额贡献'}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-subtle">
+                {boards.map(([name, metrics]) => {
+                  const returnContribution = robustMetric(metrics, 'returnContribution');
+                  const excessContribution = robustMetric(metrics, 'excessContribution');
+                  return (
+                    <tr key={name}>
+                      <td className="px-2 py-2 text-foreground">{boardNames[name] || name}</td>
+                      <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(metrics, 'averageExposure'))}</td>
+                      <td className="px-2 py-2 text-right font-mono text-foreground">{formatRatioPct(robustMetric(metrics, 'maxExposure'))}</td>
+                      <td className={`px-2 py-2 text-right font-mono ${marketTone(returnContribution)}`}>{formatRatioPct(returnContribution)}</td>
+                      <td className={`px-2 py-2 text-right font-mono ${marketTone(excessContribution)}`}>{formatRatioPct(excessContribution)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className={`mt-2 text-xs ${marketTone(robustMetric(selectedStrategy?.attributionReconciliation, 'cashExcessContribution'))}`}>
+            {english ? 'Cash excess contribution' : '现金超额贡献'} {formatRatioPct(robustMetric(selectedStrategy?.attributionReconciliation, 'cashExcessContribution'))}
+          </p>
         </div>
       ) : null}
 
