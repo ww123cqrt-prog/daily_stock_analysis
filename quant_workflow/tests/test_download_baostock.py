@@ -20,6 +20,161 @@ def load_module():
 
 
 class DownloadBaostockTest(unittest.TestCase):
+    def test_configures_real_baostock_socket_timeout(self):
+        module = load_module()
+
+        class Socket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        socket = Socket()
+        provider = types.SimpleNamespace(__name__="baostock")
+
+        configured = module._configure_baostock_socket_timeout(
+            provider,
+            37,
+            import_module=lambda name: types.SimpleNamespace(default_socket=socket),
+        )
+
+        self.assertTrue(configured)
+        self.assertEqual(socket.timeouts, [37.0])
+
+    def test_query_without_sigalrm_uses_socket_timeout(self):
+        module = load_module()
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date"]
+
+            def __init__(self):
+                self.done = False
+
+            def next(self):
+                if self.done:
+                    return False
+                self.done = True
+                return True
+
+            def get_row_data(self):
+                return ["2026-01-02"]
+
+        provider = types.SimpleNamespace(
+            __name__="baostock",
+            query_history_k_data_plus=Mock(return_value=Result()),
+        )
+        configure = Mock(return_value=True)
+
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", configure):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
+                "2",
+                retries=1,
+                timeout=37,
+            )
+
+        self.assertEqual(frame["date"].tolist(), ["2026-01-02"])
+        configure.assert_called_once_with(provider, 37)
+
+    def test_query_reconnects_and_retries_after_windows_timeout(self):
+        module = load_module()
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date"]
+
+            def next(self):
+                return False
+
+        query = Mock(side_effect=[TimeoutError("timed out"), Result()])
+        provider = types.SimpleNamespace(
+            __name__="baostock", query_history_k_data_plus=query
+        )
+        relogin = Mock()
+
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", return_value=True), \
+                patch.object(module, "_relogin_baostock", relogin), \
+                patch.object(module.time, "sleep"):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
+                "2",
+                retries=2,
+                timeout=37,
+            )
+
+        self.assertTrue(frame.empty)
+        self.assertEqual(query.call_count, 2)
+        relogin.assert_called_once_with(provider, 37)
+
+    def test_query_reconnects_after_baostock_wraps_socket_timeout(self):
+        module = load_module()
+
+        failed = types.SimpleNamespace(
+            error_code="10002007", error_msg="network receive failed"
+        )
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date"]
+
+            def next(self):
+                return False
+
+        query = Mock(side_effect=[failed, Result()])
+        provider = types.SimpleNamespace(
+            __name__="baostock", query_history_k_data_plus=query
+        )
+        relogin = Mock()
+
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", return_value=True), \
+                patch.object(module, "_relogin_baostock", relogin), \
+                patch.object(module.time, "sleep"):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
+                "2",
+                retries=2,
+                timeout=37,
+            )
+
+        self.assertTrue(frame.empty)
+        self.assertEqual(query.call_count, 2)
+        relogin.assert_called_once_with(provider, 37)
+
+    def test_login_uses_bounded_socket_timeout_and_restores_default(self):
+        module = load_module()
+        login_result = types.SimpleNamespace(error_code="0", error_msg="success")
+        provider = types.SimpleNamespace(login=Mock(return_value=login_result))
+        configured = Mock(return_value=True)
+
+        with patch.object(module.socket, "getdefaulttimeout", return_value=None), \
+                patch.object(module.socket, "setdefaulttimeout") as set_default, \
+                patch.object(module, "_configure_baostock_socket_timeout", configured):
+            result = module._login_baostock(provider, 37)
+
+        self.assertIs(result, login_result)
+        self.assertEqual(
+            set_default.call_args_list,
+            [unittest.mock.call(37.0), unittest.mock.call(None)],
+        )
+        configured.assert_called_once_with(provider, 37)
+
     def test_loads_symbols_file_with_comments_and_suffixes(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

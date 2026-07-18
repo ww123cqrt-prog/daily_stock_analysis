@@ -9,11 +9,15 @@ Parquet file per 6-digit stock code.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import signal
+import socket
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -33,6 +37,17 @@ TIMEOUT_CODES_FILE = QUANT_DATA / "baostock_timeout_codes.json"
 CURRENT_FILE = QUANT_DATA / "baostock_current.json"
 
 FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
+BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
+BAOSTOCK_NETWORK_ERROR_CODES = {
+    "10002001",
+    "10002002",
+    "10002003",
+    "10002004",
+    "10002005",
+    "10002006",
+    "10002007",
+    "10002008",
+}
 KEEP_COLUMNS = [
     "date",
     "open",
@@ -56,6 +71,72 @@ class QueryTimeout(TimeoutError):
 
 def _timeout_handler(signum, frame):
     raise QueryTimeout("single-symbol query timed out")
+
+
+def _supports_signal_timeout() -> bool:
+    return all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "setitimer")
+    )
+
+
+def _configure_baostock_socket_timeout(
+    provider: Any,
+    timeout: float,
+    *,
+    import_module=importlib.import_module,
+) -> bool:
+    if getattr(provider, "__name__", None) != "baostock":
+        return False
+    context = import_module("baostock.common.context")
+    active_socket = getattr(context, "default_socket", None)
+    if active_socket is None or not hasattr(active_socket, "settimeout"):
+        return False
+    active_socket.settimeout(float(timeout))
+    return True
+
+
+@contextmanager
+def _query_deadline(provider: Any, timeout: int):
+    if _supports_signal_timeout():
+        previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        return
+
+    _configure_baostock_socket_timeout(provider, timeout)
+    yield
+
+
+def _login_baostock(provider: Any, timeout: int) -> Any:
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(float(timeout))
+    try:
+        result = provider.login()
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+    if str(getattr(result, "error_code", "")) == "0":
+        _configure_baostock_socket_timeout(provider, timeout)
+    return result
+
+
+def _relogin_baostock(provider: Any, timeout: int) -> None:
+    try:
+        provider.logout()
+    except Exception:
+        pass
+    result = _login_baostock(provider, timeout)
+    error_code = str(getattr(result, "error_code", ""))
+    if error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+        raise RuntimeError("Baostock access is temporarily restricted")
+    if error_code != "0":
+        raise RuntimeError(
+            f"Baostock relogin failed: {error_code} {getattr(result, 'error_msg', '')}"
+        )
 
 
 def normalize_date(value: str) -> str:
@@ -173,27 +254,33 @@ def query_one(
     timeout: int,
 ) -> pd.DataFrame:
     last_error = ""
-    for attempt in range(1, retries + 1):
-        previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.setitimer(signal.ITIMER_REAL, timeout)
+    for attempt in range(1, max(int(retries), 1) + 1):
+        reconnect_required = False
         try:
-            rs = bs.query_history_k_data_plus(
-                code=bs_code,
-                fields=FIELDS,
-                start_date=start,
-                end_date=end,
-                frequency="d",
-                adjustflag=adjustflag,
-            )
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
+            with _query_deadline(bs, timeout):
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields=FIELDS,
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag=adjustflag,
+                )
+                error_code = str(getattr(rs, "error_code", ""))
+                if error_code == "0":
+                    return frame_from_result(rs)
+                if error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+                    raise RuntimeError("Baostock access is temporarily restricted")
+                last_error = f"{error_code}: {getattr(rs, 'error_msg', '')}"
+                reconnect_required = error_code in BAOSTOCK_NETWORK_ERROR_CODES
+        except (QueryTimeout, TimeoutError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            reconnect_required = True
 
-        if rs.error_code == "0":
-            return frame_from_result(rs)
-
-        last_error = f"{rs.error_code}: {rs.error_msg}"
-        time.sleep(min(2 * attempt, 10))
+        if attempt < max(int(retries), 1):
+            if reconnect_required and getattr(bs, "__name__", None) == "baostock":
+                _relogin_baostock(bs, timeout)
+            time.sleep(min(2 * attempt, 10))
 
     raise RuntimeError(last_error or "Baostock query failed")
 
@@ -293,7 +380,7 @@ def main() -> int:
 
     import baostock as bs
 
-    login_result = bs.login()
+    login_result = _login_baostock(bs, args.timeout)
     print(f"Baostock login: {login_result.error_code} {login_result.error_msg}", flush=True)
     if login_result.error_code != "0":
         return 2
