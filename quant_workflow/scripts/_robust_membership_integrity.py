@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import stat
+import sys
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _file_lock import lock_file, unlock_file
 
 
 MEMBERSHIP_SOURCE_FILENAME = "MEMBERSHIP_SOURCE.json"
@@ -219,7 +226,7 @@ def membership_read_lock(pit_dir: Path) -> Iterator[LockedMembershipSnapshot]:
         ) from exc
     snapshot = LockedMembershipSnapshot(pit_dir, _LOCK_TOKEN)
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        lock_file(handle, exclusive=False, blocking=False)
     except BlockingIOError as exc:
         snapshot._active = False
         handle.close()
@@ -237,7 +244,7 @@ def membership_read_lock(pit_dir: Path) -> Iterator[LockedMembershipSnapshot]:
     finally:
         snapshot._active = False
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
         finally:
             handle.close()
 

@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
+import sys
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _file_lock import lock_file, unlock_file
 
 
 REFERENCE_SOURCE_FILENAME = "REFERENCE_SOURCE.json"
@@ -230,7 +237,7 @@ def reference_read_lock(reference_dir: Path) -> Iterator[LockedReferenceSnapshot
     handle = lock_path.open("a+b")
     snapshot = LockedReferenceSnapshot(reference_dir, _LOCK_TOKEN)
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        lock_file(handle, exclusive=False)
     except Exception:
         snapshot._active = False
         handle.close()
@@ -240,7 +247,7 @@ def reference_read_lock(reference_dir: Path) -> Iterator[LockedReferenceSnapshot
     finally:
         snapshot._active = False
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
         finally:
             handle.close()
 

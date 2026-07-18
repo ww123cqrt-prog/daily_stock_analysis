@@ -19,10 +19,17 @@ from typing import Any, MutableMapping, Sequence
 
 import pandas as pd
 
-try:
-    multiprocessing.set_start_method("fork", force=True)
-except RuntimeError:
-    pass
+def _configure_multiprocessing_start_method(mp_module=multiprocessing) -> bool:
+    if "fork" not in mp_module.get_all_start_methods():
+        return False
+    try:
+        mp_module.set_start_method("fork", force=True)
+    except (RuntimeError, ValueError):
+        return False
+    return True
+
+
+_configure_multiprocessing_start_method()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:

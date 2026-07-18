@@ -1935,6 +1935,46 @@ def test_writer_lock_is_released_during_build_and_reacquired_for_publish(
     assert result["return_code"] == 0
 
 
+def test_windows_directory_fsync_is_a_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_module()
+    monkeypatch.setattr(module, "IS_WINDOWS", True)
+
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("Windows directory fsync must not call os.open")
+
+    monkeypatch.setattr(module.os, "open", fail_open)
+    module._fsync_directory(tmp_path)
+
+
+def test_windows_file_fsync_opens_file_read_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_module()
+    monkeypatch.setattr(module, "IS_WINDOWS", True)
+    opened: list[tuple[Path, int]] = []
+    synced: list[int] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(
+        module.os,
+        "open",
+        lambda path, flags: opened.append((Path(path), flags)) or 41,
+    )
+    monkeypatch.setattr(module.os, "fsync", lambda descriptor: synced.append(descriptor))
+    monkeypatch.setattr(module.os, "close", lambda descriptor: closed.append(descriptor))
+
+    path = tmp_path / "cache.parquet"
+    module._fsync_file(path)
+
+    assert opened == [
+        (path, module.os.O_RDWR | getattr(module.os, "O_BINARY", 0))
+    ]
+    assert synced == [41]
+    assert closed == [41]
+
+
 def test_baostock_failure_uses_safe_reason_and_never_overwrites_old_source(
     tmp_path: Path, capsys
 ) -> None:

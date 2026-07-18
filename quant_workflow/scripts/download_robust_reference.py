@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import importlib
 import json
 import os
@@ -27,6 +26,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root  # noqa: E402
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
@@ -49,6 +49,7 @@ BAOSTOCK_MAX_ATTEMPTS = 2
 BAOSTOCK_RELOGIN_ERROR_CODES = {f"1000200{suffix}" for suffix in range(1, 9)}
 BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
 BAOSTOCK_CACHE_SCHEMA_VERSION = 2
+IS_WINDOWS = os.name == "nt"
 TABLE_COLUMNS = {
     "security_master.parquet": ("symbol", "list_date", "delist_date", "board"),
     "industry_intervals.parquet": ("symbol", "industry_code", "start_date", "end_date"),
@@ -1439,6 +1440,11 @@ def _restore_backup(backup: Path, target: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if IS_WINDOWS:
+        # Windows does not expose POSIX-style directory descriptors.  Files are
+        # still fsynced before each atomic replace; directory fsync is the only
+        # unavailable durability step on this platform.
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -1447,7 +1453,9 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    flags = os.O_RDWR if IS_WINDOWS else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:
@@ -1616,7 +1624,7 @@ def _acquire_writer_lock(reference_dir: Path) -> Any:
     lock_path = reference_dir.parent / f".{reference_dir.name}{WRITER_LOCK_FILENAME}"
     handle = lock_path.open("a+b")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        lock_file(handle, exclusive=True)
     except Exception:
         handle.close()
         raise
@@ -1625,7 +1633,7 @@ def _acquire_writer_lock(reference_dir: Path) -> Any:
 
 def _release_writer_lock(handle: Any) -> None:
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_file(handle)
     finally:
         handle.close()
 
