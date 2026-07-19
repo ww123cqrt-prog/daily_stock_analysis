@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pickle
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -577,6 +578,46 @@ def test_fit_predict_job_preserves_scores_without_future_labels(
     assert result["evaluable_rows"] == 1
     assert saved["instrument"].tolist() == ["SH600000", "SZ000001"]
     assert saved.loc[saved["instrument"] == "SZ000001", "label"].isna().all()
+
+
+def test_mlflow_run_yields_active_recorder(monkeypatch, tmp_path: Path) -> None:
+    module = load_module()
+    job = module.TrainingJob("2023Q1", 504, "linear_ols", None)
+    experiment = object()
+    recorder = object()
+    calls: list[dict[str, object]] = []
+
+    class FakeR:
+        @staticmethod
+        def start(**kwargs):
+            calls.append(kwargs)
+            return nullcontext(experiment)
+
+        @staticmethod
+        def get_recorder():
+            return recorder
+
+    import qlib.workflow
+
+    monkeypatch.setattr(qlib.workflow, "R", FakeR)
+    monkeypatch.setattr(module, "mlruns_root", lambda: tmp_path / "mlruns")
+
+    with module._mlflow_run(
+        job,
+        tmp_path / "provider",
+        enabled=True,
+        phase="development",
+        experiment_name="robust_csi800_development",
+    ) as active_run:
+        assert active_run is recorder
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["experiment_name"] == "robust_csi800_development"
+    assert str(call["recorder_name"]).startswith(
+        "2023Q1__w504__linear_ols__sfixed-"
+    )
+    assert call["uri"] == f"file://{tmp_path / 'mlruns'}"
 
 
 def test_run_training_jobs_reuses_dataset_per_quarter_window_and_checkpoints(

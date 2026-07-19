@@ -13,7 +13,7 @@ import math
 import os
 import sys
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Sequence
@@ -723,6 +723,7 @@ def _write_progress(path: Path, payload: dict[str, Any]) -> None:
     _write_json(path, payload)
 
 
+@contextmanager
 def _mlflow_run(
     job: TrainingJob,
     provider_uri: Path,
@@ -732,15 +733,17 @@ def _mlflow_run(
     experiment_name: str,
 ):
     if not enabled:
-        return nullcontext(None)
+        yield None
+        return
     from qlib.workflow import R
 
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-    return R.start(
+    with R.start(
         experiment_name=experiment_name,
         recorder_name=f"{job.key}-{uuid.uuid4().hex[:8]}",
         uri=f"file://{mlruns_root()}",
-    )
+    ):
+        yield R.get_recorder()
 
 
 def _log_mlflow_result(
