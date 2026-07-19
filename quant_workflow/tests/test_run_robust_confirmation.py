@@ -72,7 +72,9 @@ def seal_provider(provider: Path, key: str = "provider-v1") -> str:
     return tree_hash
 
 
-def frozen_fixture(module, root: Path) -> tuple[Path, Path, Path]:
+def frozen_fixture(
+    module, root: Path, *, artifact_context_hash: str | None = None
+) -> tuple[Path, Path, Path]:
     from _robust_membership_integrity import membership_read_lock
     from _robust_reference_integrity import reference_read_lock
 
@@ -200,7 +202,7 @@ def frozen_fixture(module, root: Path) -> tuple[Path, Path, Path]:
                 "prediction_sha256": module.file_sha256(prediction_path),
                 "rows": 1,
                 "split": module._split_record(split),
-                "context_hash": development_context_hash,
+                "context_hash": artifact_context_hash or development_context_hash,
             }
         )
     frozen = {
@@ -432,7 +434,9 @@ def test_passing_confirmation_enters_shadow_without_changing_selection(
     tmp_path: Path,
 ) -> None:
     module = load_module()
-    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen_path, provider_state, _ = frozen_fixture(
+        module, tmp_path, artifact_context_hash="e" * 64
+    )
     report_dir = tmp_path / "reports"
     index = pd.MultiIndex.from_product(
         [pd.to_datetime(["2026-01-05"]), ["A", "B", "C"]],

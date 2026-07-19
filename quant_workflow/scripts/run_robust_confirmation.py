@@ -412,7 +412,6 @@ def run_confirmation(
     }
     expected_keys = {job.key for job in development_jobs}
     development_run_dir = Path(str(frozen.get("development_run_dir") or ""))
-    development_context_hash = str(frozen.get("development_context_hash") or "")
     invalid_development_artifacts = []
     if set(artifacts_by_key) != expected_keys:
         invalid_development_artifacts.append("development_artifact_job_set")
@@ -430,7 +429,9 @@ def run_confirmation(
                 artifacts_by_key[job.key],
                 run_dir=development_run_dir,
                 expected_split=_split_record(split),
-                context_hash=development_context_hash,
+                context_hash=str(
+                    artifacts_by_key[job.key].get("context_hash") or ""
+                ),
             ):
                 invalid_development_artifacts.append(job.key)
     if invalid_development_artifacts:
