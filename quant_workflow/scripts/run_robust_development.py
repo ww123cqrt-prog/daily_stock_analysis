@@ -1319,13 +1319,16 @@ def launch_runtime_evidence(
     report_dir: Path,
     run_id: str,
     runtime_environment: Mapping[str, Any],
+    runner_namespace: str = "runner",
 ) -> dict[str, Any]:
     requires_mps = "mps_dnn" in {
         str(item.get("id")) for item in config.get("models") or []
     }
     if not requires_mps:
         return {"required": False}
-    record = _read_provider_state(Path(report_dir) / "runner" / run_id / "launch.json")
+    record = _read_provider_state(
+        Path(report_dir) / runner_namespace / run_id / "launch.json"
+    )
     evidence = record.get("mps_preflight")
     expected_python = str(Path(sys.executable).absolute())
     expected_torch = str(

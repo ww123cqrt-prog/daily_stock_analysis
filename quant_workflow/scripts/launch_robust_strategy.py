@@ -157,8 +157,12 @@ def _pid_alive(pid: int) -> bool:
 
 
 @contextmanager
-def _claim_launch_record(report_dir: Path, run_id: str) -> Iterator[None]:
-    lock_path = Path(report_dir) / "runner" / ".locks" / f"{run_id}.lock"
+def _claim_launch_record(
+    report_dir: Path, run_id: str, *, runner_namespace: str = "runner"
+) -> Iterator[None]:
+    lock_path = (
+        Path(report_dir) / runner_namespace / ".locks" / f"{run_id}.lock"
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as stream:
         try:
@@ -214,6 +218,7 @@ def _reconcile_existing_runner(
     run_id: str,
     pid_alive: Callable[[int], bool],
     launchd_probe: Callable[[str, str], dict[str, Any] | None],
+    update_pipeline_state: bool = True,
 ) -> bool:
     launch_path = runner_dir / "launch.json"
     launch_record = _read_json(launch_path)
@@ -243,6 +248,8 @@ def _reconcile_existing_runner(
     if active:
         return True
 
+    if not update_pipeline_state:
+        return False
     run_state_path = report_dir / "runs" / run_id / "status.json"
     run_state = _read_json(run_state_path)
     lifecycle = run_state.get("lifecycle_status")
@@ -448,13 +455,16 @@ def _launch_claimed(
     cpu_probe: Callable[[int], float | None] = _cpu_percent,
     pid_alive: Callable[[int], bool] = _pid_alive,
     uid: int | None = None,
+    runner_namespace: str = "runner",
+    command_override: list[str] | None = None,
+    mps_required_override: bool | None = None,
 ) -> dict[str, Any]:
     if not RUN_ID_RE.fullmatch(run_id):
         raise ValueError("run_id contains unsupported characters")
     if warmup_seconds < 0:
         raise ValueError("warmup_seconds must be nonnegative")
     report_dir = Path(report_dir).expanduser().resolve()
-    runner_dir = report_dir / "runner" / run_id
+    runner_dir = report_dir / runner_namespace / run_id
     runner_dir.mkdir(parents=True, exist_ok=True)
     log_path = runner_dir / "runner.log"
     error_log_path = runner_dir / "runner.err.log"
@@ -463,7 +473,7 @@ def _launch_claimed(
     plist_path = runner_dir / "launchd.plist"
     domain = f"gui/{os.getuid() if uid is None else int(uid)}"
     job_label = _launchd_label(run_id)
-    command = build_command(
+    command = list(command_override) if command_override is not None else build_command(
         config=config,
         quant_data_dir=quant_data_dir,
         report_dir=report_dir,
@@ -472,7 +482,11 @@ def _launch_claimed(
         resume=resume,
         skip_membership_build=skip_membership_build,
     )
-    mps_required = _config_requests_mps(config)
+    mps_required = (
+        bool(mps_required_override)
+        if mps_required_override is not None
+        else _config_requests_mps(config)
+    )
     initial = {
         "status": "starting",
         "run_id": run_id,
@@ -577,23 +591,30 @@ def launch(
     cpu_probe: Callable[[int], float | None] = _cpu_percent,
     pid_alive: Callable[[int], bool] = _pid_alive,
     uid: int | None = None,
+    runner_namespace: str = "runner",
+    command_override: list[str] | None = None,
+    mps_required_override: bool | None = None,
+    update_pipeline_state_on_reconcile: bool = True,
 ) -> dict[str, Any]:
     report_dir = Path(report_dir).expanduser().resolve()
     resolved_mlruns_dir = Path(mlruns_dir or mlruns_root()).expanduser().resolve()
-    runner_dir = report_dir / "runner" / run_id
+    runner_dir = report_dir / runner_namespace / run_id
 
     def launchd_probe(domain: str, label: str) -> dict[str, Any] | None:
         return _launchd_job_info(
             domain, label, launchctl_runner=launchctl_runner
         )
 
-    with _claim_launch_record(report_dir, run_id):
+    with _claim_launch_record(
+        report_dir, run_id, runner_namespace=runner_namespace
+    ):
         if _reconcile_existing_runner(
             runner_dir,
             report_dir=report_dir,
             run_id=run_id,
             pid_alive=pid_alive,
             launchd_probe=launchd_probe,
+            update_pipeline_state=update_pipeline_state_on_reconcile,
         ):
             raise ValueError(f"robust strategy run {run_id!r} is already running")
         if not resume and (report_dir / "runs" / run_id / "status.json").exists():
@@ -624,6 +645,9 @@ def launch(
             cpu_probe=cpu_probe,
             pid_alive=pid_alive,
             uid=uid,
+            runner_namespace=runner_namespace,
+            command_override=command_override,
+            mps_required_override=mps_required_override,
         )
 
 

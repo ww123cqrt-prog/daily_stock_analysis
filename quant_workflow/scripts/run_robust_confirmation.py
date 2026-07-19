@@ -56,6 +56,7 @@ from run_robust_development import (  # noqa: E402
     collect_runtime_environment,
     run_training_jobs,
     frozen_context_hash,
+    launch_runtime_evidence,
     payload_sha256,
     selection_contract_hash,
 )
@@ -331,6 +332,24 @@ def run_confirmation(
         payload = _failure("frozen_runtime_environment_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
+    confirmation_config = _frozen_config(config, frozen)
+    try:
+        confirmation_launch_evidence = launch_runtime_evidence(
+            confirmation_config,
+            report_dir=report_dir,
+            run_id=run_id,
+            runtime_environment=runtime_environment,
+            runner_namespace="confirmation_runner",
+        )
+    except ValueError:
+        payload = _failure(
+            "confirmation_launch_mps_preflight_missing_or_invalid", run_id=run_id
+        )
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
+    confirmation_launch_evidence_hash = payload_sha256(
+        confirmation_launch_evidence
+    )
     development_artifacts = frozen.get("development_artifacts")
     if not isinstance(development_artifacts, list) or frozen.get(
         "development_artifacts_hash"
@@ -476,7 +495,6 @@ def run_confirmation(
         return payload
     latest_signal_day = confirmation_days[-7]
     latest_market_day = confirmation_days[-1]
-    confirmation_config = _frozen_config(config, frozen)
     jobs = build_confirmation_jobs(confirmation_config, frozen)
 
     def split_factory(_: str, window_days: int):
@@ -756,6 +774,12 @@ def run_confirmation(
                         "runtime_environment_hash": runtime_environment[
                             "environment_hash"
                         ],
+                        "confirmation_launch_runtime_evidence": (
+                            confirmation_launch_evidence
+                        ),
+                        "confirmation_launch_runtime_evidence_hash": (
+                            confirmation_launch_evidence_hash
+                        ),
                         "development_git_commit": frozen.get("git_commit"),
                         "selected_models": selected_ids,
                         "selected_strategy": strategy_id,
@@ -776,6 +800,12 @@ def run_confirmation(
                     )
                     final_frozen["confirmation_status"] = status
                     final_frozen["confirmation_run_id"] = run_id
+                    final_frozen["confirmation_launch_runtime_evidence"] = (
+                        confirmation_launch_evidence
+                    )
+                    final_frozen["confirmation_launch_runtime_evidence_hash"] = (
+                        confirmation_launch_evidence_hash
+                    )
                     final_frozen["shadow_tracking_started"] = verdict["passed"]
                     if verdict["passed"]:
                         final_frozen["confirmation_model_artifacts"] = model_artifacts

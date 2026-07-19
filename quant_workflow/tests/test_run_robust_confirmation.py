@@ -360,6 +360,49 @@ def test_confirmation_refuses_missing_frozen_candidate(tmp_path: Path) -> None:
     assert result["reason_code"] == "frozen_candidate_missing"
 
 
+def test_confirmation_with_neural_selection_requires_its_own_launchd_mps_proof(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen_before = json.loads(frozen_path.read_text(encoding="utf-8"))
+    observed = {}
+
+    monkeypatch.setattr(
+        module,
+        "_frozen_config",
+        lambda config, frozen: module.load_config(MPS_CONFIG_PATH),
+    )
+
+    def missing_proof(config, **kwargs):
+        observed.update(kwargs)
+        raise ValueError("missing confirmation launch evidence")
+
+    monkeypatch.setattr(module, "launch_runtime_evidence", missing_proof)
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-neural-missing-launch-proof",
+        git_state_provider=lambda: {
+            "commit": "a" * 40,
+            "clean": True,
+            "changes": [],
+        },
+    )
+
+    frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == (
+        "confirmation_launch_mps_preflight_missing_or_invalid"
+    )
+    assert observed["runner_namespace"] == "confirmation_runner"
+    assert frozen_after["confirmation_run_started"] is False
+    assert frozen_after == frozen_before
+
+
 def test_confirmation_is_single_use_across_run_ids(tmp_path: Path) -> None:
     module = load_module()
     frozen_path, _, _ = frozen_fixture(module, tmp_path)

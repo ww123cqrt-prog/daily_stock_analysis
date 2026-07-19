@@ -199,6 +199,8 @@ LSTM、GRU 或 Transformer 不在当前立即执行范围内。满足以下条�
 - 信息比率大于 0。
 - 最大回撤不超过 20%。
 
+确认期必须通过 `launch_robust_confirmation.py` 以独立 launchd 任务启动，运行记录保存在 `confirmation_runner/<run_id>/`。若冻结模型包含 MPS DNN，确认期必须重新执行并保存它自己的 launchd MPS 探针；开发期的 MPS 证据不能代替确认期证据。探针失败时不得抢占或消耗一次性确认资格。
+
 确认期通过后进入 60 个交易日纸面跟踪。要求：
 
 - 累计净超额收益大于 0。
