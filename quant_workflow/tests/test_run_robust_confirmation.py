@@ -236,6 +236,9 @@ def frozen_fixture(
     runtime_environment = module.collect_runtime_environment(config)
     frozen["runtime_environment"] = runtime_environment
     frozen["runtime_environment_hash"] = runtime_environment["environment_hash"]
+    launch_evidence = {"required": False}
+    frozen["launch_runtime_evidence"] = launch_evidence
+    frozen["launch_runtime_evidence_hash"] = module.payload_sha256(launch_evidence)
     frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
     frozen_path = root / "frozen.json"
     frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
@@ -1184,6 +1187,35 @@ def test_confirmation_refuses_runtime_environment_mismatch_before_claim(
 
     frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
     assert result["reason_code"] == "frozen_runtime_environment_mismatch"
+    assert frozen_after["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_tampered_launch_runtime_evidence_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    frozen["launch_runtime_evidence"]["required"] = True
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
+    frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-launch-runtime-evidence-tampered",
+        git_state_provider=lambda: {
+            "commit": "a" * 40,
+            "clean": True,
+            "changes": [],
+        },
+    )
+
+    frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_launch_runtime_evidence_mismatch"
     assert frozen_after["confirmation_run_started"] is False
 
 

@@ -222,6 +222,9 @@ def build_resume_fixture(module, root: Path, *, run_id: str) -> dict:
     )
     context["runtime_environment"] = runtime_environment
     context["runtime_environment_hash"] = runtime_environment["environment_hash"]
+    launch_evidence = {"required": False}
+    context["launch_runtime_evidence"] = launch_evidence
+    context["launch_runtime_evidence_hash"] = module.payload_sha256(launch_evidence)
     context["provider_tree_sha256"] = provider_tree_sha256
     context["context_hash"] = module.payload_sha256(context)
     context_path.write_text(json.dumps(context), encoding="utf-8")
@@ -433,6 +436,74 @@ def test_runtime_environment_metadata_is_hashed_and_contains_no_paths() -> None:
     serialized = json.dumps(metadata, sort_keys=True)
     assert "/Users/" not in serialized
     assert "site-packages" not in serialized
+
+
+def test_launch_runtime_evidence_requires_matching_launchd_mps_proof(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    runtime = module.collect_runtime_environment(config)
+    report_dir = tmp_path / "reports"
+    run_id = "six-model-run"
+    launch_path = report_dir / "runner" / run_id / "launch.json"
+    launch_path.parent.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="launchd MPS preflight evidence"):
+        module.launch_runtime_evidence(
+            config,
+            report_dir=report_dir,
+            run_id=run_id,
+            runtime_environment=runtime,
+        )
+
+    proof = {
+        "python_executable": str(Path(module.sys.executable).absolute()),
+        "python_resolved": str(Path(module.sys.executable).resolve()),
+        "torch_version": runtime["packages"]["torch"],
+        "mps_built": True,
+        "mps_available": True,
+        "device": "mps:0",
+        "tensor_sum": 4.0,
+        "checked_at": "2026-07-20T06:00:00+08:00",
+    }
+    launch_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "mps_required": True,
+                "mps_preflight": proof,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = module.launch_runtime_evidence(
+        config,
+        report_dir=report_dir,
+        run_id=run_id,
+        runtime_environment=runtime,
+    )
+
+    assert evidence == {"required": True, "source": "launchd_worker", **proof}
+    proof["device"] = "cpu"
+    launch_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "mps_required": True,
+                "mps_preflight": proof,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="launchd MPS preflight evidence"):
+        module.launch_runtime_evidence(
+            config,
+            report_dir=report_dir,
+            run_id=run_id,
+            runtime_environment=runtime,
+        )
 
 
 def test_write_json_normalizes_nonfinite_metrics_to_standard_json(

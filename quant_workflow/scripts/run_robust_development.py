@@ -76,6 +76,7 @@ FROZEN_CONTEXT_KEYS = (
     "provider_key",
     "provider_tree_sha256",
     "runtime_environment_hash",
+    "launch_runtime_evidence_hash",
     "selected_models",
     "selected_model_configs",
     "selected_strategy",
@@ -1312,6 +1313,41 @@ def payload_sha256(payload: Any) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def launch_runtime_evidence(
+    config: Mapping[str, Any],
+    *,
+    report_dir: Path,
+    run_id: str,
+    runtime_environment: Mapping[str, Any],
+) -> dict[str, Any]:
+    requires_mps = "mps_dnn" in {
+        str(item.get("id")) for item in config.get("models") or []
+    }
+    if not requires_mps:
+        return {"required": False}
+    record = _read_provider_state(Path(report_dir) / "runner" / run_id / "launch.json")
+    evidence = record.get("mps_preflight")
+    expected_python = str(Path(sys.executable).absolute())
+    expected_torch = str(
+        (runtime_environment.get("packages") or {}).get("torch") or ""
+    )
+    if (
+        record.get("run_id") != run_id
+        or record.get("mps_required") is not True
+        or not isinstance(evidence, Mapping)
+        or evidence.get("python_executable") != expected_python
+        or not expected_torch
+        or str(evidence.get("torch_version") or "") != expected_torch
+        or evidence.get("mps_built") is not True
+        or evidence.get("mps_available") is not True
+        or evidence.get("device") != "mps:0"
+        or evidence.get("tensor_sum") != 4.0
+        or not evidence.get("checked_at")
+    ):
+        raise ValueError("launchd MPS preflight evidence is missing or invalid")
+    return {"required": True, "source": "launchd_worker", **dict(evidence)}
+
+
 def frozen_context_hash(payload: Mapping[str, Any]) -> str:
     return payload_sha256({key: payload.get(key) for key in FROZEN_CONTEXT_KEYS})
 
@@ -1441,6 +1477,20 @@ def _run_development_impl(
     provider_state_path = Path(provider_state_path).resolve()
     config = load_config(config_path)
     runtime_environment = collect_runtime_environment(config)
+    try:
+        launch_evidence = launch_runtime_evidence(
+            config,
+            report_dir=report_dir,
+            run_id=run_id,
+            runtime_environment=runtime_environment,
+        )
+    except ValueError:
+        payload = _failure_report(
+            "launch_mps_preflight_missing_or_invalid", as_of_date=as_of_date
+        )
+        _write_json(report_dir / "development_latest.json", payload)
+        return payload
+    launch_evidence_hash = payload_sha256(launch_evidence)
     paths = config["paths"]
     pit_dir = quant_data_dir / paths["pit_membership"]
     reference_dir = quant_data_dir / Path(paths["security_master"]).parent
@@ -1533,6 +1583,8 @@ def _run_development_impl(
         "provider_tree_sha256": provider_tree_sha256,
         "runtime_environment": runtime_environment,
         "runtime_environment_hash": runtime_environment["environment_hash"],
+        "launch_runtime_evidence": launch_evidence,
+        "launch_runtime_evidence_hash": launch_evidence_hash,
     }
     development_context_hash = payload_sha256(expected_context)
     expected_context["context_hash"] = development_context_hash
@@ -1883,6 +1935,8 @@ def _run_development_impl(
         "provider_tree_sha256": provider_tree_sha256,
         "runtime_environment": runtime_environment,
         "runtime_environment_hash": runtime_environment["environment_hash"],
+        "launch_runtime_evidence": launch_evidence,
+        "launch_runtime_evidence_hash": launch_evidence_hash,
         "development_context_hash": development_context_hash,
         "training_job_count": len(jobs),
         "selected_models": selected_ids,
@@ -1941,6 +1995,10 @@ def _run_development_impl(
             "provider_tree_sha256": payload["provider_tree_sha256"],
             "runtime_environment": payload["runtime_environment"],
             "runtime_environment_hash": payload["runtime_environment_hash"],
+            "launch_runtime_evidence": payload["launch_runtime_evidence"],
+            "launch_runtime_evidence_hash": payload[
+                "launch_runtime_evidence_hash"
+            ],
             "selected_models": selected_ids,
             "selected_model_configs": selected_model_configs,
             "selected_strategy": payload["selected_strategy"],

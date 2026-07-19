@@ -310,6 +310,15 @@ def run_confirmation(
         payload = _failure("frozen_context_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
+    launch_evidence = frozen.get("launch_runtime_evidence")
+    if (
+        not isinstance(launch_evidence, Mapping)
+        or frozen.get("launch_runtime_evidence_hash")
+        != payload_sha256(launch_evidence)
+    ):
+        payload = _failure("frozen_launch_runtime_evidence_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
     runtime_environment = collect_runtime_environment(config)
     frozen_runtime = frozen.get("runtime_environment")
     if (
