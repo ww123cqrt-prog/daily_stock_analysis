@@ -56,6 +56,7 @@ from run_robust_strategy import (  # noqa: E402
 
 
 TREE_MODELS = {"lightgbm", "xgboost", "catboost"}
+NEURAL_MODELS = {"mps_dnn"}
 FROZEN_CONTEXT_KEYS = (
     "status",
     "as_of_date",
@@ -79,7 +80,12 @@ FROZEN_CONTEXT_KEYS = (
     "development_context_hash",
     "development_artifacts_hash",
 )
-SEED_ARGUMENTS = {"lightgbm": "seed", "xgboost": "seed", "catboost": "random_seed"}
+SEED_ARGUMENTS = {
+    "lightgbm": "seed",
+    "xgboost": "seed",
+    "catboost": "random_seed",
+    "mps_dnn": "seed",
+}
 
 
 class TrainingJob(NamedTuple):
@@ -133,11 +139,14 @@ def build_training_jobs(config: Mapping[str, Any]) -> list[TrainingJob]:
         for window in config["training"]["windows_trading_days"]:
             for model in config["models"]:
                 model_id = str(model["id"])
-                seeds: Sequence[int | None] = (
-                    config["training"]["tree_seeds"]
-                    if model_id in TREE_MODELS
-                    else [None]
-                )
+                if model_id in TREE_MODELS:
+                    seeds = config["training"]["tree_seeds"]
+                elif model_id in NEURAL_MODELS:
+                    seeds = config["training"].get(
+                        "neural_seeds", config["training"]["tree_seeds"]
+                    )
+                else:
+                    seeds = [None]
                 for seed in seeds:
                     jobs.append(
                         TrainingJob(
@@ -197,6 +206,19 @@ def generate_tuning_trials(
             trial = copy.deepcopy(base)
             trial.update({"learning_rate": learning_rate, "depth": depth})
             variants.append(trial)
+    elif model_id == "mps_dnn":
+        for learning_rate, hidden_layers in itertools.product(
+            (0.0003, 0.001, 0.003, 0.01),
+            ((128,), (128, 64), (256, 128), (256, 128, 64)),
+        ):
+            trial = copy.deepcopy(base)
+            trial.update(
+                {
+                    "lr": learning_rate,
+                    "hidden_layers": list(hidden_layers),
+                }
+            )
+            variants.append(trial)
     else:
         raise ValueError(f"unknown model for bounded tuning: {model_id}")
     unique: list[dict[str, Any]] = []
@@ -217,7 +239,17 @@ def build_tuning_screen_jobs(
 ) -> list[TrainingJob]:
     if model_id not in {str(item["id"]) for item in config["models"]}:
         raise ValueError(f"unknown model: {model_id}")
-    seed = int(config["training"]["tree_seeds"][0]) if model_id in TREE_MODELS else None
+    if model_id in TREE_MODELS:
+        seed = int(config["training"]["tree_seeds"][0])
+    elif model_id in NEURAL_MODELS:
+        seed = int(
+            (
+                config["training"].get("neural_seeds")
+                or config["training"]["tree_seeds"]
+            )[0]
+        )
+    else:
+        seed = None
     return [
         TrainingJob(str(quarter), 756, model_id, seed)
         for quarter in config["rolling_validation"]["test_quarters"]
@@ -408,9 +440,9 @@ def model_config_for_job(config: Mapping[str, Any], job: TrainingJob) -> dict[st
         raise ValueError(f"unknown model: {job.model_id}") from exc
     result = copy.deepcopy(model)
     result.setdefault("kwargs", {})
-    if job.model_id in TREE_MODELS:
+    if job.model_id in SEED_ARGUMENTS:
         if job.seed is None:
-            raise ValueError(f"tree model {job.model_id} requires a seed")
+            raise ValueError(f"seeded model {job.model_id} requires a seed")
         result["kwargs"][SEED_ARGUMENTS[job.model_id]] = int(job.seed)
         if job.model_id == "lightgbm":
             result["kwargs"]["bagging_seed"] = int(job.seed)
@@ -1292,6 +1324,8 @@ def _run_development_impl(
         _write_json(context_path, expected_context)
     if training_runner is run_training_jobs:
         dependencies = ["qlib", "sklearn", "lightgbm", "xgboost", "catboost", "mlflow"]
+        if "mps_dnn" in {str(item["id"]) for item in config["models"]}:
+            dependencies.append("torch")
         missing = [
             name for name in dependencies if importlib.util.find_spec(name) is None
         ]
@@ -1303,6 +1337,19 @@ def _run_development_impl(
             )
             _write_json(report_dir / "development_latest.json", payload)
             return payload
+        if "mps_dnn" in {str(item["id"]) for item in config["models"]}:
+            try:
+                from mps_dnn import require_mps
+
+                require_mps()
+            except Exception as exc:
+                payload = _failure_report(
+                    "mps_dnn_unavailable",
+                    as_of_date=as_of_date,
+                    error_type=type(exc).__name__,
+                )
+                _write_json(report_dir / "development_latest.json", payload)
+                return payload
     progress = training_runner(
         config,
         jobs,

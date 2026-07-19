@@ -1,0 +1,272 @@
+version: 1
+name: robust_csi800_weekly_strategy_mps_dnn
+
+statuses:
+  - blocked_data
+  - development_failed
+  - research_candidate_ready
+  - shadow_observation
+  - robust_strategy_qualified
+
+safety:
+  long_only: true
+  margin: false
+  short_selling: false
+  broker_connection: false
+  automatic_orders: false
+
+paths:
+  report_namespace: robust_strategy
+  pit_membership: reference/pit_csi800
+  security_master: reference/security_master.parquet
+  industry_intervals: reference/industry_intervals.parquet
+  st_status: reference/st_status.parquet
+  suspension_status: reference/suspension_status.parquet
+  price_parquet: runtime/robust_strategy/price_products/5516946a71ba8b12/cleaned_parquet
+  qlib_provider: runtime/robust_strategy/price_products/5516946a71ba8b12/qlib_provider
+
+universe:
+  kind: pit_csi800
+  membership_source: auto
+  reference_source: auto
+  reference_mode: reuse_existing
+  benchmark_mode: reuse_existing
+  start_date: '2014-01-02'
+  indices:
+    - id: csi300
+      jq_code: 000300.XSHG
+      qlib_symbol: SH000300
+      expected_members: 300
+    - id: csi500
+      jq_code: 000905.XSHG
+      qlib_symbol: SH000905
+      expected_members: 500
+    - id: csi800
+      jq_code: 000906.XSHG
+      qlib_symbol: SH000906
+      expected_members: 800
+
+data_gates:
+  membership_coverage_min: 0.99
+  ohlcv_coverage_min: 0.98
+  expected_members_per_day: 800
+  reject_duplicate_dates: true
+  reject_future_dates: true
+  require_benchmarks:
+    - SH000300
+    - SH000905
+    - SH000906
+  require_metadata:
+    - security_master
+    - industry_intervals
+    - st_status
+    - suspension_status
+
+features:
+  base_handler: Alpha158
+  board_feature: true
+  within_board_normalization: true
+  market_regime_uses_t_or_earlier: true
+
+label:
+  signal_time: T_close
+  execution_time: T_plus_1_open
+  horizon: T_plus_1_open_to_T_plus_6_open
+  expression: Ref($open, -6) / Ref($open, -1) - 1
+
+models:
+  - id: linear_ols
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ols
+      fit_intercept: false
+  - id: linear_ridge
+    class: LinearModel
+    module_path: qlib.contrib.model.linear
+    kwargs:
+      estimator: ridge
+      alpha: 0.01
+      fit_intercept: false
+  - id: lightgbm
+    class: LGBModel
+    module_path: qlib.contrib.model.gbdt
+    kwargs:
+      loss: mse
+      early_stopping_rounds: 50
+      num_boost_round: 1000
+      colsample_bytree: 0.8879
+      learning_rate: 0.0421
+      subsample: 0.8789
+      lambda_l1: 205.6999
+      lambda_l2: 580.9768
+      max_depth: 8
+      num_leaves: 210
+      num_threads: 8
+  - id: xgboost
+    class: XGBModel
+    module_path: qlib.contrib.model.xgboost
+    kwargs:
+      objective: reg:squarederror
+      eval_metric: rmse
+      colsample_bytree: 0.8879
+      eta: 0.0421
+      max_depth: 8
+      subsample: 0.8789
+      nthread: 8
+  - id: catboost
+    class: CatBoostModel
+    module_path: qlib.contrib.model.catboost_model
+    kwargs:
+      loss_function: RMSE
+      learning_rate: 0.0421
+      depth: 6
+      l2_leaf_reg: 3.0
+      thread_count: 8
+      allow_writing_files: false
+  - id: mps_dnn
+    class: MPSDNNModel
+    module_path: mps_dnn
+    kwargs:
+      device: mps
+      lr: 0.001
+      max_steps: 300
+      batch_size: 2048
+      early_stop_rounds: 50
+      eval_steps: 20
+      hidden_layers: [128, 64]
+      dropout: 0.05
+      weight_decay: 0.0001
+      seed: 42
+
+training:
+  windows_trading_days:
+    - 504
+    - 756
+    - 1008
+  tree_seeds:
+    - 42
+    - 2026
+    - 3407
+  neural_seeds:
+    - 42
+    - 2026
+    - 3407
+  fixed_parameters_first: true
+  bounded_tuning_trials_per_failed_model_max: 20
+  ensemble_models_min: 2
+  ensemble_models_max: 3
+  ensemble_method: equal_weight_percentile_rank
+
+rolling_validation:
+  validation_days: 126
+  test_quarters:
+    - 2023Q1
+    - 2023Q2
+    - 2023Q3
+    - 2023Q4
+    - 2024Q1
+    - 2024Q2
+    - 2024Q3
+    - 2024Q4
+    - 2025Q1
+    - 2025Q2
+    - 2025Q3
+    - 2025Q4
+  confirmation_start: '2026-01-01'
+  confirmation_is_single_use: true
+  confirmation_must_not_select_winner: true
+
+strategies:
+  - id: weekly_top50
+    eligible_for_final_selection: false
+  - id: low_turnover
+    eligible_for_final_selection: false
+  - id: regime_scaled
+    eligible_for_final_selection: false
+  - id: sector_constrained
+    eligible_for_final_selection: false
+  - id: full_risk_control
+    eligible_for_final_selection: true
+
+rebalance:
+  frequency: weekly
+  ranking_changes_only_on_rebalance: true
+  daily_risk_reduction_allowed: true
+  daily_ranking_rebalance_allowed: false
+
+market_regime:
+  train_separate_models: false
+  positions:
+    risk_on: 0.90
+    neutral: 0.70
+    defensive: 0.50
+    risk_off: 0.20
+  dedicated_model_trigger:
+    consecutive_failed_oos_intervals: 2
+    state_days_min: 252
+
+portfolio:
+  topk: 50
+  single_stock_weight_max: 0.03
+  industry_weight_max: 0.25
+  growth_and_star_weight_max: 0.30
+  boards:
+    main:
+      prefixes: [SH60, SZ00]
+    growth:
+      prefixes: [SZ30]
+    star:
+      prefixes: [SH68]
+
+costs:
+  commission_rate_each_side: 0.0003
+  minimum_commission_cny: 5.0
+  stamp_tax_sell_before_2023_08_28: 0.001
+  stamp_tax_sell_from_2023_08_28: 0.0005
+  scenarios:
+    low_total_bps: 10
+    baseline_total_bps: 20
+    stress_total_bps: 40
+  delayed_execution_days_stress: 1
+
+execution_rules:
+  handle_suspension: true
+  handle_price_limits: true
+  handle_board_limit_regime_changes: true
+  defer_unfilled_open_orders: true
+
+acceptance:
+  positive_excess_quarter_ratio_min: 0.70
+  annual_excess_return_min: 0.05
+  median_quarter_information_ratio_min: 0.5
+  positive_rank_ic_interval_ratio_min: 0.70
+  window_rank_correlation_median_min: 0.70
+  top50_overlap_mean_min: 0.60
+  development_max_drawdown_abs_max: 0.20
+  stress_cost_excess_return_min_exclusive: 0.0
+  delayed_execution_excess_return_min_exclusive: 0.0
+  positive_regime_count_min: 3
+  regime_days_for_floor: 60
+  regime_annual_excess_floor: -0.05
+  confirmation_excess_return_min_exclusive: 0.0
+  confirmation_information_ratio_min_exclusive: 0.0
+  confirmation_max_drawdown_abs_max: 0.20
+  shadow_days: 60
+  shadow_net_excess_return_min_exclusive: 0.0
+  shadow_max_drawdown_abs_max: 0.12
+  shadow_task_success_ratio_min: 0.95
+
+artifacts:
+  include_config_hash: true
+  include_git_commit: true
+  include_data_manifest_hash: true
+  include_membership_source: true
+  include_all_rolling_intervals: true
+  include_model_stability: true
+  include_regime_attribution: true
+  include_board_attribution: true
+  include_cost_stress: true
+  include_failure_reasons: true
+  overwrite_candidate_pipeline_latest: false
+  overwrite_daily_latest_training: false

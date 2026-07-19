@@ -11,6 +11,11 @@ import yaml
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_robust_strategy.py"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+MPS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "robust_strategy_mps_dnn.yaml"
+)
 
 
 def load_module():
@@ -123,6 +128,35 @@ def test_load_config_rejects_lowered_safety_or_acceptance_contract(
         assert "membership_coverage_min" in str(exc)
     else:
         raise AssertionError("weakened data gate was accepted")
+
+
+def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert module.load_config(MPS_CONFIG_PATH)["training"]["neural_seeds"] == [
+        42,
+        2026,
+        3407,
+    ]
+
+    payload["training"]["neural_seeds"] = [42]
+    one_seed = tmp_path / "one-seed.yaml"
+    one_seed.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="neural_seeds"):
+        module.load_config(one_seed)
+
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+    mps_model = next(item for item in payload["models"] if item["id"] == "mps_dnn")
+    mps_model["kwargs"]["device"] = "cpu"
+    cpu_fallback = tmp_path / "cpu-fallback.yaml"
+    cpu_fallback.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="without CPU fallback"):
+        module.load_config(cpu_fallback)
 
 
 def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> None:

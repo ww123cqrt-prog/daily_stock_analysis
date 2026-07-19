@@ -261,6 +261,15 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("training.windows_trading_days must remain [504, 756, 1008]")
     if payload.get("training", {}).get("tree_seeds") != [42, 2026, 3407]:
         raise ValueError("training.tree_seeds must remain [42, 2026, 3407]")
+    model_ids = {str(item.get("id")) for item in payload.get("models") or []}
+    if "mps_dnn" in model_ids:
+        if payload.get("training", {}).get("neural_seeds") != [42, 2026, 3407]:
+            raise ValueError("training.neural_seeds must remain [42, 2026, 3407]")
+        mps_model = next(
+            item for item in payload["models"] if str(item.get("id")) == "mps_dnn"
+        )
+        if str((mps_model.get("kwargs") or {}).get("device")) != "mps":
+            raise ValueError("mps_dnn must use device=mps without CPU fallback")
     if len(payload.get("rolling_validation", {}).get("test_quarters") or []) != 12:
         raise ValueError("rolling_validation must contain 12 development quarters")
     strategies = payload.get("strategies") or []

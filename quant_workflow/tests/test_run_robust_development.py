@@ -15,6 +15,11 @@ SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "run_robust_development.py"
 )
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+MPS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "robust_strategy_mps_dnn.yaml"
+)
 
 
 def load_module():
@@ -297,6 +302,26 @@ def test_training_matrix_contains_396_development_jobs_and_no_2026_period() -> N
     assert {job.seed for job in trees} == {42, 2026, 3407}
 
 
+def test_mps_dnn_config_adds_three_seed_matrix_without_changing_classical_jobs() -> None:
+    module = load_module()
+    classical_config = module.load_config(CONFIG_PATH)
+    mps_config = module.load_config(MPS_CONFIG_PATH)
+
+    classical_jobs = module.build_training_jobs(classical_config)
+    jobs = module.build_training_jobs(mps_config)
+    dnn_jobs = [job for job in jobs if job.model_id == "mps_dnn"]
+
+    assert len(classical_jobs) == 396
+    assert len(jobs) == 504
+    assert len(dnn_jobs) == 108
+    assert {job.window_days for job in dnn_jobs} == {504, 756, 1008}
+    assert {job.seed for job in dnn_jobs} == {42, 2026, 3407}
+    assert {job.quarter for job in dnn_jobs} == set(
+        mps_config["rolling_validation"]["test_quarters"]
+    )
+    assert all(not job.quarter.startswith("2026") for job in dnn_jobs)
+
+
 def test_model_config_applies_tree_seed_without_mutating_linear_models() -> None:
     module = load_module()
     config = module.load_config(CONFIG_PATH)
@@ -337,6 +362,21 @@ def test_model_config_applies_tree_seed_without_mutating_linear_models() -> None
     assert lgb["kwargs"]["bagging_seed"] == 3407
     assert lgb["kwargs"]["feature_fraction_seed"] == 3407
     assert cat["kwargs"]["random_seed"] == 42
+
+
+def test_model_config_applies_neural_seed_and_keeps_mps_device() -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    job = next(
+        item
+        for item in module.build_training_jobs(config)
+        if item.model_id == "mps_dnn" and item.seed == 2026
+    )
+
+    model = module.model_config_for_job(config, job)
+
+    assert model["kwargs"]["seed"] == 2026
+    assert model["kwargs"]["device"] == "mps"
 
 
 def test_build_dataset_config_uses_pit_csi800_five_day_open_label_and_purged_split() -> (
@@ -1686,6 +1726,18 @@ def test_bounded_tuning_trials_are_deterministic_capped_and_within_ranges() -> N
         == []
     )
 
+    mps_config = module.load_config(MPS_CONFIG_PATH)
+    mps_model = next(
+        item for item in mps_config["models"] if item["id"] == "mps_dnn"
+    )
+    dnn = module.generate_tuning_trials(
+        "mps_dnn", mps_model["kwargs"], maximum=20
+    )
+    assert len(dnn) == 16
+    assert all(item["device"] == "mps" for item in dnn)
+    assert all(0.0003 <= item["lr"] <= 0.01 for item in dnn)
+    assert all(1 <= len(item["hidden_layers"]) <= 3 for item in dnn)
+
 
 def test_tuning_screen_jobs_use_development_quarters_only_one_window_and_one_seed() -> (
     None
@@ -1694,6 +1746,21 @@ def test_tuning_screen_jobs_use_development_quarters_only_one_window_and_one_see
     config = module.load_config(CONFIG_PATH)
 
     jobs = module.build_tuning_screen_jobs(config, "xgboost")
+
+    assert len(jobs) == 12
+    assert {job.window_days for job in jobs} == {756}
+    assert {job.seed for job in jobs} == {42}
+    assert all(
+        job.quarter in config["rolling_validation"]["test_quarters"] for job in jobs
+    )
+    assert all(not job.quarter.startswith("2026") for job in jobs)
+
+
+def test_mps_dnn_tuning_screen_uses_one_neural_seed_and_development_only() -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+
+    jobs = module.build_tuning_screen_jobs(config, "mps_dnn")
 
     assert len(jobs) == 12
     assert {job.window_days for job in jobs} == {756}
