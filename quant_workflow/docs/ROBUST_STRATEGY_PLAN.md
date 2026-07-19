@@ -108,6 +108,7 @@ LSTM、GRU 或 Transformer 不在当前立即执行范围内。满足以下条�
 
 - 当前正式 `robust_20260719_development_v2` 已经按传统模型配置启动，OLS、Ridge、LightGBM、XGBoost 和 CatBoost 使用各自库支持的 CPU 训练。不能在运行中把它改成 MPS，也不能因为 MPS 对神经网络可能更快就把传统模型结果与 DNN 结果混在本轮。
 - MPS 只用于 `mps_dnn` 的 PyTorch 神经网络训练。统一六模型 Run 必须在独立的 `.venv-mps-dnn` 环境中确认 `torch.backends.mps.is_available()`；不可用时直接失败，禁止悄悄回退 CPU。
+- 正式启动前必须在与训练相同的 launchd 最小环境中运行一次 MPS 张量探针，并记录实际 Python 路径、`mps_built`、`mps_available`、张量设备和计算结果；不能只凭终端中的 MPS 检查判断后台训练可用。2026-07-20 的 launchd 探针使用 `.venv-mps-dnn/bin/python`，返回 `mps_available=true`、设备 `mps:0`，张量计算成功。
 - “使用 GPU”不等于所有模型都会更快。树模型和线性模型当前实现不是通过 PyTorch MPS 训练；本项目先按库的稳定实现运行，比较模型效果时以相同数据、相同切分、相同验收门槛为准，不以单纯训练速度替代策略质量。
 - 每个正式 Run 都要记录设备、依赖版本、并行度、运行时间和环境哈希。设备切换、依赖变化或环境哈希不一致时，必须启动新的 Run，不能覆盖或改写旧 Run。
 
