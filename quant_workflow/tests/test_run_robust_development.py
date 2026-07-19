@@ -2127,7 +2127,17 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
     )
 
     def training_runner(trial_config, jobs, **kwargs):
-        calls.append((len(jobs), kwargs["run_dir"]))
+        calls.append(
+            {
+                "jobs": list(jobs),
+                "run_dir": kwargs["run_dir"],
+                "model_kwargs": next(
+                    item["kwargs"]
+                    for item in trial_config["models"]
+                    if item["id"] == "xgboost"
+                ),
+            }
+        )
         progress = {}
         for job in jobs:
             model_path = Path(kwargs["run_dir"]) / "models" / f"{job.key}.pkl"
@@ -2154,12 +2164,13 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
         nonlocal aggregate_calls
         aggregate_calls += 1
         full = len({record["window_days"] for record in records}) == 3
+        screen_score = 1.0 if aggregate_calls == 3 else 0.1
         report = {
             "model_id": "xgboost",
             "eligible": full,
-            "development_score": float(aggregate_calls),
-            "rank_ic_mean": float(aggregate_calls),
-            "positive_rank_ic_interval_ratio": 1.0,
+            "development_score": 2.0 if full else screen_score,
+            "rank_ic_mean": 2.0 if full else screen_score,
+            "positive_rank_ic_interval_ratio": 1.0 if full else screen_score,
             "stability": {
                 "rank_correlation_median": 0.8 if full else None,
                 "topk_overlap_mean": 0.7 if full else None,
@@ -2183,10 +2194,28 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
     )
 
     assert len(calls) == 21
-    assert all(count == 12 for count, _ in calls[:20])
-    assert calls[-1][0] == 108
+    assert all(len(call["jobs"]) == 12 for call in calls[:20])
+    assert all(
+        {job.quarter for job in call["jobs"]}
+        == set(config["rolling_validation"]["test_quarters"])
+        for call in calls[:20]
+    )
+    assert all(
+        {job.window_days for job in call["jobs"]} == {756}
+        and {job.seed for job in call["jobs"]} == {42}
+        for call in calls[:20]
+    )
+    assert len(calls[-1]["jobs"]) == 108
     assert result["model_reports"][0]["eligible"] is True
     assert result["model_reports"][0]["tuning"]["screened_trials"] == 20
+    assert result["model_reports"][0]["tuning"]["selected_trial"] == 3
+    assert (
+        result["model_reports"][0]["tuning"]["selected_kwargs"]
+        == calls[2]["model_kwargs"]
+    )
+    assert result["model_reports"][0]["tuning"]["selection_basis"] == (
+        "2023Q1-2025Q4_only_756d_screen_then_full_matrix"
+    )
     assert "xgboost" in result["model_predictions"]
 
 
