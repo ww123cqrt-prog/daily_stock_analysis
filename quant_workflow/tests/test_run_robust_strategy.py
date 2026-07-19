@@ -666,6 +666,12 @@ def test_pipeline_stops_at_membership_permission_block_and_writes_latest_status(
     def runner(stage):
         calls.append(stage.name)
         if stage.name == "build_pit_csi800":
+            in_progress = json.loads(
+                (report_dir / "runs" / "test-blocked-membership" / "status.json")
+                .read_text(encoding="utf-8")
+            )
+            assert in_progress["status"] == "running"
+            assert in_progress["lifecycle_status"] == "running"
             status_dir = Path(stage.argv[stage.argv.index("--status-out-dir") + 1])
             status_dir.mkdir(parents=True, exist_ok=True)
             (status_dir / "build_status_latest.json").write_text(

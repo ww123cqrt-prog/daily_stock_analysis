@@ -1058,9 +1058,9 @@ def _run_pipeline_claimed(
     else:
         state = {
             "run_id": run_id,
-            "status": "blocked_data",
+            "status": "running",
             "lifecycle_status": "running",
-            "reason_code": "preflight_not_completed",
+            "reason_code": None,
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "config_path": str(config_path),
             "config_hash": config_hash,
@@ -1083,6 +1083,10 @@ def _run_pipeline_claimed(
                 )
                 _save_state(state, run_dir, report_dir)
                 return state
+    state["status"] = "running"
+    state["lifecycle_status"] = "running"
+    state["reason_code"] = None
+    state.pop("failed_stage", None)
     state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     _save_state(state, run_dir, report_dir)
 

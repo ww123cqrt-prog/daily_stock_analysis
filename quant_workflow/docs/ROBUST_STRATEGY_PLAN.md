@@ -192,6 +192,8 @@ LSTM、GRU 或 Transformer 不在当前立即执行范围内。满足以下条�
 | `shadow_observation` | 2026 确认通过，正在进行 60 日纸面跟踪 |
 | `robust_strategy_qualified` | 全部门槛和 60 日跟踪均通过 |
 
+运行中的临时状态是 `status=running` 且 `lifecycle_status=running`，它不代表任何验收门槛已经通过。只有进程停止后，才会写入上表中的最终状态。
+
 ## 11. 当前实际进度
 
 截至 2026-07-19：
