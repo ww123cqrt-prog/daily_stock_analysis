@@ -31,6 +31,8 @@ def test_checked_in_robust_strategy_config_preserves_approved_gates() -> None:
     assert config["acceptance"]["positive_rank_ic_interval_ratio_min"] == 0.70
     assert config["acceptance"]["window_rank_correlation_median_min"] == 0.70
     assert config["acceptance"]["top50_overlap_mean_min"] == 0.60
+    assert config["acceptance"]["seed_rank_correlation_median_min"] == 0.70
+    assert config["acceptance"]["seed_top50_overlap_mean_min"] == 0.60
     assert config["acceptance"]["development_max_drawdown_abs_max"] == 0.20
     assert config["acceptance"]["shadow_days"] == 60
     assert config["acceptance"]["shadow_task_success_ratio_min"] == 0.95

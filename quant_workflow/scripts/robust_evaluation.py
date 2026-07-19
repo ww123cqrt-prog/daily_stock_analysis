@@ -64,6 +64,49 @@ def aggregate_prediction_frames(frames: Mapping[str, pd.DataFrame]) -> pd.DataFr
     )
 
 
+def _prediction_pair_stability(
+    left_raw: pd.DataFrame,
+    right_raw: pd.DataFrame,
+    *,
+    left_name: str,
+    right_name: str,
+    topk: int,
+) -> tuple[float, float]:
+    left = _validate_prediction_frame(left_raw, left_name)
+    right = _validate_prediction_frame(right_raw, right_name)
+    joined = (
+        left[["score"]]
+        .rename(columns={"score": "left"})
+        .join(right[["score"]].rename(columns={"score": "right"}), how="inner")
+        .dropna()
+    )
+    daily_corr = joined.groupby(level="datetime").apply(
+        lambda group: group["left"].corr(group["right"], method="spearman")
+    )
+    daily_corr = (
+        pd.to_numeric(daily_corr, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    pair_corr = float(daily_corr.median()) if not daily_corr.empty else float("nan")
+    pair_overlaps: list[float] = []
+    for _, group in joined.groupby(level="datetime", sort=True):
+        left_top = set(
+            group.nlargest(min(topk, len(group)), "left").index.get_level_values(
+                "instrument"
+            )
+        )
+        right_top = set(
+            group.nlargest(min(topk, len(group)), "right").index.get_level_values(
+                "instrument"
+            )
+        )
+        denominator = max(1, min(len(left_top), len(right_top)))
+        pair_overlaps.append(len(left_top & right_top) / denominator)
+    pair_overlap = float(np.mean(pair_overlaps)) if pair_overlaps else float("nan")
+    return pair_corr, pair_overlap
+
+
 def window_stability(
     frames: Mapping[int, pd.DataFrame], *, topk: int = 50
 ) -> dict[str, Any]:
@@ -80,38 +123,13 @@ def window_stability(
     for (left_window, left_raw), (right_window, right_raw) in itertools.combinations(
         sorted(frames.items()), 2
     ):
-        left = _validate_prediction_frame(left_raw, str(left_window))
-        right = _validate_prediction_frame(right_raw, str(right_window))
-        joined = (
-            left[["score"]]
-            .rename(columns={"score": "left"})
-            .join(right[["score"]].rename(columns={"score": "right"}), how="inner")
-            .dropna()
+        pair_corr, pair_overlap = _prediction_pair_stability(
+            left_raw,
+            right_raw,
+            left_name=str(left_window),
+            right_name=str(right_window),
+            topk=topk,
         )
-        daily_corr = joined.groupby(level="datetime").apply(
-            lambda group: group["left"].corr(group["right"], method="spearman")
-        )
-        daily_corr = (
-            pd.to_numeric(daily_corr, errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
-        pair_corr = float(daily_corr.median()) if not daily_corr.empty else float("nan")
-        pair_overlaps: list[float] = []
-        for _, group in joined.groupby(level="datetime", sort=True):
-            left_top = set(
-                group.nlargest(min(topk, len(group)), "left").index.get_level_values(
-                    "instrument"
-                )
-            )
-            right_top = set(
-                group.nlargest(min(topk, len(group)), "right").index.get_level_values(
-                    "instrument"
-                )
-            )
-            denominator = max(1, min(len(left_top), len(right_top)))
-            pair_overlaps.append(len(left_top & right_top) / denominator)
-        pair_overlap = float(np.mean(pair_overlaps)) if pair_overlaps else float("nan")
         if math.isfinite(pair_corr):
             correlations.append(pair_corr)
         if math.isfinite(pair_overlap):
@@ -134,12 +152,64 @@ def window_stability(
     }
 
 
+def seed_stability(
+    grouped_frames: Mapping[tuple[int, str], Mapping[str, pd.DataFrame]],
+    *,
+    topk: int = 50,
+) -> dict[str, Any]:
+    pair_reports: list[dict[str, Any]] = []
+    correlations: list[float] = []
+    overlaps: list[float] = []
+    group_count = 0
+    for (window_days, quarter), frames in sorted(grouped_frames.items()):
+        if len(frames) < 2:
+            continue
+        group_count += 1
+        for (left_seed, left_raw), (right_seed, right_raw) in itertools.combinations(
+            sorted(frames.items()), 2
+        ):
+            pair_corr, pair_overlap = _prediction_pair_stability(
+                left_raw,
+                right_raw,
+                left_name=f"{quarter}-w{window_days}-s{left_seed}",
+                right_name=f"{quarter}-w{window_days}-s{right_seed}",
+                topk=topk,
+            )
+            if math.isfinite(pair_corr):
+                correlations.append(pair_corr)
+            if math.isfinite(pair_overlap):
+                overlaps.append(pair_overlap)
+            pair_reports.append(
+                {
+                    "window_days": int(window_days),
+                    "quarter": str(quarter),
+                    "left_seed": str(left_seed),
+                    "right_seed": str(right_seed),
+                    "rank_correlation_median": pair_corr,
+                    "topk_overlap_mean": pair_overlap,
+                }
+            )
+    return {
+        "applicable": bool(pair_reports),
+        "group_count": group_count,
+        "pair_count": len(pair_reports),
+        "rank_correlation_median": (
+            float(np.median(correlations)) if correlations else None
+        ),
+        "topk_overlap_mean": (
+            float(np.mean(overlaps)) if overlaps else None
+        ),
+        "pairs": pair_reports,
+    }
+
+
 def model_signal_report(
     *,
     model_id: str,
     quarter_metrics: Sequence[Mapping[str, Any]],
     stability: Mapping[str, Any],
     thresholds: Mapping[str, Any],
+    seed_stability: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     rank_ics: list[float] = []
     for item in quarter_metrics:
@@ -155,6 +225,24 @@ def model_signal_report(
     )
     rank_corr = float(stability.get("rank_correlation_median", float("nan")))
     overlap = float(stability.get("topk_overlap_mean", float("nan")))
+    seed_report = dict(seed_stability or {})
+    seed_applicable = seed_report.get("applicable") is True
+    try:
+        seed_rank_corr = (
+            float(seed_report.get("rank_correlation_median"))
+            if seed_applicable
+            else float("nan")
+        )
+    except (TypeError, ValueError):
+        seed_rank_corr = float("nan")
+    try:
+        seed_overlap = (
+            float(seed_report.get("topk_overlap_mean"))
+            if seed_applicable
+            else float("nan")
+        )
+    except (TypeError, ValueError):
+        seed_overlap = float("nan")
     limits = {
         "positive_rank_ic_interval_ratio_min": float(
             thresholds["positive_rank_ic_interval_ratio_min"]
@@ -163,6 +251,12 @@ def model_signal_report(
             thresholds["window_rank_correlation_median_min"]
         ),
         "top50_overlap_mean_min": float(thresholds["top50_overlap_mean_min"]),
+        "seed_rank_correlation_median_min": float(
+            thresholds["seed_rank_correlation_median_min"]
+        ),
+        "seed_top50_overlap_mean_min": float(
+            thresholds["seed_top50_overlap_mean_min"]
+        ),
     }
     if not all(math.isfinite(value) for value in limits.values()):
         raise ValueError("model acceptance thresholds must be finite")
@@ -173,6 +267,16 @@ def model_signal_report(
         and rank_corr >= limits["window_rank_correlation_median_min"],
         "top50_overlap": math.isfinite(overlap)
         and overlap >= limits["top50_overlap_mean_min"],
+        "seed_rank_correlation": not seed_applicable
+        or (
+            math.isfinite(seed_rank_corr)
+            and seed_rank_corr >= limits["seed_rank_correlation_median_min"]
+        ),
+        "seed_top50_overlap": not seed_applicable
+        or (
+            math.isfinite(seed_overlap)
+            and seed_overlap >= limits["seed_top50_overlap_mean_min"]
+        ),
     }
     mean_rank_ic = float(np.mean(rank_ics)) if rank_ics else -math.inf
     development_score = (
@@ -188,6 +292,7 @@ def model_signal_report(
         "positive_rank_ic_interval_ratio": positive_ratio,
         "rank_ic_mean": mean_rank_ic,
         "stability": dict(stability),
+        "seed_stability": seed_report,
         "quarter_metrics": [dict(item) for item in quarter_metrics],
         "development_score": development_score,
         "thresholds": limits,
@@ -242,10 +347,14 @@ def aggregate_training_artifacts(
 
     quarter_windows: dict[tuple[str, str], dict[int, pd.DataFrame]] = {}
     model_windows: dict[str, dict[int, list[pd.DataFrame]]] = {}
+    model_seed_groups: dict[
+        str, dict[tuple[int, str], dict[str, pd.DataFrame]]
+    ] = {}
     for (model_id, window, quarter), seed_frames in grouped.items():
         aggregate = aggregate_prediction_frames(seed_frames)
         quarter_windows.setdefault((model_id, quarter), {})[window] = aggregate
         model_windows.setdefault(model_id, {}).setdefault(window, []).append(aggregate)
+        model_seed_groups.setdefault(model_id, {})[(window, quarter)] = seed_frames
 
     window_predictions: dict[str, dict[int, pd.DataFrame]] = {}
     for model_id, windows in model_windows.items():
@@ -262,6 +371,7 @@ def aggregate_training_artifacts(
     model_predictions: dict[str, pd.DataFrame] = {}
     for model_id, windows in sorted(window_predictions.items()):
         stability = window_stability(windows, topk=topk)
+        seed_report = seed_stability(model_seed_groups[model_id], topk=topk)
         quarter_metrics: list[dict[str, Any]] = []
         quarter_aggregates: list[pd.DataFrame] = []
         for (candidate_model, quarter), frames in sorted(quarter_windows.items()):
@@ -277,6 +387,7 @@ def aggregate_training_artifacts(
             quarter_metrics=quarter_metrics,
             stability=stability,
             thresholds=thresholds,
+            seed_stability=seed_report,
         )
         model_reports.append(report)
         combined = pd.concat(quarter_aggregates).sort_index()

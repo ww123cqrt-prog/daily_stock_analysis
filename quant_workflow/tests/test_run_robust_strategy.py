@@ -129,6 +129,15 @@ def test_load_config_rejects_lowered_safety_or_acceptance_contract(
     else:
         raise AssertionError("weakened data gate was accepted")
 
+    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["acceptance"]["seed_rank_correlation_median_min"] = 0.50
+    weak_seed_gate = tmp_path / "weak-seed-gate.yaml"
+    weak_seed_gate.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="seed_rank_correlation_median_min"):
+        module.load_config(weak_seed_gate)
+
 
 def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
     tmp_path: Path,

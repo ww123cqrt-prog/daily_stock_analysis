@@ -416,6 +416,31 @@ def test_runtime_environment_metadata_is_hashed_and_contains_no_paths() -> None:
     assert "site-packages" not in serialized
 
 
+def test_write_json_normalizes_nonfinite_metrics_to_standard_json(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    path = tmp_path / "report.json"
+
+    module._write_json(
+        path,
+        {
+            "nan": float("nan"),
+            "positive_infinity": float("inf"),
+            "nested": [np.float64("-inf"), 1.0],
+        },
+    )
+
+    raw = path.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    assert json.loads(raw) == {
+        "nan": None,
+        "positive_infinity": None,
+        "nested": [None, 1.0],
+    }
+
+
 def test_build_dataset_config_uses_pit_csi800_five_day_open_label_and_purged_split() -> (
     None
 ):

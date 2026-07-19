@@ -232,6 +232,12 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
     )
     _require_at_least(payload, ("acceptance", "top50_overlap_mean_min"), 0.60)
     _require_at_least(
+        payload, ("acceptance", "seed_rank_correlation_median_min"), 0.70
+    )
+    _require_at_least(
+        payload, ("acceptance", "seed_top50_overlap_mean_min"), 0.60
+    )
+    _require_at_least(
         payload, ("acceptance", "stress_cost_excess_return_min_exclusive"), 0.0
     )
     _require_at_least(

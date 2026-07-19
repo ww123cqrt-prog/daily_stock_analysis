@@ -1251,9 +1251,29 @@ def _failure(reason_code: str, *, as_of_date: str) -> dict[str, Any]:
     }
 
 
+def _standard_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _standard_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_standard_json_value(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     _atomic_write(
-        path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        path,
+        json.dumps(
+            _standard_json_value(payload),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
     )
 
 

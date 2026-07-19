@@ -71,6 +71,36 @@ def test_window_stability_reports_rank_correlation_and_top50_overlap() -> None:
     assert result["topk_overlap_mean"] == 1.0
 
 
+def test_seed_stability_reports_all_quarter_window_seed_pairs() -> None:
+    module = load_module()
+    frame = prediction_frame([1, 2, 3, 3, 2, 1])
+    grouped = {
+        (504, "2025Q1"): {"42": frame, "2026": frame.copy(), "3407": frame.copy()},
+        (756, "2025Q1"): {"42": frame, "2026": frame.copy(), "3407": frame.copy()},
+    }
+
+    result = module.seed_stability(grouped, topk=2)
+
+    assert result["applicable"] is True
+    assert result["group_count"] == 2
+    assert result["pair_count"] == 6
+    assert result["rank_correlation_median"] == 1.0
+    assert result["topk_overlap_mean"] == 1.0
+    assert {item["window_days"] for item in result["pairs"]} == {504, 756}
+
+
+def test_seed_stability_is_not_applicable_to_fixed_linear_models() -> None:
+    module = load_module()
+    frame = prediction_frame([1, 2, 3, 3, 2, 1])
+
+    result = module.seed_stability({(504, "2025Q1"): {"fixed": frame}}, topk=2)
+
+    assert result["applicable"] is False
+    assert result["pair_count"] == 0
+    assert result["rank_correlation_median"] is None
+    assert result["topk_overlap_mean"] is None
+
+
 def test_model_signal_report_requires_rankic_and_both_stability_gates() -> None:
     module = load_module()
     quarters = [{"quarter": f"Q{i}", "rank_ic": 0.02} for i in range(9)] + [
@@ -104,6 +134,20 @@ def test_model_signal_report_requires_rankic_and_both_stability_gates() -> None:
     )
     assert strict["eligible"] is False
     assert "positive_rank_ic_intervals" in strict["failed_gates"]
+
+    seed_unstable = module.model_signal_report(
+        model_id="seed-unstable",
+        quarter_metrics=quarters,
+        stability={"rank_correlation_median": 0.75, "topk_overlap_mean": 0.65},
+        seed_stability={
+            "applicable": True,
+            "rank_correlation_median": 0.69,
+            "topk_overlap_mean": 0.65,
+        },
+        thresholds=ACCEPTANCE,
+    )
+    assert seed_unstable["eligible"] is False
+    assert "seed_rank_correlation" in seed_unstable["failed_gates"]
 
 
 def test_model_selection_uses_only_eligible_development_score() -> None:
@@ -227,6 +271,9 @@ def test_aggregate_training_artifacts_builds_model_windows_and_quarter_reports(
     assert set(result["model_predictions"]) == {"lightgbm"}
     assert result["model_reports"][0]["model_id"] == "lightgbm"
     assert result["model_reports"][0]["eligible"] is True
+    assert result["model_reports"][0]["seed_stability"]["pair_count"] == 3
+    assert result["model_reports"][0]["gates"]["seed_rank_correlation"] is True
+    assert result["model_reports"][0]["gates"]["seed_top50_overlap"] is True
     assert result["model_reports"][0]["quarter_metrics"][0]["quarter"] == "2025Q1"
     assert result["model_reports"][0]["quarter_metrics"][0]["rank_ic"] == 1.0
 
