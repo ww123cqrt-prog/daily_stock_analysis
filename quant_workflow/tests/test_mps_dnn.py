@@ -9,6 +9,9 @@ import pytest
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mps_dnn.py"
+REQUIREMENTS_PATH = (
+    Path(__file__).resolve().parents[1] / "requirements-mps-dnn.txt"
+)
 
 
 def load_module():
@@ -49,3 +52,30 @@ def test_feature_and_label_filters_non_finite_rows_without_reordering_columns() 
     assert features.index.tolist() == [index[0]]
     assert label.index.tolist() == [index[0]]
     assert float(label.iloc[0]) == pytest.approx(0.01)
+
+
+def test_formal_mps_environment_pins_every_direct_training_dependency() -> None:
+    pinned = {
+        line.split("==", 1)[0].lower(): line.split("==", 1)[1]
+        for line in REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    }
+
+    assert set(pinned) == {
+        "catboost",
+        "cloudpickle",
+        "lightgbm",
+        "mlflow",
+        "numpy",
+        "pandas",
+        "pyarrow",
+        "pyqlib",
+        "pyyaml",
+        "scikit-learn",
+        "torch",
+        "xgboost",
+    }
+    assert all(
+        version and not any(char in version for char in "<>=~*")
+        for version in pinned.values()
+    )
