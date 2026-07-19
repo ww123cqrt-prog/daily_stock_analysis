@@ -12,6 +12,7 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "launch_robust_strategy.py"
 )
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 def load_module():
@@ -41,6 +42,16 @@ def test_build_command_targets_foreground_orchestrator_and_preserves_resume(
     assert "launch_robust_strategy.py" not in " ".join(command)
     assert "--resume" in command
     assert "--skip-membership-build" in command
+
+
+def test_config_requests_mps_only_for_the_unified_six_model_config() -> None:
+    module = load_module()
+
+    assert module._config_requests_mps(CONFIG_DIR / "robust_strategy.yaml") is False
+    assert (
+        module._config_requests_mps(CONFIG_DIR / "robust_strategy_mps_dnn.yaml")
+        is True
+    )
 
 
 def test_launch_registers_launchd_job_and_writes_verified_record(
@@ -295,3 +306,95 @@ def test_launchd_worker_records_child_and_terminal_pipeline_state(
     assert captured["kwargs"]["env"]["QUANT_WORKFLOW_MLRUNS_DIR"] == str(
         tmp_path / "mlruns"
     )
+
+
+def test_launchd_worker_records_required_mps_preflight_before_starting_child(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "mps-worker-run"
+    launch_path = report_dir / "runner" / run_id / "launch.json"
+    pid_path = launch_path.parent / "pid"
+    launch_path.parent.mkdir(parents=True)
+    launch_path.write_text(
+        json.dumps(
+            {"status": "starting", "run_id": run_id, "mps_required": True}
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeProcess:
+        pid = 2468
+
+        def wait(self):
+            return 0
+
+    def popen_factory(command, **kwargs):
+        captured["record_before_child"] = json.loads(
+            launch_path.read_text(encoding="utf-8")
+        )
+        return FakeProcess()
+
+    evidence = {
+        "python_executable": "/venv/bin/python",
+        "python_resolved": "/runtime/bin/python3.11",
+        "torch_version": "2.5.1",
+        "mps_built": True,
+        "mps_available": True,
+        "device": "mps:0",
+        "tensor_sum": 4.0,
+        "checked_at": "2026-07-20T06:00:00+08:00",
+    }
+
+    return_code = module.run_launchd_worker(
+        launch_path=launch_path,
+        pid_path=pid_path,
+        report_dir=report_dir,
+        run_id=run_id,
+        command=["python", "run.py"],
+        popen_factory=popen_factory,
+        mps_probe=lambda: evidence,
+    )
+
+    record = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert return_code == 0
+    assert captured["record_before_child"]["mps_preflight"] == evidence
+    assert record["mps_preflight"] == evidence
+
+
+def test_launchd_worker_refuses_child_when_required_mps_preflight_fails(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "mps-worker-failed"
+    launch_path = report_dir / "runner" / run_id / "launch.json"
+    pid_path = launch_path.parent / "pid"
+    launch_path.parent.mkdir(parents=True)
+    launch_path.write_text(
+        json.dumps(
+            {"status": "starting", "run_id": run_id, "mps_required": True}
+        ),
+        encoding="utf-8",
+    )
+
+    return_code = module.run_launchd_worker(
+        launch_path=launch_path,
+        pid_path=pid_path,
+        report_dir=report_dir,
+        run_id=run_id,
+        command=["python", "run.py"],
+        popen_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training child must not start without MPS")
+        ),
+        mps_probe=lambda: (_ for _ in ()).throw(RuntimeError("MPS unavailable")),
+    )
+
+    record = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert return_code == 78
+    assert not pid_path.exists()
+    assert record["status"] == "failed_to_start"
+    assert record["reason_code"] == "mps_preflight_failed"
+    assert record["error_type"] == "RuntimeError"

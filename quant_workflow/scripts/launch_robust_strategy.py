@@ -23,7 +23,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import mlruns_root, quant_data_root, reports_root, workflow_root  # noqa: E402
-from run_robust_strategy import DEFAULT_CONFIG, RUN_ID_RE, new_run_id  # noqa: E402
+from run_robust_strategy import (  # noqa: E402
+    DEFAULT_CONFIG,
+    RUN_ID_RE,
+    load_config,
+    new_run_id,
+)
 
 
 LAUNCHCTL = "/bin/launchctl"
@@ -95,6 +100,37 @@ def build_command(
     if skip_membership_build:
         command.append("--skip-membership-build")
     return command
+
+
+def _config_requests_mps(config: Path) -> bool:
+    path = Path(config).expanduser().resolve()
+    if not path.is_file():
+        return False
+    payload = load_config(path)
+    return "mps_dnn" in {str(item.get("id")) for item in payload.get("models") or []}
+
+
+def _mps_probe() -> dict[str, Any]:
+    import torch
+
+    built = bool(torch.backends.mps.is_built())
+    available = bool(torch.backends.mps.is_available())
+    if not built or not available:
+        raise RuntimeError("MPS is required but unavailable in the launchd worker")
+    tensor = torch.ones(4, device="mps")
+    result = float((tensor * tensor).sum().cpu())
+    if result != 4.0:
+        raise RuntimeError("MPS launchd worker tensor probe returned an invalid result")
+    return {
+        "python_executable": str(Path(sys.executable).absolute()),
+        "python_resolved": str(Path(sys.executable).resolve()),
+        "torch_version": str(torch.__version__),
+        "mps_built": built,
+        "mps_available": available,
+        "device": str(tensor.device),
+        "tensor_sum": result,
+        "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
 
 
 def _cpu_percent(pid: int) -> float | None:
@@ -319,8 +355,28 @@ def run_launchd_worker(
     run_id: str,
     command: list[str],
     popen_factory: Callable[..., Any] = subprocess.Popen,
+    mps_probe: Callable[[], dict[str, Any]] = _mps_probe,
 ) -> int:
     launch_record = _read_json(launch_path)
+    if launch_record.get("mps_required") is True:
+        try:
+            mps_evidence = mps_probe()
+        except Exception as exc:
+            _write_pipeline_state(
+                launch_path,
+                {
+                    **launch_record,
+                    "status": "failed_to_start",
+                    "reason_code": "mps_preflight_failed",
+                    "error_type": type(exc).__name__,
+                    "finished_at": datetime.now()
+                    .astimezone()
+                    .isoformat(timespec="seconds"),
+                },
+            )
+            return 78
+        launch_record = {**launch_record, "mps_preflight": mps_evidence}
+        _write_pipeline_state(launch_path, launch_record)
     try:
         process = popen_factory(
             command,
@@ -416,6 +472,7 @@ def _launch_claimed(
         resume=resume,
         skip_membership_build=skip_membership_build,
     )
+    mps_required = _config_requests_mps(config)
     initial = {
         "status": "starting",
         "run_id": run_id,
@@ -428,6 +485,7 @@ def _launch_claimed(
         "launch_backend": "launchd",
         "launchd_domain": domain,
         "job_label": job_label,
+        "mps_required": mps_required,
     }
     _atomic_write(
         launch_path,
