@@ -53,6 +53,7 @@ ENV/
 env/
 .venv/
 /.venv
+/.venv*/
 
 # IDE
 .idea/

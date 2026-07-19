@@ -16,9 +16,7 @@ SCRIPT_PATH = (
 )
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
 MPS_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "configs"
-    / "robust_strategy_mps_dnn.yaml"
+    Path(__file__).resolve().parents[1] / "configs" / "robust_strategy_mps_dnn.yaml"
 )
 
 
@@ -200,6 +198,11 @@ def build_resume_fixture(module, root: Path, *, run_id: str) -> dict:
         **reference_context_fields(module, quant_data),
         **membership_context_fields(module, quant_data),
     }
+    runtime_environment = module.collect_runtime_environment(
+        module.load_config(CONFIG_PATH)
+    )
+    context["runtime_environment"] = runtime_environment
+    context["runtime_environment_hash"] = runtime_environment["environment_hash"]
     context["provider_tree_sha256"] = provider_tree_sha256
     context["context_hash"] = module.payload_sha256(context)
     context_path.write_text(json.dumps(context), encoding="utf-8")
@@ -302,7 +305,9 @@ def test_training_matrix_contains_396_development_jobs_and_no_2026_period() -> N
     assert {job.seed for job in trees} == {42, 2026, 3407}
 
 
-def test_mps_dnn_config_adds_three_seed_matrix_without_changing_classical_jobs() -> None:
+def test_mps_dnn_config_adds_three_seed_matrix_without_changing_classical_jobs() -> (
+    None
+):
     module = load_module()
     classical_config = module.load_config(CONFIG_PATH)
     mps_config = module.load_config(MPS_CONFIG_PATH)
@@ -377,6 +382,33 @@ def test_model_config_applies_neural_seed_and_keeps_mps_device() -> None:
 
     assert model["kwargs"]["seed"] == 2026
     assert model["kwargs"]["device"] == "mps"
+
+
+def test_runtime_environment_metadata_is_hashed_and_contains_no_paths() -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+
+    metadata = module.collect_runtime_environment(config)
+
+    assert metadata["python_version"]
+    assert metadata["platform"]
+    assert metadata["machine"]
+    assert metadata["requested_device"] == "mps"
+    assert set(metadata["packages"]) == {
+        "catboost",
+        "lightgbm",
+        "mlflow",
+        "pyqlib",
+        "scikit-learn",
+        "torch",
+        "xgboost",
+    }
+    assert metadata["environment_hash"] == module.payload_sha256(
+        {key: value for key, value in metadata.items() if key != "environment_hash"}
+    )
+    serialized = json.dumps(metadata, sort_keys=True)
+    assert "/Users/" not in serialized
+    assert "site-packages" not in serialized
 
 
 def test_build_dataset_config_uses_pit_csi800_five_day_open_label_and_purged_split() -> (
@@ -654,10 +686,80 @@ def test_mlflow_run_yields_active_recorder(monkeypatch, tmp_path: Path) -> None:
     assert len(calls) == 1
     call = calls[0]
     assert call["experiment_name"] == "robust_csi800_development"
-    assert str(call["recorder_name"]).startswith(
-        "2023Q1__w504__linear_ols__sfixed-"
-    )
+    assert str(call["recorder_name"]).startswith("2023Q1__w504__linear_ols__sfixed-")
     assert call["uri"] == f"file://{tmp_path / 'mlruns'}"
+
+
+def test_mlflow_result_records_runtime_environment_hash_and_versions(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    job = module.TrainingJob("2023Q1", 504, "mps_dnn", 2026)
+    split = module.make_job_split(
+        pd.bdate_range("2019-01-01", "2025-12-31"),
+        "2023Q1",
+        window_days=504,
+        validation_days=126,
+        label_horizon_days=5,
+    )
+    prediction_path = tmp_path / "prediction.parquet"
+    model_path = tmp_path / "model.pkl"
+    prediction_path.write_bytes(b"prediction")
+    model_path.write_bytes(b"model")
+    runtime = {
+        "python_version": "3.11.15",
+        "platform": "Darwin",
+        "machine": "arm64",
+        "requested_device": "mps",
+        "mps_built": True,
+        "mps_available": True,
+        "packages": {"pyqlib": "0.9.7", "torch": "2.5.1"},
+    }
+    runtime["environment_hash"] = module.payload_sha256(runtime)
+
+    class Recorder:
+        id = "mlflow-run-id"
+
+        def __init__(self):
+            self.params = {}
+            self.tags = {}
+            self.metrics = {}
+            self.artifacts = []
+
+        def log_params(self, **kwargs):
+            self.params.update(kwargs)
+
+        def set_tags(self, **kwargs):
+            self.tags.update(kwargs)
+
+        def log_metrics(self, **kwargs):
+            self.metrics.update(kwargs)
+
+        def log_artifact(self, path, artifact_path=None):
+            self.artifacts.append((path, artifact_path))
+
+    recorder = Recorder()
+    result = module._log_mlflow_result(
+        recorder,
+        job=job,
+        model_config={"kwargs": {"device": "mps", "seed": 2026}},
+        split=split,
+        result={"rows": 3, "dates": 1, "rank_ic_mean": 0.1},
+        prediction_path=prediction_path,
+        model_path=model_path,
+        phase="development",
+        runtime_environment=runtime,
+    )
+
+    assert result == "mlflow-run-id"
+    assert recorder.params["runtime.environment_hash"] == runtime["environment_hash"]
+    assert recorder.params["runtime.package.pyqlib"] == "0.9.7"
+    assert recorder.params["runtime.package.torch"] == "2.5.1"
+    assert recorder.params["runtime.requested_device"] == "mps"
+    assert (
+        recorder.tags["robust_strategy.runtime_environment_hash"]
+        == runtime["environment_hash"]
+    )
 
 
 def test_run_training_jobs_reuses_dataset_per_quarter_window_and_checkpoints(
@@ -1122,6 +1224,8 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     assert frozen["reference_snapshot_hash"] == latest["reference_snapshot_hash"]
     assert frozen["membership_source_metadata"] == latest["membership_source_metadata"]
     assert frozen["membership_snapshot_hash"] == latest["membership_snapshot_hash"]
+    assert frozen["runtime_environment"] == latest["runtime_environment"]
+    assert frozen["runtime_environment_hash"] == latest["runtime_environment_hash"]
     artifacts = frozen["development_artifacts"]
     assert len(artifacts) == 144
     assert [item["job_key"] for item in artifacts] == sorted(
@@ -1150,6 +1254,12 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     assert context["reference_snapshot_hash"] == latest["reference_snapshot_hash"]
     assert context["membership_source_metadata"] == latest["membership_source_metadata"]
     assert context["membership_snapshot_hash"] == latest["membership_snapshot_hash"]
+    assert context["runtime_environment"] == latest["runtime_environment"]
+    assert context["runtime_environment_hash"] == latest["runtime_environment_hash"]
+    assert (
+        context["runtime_environment_hash"]
+        == context["runtime_environment"]["environment_hash"]
+    )
 
 
 def test_run_development_rechecks_provider_before_freezing_candidate(
@@ -1567,11 +1677,7 @@ def test_run_development_publishes_normal_result_to_run_scoped_path(
 
     run_scoped = json.loads(
         (
-            report_dir
-            / "runs"
-            / "normal-failure"
-            / "development"
-            / "development.json"
+            report_dir / "runs" / "normal-failure" / "development" / "development.json"
         ).read_text(encoding="utf-8")
     )
     latest = json.loads(
@@ -1763,12 +1869,8 @@ def test_bounded_tuning_trials_are_deterministic_capped_and_within_ranges() -> N
     )
 
     mps_config = module.load_config(MPS_CONFIG_PATH)
-    mps_model = next(
-        item for item in mps_config["models"] if item["id"] == "mps_dnn"
-    )
-    dnn = module.generate_tuning_trials(
-        "mps_dnn", mps_model["kwargs"], maximum=20
-    )
+    mps_model = next(item for item in mps_config["models"] if item["id"] == "mps_dnn")
+    dnn = module.generate_tuning_trials("mps_dnn", mps_model["kwargs"], maximum=20)
     assert len(dnn) == 16
     assert all(item["device"] == "mps" for item in dnn)
     assert all(0.0003 <= item["lr"] <= 0.01 for item in dnn)

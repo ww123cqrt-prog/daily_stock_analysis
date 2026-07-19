@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.metadata
 import importlib.util
 import itertools
 import json
 import math
 import os
+import platform
 import sys
 import uuid
 from contextlib import contextmanager
@@ -71,6 +73,7 @@ FROZEN_CONTEXT_KEYS = (
     "provider_uri",
     "provider_key",
     "provider_tree_sha256",
+    "runtime_environment_hash",
     "selected_models",
     "selected_model_configs",
     "selected_strategy",
@@ -86,6 +89,52 @@ SEED_ARGUMENTS = {
     "catboost": "random_seed",
     "mps_dnn": "seed",
 }
+MODEL_DISTRIBUTIONS = {
+    "linear_ols": (),
+    "linear_ridge": (),
+    "lightgbm": ("lightgbm",),
+    "xgboost": ("xgboost",),
+    "catboost": ("catboost",),
+    "mps_dnn": ("torch",),
+}
+BASE_TRAINING_DISTRIBUTIONS = ("pyqlib", "scikit-learn", "mlflow")
+
+
+def collect_runtime_environment(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return path-free package and device provenance for a formal run."""
+    model_ids = {str(item["id"]) for item in config["models"]}
+    distributions = set(BASE_TRAINING_DISTRIBUTIONS)
+    for model_id in model_ids:
+        distributions.update(MODEL_DISTRIBUTIONS.get(model_id, ()))
+    packages: dict[str, str] = {}
+    for distribution in sorted(distributions):
+        try:
+            packages[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            packages[distribution] = "missing"
+    requests_mps = "mps_dnn" in model_ids
+    mps_built = False
+    mps_available = False
+    if requests_mps:
+        try:
+            import torch
+
+            mps_built = bool(torch.backends.mps.is_built())
+            mps_available = bool(torch.backends.mps.is_available())
+        except ImportError:
+            pass
+    result: dict[str, Any] = {
+        "python_version": platform.python_version(),
+        "platform": platform.system(),
+        "machine": platform.machine(),
+        "requested_device": "mps" if requests_mps else "cpu",
+        "mps_built": mps_built,
+        "mps_available": mps_available,
+        "packages": packages,
+    }
+    serialized = json.dumps(result, sort_keys=True, separators=(",", ":"), default=str)
+    result["environment_hash"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return result
 
 
 class TrainingJob(NamedTuple):
@@ -581,12 +630,14 @@ def fit_predict_job(model: Any, dataset: Any, artifact_path: Path) -> dict[str, 
         "rows": int(len(saved)),
         "evaluable_rows": int(len(evaluable)),
         "dates": int(saved["datetime"].nunique()),
-        "rank_ic_mean": float(clean_rank_ic.mean())
-        if not clean_rank_ic.empty
-        else float("nan"),
-        "rank_ic_positive_ratio": float((clean_rank_ic > 0).mean())
-        if not clean_rank_ic.empty
-        else float("nan"),
+        "rank_ic_mean": (
+            float(clean_rank_ic.mean()) if not clean_rank_ic.empty else float("nan")
+        ),
+        "rank_ic_positive_ratio": (
+            float((clean_rank_ic > 0).mean())
+            if not clean_rank_ic.empty
+            else float("nan")
+        ),
         "prediction_path": str(Path(artifact_path).resolve()),
     }
 
@@ -788,6 +839,7 @@ def _log_mlflow_result(
     prediction_path: Path,
     model_path: Path,
     phase: str,
+    runtime_environment: Mapping[str, Any] | None = None,
 ) -> str | None:
     if active_run is None:
         return None
@@ -806,22 +858,39 @@ def _log_mlflow_result(
     }
     for key, value in (model_config.get("kwargs") or {}).items():
         params[f"model.{key}"] = value
+    if runtime_environment:
+        for key in (
+            "environment_hash",
+            "python_version",
+            "platform",
+            "machine",
+            "requested_device",
+            "mps_built",
+            "mps_available",
+        ):
+            if key in runtime_environment:
+                params[f"runtime.{key}"] = runtime_environment[key]
+        for name, version in (runtime_environment.get("packages") or {}).items():
+            params[f"runtime.package.{name}"] = version
     active_run.log_params(**{key: str(value) for key, value in params.items()})
-    active_run.set_tags(
-        **{
-            "mlflow.runName": job.key,
-            "robust_strategy.phase": phase,
-            "robust_strategy.quarter": job.quarter,
-            "robust_strategy.window_days": str(job.window_days),
-            "robust_strategy.model_id": job.model_id,
-            "robust_strategy.seed": "fixed" if job.seed is None else str(job.seed),
-            "robust_strategy.selection_period": (
-                "2023Q1-2025Q4_only"
-                if phase == "development"
-                else "frozen_before_2026_confirmation"
-            ),
-        }
-    )
+    tags = {
+        "mlflow.runName": job.key,
+        "robust_strategy.phase": phase,
+        "robust_strategy.quarter": job.quarter,
+        "robust_strategy.window_days": str(job.window_days),
+        "robust_strategy.model_id": job.model_id,
+        "robust_strategy.seed": "fixed" if job.seed is None else str(job.seed),
+        "robust_strategy.selection_period": (
+            "2023Q1-2025Q4_only"
+            if phase == "development"
+            else "frozen_before_2026_confirmation"
+        ),
+    }
+    if runtime_environment and runtime_environment.get("environment_hash"):
+        tags["robust_strategy.runtime_environment_hash"] = str(
+            runtime_environment["environment_hash"]
+        )
+    active_run.set_tags(**tags)
     for key in ("rows", "dates", "rank_ic_mean", "rank_ic_positive_ratio"):
         try:
             numeric = float(result[key])
@@ -850,8 +919,12 @@ def run_training_jobs(
     phase: str = "development",
     experiment_name: str = "robust_csi800_development",
     context_hash: str | None = None,
+    runtime_environment: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     run_dir = Path(run_dir)
+    runtime_environment = dict(
+        runtime_environment or collect_runtime_environment(config)
+    )
     if context_hash is None:
         context_hash = hashlib.sha256(
             json.dumps(
@@ -872,6 +945,7 @@ def run_training_jobs(
         progress = {"context_hash": context_hash, "jobs": {}}
     else:
         progress["context_hash"] = context_hash
+    progress["runtime_environment_hash"] = runtime_environment.get("environment_hash")
     job_progress: dict[str, dict[str, Any]] = progress["jobs"]
     expected_splits: dict[str, dict[str, str]] = {}
     split_objects: dict[tuple[str, int], RollingSplit] = {}
@@ -954,6 +1028,7 @@ def run_training_jobs(
                         prediction_path=prediction_path,
                         model_path=model_path,
                         phase=phase,
+                        runtime_environment=runtime_environment,
                     )
                 job_progress[job.key] = {
                     "status": "completed",
@@ -969,6 +1044,9 @@ def run_training_jobs(
                     "model_sha256": file_sha256(model_path),
                     "prediction_sha256": file_sha256(prediction_path),
                     "context_hash": context_hash,
+                    "runtime_environment_hash": runtime_environment.get(
+                        "environment_hash"
+                    ),
                     "split": _split_record(split),
                     **result,
                 }
@@ -1132,9 +1210,11 @@ def _externalize_frames(value: Any, output_dir: Path, prefix: str) -> Any:
     if isinstance(value, pd.DataFrame):
         path = output_dir / f"{prefix}.parquet"
         _atomic_write_parquet(
-            value.reset_index(drop=False)
-            if not isinstance(value.index, pd.RangeIndex)
-            else value,
+            (
+                value.reset_index(drop=False)
+                if not isinstance(value.index, pd.RangeIndex)
+                else value
+            ),
             path,
         )
         return {"artifact": str(path.resolve()), "rows": int(len(value))}
@@ -1197,6 +1277,7 @@ def _run_development_impl(
     report_dir = Path(report_dir).resolve()
     provider_state_path = Path(provider_state_path).resolve()
     config = load_config(config_path)
+    runtime_environment = collect_runtime_environment(config)
     paths = config["paths"]
     pit_dir = quant_data_dir / paths["pit_membership"]
     reference_dir = quant_data_dir / Path(paths["security_master"]).parent
@@ -1287,6 +1368,8 @@ def _run_development_impl(
         "reference_source_metadata": reference_source_metadata,
         "reference_snapshot_hash": reference_snapshot_hash,
         "provider_tree_sha256": provider_tree_sha256,
+        "runtime_environment": runtime_environment,
+        "runtime_environment_hash": runtime_environment["environment_hash"],
     }
     development_context_hash = payload_sha256(expected_context)
     expected_context["context_hash"] = development_context_hash
@@ -1359,6 +1442,7 @@ def _run_development_impl(
         mlflow_enabled=True,
         resume=resume,
         context_hash=development_context_hash,
+        runtime_environment=runtime_environment,
     )
     incomplete = [
         job.key
@@ -1560,6 +1644,10 @@ def _run_development_impl(
         reproducibility_failures.append("provider_snapshot")
     elif final_provider_identity.get("provider_tree_sha256") != provider_tree_sha256:
         reproducibility_failures.append("provider_tree_sha256")
+    if collect_runtime_environment(config).get(
+        "environment_hash"
+    ) != runtime_environment.get("environment_hash"):
+        reproducibility_failures.append("runtime_environment_changed")
     if reproducibility_failures:
         payload = _failure_report(
             "reproducibility_state_changed_during_development",
@@ -1589,6 +1677,8 @@ def _run_development_impl(
         "provider_uri": str(provider_uri),
         "provider_key": provider_key,
         "provider_tree_sha256": provider_tree_sha256,
+        "runtime_environment": runtime_environment,
+        "runtime_environment_hash": runtime_environment["environment_hash"],
         "development_context_hash": development_context_hash,
         "training_job_count": len(jobs),
         "selected_models": selected_ids,
@@ -1644,6 +1734,8 @@ def _run_development_impl(
             "provider_uri": payload["provider_uri"],
             "provider_key": payload["provider_key"],
             "provider_tree_sha256": payload["provider_tree_sha256"],
+            "runtime_environment": payload["runtime_environment"],
+            "runtime_environment_hash": payload["runtime_environment_hash"],
             "selected_models": selected_ids,
             "selected_model_configs": selected_model_configs,
             "selected_strategy": payload["selected_strategy"],
