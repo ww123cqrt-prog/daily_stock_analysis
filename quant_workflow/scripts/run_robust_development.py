@@ -1670,29 +1670,35 @@ def _run_development_impl(
     return payload
 
 
+def _publish_development_result(
+    payload: Mapping[str, Any], *, report_dir: Path, run_id: str | None
+) -> None:
+    """Persist every result both per-run and as the convenience latest view."""
+    report_dir = Path(report_dir).resolve()
+    if run_id:
+        _write_json(
+            report_dir / "runs" / str(run_id) / "development" / "development.json",
+            payload,
+        )
+    _write_json(report_dir / "development_latest.json", payload)
+    _atomic_write(report_dir / "development_latest.md", _development_markdown(payload))
+
+
 def run_development(**kwargs: Any) -> dict[str, Any]:
-    """Run development and always replace stale latest status on unexpected failure."""
+    """Run development and persist normal and unexpected results consistently."""
+    report_dir = Path(kwargs["report_dir"]).resolve()
+    run_id = str(kwargs.get("run_id") or "") or None
     try:
-        return _run_development_impl(**kwargs)
+        payload = _run_development_impl(**kwargs)
     except Exception as exc:
-        report_dir = Path(kwargs["report_dir"]).resolve()
-        run_id = str(kwargs.get("run_id") or "")
         payload = _failure_report(
             "development_execution_failed",
             as_of_date=str(kwargs.get("as_of_date") or ""),
-            run_id=run_id,
+            run_id=run_id or "",
             error_type=type(exc).__name__,
         )
-        if run_id:
-            _write_json(
-                report_dir / "runs" / run_id / "development" / "development.json",
-                payload,
-            )
-        _write_json(report_dir / "development_latest.json", payload)
-        _atomic_write(
-            report_dir / "development_latest.md", _development_markdown(payload)
-        )
-        return payload
+    _publish_development_result(payload, report_dir=report_dir, run_id=run_id)
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1732,7 +1738,9 @@ def main(argv: list[str] | None = None) -> int:
     provider_uri = Path(str(provider_state.get("provider_uri") or ""))
     if provider_state.get("status") != "completed" or not provider_uri.is_dir():
         payload = _failure_report("provider_state_missing", as_of_date=args.as_of_date)
-        _write_json(args.report_dir / "development_latest.json", payload)
+        _publish_development_result(
+            payload, report_dir=args.report_dir, run_id=args.run_id
+        )
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 2
     result = run_development(

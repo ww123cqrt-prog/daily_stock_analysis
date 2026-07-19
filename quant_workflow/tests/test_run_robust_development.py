@@ -1546,6 +1546,42 @@ def test_development_exception_overwrites_stale_ready_report_with_failure(
     assert latest["run_id"] == "exception-test"
 
 
+def test_run_development_publishes_normal_result_to_run_scoped_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    payload = {
+        "status": "development_failed",
+        "reason_code": "insufficient_stable_models_after_bounded_tuning",
+        "as_of_date": "2026-07-15",
+        "run_id": "normal-failure",
+    }
+    monkeypatch.setattr(module, "_run_development_impl", lambda **kwargs: payload)
+
+    result = module.run_development(
+        report_dir=report_dir,
+        run_id="normal-failure",
+        as_of_date="2026-07-15",
+    )
+
+    run_scoped = json.loads(
+        (
+            report_dir
+            / "runs"
+            / "normal-failure"
+            / "development"
+            / "development.json"
+        ).read_text(encoding="utf-8")
+    )
+    latest = json.loads(
+        (report_dir / "development_latest.json").read_text(encoding="utf-8")
+    )
+    assert result == payload
+    assert run_scoped == payload
+    assert latest == payload
+
+
 def test_run_development_rejects_invalid_reference_source_before_training(
     tmp_path: Path,
 ) -> None:
