@@ -20,8 +20,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Sequence
 
-import pandas as pd
 import cloudpickle
+import numpy as np
+import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -156,6 +157,14 @@ class TrainingJob(NamedTuple):
     def key(self) -> str:
         seed = "fixed" if self.seed is None else str(self.seed)
         return f"{self.quarter}__w{self.window_days}__{self.model_id}__s{seed}"
+
+
+class NeuralRepeatabilityError(RuntimeError):
+    """Raised when identical neural training inputs produce different scores."""
+
+    def __init__(self, message: str, *, max_abs_diff: float | None = None):
+        super().__init__(message)
+        self.max_abs_diff = max_abs_diff
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -651,6 +660,58 @@ def fit_predict_job(model: Any, dataset: Any, artifact_path: Path) -> dict[str, 
     }
 
 
+def compare_neural_prediction_artifacts(
+    primary_path: Path,
+    repeat_path: Path,
+    *,
+    score_max_abs_diff: float,
+) -> dict[str, Any]:
+    """Compare ordered neural scores and return durable repeatability evidence."""
+    if not math.isfinite(score_max_abs_diff) or score_max_abs_diff < 0.0:
+        raise ValueError("score_max_abs_diff must be finite and non-negative")
+    frames: list[pd.DataFrame] = []
+    for path in (Path(primary_path), Path(repeat_path)):
+        frame = pd.read_parquet(path, columns=["datetime", "instrument", "score"])
+        frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+        frame["instrument"] = frame["instrument"].astype(str)
+        frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+        if (
+            frame.empty
+            or frame[["datetime", "instrument", "score"]].isna().any().any()
+            or frame.duplicated(["datetime", "instrument"]).any()
+        ):
+            raise NeuralRepeatabilityError("neural repeatability artifact is invalid")
+        frames.append(
+            frame.sort_values(["datetime", "instrument"]).reset_index(drop=True)
+        )
+    primary, repeated = frames
+    if not primary[["datetime", "instrument"]].equals(
+        repeated[["datetime", "instrument"]]
+    ):
+        raise NeuralRepeatabilityError("neural repeatability prediction keys differ")
+    primary_scores = np.ascontiguousarray(primary["score"].to_numpy(dtype=np.float64))
+    repeat_scores = np.ascontiguousarray(repeated["score"].to_numpy(dtype=np.float64))
+    if not np.isfinite(primary_scores).all() or not np.isfinite(repeat_scores).all():
+        raise NeuralRepeatabilityError("neural repeatability scores are non-finite")
+    max_abs_diff = float(np.max(np.abs(primary_scores - repeat_scores)))
+    if max_abs_diff > score_max_abs_diff:
+        raise NeuralRepeatabilityError(
+            "neural repeatability score difference exceeds tolerance",
+            max_abs_diff=max_abs_diff,
+        )
+    return {
+        "neural_repeatability_passed": True,
+        "neural_repeatability_max_abs_diff": max_abs_diff,
+        "neural_repeatability_score_count": int(len(primary_scores)),
+        "neural_repeatability_primary_score_sha256": hashlib.sha256(
+            primary_scores.tobytes()
+        ).hexdigest(),
+        "neural_repeatability_repeat_score_sha256": hashlib.sha256(
+            repeat_scores.tobytes()
+        ).hexdigest(),
+    }
+
+
 def _split_record(split: RollingSplit) -> dict[str, str]:
     return {
         "train_start": _date(split.train_start),
@@ -679,6 +740,30 @@ def completed_job_artifact_is_valid(
         or state.get("seed") != job.seed
     ):
         return False
+    if job.model_id in NEURAL_MODELS:
+        try:
+            repeatability_diff = float(state["neural_repeatability_max_abs_diff"])
+            repeatability_count = int(state["neural_repeatability_score_count"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        repeatability_hashes = (
+            state.get("neural_repeatability_primary_score_sha256"),
+            state.get("neural_repeatability_repeat_score_sha256"),
+        )
+        if (
+            state.get("neural_repeatability_passed") is not True
+            or not math.isfinite(repeatability_diff)
+            or repeatability_diff < 0.0
+            or repeatability_diff > 1e-7
+            or repeatability_count <= 0
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in repeatability_hashes
+            )
+        ):
+            return False
     split = state.get("split")
     split_keys = {
         "train_start",
@@ -867,6 +952,12 @@ def _log_mlflow_result(
     }
     for key, value in (model_config.get("kwargs") or {}).items():
         params[f"model.{key}"] = value
+    for key in (
+        "neural_repeatability_primary_score_sha256",
+        "neural_repeatability_repeat_score_sha256",
+    ):
+        if result.get(key):
+            params[key] = result[key]
     if runtime_environment:
         for key in (
             "environment_hash",
@@ -900,7 +991,14 @@ def _log_mlflow_result(
             runtime_environment["environment_hash"]
         )
     active_run.set_tags(**tags)
-    for key in ("rows", "dates", "rank_ic_mean", "rank_ic_positive_ratio"):
+    for key in (
+        "rows",
+        "dates",
+        "rank_ic_mean",
+        "rank_ic_positive_ratio",
+        "neural_repeatability_max_abs_diff",
+        "neural_repeatability_score_count",
+    ):
         try:
             numeric = float(result[key])
         except (KeyError, TypeError, ValueError):
@@ -1027,6 +1125,29 @@ def run_training_jobs(
                     experiment_name=experiment_name,
                 ) as active_run:
                     result = fit_predict_job(model, dataset, prediction_path)
+                    if job.model_id in NEURAL_MODELS:
+                        repeatability_config = config["training"][
+                            "neural_repeatability"
+                        ]
+                        repeat_prediction_path = (
+                            run_dir / "repeatability" / f"{job.key}.parquet"
+                        )
+                        try:
+                            repeat_model = model_factory(model_config, job)
+                            fit_predict_job(
+                                repeat_model, dataset, repeat_prediction_path
+                            )
+                            result.update(
+                                compare_neural_prediction_artifacts(
+                                    prediction_path,
+                                    repeat_prediction_path,
+                                    score_max_abs_diff=float(
+                                        repeatability_config["score_max_abs_diff"]
+                                    ),
+                                )
+                            )
+                        finally:
+                            repeat_prediction_path.unlink(missing_ok=True)
                     _atomic_write_pickle(model, model_path)
                     run_id = _log_mlflow_result(
                         active_run,
@@ -1060,14 +1181,26 @@ def run_training_jobs(
                     **result,
                 }
             except Exception as exc:
+                reason_code = (
+                    "neural_repeatability_failed"
+                    if isinstance(exc, NeuralRepeatabilityError)
+                    else "model_training_failed"
+                )
                 job_progress[job.key] = {
                     "status": "failed",
                     "finished_at": datetime.now()
                     .astimezone()
                     .isoformat(timespec="seconds"),
-                    "reason_code": "model_training_failed",
+                    "reason_code": reason_code,
                     "error_type": type(exc).__name__,
                 }
+                if (
+                    isinstance(exc, NeuralRepeatabilityError)
+                    and exc.max_abs_diff is not None
+                ):
+                    job_progress[job.key]["neural_repeatability_max_abs_diff"] = (
+                        exc.max_abs_diff
+                    )
             _write_progress(progress_path, progress)
         del dataset
     return job_progress

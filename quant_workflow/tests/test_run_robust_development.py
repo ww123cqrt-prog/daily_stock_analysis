@@ -749,7 +749,15 @@ def test_mlflow_result_records_runtime_environment_hash_and_versions(
         job=job,
         model_config={"kwargs": {"device": "mps", "seed": 2026}},
         split=split,
-        result={"rows": 3, "dates": 1, "rank_ic_mean": 0.1},
+        result={
+            "rows": 3,
+            "dates": 1,
+            "rank_ic_mean": 0.1,
+            "neural_repeatability_max_abs_diff": 0.0,
+            "neural_repeatability_score_count": 3,
+            "neural_repeatability_primary_score_sha256": "a" * 64,
+            "neural_repeatability_repeat_score_sha256": "a" * 64,
+        },
         prediction_path=prediction_path,
         model_path=model_path,
         phase="development",
@@ -761,6 +769,10 @@ def test_mlflow_result_records_runtime_environment_hash_and_versions(
     assert recorder.params["runtime.package.pyqlib"] == "0.9.7"
     assert recorder.params["runtime.package.torch"] == "2.5.1"
     assert recorder.params["runtime.requested_device"] == "mps"
+    assert recorder.params["neural_repeatability_primary_score_sha256"] == "a" * 64
+    assert recorder.params["neural_repeatability_repeat_score_sha256"] == "a" * 64
+    assert recorder.metrics["development.neural_repeatability_max_abs_diff"] == 0.0
+    assert recorder.metrics["development.neural_repeatability_score_count"] == 3.0
     assert (
         recorder.tags["robust_strategy.runtime_environment_hash"]
         == runtime["environment_hash"]
@@ -850,6 +862,113 @@ def test_run_training_jobs_reuses_dataset_per_quarter_window_and_checkpoints(
         assert state["rows"] == 6
     saved = json.loads((tmp_path / "run" / "progress.json").read_text(encoding="utf-8"))
     assert set(saved["jobs"]) == {job.key for job in jobs}
+
+
+def test_neural_training_repeats_each_job_and_records_prediction_consistency(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    job = next(
+        item
+        for item in module.build_training_jobs(config)
+        if item.model_id == "mps_dnn"
+    )
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2023-01-03", "2023-01-04"]), ["A", "B"]],
+        names=["datetime", "instrument"],
+    )
+    model_calls: list[str] = []
+
+    class FakeDataset:
+        def prepare(self, segment, col_set, data_key=None):
+            return pd.DataFrame({"LABEL0": [0.03, 0.02, -0.01, 0.01]}, index=index)
+
+    class FakeModel:
+        def fit(self, dataset):
+            return None
+
+        def predict(self, dataset, segment="test"):
+            return pd.Series([0.4, 0.3, 0.2, 0.1], index=index)
+
+    def model_factory(model_config, current_job):
+        model_calls.append(current_job.key)
+        return FakeModel()
+
+    progress = module.run_training_jobs(
+        config,
+        [job],
+        provider_uri=tmp_path / "provider",
+        calendar=pd.bdate_range("2019-01-01", "2025-12-31"),
+        run_dir=tmp_path / "run",
+        dataset_factory=lambda *args: FakeDataset(),
+        model_factory=model_factory,
+        mlflow_enabled=False,
+    )
+
+    state = progress[job.key]
+    assert model_calls == [job.key, job.key]
+    assert state["status"] == "completed"
+    assert state["neural_repeatability_passed"] is True
+    assert state["neural_repeatability_max_abs_diff"] == pytest.approx(0.0)
+    assert state["neural_repeatability_score_count"] == 4
+    assert state["neural_repeatability_primary_score_sha256"]
+    assert (
+        state["neural_repeatability_primary_score_sha256"]
+        == state["neural_repeatability_repeat_score_sha256"]
+    )
+    assert not (tmp_path / "run" / "repeatability" / f"{job.key}.parquet").exists()
+
+
+def test_neural_training_fails_closed_when_repeat_prediction_changes(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    job = next(
+        item
+        for item in module.build_training_jobs(config)
+        if item.model_id == "mps_dnn"
+    )
+    index = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2023-01-03"), "SH600000")],
+        names=["datetime", "instrument"],
+    )
+    model_count = 0
+
+    class FakeDataset:
+        def prepare(self, segment, col_set, data_key=None):
+            return pd.DataFrame({"LABEL0": [0.01]}, index=index)
+
+    class FakeModel:
+        def __init__(self, score):
+            self.score = score
+
+        def fit(self, dataset):
+            return None
+
+        def predict(self, dataset, segment="test"):
+            return pd.Series([self.score], index=index)
+
+    def model_factory(model_config, current_job):
+        nonlocal model_count
+        model_count += 1
+        return FakeModel(1.0 if model_count == 1 else 1.01)
+
+    progress = module.run_training_jobs(
+        config,
+        [job],
+        provider_uri=tmp_path / "provider",
+        calendar=pd.bdate_range("2019-01-01", "2025-12-31"),
+        run_dir=tmp_path / "run",
+        dataset_factory=lambda *args: FakeDataset(),
+        model_factory=model_factory,
+        mlflow_enabled=False,
+    )
+
+    assert progress[job.key]["status"] == "failed"
+    assert progress[job.key]["reason_code"] == "neural_repeatability_failed"
+    assert progress[job.key]["error_type"] == "NeuralRepeatabilityError"
 
 
 def test_run_training_jobs_resume_skips_completed_artifact(tmp_path: Path) -> None:
@@ -1061,6 +1180,33 @@ def test_pending_jobs_treats_malformed_recorded_rows_as_invalid(tmp_path: Path) 
     state["rows"] = "not-an-integer"
 
     assert module.pending_jobs([job], {job.key: state}) == [job]
+
+
+def test_completed_neural_artifact_requires_repeatability_evidence(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    job = next(
+        item
+        for item in module.build_training_jobs(config)
+        if item.model_id == "mps_dnn"
+    )
+    state = completed_artifact_state(module, tmp_path / "artifacts", job)
+
+    assert module.completed_job_artifact_is_valid(job, state) is False
+
+    state.update(
+        neural_repeatability_passed=True,
+        neural_repeatability_max_abs_diff=0.0,
+        neural_repeatability_score_count=1,
+        neural_repeatability_primary_score_sha256="a" * 64,
+        neural_repeatability_repeat_score_sha256="a" * 64,
+    )
+    assert module.completed_job_artifact_is_valid(job, state) is True
+
+    state["neural_repeatability_max_abs_diff"] = 1e-6
+    assert module.completed_job_artifact_is_valid(job, state) is False
 
 
 def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(

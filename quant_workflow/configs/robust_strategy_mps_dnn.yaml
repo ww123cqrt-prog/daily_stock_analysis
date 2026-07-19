@@ -152,6 +152,9 @@ training:
     - 42
     - 2026
     - 3407
+  neural_repeatability:
+    enabled: true
+    score_max_abs_diff: 1.0e-7
   fixed_parameters_first: true
   bounded_tuning_trials_per_failed_model_max: 20
   ensemble_models_min: 2

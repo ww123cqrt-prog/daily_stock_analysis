@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -286,6 +287,26 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         evaluation_count = (max_steps + eval_steps - 1) // eval_steps
         if early_stop_rounds >= evaluation_count:
             raise ValueError("mps_dnn early stopping must be reachable before max_steps")
+        repeatability = payload.get("training", {}).get("neural_repeatability")
+        if (
+            not isinstance(repeatability, dict)
+            or repeatability.get("enabled") is not True
+        ):
+            raise ValueError("neural repeatability check must remain enabled")
+        try:
+            repeatability_tolerance = float(repeatability["score_max_abs_diff"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "training.neural_repeatability.score_max_abs_diff must be finite and at most 1e-7"
+            ) from exc
+        if (
+            not math.isfinite(repeatability_tolerance)
+            or repeatability_tolerance < 0.0
+            or repeatability_tolerance > 1e-7
+        ):
+            raise ValueError(
+                "training.neural_repeatability.score_max_abs_diff must be finite and at most 1e-7"
+            )
     if len(payload.get("rolling_validation", {}).get("test_quarters") or []) != 12:
         raise ValueError("rolling_validation must contain 12 development quarters")
     strategies = payload.get("strategies") or []

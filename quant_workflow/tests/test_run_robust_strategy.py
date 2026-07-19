@@ -168,6 +168,24 @@ def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
     with pytest.raises(ValueError, match="early stopping must be reachable"):
         module.load_config(unreachable_early_stop)
 
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["training"]["neural_repeatability"]["enabled"] = False
+    repeatability_disabled = tmp_path / "repeatability-disabled.yaml"
+    repeatability_disabled.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="neural repeatability check must remain enabled"):
+        module.load_config(repeatability_disabled)
+
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["training"]["neural_repeatability"]["score_max_abs_diff"] = 0.001
+    weak_repeatability = tmp_path / "weak-repeatability.yaml"
+    weak_repeatability.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="score_max_abs_diff"):
+        module.load_config(weak_repeatability)
+
 
 def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> None:
     module = load_module()
