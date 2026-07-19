@@ -110,6 +110,64 @@ def seed_reference_snapshot(quant_data: Path, membership_hash: str) -> Path:
     return reference
 
 
+def seed_robust_price_product(quant_data: Path) -> Path:
+    products = quant_data / "runtime" / "robust_strategy" / "price_products"
+    product = products / "0123456789abcdef"
+    (product / "cleaned_parquet").mkdir(parents=True)
+    (product / "qlib_provider" / "calendars").mkdir(parents=True)
+    (product / "qlib_provider" / "instruments").mkdir(parents=True)
+    (product / "cleaned_parquet" / "000001.parquet").write_bytes(b"parquet")
+    (product / "qlib_provider" / "calendars" / "day.txt").write_text(
+        "2025-01-02\n", encoding="utf-8"
+    )
+    (product / "qlib_provider" / "instruments" / "all.txt").write_text(
+        "SH000001\t2025-01-02\t2025-01-02\n", encoding="utf-8"
+    )
+    files = {
+        "cleaned_parquet/000001.parquet": {},
+        "qlib_provider/calendars/day.txt": {},
+        "qlib_provider/instruments/all.txt": {},
+    }
+    (product / "CONTENT.json").write_text(
+        json.dumps(
+            {
+                "build_version": 1,
+                "product_key": product.name,
+                "tree_sha256": "tree-hash",
+                "files": files,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (product / "BUILD.json").write_text(
+        json.dumps(
+            {
+                "build_version": 1,
+                "product_key": product.name,
+                "price_manifest_sha256": "p" * 64,
+                "membership_snapshot_hash": "m" * 64,
+                "benchmark_fingerprint": "b" * 64,
+                "content_manifest_sha256": "c" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (products / "latest_product.json").parent.mkdir(parents=True, exist_ok=True)
+    (products / "latest_product.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "product_key": product.name,
+                "product_dir": str(product),
+                "cleaned_symbols": 1,
+                "output_rows": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return product
+
+
 class SyncDataManifestTest(unittest.TestCase):
     def test_sync_manifest_reflects_actual_cleaned_provider_calendar(self):
         module = load_module()
@@ -190,6 +248,28 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(entry["row_counts"]["st_status.parquet"], 2)
         self.assertEqual(len(entry["reference_snapshot_hash"]), 64)
         self.assertNotIn("robust_reference", manifest.get("pending_entries", {}))
+
+    def test_manifest_registers_immutable_robust_price_product(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            pit_dir = seed_pit_membership(quant_data)
+            with module.membership_read_lock(pit_dir) as snapshot:
+                membership_hash = snapshot.fingerprint()
+            seed_reference_snapshot(quant_data, membership_hash)
+            product = seed_robust_price_product(quant_data)
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["official_entries"]["robust_price_product"]
+        self.assertEqual(entry["path"], str(product.resolve()))
+        self.assertEqual(entry["product_key"], product.name)
+        self.assertEqual(entry["cleaned_symbols"], 1)
+        self.assertNotIn("robust_price_product", manifest["pending_entries"])
 
     def test_pit_lock_remains_held_during_reference_validation(self):
         module = load_module()

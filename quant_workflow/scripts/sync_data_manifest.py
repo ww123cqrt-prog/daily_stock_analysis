@@ -244,6 +244,76 @@ def reference_manifest_entry(
         }
 
 
+def robust_price_product_manifest_entry(
+    runtime_root: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Register the immutable robust price product selected by its pointer."""
+    products_root = (Path(runtime_root) / "price_products").resolve()
+    pointer_path = products_root / "latest_product.json"
+    pending = {
+        "path": str(products_root),
+        "status": "not_ready",
+        "reason_code": "robust_price_product_missing",
+    }
+    if not pointer_path.is_file() or pointer_path.is_symlink():
+        return None, pending
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        product = Path(pointer["product_dir"]).expanduser()
+        if product.is_symlink() or product.resolve().parent != products_root:
+            raise ValueError("robust price product is outside its content-addressed root")
+        product = product.resolve()
+        if not product.is_dir():
+            raise ValueError("robust price product directory is missing")
+        build_path = product / "BUILD.json"
+        content_path = product / "CONTENT.json"
+        if build_path.is_symlink() or content_path.is_symlink():
+            raise ValueError("robust price product metadata contains a symlink")
+        build = json.loads(build_path.read_text(encoding="utf-8"))
+        content = json.loads(content_path.read_text(encoding="utf-8"))
+        product_key = str(pointer["product_key"])
+        if (
+            pointer.get("status") != "completed"
+            or build.get("product_key") != product_key
+            or content.get("product_key") != product_key
+            or not isinstance(content.get("files"), dict)
+            or not isinstance(content.get("tree_sha256"), str)
+            or build.get("content_manifest_sha256") is None
+        ):
+            raise ValueError("robust price product metadata is incomplete")
+        expected_paths = set(content["files"]) | {"BUILD.json", "CONTENT.json"}
+        actual_paths = {
+            path.relative_to(product).as_posix()
+            for path in product.rglob("*")
+            if path.is_file()
+        }
+        if actual_paths != expected_paths:
+            raise ValueError("robust price product file set does not match its manifest")
+        if any(path.is_symlink() for path in [product, *product.rglob("*")]):
+            raise ValueError("robust price product contains a symlink")
+        entry = {
+            "path": str(product),
+            "role": "Immutable cleaned OHLCV and Qlib provider for robust CSI800 research.",
+            "status": "do_not_move",
+            "product_key": product_key,
+            "price_manifest_sha256": build.get("price_manifest_sha256"),
+            "membership_snapshot_hash": build.get("membership_snapshot_hash"),
+            "benchmark_fingerprint": build.get("benchmark_fingerprint"),
+            "product_tree_sha256": content["tree_sha256"],
+            "content_manifest_sha256": build["content_manifest_sha256"],
+            "cleaned_parquet": str(product / "cleaned_parquet"),
+            "qlib_provider": str(product / "qlib_provider"),
+            "cleaned_symbols": pointer.get("cleaned_symbols"),
+            "output_rows": pointer.get("output_rows"),
+            "size": human_size(product),
+        }
+        return entry, None
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        pending["reason_code"] = "robust_price_product_invalid"
+        pending["message"] = str(exc)
+        return None, pending
+
+
 def robust_manifest_entries(reference_dir: Path) -> tuple[
     dict[str, Any] | None,
     dict[str, Any] | None,
@@ -290,8 +360,12 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     cleaned_provider = qlib_root / "cn_data_baostock_jqdata_cleaned"
     canonical_provider = qlib_root / "cn_data_baostock_jqdata"
     reference_root = quant_data / "reference"
+    robust_runtime_root = quant_data / "runtime" / "robust_strategy"
     pit_entry, pit_pending, reference_entry, reference_pending = (
         robust_manifest_entries(reference_root)
+    )
+    robust_product_entry, robust_product_pending = (
+        robust_price_product_manifest_entry(robust_runtime_root)
     )
 
     official_entries: dict[str, Any] = {
@@ -314,11 +388,15 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
         official_entries["pit_csi800"] = pit_entry
     if reference_entry is not None:
         official_entries["robust_reference"] = reference_entry
+    if robust_product_entry is not None:
+        official_entries["robust_price_product"] = robust_product_entry
     pending_entries: dict[str, Any] = {}
     if pit_pending is not None:
         pending_entries["pit_csi800"] = pit_pending
     if reference_pending is not None:
         pending_entries["robust_reference"] = reference_pending
+    if robust_product_pending is not None:
+        pending_entries["robust_price_product"] = robust_product_pending
 
     manifest = {
         "schema_version": 1,
