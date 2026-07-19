@@ -43,6 +43,7 @@ from robust_market_data import (  # noqa: E402
 from robust_strategy_core import make_confirmation_split  # noqa: E402
 from prepare_robust_provider import runtime_provider_identity  # noqa: E402
 from run_robust_development import (  # noqa: E402
+    NEURAL_MODELS,
     TREE_MODELS,
     TrainingJob,
     _atomic_write_parquet,
@@ -52,6 +53,7 @@ from run_robust_development import (  # noqa: E402
     load_config,
     make_job_split,
     completed_job_artifact_is_valid,
+    collect_runtime_environment,
     run_training_jobs,
     frozen_context_hash,
     payload_sha256,
@@ -105,9 +107,14 @@ def build_confirmation_jobs(
     jobs: list[TrainingJob] = []
     for window in config["training"]["windows_trading_days"]:
         for model_id in selected:
-            seeds: Sequence[int | None] = (
-                config["training"]["tree_seeds"] if model_id in TREE_MODELS else [None]
-            )
+            if model_id in TREE_MODELS:
+                seeds: Sequence[int | None] = config["training"]["tree_seeds"]
+            elif model_id in NEURAL_MODELS:
+                seeds = config["training"].get(
+                    "neural_seeds", config["training"]["tree_seeds"]
+                )
+            else:
+                seeds = [None]
             for seed in seeds:
                 jobs.append(
                     TrainingJob(
@@ -303,6 +310,18 @@ def run_confirmation(
         payload = _failure("frozen_context_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
+    runtime_environment = collect_runtime_environment(config)
+    frozen_runtime = frozen.get("runtime_environment")
+    if (
+        not isinstance(frozen_runtime, Mapping)
+        or frozen_runtime.get("environment_hash")
+        != frozen.get("runtime_environment_hash")
+        or frozen.get("runtime_environment_hash")
+        != runtime_environment["environment_hash"]
+    ):
+        payload = _failure("frozen_runtime_environment_mismatch", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
     development_artifacts = frozen.get("development_artifacts")
     if not isinstance(development_artifacts, list) or frozen.get(
         "development_artifacts_hash"
@@ -474,6 +493,7 @@ def run_confirmation(
         split_factory=split_factory,
         phase="confirmation",
         experiment_name="robust_csi800_confirmation",
+        runtime_environment=runtime_environment,
     )
     if any(progress.get(job.key, {}).get("status") != "completed" for job in jobs):
         payload = _failure("confirmation_training_incomplete", run_id=run_id)
@@ -676,6 +696,11 @@ def run_confirmation(
                     ) != frozen.get("provider_tree_sha256"):
                         reproducibility_failures.append("provider_tree_sha256")
                     if (
+                        collect_runtime_environment(config).get("environment_hash")
+                        != runtime_environment.get("environment_hash")
+                    ):
+                        reproducibility_failures.append("runtime_environment_hash")
+                    if (
                         membership_integrity_failure is not None
                         or final_membership_snapshot_hash
                         != frozen.get("membership_snapshot_hash")
@@ -719,6 +744,9 @@ def run_confirmation(
                         .astimezone()
                         .isoformat(timespec="seconds"),
                         "config_hash": frozen["config_hash"],
+                        "runtime_environment_hash": runtime_environment[
+                            "environment_hash"
+                        ],
                         "development_git_commit": frozen.get("git_commit"),
                         "selected_models": selected_ids,
                         "selected_strategy": strategy_id,

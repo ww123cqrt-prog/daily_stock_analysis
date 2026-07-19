@@ -14,6 +14,11 @@ SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "run_robust_confirmation.py"
 )
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+MPS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "robust_strategy_mps_dnn.yaml"
+)
 
 
 def load_module():
@@ -228,6 +233,9 @@ def frozen_fixture(
         "confirmation_run_started": False,
         "shadow_tracking_started": False,
     }
+    runtime_environment = module.collect_runtime_environment(config)
+    frozen["runtime_environment"] = runtime_environment
+    frozen["runtime_environment_hash"] = runtime_environment["environment_hash"]
     frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
     frozen_path = root / "frozen.json"
     frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
@@ -317,6 +325,20 @@ def test_confirmation_jobs_keep_frozen_models_and_full_window_seed_matrix(
     assert len([job for job in jobs if job.model_id == "linear_ridge"]) == 3
     assert len([job for job in jobs if job.model_id == "lightgbm"]) == 9
     assert {job.quarter for job in jobs} == {"confirmation_2026"}
+
+
+def test_confirmation_jobs_use_neural_seed_matrix_for_mps_dnn() -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+    frozen = {"selected_models": ["linear_ridge", "mps_dnn"]}
+
+    jobs = module.build_confirmation_jobs(config, frozen)
+    dnn_jobs = [job for job in jobs if job.model_id == "mps_dnn"]
+
+    assert len(jobs) == 12
+    assert len(dnn_jobs) == 9
+    assert {job.window_days for job in dnn_jobs} == {504, 756, 1008}
+    assert {job.seed for job in dnn_jobs} == {42, 2026, 3407}
 
 
 def test_confirmation_refuses_missing_frozen_candidate(tmp_path: Path) -> None:
@@ -1133,6 +1155,35 @@ def test_confirmation_refuses_tampered_frozen_context_before_claim(
 
     frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
     assert result["reason_code"] == "frozen_context_mismatch"
+    assert frozen_after["confirmation_run_started"] is False
+
+
+def test_confirmation_refuses_runtime_environment_mismatch_before_claim(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    frozen_path, provider_state, _ = frozen_fixture(module, tmp_path)
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    frozen["runtime_environment_hash"] = "f" * 64
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
+    frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
+
+    result = module.run_confirmation(
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports",
+        frozen_path=frozen_path,
+        provider_state_path=provider_state,
+        run_id="confirmation-runtime-mismatch",
+        git_state_provider=lambda: {
+            "commit": "a" * 40,
+            "clean": True,
+            "changes": [],
+        },
+    )
+
+    frozen_after = json.loads(frozen_path.read_text(encoding="utf-8"))
+    assert result["reason_code"] == "frozen_runtime_environment_mismatch"
     assert frozen_after["confirmation_run_started"] is False
 
 

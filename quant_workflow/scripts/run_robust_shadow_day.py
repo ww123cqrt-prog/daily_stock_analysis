@@ -41,8 +41,11 @@ from robust_shadow_tracking import (  # noqa: E402
 )
 from robust_strategy_core import RollingSplit  # noqa: E402
 from run_robust_development import (  # noqa: E402
+    NEURAL_MODELS,
     TREE_MODELS,
     build_dataset_config,
+    collect_runtime_environment,
+    frozen_context_hash,
     selection_contract_hash,
 )
 from run_robust_strategy import (  # noqa: E402
@@ -144,9 +147,14 @@ def _expected_artifact_keys(
 ) -> set[tuple[str, int, int | None]]:
     expected: set[tuple[str, int, int | None]] = set()
     for model_id in selected_models:
-        seeds: Sequence[int | None] = (
-            config["training"]["tree_seeds"] if model_id in TREE_MODELS else [None]
-        )
+        if model_id in TREE_MODELS:
+            seeds: Sequence[int | None] = config["training"]["tree_seeds"]
+        elif model_id in NEURAL_MODELS:
+            seeds = config["training"].get(
+                "neural_seeds", config["training"]["tree_seeds"]
+            )
+        else:
+            seeds = [None]
         for window in config["training"]["windows_trading_days"]:
             for seed in seeds:
                 expected.add(
@@ -179,6 +187,18 @@ def _validate_frozen_inputs(
         or frozen.get("config_hash") != config_hash
     ):
         raise ShadowBlocked("frozen_config_mismatch")
+    if frozen.get("frozen_context_hash") != frozen_context_hash(frozen):
+        raise ShadowBlocked("frozen_context_mismatch")
+    runtime_environment = collect_runtime_environment(config)
+    frozen_runtime = frozen.get("runtime_environment")
+    if (
+        not isinstance(frozen_runtime, Mapping)
+        or frozen_runtime.get("environment_hash")
+        != frozen.get("runtime_environment_hash")
+        or frozen.get("runtime_environment_hash")
+        != runtime_environment["environment_hash"]
+    ):
+        raise ShadowBlocked("frozen_runtime_environment_mismatch")
 
     selected_models = [str(value) for value in frozen.get("selected_models") or []]
     selected_configs = frozen.get("selected_model_configs")
@@ -203,6 +223,8 @@ def _validate_frozen_inputs(
         or confirmation.get("selected_strategy") != selected_strategy
         or confirmation.get("run_id") != frozen.get("confirmation_run_id")
         or confirmation.get("latest_market_day") != frozen.get("shadow_start_after")
+        or confirmation.get("runtime_environment_hash")
+        != frozen.get("runtime_environment_hash")
     ):
         raise ShadowBlocked("confirmation_contract_mismatch")
 

@@ -14,6 +14,11 @@ SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "run_robust_shadow_day.py"
 )
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "robust_strategy.yaml"
+MPS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "robust_strategy_mps_dnn.yaml"
+)
 
 
 def load_module():
@@ -150,6 +155,10 @@ def make_run_fixture(
         "confirmation_run_id": "confirmation-one",
         "shadow_start_after": shadow_start_after,
     }
+    runtime_environment = module.collect_runtime_environment(config)
+    frozen["runtime_environment"] = runtime_environment
+    frozen["runtime_environment_hash"] = runtime_environment["environment_hash"]
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
     frozen_path = tmp_path / "frozen.json"
     frozen_path.write_text(json.dumps(frozen), encoding="utf-8")
     confirmation = {
@@ -162,6 +171,7 @@ def make_run_fixture(
         "confirmation_model_artifact_count": len(artifacts),
         "confirmation_ensemble_prediction_path": str(ensemble_path),
         "confirmation_ensemble_prediction_hash": ensemble_hash,
+        "runtime_environment_hash": frozen["runtime_environment_hash"],
     }
     confirmation_path = tmp_path / "confirmation.json"
     confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
@@ -279,6 +289,43 @@ def test_provider_prefix_change_is_blocked_before_inference(tmp_path: Path) -> N
     assert result["reason_code"] == "provider_history_changed"
     assert calls == []
     assert not (fixture["report_dir"] / "shadow_state_latest.json").exists()
+
+
+def test_expected_artifact_keys_use_neural_seeds_for_mps_dnn() -> None:
+    module = load_module()
+    config = module.load_config(MPS_CONFIG_PATH)
+
+    keys = module._expected_artifact_keys(config, ["linear_ridge", "mps_dnn"])
+    dnn_keys = {item for item in keys if item[0] == "mps_dnn"}
+
+    assert len(keys) == 12
+    assert len(dnn_keys) == 9
+    assert {item[1] for item in dnn_keys} == {504, 756, 1008}
+    assert {item[2] for item in dnn_keys} == {42, 2026, 3407}
+
+
+def test_runtime_environment_mismatch_blocks_before_inference(tmp_path: Path) -> None:
+    module = load_module()
+    fixture = make_run_fixture(
+        module, tmp_path, dates=["2026-07-15", "2026-07-16"]
+    )
+    frozen = json.loads(fixture["frozen_path"].read_text(encoding="utf-8"))
+    frozen["runtime_environment_hash"] = "f" * 64
+    frozen["frozen_context_hash"] = module.frozen_context_hash(frozen)
+    fixture["frozen_path"].write_text(json.dumps(frozen), encoding="utf-8")
+    calls = []
+    kwargs, _ = run_kwargs(
+        module,
+        fixture,
+        as_of_date="2026-07-16",
+        inference_runner=lambda **kwargs: calls.append(kwargs),
+    )
+
+    result = module.run_shadow_day(**kwargs)
+
+    assert result["status"] == "development_failed"
+    assert result["reason_code"] == "frozen_runtime_environment_mismatch"
+    assert calls == []
 
 
 def test_verify_provider_requires_calendar_and_every_frozen_feature_to_be_prefix(
