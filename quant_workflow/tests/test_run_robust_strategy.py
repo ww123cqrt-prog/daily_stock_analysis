@@ -157,7 +157,7 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
     )
     provider_index = benchmark_stage.argv.index("--provider-dir")
     assert benchmark_stage.argv[provider_index + 1] == str(
-        tmp_path / "quant_data" / "qlib" / "cn_data_baostock_jqdata_cleaned"
+        tmp_path / "quant_data" / Path(config["paths"]["qlib_provider"])
     )
     required_start_index = benchmark_stage.argv.index("--required-start-date")
     assert benchmark_stage.argv[required_start_index + 1] == "2014-01-02"

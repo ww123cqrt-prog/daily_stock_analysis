@@ -22,8 +22,8 @@ paths:
   industry_intervals: reference/industry_intervals.parquet
   st_status: reference/st_status.parquet
   suspension_status: reference/suspension_status.parquet
-  price_parquet: parquet/ashare_1d/merged_baostock_jqdata_cleaned
-  qlib_provider: qlib/cn_data_baostock_jqdata_cleaned
+  price_parquet: runtime/robust_strategy/price_products/5516946a71ba8b12/cleaned_parquet
+  qlib_provider: runtime/robust_strategy/price_products/5516946a71ba8b12/qlib_provider
 
 universe:
   kind: pit_csi800
