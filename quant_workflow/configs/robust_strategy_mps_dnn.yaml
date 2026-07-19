@@ -132,7 +132,7 @@ models:
       lr: 0.001
       max_steps: 300
       batch_size: 2048
-      early_stop_rounds: 50
+      early_stop_rounds: 5
       eval_steps: 20
       hidden_layers: [128, 64]
       dropout: 0.05

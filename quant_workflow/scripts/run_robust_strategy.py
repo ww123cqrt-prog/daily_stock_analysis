@@ -268,8 +268,24 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         mps_model = next(
             item for item in payload["models"] if str(item.get("id")) == "mps_dnn"
         )
-        if str((mps_model.get("kwargs") or {}).get("device")) != "mps":
+        mps_kwargs = mps_model.get("kwargs") or {}
+        if str(mps_kwargs.get("device")) != "mps":
             raise ValueError("mps_dnn must use device=mps without CPU fallback")
+        try:
+            max_steps = int(mps_kwargs["max_steps"])
+            eval_steps = int(mps_kwargs["eval_steps"])
+            early_stop_rounds = int(mps_kwargs["early_stop_rounds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "mps_dnn early stopping parameters must be positive integers"
+            ) from exc
+        if max_steps <= 0 or eval_steps <= 0 or early_stop_rounds <= 0:
+            raise ValueError(
+                "mps_dnn early stopping parameters must be positive integers"
+            )
+        evaluation_count = (max_steps + eval_steps - 1) // eval_steps
+        if early_stop_rounds >= evaluation_count:
+            raise ValueError("mps_dnn early stopping must be reachable before max_steps")
     if len(payload.get("rolling_validation", {}).get("test_quarters") or []) != 12:
         raise ValueError("rolling_validation must contain 12 development quarters")
     strategies = payload.get("strategies") or []

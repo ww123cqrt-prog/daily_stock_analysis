@@ -97,7 +97,16 @@ MODEL_DISTRIBUTIONS = {
     "catboost": ("catboost",),
     "mps_dnn": ("torch",),
 }
-BASE_TRAINING_DISTRIBUTIONS = ("pyqlib", "scikit-learn", "mlflow")
+BASE_TRAINING_DISTRIBUTIONS = (
+    "cloudpickle",
+    "mlflow",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyqlib",
+    "pyyaml",
+    "scikit-learn",
+)
 
 
 def collect_runtime_environment(config: Mapping[str, Any]) -> dict[str, Any]:

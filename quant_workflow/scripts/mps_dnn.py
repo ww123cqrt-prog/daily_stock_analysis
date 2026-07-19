@@ -89,7 +89,7 @@ class MPSDNNModel:
         lr: float = 0.001,
         max_steps: int = 300,
         batch_size: int = 2048,
-        early_stop_rounds: int = 50,
+        early_stop_rounds: int = 5,
         eval_steps: int = 20,
         hidden_layers: tuple[int, ...] | list[int] = (128, 64),
         dropout: float = 0.05,
@@ -111,8 +111,15 @@ class MPSDNNModel:
         self.seed = int(seed)
         if not self.hidden_layers or any(width <= 0 for width in self.hidden_layers):
             raise ValueError("hidden_layers must contain positive widths")
-        if self.max_steps <= 0 or self.batch_size <= 0 or self.eval_steps <= 0:
-            raise ValueError("max_steps, batch_size, and eval_steps must be positive")
+        if (
+            self.max_steps <= 0
+            or self.batch_size <= 0
+            or self.eval_steps <= 0
+            or self.early_stop_rounds <= 0
+        ):
+            raise ValueError(
+                "max_steps, batch_size, eval_steps, and early_stop_rounds must be positive"
+            )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
         self._network = None

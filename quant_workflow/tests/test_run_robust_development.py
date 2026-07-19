@@ -396,9 +396,14 @@ def test_runtime_environment_metadata_is_hashed_and_contains_no_paths() -> None:
     assert metadata["requested_device"] == "mps"
     assert set(metadata["packages"]) == {
         "catboost",
+        "cloudpickle",
         "lightgbm",
         "mlflow",
+        "numpy",
+        "pandas",
+        "pyarrow",
         "pyqlib",
+        "pyyaml",
         "scikit-learn",
         "torch",
         "xgboost",

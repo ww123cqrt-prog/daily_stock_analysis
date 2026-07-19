@@ -158,6 +158,16 @@ def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
     with pytest.raises(ValueError, match="without CPU fallback"):
         module.load_config(cpu_fallback)
 
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+    mps_model = next(item for item in payload["models"] if item["id"] == "mps_dnn")
+    mps_model["kwargs"]["early_stop_rounds"] = 15
+    unreachable_early_stop = tmp_path / "unreachable-early-stop.yaml"
+    unreachable_early_stop.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="early stopping must be reachable"):
+        module.load_config(unreachable_early_stop)
+
 
 def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> None:
     module = load_module()
