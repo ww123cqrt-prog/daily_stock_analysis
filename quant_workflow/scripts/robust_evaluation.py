@@ -729,14 +729,75 @@ def evaluate_strategy_candidates(
     }
 
 
+def cross_model_diversification_report(
+    model_predictions: Mapping[str, pd.DataFrame],
+    model_ids: Sequence[str],
+    *,
+    topk: int = 50,
+    rank_correlation_abs_max: float,
+    topk_overlap_max: float,
+) -> dict[str, Any]:
+    ordered_ids = [str(model_id) for model_id in model_ids]
+    if len(set(ordered_ids)) != len(ordered_ids):
+        raise ValueError("cross-model diversification requires unique model ids")
+    pairs: list[dict[str, Any]] = []
+    for left_id, right_id in itertools.combinations(ordered_ids, 2):
+        if left_id not in model_predictions or right_id not in model_predictions:
+            raise ValueError("cross-model diversification prediction is missing")
+        rank_corr, overlap = _prediction_pair_stability(
+            model_predictions[left_id],
+            model_predictions[right_id],
+            left_name=left_id,
+            right_name=right_id,
+            topk=topk,
+        )
+        passed = (
+            math.isfinite(rank_corr)
+            and abs(rank_corr) <= rank_correlation_abs_max
+            and math.isfinite(overlap)
+            and overlap <= topk_overlap_max
+        )
+        pairs.append(
+            {
+                "left_model": left_id,
+                "right_model": right_id,
+                "rank_correlation_median": rank_corr,
+                "rank_correlation_abs": (
+                    abs(rank_corr) if math.isfinite(rank_corr) else None
+                ),
+                "topk_overlap_mean": overlap,
+                "passed": passed,
+            }
+        )
+    return {
+        "model_ids": ordered_ids,
+        "pair_count": len(pairs),
+        "passed": len(ordered_ids) >= 2 and all(item["passed"] for item in pairs),
+        "rank_correlation_abs_max": rank_correlation_abs_max,
+        "topk_overlap_max": topk_overlap_max,
+        "pairs": pairs,
+    }
+
+
 def select_development_models(
     reports: Sequence[Mapping[str, Any]],
     *,
     minimum: int = 2,
     maximum: int = 3,
+    model_predictions: Mapping[str, pd.DataFrame] | None = None,
+    topk: int = 50,
+    rank_correlation_abs_max: float = 1.0,
+    topk_overlap_max: float = 1.0,
 ) -> list[Mapping[str, Any]]:
     if minimum <= 0 or maximum < minimum:
         raise ValueError("invalid ensemble model count bounds")
+    if (
+        not math.isfinite(rank_correlation_abs_max)
+        or not 0.0 <= rank_correlation_abs_max <= 1.0
+        or not math.isfinite(topk_overlap_max)
+        or not 0.0 <= topk_overlap_max <= 1.0
+    ):
+        raise ValueError("invalid cross-model diversification thresholds")
     eligible = [item for item in reports if item.get("eligible") is True]
     eligible.sort(
         key=lambda item: (
@@ -747,7 +808,28 @@ def select_development_models(
     )
     if len(eligible) < minimum:
         return []
-    return eligible[:maximum]
+    if model_predictions is None:
+        return eligible[:maximum]
+    selected: list[Mapping[str, Any]] = []
+    for report in eligible:
+        model_id = str(report.get("model_id") or "")
+        if model_id not in model_predictions:
+            raise ValueError(f"model prediction is missing for selection: {model_id}")
+        if selected:
+            candidate_ids = [str(item["model_id"]) for item in selected] + [model_id]
+            diversification = cross_model_diversification_report(
+                model_predictions,
+                candidate_ids,
+                topk=topk,
+                rank_correlation_abs_max=rank_correlation_abs_max,
+                topk_overlap_max=topk_overlap_max,
+            )
+            if diversification["passed"] is not True:
+                continue
+        selected.append(report)
+        if len(selected) >= maximum:
+            break
+    return selected if len(selected) >= minimum else []
 
 
 def confirmation_verdict(

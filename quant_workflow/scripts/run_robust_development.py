@@ -33,6 +33,7 @@ from _paths import mlruns_root  # noqa: E402
 from robust_evaluation import (  # noqa: E402
     aggregate_prediction_frames,
     aggregate_training_artifacts,
+    cross_model_diversification_report,
     evaluate_strategy_candidates,
     select_development_models,
 )
@@ -1641,18 +1642,37 @@ def _run_development_impl(
         topk=int(config["portfolio"]["topk"]),
         thresholds=config["acceptance"],
     )
+    selection_options = {
+        "maximum": int(config["training"]["ensemble_models_max"]),
+        "topk": int(config["portfolio"]["topk"]),
+        "rank_correlation_abs_max": float(
+            config["training"]["ensemble_model_rank_correlation_abs_max"]
+        ),
+        "topk_overlap_max": float(
+            config["training"]["ensemble_model_top50_overlap_max"]
+        ),
+    }
     selected_reports = select_development_models(
         aggregated["model_reports"],
         minimum=int(config["training"]["ensemble_models_min"]),
-        maximum=int(config["training"]["ensemble_models_max"]),
+        model_predictions=aggregated["model_predictions"],
+        **selection_options,
     )
     tuning_summaries: list[dict[str, Any]] = []
     tuned_artifacts_by_model: dict[str, list[dict[str, Any]]] = {}
     if len(selected_reports) < int(config["training"]["ensemble_models_min"]):
+        preserved_reports = select_development_models(
+            aggregated["model_reports"],
+            minimum=1,
+            model_predictions=aggregated["model_predictions"],
+            **selection_options,
+        )
+        preserved_ids = {str(item["model_id"]) for item in preserved_reports}
         failed_model_ids = [
             str(item["model_id"])
             for item in aggregated["model_reports"]
             if item.get("eligible") is not True
+            or str(item["model_id"]) not in preserved_ids
         ]
         tuned = tuner(
             config,
@@ -1679,14 +1699,29 @@ def _run_development_impl(
         selected_reports = select_development_models(
             aggregated["model_reports"],
             minimum=int(config["training"]["ensemble_models_min"]),
-            maximum=int(config["training"]["ensemble_models_max"]),
+            model_predictions=aggregated["model_predictions"],
+            **selection_options,
         )
         if len(selected_reports) < int(config["training"]["ensemble_models_min"]):
+            eligible_ids = [
+                str(item["model_id"])
+                for item in aggregated["model_reports"]
+                if item.get("eligible") is True
+            ]
             payload = _failure_report(
-                "insufficient_stable_models_after_bounded_tuning",
+                "insufficient_stable_diverse_models_after_bounded_tuning",
                 as_of_date=as_of_date,
                 started=len(jobs),
                 model_reports=aggregated["model_reports"],
+                model_diversification=cross_model_diversification_report(
+                    aggregated["model_predictions"],
+                    eligible_ids,
+                    topk=int(config["portfolio"]["topk"]),
+                    rank_correlation_abs_max=selection_options[
+                        "rank_correlation_abs_max"
+                    ],
+                    topk_overlap_max=selection_options["topk_overlap_max"],
+                ),
                 tuning_summaries=tuning_summaries,
                 bounded_tuning_trials_per_model=int(
                     config["training"]["bounded_tuning_trials_per_failed_model_max"]
@@ -1695,6 +1730,13 @@ def _run_development_impl(
             _write_json(report_dir / "development_latest.json", payload)
             return payload
     selected_ids = [str(item["model_id"]) for item in selected_reports]
+    model_diversification = cross_model_diversification_report(
+        aggregated["model_predictions"],
+        selected_ids,
+        topk=int(config["portfolio"]["topk"]),
+        rank_correlation_abs_max=selection_options["rank_correlation_abs_max"],
+        topk_overlap_max=selection_options["topk_overlap_max"],
+    )
     ensemble = aggregate_prediction_frames(
         {
             model_id: aggregated["model_predictions"][model_id]
@@ -1850,6 +1892,7 @@ def _run_development_impl(
             else None
         ),
         "model_reports": aggregated["model_reports"],
+        "model_diversification": model_diversification,
         "tuning_summaries": tuning_summaries,
         "evaluation": _externalize_frames(
             evaluation, run_dir / "backtests", "development"

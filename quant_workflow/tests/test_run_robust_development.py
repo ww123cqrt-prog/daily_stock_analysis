@@ -159,6 +159,25 @@ def membership_context_fields(module, quant_data: Path) -> dict:
     }
 
 
+def diverse_prediction_pair(
+    report_date: str = "2025-01-02",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    symbols = [f"S{index:03d}" for index in range(100)]
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime([report_date]), symbols],
+        names=["datetime", "instrument"],
+    )
+    labels = np.linspace(0.03, -0.03, len(symbols))
+    first = pd.DataFrame(
+        {"score": np.arange(100.0, 0.0, -1.0), "label": labels}, index=index
+    )
+    second = pd.DataFrame(
+        {"score": np.roll(first["score"].to_numpy(), 50), "label": labels},
+        index=index,
+    )
+    return first, second
+
+
 def build_resume_fixture(module, root: Path, *, run_id: str) -> dict:
     provider = root / "provider"
     (provider / "calendars").mkdir(parents=True)
@@ -1262,12 +1281,24 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
     reference_source = write_reference_source(quant_data)
     report_dir = tmp_path / "reports"
+    symbols = [f"S{index:03d}" for index in range(100)]
     index = pd.MultiIndex.from_product(
-        [pd.to_datetime(["2025-01-02"]), ["A", "B", "C"]],
+        [pd.to_datetime(["2025-01-02"]), symbols],
         names=["datetime", "instrument"],
     )
-    model_prediction = pd.DataFrame(
-        {"score": [3.0, 2.0, 1.0], "label": [0.03, 0.02, 0.01]}, index=index
+    lightgbm_prediction = pd.DataFrame(
+        {
+            "score": np.arange(100.0, 0.0, -1.0),
+            "label": np.linspace(0.03, -0.03, 100),
+        },
+        index=index,
+    )
+    ridge_prediction = pd.DataFrame(
+        {
+            "score": np.roll(np.arange(100.0, 0.0, -1.0), 50),
+            "label": lightgbm_prediction["label"],
+        },
+        index=index,
     )
     calendar = pd.bdate_range("2018-01-01", "2026-07-15")
 
@@ -1334,8 +1365,8 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
         return {
             "model_reports": reports,
             "model_predictions": {
-                "lightgbm": model_prediction,
-                "linear_ridge": model_prediction,
+                "lightgbm": lightgbm_prediction,
+                "linear_ridge": ridge_prediction,
             },
             "window_predictions": {},
         }
@@ -1394,6 +1425,8 @@ def test_run_development_writes_frozen_candidate_only_after_all_gates_pass(
     assert len(latest["reference_snapshot_hash"]) == 64
     assert latest["membership_source_metadata"]["selected"] == "baostock"
     assert len(latest["membership_snapshot_hash"]) == 64
+    assert latest["model_diversification"]["passed"] is True
+    assert latest["model_diversification"]["pair_count"] == 1
     assert frozen["selected_models"] == ["lightgbm", "linear_ridge"]
     assert frozen["selected_strategy"] == "full_risk_control"
     assert frozen["reference_source_metadata"] == reference_source
@@ -1466,13 +1499,7 @@ def test_run_development_rechecks_provider_before_freezing_candidate(
     (quant_data / "DATA_MANIFEST.json").write_text('{"version": 1}\n', encoding="utf-8")
     write_reference_source(quant_data)
     report_dir = tmp_path / "reports"
-    index = pd.MultiIndex.from_product(
-        [pd.to_datetime(["2025-01-02"]), ["A", "B", "C"]],
-        names=["datetime", "instrument"],
-    )
-    prediction = pd.DataFrame(
-        {"score": [3.0, 2.0, 1.0], "label": [0.03, 0.02, 0.01]}, index=index
-    )
+    lightgbm_prediction, ridge_prediction = diverse_prediction_pair()
 
     def training_runner(config, jobs, **kwargs):
         return {
@@ -1490,7 +1517,10 @@ def test_run_development_rechecks_provider_before_freezing_candidate(
         ]
         return {
             "model_reports": reports,
-            "model_predictions": {"lightgbm": prediction, "linear_ridge": prediction},
+            "model_predictions": {
+                "lightgbm": lightgbm_prediction,
+                "linear_ridge": ridge_prediction,
+            },
             "window_predictions": {},
         }
 
@@ -1960,11 +1990,7 @@ def test_run_development_detects_snapshot_change_before_evaluation(
         module.TrainingJob("2025Q1", 504, "linear_ridge", None),
     ]
     monkeypatch.setattr(module, "build_training_jobs", lambda config: jobs)
-    index = pd.MultiIndex.from_product(
-        [pd.to_datetime(["2025-01-02"]), ["A", "B"]],
-        names=["datetime", "instrument"],
-    )
-    prediction = pd.DataFrame({"score": [2.0, 1.0], "label": [0.02, 0.01]}, index=index)
+    lightgbm_prediction, ridge_prediction = diverse_prediction_pair()
 
     def training_runner(config, selected_jobs, **kwargs):
         return {
@@ -1983,8 +2009,8 @@ def test_run_development_detects_snapshot_change_before_evaluation(
         return {
             "model_reports": reports,
             "model_predictions": {
-                "lightgbm": prediction,
-                "linear_ridge": prediction,
+                "lightgbm": lightgbm_prediction,
+                "linear_ridge": ridge_prediction,
             },
             "window_predictions": {},
         }

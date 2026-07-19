@@ -268,6 +268,16 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("training.windows_trading_days must remain [504, 756, 1008]")
     if payload.get("training", {}).get("tree_seeds") != [42, 2026, 3407]:
         raise ValueError("training.tree_seeds must remain [42, 2026, 3407]")
+    _require_at_most(
+        payload,
+        ("training", "ensemble_model_rank_correlation_abs_max"),
+        0.95,
+    )
+    _require_at_most(
+        payload,
+        ("training", "ensemble_model_top50_overlap_max"),
+        0.90,
+    )
     model_ids = {str(item.get("id")) for item in payload.get("models") or []}
     if "mps_dnn" in model_ids:
         if payload.get("training", {}).get("neural_seeds") != [42, 2026, 3407]:

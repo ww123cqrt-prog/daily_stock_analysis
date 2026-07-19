@@ -184,6 +184,66 @@ def test_model_selection_uses_only_eligible_development_score() -> None:
     assert [item["model_id"] for item in selected] == ["a", "b", "c"]
 
 
+def test_model_selection_skips_near_duplicate_cross_model_predictions() -> None:
+    module = load_module()
+    reports = [
+        {"model_id": "a", "eligible": True, "development_score": 3.0},
+        {"model_id": "b", "eligible": True, "development_score": 2.0},
+        {"model_id": "c", "eligible": True, "development_score": 1.0},
+    ]
+    anchor = prediction_frame([1, 2, 3, 3, 2, 1])
+    predictions = {
+        "a": anchor,
+        "b": anchor.copy(),
+        "c": prediction_frame([2, 3, 1, 2, 1, 3]),
+    }
+
+    selected = module.select_development_models(
+        reports,
+        minimum=2,
+        maximum=3,
+        model_predictions=predictions,
+        topk=2,
+        rank_correlation_abs_max=0.95,
+        topk_overlap_max=0.90,
+    )
+
+    assert [item["model_id"] for item in selected] == ["a", "c"]
+
+    insufficient = module.select_development_models(
+        reports[:2],
+        minimum=2,
+        maximum=3,
+        model_predictions={"a": anchor, "b": anchor.copy()},
+        topk=2,
+        rank_correlation_abs_max=0.95,
+        topk_overlap_max=0.90,
+    )
+    assert insufficient == []
+
+
+def test_cross_model_diversification_report_records_pair_gates() -> None:
+    module = load_module()
+    predictions = {
+        "a": prediction_frame([1, 2, 3, 3, 2, 1]),
+        "b": prediction_frame([2, 3, 1, 2, 1, 3]),
+    }
+
+    report = module.cross_model_diversification_report(
+        predictions,
+        ["a", "b"],
+        topk=2,
+        rank_correlation_abs_max=0.95,
+        topk_overlap_max=0.90,
+    )
+
+    assert report["passed"] is True
+    assert report["pair_count"] == 1
+    assert report["pairs"][0]["passed"] is True
+    assert abs(report["pairs"][0]["rank_correlation_median"]) == 0.5
+    assert report["pairs"][0]["topk_overlap_mean"] == 0.5
+
+
 def test_confirmation_and_shadow_gates_fail_closed() -> None:
     module = load_module()
 

@@ -138,6 +138,15 @@ def test_load_config_rejects_lowered_safety_or_acceptance_contract(
     with pytest.raises(ValueError, match="seed_rank_correlation_median_min"):
         module.load_config(weak_seed_gate)
 
+    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["training"]["ensemble_model_rank_correlation_abs_max"] = 1.0
+    weak_diversification = tmp_path / "weak-diversification.yaml"
+    weak_diversification.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="ensemble_model_rank_correlation_abs_max"):
+        module.load_config(weak_diversification)
+
 
 def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
     tmp_path: Path,

@@ -139,6 +139,8 @@ training:
   ensemble_models_min: 2
   ensemble_models_max: 3
   ensemble_method: equal_weight_percentile_rank
+  ensemble_model_rank_correlation_abs_max: 0.95
+  ensemble_model_top50_overlap_max: 0.90
 
 rolling_validation:
   validation_days: 126
