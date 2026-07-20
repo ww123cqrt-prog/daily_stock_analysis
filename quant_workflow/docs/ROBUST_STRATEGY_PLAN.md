@@ -239,15 +239,15 @@ LSTM、GRU 或 Transformer 不在当前立即执行范围内。满足以下条�
 | --- | --- | --- |
 | 数据和严格 preflight | 已完成 | PIT CSI800 和正式价格产品已通过启动门槛 |
 | 五类传统模型固定参数训练 | 已完成 | 396 个任务完成，0 个任务失败 |
-| 五类传统模型有界调参 | 运行中 | 截至本次更新，CatBoost 和 LightGBM 的 20/20 组筛选及各自 108/108 最佳矩阵任务均已完成；Ridge 的 10 组筛选共 120/120 个季度任务和 36/36 最佳矩阵任务已完成；XGBoost 的 20/20 组筛选已完成，最佳完整矩阵已完成 81/108，所有已落盘调参任务失败数为 0。实时数字仍以 Run 目录的 `progress.json` 为准。XGBoost 最佳矩阵和开发期汇总尚未完成，因此当前仍没有五模型最终结论 |
-| MPS DNN 候选 | 已接入编排器，当前配置单任务和重复训练门禁冒烟已通过 | `.venv-mps-dnn` 同时包含 Qlib 0.9.7 和 PyTorch 2.5.1；真实 PIT CSI800 的 2023Q1、504日、seed 42 任务训练两次，两组 47,200 个预测最大差异为 0、哈希完全一致，MPS、模型保存和 12 个直接依赖版本均通过核对；完整六模型开发矩阵仍未开始 |
+| 五类传统模型有界调参 | 已完成，但开发期失败 | 20 组参数筛选和最佳完整矩阵均已完成，失败任务数为 0；五个模型全部未通过稳定性门槛，真实原因是 OLS/Ridge 的 Top50 重合率不足，CatBoost 的窗口相关性和 Top50 重合率不足，LightGBM 的正 RankIC 比例/窗口相关性/Top50 重合率不足，XGBoost 的正 RankIC 比例/窗口相关性/Top50 重合率不足。报告状态为 `development_failed / insufficient_stable_models_after_bounded_tuning`；原共享报告已按 SHA-256 `840c61a8...` 归档到该 Run 的 `development/development_latest_recovered.json` |
+| MPS DNN 候选 | 已合并，统一 Run 待启动 | `.venv-mps-dnn` 已现场确认 PyTorch 2.5.1、Qlib 0.9.7、`mps_available=true`、设备 `mps:0`；统一六模型配置包含 504 个逻辑任务：OLS 36、Ridge 36、LightGBM 108、XGBoost 108、CatBoost 108、MPS DNN 108。六模型正式矩阵尚未开始 |
 | 五套交易策略统一回测 | 未开始 | 必须等待至少 2 个模型通过稳定性门槛 |
 | 2026 单次确认 | 未开始 | 2026 数据仍封存，不能提前查看并据此改模型 |
 | 60 个交易日纸面跟踪 | 调度实现完成，正式跟踪未开始 | 已拆成工作日 19:10 的独立 launchd 任务；含 DNN 时强制使用 MPS 环境并保存探针证据，数据更新或推理失败返回非零。当前正式 DSA 最近一次日更新在 `apply_data_cleaning` 阶段失败，正式启用前必须先修复并连续验证日更新成功；同时仍须等待统一六模型开发期和 2026 确认期通过 |
 
-当前正式 Run：`robust_20260719_development_v2`
+当前五模型 Run：`robust_20260719_development_v2`，已结束，状态为 `development_failed`
 
-当前正式提交：`4afaca304bab45bd4a38ab8b6539eb14517b4539`
+五模型 Run 的冻结提交：`4afaca304bab45bd4a38ab8b6539eb14517b4539`；下一轮统一六模型使用代码提交：`e259e46`
 
 当前 Run 必须保持不变。不得在运行期间修改它的工作树、配置、数据清单或 provider。
 
@@ -255,10 +255,10 @@ MPS 候选实现保存在隔离分支 `feature/robust-mps-dnn`；统一六模型
 
 ## 12. 接下来按什么顺序执行
 
-1. 让当前五模型 Run 完整结束，不中途改配置、切换设备或挑选局部最好结果；当前继续等待剩余有界调参任务和开发期汇总完成。
-2. 开发期汇总生成后，审计五类模型的全部固定参数、调参结果和失败原因；不足 2 个模型通过时，如实记录当前 Run 的结果，不能把它包装成最终策略。
-3. 审查并合并隔离分支中已经完成的 `mps_dnn_v1` 编排、MLflow 归属、运行环境指纹和失败持久化实现；合并后重新运行完整鲁棒测试。
-4. 在一个新的 Git 提交上创建统一六模型 Run，完整运行 OLS、Ridge、LightGBM、XGBoost、CatBoost 和 MPS DNN；统一记录 `git_commit`、`config_hash`、`development_context_hash`、`provider_key` 和每个模型产物哈希。
+1. 五模型 Run 已完整结束；保留它的真实失败结论，不从失败结果中挑选替代冠军。
+2. 已审计五类模型的全部稳定性门槛和失败原因；当前没有合格模型，因此没有运行五套交易策略回测。
+3. 已合并 `mps_dnn_v1` 编排、MLflow 归属、运行环境指纹、重复训练门禁、MPS 证据和失败持久化实现；合并提交为 `e259e46`，并已通过 `631` 项量化测试。
+4. 在新的 Git 提交上启动统一六模型 Run，完整运行 OLS、Ridge、LightGBM、XGBoost、CatBoost 和 MPS DNN；统一记录 `git_commit`、`config_hash`、`development_context_hash`、`provider_key` 和每个模型产物哈希。
 5. 仅用 2023Q1 至 2025Q4 选择 2 至 3 个合格且不过度相关的模型；不得从两个不同上下文的 Run 拼接候选集合。
 6. 对统一 Run 的模型集成运行五套交易策略和全部成本、延迟、牛熊、板块测试。
 7. 开发期全部通过后冻结代码、配置、数据和模型，再运行一次 2026 确认期。
