@@ -247,7 +247,7 @@ LSTM、GRU 或 Transformer 不在当前立即执行范围内。满足以下条�
 
 当前五模型 Run：`robust_20260719_development_v2`，已结束，状态为 `development_failed`
 
-五模型 Run 的冻结提交：`4afaca304bab45bd4a38ab8b6539eb14517b4539`；下一轮统一六模型使用代码提交：`e259e46`
+五模型 Run 的冻结提交：`4afaca304bab45bd4a38ab8b6539eb14517b4539`；下一轮统一六模型的精确代码提交必须以该 Run 自己的 `launch.json` 和 `development_context.json` 为准，不能从计划文档猜测。
 
 当前 Run 必须保持不变。不得在运行期间修改它的工作树、配置、数据清单或 provider。
 
