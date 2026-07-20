@@ -54,6 +54,7 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   run_robust_confirmation.py
   launch_robust_confirmation.py
   run_robust_shadow_day.py
+  run_robust_shadow_schedule.py
   launch_robust_strategy.py
   run_daily_update.py
 )

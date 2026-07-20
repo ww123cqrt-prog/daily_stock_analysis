@@ -2,6 +2,7 @@ import importlib.util
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,36 @@ def load_script(name: str):
 
 
 class ApplyDataCleaningTest(unittest.TestCase):
+    def test_cleaned_qlib_conversion_reuses_canonical_calendar(self):
+        module = load_script("apply_data_cleaning")
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical = base / "canonical"
+            cleaned_parquet = base / "cleaned-parquet"
+            cleaned_qlib = base / "cleaned-qlib"
+            calendar = canonical / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text(
+                "2024-01-02\n2024-01-03\n2024-01-04\n", encoding="utf-8"
+            )
+
+            with patch.object(module, "convert_to_bin", return_value=0) as convert:
+                result = module.convert_cleaned_to_qlib(
+                    cleaned_parquet,
+                    cleaned_qlib,
+                    canonical_provider=canonical,
+                    overwrite=True,
+                )
+
+        self.assertEqual(result, 0)
+        convert.assert_called_once_with(
+            cleaned_parquet,
+            cleaned_qlib,
+            True,
+            dropna_fields=[],
+            calendar_path=calendar,
+        )
+
     def test_cleaning_plan_excludes_blockers_and_masks_review_events(self):
         module = load_script("apply_data_cleaning")
         with TemporaryDirectory() as temp_dir:

@@ -348,6 +348,25 @@ def copy_benchmark_features(
     return copied
 
 
+def convert_cleaned_to_qlib(
+    cleaned_parquet_dir: Path,
+    cleaned_qlib_dir: Path,
+    *,
+    canonical_provider: Path,
+    overwrite: bool,
+) -> int:
+    calendar_path = Path(canonical_provider) / "calendars" / "day.txt"
+    if not calendar_path.is_file():
+        raise ValueError(f"Canonical Qlib calendar is unavailable: {calendar_path}")
+    return convert_to_bin(
+        cleaned_parquet_dir,
+        cleaned_qlib_dir,
+        overwrite,
+        dropna_fields=[],
+        calendar_path=calendar_path,
+    )
+
+
 def write_reports(
     *,
     summary: dict[str, Any],
@@ -454,8 +473,11 @@ def main() -> int:
         print("Dry run enabled; skipping cleaned parquet writes and Qlib conversion.")
     elif not args.skip_qlib_convert:
         print("Converting cleaned parquet to Qlib bin...")
-        qlib_return_code = convert_to_bin(
-            args.cleaned_merged_dir, args.qlib_dir, overwrite, dropna_fields=[]
+        qlib_return_code = convert_cleaned_to_qlib(
+            args.cleaned_merged_dir,
+            args.qlib_dir,
+            canonical_provider=CANONICAL_QLIB_DIR,
+            overwrite=overwrite,
         )
         if qlib_return_code == 0:
             copied = copy_benchmark_features(

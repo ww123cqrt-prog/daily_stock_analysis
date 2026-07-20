@@ -67,6 +67,7 @@ if [[ ! -f "${UPDATE_SCRIPT}" ]]; then
 fi
 
 rendered="$(sed \
+  -e "s#__HOME__#${HOME}#g" \
   -e "s#__PYTHON__#${PYTHON_BIN}#g" \
   -e "s#__SCRIPT__#${UPDATE_SCRIPT}#g" \
   -e "s#__WORKDIR__#${WORKDIR}#g" \

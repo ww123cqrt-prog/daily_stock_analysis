@@ -35,7 +35,6 @@ def _args(**overrides):
         skip_eastmoney=False,
         skip_akshare=False,
         skip_snapshot_validation=False,
-        skip_robust_shadow=False,
         use_system_proxy=False,
         snapshot_limit=50,
         overlap_sample=0,
@@ -186,7 +185,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("--use-system-proxy", akshare.argv)
         self.assertIn("--use-system-proxy", snapshot.argv)
 
-    def test_active_robust_shadow_is_appended_after_manifest_sync(self):
+    def test_daily_update_never_runs_robust_shadow_tracking(self):
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
             robust = reports / "robust_strategy"
@@ -208,18 +207,10 @@ class BuildStagesTest(unittest.TestCase):
                 stages = self.module.build_stages(_args(end="20260716"))
 
         names = [stage.name for stage in stages]
-        self.assertEqual(names[-2:], ["sync_data_manifest", "run_robust_shadow_day"])
-        shadow = stages[-1]
-        self.assertFalse(shadow.heavy)
-        self.assertFalse(shadow.required)
-        self.assertIn("run_robust_shadow_day.py", shadow.argv[1])
-        self.assertEqual(shadow.argv[shadow.argv.index("--as-of-date") + 1], "20260716")
-        self.assertEqual(
-            shadow.argv[shadow.argv.index("--frozen") + 1],
-            str(robust / "frozen_strategy_latest.json"),
-        )
+        self.assertEqual(names[-1], "sync_data_manifest")
+        self.assertNotIn("run_robust_shadow_day", names)
 
-    def test_robust_shadow_is_omitted_when_not_confirmed_skipped_or_finalized(self):
+    def test_daily_update_has_no_shadow_skip_argument(self):
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
             robust = reports / "robust_strategy"
@@ -252,12 +243,7 @@ class BuildStagesTest(unittest.TestCase):
                 )
                 self.assertNotIn(
                     "run_robust_shadow_day",
-                    [
-                        stage.name
-                        for stage in self.module.build_stages(
-                            _args(skip_robust_shadow=True)
-                        )
-                    ],
+                    [stage.name for stage in self.module.build_stages(_args())],
                 )
 
 

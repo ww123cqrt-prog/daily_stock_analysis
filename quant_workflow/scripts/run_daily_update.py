@@ -12,7 +12,6 @@ Chains the existing stable quant_workflow scripts into one auditable run:
     7. report_data_quality.py   cross-source validation
     8. check_qlib_data.py       final provider calendar/instrument sanity check
     9. sync_data_manifest.py    refresh quant_data/DATA_MANIFEST.json
-   10. run_robust_shadow_day.py active frozen-strategy paper observation
 
 Every stage runs the current interpreter (sys.executable) against the embedded
 quant_workflow scripts, so reports and providers resolve to the same canonical
@@ -148,28 +147,6 @@ def _script(name: str) -> list[str]:
     return [_python(), str(WORKFLOW_ROOT / "scripts" / name)]
 
 
-def _read_json_object(path: Path) -> dict:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def robust_shadow_tracking_is_active(report_dir: Path) -> bool:
-    robust_dir = Path(report_dir) / "robust_strategy"
-    confirmation = _read_json_object(robust_dir / "confirmation_latest.json")
-    frozen = _read_json_object(robust_dir / "frozen_strategy_latest.json")
-    state = _read_json_object(robust_dir / "shadow_state_latest.json")
-    if state.get("status") in {"robust_strategy_qualified", "development_failed"}:
-        return False
-    return (
-        confirmation.get("status") == "shadow_observation"
-        and frozen.get("confirmation_status") == "shadow_observation"
-        and frozen.get("shadow_tracking_started") is True
-    )
-
-
 def build_stages(args: argparse.Namespace) -> "list[Stage]":
     """Compose the ordered pipeline. Each stage is (name, argv, heavy)."""
     out = ["--out-dir", str(REPORTS_ROOT)]
@@ -252,28 +229,6 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
             required=True,
         )
     )
-    if not args.skip_robust_shadow and robust_shadow_tracking_is_active(REPORTS_ROOT):
-        robust_dir = REPORTS_ROOT / "robust_strategy"
-        stages.append(
-            Stage(
-                "run_robust_shadow_day",
-                _script("run_robust_shadow_day.py")
-                + [
-                    "--report-dir",
-                    str(robust_dir),
-                    "--frozen",
-                    str(robust_dir / "frozen_strategy_latest.json"),
-                    "--confirmation-latest",
-                    str(robust_dir / "confirmation_latest.json"),
-                    "--provider-latest",
-                    str(robust_dir / "provider_latest.json"),
-                    "--as-of-date",
-                    str(args.end),
-                ],
-                heavy=False,
-                required=False,
-            )
-        )
     return stages
 
 
@@ -419,11 +374,6 @@ def main() -> int:
         "--skip-snapshot-validation",
         action="store_true",
         help="Skip Sina latest snapshot validation.",
-    )
-    parser.add_argument(
-        "--skip-robust-shadow",
-        action="store_true",
-        help="Skip the active frozen-strategy paper observation stage.",
     )
     parser.add_argument(
         "--use-system-proxy",

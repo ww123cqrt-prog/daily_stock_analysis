@@ -140,7 +140,17 @@ scripts/launchd/install-quant-daily-update.sh --dry-run  # 只打印解析后的
 scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 plist
 ```
 
-任务 `com.dsa.quant-daily-update` 默认工作日 18:40（A 股收盘且日终数据落定后）本地触发，用 `daily_stock_analysis/.venv` 运行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。`launchctl kickstart gui/<uid>/com.dsa.quant-daily-update` 可手动触发一次。
+任务 `com.dsa.quant-daily-update` 默认工作日 18:40（A 股收盘且日终数据落定后）本地触发，用 `daily_stock_analysis/.venv` 运行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。`launchctl kickstart gui/<uid>/com.dsa.quant-daily-update` 可手动触发一次。这个任务只更新数据，不再顺带运行 60 日纸面跟踪。
+
+2026 确认期通过后，另行安装纸面跟踪任务：
+
+```bash
+scripts/launchd/install-robust-shadow.sh --dry-run  # 核对 Python、配置和 19:10 调度
+scripts/launchd/install-robust-shadow.sh --load     # 确认期通过后才安装启用
+scripts/launchd/install-robust-shadow.sh --uninstall
+```
+
+`com.dsa.robust-shadow` 在工作日 19:10 启动，并最多等待 4 小时让 18:40 数据任务结束；本机近期全量日更新实测约需 2.5 至 3.5 小时。当天数据更新失败、只是 dry-run、等待超时或推理失败时，该任务返回非零并写 `robust_strategy/shadow_runner/schedule_latest.json`，不能降级成日更新 warning。冻结组合含 `mps_dnn` 时，安装脚本默认使用 `.venv-mps-dnn`，每次推理前保存真实 MPS 探针；不允许自动回退 CPU。尚未通过确认期时任务只返回 `inactive/skipped`，不会伪造纸面观察。正式启用前还必须确认 18:40 数据任务已经恢复成功；最近一次正式记录停在 `apply_data_cleaning` 失败，当前不能据此开始 60 日计数。
 
 ### 2.3 只读盘点与报告任务
 
