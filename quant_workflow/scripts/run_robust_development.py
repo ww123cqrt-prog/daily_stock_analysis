@@ -438,59 +438,124 @@ def run_bounded_tuning(
                 }
             )
             continue
-        best = max(completed, key=lambda item: (item["score"], -int(item["trial"])))
-        best_config = _config_with_model_kwargs(config, model_id, best["kwargs"])
-        full_jobs = [
-            job for job in build_training_jobs(best_config) if job.model_id == model_id
-        ]
-        full_dir = Path(run_dir) / model_id / "best_full_matrix"
-        progress = training_runner(
-            best_config,
-            full_jobs,
-            provider_uri=provider_uri,
-            calendar=calendar,
-            run_dir=full_dir,
-            mlflow_enabled=True,
-            resume=True,
-            context_hash=payload_sha256(
-                {
-                    "parent_context_hash": context_hash,
-                    "trial": best["trial"],
-                    "model_id": model_id,
-                    "config": best_config,
-                    "phase": "best_full_matrix",
-                }
-            ),
+        finalist_count = int(
+            config["training"].get("bounded_tuning_full_matrix_finalists", 1)
         )
-        if any(
-            progress.get(job.key, {}).get("status") != "completed" for job in full_jobs
-        ):
+        if not 1 <= finalist_count <= 3:
+            raise ValueError(
+                "training.bounded_tuning_full_matrix_finalists must be between 1 and 3"
+            )
+        finalists = sorted(
+            completed,
+            key=lambda item: (item["score"], -int(item["trial"])),
+            reverse=True,
+        )[:finalist_count]
+        full_results: list[dict[str, Any]] = []
+        for finalist in finalists:
+            finalist_config = _config_with_model_kwargs(
+                config, model_id, finalist["kwargs"]
+            )
+            full_jobs = [
+                job
+                for job in build_training_jobs(finalist_config)
+                if job.model_id == model_id
+            ]
+            full_dir_name = (
+                "best_full_matrix"
+                if finalist_count == 1
+                else f"finalist_{int(finalist['trial']):02d}_full_matrix"
+            )
+            full_dir = Path(run_dir) / model_id / full_dir_name
+            progress = training_runner(
+                finalist_config,
+                full_jobs,
+                provider_uri=provider_uri,
+                calendar=calendar,
+                run_dir=full_dir,
+                mlflow_enabled=True,
+                resume=True,
+                context_hash=payload_sha256(
+                    {
+                        "parent_context_hash": context_hash,
+                        "trial": finalist["trial"],
+                        "model_id": model_id,
+                        "config": finalist_config,
+                        "phase": "best_full_matrix",
+                    }
+                ),
+            )
+            if any(
+                progress.get(job.key, {}).get("status") != "completed"
+                for job in full_jobs
+            ):
+                full_results.append(
+                    {"trial": finalist["trial"], "status": "failed"}
+                )
+                continue
+            aggregate = aggregator(
+                _artifact_records(full_jobs, progress),
+                topk=int(config["portfolio"]["topk"]),
+                thresholds=config["acceptance"],
+            )
+            full_results.append(
+                {
+                    "trial": finalist["trial"],
+                    "kwargs": finalist["kwargs"],
+                    "screen_score": finalist["score"],
+                    "status": "completed",
+                    "report": copy.deepcopy(aggregate["model_reports"][0]),
+                    "predictions": aggregate["model_predictions"][model_id],
+                    "artifacts": _development_artifacts(
+                        full_jobs, progress, [model_id]
+                    ),
+                }
+            )
+        completed_full = [
+            item for item in full_results if item["status"] == "completed"
+        ]
+        if not completed_full:
             tuning_summaries.append(
                 {
                     "model_id": model_id,
                     "screened_trials": len(screened),
-                    "selected_trial": best["trial"],
+                    "full_matrix_finalists": [item["trial"] for item in finalists],
                     "status": "best_full_matrix_failed",
                 }
             )
             continue
-        aggregate = aggregator(
-            _artifact_records(full_jobs, progress),
-            topk=int(config["portfolio"]["topk"]),
-            thresholds=config["acceptance"],
-        )
-        report = copy.deepcopy(aggregate["model_reports"][0])
+
+        def full_result_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+            report = item["report"]
+            gates = report.get("gates") or {}
+            try:
+                development_score = float(report.get("development_score", -math.inf))
+            except (TypeError, ValueError):
+                development_score = -math.inf
+            if not math.isfinite(development_score):
+                development_score = -math.inf
+            return (
+                report.get("eligible") is True,
+                sum(value is True for value in gates.values()),
+                development_score,
+                item["screen_score"],
+                -int(item["trial"]),
+            )
+
+        best = max(completed_full, key=full_result_key)
+        report = best["report"]
         report["tuning"] = {
             "screened_trials": len(screened),
             "selected_trial": best["trial"],
             "selected_kwargs": best["kwargs"],
-            "selection_basis": "2023Q1-2025Q4_only_756d_screen_then_full_matrix",
+            "full_matrix_finalists": [item["trial"] for item in finalists],
+            "selection_basis": (
+                "2023Q1-2025Q4_only_756d_screen_then_"
+                f"top{len(finalists)}_full_matrix"
+            ),
         }
         reports.append(report)
-        predictions[model_id] = aggregate["model_predictions"][model_id]
-        model_artifacts[model_id] = _development_artifacts(
-            full_jobs, progress, [model_id]
-        )
+        predictions[model_id] = best["predictions"]
+        model_artifacts[model_id] = best["artifacts"]
         tuning_summaries.append(
             {"model_id": model_id, "status": "completed", **report["tuning"]}
         )

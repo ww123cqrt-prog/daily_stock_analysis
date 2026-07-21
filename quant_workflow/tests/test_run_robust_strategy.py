@@ -205,6 +205,34 @@ def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
         module.load_config(weak_repeatability)
 
 
+def test_bounded_tuning_full_matrix_finalists_must_be_between_one_and_three(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    payload = yaml.safe_load(MPS_CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["training"]["bounded_tuning_full_matrix_finalists"] = 3
+    valid = tmp_path / "three-finalists.yaml"
+    valid.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    assert (
+        module.load_config(valid)["training"][
+            "bounded_tuning_full_matrix_finalists"
+        ]
+        == 3
+    )
+
+    for invalid in (0, 4):
+        payload["training"]["bounded_tuning_full_matrix_finalists"] = invalid
+        invalid_path = tmp_path / f"invalid-finalists-{invalid}.yaml"
+        invalid_path.write_text(
+            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+        )
+        with pytest.raises(
+            ValueError, match="bounded_tuning_full_matrix_finalists"
+        ):
+            module.load_config(invalid_path)
+
+
 def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> None:
     module = load_module()
     config = module.load_config(CONFIG_PATH)

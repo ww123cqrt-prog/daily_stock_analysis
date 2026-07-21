@@ -157,6 +157,7 @@ training:
     score_max_abs_diff: 1.0e-7
   fixed_parameters_first: true
   bounded_tuning_trials_per_failed_model_max: 20
+  bounded_tuning_full_matrix_finalists: 3
   ensemble_models_min: 2
   ensemble_models_max: 3
   ensemble_method: equal_weight_percentile_rank

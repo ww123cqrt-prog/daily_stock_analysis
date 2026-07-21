@@ -268,6 +268,17 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("training.windows_trading_days must remain [504, 756, 1008]")
     if payload.get("training", {}).get("tree_seeds") != [42, 2026, 3407]:
         raise ValueError("training.tree_seeds must remain [42, 2026, 3407]")
+    full_matrix_finalists = payload.get("training", {}).get(
+        "bounded_tuning_full_matrix_finalists", 1
+    )
+    if (
+        isinstance(full_matrix_finalists, bool)
+        or not isinstance(full_matrix_finalists, int)
+        or not 1 <= full_matrix_finalists <= 3
+    ):
+        raise ValueError(
+            "training.bounded_tuning_full_matrix_finalists must be between 1 and 3"
+        )
     _require_at_most(
         payload,
         ("training", "ensemble_model_rank_correlation_abs_max"),

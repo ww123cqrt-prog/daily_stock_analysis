@@ -2182,11 +2182,12 @@ def test_mps_dnn_tuning_screen_uses_one_neural_seed_and_development_only() -> No
     assert all(not job.quarter.startswith("2026") for job in jobs)
 
 
-def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
+def test_bounded_tuning_screens_20_then_reruns_top_three_with_full_matrix(
     tmp_path: Path,
 ) -> None:
     module = load_module()
     config = module.load_config(CONFIG_PATH)
+    config["training"]["bounded_tuning_full_matrix_finalists"] = 3
     calls = []
     aggregate_calls = 0
     index = pd.MultiIndex.from_product(
@@ -2236,11 +2237,13 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
         aggregate_calls += 1
         full = len({record["window_days"] for record in records}) == 3
         screen_score = 1.0 if aggregate_calls == 3 else 0.1
+        full_index = aggregate_calls - 20 if full else 0
+        full_scores = {1: 2.0, 2: 1.5, 3: 1.6}
         report = {
             "model_id": "xgboost",
-            "eligible": full,
-            "development_score": 2.0 if full else screen_score,
-            "rank_ic_mean": 2.0 if full else screen_score,
+            "eligible": full and full_index in {2, 3},
+            "development_score": full_scores.get(full_index, screen_score),
+            "rank_ic_mean": full_scores.get(full_index, screen_score),
             "positive_rank_ic_interval_ratio": 1.0 if full else screen_score,
             "stability": {
                 "rank_correlation_median": 0.8 if full else None,
@@ -2264,7 +2267,7 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
         aggregator=aggregator,
     )
 
-    assert len(calls) == 21
+    assert len(calls) == 23
     assert all(len(call["jobs"]) == 12 for call in calls[:20])
     assert all(
         {job.quarter for job in call["jobs"]}
@@ -2276,16 +2279,17 @@ def test_bounded_tuning_screens_20_then_reruns_best_with_full_matrix(
         and {job.seed for job in call["jobs"]} == {42}
         for call in calls[:20]
     )
-    assert len(calls[-1]["jobs"]) == 108
+    assert all(len(call["jobs"]) == 108 for call in calls[-3:])
     assert result["model_reports"][0]["eligible"] is True
     assert result["model_reports"][0]["tuning"]["screened_trials"] == 20
-    assert result["model_reports"][0]["tuning"]["selected_trial"] == 3
+    assert result["model_reports"][0]["tuning"]["full_matrix_finalists"] == [3, 1, 2]
+    assert result["model_reports"][0]["tuning"]["selected_trial"] == 2
     assert (
         result["model_reports"][0]["tuning"]["selected_kwargs"]
-        == calls[2]["model_kwargs"]
+        == calls[1]["model_kwargs"]
     )
     assert result["model_reports"][0]["tuning"]["selection_basis"] == (
-        "2023Q1-2025Q4_only_756d_screen_then_full_matrix"
+        "2023Q1-2025Q4_only_756d_screen_then_top3_full_matrix"
     )
     assert "xgboost" in result["model_predictions"]
 
