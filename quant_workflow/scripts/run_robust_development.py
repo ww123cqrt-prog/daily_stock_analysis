@@ -319,10 +319,96 @@ def build_tuning_screen_jobs(
         )
     else:
         seed = None
-    return [
-        TrainingJob(str(quarter), 756, model_id, seed)
-        for quarter in config["rolling_validation"]["test_quarters"]
+    seeds = (
+        config["training"].get("neural_seeds") or config["training"]["tree_seeds"]
+        if model_id in NEURAL_MODELS
+        else config["training"]["tree_seeds"]
+        if model_id in TREE_MODELS
+        else [None]
+    )
+    windows = sorted(
+        {int(window) for window in config["training"]["windows_trading_days"]}
+    )
+    if not windows:
+        raise ValueError("training.windows_trading_days must not be empty")
+    reference_window = int(
+        config["training"].get("tuning_screen_reference_window", 756)
+    )
+    if reference_window not in windows:
+        raise ValueError(
+            "training.tuning_screen_reference_window must be one of "
+            "training.windows_trading_days"
+        )
+    jobs: list[TrainingJob] = []
+    seen: set[str] = set()
+
+    def add_job(quarter: Any, window: int, job_seed: int | None) -> None:
+        job = TrainingJob(str(quarter), int(window), model_id, job_seed)
+        if job.key in seen:
+            return
+        seen.add(job.key)
+        jobs.append(job)
+
+    # Every trial gets all windows, plus all seeds in one fixed reference window.
+    # This lets tuning see the same stability dimensions used by final acceptance.
+    primary_seed = None if seed is None else int(seed)
+    for quarter in config["rolling_validation"]["test_quarters"]:
+        for window in windows:
+            add_job(quarter, window, primary_seed)
+        for extra_seed in seeds:
+            add_job(
+                quarter,
+                reference_window,
+                None if extra_seed is None else int(extra_seed),
+            )
+    return jobs
+
+
+def _tuning_report_key(
+    report: Mapping[str, Any], *, trial: int
+) -> tuple[Any, ...]:
+    """Rank tuning trials using the same stability dimensions as acceptance."""
+    gates = report.get("gates") or {}
+    thresholds = report.get("thresholds") or {}
+    stability = report.get("stability") or {}
+    seed_stability = report.get("seed_stability") or {}
+
+    def finite(value: Any, fallback: float = -math.inf) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if math.isfinite(number) else fallback
+
+    margins = [
+        finite(report.get("positive_rank_ic_interval_ratio"))
+        - finite(thresholds.get("positive_rank_ic_interval_ratio_min")),
+        finite(stability.get("rank_correlation_median"))
+        - finite(thresholds.get("window_rank_correlation_median_min")),
+        finite(stability.get("topk_overlap_mean"))
+        - finite(thresholds.get("top50_overlap_mean_min")),
     ]
+    if seed_stability.get("applicable") is True:
+        margins.extend(
+            [
+                finite(seed_stability.get("rank_correlation_median"))
+                - finite(thresholds.get("seed_rank_correlation_median_min")),
+                finite(seed_stability.get("topk_overlap_mean"))
+                - finite(thresholds.get("seed_top50_overlap_mean_min")),
+            ]
+        )
+    try:
+        development_score = finite(report.get("development_score"))
+    except (TypeError, ValueError):
+        development_score = -math.inf
+    return (
+        report.get("eligible") is True,
+        sum(value is True for value in gates.values()),
+        min(margins) if margins else -math.inf,
+        development_score,
+        finite(report.get("rank_ic_mean")),
+        -int(trial),
+    )
 
 
 def _config_with_model_kwargs(
@@ -415,10 +501,7 @@ def run_bounded_tuning(
                 thresholds=config["acceptance"],
             )
             report = aggregate["model_reports"][0]
-            score = (
-                float(report.get("positive_rank_ic_interval_ratio", 0.0)),
-                float(report.get("rank_ic_mean", -math.inf)),
-            )
+            score = _tuning_report_key(report, trial=index)
             screened.append(
                 {
                     "trial": index,
@@ -548,8 +631,20 @@ def run_bounded_tuning(
             "selected_trial": best["trial"],
             "selected_kwargs": best["kwargs"],
             "full_matrix_finalists": [item["trial"] for item in finalists],
+            "screen_jobs_per_trial": len(
+                build_tuning_screen_jobs(config, model_id)
+            ),
+            "screen_windows": sorted(
+                {
+                    int(window)
+                    for window in config["training"]["windows_trading_days"]
+                }
+            ),
+            "screen_reference_window": int(
+                config["training"].get("tuning_screen_reference_window", 756)
+            ),
             "selection_basis": (
-                "2023Q1-2025Q4_only_756d_screen_then_"
+                "2023Q1-2025Q4_stability_aware_screen_then_"
                 f"top{len(finalists)}_full_matrix"
             ),
         }

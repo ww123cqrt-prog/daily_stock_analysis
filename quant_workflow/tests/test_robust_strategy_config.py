@@ -17,6 +17,7 @@ def test_checked_in_robust_strategy_config_preserves_approved_gates() -> None:
     assert config["data_gates"]["membership_coverage_min"] == 0.99
     assert config["data_gates"]["ohlcv_coverage_min"] == 0.98
     assert config["training"]["windows_trading_days"] == [504, 756, 1008]
+    assert config["training"]["tuning_screen_reference_window"] == 756
     assert config["training"]["tree_seeds"] == [42, 2026, 3407]
     assert config["training"]["ensemble_model_rank_correlation_abs_max"] == 0.95
     assert config["training"]["ensemble_model_top50_overlap_max"] == 0.90

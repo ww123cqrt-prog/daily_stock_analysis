@@ -266,6 +266,17 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
     _require_at_most(payload, ("acceptance", "shadow_max_drawdown_abs_max"), 0.12)
     if payload.get("training", {}).get("windows_trading_days") != [504, 756, 1008]:
         raise ValueError("training.windows_trading_days must remain [504, 756, 1008]")
+    tuning_screen_reference_window = payload.get("training", {}).get(
+        "tuning_screen_reference_window"
+    )
+    if (
+        isinstance(tuning_screen_reference_window, bool)
+        or not isinstance(tuning_screen_reference_window, int)
+        or tuning_screen_reference_window not in [504, 756, 1008]
+    ):
+        raise ValueError(
+            "training.tuning_screen_reference_window must be one of [504, 756, 1008]"
+        )
     if payload.get("training", {}).get("tree_seeds") != [42, 2026, 3407]:
         raise ValueError("training.tree_seeds must remain [42, 2026, 3407]")
     full_matrix_finalists = payload.get("training", {}).get(

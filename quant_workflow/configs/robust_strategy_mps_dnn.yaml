@@ -144,6 +144,7 @@ training:
     - 504
     - 756
     - 1008
+  tuning_screen_reference_window: 756
   tree_seeds:
     - 42
     - 2026

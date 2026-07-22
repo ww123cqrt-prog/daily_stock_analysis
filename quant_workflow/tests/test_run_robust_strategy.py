@@ -147,6 +147,15 @@ def test_load_config_rejects_lowered_safety_or_acceptance_contract(
     with pytest.raises(ValueError, match="ensemble_model_rank_correlation_abs_max"):
         module.load_config(weak_diversification)
 
+    payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    payload["training"]["tuning_screen_reference_window"] = 999
+    invalid_screen_window = tmp_path / "invalid-screen-window.yaml"
+    invalid_screen_window.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="tuning_screen_reference_window"):
+        module.load_config(invalid_screen_window)
+
 
 def test_mps_config_requires_three_seeds_and_forbids_cpu_fallback(
     tmp_path: Path,

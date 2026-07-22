@@ -2150,36 +2150,93 @@ def test_bounded_tuning_trials_are_deterministic_capped_and_within_ranges() -> N
     assert all(1 <= len(item["hidden_layers"]) <= 3 for item in dnn)
 
 
-def test_tuning_screen_jobs_use_development_quarters_only_one_window_and_one_seed() -> (
-    None
-):
+def test_tuning_screen_jobs_cover_all_windows_and_reference_window_seeds() -> None:
     module = load_module()
     config = module.load_config(CONFIG_PATH)
 
     jobs = module.build_tuning_screen_jobs(config, "xgboost")
 
-    assert len(jobs) == 12
-    assert {job.window_days for job in jobs} == {756}
-    assert {job.seed for job in jobs} == {42}
+    assert len(jobs) == 60
+    assert {job.window_days for job in jobs} == {504, 756, 1008}
+    assert {job.seed for job in jobs} == {42, 2026, 3407}
+    assert len([job for job in jobs if job.window_days == 504]) == 12
+    assert len([job for job in jobs if job.window_days == 756]) == 36
+    assert len([job for job in jobs if job.window_days == 1008]) == 12
     assert all(
         job.quarter in config["rolling_validation"]["test_quarters"] for job in jobs
     )
     assert all(not job.quarter.startswith("2026") for job in jobs)
 
 
-def test_mps_dnn_tuning_screen_uses_one_neural_seed_and_development_only() -> None:
+def test_mps_dnn_tuning_screen_covers_windows_and_neural_seeds() -> None:
     module = load_module()
     config = module.load_config(MPS_CONFIG_PATH)
 
     jobs = module.build_tuning_screen_jobs(config, "mps_dnn")
 
-    assert len(jobs) == 12
-    assert {job.window_days for job in jobs} == {756}
-    assert {job.seed for job in jobs} == {42}
+    assert len(jobs) == 60
+    assert {job.window_days for job in jobs} == {504, 756, 1008}
+    assert {job.seed for job in jobs} == {42, 2026, 3407}
+    assert len([job for job in jobs if job.window_days == 756]) == 36
     assert all(
         job.quarter in config["rolling_validation"]["test_quarters"] for job in jobs
     )
     assert all(not job.quarter.startswith("2026") for job in jobs)
+
+
+def test_tuning_screen_prefers_stability_over_higher_rank_ic() -> None:
+    module = load_module()
+    thresholds = {
+        "positive_rank_ic_interval_ratio_min": 0.70,
+        "window_rank_correlation_median_min": 0.70,
+        "top50_overlap_mean_min": 0.60,
+        "seed_rank_correlation_median_min": 0.70,
+        "seed_top50_overlap_mean_min": 0.60,
+    }
+    unstable = {
+        "eligible": False,
+        "gates": {
+            "positive_rank_ic_intervals": True,
+            "window_rank_correlation": False,
+            "top50_overlap": False,
+            "seed_rank_correlation": True,
+            "seed_top50_overlap": False,
+        },
+        "thresholds": thresholds,
+        "positive_rank_ic_interval_ratio": 0.90,
+        "rank_ic_mean": 0.08,
+        "development_score": 0.09,
+        "stability": {
+            "rank_correlation_median": 0.50,
+            "topk_overlap_mean": 0.40,
+        },
+        "seed_stability": {
+            "applicable": True,
+            "rank_correlation_median": 0.80,
+            "topk_overlap_mean": 0.45,
+        },
+    }
+    stable = {
+        "eligible": True,
+        "gates": {name: True for name in unstable["gates"]},
+        "thresholds": thresholds,
+        "positive_rank_ic_interval_ratio": 0.75,
+        "rank_ic_mean": 0.02,
+        "development_score": 0.03,
+        "stability": {
+            "rank_correlation_median": 0.75,
+            "topk_overlap_mean": 0.65,
+        },
+        "seed_stability": {
+            "applicable": True,
+            "rank_correlation_median": 0.75,
+            "topk_overlap_mean": 0.65,
+        },
+    }
+
+    assert module._tuning_report_key(stable, trial=2) > module._tuning_report_key(
+        unstable, trial=1
+    )
 
 
 def test_bounded_tuning_screens_20_then_reruns_top_three_with_full_matrix(
@@ -2235,7 +2292,10 @@ def test_bounded_tuning_screens_20_then_reruns_top_three_with_full_matrix(
     def aggregator(records, topk, thresholds):
         nonlocal aggregate_calls
         aggregate_calls += 1
-        full = len({record["window_days"] for record in records}) == 3
+        full = (
+            len({record["window_days"] for record in records}) == 3
+            and len(records) == 108
+        )
         screen_score = 1.0 if aggregate_calls == 3 else 0.1
         full_index = aggregate_calls - 20 if full else 0
         full_scores = {1: 2.0, 2: 1.5, 3: 1.6}
@@ -2268,15 +2328,15 @@ def test_bounded_tuning_screens_20_then_reruns_top_three_with_full_matrix(
     )
 
     assert len(calls) == 23
-    assert all(len(call["jobs"]) == 12 for call in calls[:20])
+    assert all(len(call["jobs"]) == 60 for call in calls[:20])
     assert all(
         {job.quarter for job in call["jobs"]}
         == set(config["rolling_validation"]["test_quarters"])
         for call in calls[:20]
     )
     assert all(
-        {job.window_days for job in call["jobs"]} == {756}
-        and {job.seed for job in call["jobs"]} == {42}
+        {job.window_days for job in call["jobs"]} == {504, 756, 1008}
+        and {job.seed for job in call["jobs"]} == {42, 2026, 3407}
         for call in calls[:20]
     )
     assert all(len(call["jobs"]) == 108 for call in calls[-3:])
@@ -2289,7 +2349,7 @@ def test_bounded_tuning_screens_20_then_reruns_top_three_with_full_matrix(
         == calls[1]["model_kwargs"]
     )
     assert result["model_reports"][0]["tuning"]["selection_basis"] == (
-        "2023Q1-2025Q4_only_756d_screen_then_top3_full_matrix"
+        "2023Q1-2025Q4_stability_aware_screen_then_top3_full_matrix"
     )
     assert "xgboost" in result["model_predictions"]
 
