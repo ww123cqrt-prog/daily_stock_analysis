@@ -280,6 +280,67 @@ beforeEach(() => {
       },
       mlflowExperiments: ['robust_csi800_development', 'robust_csi800_confirmation'],
     },
+    robustSignal: {
+      status: 'signal_candidate_ready',
+      lifecycleStatus: 'completed',
+      runId: 'robust_signal_20260723',
+      currentStage: 'completed',
+      pauseState: 'completed',
+      nextGate: 'create_goal_2_trade_strategy',
+      completedCount: 72,
+      expectedCount: 72,
+      result: {
+        status: 'signal_candidate_ready',
+        selectedSignalId: 'alpha158_excess_5d',
+        selectedModelId: 'linear_ridge',
+      },
+      factorContract: {
+        signalId: 'alpha158_excess_5d',
+        modelId: 'linear_ridge',
+        horizonDays: 5,
+        contractHash: 'abc123',
+      },
+      screeningReports: [],
+      validationReports: [
+        {
+          phase: 'validation',
+          signalId: 'alpha158_excess_5d',
+          modelId: 'linear_ridge',
+          passed: true,
+          failedGates: [],
+          values: {
+            medianQuarterRankIc: 0.03,
+            windowRankCorrelationMedian: 0.78,
+            top50OverlapMean: 0.66,
+            annualExcessReturn: 0.08,
+          },
+          factorQuality: {
+            featureCountMin: 158,
+            featureCountMax: 158,
+            maxMissingRate: 0.02,
+            highCorrelationPairCountMax: 3,
+          },
+          topkSensitivity: {
+            primaryTopk: 50,
+            results: {
+              '20': { meanLabel: 0.02 },
+              '50': { meanLabel: 0.01 },
+              '100': { meanLabel: 0.005 },
+            },
+          },
+          windowStability: {
+            rankCorrelationMedian: 0.78,
+            topkOverlapMean: 0.66,
+          },
+          marketStateAttribution: {
+            risk_on: { periodCount: 10, annualExcessReturn: 0.08 },
+            neutral: { periodCount: 8, annualExcessReturn: 0.03 },
+            defensive: { periodCount: 4, annualExcessReturn: -0.01 },
+            risk_off: { periodCount: 2, annualExcessReturn: 0.01 },
+          },
+        },
+      ],
+    },
     mlflow: {
       url: 'http://127.0.0.1:6606/',
       role: 'experiment_raw_records',
@@ -401,6 +462,12 @@ describe('BacktestPage', () => {
     expect(screen.getByText('通过研究门槛')).toBeInTheDocument();
     expect(screen.getByText('20.2%')).toBeInTheDocument();
     expect(screen.getByText('鲁棒策略矩阵')).toBeInTheDocument();
+    expect(screen.getByText('选股信号稳定性矩阵')).toBeInTheDocument();
+    expect(screen.getByText('因子质量')).toBeInTheDocument();
+    expect(screen.getByText('标签方案对比')).toBeInTheDocument();
+    expect(screen.getByText('TopK 敏感性')).toBeInTheDocument();
+    expect(screen.getByText('四类市场状态')).toBeInTheDocument();
+    expect(screen.getAllByText('alpha158_excess_5d').length).toBeGreaterThan(0);
     expect(screen.getByText('60日纸面跟踪中')).toBeInTheDocument();
     expect(screen.getAllByText('full_risk_control').length).toBeGreaterThan(0);
     expect(screen.getByText('模型稳定性')).toBeInTheDocument();

@@ -59,6 +59,7 @@ CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
 CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
 ROBUST_STRATEGY_DIRNAME = "robust_strategy"
+ROBUST_SIGNAL_DIRNAME = "robust_signal"
 QLIB_RESEARCH_REPORTS = {
     "model_explainability": (
         "模型效果深度解释",
@@ -256,6 +257,134 @@ def _candidate_pipeline_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
         payload["provider_uri"] = _public_path_label(payload["provider_uri"])
     payload["artifacts"] = _public_artifacts(payload.get("artifacts"))
     return _sanitize_public_tree(payload)
+
+
+def _robust_signal_report_row(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    result = {
+        key: raw[key]
+        for key in (
+            "phase",
+            "signal_id",
+            "model_id",
+            "passed",
+            "failed_gates",
+            "values",
+            "quarter_rank_ic",
+            "window_stability",
+            "topk_sensitivity",
+            "prediction_dispersion",
+            "monotonicity",
+            "returns_after_20bps",
+            "board_attribution",
+            "market_state_attribution",
+            "factor_quality",
+        )
+        if key in raw
+    }
+    return _sanitize_robust_tree(result)
+
+
+def _robust_signal_report_matrix(raw: Any) -> list[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    return [
+        row
+        for item in raw[:ROBUST_LIST_PREVIEW_LIMIT]
+        if (row := _robust_signal_report_row(item)) is not None
+    ]
+
+
+def _robust_signal_payload(reports_dir: Path) -> Dict[str, Any]:
+    signal_dir = reports_dir / ROBUST_SIGNAL_DIRNAME
+    status_path = signal_dir / "robust_signal_status_latest.json"
+    status = _read_robust_json_object(status_path)
+    if not isinstance(status, dict):
+        return {
+            "status": "missing",
+            "lifecycle_status": "not_started",
+            "screening_reports": [],
+            "validation_reports": [],
+        }
+
+    run_id = status.get("run_id")
+    run_dir = (
+        signal_dir / "runs" / run_id
+        if isinstance(run_id, str) and ROBUST_RUN_ID_RE.fullmatch(run_id)
+        else None
+    )
+    result = _read_robust_json_object(run_dir / "result.json") if run_dir else None
+    contract = (
+        _read_robust_json_object(run_dir / "factor_contract.json")
+        if run_dir
+        else None
+    )
+
+    def read_reports(phase: str) -> list[Dict[str, Any]]:
+        if run_dir is None:
+            return []
+        report = _read_robust_json_object(
+            run_dir / phase / f"{phase}_report.json"
+        )
+        return _robust_signal_report_matrix(report.get("reports") if report else None)
+
+    payload = {
+        key: status[key]
+        for key in (
+            "status",
+            "lifecycle_status",
+            "reason_code",
+            "run_id",
+            "current_stage",
+            "pause_state",
+            "next_gate",
+            "completed_count",
+            "expected_count",
+            "updated_at",
+            "config_hash",
+            "git_commit",
+            "data_manifest_hash",
+            "context_hash",
+        )
+        if key in status
+    }
+    payload["progress"] = {
+        key: status[key]
+        for key in ("current_stage", "pause_state", "completed_count", "expected_count")
+        if key in status
+    }
+    payload["result"] = _sanitize_robust_tree(
+        {
+            key: result[key]
+            for key in ("status", "reason_code", "screening_candidates", "selected_signal_id", "selected_model_id", "challengers")
+            if isinstance(result, dict) and key in result
+        }
+    )
+    payload["factor_contract"] = _sanitize_robust_tree(
+        {
+            key: contract[key]
+            for key in (
+                "status",
+                "signal_id",
+                "model_id",
+                "feature_family",
+                "feature_prefixes",
+                "horizon_days",
+                "label_expression",
+                "signal_cutoff",
+                "execution_start",
+                "normalization_scope",
+                "target",
+                "contract_hash",
+                "offline_daily_parity_required",
+            )
+            if isinstance(contract, dict) and key in contract
+        }
+    )
+    payload["screening_reports"] = read_reports("screening")
+    payload["validation_reports"] = read_reports("validation")
+    return _sanitize_robust_tree(payload)
 
 
 ROBUST_PRIVATE_KEYS = {
@@ -1885,6 +2014,7 @@ def build_research_status_payload() -> Dict[str, Any]:
     payload["qlib_predictions"] = _qlib_predictions_payload(reports_dir)
     payload["candidate_pipeline"] = _candidate_pipeline_payload(reports_dir)
     payload["robust_strategy"] = _robust_strategy_payload(reports_dir)
+    payload["robust_signal"] = _robust_signal_payload(reports_dir)
     payload["qlib_research"] = _qlib_research_payload(reports_dir)
     payload["experiment_notebook"] = _experiment_notebook_payload(reports_dir)
     payload["mlflow"] = _mlflow_payload()

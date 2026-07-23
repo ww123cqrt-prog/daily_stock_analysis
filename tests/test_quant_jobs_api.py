@@ -2360,6 +2360,58 @@ class QuantJobsApiTestCase(unittest.TestCase):
             available["run_robust_shadow_day"]["allowed_params"], ["as_of_date"]
         )
 
+    def test_default_specs_include_robust_signal_start_pause_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            configured_quant_data = Path(temp_dir) / "shared-quant-data"
+            with patch(
+                "src.services.quant_job_service.quant_data_root",
+                return_value=configured_quant_data,
+            ):
+                service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+                start = service._build_command(
+                    "run_robust_signal_research", {"run_id": "signal_20260723"}
+                )
+                pause = service._build_command(
+                    "pause_robust_signal_research", {"run_id": "signal_20260723"}
+                )
+                resume = service._build_command(
+                    "resume_robust_signal_research", {"run_id": "signal_20260723"}
+                )
+                available = service.available_job_types()
+
+            with self.assertRaisesRegex(ValueError, "run_id is required"):
+                service._build_command("pause_robust_signal_research", {})
+            with self.assertRaisesRegex(ValueError, "run_id is required"):
+                service._build_command("resume_robust_signal_research", {})
+
+        self.assertIn("launch_robust_signal_research.py", start[1])
+        self.assertEqual(
+            start[start.index("--report-dir") + 1],
+            str(REPORTS_ROOT / "robust_signal"),
+        )
+        self.assertEqual(
+            start[start.index("--mlruns-dir") + 1], str(MLRUNS_ROOT)
+        )
+        self.assertEqual(
+            start[start.index("--quant-data-dir") + 1], str(configured_quant_data)
+        )
+        self.assertNotIn("--request-pause", start)
+        self.assertNotIn("--resume", start)
+        self.assertIn("--request-pause", pause)
+        self.assertNotIn("--resume", pause)
+        self.assertIn("--resume", resume)
+        self.assertNotIn("--request-pause", resume)
+        self.assertEqual(
+            available["run_robust_signal_research"]["allowed_params"], ["run_id"]
+        )
+        self.assertEqual(
+            available["pause_robust_signal_research"]["allowed_params"], ["run_id"]
+        )
+        self.assertEqual(
+            available["resume_robust_signal_research"]["allowed_params"], ["run_id"]
+        )
+
     def test_report_and_refresh_jobs_use_configured_reports_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")

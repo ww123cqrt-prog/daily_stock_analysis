@@ -1,0 +1,234 @@
+version: 1
+name: robust_csi800_signal_research
+
+statuses:
+  - blocked_data
+  - signal_diagnosis_complete
+  - signal_not_found
+  - signal_candidate_ready
+
+safety:
+  long_only: true
+  broker_connection: false
+  automatic_orders: false
+  locked_confirmation_start: '2026-01-01'
+
+paths:
+  report_namespace: robust_signal
+  industry_intervals: reference/industry_intervals.parquet
+  data_manifest: DATA_MANIFEST.json
+  qlib_provider_status: robust_strategy/robust_strategy_status_latest.json
+
+periods:
+  screening_quarters:
+    - 2018Q1
+    - 2018Q2
+    - 2018Q3
+    - 2018Q4
+    - 2019Q1
+    - 2019Q2
+    - 2019Q3
+    - 2019Q4
+    - 2020Q1
+    - 2020Q2
+    - 2020Q3
+    - 2020Q4
+    - 2021Q1
+    - 2021Q2
+    - 2021Q3
+    - 2021Q4
+    - 2022Q1
+    - 2022Q2
+    - 2022Q3
+    - 2022Q4
+  validation_quarters:
+    - 2023Q1
+    - 2023Q2
+    - 2023Q3
+    - 2023Q4
+    - 2024Q1
+    - 2024Q2
+    - 2024Q3
+    - 2024Q4
+    - 2025Q1
+    - 2025Q2
+    - 2025Q3
+    - 2025Q4
+  validation_days: 126
+  screening_window_days: 756
+  validation_windows_days: [504, 756, 1008]
+
+signals:
+  - id: alpha158_raw_5d
+    label: Alpha158 raw 5-day return
+    feature_family: full
+    normalization_scope: board
+    target: raw_return
+    horizon_days: 5
+  - id: alpha158_excess_5d
+    label: Alpha158 CSI800 excess 5-day return
+    feature_family: full
+    normalization_scope: board
+    target: csi800_excess
+    horizon_days: 5
+  - id: trend_momentum_excess_5d
+    label: Trend and momentum CSI800 excess 5-day return
+    feature_family: trend_momentum
+    normalization_scope: board
+    target: csi800_excess
+    horizon_days: 5
+  - id: trend_momentum_excess_10d
+    label: Trend and momentum CSI800 excess 10-day return
+    feature_family: trend_momentum
+    normalization_scope: board
+    target: csi800_excess
+    horizon_days: 10
+  - id: reversal_liquidity_excess_5d
+    label: Reversal volatility and liquidity CSI800 excess 5-day return
+    feature_family: reversal_liquidity
+    normalization_scope: board
+    target: csi800_excess
+    horizon_days: 5
+  - id: reversal_liquidity_excess_10d
+    label: Reversal volatility and liquidity CSI800 excess 10-day return
+    feature_family: reversal_liquidity
+    normalization_scope: board
+    target: csi800_excess
+    horizon_days: 10
+  - id: industry_relative_excess_5d
+    label: Industry-relative combined CSI800 excess 5-day return
+    feature_family: combined
+    normalization_scope: industry
+    target: csi800_excess
+    horizon_days: 5
+  - id: industry_relative_excess_10d
+    label: Industry-relative combined CSI800 excess 10-day return
+    feature_family: combined
+    normalization_scope: industry
+    target: csi800_excess
+    horizon_days: 10
+
+feature_families:
+  full:
+    prefixes: []
+  trend_momentum:
+    prefixes:
+      - ROC
+      - MA
+      - BETA
+      - RSQR
+      - RANK
+      - RSV
+      - IMAX
+      - IMIN
+      - IMXD
+      - CNTP
+      - CNTN
+      - CNTD
+      - SUMP
+      - SUMN
+      - SUMD
+  reversal_liquidity:
+    prefixes:
+      - KMID
+      - KLEN
+      - KUP
+      - KLOW
+      - KSFT
+      - STD
+      - RESI
+      - MAX
+      - MIN
+      - QTLU
+      - QTLD
+      - CORR
+      - CORD
+      - VMA
+      - VSTD
+      - WVMA
+      - VSUMP
+      - VSUMN
+      - VSUMD
+  combined:
+    prefixes: []
+
+models:
+  screening:
+    - id: equal_weight_rank
+      class: EqualWeightRankModel
+      module_path: robust_signal_models
+      kwargs:
+        minimum_absolute_ic: 0.0
+    - id: linear_ridge
+      class: LinearModel
+      module_path: qlib.contrib.model.linear
+      kwargs:
+        estimator: ridge
+        alpha: 0.01
+        fit_intercept: false
+  validation:
+    - id: linear_ols
+      class: LinearModel
+      module_path: qlib.contrib.model.linear
+      kwargs:
+        estimator: ols
+        fit_intercept: false
+    - id: linear_ridge
+      class: LinearModel
+      module_path: qlib.contrib.model.linear
+      kwargs:
+        estimator: ridge
+        alpha: 0.01
+        fit_intercept: false
+  challengers:
+    enabled_after_deterministic_pass: true
+    maximum_full_matrix_models: 2
+    tuning_trials_per_failed_model_max: 5
+    ids: [lightgbm, xgboost, catboost, mps_dnn]
+
+screening:
+  maximum_candidates: 3
+  positive_rank_ic_quarter_ratio_min: 0.60
+  median_quarter_rank_ic_min: 0.01
+  monotonic_quarter_ratio_min: 0.60
+
+evaluation:
+  market: csi800
+  benchmark: SH000906
+  market_state_lookback_days: 60
+  primary_topk: 50
+  sensitivity_topk: [20, 30, 50, 100]
+  total_cost_bps: 20
+  deciles: 10
+  monotonic_spearman_min: 0.80
+  high_correlation_threshold: 0.98
+  low_variance_threshold: 1.0e-8
+
+acceptance:
+  feature_coverage_min: 0.98
+  positive_rank_ic_quarter_ratio_min: 0.70
+  median_quarter_rank_ic_min: 0.02
+  window_rank_correlation_median_min: 0.70
+  top50_overlap_mean_min: 0.60
+  positive_excess_quarter_ratio_min: 0.70
+  annual_excess_return_min: 0.05
+  monotonic_quarter_ratio_min: 0.70
+  seed_rank_correlation_median_min: 0.70
+  seed_top50_overlap_mean_min: 0.60
+
+fundamentals:
+  enabled_only_after_price_volume_failure: true
+  source_priority: [jqdata, eastmoney_akshare]
+  coverage_min: 0.98
+  announcement_delay_trading_days: 1
+  families: [valuation, quality, growth, cash_flow, leverage]
+  allow_mixed_sources: false
+
+artifacts:
+  experiment_name: robust_csi800_signal_research
+  include_config_hash: true
+  include_git_commit: true
+  include_data_manifest_hash: true
+  include_feature_diagnostics: true
+  include_topk_sensitivity: true
+  overwrite_robust_strategy: false

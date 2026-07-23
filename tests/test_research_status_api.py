@@ -20,6 +20,113 @@ from api.app import create_app
 
 
 class ResearchStatusApiTestCase(unittest.TestCase):
+    def test_robust_signal_status_exposes_bounded_sanitized_matrices(self) -> None:
+        from api.v1.endpoints.research_status import _robust_signal_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            signal_dir = reports_dir / "robust_signal"
+            run_id = "robust_signal_20260723"
+            run_dir = signal_dir / "runs" / run_id
+            (run_dir / "screening").mkdir(parents=True)
+            (run_dir / "validation").mkdir(parents=True)
+            (signal_dir / "robust_signal_status_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "signal_candidate_ready",
+                        "lifecycle_status": "completed",
+                        "run_id": run_id,
+                        "current_stage": "completed",
+                        "pause_state": "completed",
+                        "completed_count": 48,
+                        "expected_count": 48,
+                        "next_gate": "create_goal_2_trade_strategy",
+                        "updated_at": "2026-07-23T12:00:00+08:00",
+                        "provider_uri": "/Users/cq/private/provider",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = {
+                "phase": "validation",
+                "signal_id": "alpha158_excess_5d",
+                "model_id": "linear_ridge",
+                "passed": True,
+                "failed_gates": [],
+                "values": {
+                    "median_quarter_rank_ic": 0.03,
+                    "top50_overlap_mean": 0.66,
+                },
+                "quarter_rank_ic": {"2023Q1": 0.03},
+                "window_stability": {
+                    "rank_correlation_median": 0.78,
+                    "topk_overlap_mean": 0.66,
+                },
+                "topk_sensitivity": {
+                    "primary_topk": 50,
+                    "results": {"20": {"mean_label": 0.02}, "50": {"mean_label": 0.01}},
+                },
+                "factor_quality": {
+                    "feature_count_min": 158,
+                    "feature_count_max": 158,
+                    "max_missing_rate": 0.02,
+                    "constant_features": [],
+                    "high_correlation_pair_count_max": 3,
+                },
+                "market_state_attribution": {
+                    "risk_on": {"period_count": 10, "annual_excess_return": 0.08},
+                    "neutral": {"period_count": 8, "annual_excess_return": 0.03},
+                    "defensive": {"period_count": 4, "annual_excess_return": -0.01},
+                    "risk_off": {"period_count": 2, "annual_excess_return": 0.01},
+                },
+                "private_path": "/Users/cq/private/prediction.parquet",
+            }
+            (run_dir / "validation" / "validation_report.json").write_text(
+                json.dumps({"reports": [report]}), encoding="utf-8"
+            )
+            (run_dir / "screening" / "screening_report.json").write_text(
+                json.dumps({"reports": []}), encoding="utf-8"
+            )
+            (run_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "signal_candidate_ready",
+                        "selected_signal_id": "alpha158_excess_5d",
+                        "selected_model_id": "linear_ridge",
+                        "factor_contract": "/Users/cq/private/factor_contract.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "factor_contract.json").write_text(
+                json.dumps(
+                    {
+                        "status": "signal_candidate_ready",
+                        "signal_id": "alpha158_excess_5d",
+                        "model_id": "linear_ridge",
+                        "horizon_days": 5,
+                        "contract_hash": "abc123",
+                        "provider_tree_sha256": "provider-hash",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = _robust_signal_payload(reports_dir)
+
+        self.assertEqual(payload["status"], "signal_candidate_ready")
+        self.assertEqual(payload["progress"]["completed_count"], 48)
+        self.assertEqual(payload["result"]["selected_signal_id"], "alpha158_excess_5d")
+        self.assertEqual(
+            payload["validation_reports"][0]["factor_quality"]["feature_count_min"],
+            158,
+        )
+        self.assertEqual(
+            set(payload["validation_reports"][0]["market_state_attribution"]),
+            {"risk_on", "neutral", "defensive", "risk_off"},
+        )
+        self.assertNotIn("/Users/", json.dumps(payload))
+
     def test_robust_status_exposes_run_scoped_membership_progress(self) -> None:
         from api.v1.endpoints.research_status import _robust_strategy_payload
 

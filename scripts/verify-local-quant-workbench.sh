@@ -56,6 +56,12 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   run_robust_shadow_day.py
   run_robust_shadow_schedule.py
   launch_robust_strategy.py
+  report_robust_strategy_closure.py
+  robust_signal_dataset.py
+  robust_signal_evaluation.py
+  robust_signal_models.py
+  run_robust_signal_research.py
+  launch_robust_signal_research.py
   run_daily_update.py
 )
 

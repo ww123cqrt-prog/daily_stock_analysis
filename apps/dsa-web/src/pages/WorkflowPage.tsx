@@ -442,6 +442,31 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     ],
   },
   {
+    title: '鲁棒选股信号 Goal 1',
+    description: '先证明选股信号是否稳定，再决定是否进入交易策略阶段；不读取 2026 收益，不降低验收门槛。',
+    icon: FlaskConical,
+    jobs: [
+      {
+        type: 'run_robust_signal_research',
+        label: '启动鲁棒选股信号研究',
+        description: '运行八组预注册信号，先做 2018-2022 初筛，再做 2023-2025 多窗口样本外验证。',
+        params: [{ key: 'run_id', label: '运行 ID', kind: 'text', placeholder: '留空自动生成' }],
+      },
+      {
+        type: 'pause_robust_signal_research',
+        label: '暂停鲁棒选股信号研究',
+        description: '写入暂停请求，当前完整任务结束后暂停；不会强杀正在执行的任务。',
+        params: [{ key: 'run_id', label: '运行 ID', kind: 'text', placeholder: '必填：当前 run ID' }],
+      },
+      {
+        type: 'resume_robust_signal_research',
+        label: '恢复鲁棒选股信号研究',
+        description: '使用同一配置、Git 提交和数据上下文恢复已暂停 run。',
+        params: [{ key: 'run_id', label: '运行 ID', kind: 'text', placeholder: '必填：当前 run ID' }],
+      },
+    ],
+  },
+  {
     title: 'Qlib研究增强',
     description: '把已有 Qlib/MLflow 产物拆成模型解释、回测明细、对比、因子、滚动训练和风险诊断报告。',
     icon: Activity,
@@ -1031,6 +1056,8 @@ const WorkflowPage: React.FC = () => {
       cashControlBacktest: quantStatus.cashControlBacktest,
       qlibPredictions: quantStatus.qlibPredictions,
       qlibResearch: quantStatus.qlibResearch,
+      robustStrategy: quantStatus.robustStrategy,
+      robustSignal: quantStatus.robustSignal,
       experimentNotebook: quantStatus.experimentNotebook,
     };
   }, [researchStatus, quantStatus]);
@@ -1253,6 +1280,7 @@ const WorkflowPage: React.FC = () => {
   const trainable = workflowStatus?.trainable;
   const latestTraining = workflowStatus?.latestTraining;
   const robustStrategy = workflowStatus?.robustStrategy;
+  const robustSignal = workflowStatus?.robustSignal;
   const robustMeta = robustStatusLabel(robustStrategy?.status, language);
   const robustProgress = robustStrategy?.progress;
   const robustProgressPercent = robustProgress && robustProgress.expectedDateCount > 0
@@ -1403,6 +1431,78 @@ const WorkflowPage: React.FC = () => {
 
         <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <div className="flex flex-col gap-4">
+            <Card variant="bordered" padding="md">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <span className="label-uppercase">Goal 1 · Signal</span>
+                  <h2 className="mt-2 text-base font-semibold text-foreground">选股信号 Goal 1</h2>
+                  <p className="mt-1 text-sm leading-5 text-secondary-text">
+                    先验证信号是否稳定；通过后才允许创建交易策略 Goal 2。
+                  </p>
+                </div>
+                <Badge variant={robustSignal?.status === 'signal_candidate_ready' ? 'success' : robustSignal?.pauseState === 'paused' ? 'warning' : 'info'}>
+                  {robustSignal?.status || '未启动'}
+                </Badge>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-4">
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">Run ID</p>
+                  <p className="mt-1 truncate font-mono text-sm text-foreground">{robustSignal?.runId || '-'}</p>
+                </div>
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">当前阶段</p>
+                  <p className="mt-1 truncate font-mono text-sm text-foreground">{robustSignal?.currentStage || '-'}</p>
+                </div>
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">暂停状态</p>
+                  <p className="mt-1 truncate font-mono text-sm text-foreground">{robustSignal?.pauseState || '-'}</p>
+                </div>
+                <div className="border-l-2 border-subtle pl-3">
+                  <p className="text-xs text-muted-text">下一门槛</p>
+                  <p className="mt-1 break-words font-mono text-sm text-foreground">{robustSignal?.nextGate || '-'}</p>
+                </div>
+              </div>
+              {robustSignal?.expectedCount ? (
+                <div data-testid="robust-signal-progress" className="mt-4 border-y border-subtle py-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-secondary-text">Goal 1 任务进度</span>
+                    <span className="font-mono text-foreground">{robustSignal.completedCount || 0} / {robustSignal.expectedCount}</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-subtle">
+                    <div
+                      className="h-full bg-cyan transition-[width] duration-300"
+                      style={{ width: `${Math.min(100, Math.round(((robustSignal.completedCount || 0) / robustSignal.expectedCount) * 100))}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="btn-primary h-9 px-3 text-sm"
+                  disabled={Boolean(robustSignal?.lifecycleStatus === 'running')}
+                  onClick={() => void submitGuideJob('run_robust_signal_research')}
+                >
+                  启动 Goal 1
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary h-9 px-3 text-sm"
+                  disabled={!robustSignal?.runId || robustSignal.pauseState !== 'running'}
+                  onClick={() => void submitGuideJob('pause_robust_signal_research', { run_id: robustSignal?.runId })}
+                >
+                  完成当前任务后暂停
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary h-9 px-3 text-sm"
+                  disabled={!robustSignal?.runId || robustSignal.pauseState !== 'paused'}
+                  onClick={() => void submitGuideJob('resume_robust_signal_research', { run_id: robustSignal?.runId })}
+                >
+                  从当前断点恢复
+                </button>
+              </div>
+            </Card>
             <Card variant="bordered" padding="md">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>

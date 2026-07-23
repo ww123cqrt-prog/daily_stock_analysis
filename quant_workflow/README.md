@@ -19,9 +19,10 @@ outside the cloned Qlib source tree.
 
 Run commands from the DSA repository root. Python runtime is shared with the
 DSA backend: use `.venv/bin/python` for Qlib, JQData/AkShare,
-china-astock-quant adapters, and every stable script here. Data paths default
-to `quant_data/` under the DSA repository; set `QUANT_DATA_ROOT` when the local
-Parquet or Qlib provider root moves.
+china-astock-quant adapters, and every stable script here. Data paths use
+`QUANT_DATA_ROOT` when configured; otherwise the resolver uses the DSA-local
+`quant_data/` directory when present and then the sibling WorkingProjects
+`quant_data/` directory. Do not construct this path from the workflow directory.
 
 ```bash
 # Verify JQData auth and stock-pool parsing without writing data

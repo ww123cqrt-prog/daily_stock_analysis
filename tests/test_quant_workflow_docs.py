@@ -119,6 +119,12 @@ def test_verification_script_requires_robust_strategy_entrypoints() -> None:
         "run_robust_confirmation.py",
         "run_robust_shadow_day.py",
         "robust_shadow_tracking.py",
+        "report_robust_strategy_closure.py",
+        "robust_signal_dataset.py",
+        "robust_signal_evaluation.py",
+        "robust_signal_models.py",
+        "run_robust_signal_research.py",
+        "launch_robust_signal_research.py",
     ):
         assert filename in script
 

@@ -10,6 +10,7 @@ import {
   type ResearchQlibPredictions,
   type ResearchCandidatePipeline,
   type ResearchRobustMetricMap,
+  type ResearchRobustSignal,
   type ResearchRobustStrategy,
   type ResearchStatus,
 } from '../api/research';
@@ -459,6 +460,155 @@ function robustMetric(metrics: ResearchRobustMetricMap | undefined, key: string)
   const value = metrics?.[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
+
+const RobustSignalCard: React.FC<{
+  report?: ResearchRobustSignal | null;
+  text: BacktestText;
+}> = ({ report, text }) => {
+  if (!report) return null;
+  const english = text.tabQlib === 'Qlib model/strategy backtest';
+  const validation = report.validationReports || [];
+  const selectedId = report.result?.selectedSignalId;
+  const selected = validation.find((item) => item.signalId === selectedId) || validation[0];
+  const factor = selected?.factorQuality;
+  const processedFactor = factor?.processed;
+  const topk = Object.entries(selected?.topkSensitivity?.results || {});
+  const stability = selected?.windowStability;
+  const states = Object.entries(selected?.marketStateAttribution || {});
+  const stateLabels: Record<string, string> = english
+    ? { risk_on: 'Risk-on', neutral: 'Neutral', defensive: 'Defensive', risk_off: 'Risk-off' }
+    : { risk_on: '风险偏好', neutral: '中性', defensive: '防御', risk_off: '风险关闭' };
+  const pctValue = (value: unknown) => (
+    typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : '--'
+  );
+  const numberValue = (value: unknown) => (
+    typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '--'
+  );
+
+  return (
+    <Card variant="bordered" padding="md">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <span className="label-uppercase">Goal 1 · Signal</span>
+          <h3 className="mt-2 text-sm font-semibold text-foreground">
+            {english ? 'Signal stability matrix' : '选股信号稳定性矩阵'}
+          </h3>
+          <p className="mt-1 text-xs leading-5 text-muted-text">
+            {english
+              ? 'This is signal research, not a completed trading strategy. 2026 results are locked out.'
+              : '这是选股信号研究，不是已经完成的交易策略；2026 结果被锁定，不能参与选型。'}
+          </p>
+        </div>
+        <Badge variant={report.status === 'signal_candidate_ready' ? 'success' : 'warning'}>
+          {report.status}
+        </Badge>
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-4">
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Run ID' : 'Run ID'}</p>
+          <p className="mt-1 truncate font-mono text-sm text-foreground">{report.runId || '--'}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Selected signal' : '入选信号'}</p>
+          <p className="mt-1 truncate font-mono text-sm text-foreground">{selectedId || '--'}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Model' : '模型'}</p>
+          <p className="mt-1 truncate font-mono text-sm text-foreground">{report.result?.selectedModelId || '--'}</p>
+        </div>
+        <div className="border-l-2 border-subtle pl-3">
+          <p className="text-xs text-muted-text">{english ? 'Next gate' : '下一门槛'}</p>
+          <p className="mt-1 break-words font-mono text-sm text-foreground">{report.nextGate || '--'}</p>
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-3 lg:grid-cols-2">
+        <div>
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Factor quality' : '因子质量'}</h4>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Raw feature count' : '原始因子数'}</span>
+              <p className="mt-1 font-mono text-foreground">{factor?.featureCountMin ?? '--'} - {factor?.featureCountMax ?? '--'}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Raw max missing' : '原始最高缺失率'}</span>
+              <p className="mt-1 font-mono text-foreground">{pctValue(factor?.maxMissingRate)}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Model input count' : '模型输入因子数'}</span>
+              <p className="mt-1 font-mono text-foreground">{processedFactor?.featureCountMin ?? '--'} - {processedFactor?.featureCountMax ?? '--'}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Input max missing' : '模型输入最高缺失率'}</span>
+              <p className="mt-1 font-mono text-foreground">{pctValue(processedFactor?.maxMissingRate)}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'High-correlation pairs' : '高相关因子对'}</span>
+              <p className="mt-1 font-mono text-foreground">{factor?.highCorrelationPairCountMax ?? '--'}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Contract hash' : '契约哈希'}</span>
+              <p className="mt-1 truncate font-mono text-foreground">{report.factorContract?.contractHash || '--'}</p>
+            </div>
+          </div>
+        </div>
+        <div>
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Window stability' : '训练窗口稳定性'}</h4>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">{english ? 'Rank correlation' : '排名相关性'}</span>
+              <p className="mt-1 font-mono text-foreground">{numberValue(stability?.rankCorrelationMedian)}</p>
+            </div>
+            <div className="rounded-lg border border-subtle px-3 py-2">
+              <span className="text-muted-text">Top50 overlap</span>
+              <p className="mt-1 font-mono text-foreground">{pctValue(stability?.topkOverlapMean)}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-5 overflow-x-auto">
+        <h4 className="text-xs font-semibold text-foreground">{english ? 'Label scheme comparison' : '标签方案对比'}</h4>
+        <table className="mt-2 min-w-full text-left text-xs">
+          <thead className="text-muted-text"><tr>
+            <th className="px-2 py-2 font-medium">{english ? 'Signal' : '信号方案'}</th>
+            <th className="px-2 py-2 font-medium">{english ? 'Model' : '模型'}</th>
+            <th className="px-2 py-2 text-right font-medium">{english ? 'Median RankIC' : 'RankIC 中位数'}</th>
+            <th className="px-2 py-2 text-right font-medium">{english ? 'Annual excess' : '年化超额'}</th>
+            <th className="px-2 py-2 text-right font-medium">{english ? 'Gate' : '门槛'}</th>
+          </tr></thead>
+          <tbody className="divide-y divide-subtle">
+            {validation.map((item) => (
+              <tr key={`${item.signalId}-${item.modelId}`}>
+                <td className="px-2 py-2 font-mono text-foreground">{item.signalId || '--'}</td>
+                <td className="px-2 py-2 font-mono text-foreground">{item.modelId || '--'}</td>
+                <td className="px-2 py-2 text-right font-mono text-foreground">{numberValue(item.values?.medianQuarterRankIc)}</td>
+                <td className="px-2 py-2 text-right font-mono text-foreground">{pctValue(item.values?.annualExcessReturn)}</td>
+                <td className="px-2 py-2 text-right">{item.passed ? (english ? 'Pass' : '通过') : (english ? 'Fail' : '未通过')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-5 grid gap-4 lg:grid-cols-2">
+        <div className="overflow-x-auto">
+          <h4 className="text-xs font-semibold text-foreground">TopK {english ? 'sensitivity' : '敏感性'}</h4>
+          <table className="mt-2 min-w-full text-left text-xs"><tbody className="divide-y divide-subtle">
+            {topk.map(([key, value]) => <tr key={key}><td className="px-2 py-2 font-mono text-foreground">Top{key}</td><td className="px-2 py-2 text-right font-mono text-foreground">{pctValue(value.meanLabel)}</td></tr>)}
+          </tbody></table>
+        </div>
+        <div className="overflow-x-auto">
+          <h4 className="text-xs font-semibold text-foreground">{english ? 'Four market states' : '四类市场状态'}</h4>
+          <table className="mt-2 min-w-full text-left text-xs"><tbody className="divide-y divide-subtle">
+            {states.map(([key, value]) => <tr key={key}><td className="px-2 py-2 text-foreground">{stateLabels[key] || key}</td><td className="px-2 py-2 text-right font-mono text-foreground">{pctValue(value.annualExcessReturn)}</td><td className="px-2 py-2 text-right font-mono text-muted-text">{value.periodCount ?? 0} {english ? 'periods' : '期'}</td></tr>)}
+          </tbody></table>
+        </div>
+      </div>
+    </Card>
+  );
+};
 
 const RobustStrategyCard: React.FC<{
   report?: ResearchRobustStrategy | null;
@@ -1111,6 +1261,8 @@ const QlibBacktestPanel: React.FC<{
           <QlibPredictionCard report={qlibPredictions} text={text} />
 
           {candidatePipeline ? <CandidatePipelineCard report={candidatePipeline} text={text} /> : null}
+
+          <RobustSignalCard report={status?.robustSignal} text={text} />
 
           <RobustStrategyCard report={status?.robustStrategy} text={text} />
 

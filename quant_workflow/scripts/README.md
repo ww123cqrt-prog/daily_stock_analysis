@@ -91,3 +91,39 @@ The current main provider defaults to:
 The optional cleaned provider defaults to:
 
 `${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned`
+
+## Robust Signal Goal 1
+
+The first robust-research goal is isolated from the legacy full-strategy run.
+Formal runs must use the launchd wrapper, a clean Git worktree, and the shared
+quant data root resolved by `_paths.quant_data_root()`:
+
+```bash
+# Start a new durable formal run
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS
+
+# Pause after the currently running atomic job finishes
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS --request-pause
+
+# Resume only the same run and frozen context
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS --resume
+```
+
+The formal report namespace is `reports/robust_signal/`, and the MLflow
+experiment is `robust_csi800_signal_research`. A smoke run validates wiring
+only; it is not signal evidence. Goal 1 rejects prediction rows dated 2026 or
+later. If price-volume signals fail, `signal_diagnosis_complete` means the
+conditional historical-fundamental stage is still required; it does not mean
+`signal_not_found`.
+
+Each completed job writes two factor-quality views: `raw` is the Alpha158
+handler output before infer processors and exposes real missing/non-finite
+values; `processed` is the model input after robust normalization, fillna,
+board flags, and four point-in-time CSI800 market-regime one-hot features.
+Market regimes are calculated from the CSI800 close panel with a 60-trading-day
+lookback and are mapped only to dates in the job window. Attribution uses one
+global horizon schedule before splitting dates by regime, so the state periods
+sum back to the total evaluation schedule.

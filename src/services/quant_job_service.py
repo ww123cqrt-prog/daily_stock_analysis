@@ -30,6 +30,7 @@ from src.services.quant_workflow_paths import (
     dsa_root,
     mlruns_root,
     projects_root,
+    quant_data_root,
     reports_root,
     workflow_root,
 )
@@ -841,6 +842,44 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         )
         return command
 
+    def _robust_signal_command(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("launch_robust_signal_research.py")
+        command.extend(
+            [
+                "--config",
+                str(QUANT_WORKFLOW_ROOT / "configs" / "robust_signal_research.yaml"),
+                "--quant-data-dir",
+                str(quant_data_root(DSA_ROOT)),
+                "--report-dir",
+                str(REPORTS_ROOT / "robust_signal"),
+                "--mlruns-dir",
+                str(MLRUNS_ROOT),
+            ]
+        )
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        return command
+
+    def run_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        return _robust_signal_command(params)
+
+    def pause_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        run_id = _safe_run_id(params.get("run_id"))
+        if not run_id:
+            raise ValueError("run_id is required for robust signal pause")
+        command = _robust_signal_command({"run_id": run_id})
+        command.append("--request-pause")
+        return command
+
+    def resume_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        run_id = _safe_run_id(params.get("run_id"))
+        if not run_id:
+            raise ValueError("run_id is required for robust signal resume")
+        command = _robust_signal_command({"run_id": run_id})
+        command.append("--resume")
+        return command
+
     def run_robust_confirmation(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("run_robust_confirmation.py")
         command.extend(["--report-dir", str(REPORTS_ROOT / "robust_strategy")])
@@ -1237,6 +1276,31 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "robust_strategy" / "development_latest.json"),
                 str(REPORTS_ROOT / "robust_strategy" / "development_latest.md"),
                 str(REPORTS_ROOT / "robust_strategy" / "frozen_strategy_latest.json"),
+            ],
+        },
+        "run_robust_signal_research": {
+            "label": "启动鲁棒选股信号研究",
+            "command": run_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+                str(REPORTS_ROOT / "robust_signal" / "runs" / "*" / "result.json"),
+            ],
+        },
+        "pause_robust_signal_research": {
+            "label": "暂停鲁棒选股信号研究",
+            "command": pause_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+            ],
+        },
+        "resume_robust_signal_research": {
+            "label": "恢复鲁棒选股信号研究",
+            "command": resume_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
             ],
         },
         "run_robust_confirmation": {

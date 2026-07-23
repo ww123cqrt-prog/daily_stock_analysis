@@ -137,6 +137,26 @@ vi.mock('../../api/research', () => ({
         },
         mlflowExperiments: ['robust_csi800_development', 'robust_csi800_confirmation'],
       },
+      robustSignal: {
+        status: 'signal_diagnosis_complete',
+        lifecycleStatus: 'stopped',
+        reasonCode: 'user_requested_after_current_job',
+        runId: 'robust_signal_20260723',
+        currentStage: 'validation',
+        pauseState: 'paused',
+        nextGate: 'resume_validation',
+        completedCount: 24,
+        expectedCount: 72,
+        updatedAt: '2026-07-23T12:00:00+08:00',
+        progress: {
+          currentStage: 'validation',
+          pauseState: 'paused',
+          completedCount: 24,
+          expectedCount: 72,
+        },
+        screeningReports: [],
+        validationReports: [],
+      },
     }),
   },
 }));
@@ -200,6 +220,9 @@ describe('WorkflowPage', () => {
         train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config', 'experiment_name', 'provider'] },
         run_candidate_pipeline: { label: '运行五模型完整量化流程', allowedParams: ['dry_run', 'provider'] },
         run_robust_strategy: { label: '运行鲁棒策略开发流程', allowedParams: ['as_of_date', 'run_id', 'resume', 'skip_membership_build'] },
+        run_robust_signal_research: { label: '启动鲁棒选股信号研究', allowedParams: ['run_id'] },
+        pause_robust_signal_research: { label: '暂停鲁棒选股信号研究', allowedParams: ['run_id'] },
+        resume_robust_signal_research: { label: '恢复鲁棒选股信号研究', allowedParams: ['run_id'] },
         run_robust_confirmation: { label: '运行冻结策略 2026 确认期', allowedParams: ['run_id', 'resume'] },
         run_robust_shadow_day: { label: '运行鲁棒策略当日纸面跟踪', allowedParams: ['as_of_date'] },
         generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
@@ -333,6 +356,10 @@ describe('WorkflowPage', () => {
     expect(screen.getByLabelText('运行五模型完整量化流程 数据版本')).toBeInTheDocument();
     expect(screen.getByLabelText('运行五模型完整量化流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('鲁棒策略生命周期')).toBeInTheDocument();
+    expect(screen.getByText('选股信号 Goal 1')).toBeInTheDocument();
+    expect(screen.getByTestId('robust-signal-progress')).toHaveTextContent('24 / 72');
+    expect(screen.getByText('resume_validation')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '从当前断点恢复' })).toBeInTheDocument();
     expect(screen.getByText('数据阻断')).toBeInTheDocument();
     expect(screen.getAllByText('jqdata_permission_denied').length).toBeGreaterThan(0);
     expect(screen.getAllByText('build_pit_csi800').length).toBeGreaterThan(0);
@@ -453,6 +480,18 @@ describe('WorkflowPage', () => {
     });
 
     expect(await screen.findByText('qj_check')).toBeInTheDocument();
+  });
+
+  it('resumes the current robust signal run without asking for a second run id', async () => {
+    renderWorkflowPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '从当前断点恢复' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('resume_robust_signal_research', {
+        run_id: 'robust_signal_20260723',
+      });
+    });
   });
 
   it('does not increment the active count when a submitted job already failed to start', async () => {
