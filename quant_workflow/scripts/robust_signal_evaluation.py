@@ -276,6 +276,7 @@ def acceptance_verdict(
     values: Mapping[str, Any], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
     gates = {
+        "feature_coverage": ("feature_coverage", "feature_coverage_min"),
         "positive_rank_ic_quarters": (
             "positive_rank_ic_quarter_ratio",
             "positive_rank_ic_quarter_ratio_min",

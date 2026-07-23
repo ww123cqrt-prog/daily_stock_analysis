@@ -792,6 +792,8 @@ def _summarize_factor_quality(
             diagnostics.append(
                 {
                     "feature_count": feature_count,
+                    "feature_coverage": 1.0
+                    - (sum(missing_rates) / len(missing_rates) if missing_rates else 0.0),
                     "max_missing_rate": max(missing_rates, default=0.0),
                     "constant_features": [
                         str(value) for value in payload["constant_features"]
@@ -811,6 +813,9 @@ def _summarize_factor_quality(
             "diagnostics_count": len(diagnostics),
             "feature_count_min": min(item["feature_count"] for item in diagnostics),
             "feature_count_max": max(item["feature_count"] for item in diagnostics),
+            "minimum_feature_coverage": min(
+                item["feature_coverage"] for item in diagnostics
+            ),
             "max_missing_rate": max(item["max_missing_rate"] for item in diagnostics),
             "constant_features": sorted(
                 {
@@ -922,6 +927,7 @@ def evaluate_records(
             }
         )
         values = {
+            "feature_coverage": factor_quality["minimum_feature_coverage"],
             "positive_rank_ic_quarter_ratio": (
                 sum(value > 0 for value in rank_values) / len(rank_ic) if rank_ic else 0.0
             ),

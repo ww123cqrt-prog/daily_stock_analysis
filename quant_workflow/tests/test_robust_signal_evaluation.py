@@ -52,6 +52,7 @@ def test_topk_sensitivity_keeps_top50_as_primary() -> None:
 
 def test_acceptance_verdict_requires_every_registered_gate() -> None:
     values = {
+        "feature_coverage": 0.99,
         "positive_rank_ic_quarter_ratio": 0.75,
         "median_quarter_rank_ic": 0.03,
         "window_rank_correlation_median": 0.8,
@@ -61,6 +62,7 @@ def test_acceptance_verdict_requires_every_registered_gate() -> None:
         "monotonic_quarter_ratio": 0.75,
     }
     thresholds = {
+        "feature_coverage_min": 0.98,
         "positive_rank_ic_quarter_ratio_min": 0.70,
         "median_quarter_rank_ic_min": 0.02,
         "window_rank_correlation_median_min": 0.70,
@@ -74,6 +76,34 @@ def test_acceptance_verdict_requires_every_registered_gate() -> None:
 
     assert verdict["passed"] is False
     assert verdict["failed_gates"] == ["top50_overlap"]
+
+
+def test_acceptance_verdict_enforces_registered_feature_coverage() -> None:
+    values = {
+        "feature_coverage": 0.979,
+        "positive_rank_ic_quarter_ratio": 0.75,
+        "median_quarter_rank_ic": 0.03,
+        "window_rank_correlation_median": 0.8,
+        "top50_overlap_mean": 0.65,
+        "positive_excess_quarter_ratio": 0.75,
+        "annual_excess_return": 0.08,
+        "monotonic_quarter_ratio": 0.75,
+    }
+    thresholds = {
+        "feature_coverage_min": 0.98,
+        "positive_rank_ic_quarter_ratio_min": 0.70,
+        "median_quarter_rank_ic_min": 0.02,
+        "window_rank_correlation_median_min": 0.70,
+        "top50_overlap_mean_min": 0.60,
+        "positive_excess_quarter_ratio_min": 0.70,
+        "annual_excess_return_min": 0.05,
+        "monotonic_quarter_ratio_min": 0.70,
+    }
+
+    verdict = acceptance_verdict(values, thresholds)
+
+    assert verdict["passed"] is False
+    assert verdict["failed_gates"] == ["feature_coverage"]
 
 
 def test_raw_return_excess_uses_stored_csi800_benchmark_not_universe_mean() -> None:
