@@ -5,12 +5,14 @@ import pandas as pd
 import pytest
 
 from run_robust_signal_research import (
+    QlibJobRunner,
     SignalJob,
     _aggregate_signal_prediction_frames,
     _factor_contract,
     _load_prediction,
     _load_market_states,
     _summarize_factor_quality,
+    _write_failed_status,
     build_jobs,
     run_job_loop,
     write_immutable_factor_contract,
@@ -160,6 +162,59 @@ def test_market_state_loader_resolves_csi800_as_a_qlib_universe() -> None:
         "filter_pipe": [],
     }
     assert not states.empty
+
+
+def test_mlflow_context_yields_active_recorder_not_experiment(monkeypatch) -> None:
+    events = []
+    recorder = object()
+
+    class FakeStart:
+        def __enter__(self):
+            events.append("enter")
+            return object()
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+    class FakeR:
+        @staticmethod
+        def start(**_kwargs):
+            return FakeStart()
+
+        @staticmethod
+        def get_recorder():
+            events.append("recorder")
+            return recorder
+
+    monkeypatch.setattr("qlib.workflow.R", FakeR)
+    runner = object.__new__(QlibJobRunner)
+    runner.mlflow_enabled = True
+    runner.config = {"artifacts": {"experiment_name": "test"}}
+    job = SignalJob("screening", "signal", "model", "2023Q1", 756)
+
+    with runner._mlflow_context(job) as active_run:
+        assert active_run is recorder
+
+    assert events == ["enter", "recorder", "exit"]
+
+
+def test_failed_job_updates_top_level_status_before_reraising(tmp_path: Path) -> None:
+    status = _write_failed_status(
+        run_id="run",
+        context={"context_hash": "context", "git_commit": "commit"},
+        report_dir=tmp_path,
+        current_stage="screening",
+        completed_count=1,
+        expected_count=2,
+        error=RuntimeError("provider failed"),
+    )
+
+    assert status["lifecycle_status"] == "failed"
+    assert status["pause_state"] == "failed"
+    assert status["error_type"] == "RuntimeError"
+    assert json.loads(
+        (tmp_path / "robust_signal_status_latest.json").read_text()
+    )["reason_code"] == "job_failed"
 
 
 def test_signal_window_aggregation_preserves_and_validates_context_columns() -> None:

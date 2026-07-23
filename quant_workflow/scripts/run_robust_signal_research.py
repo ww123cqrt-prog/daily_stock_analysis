@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -577,19 +578,20 @@ class QlibJobRunner:
         self._cached_market_states = market_states
         return dataset, benchmark.copy(), market_states.copy(), split
 
+    @contextmanager
     def _mlflow_context(self, job: SignalJob):
         if not self.mlflow_enabled:
-            from contextlib import nullcontext
-
-            return nullcontext(None)
+            yield None
+            return
         from qlib.workflow import R
 
         os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-        return R.start(
+        with R.start(
             experiment_name=str(self.config["artifacts"]["experiment_name"]),
             recorder_name=f"{job.key}-{uuid.uuid4().hex[:8]}",
             uri=f"file://{mlruns_root()}",
-        )
+        ):
+            yield R.get_recorder()
 
     def __call__(self, job: SignalJob) -> Mapping[str, Any]:
         dataset, benchmark, market_states, split = self._dataset(job)
@@ -1100,6 +1102,35 @@ def _status_payload(
     }
 
 
+def _write_failed_status(
+    *,
+    run_id: str,
+    context: Mapping[str, Any],
+    report_dir: Path,
+    current_stage: str,
+    completed_count: int,
+    expected_count: int,
+    error: BaseException,
+) -> dict[str, Any]:
+    status = _status_payload(
+        run_id=run_id,
+        context=context,
+        lifecycle_status="failed",
+        status=None,
+        current_stage=current_stage,
+        pause_state="failed",
+        completed_count=completed_count,
+        expected_count=expected_count,
+        reason_code="job_failed",
+        next_gate="inspect_failed_job",
+    )
+    status["error_type"] = type(error).__name__
+    status["error"] = str(error)[:500]
+    _write_json(report_dir / "runs" / run_id / "status.json", status)
+    _write_json(report_dir / "robust_signal_status_latest.json", status)
+    return status
+
+
 def run_research(
     *,
     config_path: Path,
@@ -1167,14 +1198,30 @@ def run_research(
     )
     _write_json(run_dir / "status.json", status)
     _write_json(report_dir / "robust_signal_status_latest.json", status)
-    screening_progress = run_job_loop(
-        screening_jobs,
-        progress_path=run_dir / "screening" / "progress.json",
-        context_hash=str(context["context_hash"]),
-        resume=resume,
-        run_job=job_runner,
-        pause_requested=paused,
-    )
+    try:
+        screening_progress = run_job_loop(
+            screening_jobs,
+            progress_path=run_dir / "screening" / "progress.json",
+            context_hash=str(context["context_hash"]),
+            resume=resume,
+            run_job=job_runner,
+            pause_requested=paused,
+        )
+    except Exception as exc:
+        progress = _read_json(run_dir / "screening" / "progress.json")
+        _write_failed_status(
+            run_id=run_id,
+            context=context,
+            report_dir=report_dir,
+            current_stage="screening",
+            completed_count=sum(
+                value.get("status") == "completed"
+                for value in (progress.get("jobs") or {}).values()
+            ),
+            expected_count=len(screening_jobs),
+            error=exc,
+        )
+        raise
     if screening_progress.get("pause_state") == "paused":
         status = _status_payload(
             run_id=run_id,
@@ -1254,14 +1301,31 @@ def run_research(
     )
     _write_json(run_dir / "status.json", validation_status)
     _write_json(report_dir / "robust_signal_status_latest.json", validation_status)
-    validation_progress = run_job_loop(
-        validation_jobs,
-        progress_path=run_dir / "validation" / "progress.json",
-        context_hash=str(context["context_hash"]),
-        resume=resume,
-        run_job=job_runner,
-        pause_requested=paused,
-    )
+    try:
+        validation_progress = run_job_loop(
+            validation_jobs,
+            progress_path=run_dir / "validation" / "progress.json",
+            context_hash=str(context["context_hash"]),
+            resume=resume,
+            run_job=job_runner,
+            pause_requested=paused,
+        )
+    except Exception as exc:
+        progress = _read_json(run_dir / "validation" / "progress.json")
+        _write_failed_status(
+            run_id=run_id,
+            context=context,
+            report_dir=report_dir,
+            current_stage="validation",
+            completed_count=len(screening_jobs)
+            + sum(
+                value.get("status") == "completed"
+                for value in (progress.get("jobs") or {}).values()
+            ),
+            expected_count=len(screening_jobs) + len(validation_jobs),
+            error=exc,
+        )
+        raise
     if validation_progress.get("pause_state") == "paused":
         completed = len(screening_jobs) + int(validation_progress.get("completed_count") or 0)
         status = _status_payload(
