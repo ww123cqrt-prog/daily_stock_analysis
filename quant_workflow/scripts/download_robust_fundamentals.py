@@ -546,6 +546,12 @@ def build_fundamental_product(
         "revision_policy": (
             "current statement values are not available before the last source update date"
         ),
+        "derived_field_rules": {
+            "market_cap": (
+                "vwap*reported_share_capital; else amount/(turn/100); "
+                "else vwap*(annualized_parent_netprofit/(basic_eps*annualization_factor))"
+            )
+        },
         "coverage": coverage,
         "row_counts": {
             "events": int(len(events)),

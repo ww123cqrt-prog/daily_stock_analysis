@@ -231,15 +231,22 @@ def build_daily_fundamental_features(
         joined_blocks.append(joined)
     joined = pd.concat(joined_blocks, ignore_index=True) if joined_blocks else market.copy()
     vwap = _safe_ratio(joined["amount"], joined["volume"])
-    market_cap = vwap * pd.to_numeric(joined.get("share_capital"), errors="coerce")
+    reported_share_capital = pd.to_numeric(
+        joined.get("share_capital"), errors="coerce"
+    )
+    eps = pd.to_numeric(joined.get("basic_eps"), errors="coerce")
+    annualization = pd.to_numeric(joined.get("annualization_factor"), errors="coerce")
+    annual_profit = pd.to_numeric(joined.get("parent_netprofit"), errors="coerce") * annualization
+    inferred_share_capital = _safe_ratio(annual_profit, eps * annualization)
+    inferred_share_capital = inferred_share_capital.where(inferred_share_capital > 0)
+    market_cap = vwap * reported_share_capital
     if "turn" in joined.columns:
         turnover_market_cap = _safe_ratio(
             pd.to_numeric(joined["amount"], errors="coerce"),
             pd.to_numeric(joined["turn"], errors="coerce") / 100.0,
         )
         market_cap = market_cap.fillna(turnover_market_cap)
-    annualization = pd.to_numeric(joined.get("annualization_factor"), errors="coerce")
-    annual_profit = pd.to_numeric(joined.get("parent_netprofit"), errors="coerce") * annualization
+    market_cap = market_cap.fillna(vwap * inferred_share_capital)
     annual_cashflow = pd.to_numeric(joined.get("netcash_operate"), errors="coerce") * annualization
     assets = pd.to_numeric(joined.get("total_assets"), errors="coerce")
     equity = pd.to_numeric(joined.get("total_parent_equity"), errors="coerce")
