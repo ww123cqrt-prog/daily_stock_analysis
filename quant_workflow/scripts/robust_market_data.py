@@ -339,8 +339,14 @@ def build_market_regimes(panel: pd.DataFrame) -> pd.Series:
     metrics = pd.DataFrame(index=matrix.index)
     metrics["return_20d"] = market_index / market_index.shift(20) - 1.0
     metrics["return_60d"] = market_index / market_index.shift(60) - 1.0
-    metrics["breadth_20d"] = (matrix / matrix.shift(20) - 1.0).gt(0).mean(axis=1)
-    metrics["breadth_60d"] = (matrix / matrix.shift(60) - 1.0).gt(0).mean(axis=1)
+    returns_20d = matrix / matrix.shift(20) - 1.0
+    returns_60d = matrix / matrix.shift(60) - 1.0
+    metrics["breadth_20d"] = (
+        returns_20d.gt(0).astype(float).where(returns_20d.notna()).mean(axis=1)
+    )
+    metrics["breadth_60d"] = (
+        returns_60d.gt(0).astype(float).where(returns_60d.notna()).mean(axis=1)
+    )
     metrics["drawdown"] = market_index / market_index.cummax() - 1.0
     metrics["volatility_20d"] = market_returns.rolling(20, min_periods=2).std()
     regimes: list[str] = []

@@ -432,3 +432,31 @@ def test_regime_history_is_unchanged_when_only_future_rows_change() -> None:
     second = module.build_market_regimes(changed)
 
     assert first.loc[first.index <= cutoff].equals(second.loc[second.index <= cutoff])
+
+
+def test_regime_history_ignores_symbols_that_only_appear_in_the_future() -> None:
+    module = load_module()
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    existing_symbols = [f"SH600{i:03d}" for i in range(100)]
+    existing = pd.MultiIndex.from_product(
+        [dates, existing_symbols], names=["date", "symbol"]
+    ).to_frame(index=False)
+    existing["close"] = np.repeat(
+        np.linspace(10.0, 20.0, len(dates)), len(existing_symbols)
+    )
+    cutoff = dates[-20]
+    future_symbols = [f"SZ300{i:03d}" for i in range(100)]
+    future = pd.MultiIndex.from_product(
+        [dates[dates > cutoff], future_symbols], names=["date", "symbol"]
+    ).to_frame(index=False)
+    future["close"] = 10.0
+
+    baseline = module.build_market_regimes(existing)
+    with_future_members = module.build_market_regimes(
+        pd.concat([existing, future], ignore_index=True)
+    )
+
+    pd.testing.assert_series_equal(
+        baseline.loc[baseline.index <= cutoff],
+        with_future_members.loc[with_future_members.index <= cutoff],
+    )

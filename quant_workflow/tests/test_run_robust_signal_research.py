@@ -9,11 +9,13 @@ from run_robust_signal_research import (
     SignalJob,
     _aggregate_signal_prediction_frames,
     _factor_contract,
+    _load_canonical_market_states,
     _load_prediction,
     _load_market_states,
     _summarize_factor_quality,
     _write_failed_status,
     build_jobs,
+    run_research,
     run_job_loop,
     write_immutable_factor_contract,
 )
@@ -164,6 +166,56 @@ def test_market_state_loader_resolves_csi800_as_a_qlib_universe() -> None:
     assert not states.empty
 
 
+def test_canonical_market_states_use_one_history_start_and_are_future_invariant() -> None:
+    class FakeDataApi:
+        calls: list[tuple[str, str]] = []
+
+        @classmethod
+        def instruments(cls, market: str):
+            return {"market": market, "filter_pipe": []}
+
+        @classmethod
+        def features(cls, instruments, _fields, **kwargs):
+            del instruments
+            cls.calls.append((str(kwargs["start_time"]), str(kwargs["end_time"])))
+            dates = pd.bdate_range(kwargs["start_time"], kwargs["end_time"])
+            symbols = ["SH600000", "SZ000001"]
+            rows = []
+            for position, date_value in enumerate(dates):
+                for symbol_offset, symbol in enumerate(symbols):
+                    rows.append(
+                        {
+                            "instrument": symbol,
+                            "datetime": date_value,
+                            "$close": 100.0 + position + symbol_offset,
+                        }
+                    )
+            frame = pd.DataFrame(rows)
+            return frame.set_index(["instrument", "datetime"])
+
+    calendar = pd.bdate_range("1991-01-02", "2025-12-31")
+    early = _load_canonical_market_states(
+        FakeDataApi,
+        market="csi800",
+        calendar=calendar,
+        history_start="2014-01-02",
+        end_date="2023-03-31",
+    )
+    later = _load_canonical_market_states(
+        FakeDataApi,
+        market="csi800",
+        calendar=calendar,
+        history_start="2014-01-02",
+        end_date="2023-06-30",
+    )
+
+    assert FakeDataApi.calls == [
+        ("2014-01-02", "2023-03-31"),
+        ("2014-01-02", "2023-06-30"),
+    ]
+    pd.testing.assert_series_equal(early, later.loc[early.index])
+
+
 def test_mlflow_context_yields_active_recorder_not_experiment(monkeypatch) -> None:
     events = []
     recorder = object()
@@ -215,6 +267,98 @@ def test_failed_job_updates_top_level_status_before_reraising(tmp_path: Path) ->
     assert json.loads(
         (tmp_path / "robust_signal_status_latest.json").read_text()
     )["reason_code"] == "job_failed"
+
+
+def test_validation_summary_failure_updates_run_and_latest_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "robust_signal_research.yaml"
+    )
+    context = {
+        "config_hash": "config",
+        "context_hash": "context",
+        "git_commit": "commit",
+        "git_clean": True,
+        "data_manifest_hash": "manifest",
+        "provider_tree_sha256": "provider",
+        "provider_uri": str(tmp_path / "provider"),
+    }
+    screening_job = SignalJob("screening", "signal", "ridge", "2020Q1", 756)
+    validation_job = SignalJob("validation", "signal", "ridge", "2023Q1", 756)
+
+    monkeypatch.setattr(
+        "run_robust_signal_research.build_context", lambda **_kwargs: context
+    )
+    monkeypatch.setattr(
+        "run_robust_signal_research.QlibJobRunner", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "run_robust_signal_research.build_jobs",
+        lambda _config, *, phase, **_kwargs: (
+            [screening_job] if phase == "screening" else [validation_job]
+        ),
+    )
+
+    def completed_progress(_jobs, *, progress_path, **_kwargs):
+        job = screening_job if "screening" in str(progress_path) else validation_job
+        return {
+            "pause_state": "completed",
+            "jobs": {
+                job.key: {
+                    "status": "completed",
+                    "phase": job.phase,
+                    "signal_id": job.signal_id,
+                    "model_id": job.model_id,
+                    "quarter": job.quarter,
+                    "window_days": job.window_days,
+                }
+            },
+        }
+
+    monkeypatch.setattr("run_robust_signal_research.run_job_loop", completed_progress)
+    monkeypatch.setattr(
+        "run_robust_signal_research.select_screening_candidates",
+        lambda _reports, *, maximum: ["signal"],
+    )
+    evaluation_calls = 0
+
+    def evaluate(_records, *, config, phase):
+        nonlocal evaluation_calls
+        del config
+        evaluation_calls += 1
+        if phase == "validation":
+            raise ValueError("market_state values differ across signal windows")
+        return [{"phase": phase, "passed": True}]
+
+    monkeypatch.setattr("run_robust_signal_research.evaluate_records", evaluate)
+
+    with pytest.raises(ValueError, match="market_state"):
+        run_research(
+            config_path=config_path,
+            quant_data_dir=tmp_path / "quant_data",
+            report_dir=tmp_path / "reports",
+            run_id="run",
+            resume=False,
+            smoke=False,
+            smoke_quarter="2023Q1",
+            smoke_signal_id="signal",
+            mlflow_enabled=False,
+        )
+
+    assert evaluation_calls == 2
+    for path in (
+        tmp_path / "reports" / "runs" / "run" / "status.json",
+        tmp_path / "reports" / "robust_signal_status_latest.json",
+    ):
+        status = json.loads(path.read_text())
+        assert status["lifecycle_status"] == "failed"
+        assert status["current_stage"] == "validation_summary"
+        assert status["reason_code"] == "summary_failed"
+        assert status["completed_count"] == 2
+        assert status["expected_count"] == 2
 
 
 def test_signal_window_aggregation_preserves_and_validates_context_columns() -> None:

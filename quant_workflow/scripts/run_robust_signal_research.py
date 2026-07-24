@@ -190,6 +190,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Top50 is the frozen primary acceptance scope")
     if str(config["evaluation"]["market"]) != "csi800":
         raise ValueError("Goal 1 market universe must remain csi800")
+    market_state_history_start = pd.Timestamp(
+        config["evaluation"].get("market_state_history_start")
+    ).normalize()
+    if market_state_history_start != pd.Timestamp("2014-01-02"):
+        raise ValueError("market-state history start must remain 2014-01-02")
     if int(config["evaluation"].get("market_state_lookback_days", 0)) < 60:
         raise ValueError("market-state features require at least 60 trading days of lookback")
 
@@ -460,6 +465,37 @@ def _load_market_states(
     return market_states
 
 
+def _load_canonical_market_states(
+    data_api: Any,
+    *,
+    market: str,
+    calendar: pd.DatetimeIndex,
+    history_start: Any,
+    end_date: Any,
+) -> pd.Series:
+    canonical_calendar = pd.DatetimeIndex(
+        pd.to_datetime(calendar, errors="coerce")
+    ).dropna().normalize().sort_values().unique()
+    if canonical_calendar.empty:
+        raise ValueError("canonical market-state calendar is empty")
+    start = pd.Timestamp(history_start).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end >= LOCKED_CONFIRMATION_START:
+        raise ValueError("Goal 1 market states attempted to read 2026")
+    if (
+        start not in canonical_calendar
+        or end < start
+        or end > canonical_calendar[-1]
+    ):
+        raise ValueError("market-state end date is outside the provider calendar")
+    return _load_market_states(
+        data_api,
+        market=market,
+        start_date=str(start.date()),
+        end_date=str(end.date()),
+    )
+
+
 class QlibJobRunner:
     def __init__(
         self,
@@ -485,6 +521,7 @@ class QlibJobRunner:
         self._cached_dataset: Any = None
         self._cached_benchmark: pd.Series | None = None
         self._cached_market_states: pd.Series | None = None
+        self._market_states_by_end: dict[pd.Timestamp, pd.Series] = {}
 
     def _signal(self, signal_id: str) -> Mapping[str, Any]:
         return next(item for item in self.config["signals"] if item["id"] == signal_id)
@@ -540,18 +577,30 @@ class QlibJobRunner:
         benchmark.index = pd.to_datetime(
             benchmark.index.get_level_values("datetime"), errors="coerce"
         ).normalize()
-        market_states = _load_market_states(
-            D,
-            market=str(self.config["evaluation"]["market"]),
-            start_date=str(
-                _lookback_start(
-                    self.calendar,
-                    split.train_start,
-                    int(self.config["evaluation"]["market_state_lookback_days"]),
-                ).date()
-            ),
-            end_date=str(split.test_end.date()),
+        market_state_end = pd.Timestamp(split.test_end).normalize()
+        market_state_history_start = pd.Timestamp(
+            self.config["evaluation"]["market_state_history_start"]
+        ).normalize()
+        required_history_start = _lookback_start(
+            self.calendar,
+            split.train_start,
+            int(self.config["evaluation"]["market_state_lookback_days"]),
         )
+        if market_state_history_start > required_history_start:
+            raise ValueError(
+                "market-state history does not provide the configured training lookback"
+            )
+        cached_market_states = self._market_states_by_end.get(market_state_end)
+        if cached_market_states is None:
+            cached_market_states = _load_canonical_market_states(
+                D,
+                market=str(self.config["evaluation"]["market"]),
+                calendar=self.calendar,
+                history_start=market_state_history_start,
+                end_date=market_state_end,
+            )
+            self._market_states_by_end[market_state_end] = cached_market_states.copy()
+        market_states = cached_market_states.copy()
         market_states = market_states.loc[
             (market_states.index >= split.train_start)
             & (market_states.index <= split.test_end)
@@ -1117,6 +1166,8 @@ def _write_failed_status(
     completed_count: int,
     expected_count: int,
     error: BaseException,
+    reason_code: str = "job_failed",
+    next_gate: str = "inspect_failed_job",
 ) -> dict[str, Any]:
     status = _status_payload(
         run_id=run_id,
@@ -1127,8 +1178,8 @@ def _write_failed_status(
         pause_state="failed",
         completed_count=completed_count,
         expected_count=expected_count,
-        reason_code="job_failed",
-        next_gate="inspect_failed_job",
+        reason_code=reason_code,
+        next_gate=next_gate,
     )
     status["error_type"] = type(error).__name__
     status["error"] = str(error)[:500]
@@ -1244,12 +1295,29 @@ def run_research(
         _write_json(run_dir / "status.json", status)
         _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
-    screening_reports = evaluate_records(
-        _records_for_phase(screening_progress, "screening"),
-        config=config,
-        phase="screening",
-    )
-    _write_json(run_dir / "screening" / "screening_report.json", {"reports": screening_reports})
+    try:
+        screening_reports = evaluate_records(
+            _records_for_phase(screening_progress, "screening"),
+            config=config,
+            phase="screening",
+        )
+        _write_json(
+            run_dir / "screening" / "screening_report.json",
+            {"reports": screening_reports},
+        )
+    except Exception as exc:
+        _write_failed_status(
+            run_id=run_id,
+            context=context,
+            report_dir=report_dir,
+            current_stage="screening_summary",
+            completed_count=len(screening_jobs),
+            expected_count=len(screening_jobs),
+            error=exc,
+            reason_code="summary_failed",
+            next_gate="inspect_failed_summary",
+        )
+        raise
     if smoke:
         status = _status_payload(
             run_id=run_id,
@@ -1349,15 +1417,29 @@ def run_research(
         _write_json(run_dir / "status.json", status)
         _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
-    validation_reports = evaluate_records(
-        _records_for_phase(validation_progress, "validation"),
-        config=config,
-        phase="validation",
-    )
-    _write_json(
-        run_dir / "validation" / "validation_report.json",
-        {"reports": validation_reports},
-    )
+    try:
+        validation_reports = evaluate_records(
+            _records_for_phase(validation_progress, "validation"),
+            config=config,
+            phase="validation",
+        )
+        _write_json(
+            run_dir / "validation" / "validation_report.json",
+            {"reports": validation_reports},
+        )
+    except Exception as exc:
+        _write_failed_status(
+            run_id=run_id,
+            context=context,
+            report_dir=report_dir,
+            current_stage="validation_summary",
+            completed_count=len(screening_jobs) + len(validation_jobs),
+            expected_count=len(screening_jobs) + len(validation_jobs),
+            error=exc,
+            reason_code="summary_failed",
+            next_gate="inspect_failed_summary",
+        )
+        raise
     passed = [report for report in validation_reports if report.get("passed") is True]
     total_jobs = len(screening_jobs) + len(validation_jobs)
     if not passed:

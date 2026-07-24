@@ -123,7 +123,9 @@ Each completed job writes two factor-quality views: `raw` is the Alpha158
 handler output before infer processors and exposes real missing/non-finite
 values; `processed` is the model input after robust normalization, fillna,
 board flags, and four point-in-time CSI800 market-regime one-hot features.
-Market regimes are calculated from the CSI800 close panel with a 60-trading-day
-lookback and are mapped only to dates in the job window. Attribution uses one
+Market regimes are calculated continuously from the frozen `2014-01-02`
+history start through each job's test end. The runner requires at least 60
+trading days of warm-up before training and never changes the regime-history
+start with the 504/756/1008-day training window. Attribution uses one
 global horizon schedule before splitting dates by regime, so the state periods
 sum back to the total evaluation schedule.

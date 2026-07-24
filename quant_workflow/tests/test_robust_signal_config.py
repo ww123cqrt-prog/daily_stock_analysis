@@ -14,6 +14,7 @@ def test_signal_research_preregisters_exactly_eight_unique_schemes() -> None:
     assert len({item["id"] for item in signals}) == 8
     assert {item["horizon_days"] for item in signals} == {5, 10}
     assert payload["evaluation"]["market"] == "csi800"
+    assert payload["evaluation"]["market_state_history_start"] == "2014-01-02"
     assert payload["evaluation"]["primary_topk"] == 50
 
 

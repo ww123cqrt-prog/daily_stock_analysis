@@ -195,6 +195,7 @@ screening:
 evaluation:
   market: csi800
   benchmark: SH000906
+  market_state_history_start: '2014-01-02'
   market_state_lookback_days: 60
   primary_topk: 50
   sensitivity_topk: [20, 30, 50, 100]

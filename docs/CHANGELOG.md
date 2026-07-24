@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] `/workflow` 新增 Goal 1 启动、完成当前任务后暂停和同一 Run 恢复，`/backtest` 新增因子质量、标签对比、TopK 敏感性、窗口稳定性和市场状态矩阵；正式长任务继续由 launchd 托管。
 - [修复] Goal 1 网页任务统一使用共享 `quant_data_root()` 解析正式数据目录；研究汇总从每个完成任务的 diagnostics 文件读取真实因子质量，缺失或损坏时直接失败，不显示空占位指标。
 - [修复] Goal 1 市场状态归因先固定全体样本的统一 horizon 取样日，再按状态拆分；模型输入改用带历史回看期的 CSI800 状态 one-hot 特征，因子诊断同时保留原始与处理后数据口径。
+- [修复] Goal 1 市场状态统一从冻结的 2014-01-02 历史起点计算并按测试期末缓存；市场宽度只统计有有效回看价格的股票，避免窗口起点或未来才入池的股票改写历史状态并导致验证汇总失败。
+- [修复] Goal 1 筛选或验证汇总失败时同步将 Run 与 latest 状态写成 `failed/summary_failed`，不再在进程退出后继续显示运行中。
 - [修复] Goal 1 MLflow 记录改为使用 Qlib 当前活动 Recorder 写入参数、指标和 Artifact；任务异常时同步写入顶层失败状态，避免进程退出后网页继续显示运行中。
 - [维护] 旧鲁棒训练在 CatBoost 第 20 组完整落盘后结案，保留 504 个固定参数任务和全部完整调参产物；结论固定为第零代失败基线，不伪装成合格策略。
 - [安全] 18:40 数据更新和 19:10 纸面跟踪 LaunchAgent 统一通过 `/usr/bin/env -i` 启动，只传递 HOME、PATH、TZ 和 Python 输出设置，避免图形会话中的 GitHub、LLM 或其他 API token 进入行情与推理子进程。
