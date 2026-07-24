@@ -36,6 +36,7 @@ from robust_evaluation import (  # noqa: E402
 from robust_market_data import build_market_regimes  # noqa: E402
 from robust_signal_dataset import (  # noqa: E402
     build_signal_dataset_config,
+    build_signal_handler_config,
     label_expression,
 )
 from robust_signal_evaluation import (  # noqa: E402
@@ -242,6 +243,52 @@ def _lookback_start(
     return pd.Timestamp(calendar[max(0, position - int(lookback_days))]).normalize()
 
 
+def _goal1_outcome_boundary(config: Mapping[str, Any], job: SignalJob) -> pd.Timestamp:
+    boundary = LOCKED_CONFIRMATION_START
+    screening_quarters = {
+        str(value) for value in config["periods"]["screening_quarters"]
+    }
+    if job.phase == "screening" and job.quarter in screening_quarters:
+        validation_quarters = [
+            pd.Period(str(value), freq="Q")
+            for value in config["periods"]["validation_quarters"]
+        ]
+        if not validation_quarters:
+            raise ValueError("Goal 1 requires validation quarters")
+        validation_start = min(validation_quarters).start_time.normalize()
+        boundary = min(boundary, validation_start)
+    return pd.Timestamp(boundary).normalize()
+
+
+def _goal1_safe_split(
+    *,
+    config: Mapping[str, Any],
+    job: SignalJob,
+    calendar: Sequence[Any],
+    split: RollingSplit,
+    horizon_days: int,
+) -> RollingSplit:
+    days = pd.DatetimeIndex(pd.to_datetime(calendar, errors="coerce"))
+    days = days.dropna().normalize().sort_values().unique()
+    horizon = int(horizon_days)
+    if days.empty or horizon <= 0:
+        raise ValueError("Goal 1 label boundary requires a calendar and positive horizon")
+    boundary = _goal1_outcome_boundary(config, job)
+    first_disallowed_index = int(days.searchsorted(boundary, side="left"))
+    last_safe_signal_index = first_disallowed_index - horizon - 2
+    if last_safe_signal_index < 0:
+        raise ValueError("calendar history cannot satisfy the Goal 1 label boundary")
+    safe_test_end = pd.Timestamp(days[last_safe_signal_index]).normalize()
+    if safe_test_end >= pd.Timestamp(split.test_end).normalize():
+        return split
+    if safe_test_end < pd.Timestamp(split.test_start).normalize():
+        raise ValueError(
+            f"{job.key} has no test dates whose forward label stays before "
+            f"{boundary.date()}"
+        )
+    return split._replace(test_end=safe_test_end)
+
+
 def build_context(
     *, config_path: Path, config: Mapping[str, Any], quant_data_dir: Path, report_root: Path
 ) -> dict[str, Any]:
@@ -378,9 +425,9 @@ def build_jobs(
             quarter=str(quarter),
             window_days=window,
         )
-        for signal in selected_signals
         for quarter in selected_quarters
         for window in windows
+        for signal in selected_signals
         for model in selected_models
     ]
     if any(job.quarter.startswith("2026") for job in jobs):
@@ -601,6 +648,8 @@ class QlibJobRunner:
         self.calendar = _calendar(provider)
         self._cached_key: tuple[str, str, int] | None = None
         self._cached_dataset: Any = None
+        self._cached_shared_key: tuple[str, str, int, int, bool] | None = None
+        self._cached_handler: Any = None
         self._cached_benchmark: pd.Series | None = None
         self._cached_market_states: pd.Series | None = None
         self._market_states_by_end: dict[pd.Timestamp, pd.Series] = {}
@@ -635,6 +684,13 @@ class QlibJobRunner:
             validation_days=int(self.config["periods"]["validation_days"]),
             label_horizon_days=int(signal["horizon_days"]),
         )
+        split = _goal1_safe_split(
+            config=self.config,
+            job=job,
+            calendar=self.calendar,
+            split=split,
+            horizon_days=int(signal["horizon_days"]),
+        )
         if split.test_end >= LOCKED_CONFIRMATION_START:
             raise ValueError("Goal 1 dataset attempted to read 2026")
         if key == self._cached_key:
@@ -644,54 +700,73 @@ class QlibJobRunner:
                 self._cached_market_states.copy(),
                 split,
             )
-        from qlib.data import D
-        from qlib.utils import init_instance_by_config
-
-        expression = label_expression(int(signal["horizon_days"]))
-        benchmark_frame = D.features(
-            [str(self.config["evaluation"]["benchmark"])],
-            [expression],
-            start_time=str(split.train_start.date()),
-            end_time=str(split.test_end.date()),
-            freq="day",
-        )
-        benchmark = benchmark_frame.iloc[:, 0].copy()
-        benchmark.index = pd.to_datetime(
-            benchmark.index.get_level_values("datetime"), errors="coerce"
-        ).normalize()
-        market_state_end = pd.Timestamp(split.test_end).normalize()
-        market_state_history_start = pd.Timestamp(
-            self.config["evaluation"]["market_state_history_start"]
-        ).normalize()
-        required_history_start = _lookback_start(
-            self.calendar,
-            split.train_start,
-            int(self.config["evaluation"]["market_state_lookback_days"]),
-        )
-        if market_state_history_start > required_history_start:
-            raise ValueError(
-                "market-state history does not provide the configured training lookback"
-            )
-        cached_market_states = self._market_states_by_end.get(market_state_end)
-        if cached_market_states is None:
-            cached_market_states = _load_canonical_market_states(
-                D,
-                market=str(self.config["evaluation"]["market"]),
-                calendar=self.calendar,
-                history_start=market_state_history_start,
-                end_date=market_state_end,
-            )
-            self._market_states_by_end[market_state_end] = cached_market_states.copy()
-        market_states = cached_market_states.copy()
-        market_states = market_states.loc[
-            (market_states.index >= split.train_start)
-            & (market_states.index <= split.test_end)
-        ]
-        if market_states.empty:
-            raise ValueError("market states are missing for signal dataset dates")
         feature_options = _dataset_feature_options(
             self.config, signal, self.quant_data_dir
         )
+        shared_key = (
+            job.phase,
+            job.quarter,
+            int(job.window_days),
+            int(signal["horizon_days"]),
+            bool(feature_options["include_handler_features"]),
+        )
+        if shared_key != self._cached_shared_key:
+            from qlib.data import D
+            from qlib.utils import init_instance_by_config
+
+            expression = label_expression(int(signal["horizon_days"]))
+            benchmark_frame = D.features(
+                [str(self.config["evaluation"]["benchmark"])],
+                [expression],
+                start_time=str(split.train_start.date()),
+                end_time=str(split.test_end.date()),
+                freq="day",
+            )
+            benchmark = benchmark_frame.iloc[:, 0].copy()
+            benchmark.index = pd.to_datetime(
+                benchmark.index.get_level_values("datetime"), errors="coerce"
+            ).normalize()
+            market_state_end = pd.Timestamp(split.test_end).normalize()
+            market_state_history_start = pd.Timestamp(
+                self.config["evaluation"]["market_state_history_start"]
+            ).normalize()
+            required_history_start = _lookback_start(
+                self.calendar,
+                split.train_start,
+                int(self.config["evaluation"]["market_state_lookback_days"]),
+            )
+            if market_state_history_start > required_history_start:
+                raise ValueError(
+                    "market-state history does not provide the configured training lookback"
+                )
+            cached_market_states = self._market_states_by_end.get(market_state_end)
+            if cached_market_states is None:
+                cached_market_states = _load_canonical_market_states(
+                    D,
+                    market=str(self.config["evaluation"]["market"]),
+                    calendar=self.calendar,
+                    history_start=market_state_history_start,
+                    end_date=market_state_end,
+                )
+                self._market_states_by_end[market_state_end] = cached_market_states.copy()
+            market_states = cached_market_states.loc[
+                (cached_market_states.index >= split.train_start)
+                & (cached_market_states.index <= split.test_end)
+            ].copy()
+            if market_states.empty:
+                raise ValueError("market states are missing for signal dataset dates")
+            handler_config = build_signal_handler_config(
+                split=split,
+                signal=signal,
+                include_handler_features=bool(feature_options["include_handler_features"]),
+            )
+            self._cached_shared_key = shared_key
+            self._cached_handler = init_instance_by_config(handler_config)
+            self._cached_benchmark = benchmark
+            self._cached_market_states = market_states
+
+        benchmark = self._cached_benchmark.copy()
+        market_states = self._cached_market_states.copy()
         dataset_config = build_signal_dataset_config(
             split=split,
             signal=signal,
@@ -702,13 +777,14 @@ class QlibJobRunner:
                 str(index.date()): str(value)
                 for index, value in market_states.items()
             },
+            handler=self._cached_handler,
             **feature_options,
         )
+        from qlib.utils import init_instance_by_config
+
         dataset = init_instance_by_config(dataset_config)
         self._cached_key = key
         self._cached_dataset = dataset
-        self._cached_benchmark = benchmark
-        self._cached_market_states = market_states
         return dataset, benchmark.copy(), market_states.copy(), split
 
     @contextmanager
@@ -1281,6 +1357,7 @@ def _write_failed_status(
     error: BaseException,
     reason_code: str = "job_failed",
     next_gate: str = "inspect_failed_job",
+    publish_latest: bool = True,
 ) -> dict[str, Any]:
     status = _status_payload(
         run_id=run_id,
@@ -1297,7 +1374,8 @@ def _write_failed_status(
     status["error_type"] = type(error).__name__
     status["error"] = str(error)[:500]
     _write_json(report_dir / "runs" / run_id / "status.json", status)
-    _write_json(report_dir / "robust_signal_status_latest.json", status)
+    if publish_latest:
+        _write_json(report_dir / "robust_signal_status_latest.json", status)
     return status
 
 
@@ -1324,6 +1402,7 @@ def run_research(
     if not smoke and context["git_clean"] is not True:
         raise ValueError("formal signal research requires a clean Git worktree")
     run_dir = report_dir / "runs" / run_id
+    publish_latest = not smoke
     context_path = run_dir / "context.json"
     if resume:
         stored = _read_json(context_path)
@@ -1367,7 +1446,8 @@ def run_research(
         next_gate="screening_diagnostics",
     )
     _write_json(run_dir / "status.json", status)
-    _write_json(report_dir / "robust_signal_status_latest.json", status)
+    if publish_latest:
+        _write_json(report_dir / "robust_signal_status_latest.json", status)
     try:
         screening_progress = run_job_loop(
             screening_jobs,
@@ -1390,6 +1470,7 @@ def run_research(
             ),
             expected_count=len(screening_jobs),
             error=exc,
+            publish_latest=publish_latest,
         )
         raise
     if screening_progress.get("pause_state") == "paused":
@@ -1406,7 +1487,8 @@ def run_research(
             next_gate="resume_screening",
         )
         _write_json(run_dir / "status.json", status)
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+        if publish_latest:
+            _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
     try:
         screening_reports = evaluate_records(
@@ -1429,6 +1511,7 @@ def run_research(
             error=exc,
             reason_code="summary_failed",
             next_gate="inspect_failed_summary",
+            publish_latest=publish_latest,
         )
         raise
     if smoke:
@@ -1445,7 +1528,8 @@ def run_research(
             next_gate="formal_screening",
         )
         _write_json(run_dir / "status.json", status)
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+        if publish_latest:
+            _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
     candidates = select_screening_candidates(
         screening_reports, maximum=int(config["screening"]["maximum_candidates"])
@@ -1481,7 +1565,8 @@ def run_research(
             next_gate=outcome["next_gate"],
         )
         _write_json(run_dir / "status.json", status)
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+        if publish_latest:
+            _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
     validation_jobs = build_jobs(config, phase="validation", signal_ids=candidates)
     validation_status = _status_payload(
@@ -1496,7 +1581,8 @@ def run_research(
         next_gate="strict_signal_acceptance",
     )
     _write_json(run_dir / "status.json", validation_status)
-    _write_json(report_dir / "robust_signal_status_latest.json", validation_status)
+    if publish_latest:
+        _write_json(report_dir / "robust_signal_status_latest.json", validation_status)
     try:
         validation_progress = run_job_loop(
             validation_jobs,
@@ -1520,6 +1606,7 @@ def run_research(
             ),
             expected_count=len(screening_jobs) + len(validation_jobs),
             error=exc,
+            publish_latest=publish_latest,
         )
         raise
     if validation_progress.get("pause_state") == "paused":
@@ -1537,7 +1624,8 @@ def run_research(
             next_gate="resume_validation",
         )
         _write_json(run_dir / "status.json", status)
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+        if publish_latest:
+            _write_json(report_dir / "robust_signal_status_latest.json", status)
         return status
     try:
         validation_reports = evaluate_records(
@@ -1560,6 +1648,7 @@ def run_research(
             error=exc,
             reason_code="summary_failed",
             next_gate="inspect_failed_summary",
+            publish_latest=publish_latest,
         )
         raise
     passed = [report for report in validation_reports if report.get("passed") is True]
@@ -1628,7 +1717,8 @@ def run_research(
             next_gate="create_goal_2_trade_strategy",
         )
     _write_json(run_dir / "status.json", status)
-    _write_json(report_dir / "robust_signal_status_latest.json", status)
+    if publish_latest:
+        _write_json(report_dir / "robust_signal_status_latest.json", status)
     return status
 
 

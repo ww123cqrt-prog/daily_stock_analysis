@@ -347,7 +347,8 @@ def build_market_regimes(panel: pd.DataFrame) -> pd.Series:
     metrics["breadth_60d"] = (
         returns_60d.gt(0).astype(float).where(returns_60d.notna()).mean(axis=1)
     )
-    metrics["drawdown"] = market_index / market_index.cummax() - 1.0
+    trailing_peak = market_index.rolling(252, min_periods=1).max()
+    metrics["drawdown"] = market_index / trailing_peak - 1.0
     metrics["volatility_20d"] = market_returns.rolling(20, min_periods=2).std()
     regimes: list[str] = []
     for _, row in metrics.iterrows():

@@ -237,40 +237,25 @@ def build_signal_dataset_config(
     include_handler_features: bool = True,
     external_features_path: Path | None = None,
     external_feature_prefixes: Sequence[str] = (),
+    handler: Any | None = None,
 ) -> dict[str, Any]:
-    horizon = int(signal["horizon_days"])
-    expression = label_expression(horizon)
-
     def date_string(value: Any) -> str:
         return str(pd.Timestamp(value).date())
 
+    handler_config = (
+        handler
+        if handler is not None
+        else build_signal_handler_config(
+            split=split,
+            signal=signal,
+            include_handler_features=include_handler_features,
+        )
+    )
     return {
         "class": "SignalResearchDataset",
         "module_path": "robust_signal_dataset",
         "kwargs": {
-            "handler": {
-                "class": "Alpha158",
-                "module_path": "qlib.contrib.data.handler",
-                "kwargs": {
-                    "start_time": date_string(split.train_start),
-                    "end_time": date_string(split.test_end),
-                    "fit_start_time": date_string(split.train_start),
-                    "fit_end_time": date_string(split.train_end),
-                    "instruments": "csi800",
-                    "label": [[expression], ["LABEL0"]],
-                    "infer_processors": [
-                        {
-                            "class": "RobustZScoreNorm",
-                            "kwargs": {
-                                "fields_group": "feature",
-                                "clip_outlier": True,
-                            },
-                        },
-                        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-                    ],
-                    "learn_processors": [{"class": "DropnaLabel"}],
-                },
-            },
+            "handler": handler_config,
             "segments": {
                 "train": [date_string(split.train_start), date_string(split.train_end)],
                 "valid": [
@@ -292,6 +277,66 @@ def build_signal_dataset_config(
             "target": str(signal["target"]),
             "benchmark_returns": dict(benchmark_returns),
             "market_states": dict(market_states),
+        },
+    }
+
+
+def build_signal_handler_config(
+    *,
+    split: RollingSplit,
+    signal: Mapping[str, Any],
+    include_handler_features: bool = True,
+) -> dict[str, Any]:
+    horizon = int(signal["horizon_days"])
+    expression = label_expression(horizon)
+
+    def date_string(value: Any) -> str:
+        return str(pd.Timestamp(value).date())
+
+    if include_handler_features:
+        return {
+            "class": "Alpha158",
+            "module_path": "qlib.contrib.data.handler",
+            "kwargs": {
+                "start_time": date_string(split.train_start),
+                "end_time": date_string(split.test_end),
+                "fit_start_time": date_string(split.train_start),
+                "fit_end_time": date_string(split.train_end),
+                "instruments": "csi800",
+                "label": [[expression], ["LABEL0"]],
+                "infer_processors": [
+                    {
+                        "class": "RobustZScoreNorm",
+                        "kwargs": {
+                            "fields_group": "feature",
+                            "clip_outlier": True,
+                        },
+                    },
+                    {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+                ],
+                "learn_processors": [{"class": "DropnaLabel"}],
+            },
+        }
+
+    return {
+        "class": "DataHandlerLP",
+        "module_path": "qlib.data.dataset.handler",
+        "kwargs": {
+            "start_time": date_string(split.train_start),
+            "end_time": date_string(split.test_end),
+            "instruments": "csi800",
+            "data_loader": {
+                "class": "QlibDataLoader",
+                "kwargs": {
+                    "config": {
+                        "feature": [["$close"], ["ANCHOR_CLOSE"]],
+                        "label": [[expression], ["LABEL0"]],
+                    },
+                    "freq": "day",
+                },
+            },
+            "infer_processors": [],
+            "learn_processors": [{"class": "DropnaLabel"}],
         },
     }
 

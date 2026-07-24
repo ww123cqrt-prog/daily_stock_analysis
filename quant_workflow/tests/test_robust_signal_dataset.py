@@ -233,6 +233,48 @@ def test_signal_dataset_config_wires_external_feature_contract(tmp_path: Path) -
     assert kwargs["external_feature_prefixes"] == ["FUND_QUALITY_"]
 
 
+def test_external_only_dataset_config_uses_minimal_anchor_handler(
+    tmp_path: Path,
+) -> None:
+    split = RollingSplit(
+        train_start=pd.Timestamp("2020-01-02"),
+        train_end=pd.Timestamp("2022-06-30"),
+        validation_start=pd.Timestamp("2022-07-08"),
+        validation_end=pd.Timestamp("2022-12-30"),
+        test_start=pd.Timestamp("2023-01-09"),
+        test_end=pd.Timestamp("2023-03-31"),
+    )
+
+    config = build_signal_dataset_config(
+        split=split,
+        signal={
+            "horizon_days": 5,
+            "normalization_scope": "industry",
+            "target": "csi800_excess",
+        },
+        feature_prefixes=[],
+        include_handler_features=False,
+        external_features_path=tmp_path / "fundamentals",
+        external_feature_prefixes=["FUND_QUALITY_"],
+        industry_intervals_path=tmp_path / "industry.parquet",
+        benchmark_returns={},
+        market_states={},
+    )
+
+    handler = config["kwargs"]["handler"]
+    assert handler["class"] == "DataHandlerLP"
+    assert handler["module_path"] == "qlib.data.dataset.handler"
+    loader_config = handler["kwargs"]["data_loader"]["kwargs"]["config"]
+    assert loader_config["feature"] == [["$close"], ["ANCHOR_CLOSE"]]
+    assert loader_config["label"] == [
+        ["Ref($open, -6) / Ref($open, -1) - 1"],
+        ["LABEL0"],
+    ]
+    assert handler["kwargs"]["infer_processors"] == []
+    assert "fit_start_time" not in handler["kwargs"]
+    assert "fit_end_time" not in handler["kwargs"]
+
+
 def test_dataset_transform_can_use_only_external_fundamental_features(
     tmp_path: Path,
 ) -> None:

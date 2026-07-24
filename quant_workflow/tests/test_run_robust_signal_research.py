@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import pytest
 
+from robust_market_data import build_market_regimes
 from run_robust_signal_research import (
     QlibJobRunner,
     SignalJob,
@@ -11,6 +12,7 @@ from run_robust_signal_research import (
     _dataset_feature_options,
     _factor_contract,
     _failed_signal_outcome,
+    _goal1_safe_split,
     _load_fundamental_source_context,
     _load_canonical_market_states,
     _load_prediction,
@@ -101,6 +103,139 @@ def test_resume_requires_same_context_and_skips_valid_artifact(tmp_path: Path) -
 def test_build_jobs_never_accepts_2026_quarter(signal_config) -> None:
     with pytest.raises(ValueError, match="2026"):
         build_jobs(signal_config, phase="screening", quarters=["2026Q1"])
+
+
+def test_build_jobs_groups_shared_data_before_switching_quarters() -> None:
+    config = {
+        "signals": [{"id": "first"}, {"id": "second"}],
+        "models": {
+            "screening": [{"id": "equal"}, {"id": "ridge"}],
+            "validation": [],
+        },
+        "periods": {
+            "screening_quarters": ["2020Q1", "2020Q2"],
+            "screening_window_days": 756,
+        },
+    }
+
+    jobs = build_jobs(config, phase="screening")
+
+    assert [
+        (job.quarter, job.signal_id, job.model_id) for job in jobs
+    ] == [
+        ("2020Q1", "first", "equal"),
+        ("2020Q1", "first", "ridge"),
+        ("2020Q1", "second", "equal"),
+        ("2020Q1", "second", "ridge"),
+        ("2020Q2", "first", "equal"),
+        ("2020Q2", "first", "ridge"),
+        ("2020Q2", "second", "equal"),
+        ("2020Q2", "second", "ridge"),
+    ]
+
+
+def test_qlib_job_runner_reuses_handler_for_same_split_and_horizon(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = object.__new__(QlibJobRunner)
+    runner.config = {
+        "signals": [
+            {
+                "id": "first",
+                "feature_family": "first",
+                "horizon_days": 5,
+                "normalization_scope": "industry",
+                "target": "csi800_excess",
+            },
+            {
+                "id": "second",
+                "feature_family": "second",
+                "horizon_days": 5,
+                "normalization_scope": "industry",
+                "target": "csi800_excess",
+            },
+        ],
+        "feature_families": {
+            "first": {
+                "include_handler_features": False,
+                "external_prefixes": ["FUND_FIRST_"],
+            },
+            "second": {
+                "include_handler_features": False,
+                "external_prefixes": ["FUND_SECOND_"],
+            },
+        },
+        "paths": {
+            "fundamental_features": "reference/fundamentals",
+            "industry_intervals": "reference/industry_intervals.parquet",
+        },
+        "periods": {
+            "screening_quarters": ["2020Q1"],
+            "validation_quarters": ["2023Q1"],
+            "validation_days": 126,
+        },
+        "evaluation": {
+            "benchmark": "SH000906",
+            "market": "csi800",
+            "market_state_history_start": "2014-01-02",
+            "market_state_lookback_days": 60,
+        },
+    }
+    runner.quant_data_dir = tmp_path
+    runner.calendar = pd.bdate_range("2014-01-02", "2025-12-31")
+    runner._cached_key = None
+    runner._cached_dataset = None
+    runner._cached_shared_key = None
+    runner._cached_handler = None
+    runner._cached_benchmark = None
+    runner._cached_market_states = None
+    runner._market_states_by_end = {}
+
+    class FakeDataApi:
+        @classmethod
+        def features(cls, instruments, fields, **kwargs):
+            dates = pd.bdate_range(kwargs["start_time"], kwargs["end_time"])
+            index = pd.MultiIndex.from_product(
+                [instruments, dates], names=["instrument", "datetime"]
+            )
+            return pd.DataFrame({fields[0]: 0.01}, index=index)
+
+    monkeypatch.setattr("qlib.data.D", FakeDataApi)
+    monkeypatch.setattr(
+        "run_robust_signal_research._load_canonical_market_states",
+        lambda _api, **kwargs: pd.Series(
+            "neutral",
+            index=pd.bdate_range(kwargs["history_start"], kwargs["end_date"]),
+            dtype="string",
+        ),
+    )
+    handler_calls = 0
+    dataset_handlers = []
+    shared_handler = object()
+
+    def fake_init(config):
+        nonlocal handler_calls
+        if config.get("kind") == "handler":
+            handler_calls += 1
+            return shared_handler
+        dataset_handlers.append(config["kwargs"]["handler"])
+        return object()
+
+    monkeypatch.setattr("qlib.utils.init_instance_by_config", fake_init)
+    monkeypatch.setattr(
+        "run_robust_signal_research.build_signal_handler_config",
+        lambda **_kwargs: {"kind": "handler"},
+    )
+    monkeypatch.setattr(
+        "run_robust_signal_research.build_signal_dataset_config",
+        lambda **kwargs: {"kind": "dataset", "kwargs": {"handler": kwargs["handler"]}},
+    )
+
+    runner._dataset(SignalJob("screening", "first", "ridge", "2020Q1", 756))
+    runner._dataset(SignalJob("screening", "second", "ridge", "2020Q1", 756))
+
+    assert handler_calls == 1
+    assert dataset_handlers == [shared_handler, shared_handler]
 
 
 def test_fundamental_extension_failure_is_terminal_signal_not_found(
@@ -237,6 +372,71 @@ def test_ten_day_label_uses_ten_trading_day_purge_on_both_boundaries() -> None:
     assert calendar.get_loc(split.test_start) - calendar.get_loc(split.validation_end) - 1 == 10
 
 
+def test_goal1_split_excludes_forward_labels_crossing_research_boundaries() -> None:
+    calendar = pd.bdate_range("2017-01-02", "2026-03-31")
+    config = {
+        "periods": {
+            "screening_quarters": ["2018Q1", "2022Q4"],
+            "validation_quarters": ["2023Q1", "2025Q4"],
+        }
+    }
+
+    screening = make_rolling_split(
+        calendar,
+        "2022Q4",
+        train_days=756,
+        validation_days=126,
+        label_horizon_days=5,
+    )
+    safe_screening = _goal1_safe_split(
+        config=config,
+        job=SignalJob("screening", "signal", "ridge", "2022Q4", 756),
+        calendar=calendar,
+        split=screening,
+        horizon_days=5,
+    )
+    pre_validation = calendar[calendar < pd.Timestamp("2023-01-01")]
+    assert safe_screening.test_end == pre_validation[-7]
+    assert calendar[calendar.get_loc(safe_screening.test_end) + 6] < pd.Timestamp(
+        "2023-01-01"
+    )
+
+    validation = make_rolling_split(
+        calendar,
+        "2025Q4",
+        train_days=756,
+        validation_days=126,
+        label_horizon_days=10,
+    )
+    safe_validation = _goal1_safe_split(
+        config=config,
+        job=SignalJob("validation", "signal", "ridge", "2025Q4", 756),
+        calendar=calendar,
+        split=validation,
+        horizon_days=10,
+    )
+    pre_confirmation = calendar[calendar < pd.Timestamp("2026-01-01")]
+    assert safe_validation.test_end == pre_confirmation[-12]
+    assert calendar[calendar.get_loc(safe_validation.test_end) + 11] < pd.Timestamp(
+        "2026-01-01"
+    )
+
+    ordinary = make_rolling_split(
+        calendar,
+        "2025Q3",
+        train_days=756,
+        validation_days=126,
+        label_horizon_days=5,
+    )
+    assert _goal1_safe_split(
+        config=config,
+        job=SignalJob("validation", "signal", "ridge", "2025Q3", 756),
+        calendar=calendar,
+        split=ordinary,
+        horizon_days=5,
+    ) == ordinary
+
+
 def test_prediction_reader_rejects_any_2026_rows(tmp_path: Path) -> None:
     path = tmp_path / "prediction.parquet"
     pd.DataFrame(
@@ -287,6 +487,26 @@ def test_market_state_loader_resolves_csi800_as_a_qlib_universe() -> None:
         "filter_pipe": [],
     }
     assert not states.empty
+
+
+def test_market_regime_forgets_a_peak_older_than_one_trading_year() -> None:
+    dates = pd.bdate_range("2020-01-02", periods=320)
+    closes = pd.Series(100.0, index=dates)
+    closes.iloc[0] = 200.0
+    closes.iloc[-40:] = pd.Series(
+        range(100, 140), index=dates[-40:], dtype="float64"
+    )
+    panel = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": "SH600000",
+            "close": closes.to_numpy(),
+        }
+    )
+
+    regimes = build_market_regimes(panel)
+
+    assert regimes.iloc[-1] == "risk_on"
 
 
 def test_canonical_market_states_use_one_history_start_and_are_future_invariant() -> None:
@@ -390,6 +610,27 @@ def test_failed_job_updates_top_level_status_before_reraising(tmp_path: Path) ->
     assert json.loads(
         (tmp_path / "robust_signal_status_latest.json").read_text()
     )["reason_code"] == "job_failed"
+
+
+def test_smoke_failure_does_not_replace_latest_formal_status(tmp_path: Path) -> None:
+    latest = tmp_path / "robust_signal_status_latest.json"
+    latest.write_text(json.dumps({"run_id": "formal"}), encoding="utf-8")
+
+    _write_failed_status(
+        run_id="smoke",
+        context={"context_hash": "context", "git_commit": "commit"},
+        report_dir=tmp_path,
+        current_stage="screening",
+        completed_count=0,
+        expected_count=1,
+        error=RuntimeError("smoke failed"),
+        publish_latest=False,
+    )
+
+    assert json.loads(latest.read_text(encoding="utf-8")) == {"run_id": "formal"}
+    assert json.loads(
+        (tmp_path / "runs" / "smoke" / "status.json").read_text(encoding="utf-8")
+    )["lifecycle_status"] == "failed"
 
 
 def test_validation_summary_failure_updates_run_and_latest_status(
