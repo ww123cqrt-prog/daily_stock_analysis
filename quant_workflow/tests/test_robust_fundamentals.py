@@ -238,6 +238,40 @@ def test_valuation_derives_missing_share_capital_from_profit_and_eps() -> None:
     assert np.isclose(result["FUND_VALUE_BOOK_TO_MARKET"], 0.4)
 
 
+def test_valuation_uses_close_when_no_trade_vwap_is_available() -> None:
+    events = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "report_date": [pd.Timestamp("2024-03-31")],
+            "effective_date": [pd.Timestamp("2024-05-06")],
+            "total_assets": [1_000.0],
+            "total_liabilities": [600.0],
+            "total_parent_equity": [400.0],
+            "share_capital": [100.0],
+            "total_operate_income": [300.0],
+            "revenue_yoy": [0.20],
+            "parent_netprofit": [40.0],
+            "netprofit_yoy": [0.10],
+            "basic_eps": [0.4],
+            "netcash_operate": [80.0],
+            "annualization_factor": [4.0],
+        }
+    )
+    market_rows = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2024-05-06")],
+            "symbol": ["SH600000"],
+            "close": [10.0],
+            "volume": [np.nan],
+            "amount": [0.0],
+        }
+    )
+
+    result = build_daily_fundamental_features(events, market_rows).iloc[0]
+
+    assert np.isclose(result["FUND_VALUE_BOOK_TO_MARKET"], 0.4)
+
+
 def test_coverage_gate_passes_at_exact_threshold() -> None:
     frame = pd.DataFrame(
         {

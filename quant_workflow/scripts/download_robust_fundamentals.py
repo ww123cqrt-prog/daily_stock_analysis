@@ -548,6 +548,7 @@ def build_fundamental_product(
         ),
         "derived_field_rules": {
             "market_cap": (
+                "vwap=(amount/volume) else close; "
                 "vwap*reported_share_capital; else amount/(turn/100); "
                 "else vwap*(annualized_parent_netprofit/(basic_eps*annualization_factor))"
             )

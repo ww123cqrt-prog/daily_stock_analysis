@@ -230,7 +230,9 @@ def build_daily_fundamental_features(
             )
         joined_blocks.append(joined)
     joined = pd.concat(joined_blocks, ignore_index=True) if joined_blocks else market.copy()
-    vwap = _safe_ratio(joined["amount"], joined["volume"])
+    vwap = _safe_ratio(joined["amount"], joined["volume"]).fillna(
+        pd.to_numeric(joined["close"], errors="coerce")
+    )
     reported_share_capital = pd.to_numeric(
         joined.get("share_capital"), errors="coerce"
     )
