@@ -134,6 +134,33 @@ def test_build_jobs_groups_shared_data_before_switching_quarters() -> None:
     ]
 
 
+def test_build_jobs_groups_signals_by_shared_handler_shape() -> None:
+    config = {
+        "signals": [
+            {"id": "five_first", "horizon_days": 5, "feature_family": "full"},
+            {"id": "ten", "horizon_days": 10, "feature_family": "full"},
+            {"id": "five_second", "horizon_days": 5, "feature_family": "full"},
+        ],
+        "feature_families": {"full": {"include_handler_features": True}},
+        "models": {
+            "screening": [{"id": "ridge"}],
+            "validation": [],
+        },
+        "periods": {
+            "screening_quarters": ["2020Q1"],
+            "screening_window_days": 756,
+        },
+    }
+
+    jobs = build_jobs(config, phase="screening")
+
+    assert [job.signal_id for job in jobs] == [
+        "five_first",
+        "five_second",
+        "ten",
+    ]
+
+
 def test_qlib_job_runner_reuses_handler_for_same_split_and_horizon(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -401,6 +401,17 @@ def build_jobs(
         for item in config["signals"]
         if signal_ids is None or str(item["id"]) in set(signal_ids)
     ]
+    feature_families = config.get("feature_families") or {}
+    selected_signals.sort(
+        key=lambda item: (
+            int(item.get("horizon_days") or 0),
+            bool(
+                feature_families.get(str(item.get("feature_family")), {}).get(
+                    "include_handler_features", True
+                )
+            ),
+        )
+    )
     configured_models = config["models"][phase]
     selected_models = [
         item
