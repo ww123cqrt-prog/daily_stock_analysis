@@ -453,6 +453,28 @@ def load_symbol_history(
     )
 
 
+def merge_statement_history(
+    summary: pd.DataFrame, detail: pd.DataFrame
+) -> pd.DataFrame:
+    """Prefer non-null historical detail while retaining summary-only rows."""
+    keys = ["SECUCODE", "REPORT_DATE"]
+    for frame_name, frame in (("summary", summary), ("detail", detail)):
+        if not set(keys).issubset(frame.columns):
+            raise ValueError(f"{frame_name} statement is missing merge keys")
+
+    def indexed(frame: pd.DataFrame) -> pd.DataFrame:
+        return frame.drop_duplicates(keys, keep="last").set_index(keys)
+
+    base = indexed(summary)
+    enriched = indexed(detail)
+    union = base.index.union(enriched.index)
+    result = base.reindex(union)
+    for column in enriched.columns:
+        values = enriched[column].reindex(union)
+        result[column] = values.combine_first(result[column]) if column in result else values
+    return result.reset_index()
+
+
 def _atomic_json(payload: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -728,7 +750,7 @@ def _download_raw_statements(
         )
         if history.empty:
             raise RuntimeError(f"EastMoney {statement} symbol history returned no data")
-        combined[statement] = history
+        combined[statement] = merge_statement_history(combined[statement], history)
         print(
             f"[symbol-history] {statement}: {history['SECUCODE'].nunique()} symbols, "
             f"{len(history)} rows",

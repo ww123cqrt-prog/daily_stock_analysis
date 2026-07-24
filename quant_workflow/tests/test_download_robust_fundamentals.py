@@ -423,6 +423,39 @@ def test_load_symbol_history_fetches_bounded_batches() -> None:
     assert len(result) == 5
 
 
+def test_merge_statement_history_keeps_summary_rows_missing_from_detail() -> None:
+    module = load_module()
+    pd = __import__("pandas")
+    summary = pd.DataFrame(
+        {
+            "SECUCODE": ["600000.SH", "600001.SH"],
+            "REPORT_DATE": ["2025-12-31", "2025-12-31"],
+            "NOTICE_DATE": ["2026-03-01", "2026-03-02"],
+            "UPDATE_DATE": ["2026-03-01", "2026-03-02"],
+            "SHARE_CAPITAL": [None, None],
+            "TOTAL_ASSETS": [100.0, 200.0],
+        }
+    )
+    detail = pd.DataFrame(
+        {
+            "SECUCODE": ["600000.SH"],
+            "REPORT_DATE": ["2025-12-31"],
+            "NOTICE_DATE": ["2026-03-01"],
+            "UPDATE_DATE": ["2026-03-05"],
+            "SHARE_CAPITAL": [10.0],
+            "TOTAL_ASSETS": [101.0],
+        }
+    )
+
+    merged = module.merge_statement_history(summary, detail)
+
+    assert sorted(merged["SECUCODE"].tolist()) == ["600000.SH", "600001.SH"]
+    row = merged.loc[merged["SECUCODE"] == "600000.SH"].iloc[0]
+    assert row["SHARE_CAPITAL"] == 10.0
+    assert row["TOTAL_ASSETS"] == 101.0
+    assert row["UPDATE_DATE"] == "2026-03-05"
+
+
 def test_goal1_download_rejects_any_2026_boundary() -> None:
     module = load_module()
 
