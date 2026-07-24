@@ -395,6 +395,34 @@ def test_symbol_batch_cache_reuses_complete_parquet(tmp_path: Path) -> None:
     assert first.equals(second)
 
 
+def test_load_symbol_history_fetches_bounded_batches() -> None:
+    module = load_module()
+    pd = __import__("pandas")
+    calls: list[list[str]] = []
+
+    def fetcher(symbols):
+        calls.append(list(symbols))
+        return pd.DataFrame(
+            {
+                "SECUCODE": [f"{symbol[2:]}.{symbol[:2]}" for symbol in symbols],
+                "REPORT_DATE": ["2025-12-31"] * len(symbols),
+            }
+        )
+
+    result = module.load_symbol_history(
+        ["SH600000", "SH600001", "SH600002", "SH600003", "SH600004"],
+        fetcher=fetcher,
+        batch_size=2,
+    )
+
+    assert calls == [
+        ["SH600000", "SH600001"],
+        ["SH600002", "SH600003"],
+        ["SH600004"],
+    ]
+    assert len(result) == 5
+
+
 def test_goal1_download_rejects_any_2026_boundary() -> None:
     module = load_module()
 

@@ -31,7 +31,7 @@ from _paths import quant_data_root, reports_root
 
 EASTMONEY_URL = "https://datacenter.eastmoney.com/securities/api/data/get"
 EASTMONEY_SUMMARY_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-SOURCE_CONTRACT_VERSION = 2
+SOURCE_CONTRACT_VERSION = 3
 PERIOD_CACHE_CONTRACT_VERSION = 1
 PAGE_SIZE = 500
 SYMBOL_BATCH_SIZE = 20
@@ -431,6 +431,28 @@ def supplement_missing_symbols(
     return result.drop_duplicates().reset_index(drop=True), missing
 
 
+def load_symbol_history(
+    symbols: Sequence[str],
+    *,
+    fetcher: Callable[[Sequence[str]], pd.DataFrame],
+    batch_size: int = SYMBOL_BATCH_SIZE,
+) -> pd.DataFrame:
+    if int(batch_size) <= 0:
+        raise ValueError("symbol history batch_size must be positive")
+    normalized = sorted(set(str(value).strip().upper() for value in symbols))
+    blocks: list[pd.DataFrame] = []
+    for offset in range(0, len(normalized), int(batch_size)):
+        batch = normalized[offset : offset + int(batch_size)]
+        frame = fetcher(batch)
+        if not frame.empty:
+            blocks.append(frame.reset_index(drop=True))
+    if not blocks:
+        return pd.DataFrame()
+    return pd.concat(blocks, ignore_index=True, sort=False).drop_duplicates().reset_index(
+        drop=True
+    )
+
+
 def _atomic_json(payload: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -646,7 +668,7 @@ def _download_raw_statements(
         statement: pd.concat(frames, ignore_index=True)
         for statement, frames in blocks.items()
     }
-    for statement in ("income", "balance", "cashflow"):
+    for statement in ("income",):
         def fetch_batch(
             batch: Sequence[str], *, statement: str = statement
         ) -> pd.DataFrame:
@@ -678,6 +700,40 @@ def _download_raw_statements(
                 f"[supplement] {statement}: requested {len(supplemented)} historical symbols",
                 flush=True,
             )
+    for statement in ("balance", "cashflow"):
+        def fetch_history_batch(
+            batch: Sequence[str], *, statement: str = statement
+        ) -> pd.DataFrame:
+            return load_or_fetch_symbol_batch(
+                cache_dir=cache_dir,
+                statement=statement,
+                symbols=batch,
+                start_report_date=start_report_date,
+                end_report_date=end_report_date,
+                fetcher=lambda: _retry_source_call(
+                    lambda: fetch_statement_batch(
+                        session,
+                        statement=statement,
+                        symbols=batch,
+                        start_report_date=start_report_date,
+                        end_report_date=end_report_date,
+                        timeout=timeout,
+                    )
+                ),
+            )
+
+        history = load_symbol_history(
+            sorted(symbols),
+            fetcher=fetch_history_batch,
+        )
+        if history.empty:
+            raise RuntimeError(f"EastMoney {statement} symbol history returned no data")
+        combined[statement] = history
+        print(
+            f"[symbol-history] {statement}: {history['SECUCODE'].nunique()} symbols, "
+            f"{len(history)} rows",
+            flush=True,
+        )
     return combined
 
 
@@ -770,8 +826,8 @@ def run_download(
             "fallback_reason": "jqdata_historical_coverage_insufficient",
             "source_endpoints": [EASTMONEY_URL, EASTMONEY_SUMMARY_URL],
             "source_routes": [
-                "all_ashare_period_summary",
-                "historical_symbol_batch_for_missing_members",
+                "income_period_history_with_missing_symbol_supplement",
+                "balance_and_cashflow_historical_symbol_batches",
             ],
             "data_range": {"start": data_start, "end": data_end},
             "report_range": {"start": report_start, "end": report_end},
