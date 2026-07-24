@@ -218,6 +218,8 @@ acceptance:
   seed_top50_overlap_mean_min: 0.60
 
 fundamentals:
+  research_round: price_volume_baseline
+  expected_signal_count: 8
   enabled_only_after_price_volume_failure: true
   source_priority: [jqdata, eastmoney_akshare]
   coverage_min: 0.98

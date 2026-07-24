@@ -18,6 +18,7 @@ MARKET_REGIMES = ("risk_on", "neutral", "defensive", "risk_off")
 MARKET_REGIME_FEATURES = tuple(
     f"MARKET_REGIME_{state.upper()}" for state in MARKET_REGIMES
 )
+LOCKED_CONFIRMATION_START = pd.Timestamp("2026-01-01")
 
 
 def label_expression(horizon_days: int) -> str:
@@ -41,6 +42,86 @@ def select_feature_family(
     if not selected:
         raise ValueError("feature family selected no Alpha158 columns")
     return features.loc[:, selected].copy()
+
+
+@lru_cache(maxsize=24)
+def _read_external_feature_year(path: str) -> pd.DataFrame:
+    frame = pd.read_parquet(path)
+    required = {"datetime", "instrument"}
+    if not required.issubset(frame.columns):
+        raise ValueError("external features are missing datetime or instrument")
+    result = frame.copy()
+    result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce").dt.normalize()
+    result["instrument"] = result["instrument"].astype(str).str.upper()
+    if result["datetime"].isna().any():
+        raise ValueError("external features contain invalid dates")
+    if (result["datetime"] >= LOCKED_CONFIRMATION_START).any():
+        raise ValueError("Goal 1 external features attempted to expose 2026 data")
+    if result.duplicated(["datetime", "instrument"]).any():
+        raise ValueError("external features contain duplicate date-instrument rows")
+    return result.set_index(["datetime", "instrument"]).sort_index()
+
+
+def align_external_features(
+    index: pd.MultiIndex,
+    root: Path,
+    *,
+    prefixes: Sequence[str],
+) -> pd.DataFrame:
+    """Load PIT daily features and align them exactly to a Qlib dataset index."""
+    if not {"datetime", "instrument"}.issubset(index.names):
+        raise ValueError("external feature alignment requires datetime and instrument levels")
+    dates = pd.to_datetime(index.get_level_values("datetime"), errors="coerce").normalize()
+    if dates.hasnans:
+        raise ValueError("external feature alignment received invalid dates")
+    if (dates >= LOCKED_CONFIRMATION_START).any():
+        raise ValueError("Goal 1 external feature alignment attempted to access 2026")
+
+    daily_dir = Path(root) / "daily"
+    files = sorted(daily_dir.glob("*.parquet"))
+    if not files:
+        raise ValueError("external daily features are unavailable")
+    years_by_path: dict[int, Path] = {}
+    for path in files:
+        try:
+            year = int(path.stem)
+        except ValueError as exc:
+            raise ValueError(f"external feature filename is not a year: {path.name}") from exc
+        if year >= LOCKED_CONFIRMATION_START.year:
+            raise ValueError("Goal 1 external features attempted to expose 2026 data")
+        years_by_path[year] = path
+
+    requested_years = sorted(set(int(value) for value in dates.year))
+    missing_years = [year for year in requested_years if year not in years_by_path]
+    if missing_years:
+        raise ValueError(
+            "external daily features are missing years: "
+            + ", ".join(str(value) for value in missing_years)
+        )
+    source = pd.concat(
+        [_read_external_feature_year(str(years_by_path[year].resolve())) for year in requested_years],
+        axis=0,
+    )
+    normalized_prefixes = tuple(str(value).upper() for value in prefixes)
+    selected = (
+        [
+            column
+            for column in source.columns
+            if str(column).upper().startswith(normalized_prefixes)
+        ]
+        if normalized_prefixes
+        else list(source.columns)
+    )
+    if not selected:
+        raise ValueError("external feature family selected no columns")
+
+    canonical_index = pd.MultiIndex.from_arrays(
+        [dates, index.get_level_values("instrument").astype(str).str.upper()],
+        names=["datetime", "instrument"],
+    )
+    aligned = source.loc[:, selected].reindex(canonical_index)
+    aligned.index = index
+    return aligned
 
 
 def normalize_cross_section(
@@ -153,6 +234,9 @@ def build_signal_dataset_config(
     industry_intervals_path: Path,
     benchmark_returns: Mapping[str, float],
     market_states: Mapping[str, str],
+    include_handler_features: bool = True,
+    external_features_path: Path | None = None,
+    external_feature_prefixes: Sequence[str] = (),
 ) -> dict[str, Any]:
     horizon = int(signal["horizon_days"])
     expression = label_expression(horizon)
@@ -196,6 +280,13 @@ def build_signal_dataset_config(
                 "test": [date_string(split.test_start), date_string(split.test_end)],
             },
             "feature_prefixes": list(feature_prefixes),
+            "include_handler_features": bool(include_handler_features),
+            "external_features_path": (
+                str(Path(external_features_path).resolve())
+                if external_features_path is not None
+                else None
+            ),
+            "external_feature_prefixes": list(external_feature_prefixes),
             "normalization_scope": str(signal["normalization_scope"]),
             "industry_intervals_path": str(Path(industry_intervals_path).resolve()),
             "target": str(signal["target"]),
@@ -224,6 +315,9 @@ class SignalResearchDataset(DatasetH):
         self,
         *args: Any,
         feature_prefixes: Sequence[str] = (),
+        include_handler_features: bool = True,
+        external_features_path: str | None = None,
+        external_feature_prefixes: Sequence[str] = (),
         normalization_scope: str = "board",
         industry_intervals_path: str | None = None,
         target: str = "raw_return",
@@ -232,6 +326,13 @@ class SignalResearchDataset(DatasetH):
         **kwargs: Any,
     ) -> None:
         self.feature_prefixes = tuple(str(value) for value in feature_prefixes)
+        self.include_handler_features = bool(include_handler_features)
+        self.external_features_path = (
+            Path(external_features_path) if external_features_path else None
+        )
+        self.external_feature_prefixes = tuple(
+            str(value) for value in external_feature_prefixes
+        )
         self.normalization_scope = str(normalization_scope)
         self.industry_intervals_path = (
             Path(industry_intervals_path) if industry_intervals_path else None
@@ -251,8 +352,28 @@ class SignalResearchDataset(DatasetH):
             raise ValueError("market_states contains invalid or duplicate dates")
         super().__init__(*args, **kwargs)
 
+    def _select_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        blocks: list[pd.DataFrame] = []
+        if getattr(self, "include_handler_features", True):
+            blocks.append(select_feature_family(frame, prefixes=self.feature_prefixes))
+        external_path = getattr(self, "external_features_path", None)
+        if external_path is not None:
+            blocks.append(
+                align_external_features(
+                    frame.index,
+                    external_path,
+                    prefixes=getattr(self, "external_feature_prefixes", ()),
+                )
+            )
+        if not blocks:
+            raise ValueError("signal dataset selected no handler or external features")
+        selected = pd.concat(blocks, axis=1)
+        if selected.columns.duplicated().any():
+            raise ValueError("signal dataset contains duplicate feature columns")
+        return selected
+
     def _transform_features(self, frame: pd.DataFrame) -> pd.DataFrame:
-        selected = select_feature_family(frame, prefixes=self.feature_prefixes)
+        selected = self._select_features(frame)
         instruments = selected.index.get_level_values("instrument").astype(str)
         if self.normalization_scope == "industry":
             if self.industry_intervals_path is None:
@@ -275,7 +396,7 @@ class SignalResearchDataset(DatasetH):
         def transform(frame: pd.DataFrame) -> pd.DataFrame:
             if isinstance(frame.columns, pd.MultiIndex):
                 frame, _ = _split_column_groups(frame)
-            return select_feature_family(frame, prefixes=self.feature_prefixes)
+            return self._select_features(frame)
 
         if isinstance(prepared, list):
             return [transform(frame) for frame in prepared]

@@ -341,6 +341,60 @@ def test_period_cache_reuses_complete_parquet(tmp_path: Path) -> None:
     assert first.equals(second)
 
 
+def test_missing_historical_members_are_supplemented_by_symbol_batches() -> None:
+    module = load_module()
+    pd = __import__("pandas")
+    base = pd.DataFrame(
+        {"SECUCODE": ["600000.SH"], "REPORT_DATE": ["2022-12-31"]}
+    )
+    calls: list[list[str]] = []
+
+    def fetcher(symbols):
+        calls.append(list(symbols))
+        return pd.DataFrame(
+            {
+                "SECUCODE": ["600005.SH"],
+                "REPORT_DATE": ["2014-12-31"],
+            }
+        )
+
+    result, supplemented = module.supplement_missing_symbols(
+        base,
+        expected_symbols=["SH600000", "SH600005"],
+        fetcher=fetcher,
+        batch_size=20,
+    )
+
+    assert calls == [["SH600005"]]
+    assert supplemented == ["SH600005"]
+    assert sorted(result["SECUCODE"].unique()) == ["600000.SH", "600005.SH"]
+
+
+def test_symbol_batch_cache_reuses_complete_parquet(tmp_path: Path) -> None:
+    module = load_module()
+    pd = __import__("pandas")
+    calls = 0
+
+    def fetcher():
+        nonlocal calls
+        calls += 1
+        return pd.DataFrame({"SECUCODE": ["600005.SH"], "value": [calls]})
+
+    kwargs = {
+        "cache_dir": tmp_path,
+        "statement": "income",
+        "symbols": ["SH600005"],
+        "start_report_date": "2010-01-01",
+        "end_report_date": "2025-12-31",
+        "fetcher": fetcher,
+    }
+    first = module.load_or_fetch_symbol_batch(**kwargs)
+    second = module.load_or_fetch_symbol_batch(**kwargs)
+
+    assert calls == 1
+    assert first.equals(second)
+
+
 def test_goal1_download_rejects_any_2026_boundary() -> None:
     module = load_module()
 

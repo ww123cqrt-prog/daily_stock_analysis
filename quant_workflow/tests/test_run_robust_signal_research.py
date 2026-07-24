@@ -8,13 +8,17 @@ from run_robust_signal_research import (
     QlibJobRunner,
     SignalJob,
     _aggregate_signal_prediction_frames,
+    _dataset_feature_options,
     _factor_contract,
+    _failed_signal_outcome,
+    _load_fundamental_source_context,
     _load_canonical_market_states,
     _load_prediction,
     _load_market_states,
     _summarize_factor_quality,
     _write_failed_status,
     build_jobs,
+    load_config,
     run_research,
     run_job_loop,
     write_immutable_factor_contract,
@@ -97,6 +101,125 @@ def test_resume_requires_same_context_and_skips_valid_artifact(tmp_path: Path) -
 def test_build_jobs_never_accepts_2026_quarter(signal_config) -> None:
     with pytest.raises(ValueError, match="2026"):
         build_jobs(signal_config, phase="screening", quarters=["2026Q1"])
+
+
+def test_fundamental_extension_failure_is_terminal_signal_not_found(
+    signal_config,
+) -> None:
+    signal_config["fundamentals"]["research_round"] = "single_extension"
+
+    outcome = _failed_signal_outcome(
+        signal_config, reason_code="fundamental_validation_failed"
+    )
+
+    assert outcome == {
+        "status": "signal_not_found",
+        "reason_code": "fundamental_validation_failed",
+        "next_stage": "goal_1_complete_no_signal",
+        "next_gate": "close_goal_1_without_goal_2",
+    }
+
+
+def test_fundamental_source_context_requires_pass_and_verifies_artifact_hashes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "reference" / "fundamentals"
+    (root / "daily").mkdir(parents=True)
+    artifact = root / "daily" / "2025.parquet"
+    artifact.write_bytes(b"immutable fundamental artifact")
+    digest = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+    source = {
+        "status": "pass",
+        "selected_source": "eastmoney_hsf10",
+        "mixed_sources": False,
+        "data_range": {"start": "2014-01-02", "end": "2025-12-31"},
+        "artifacts": {"daily/2025.parquet": digest},
+    }
+    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
+    config = {
+        "paths": {"fundamental_features": "reference/fundamentals"},
+        "fundamentals": {
+            "research_round": "single_extension",
+            "selected_source": "eastmoney_hsf10",
+            "allow_mixed_sources": False,
+        },
+    }
+
+    context = _load_fundamental_source_context(config, tmp_path)
+
+    assert context["fundamental_source"] == "eastmoney_hsf10"
+    assert context["fundamental_source_manifest_hash"]
+    assert context["fundamental_artifacts_hash"]
+    source["status"] = "blocked_data"
+    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
+    with pytest.raises(ValueError, match="status=pass"):
+        _load_fundamental_source_context(config, tmp_path)
+
+
+def test_fundamental_source_context_rejects_tampered_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "reference" / "fundamentals"
+    root.mkdir(parents=True)
+    artifact = root / "artifact.parquet"
+    artifact.write_bytes(b"actual")
+    source = {
+        "status": "pass",
+        "selected_source": "eastmoney_hsf10",
+        "mixed_sources": False,
+        "data_range": {"start": "2014-01-02", "end": "2025-12-31"},
+        "artifacts": {"artifact.parquet": "0" * 64},
+    }
+    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
+    config = {
+        "paths": {"fundamental_features": "reference/fundamentals"},
+        "fundamentals": {
+            "research_round": "single_extension",
+            "selected_source": "eastmoney_hsf10",
+            "allow_mixed_sources": False,
+        },
+    }
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        _load_fundamental_source_context(config, tmp_path)
+
+
+def test_dataset_feature_options_resolve_fundamental_family(tmp_path: Path) -> None:
+    config = {
+        "paths": {"fundamental_features": "reference/fundamentals"},
+        "feature_families": {
+            "quality": {
+                "include_handler_features": False,
+                "handler_prefixes": [],
+                "external_prefixes": ["FUND_QUALITY_"],
+            }
+        },
+    }
+    signal = {"feature_family": "quality"}
+
+    options = _dataset_feature_options(config, signal, tmp_path)
+
+    assert options == {
+        "feature_prefixes": [],
+        "include_handler_features": False,
+        "external_features_path": tmp_path / "reference" / "fundamentals",
+        "external_feature_prefixes": ["FUND_QUALITY_"],
+    }
+
+
+def test_preregistered_price_volume_and_fundamental_configs_are_distinct() -> None:
+    config_dir = Path(__file__).parents[1] / "configs"
+
+    price_volume = load_config(config_dir / "robust_signal_research.yaml")
+    fundamentals = load_config(config_dir / "robust_signal_fundamentals.yaml")
+
+    assert price_volume["fundamentals"]["research_round"] == "price_volume_baseline"
+    assert fundamentals["fundamentals"]["research_round"] == "single_extension"
+    assert len(fundamentals["signals"]) == 7
+    assert fundamentals["artifacts"]["experiment_name"] == (
+        "robust_csi800_signal_fundamentals"
+    )
+    assert fundamentals["paths"]["fundamental_features"] == (
+        "reference/fundamentals"
+    )
 
 
 def test_ten_day_label_uses_ten_trading_day_purge_on_both_boundaries() -> None:
@@ -522,6 +645,7 @@ def test_factor_quality_summary_fails_closed_when_diagnostics_are_missing(
 @pytest.fixture
 def signal_config():
     return {
+        "fundamentals": {"research_round": "price_volume_baseline"},
         "signals": [
             {
                 "id": "signal",

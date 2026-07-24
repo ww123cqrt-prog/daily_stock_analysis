@@ -177,8 +177,21 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if statuses != FINAL_STATUSES:
         raise ValueError("signal research statuses do not match the frozen contract")
     signals = config.get("signals") or []
-    if len(signals) != 8 or len({str(item.get("id")) for item in signals}) != 8:
-        raise ValueError("signal research requires exactly eight unique preregistered schemes")
+    research_round = str(
+        config.get("fundamentals", {}).get("research_round")
+        or "price_volume_baseline"
+    )
+    expected_signals = int(
+        config.get("fundamentals", {}).get(
+            "expected_signal_count", 8 if research_round == "price_volume_baseline" else 0
+        )
+    )
+    if research_round not in {"price_volume_baseline", "single_extension"}:
+        raise ValueError("unknown signal research round")
+    if expected_signals <= 0 or len(signals) != expected_signals:
+        raise ValueError("signal research scheme count does not match its preregistration")
+    if len({str(item.get("id")) for item in signals}) != len(signals):
+        raise ValueError("signal research schemes must have unique ids")
     quarters = list(config["periods"]["screening_quarters"]) + list(
         config["periods"]["validation_quarters"]
     )
@@ -249,12 +262,81 @@ def build_context(
         "reference_snapshot_hash": provider_status.get("reference_snapshot_hash"),
         "locked_confirmation_start": str(LOCKED_CONFIRMATION_START.date()),
     }
+    if str(config.get("fundamentals", {}).get("research_round")) == "single_extension":
+        payload.update(_load_fundamental_source_context(config, quant_data_dir))
     payload["context_hash"] = _sha256_bytes(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
             "utf-8"
         )
     )
     return payload
+
+
+def _load_fundamental_source_context(
+    config: Mapping[str, Any], quant_data_dir: Path
+) -> dict[str, Any]:
+    relative_root = config.get("paths", {}).get("fundamental_features")
+    if not relative_root:
+        raise ValueError("fundamental feature path is not configured")
+    root = (Path(quant_data_dir) / str(relative_root)).resolve()
+    source_path = root / "FUNDAMENTAL_SOURCE.json"
+    source = _read_json(source_path)
+    if source.get("status") != "pass":
+        raise ValueError("FUNDAMENTAL_SOURCE.json must have status=pass")
+    fundamentals = config.get("fundamentals", {})
+    selected_source = str(source.get("selected_source") or "")
+    if selected_source != str(fundamentals.get("selected_source") or ""):
+        raise ValueError("fundamental selected source does not match the frozen config")
+    mixed_sources = source.get("mixed_sources")
+    if mixed_sources is not False or bool(fundamentals.get("allow_mixed_sources")):
+        raise ValueError("fundamental research requires one unmixed source")
+    data_end = pd.Timestamp(source.get("data_range", {}).get("end")).normalize()
+    if pd.isna(data_end) or data_end >= LOCKED_CONFIRMATION_START:
+        raise ValueError("Goal 1 fundamental source attempted to expose 2026 data")
+    artifacts = source.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise ValueError("fundamental source does not declare artifacts")
+    verified: dict[str, str] = {}
+    for relative, expected_hash in sorted(artifacts.items()):
+        path = (root / str(relative)).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError(f"fundamental artifact is unavailable: {relative}")
+        actual_hash = _sha256_file(path)
+        if actual_hash != str(expected_hash):
+            raise ValueError(f"fundamental artifact hash mismatch: {relative}")
+        verified[str(relative)] = actual_hash
+    artifact_set_hash = _sha256_bytes(
+        json.dumps(verified, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return {
+        "fundamental_features_path": str(root),
+        "fundamental_source": selected_source,
+        "fundamental_source_manifest_hash": _sha256_file(source_path),
+        "fundamental_artifacts_hash": artifact_set_hash,
+    }
+
+
+def _dataset_feature_options(
+    config: Mapping[str, Any], signal: Mapping[str, Any], quant_data_dir: Path
+) -> dict[str, Any]:
+    family = config["feature_families"][str(signal["feature_family"])]
+    external_prefixes = list(family.get("external_prefixes") or [])
+    external_path: Path | None = None
+    if external_prefixes:
+        configured = config.get("paths", {}).get("fundamental_features")
+        if not configured:
+            raise ValueError("external feature family requires a configured data path")
+        external_path = Path(quant_data_dir) / str(configured)
+    return {
+        "feature_prefixes": list(
+            family.get("handler_prefixes", family.get("prefixes")) or []
+        ),
+        "include_handler_features": bool(
+            family.get("include_handler_features", True)
+        ),
+        "external_features_path": external_path,
+        "external_feature_prefixes": external_prefixes,
+    }
 
 
 def build_jobs(
@@ -607,11 +689,12 @@ class QlibJobRunner:
         ]
         if market_states.empty:
             raise ValueError("market states are missing for signal dataset dates")
-        family = self.config["feature_families"][str(signal["feature_family"])]
+        feature_options = _dataset_feature_options(
+            self.config, signal, self.quant_data_dir
+        )
         dataset_config = build_signal_dataset_config(
             split=split,
             signal=signal,
-            feature_prefixes=family.get("prefixes") or [],
             industry_intervals_path=self.quant_data_dir
             / str(self.config["paths"]["industry_intervals"]),
             benchmark_returns={str(index.date()): float(value) for index, value in benchmark.items()},
@@ -619,6 +702,7 @@ class QlibJobRunner:
                 str(index.date()): str(value)
                 for index, value in market_states.items()
             },
+            **feature_options,
         )
         dataset = init_instance_by_config(dataset_config)
         self._cached_key = key
@@ -1080,7 +1164,13 @@ def _factor_contract(
         "signal_id": signal["id"],
         "model_id": report["model_id"],
         "feature_family": signal["feature_family"],
-        "feature_prefixes": list(family.get("prefixes") or []),
+        "feature_prefixes": list(
+            family.get("handler_prefixes", family.get("prefixes")) or []
+        ),
+        "external_feature_prefixes": list(family.get("external_prefixes") or []),
+        "include_handler_features": bool(
+            family.get("include_handler_features", True)
+        ),
         "base_handler": "Alpha158",
         "raw_fields": ["open", "high", "low", "close", "volume", "factor"],
         "horizon_days": int(signal["horizon_days"]),
@@ -1092,6 +1182,11 @@ def _factor_contract(
         "data_source": "verified_local_qlib_provider",
         "provider_tree_sha256": context.get("provider_tree_sha256"),
         "membership_snapshot_hash": context.get("membership_snapshot_hash"),
+        "fundamental_source": context.get("fundamental_source"),
+        "fundamental_source_manifest_hash": context.get(
+            "fundamental_source_manifest_hash"
+        ),
+        "fundamental_artifacts_hash": context.get("fundamental_artifacts_hash"),
         "config_hash": context["config_hash"],
         "context_hash": context["context_hash"],
         "git_commit": context["git_commit"],
@@ -1121,6 +1216,24 @@ def _records_for_phase(progress: Mapping[str, Any], phase: str) -> list[dict[str
         for value in (progress.get("jobs") or {}).values()
         if value.get("status") == "completed" and value.get("phase") == phase
     ]
+
+
+def _failed_signal_outcome(
+    config: Mapping[str, Any], *, reason_code: str
+) -> dict[str, str]:
+    if str(config.get("fundamentals", {}).get("research_round")) == "single_extension":
+        return {
+            "status": "signal_not_found",
+            "reason_code": str(reason_code),
+            "next_stage": "goal_1_complete_no_signal",
+            "next_gate": "close_goal_1_without_goal_2",
+        }
+    return {
+        "status": "signal_diagnosis_complete",
+        "reason_code": str(reason_code),
+        "next_stage": "historical_fundamental_data_required",
+        "next_gate": "build_historical_fundamentals",
+    }
 
 
 def _status_payload(
@@ -1338,11 +1451,16 @@ def run_research(
         screening_reports, maximum=int(config["screening"]["maximum_candidates"])
     )
     if not candidates:
+        reason_code = (
+            "fundamental_screening_failed"
+            if str(config.get("fundamentals", {}).get("research_round"))
+            == "single_extension"
+            else "price_volume_screening_failed"
+        )
+        outcome = _failed_signal_outcome(config, reason_code=reason_code)
         result = {
-            "status": "signal_diagnosis_complete",
-            "reason_code": "price_volume_screening_failed",
+            **outcome,
             "screening_candidates": [],
-            "next_stage": "historical_fundamental_data_required",
             "reports": screening_reports,
         }
         _write_json(run_dir / "result.json", result)
@@ -1350,13 +1468,17 @@ def run_research(
             run_id=run_id,
             context=context,
             lifecycle_status="completed",
-            status="signal_diagnosis_complete",
-            current_stage="price_volume_complete",
+            status=outcome["status"],
+            current_stage=(
+                "fundamental_complete"
+                if outcome["status"] == "signal_not_found"
+                else "price_volume_complete"
+            ),
             pause_state="completed",
             completed_count=len(screening_jobs),
             expected_count=len(screening_jobs),
-            reason_code="price_volume_screening_failed",
-            next_gate="build_historical_fundamentals",
+            reason_code=outcome["reason_code"],
+            next_gate=outcome["next_gate"],
         )
         _write_json(run_dir / "status.json", status)
         _write_json(report_dir / "robust_signal_status_latest.json", status)
@@ -1443,11 +1565,16 @@ def run_research(
     passed = [report for report in validation_reports if report.get("passed") is True]
     total_jobs = len(screening_jobs) + len(validation_jobs)
     if not passed:
+        reason_code = (
+            "fundamental_validation_failed"
+            if str(config.get("fundamentals", {}).get("research_round"))
+            == "single_extension"
+            else "price_volume_validation_failed"
+        )
+        outcome = _failed_signal_outcome(config, reason_code=reason_code)
         result = {
-            "status": "signal_diagnosis_complete",
-            "reason_code": "price_volume_validation_failed",
+            **outcome,
             "screening_candidates": candidates,
-            "next_stage": "historical_fundamental_data_required",
             "reports": validation_reports,
         }
         _write_json(run_dir / "result.json", result)
@@ -1455,13 +1582,17 @@ def run_research(
             run_id=run_id,
             context=context,
             lifecycle_status="completed",
-            status="signal_diagnosis_complete",
-            current_stage="price_volume_complete",
+            status=outcome["status"],
+            current_stage=(
+                "fundamental_complete"
+                if outcome["status"] == "signal_not_found"
+                else "price_volume_complete"
+            ),
             pause_state="completed",
             completed_count=total_jobs,
             expected_count=total_jobs,
-            reason_code="price_volume_validation_failed",
-            next_gate="build_historical_fundamentals",
+            reason_code=outcome["reason_code"],
+            next_gate=outcome["next_gate"],
         )
     else:
         winner = max(
