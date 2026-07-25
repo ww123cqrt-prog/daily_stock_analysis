@@ -40,7 +40,7 @@ import type {
   ResearchFunctionInventoryItem,
   ResearchStatus,
 } from '../api/research';
-import { AppPage, Badge, Button, Card, PageHeader, StatusDot } from '../components/common';
+import { AppPage, Badge, Button, Card, ConfirmDialog, PageHeader, StatusDot } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
 
@@ -128,7 +128,8 @@ type ExperimentComparison = {
   delta: number;
 };
 
-const DEFAULT_MLFLOW_URL = 'http://127.0.0.1:6006/';
+const DEFAULT_MLFLOW_URL = (import.meta.env.VITE_MLFLOW_URL as string) || 'http://127.0.0.1:6006/';
+const CATDESK_URL = (import.meta.env.VITE_CATDESK_URL as string) || 'http://127.0.0.1:8765/';
 const COMPARISON_METRIC_KEY = '1day.excess_return_with_cost.annualized_return';
 
 const STATUS_STYLE: Record<SupportState, { zh: string; en: string; variant: BadgeVariant; tone: StatusTone }> = {
@@ -910,6 +911,7 @@ const ResearchPage: React.FC = () => {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [mutatingRunKey, setMutatingRunKey] = useState<string | null>(null);
+  const [confirmDeleteRunId, setConfirmDeleteRunId] = useState<string | null>(null);
   const [dataHygieneJob, setDataHygieneJob] = useState<QuantJob | null>(null);
   const [dataHygieneSubmitting, setDataHygieneSubmitting] = useState(false);
   const [dataHygieneJobError, setDataHygieneJobError] = useState<string | null>(null);
@@ -1088,11 +1090,20 @@ const ResearchPage: React.FC = () => {
     await applyExperimentMutation(runId, 'archive');
   };
 
-  const handlePermanentDeleteExperiment = async (runId: string) => {
-    if (!window.confirm(text.permanentDeleteConfirm)) {
-      return;
+  const handlePermanentDeleteExperiment = (runId: string) => {
+    setConfirmDeleteRunId(runId);
+  };
+
+  const handleConfirmPermanentDelete = async () => {
+    const runId = confirmDeleteRunId;
+    setConfirmDeleteRunId(null);
+    if (runId) {
+      await applyExperimentMutation(runId, 'permanent');
     }
-    await applyExperimentMutation(runId, 'permanent');
+  };
+
+  const handleCancelPermanentDelete = () => {
+    setConfirmDeleteRunId(null);
   };
 
   return (
@@ -2190,7 +2201,7 @@ const ResearchPage: React.FC = () => {
                 <p className="mt-2 text-sm leading-6 text-secondary-text">{text.catdeskDescription}</p>
                 <p className="mt-2 text-xs leading-5 text-muted-text">{text.catdeskNote}</p>
                 <a
-                  href="http://127.0.0.1:8765/"
+                  href={CATDESK_URL}
                   target="_blank"
                   rel="noreferrer"
                   className="mt-3 inline-flex h-9 items-center gap-2 rounded-lg border border-cyan/30 bg-cyan/10 px-3 text-sm font-medium text-cyan transition-colors hover:bg-cyan/15"
@@ -2236,6 +2247,14 @@ const ResearchPage: React.FC = () => {
           </Card>
         </aside>
       </div>
+      <ConfirmDialog
+        isOpen={confirmDeleteRunId !== null}
+        title={text.permanentDeleteExperiment}
+        message={text.permanentDeleteConfirm}
+        isDanger
+        onConfirm={handleConfirmPermanentDelete}
+        onCancel={handleCancelPermanentDelete}
+      />
     </AppPage>
   );
 };

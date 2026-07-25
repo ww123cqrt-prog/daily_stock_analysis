@@ -458,8 +458,14 @@ async def auth_login(request: Request, body: LoginRequest):
     summary="Change password",
     description="Change password. Requires valid session.",
 )
-async def auth_change_password(body: ChangePasswordRequest):
+async def auth_change_password(request: Request, body: ChangePasswordRequest):
     """Change password. Requires login."""
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    if not (cookie_val and verify_session(cookie_val)):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "unauthorized", "message": "未登录"},
+        )
     if not is_password_changeable():
         return JSONResponse(
             status_code=400,

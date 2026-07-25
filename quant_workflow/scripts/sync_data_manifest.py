@@ -16,6 +16,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root as default_quant_data_root, reports_root as default_reports_root  # noqa: E402
+from _daily_update_runtime import write_json_atomic  # noqa: E402
 
 
 def count_lines(path: Path) -> int:
@@ -67,12 +68,22 @@ def human_size(path: Path) -> str:
     return f"{round(size / (1024 * 1024 * 1024), 2)}G"
 
 
-def parquet_entry(path: Path, role: str) -> dict[str, Any]:
+def parquet_entry(path: Path, role: str, *, recursive: bool = False) -> dict[str, Any]:
+    files = list(path.rglob("*.parquet")) if recursive and path.exists() else list(path.glob("*.parquet")) if path.exists() else []
     return {
         "path": str(path),
         "role": role,
         "size": human_size(path),
-        "file_count": len(list(path.glob("*.parquet"))) if path.exists() else 0,
+        "file_count": len(files),
+    }
+
+
+def raw_entry(path: Path, role: str) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "role": role,
+        "size": human_size(path),
+        "file_count": sum(1 for item in path.rglob("*") if item.is_file()) if path.exists() else 0,
     }
 
 
@@ -92,6 +103,8 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     quant_data = Path(quant_data_root).expanduser()
     reports = Path(reports_root).expanduser()
     parquet_root = quant_data / "parquet" / "ashare_1d"
+    global_parquet_root = quant_data / "parquet" / "global_1d"
+    raw_root = quant_data / "raw"
     qlib_root = quant_data / "qlib"
 
     cleaned_parquet = parquet_root / "merged_baostock_jqdata_cleaned"
@@ -152,6 +165,23 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
                 canonical_provider,
                 "Merged pre-cleaning Qlib provider retained as a comparison baseline.",
             ),
+            "global_daily": parquet_entry(
+                global_parquet_root,
+                "Canonical US, Japan, and Korea daily parquet used by CatDesk research.",
+                recursive=True,
+            ),
+            "raw_global_daily": raw_entry(
+                raw_root / "global_1d" / "yahoo",
+                "Timestamped original Yahoo Chart responses for global daily bars.",
+            ),
+            "raw_ashare_snapshots": raw_entry(
+                raw_root / "ashare_snapshots",
+                "Timestamped original Sina A-share quote snapshot responses.",
+            ),
+            "raw_ashare_news": raw_entry(
+                raw_root / "ashare_news",
+                "Timestamped bounded EastMoney A-share news search responses.",
+            ),
         },
         "archive_candidates": {
             "require_confirmation": True,
@@ -180,13 +210,34 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     return manifest
 
 
+def merge_existing_manifest(existing: dict[str, Any], generated: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    merged.update(generated)
+    existing_official = existing.get("official_entries")
+    generated_official = generated.get("official_entries")
+    official = dict(existing_official) if isinstance(existing_official, dict) else {}
+    if isinstance(generated_official, dict):
+        official.update(generated_official)
+    merged["official_entries"] = official
+    return merged
+
+
 def sync_data_manifest(*, quant_data_root: Path | None = None, reports_root: Path | None = None) -> Path:
     quant_data = Path(quant_data_root or default_quant_data_root()).expanduser()
     reports = Path(reports_root or default_reports_root()).expanduser()
-    manifest = build_manifest(quant_data_root=quant_data, reports_root=reports)
     quant_data.mkdir(parents=True, exist_ok=True)
     path = quant_data / "DATA_MANIFEST.json"
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            existing = payload
+    generated = build_manifest(quant_data_root=quant_data, reports_root=reports)
+    manifest = merge_existing_manifest(existing, generated)
+    write_json_atomic(path, manifest)
     return path
 
 

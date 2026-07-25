@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -17,13 +18,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _daily_update_runtime import write_json_atomic  # noqa: E402
 from _paths import quant_data_root, reports_root  # noqa: E402
-from market_data_clients import fetch_sina_a_snapshots, sina_quote_code  # noqa: E402
+from market_data_clients import (  # noqa: E402
+    fetch_sina_a_snapshot_text,
+    fetch_sina_a_snapshots,
+    parse_sina_quote_text,
+    sina_quote_code,
+)
 
 
 QUANT_DATA = quant_data_root()
 MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
 REPORT_DIR = reports_root()
+RAW_DIR = QUANT_DATA / "raw" / "ashare_snapshots"
 
 
 def sina_code(symbol: str) -> str:
@@ -43,6 +51,51 @@ def fetch_sina_snapshots(
         timeout=timeout,
         use_system_proxy=use_system_proxy,
     )
+
+
+def fetch_sina_snapshot_capture(
+    symbols: list[str],
+    *,
+    session=None,
+    timeout: float = 10,
+    use_system_proxy: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    raw_text = fetch_sina_a_snapshot_text(
+        symbols,
+        session=session,
+        timeout=timeout,
+        use_system_proxy=use_system_proxy,
+    )
+    return raw_text, parse_sina_quote_text(raw_text)
+
+
+def write_raw_snapshot_capture(
+    *,
+    raw_text: str,
+    symbols: list[str],
+    raw_root: Path,
+    captured_at: str | None = None,
+) -> Path:
+    captured = datetime.fromisoformat(captured_at) if captured_at else datetime.now().astimezone()
+    if captured.tzinfo is None:
+        captured = captured.astimezone()
+    path = (
+        raw_root
+        / f"captured_date={captured.date().isoformat()}"
+        / f"sina_snapshot_{captured.strftime('%Y%m%dT%H%M%S_%f%z')}.json"
+    )
+    write_json_atomic(
+        path,
+        {
+            "schema_version": 1,
+            "source": "sina_snapshot",
+            "captured_at": captured.isoformat(timespec="microseconds"),
+            "raw_text_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            "symbols": symbols,
+            "raw_text": raw_text,
+        },
+    )
+    return path
 
 
 def _latest_merged_close(path: Path) -> tuple[str, float] | None:
@@ -147,13 +200,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate merged latest close against Sina snapshot.")
     parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
+    parser.add_argument("--raw-dir", type=Path, default=RAW_DIR)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--timeout", type=float, default=10)
     parser.add_argument("--use-system-proxy", action="store_true", help="Opt into macOS/system proxy settings.")
     args = parser.parse_args()
 
     symbols = load_symbols_from_merged(args.merged_dir, args.limit)
-    snapshots = fetch_sina_snapshots(symbols, timeout=args.timeout, use_system_proxy=args.use_system_proxy)
+    raw_text, snapshots = fetch_sina_snapshot_capture(
+        symbols,
+        timeout=args.timeout,
+        use_system_proxy=args.use_system_proxy,
+    )
+    write_raw_snapshot_capture(raw_text=raw_text, symbols=symbols, raw_root=args.raw_dir)
     payload = build_validation_report(snapshots=snapshots, merged_dir=args.merged_dir, out_dir=args.out_dir)
     print(f"Snapshot validation compared {payload['compared']} of {payload['snapshots']} snapshots -> {args.out_dir}")
     return 0 if payload["compared"] > 0 else 1

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import numpy as np
 
 
 def load_module():
@@ -34,6 +35,30 @@ def write_prices(directory: Path, symbol: str) -> None:
 
 
 class ReportDataQualityTest(unittest.TestCase):
+    def test_incomplete_benchmark_is_a_training_readiness_blocker(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "qlib"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-17\n2026-07-20\n", encoding="utf-8")
+            instruments = provider / "instruments" / "all.txt"
+            instruments.parent.mkdir(parents=True)
+            instruments.write_text("SZ000001\t2026-07-17\t2026-07-20\n", encoding="utf-8")
+            feature = provider / "features" / "sh000300" / "close.day.bin"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(np.array([0.0, 3900.0], dtype="<f4").tobytes())
+
+            stats = module.qlib_provider_stats(provider)
+            ready, detail = module.build_training_readiness(
+                stats,
+                {f"{index:06d}" for index in range(100)},
+                {"duplicate_dates": 0, "null_dates": 0, "missing_columns": 0, "bad_ohlc_rows": 0},
+            )
+
+        self.assertFalse(stats["benchmark_complete"])
+        self.assertFalse(ready)
+        self.assertIn("benchmark", detail["summary"].lower())
     def test_scan_merged_files_respects_sample_limit(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

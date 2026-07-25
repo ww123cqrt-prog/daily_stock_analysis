@@ -1,5 +1,6 @@
 import importlib.util
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -111,6 +112,66 @@ class MarketDataClientsTest(unittest.TestCase):
         self.assertEqual(payload["pct"], 1.5)
         self.assertEqual(payload["turnover_rate"], 0.75)
         self.assertEqual(payload["source"], "eastmoney_snapshot")
+
+    def test_parse_yahoo_chart_payload_returns_daily_bars(self):
+        module = load_module()
+        timestamp = int(datetime(2026, 7, 8, 20, 0, tzinfo=timezone.utc).timestamp())
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {"exchangeTimezoneName": "America/New_York"},
+                        "timestamp": [timestamp],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": [210.0],
+                                    "high": [215.0],
+                                    "low": [208.0],
+                                    "close": [214.0],
+                                    "volume": [123456],
+                                }
+                            ],
+                            "adjclose": [{"adjclose": [213.5]}],
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        frame = module.parse_yahoo_chart_payload(payload)
+
+        self.assertEqual(frame["date"].dt.strftime("%Y-%m-%d").tolist(), ["2026-07-08"])
+        self.assertEqual(frame["close"].tolist(), [214.0])
+        self.assertEqual(frame["adj_close"].tolist(), [213.5])
+        self.assertEqual(frame["volume"].tolist(), [123456])
+
+    def test_fetch_yahoo_chart_payload_returns_unmodified_json(self):
+        module = load_module()
+        raw_payload = {"chart": {"result": [], "error": None}}
+        session = FakeSession(FakeResponse(raw_payload))
+
+        payload = module.fetch_yahoo_chart_payload(
+            "7203.T",
+            "2026-07-01",
+            "2026-07-08",
+            session=session,
+            timeout=7,
+        )
+
+        self.assertIs(payload, raw_payload)
+        self.assertTrue(session.calls[0]["url"].endswith("/7203.T"))
+        self.assertEqual(session.calls[0]["params"]["interval"], "1d")
+        self.assertGreater(session.calls[0]["params"]["period2"], session.calls[0]["params"]["period1"])
+
+    def test_parse_eastmoney_news_jsonp_returns_payload(self):
+        module = load_module()
+        text = 'jQuery_catdesk({"result":{"cmsArticleWebOld":[{"code":"1","title":"news"}]}});'
+
+        payload = module.parse_eastmoney_news_jsonp(text)
+
+        self.assertEqual(payload["result"]["cmsArticleWebOld"][0]["title"], "news")
 
 
 if __name__ == "__main__":

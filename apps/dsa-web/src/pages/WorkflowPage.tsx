@@ -96,8 +96,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'run_daily_update',
         label: '运行每日数据更新全链路',
         description:
-          '按顺序执行：Baostock/东方财富/AkShare 增量下载 → 合并转换 Qlib → 新浪快照校验 → 异常检测 → 清洗 → 多源交叉验证 → provider 校验。' +
-          'Baostock 失败会让日更失败；东方财富/AkShare 失败会记录为警告并继续后续可执行阶段；JQData 只参与合并与交叉验证，不在此下载。',
+          '按顺序执行：A 股三源增量下载、全球日线和限定新闻原始证据下载 → 合并转换 Qlib → 新浪快照校验 → 异常检测 → 清洗 → 多源交叉验证 → provider 校验。' +
+          '下载源彼此独立；全球或新闻下载失败只记录警告，不影响 A 股覆盖率门禁。JQData 只参与合并与交叉验证，不在此下载。',
         params: [
           { key: 'skip_download', label: '跳过下载只重建', kind: 'checkbox' },
           { key: 'force', label: '强制重建（无新数据也跑）', kind: 'checkbox' },
@@ -105,6 +105,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
           { key: 'skip_eastmoney', label: '跳过东方财富', kind: 'checkbox' },
           { key: 'skip_akshare', label: '跳过 AkShare', kind: 'checkbox' },
+          { key: 'skip_global_daily', label: '跳过全球日线', kind: 'checkbox' },
+          { key: 'skip_ashare_news', label: '跳过新闻原始证据', kind: 'checkbox' },
           { key: 'skip_snapshot_validation', label: '跳过快照校验', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
           { key: 'end', label: '结束日期', kind: 'date' },
@@ -115,6 +117,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, placeholder: '50' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
           { key: 'snapshot_limit', label: '快照校验样本', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'news_limit', label: '新闻下载股票数', kind: 'number', min: 1, placeholder: '50' },
           { key: 'overlap_sample', label: '交叉验证重叠样本', kind: 'number', min: 1, placeholder: '留空为全部' },
           { key: 'merged_sample', label: '质量报告合并样本', kind: 'number', min: 1, placeholder: '留空为全部' },
         ],
@@ -123,7 +126,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
   {
     title: '更新数据',
-    description: '准备增量清单，并从 Baostock/JQData 拉取本地价格数据。',
+    description: '更新 A 股、全球市场日线及可追溯原始数据。',
     icon: Database,
     jobs: [
       {
@@ -188,6 +191,35 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '30' },
           { key: 'incremental', label: '增量下载', kind: 'checkbox' },
           { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'download_global_daily',
+        label: '下载全球日线与原始证据',
+        description: '从 Yahoo Chart 增量下载美股、日股、韩股日线；每个代码保留一个 canonical parquet，并按抓取日期保存原始响应。',
+        defaultParams: { incremental: true },
+        params: [
+          { key: 'start', label: '开始日期', kind: 'date' },
+          { key: 'end', label: '结束日期', kind: 'date' },
+          { key: 'limit', label: '代码数量上限', kind: 'number', min: 1 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.1' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '7' },
+          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
+          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
+        ],
+      },
+      {
+        type: 'download_ashare_news',
+        label: '下载 A 股新闻原始证据',
+        description: '按限定股票数保存东方财富新闻搜索的原始响应；不允许网页端无上限抓取全市场。',
+        params: [
+          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.1' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
         ],
       },
@@ -630,6 +662,8 @@ function buildDailyGuideSteps(
     'download_baostock',
     'download_eastmoney',
     'download_akshare',
+    'download_global_daily',
+    'download_ashare_news',
     'download_jqdata',
   ]);
   const qualityJob = latestJobs.report_data_quality;

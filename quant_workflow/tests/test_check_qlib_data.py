@@ -18,6 +18,14 @@ def load_module():
 
 
 class CheckQlibDataTest(unittest.TestCase):
+    def test_parse_args_accepts_candidate_provider_directory(self):
+        module = load_module()
+        provider = Path("/tmp/candidate-provider")
+
+        args = module.parse_args(["--provider-dir", str(provider)])
+
+        self.assertEqual(args.provider_dir, provider)
+
     def test_provider_uri_honors_quant_data_root_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             quant_data = Path(temp_dir) / "quant_data"

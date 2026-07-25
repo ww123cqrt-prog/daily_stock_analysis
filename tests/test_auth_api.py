@@ -178,6 +178,7 @@ class AuthApiTestCase(unittest.TestCase):
 
         response = asyncio.run(
             auth_endpoint.auth_change_password(
+                self._build_request(),
                 auth_endpoint.ChangePasswordRequest(
                     currentPassword="oldpass6",
                     newPassword="newpass6",
@@ -185,7 +186,29 @@ class AuthApiTestCase(unittest.TestCase):
                 )
             )
         )
-        self.assertIn(response.status_code, (200, 204))
+        self.assertEqual(response.status_code, 401)
+
+    def test_change_password_accepts_valid_session(self) -> None:
+        first_response = asyncio.run(
+            auth_endpoint.auth_login(
+                self._build_request(),
+                auth_endpoint.LoginRequest(password="oldpass6", passwordConfirm="oldpass6"),
+            )
+        )
+        self.assertEqual(first_response.status_code, 200)
+        session_cookie = first_response.headers["set-cookie"].split("dsa_session=", 1)[1].split(";", 1)[0]
+
+        response = asyncio.run(
+            auth_endpoint.auth_change_password(
+                self._build_request({"dsa_session": session_cookie}),
+                auth_endpoint.ChangePasswordRequest(
+                    currentPassword="oldpass6",
+                    newPassword="newpass6",
+                    newPasswordConfirm="newpass6",
+                ),
+            )
+        )
+        self.assertEqual(response.status_code, 204)
 
     def test_change_password_wrong_current_rejected(self) -> None:
         first_response = asyncio.run(
@@ -195,9 +218,11 @@ class AuthApiTestCase(unittest.TestCase):
             )
         )
         self.assertEqual(first_response.status_code, 200)
+        session_cookie = first_response.headers["set-cookie"].split("dsa_session=", 1)[1].split(";", 1)[0]
 
         response = asyncio.run(
             auth_endpoint.auth_change_password(
+                self._build_request({"dsa_session": session_cookie}),
                 auth_endpoint.ChangePasswordRequest(
                     currentPassword="wrong",
                     newPassword="new123",

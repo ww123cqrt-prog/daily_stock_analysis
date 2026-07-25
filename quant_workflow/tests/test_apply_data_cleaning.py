@@ -211,7 +211,7 @@ class ApplyDataCleaningTest(unittest.TestCase):
             target_provider = base / "target"
             source_feature = source_provider / "features" / "sh000300"
             source_feature.mkdir(parents=True)
-            (source_feature / "close.day.bin").write_bytes(np.array([0.0, 1.0], dtype="<f4").tobytes())
+            (source_feature / "close.day.bin").write_bytes(np.array([0.0, 1.0, 2.0], dtype="<f4").tobytes())
 
             for provider in [source_provider, target_provider]:
                 calendar = provider / "calendars" / "day.txt"
@@ -229,6 +229,48 @@ class ApplyDataCleaningTest(unittest.TestCase):
             self.assertTrue((target_provider / "features" / "sh000300" / "close.day.bin").exists())
             self.assertNotIn("SH000300", (target_provider / "instruments" / "all.txt").read_text(encoding="utf-8"))
             self.assertNotIn("SH000300", (target_provider / "instruments" / "csi300.txt").read_text(encoding="utf-8"))
+
+    def test_copy_benchmark_features_reindexes_source_extra_day_by_calendar_date(self):
+        module = load_script("apply_data_cleaning")
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            target = base / "target"
+            for root, text in [
+                (source, "2026-07-17\n2026-07-20\n2026-07-21\n"),
+                (target, "2026-07-17\n2026-07-21\n"),
+            ]:
+                path = root / "calendars" / "day.txt"
+                path.parent.mkdir(parents=True)
+                path.write_text(text, encoding="utf-8")
+            feature = source / "features" / "sh000300" / "close.day.bin"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(np.array([0.0, 3900.0, 3910.0, 3920.0], dtype="<f4").tobytes())
+
+            module.copy_benchmark_features(source, target, {"SH000300"})
+            values = np.fromfile(target / "features" / "sh000300" / "close.day.bin", dtype="<f4")
+
+        self.assertEqual(values.tolist(), [0.0, 3900.0, 3920.0])
+
+    def test_copy_benchmark_features_rejects_target_day_missing_from_source_calendar(self):
+        module = load_script("apply_data_cleaning")
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "source"
+            target = base / "target"
+            for root, text in [
+                (source, "2026-07-17\n2026-07-20\n"),
+                (target, "2026-07-17\n2026-07-20\n2026-07-21\n"),
+            ]:
+                path = root / "calendars" / "day.txt"
+                path.parent.mkdir(parents=True)
+                path.write_text(text, encoding="utf-8")
+            feature = source / "features" / "sh000300" / "close.day.bin"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(np.array([0.0, 3900.0, 3910.0], dtype="<f4").tobytes())
+
+            with self.assertRaisesRegex(ValueError, "target calendar dates missing"):
+                module.copy_benchmark_features(source, target, {"SH000300"})
 
 
 if __name__ == "__main__":

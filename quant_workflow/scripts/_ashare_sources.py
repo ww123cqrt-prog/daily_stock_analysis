@@ -178,11 +178,14 @@ def run_daily_download(
     overlap_days: int,
     sleep_seconds: float,
     summary_dir: Path | None = None,
+    runtime_status_dir: Path | None = None,
     retry_failed: bool = False,
     max_consecutive_failures: int = 50,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    summary_root = summary_dir or (reports_root() / "download_state")
+    report_root = reports_root()
+    summary_root = summary_dir or (report_root / "download_state")
+    runtime_root = runtime_status_dir or (report_root / "runtime" / "status")
     if retry_failed:
         existing = {path.stem for path in output_dir.glob("*.parquet")}
         symbols = [symbol for symbol in symbols if symbol not in existing]
@@ -292,8 +295,10 @@ def run_daily_download(
         "failures": failures[:100],
     }
     write_json(summary_root / f"{source_name}_download_summary_latest.json", summary)
+    write_json(runtime_root / f"{source_name}_download_summary_latest.json", summary)
     if failures:
         write_json(summary_root / f"{source_name}_failures.json", failures)
+    write_json(runtime_root / f"{source_name}_failures_latest.json", failures)
     print(
         f"Done {source_name} in {elapsed / 60:.1f} min. OK={ok}, NO_NEW={no_new}, EMPTY={empty}, FAIL={fail}",
         flush=True,

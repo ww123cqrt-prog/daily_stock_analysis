@@ -43,7 +43,7 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    message: str
+    message: str = Field(..., max_length=50000)
     session_id: Optional[str] = None
     skills: Optional[List[str]] = Field(
         default=None,
@@ -186,7 +186,7 @@ async def agent_chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Agent chat API failed: {e}")
         logger.exception("Agent chat error details:")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部错误，请稍后重试")
 
 
 class SessionItem(BaseModel):
@@ -297,7 +297,7 @@ async def _run_research_in_background(
 # ============================================================
 
 class ResearchRequest(BaseModel):
-    question: str
+    question: str = Field(..., max_length=10000)
     stock_code: Optional[str] = None
 
 class ResearchResponse(BaseModel):
@@ -367,7 +367,7 @@ async def agent_research(request: ResearchRequest):
     except Exception as e:
         logger.error("Agent research API failed: %s", e)
         logger.exception("Agent research error details:")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部错误，请稍后重试")
 
 
 @router.post("/chat/stream")
@@ -427,7 +427,7 @@ async def agent_chat_stream(request: ChatRequest):
         except Exception as exc:
             logger.error(f"Agent stream error: {exc}")
             asyncio.run_coroutine_threadsafe(
-                queue.put({"type": "error", "message": str(exc)}),
+                queue.put({"type": "error", "message": "分析失败，请稍后重试"}),
                 loop,
             )
 

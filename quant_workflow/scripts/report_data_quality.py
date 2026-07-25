@@ -261,13 +261,53 @@ def overlap_consistency(sample_limit: int = 0) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def qlib_provider_stats() -> dict:
-    cal = QLIB_DIR / "calendars" / "day.txt"
-    inst = QLIB_DIR / "instruments" / "all.txt"
+def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict[str, int | bool | str]:
+    close_path = provider_dir / "features" / "sh000300" / "close.day.bin"
+    if not calendar or not close_path.exists():
+        return {
+            "benchmark_complete": False,
+            "benchmark_first_observation": "",
+            "benchmark_missing_days": len(calendar),
+        }
+    raw = np.fromfile(close_path, dtype="<f4")
+    if len(raw) < 2:
+        return {
+            "benchmark_complete": False,
+            "benchmark_first_observation": "",
+            "benchmark_missing_days": len(calendar),
+        }
+    start_idx = int(raw[0])
+    values = raw[1:]
+    aligned = np.full(len(calendar), np.nan, dtype=np.float32)
+    if start_idx >= 0:
+        available = min(len(values), max(len(calendar) - start_idx, 0))
+        if available > 0:
+            aligned[start_idx:start_idx + available] = values[:available]
+    valid = np.isfinite(aligned) & (aligned > 0)
+    valid_positions = np.flatnonzero(valid)
+    if not len(valid_positions):
+        return {
+            "benchmark_complete": False,
+            "benchmark_first_observation": "",
+            "benchmark_missing_days": len(calendar),
+        }
+    first = int(valid_positions[0])
+    missing_days = int((~valid[first:]).sum())
+    return {
+        "benchmark_complete": missing_days == 0,
+        "benchmark_first_observation": calendar[first],
+        "benchmark_missing_days": missing_days,
+    }
+
+
+def qlib_provider_stats(provider_dir: Path = QLIB_DIR) -> dict:
+    provider_dir = Path(provider_dir)
+    cal = provider_dir / "calendars" / "day.txt"
+    inst = provider_dir / "instruments" / "all.txt"
     calendar = cal.read_text(encoding="utf-8").splitlines() if cal.exists() else []
     instruments = inst.read_text(encoding="utf-8").splitlines() if inst.exists() else []
     instrument_names = {line.split("\t")[0].lower() for line in instruments if line.strip()}
-    feature_dirs = [p for p in (QLIB_DIR / "features").iterdir() if p.is_dir()] if (QLIB_DIR / "features").exists() else []
+    feature_dirs = [p for p in (provider_dir / "features").iterdir() if p.is_dir()] if (provider_dir / "features").exists() else []
     feature_names = {p.name for p in feature_dirs}
     extra_features = sorted(feature_names - instrument_names)
     unexpected_extra = [name for name in extra_features if name not in BENCHMARK_FEATURES]
@@ -280,7 +320,8 @@ def qlib_provider_stats() -> dict:
         "benchmark_feature_dirs": len([name for name in extra_features if name in BENCHMARK_FEATURES]),
         "unexpected_extra_feature_dirs": len(unexpected_extra),
         "unexpected_extra_feature_sample": ", ".join(unexpected_extra[:20]),
-        "size_mb": file_size_mb(QLIB_DIR),
+        "size_mb": file_size_mb(provider_dir),
+        **benchmark_feature_stats(provider_dir, calendar),
     }
 
 
@@ -309,14 +350,23 @@ def build_training_readiness(
     qlib_stats: dict,
     merged_success: set[str],
     issue_counts: dict[str, int],
+    *,
+    min_calendar_days: int = 252,
+    min_instruments: int = 100,
+    min_merged_instruments: int = 100,
 ) -> tuple[bool, dict[str, str]]:
     blockers = []
-    if qlib_stats["calendar_days"] < 252:
-        blockers.append("Qlib calendar has fewer than 252 trading days")
-    if qlib_stats["instruments"] < 100:
-        blockers.append("Qlib provider has fewer than 100 instruments")
-    if len(merged_success) < 100:
-        blockers.append("Merged local dataset has fewer than 100 instruments")
+    if qlib_stats["calendar_days"] < min_calendar_days:
+        blockers.append(f"Qlib calendar has fewer than {min_calendar_days} trading days")
+    if qlib_stats["instruments"] < min_instruments:
+        blockers.append(f"Qlib provider has fewer than {min_instruments} instruments")
+    if len(merged_success) < min_merged_instruments:
+        blockers.append(f"Merged local dataset has fewer than {min_merged_instruments} instruments")
+    if not qlib_stats.get("benchmark_complete", False):
+        blockers.append(
+            "SH000300 benchmark is missing or incomplete "
+            f"({qlib_stats.get('benchmark_missing_days', 'unknown')} missing days)"
+        )
     for key in ["duplicate_dates", "null_dates", "missing_columns", "bad_ohlc_rows"]:
         if issue_counts.get(key, 0) > 0:
             blockers.append(f"Structural issue remains: {key}={issue_counts[key]}")
@@ -349,11 +399,18 @@ def write_research_status(
     qlib_stats: dict,
     merged_success: set[str],
     issue_counts: dict[str, int],
+    provider_dir: Path = QLIB_DIR,
+    min_calendar_days: int = 252,
+    min_instruments: int = 100,
+    min_merged_instruments: int = 100,
 ) -> Path:
     trainable, training_readiness = build_training_readiness(
         qlib_stats=qlib_stats,
         merged_success=merged_success,
         issue_counts=issue_counts,
+        min_calendar_days=min_calendar_days,
+        min_instruments=min_instruments,
+        min_merged_instruments=min_merged_instruments,
     )
     latest_training = load_latest_training_result(out_dir)
 
@@ -377,11 +434,13 @@ def write_research_status(
         "training_readiness": training_readiness,
         "data_sources": data_sources,
         "qlib_provider": {
-            "path": str(QLIB_DIR),
+            "path": str(provider_dir),
             "calendar_days": qlib_stats["calendar_days"],
             "calendar_range": f"{qlib_stats['calendar_start']} ~ {qlib_stats['calendar_end']}",
             "instruments": qlib_stats["instruments"],
             "feature_dirs": qlib_stats["feature_dirs"],
+            "benchmark_complete": qlib_stats.get("benchmark_complete", False),
+            "benchmark_missing_days": qlib_stats.get("benchmark_missing_days", 0),
             "size_mb": round(qlib_stats["size_mb"], 2),
         },
         "latest_training": latest_training,
@@ -410,6 +469,11 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--overlap-sample", type=int, default=0, help="0 means all overlaps")
     parser.add_argument("--merged-sample", type=int, default=0, help="0 means all merged files")
+    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument("--qlib-dir", type=Path, default=QLIB_DIR)
+    parser.add_argument("--min-calendar-days", type=int, default=252)
+    parser.add_argument("--min-instruments", type=int, default=100)
+    parser.add_argument("--fail-on-not-trainable", action="store_true")
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -427,7 +491,7 @@ def main() -> int:
         ("jqdata", JQDATA_DIR),
         ("eastmoney", EASTMONEY_DIR),
         ("akshare", AKSHARE_DIR),
-        ("merged", MERGED_DIR),
+        ("merged", args.merged_dir),
     ]:
         stats = source_stats(name, directory)
         source_rows.append(stats.__dict__)
@@ -437,7 +501,7 @@ def main() -> int:
     source_df.to_csv(source_csv, index=False)
 
     print("Scanning merged files...")
-    merged_summary, merged_issues = scan_merged_files(MERGED_DIR, sample_limit=args.merged_sample)
+    merged_summary, merged_issues = scan_merged_files(args.merged_dir, sample_limit=args.merged_sample)
     summary_csv = out_dir / f"data_quality_merged_summary_{ts}.csv"
     issues_csv = out_dir / f"data_quality_issues_{ts}.csv"
     merged_summary.to_csv(summary_csv, index=False)
@@ -448,10 +512,10 @@ def main() -> int:
     overlap_csv = out_dir / f"data_quality_overlap_{ts}.csv"
     overlap.to_csv(overlap_csv, index=False)
 
-    qlib_stats = qlib_provider_stats()
+    qlib_stats = qlib_provider_stats(args.qlib_dir)
     bs_success = load_source_index(BAOSTOCK_DIR)
     jq_success = load_source_index(JQDATA_DIR)
-    merged_success = load_source_index(MERGED_DIR)
+    merged_success = load_source_index(args.merged_dir)
 
     missing_success = sorted(stock_set - merged_success)
     classified = bs_success | empty_codes | timeout_codes
@@ -499,7 +563,7 @@ Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - Baostock timeout instruments: {len(timeout_codes)}
 - Unclassified instruments: {len(unclassified)}
 - Merged rows: {int(source_df[source_df['name'] == 'merged']['rows'].iloc[0]):,}
-- Qlib provider: `{QLIB_DIR}`
+- Qlib provider: `{args.qlib_dir}`
 
 ## Source Coverage
 
@@ -512,6 +576,8 @@ Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - Instruments: {qlib_stats["instruments"]}
 - Feature directories: {qlib_stats["feature_dirs"]}
 - Benchmark-only feature directories: {qlib_stats["benchmark_feature_dirs"]}
+- Benchmark complete through calendar end: {qlib_stats["benchmark_complete"]}
+- Benchmark missing days after first observation: {qlib_stats["benchmark_missing_days"]}
 - Unexpected extra feature directories: {qlib_stats["unexpected_extra_feature_dirs"]} `{qlib_stats["unexpected_extra_feature_sample"]}`
 - Size: {qlib_stats["size_mb"]:.1f} MB
 
@@ -562,6 +628,10 @@ expected in adjusted-volume space after corporate actions.
         qlib_stats=qlib_stats,
         merged_success=merged_success,
         issue_counts=issue_counts,
+        provider_dir=args.qlib_dir,
+        min_calendar_days=args.min_calendar_days,
+        min_instruments=args.min_instruments,
+        min_merged_instruments=args.min_instruments,
     )
 
     print(f"Report: {report_path}")
@@ -571,7 +641,15 @@ expected in adjusted-volume space after corporate actions.
     print(f"Summary: {summary_csv}")
     print(f"Issues: {issues_csv}")
     print(f"Overlap: {overlap_csv}")
-    return 0
+    trainable, _detail = build_training_readiness(
+        qlib_stats,
+        merged_success,
+        issue_counts,
+        min_calendar_days=args.min_calendar_days,
+        min_instruments=args.min_instruments,
+        min_merged_instruments=args.min_instruments,
+    )
+    return 1 if args.fail_on_not_trainable and not trainable else 0
 
 
 if __name__ == "__main__":

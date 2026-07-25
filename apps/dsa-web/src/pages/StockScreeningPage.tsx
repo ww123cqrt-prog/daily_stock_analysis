@@ -66,6 +66,8 @@ const clearPersistedScreenTask = () => {
   }
 };
 
+// TODO: 应改为比较错误码，需后端在 ParsedApiError 中暴露 code 字段后配合修改
+// 当前 ParsedApiError 只有 title/category，category 为 'http_error' 且与其他错误共用，无法区分
 const isUnrecoverableScreenTaskError = (error: ParsedApiError) =>
   error.title === '选股任务不可恢复';
 

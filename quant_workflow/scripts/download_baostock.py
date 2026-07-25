@@ -22,15 +22,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root  # noqa: E402
+from _daily_update_runtime import write_json_atomic  # noqa: E402
+from _paths import quant_data_root, reports_root  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
+REPORTS_ROOT = reports_root()
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
 PARQUET_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
 EMPTY_CODES_FILE = QUANT_DATA / "baostock_empty_codes.json"
 TIMEOUT_CODES_FILE = QUANT_DATA / "baostock_timeout_codes.json"
-CURRENT_FILE = QUANT_DATA / "baostock_current.json"
+CURRENT_FILE = REPORTS_ROOT / "runtime" / "status" / "baostock_current.json"
 
 FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
 KEEP_COLUMNS = [
@@ -174,9 +176,26 @@ def query_one(
 ) -> pd.DataFrame:
     last_error = ""
     for attempt in range(1, retries + 1):
-        previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.setitimer(signal.ITIMER_REAL, timeout)
-        try:
+        supports_signal_timeout = all(
+            hasattr(signal, name)
+            for name in ("signal", "SIGALRM", "setitimer", "ITIMER_REAL")
+        )
+        if supports_signal_timeout:
+            previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+            try:
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields=FIELDS,
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag=adjustflag,
+                )
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+        else:
             rs = bs.query_history_k_data_plus(
                 code=bs_code,
                 fields=FIELDS,
@@ -185,9 +204,6 @@ def query_one(
                 frequency="d",
                 adjustflag=adjustflag,
             )
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
 
         if rs.error_code == "0":
             return frame_from_result(rs)
@@ -245,6 +261,12 @@ def merge_existing_frame(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
+def write_download_status(payload: dict) -> Path:
+    path = REPORTS_ROOT / "runtime" / "status" / "baostock_download_summary_latest.json"
+    write_json_atomic(path, payload)
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="20200101")
@@ -296,6 +318,21 @@ def main() -> int:
     login_result = bs.login()
     print(f"Baostock login: {login_result.error_code} {login_result.error_msg}", flush=True)
     if login_result.error_code != "0":
+        write_download_status(
+            {
+                "source": "baostock",
+                "status": "failed",
+                "failure_type": "login_failed",
+                "total": len(codes),
+                "ok": 0,
+                "no_new": 0,
+                "empty": 0,
+                "fail": len(codes),
+                "start": start,
+                "end": end,
+                "failures": [],
+            }
+        )
         return 2
 
     ok = 0
@@ -320,9 +357,9 @@ def main() -> int:
                     if args.incremental
                     else start
                 )
-                CURRENT_FILE.write_text(
-                    json.dumps(
-                        {
+                write_json_atomic(
+                    CURRENT_FILE,
+                    {
                             "index": i,
                             "total": total,
                             "symbol": sym,
@@ -331,11 +368,7 @@ def main() -> int:
                             "end": end,
                             "incremental": args.incremental,
                             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
+                    },
                 )
                 if args.incremental and out_path.exists() and range_starts_after_end(symbol_start, end):
                     no_new += 1
@@ -410,6 +443,27 @@ def main() -> int:
         fail_log = QUANT_DATA / "baostock_failures.json"
         fail_log.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Failure details saved to {fail_log}", flush=True)
+
+    status = "ok" if ok > 0 or no_new > 0 else "failed"
+    write_download_status(
+        {
+            "source": "baostock",
+            "status": status,
+            "output_dir": str(out_dir),
+            "start": start,
+            "end": end,
+            "total": len(codes),
+            "ok": ok,
+            "no_new": no_new,
+            "empty": empty,
+            "fail": fail,
+            "seconds": round(elapsed, 2),
+            "failures": [
+                {"symbol": symbol, "provider_symbol": provider_symbol, "error": error}
+                for symbol, provider_symbol, error in failures[:100]
+            ],
+        }
+    )
 
     return 0 if ok > 0 or no_new > 0 else 1
 

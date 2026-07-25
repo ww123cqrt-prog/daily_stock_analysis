@@ -1,9 +1,11 @@
 import importlib.util
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_module():
@@ -59,6 +61,118 @@ class AddIndexBenchmarkTest(unittest.TestCase):
 
         self.assertNotIn("SH000300", text)
         self.assertIn("SH600000", text)
+
+    def test_baostock_failure_uses_complete_eastmoney_fallback_without_forward_fill(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "provider"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-20\n2026-07-21\n", encoding="utf-8")
+
+            def failed(_start, _end):
+                raise RuntimeError("source unavailable")
+
+            status = module.add_benchmark(
+                provider,
+                source_fetchers=[
+                    ("baostock", failed),
+                    ("eastmoney", lambda _start, _end: {"2026-07-20": 4000.0, "2026-07-21": 4010.0}),
+                ],
+                cache_providers=[],
+            )
+            start_idx, values = module.read_feature_bin(provider / "features" / "sh000300" / "close.day.bin")
+
+        self.assertEqual(status["source"], "eastmoney")
+        self.assertEqual(start_idx, 0)
+        self.assertEqual(values.tolist(), [4000.0, 4010.0])
+
+    def test_incomplete_sources_fail_closed_without_replacing_existing_benchmark(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "provider"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-20\n2026-07-21\n", encoding="utf-8")
+            feature = provider / "features" / "sh000300" / "close.day.bin"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(b"previous-official-benchmark")
+
+            with self.assertRaises(module.BenchmarkSourceError):
+                module.add_benchmark(
+                    provider,
+                    source_fetchers=[
+                        ("baostock", lambda _start, _end: {"2026-07-20": 4000.0}),
+                        ("eastmoney", lambda _start, _end: {}),
+                    ],
+                    cache_providers=[],
+                )
+
+            self.assertEqual(feature.read_bytes(), b"previous-official-benchmark")
+
+    def test_validated_local_provider_cache_is_a_legal_fallback(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            provider = base / "provider"
+            cache = base / "cache"
+            for root in [provider, cache]:
+                calendar = root / "calendars" / "day.txt"
+                calendar.parent.mkdir(parents=True)
+                calendar.write_text("2026-07-20\n2026-07-21\n", encoding="utf-8")
+            cache_feature = cache / "features" / "sh000300" / "close.day.bin"
+            cache_feature.parent.mkdir(parents=True)
+            module.write_feature_bin(cache_feature, 0, [4000.0, 4010.0])
+
+            status = module.add_benchmark(
+                provider,
+                source_fetchers=[("baostock", lambda _start, _end: (_ for _ in ()).throw(RuntimeError("down")))],
+                cache_providers=[cache],
+            )
+
+        self.assertEqual(status["source"], f"local_cache:{cache}")
+
+    def test_default_cache_search_includes_official_and_runtime_providers(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            quant_data = Path(tmp) / "quant_data"
+            official = quant_data / "qlib" / "official"
+            runtime = quant_data / "runtime" / "run-1" / "provider"
+            current = quant_data / "runtime" / "current" / "provider"
+            for provider in [official, runtime, current]:
+                feature = provider / "features" / "sh000300" / "close.day.bin"
+                feature.parent.mkdir(parents=True)
+                feature.write_bytes(b"cache")
+
+            with patch.object(module, "QUANT_DATA", quant_data):
+                providers = module._default_cache_providers(current)
+
+        self.assertIn(official, providers)
+        self.assertIn(runtime, providers)
+        self.assertNotIn(current, providers)
+
+    def test_all_benchmark_sources_failed_writes_sanitized_runtime_status(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            provider = base / "provider"
+            status_dir = base / "runtime" / "status"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-20\n", encoding="utf-8")
+
+            with self.assertRaises(module.BenchmarkSourceError):
+                module.add_benchmark(
+                    provider,
+                    source_fetchers=[("baostock", lambda _start, _end: (_ for _ in ()).throw(RuntimeError("blacklisted")))],
+                    cache_providers=[],
+                    status_dir=status_dir,
+                )
+
+            status = json.loads((status_dir / "benchmark_update_latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["attempts"][0]["source"], "baostock")
 
 
 if __name__ == "__main__":

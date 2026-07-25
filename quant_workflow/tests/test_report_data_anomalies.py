@@ -15,6 +15,21 @@ def load_module():
 
 
 class ReportDataAnomaliesTest(unittest.TestCase):
+    def test_report_records_the_candidate_merged_directory(self):
+        module = load_module()
+        candidate = Path("/tmp/daily-candidate/cleaned-parquet")
+
+        report = module.build_report(
+            summary_df=pd.DataFrame(),
+            events_df=pd.DataFrame(),
+            coverage={"files": 0, "rows": 0, "start": "", "end": ""},
+            stock_csv=Path("/tmp/stocks.csv"),
+            events_csv=Path("/tmp/events.csv"),
+            merged_dir=candidate,
+        )
+
+        self.assertIn(str(candidate), report)
+
     def test_classifies_structural_price_issue_as_blocker(self):
         module = load_module()
         df = pd.DataFrame(

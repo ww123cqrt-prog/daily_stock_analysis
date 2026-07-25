@@ -12,6 +12,7 @@
     <string>__PYTHON__</string>
     <string>-u</string>
     <string>__SCRIPT__</string>
+    <string>--skip-if-robust-training</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -23,6 +24,8 @@
     <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
   </dict>
 
   <key>StandardOutPath</key>

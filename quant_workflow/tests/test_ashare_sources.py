@@ -86,6 +86,7 @@ class AShareSourcesTest(unittest.TestCase):
                 overlap_days=2,
                 sleep_seconds=0,
                 summary_dir=base,
+                runtime_status_dir=base / "runtime" / "status",
             )
 
             merged = pd.read_parquet(out_dir / "000001.parquet")
@@ -137,6 +138,7 @@ class AShareSourcesTest(unittest.TestCase):
 
             self.assertTrue((reports / "download_state" / "eastmoney_current.json").exists())
             self.assertTrue((reports / "download_state" / "eastmoney_download_summary_latest.json").exists())
+            self.assertTrue((reports / "runtime" / "status" / "eastmoney_download_summary_latest.json").exists())
             self.assertFalse((quant_data / "eastmoney_current.json").exists())
 
     def test_incremental_range_after_end_is_no_new_without_fetching_source(self):
@@ -168,6 +170,7 @@ class AShareSourcesTest(unittest.TestCase):
                 overlap_days=0,
                 sleep_seconds=0,
                 summary_dir=base,
+                runtime_status_dir=base / "runtime" / "status",
             )
 
         self.assertEqual(summary["no_new"], 1)

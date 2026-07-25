@@ -2480,6 +2480,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 {"start": "2026-07-01", "end": "2026-07-08", "limit": 2, "incremental": True, "overlap_days": 7},
             )
             snapshot = service._build_command("validate_latest_snapshot", {"limit": 3, "timeout": 9})
+            global_daily = service._build_command(
+                "download_global_daily",
+                {"start": "2026-07-01", "end": "2026-07-08", "limit": 2, "incremental": True},
+            )
+            news = service._build_command("download_ashare_news", {"limit": 5, "timeout": 9})
             status = service.available_job_types()
 
             with self.assertRaises(ValueError) as unsafe_ctx:
@@ -2493,6 +2498,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("--incremental", akshare)
         self.assertIn("validate_latest_snapshot.py", snapshot[1])
         self.assertIn("--out-dir", snapshot)
+        self.assertIn("download_global_daily.py", global_daily[1])
+        self.assertIn("--incremental", global_daily)
+        self.assertIn("download_ashare_news.py", news[1])
+        self.assertEqual(news[news.index("--limit") + 1], "5")
         self.assertEqual(
             status["download_eastmoney"]["allowed_params"],
             [
@@ -2526,6 +2535,14 @@ class QuantJobsApiTestCase(unittest.TestCase):
             ],
         )
         self.assertEqual(status["validate_latest_snapshot"]["allowed_params"], ["limit", "timeout", "use_system_proxy"])
+        self.assertEqual(
+            status["download_global_daily"]["allowed_params"],
+            ["end", "incremental", "limit", "overlap_days", "retries", "sleep", "start", "timeout", "use_system_proxy"],
+        )
+        self.assertEqual(
+            status["download_ashare_news"]["allowed_params"],
+            ["limit", "retries", "sleep", "timeout", "use_system_proxy"],
+        )
         self.assertIn("Unsupported params for download_eastmoney", str(unsafe_ctx.exception))
 
     def test_market_regime_report_job_is_whitelisted_with_safe_params(self) -> None:

@@ -395,6 +395,7 @@ def build_report(
     coverage: dict,
     stock_csv: Path,
     events_csv: Path,
+    merged_dir: Path,
 ) -> str:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     severity_counts = (
@@ -427,7 +428,7 @@ Generated: {generated}
 
 ## Coverage
 
-- Merged parquet directory: `{MERGED_DIR}`
+- Merged parquet directory: `{merged_dir}`
 - Files scanned: {coverage["files"]}
 - Rows scanned: {coverage["rows"]:,}
 - Dataset date range: {coverage["start"]} ~ {coverage["end"]}
@@ -504,6 +505,7 @@ def main() -> int:
         coverage=coverage,
         stock_csv=stock_csv,
         events_csv=events_csv,
+        merged_dir=args.merged_dir,
     )
     report_path.write_text(report, encoding="utf-8")
 

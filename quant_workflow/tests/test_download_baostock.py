@@ -20,6 +20,59 @@ def load_module():
 
 
 class DownloadBaostockTest(unittest.TestCase):
+    def test_query_one_runs_without_unix_signal_timer(self):
+        module = load_module()
+
+        class EmptySuccessResult:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date", "code"]
+
+            def next(self):
+                return False
+
+        query = Mock(return_value=EmptySuccessResult())
+        fake_bs = types.SimpleNamespace(query_history_k_data_plus=query)
+
+        with patch.object(module, "signal", types.SimpleNamespace()):
+            result = module.query_one(
+                fake_bs,
+                "sz.000001",
+                "2026-07-23",
+                "2026-07-24",
+                "2",
+                retries=1,
+                timeout=5,
+            )
+
+        self.assertTrue(result.empty)
+        query.assert_called_once()
+
+    def test_login_failure_writes_runtime_status_summary(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reports = root / "reports"
+            stock_list = root / "stock_lists.json"
+            stock_list.write_text(json.dumps({"all": ["000001.XSHE"]}), encoding="utf-8")
+            fake_bs = types.SimpleNamespace(
+                login=lambda: types.SimpleNamespace(error_code="1001", error_msg="blocked"),
+                logout=lambda: None,
+            )
+            with patch.object(module, "STOCK_LIST", stock_list), \
+                    patch.object(module, "REPORTS_ROOT", reports), \
+                    patch.dict(sys.modules, {"baostock": fake_bs}), \
+                    patch.object(sys, "argv", ["download_baostock.py", "--out", str(root / "out")]):
+                rc = module.main()
+
+            status = json.loads(
+                (reports / "runtime" / "status" / "baostock_download_summary_latest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["failure_type"], "login_failed")
+
     def test_loads_symbols_file_with_comments_and_suffixes(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

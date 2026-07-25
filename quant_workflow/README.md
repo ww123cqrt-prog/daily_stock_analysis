@@ -33,6 +33,12 @@ Parquet or Qlib provider root moves.
 # Download Baostock long-history data
 .venv/bin/python quant_workflow/scripts/download_baostock.py --retry-failed
 
+# Download the CatDesk US/Japan/Korea universe and retain each raw Yahoo response
+.venv/bin/python quant_workflow/scripts/download_global_daily.py --incremental
+
+# Download a bounded A-share news sample and retain each raw EastMoney response
+.venv/bin/python quant_workflow/scripts/download_ashare_news.py --limit 50
+
 # Supervise Baostock in restartable batches
 .venv/bin/python quant_workflow/scripts/supervise_baostock.py
 
@@ -47,6 +53,13 @@ Parquet or Qlib provider root moves.
 
 # Apply anomaly cleaning rules into a separate cleaned provider
 .venv/bin/python quant_workflow/scripts/apply_data_cleaning.py
+
+# Run the scheduled chain manually; derived data is staged and published only
+# after benchmark, cleaning, quality, Qlib, and manifest checks all pass
+.venv/bin/python quant_workflow/scripts/run_daily_update.py
+
+# Read-only data-governance inventory and dry-run cleanup plan
+.venv/bin/python quant_workflow/scripts/report_data_hygiene.py
 
 # Run the canonical Qlib Alpha158 + LightGBM baseline
 .venv/bin/python quant_workflow/scripts/train_baseline_lgb.py
@@ -63,6 +76,10 @@ Parquet or Qlib provider root moves.
 - Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata`
 - Cleaned merged Parquet: `quant_data/parquet/ashare_1d/merged_baostock_jqdata_cleaned`
 - Cleaned Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata_cleaned`
+- Canonical global daily Parquet: `quant_data/parquet/global_1d/{us,jp,kr}`
+- Yahoo raw responses: `quant_data/raw/global_1d/yahoo/captured_date=YYYY-MM-DD`
+- Sina snapshot raw responses: `quant_data/raw/ashare_snapshots/captured_date=YYYY-MM-DD`
+- EastMoney news raw responses: `quant_data/raw/ashare_news/captured_date=YYYY-MM-DD`
 
 ## Notes
 
@@ -74,8 +91,30 @@ Parquet or Qlib provider root moves.
 - Historical one-off scratch scripts are intentionally not kept in the public
   repository. Promote useful experiments into `scripts/`, `configs/`, `tests/`
   and docs before committing them.
+- `configs/global_daily_symbols.json` is the canonical global universe consumed
+  by the downloader. Each symbol has one incrementally merged Parquet file;
+  timestamped raw responses are append-only evidence and are never committed.
+- The A-share news downloader is bounded by default. It refuses an unbounded
+  full-market request unless the operator supplies an explicit symbols file.
 - `train_baseline_lgb.py --provider cleaned` rewrites a runtime YAML under
   `reports/runtime_configs/` so the source config stays canonical.
 - `SH000300` benchmark data may exist under `features/sh000300`, but it must
   not be listed in `instruments/all.txt` or `instruments/csi300.txt`; otherwise
   model training can treat the index as a tradable stock.
+- The daily updater uses `reports/runtime/status/daily_update.lock.json` for
+  single-instance execution. A duplicate trigger is recorded as
+  `controlled_skip`; a dead PID lock is reclaimed, while a live PID lock is
+  never removed.
+- Source parquet caches, run-scoped merged/cleaned candidates, and fixed-path
+  official providers have separate roles. Candidates live under
+  `quant_data/runtime/daily_update/runs/<run-id>/`; the four official derived
+  directories and `DATA_MANIFEST.json` are promoted together only after every
+  required check passes. Previous official directories remain under that
+  run's `previous_official/` rollback directory.
+- Benchmark fallback is fail-closed. Baostock, anonymous public-source
+  fallbacks, and validated local provider caches are tried in order; missing
+  benchmark dates are never silently forward-filled as real closes.
+- `report_data_hygiene.py` intentionally remains a manual, read-only governance
+  report rather than part of the weekday 18:40 chain. It inventories data and
+  writes a dry-run cleanup plan only. It never deletes or moves data, and any
+  future low-frequency schedule must preserve that read-only contract.

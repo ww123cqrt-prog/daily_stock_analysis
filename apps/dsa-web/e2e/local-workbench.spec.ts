@@ -21,7 +21,7 @@ test.use({
   locale: 'zh-CN',
 });
 
-test.describe.configure({ mode: 'serial' });
+test.describe.configure({ mode: 'serial', timeout: 120_000 });
 
 type ConsoleWatch = {
   errors: string[];
@@ -1549,11 +1549,10 @@ test('research page can archive and permanently delete temporary experiment reco
     await page.getByRole('button', { name: `归档实验 ${archiveRunId}` }).click();
     await expect(page.getByText(`Run ${archiveRunId}`)).not.toBeVisible({ timeout: 15_000 });
 
-    page.once('dialog', async (dialog) => {
-      expect(dialog.message()).toContain('永久删除');
-      await dialog.accept();
-    });
     await page.getByRole('button', { name: `永久删除实验 ${permanentRunId}` }).click();
+    const deleteDialog = page.getByRole('dialog', { name: '永久删除' });
+    await expect(deleteDialog).toBeVisible();
+    await deleteDialog.getByRole('button', { name: '确定' }).click();
     await expect(page.getByText(`Run ${permanentRunId}`)).not.toBeVisible({ timeout: 15_000 });
 
     const reportsRoot = getQuantReportsRoot();

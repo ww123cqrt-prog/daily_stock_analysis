@@ -74,9 +74,9 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 建议顺序：
 
-0. 一键更新：运行“运行每日数据更新全链路”，自动串联 Baostock/东方财富/AkShare 增量下载、合并、最新快照校验、异常检测、清洗和跨源验证。日常维护优先用这一个入口；下面的 1-6 步是需要单独排查某一环时的手动拆分。
+0. 一键更新：运行“运行每日数据更新全链路”，自动串联 A 股三源增量下载、全球日线、限定 A 股新闻原始证据、合并、最新快照校验、异常检测、清洗和跨源验证。日常维护优先用这一个入口；下面的 1-6 步是需要单独排查某一环时的手动拆分。
 1. 检查 Qlib 数据：运行“检查 Qlib 数据”。
-2. 更新数据：先运行“准备 Baostock 增量清单”，再按需运行“下载 Baostock 长历史”、“下载东方财富日线”和“下载 AkShare 日线”。东方财富和 AkShare 都是免费匿名公开接口，写入 `eastmoney_qfq` / `akshare_qfq`，只作为冗余源，不覆盖原始 Baostock/JQData 目录。
+2. 更新数据：先运行“准备 Baostock 增量清单”，再按需运行“下载 Baostock 长历史”、“下载东方财富日线”、“下载 AkShare 日线”、“下载全球日线与原始证据”和“下载 A 股新闻原始证据”。东方财富和 AkShare 的 A 股日线只作为冗余源；全球日线写入独立 `global_1d`，不会混入 Qlib A 股股票池。
 3. 验证 JQData：运行“验证 JQData 连接”。网页端只允许 dry-run、小样本认证和股票池解析，不写入真实数据目录。
 4. 合并 Qlib：运行“合并并转换为 Qlib”，必要时先用小样本演练。
 5. 质量报告：运行“生成数据质量报告”、“生成异常股票和清洗策略”、“校验新浪最新快照”、“生成数据治理盘点和清理预案”和“生成工作台能力盘点”。
@@ -98,14 +98,18 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 1. `download_baostock.py --incremental`：Baostock 增量刷新（匿名登录，不需要也不读取任何凭据）。
 2. `download_eastmoney.py --incremental`：东方财富 qfq 日线冗余源，写入 `quant_data/parquet/ashare_1d/eastmoney_qfq/`。
 3. `download_akshare.py --incremental`：AkShare `stock_zh_a_hist(adjust="qfq")` 冗余源，写入 `quant_data/parquet/ashare_1d/akshare_qfq/`。
-4. `merge_to_qlib.py`：把 Baostock 长历史、JQData 近期数据和已存在的新冗余源多源合并，输出目录名仍保持 `merged_baostock_jqdata`，再转换为 canonical Qlib provider。重叠交易日的 OHLC 覆盖顺序是 Baostock -> JQData -> EastMoney -> AkShare；成交量/成交额在重叠日保留较早来源以避免复权量突变，新来源只补自己独有日期的完整字段。
-5. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`；这是只读校验，不参与训练。
-6. `report_data_anomalies.py`：异常检测，产出清洗输入。
-7. `apply_data_cleaning.py`：套用清洗规则，生成官方 cleaned provider。
-8. `report_data_quality.py`：Baostock/JQData/东方财富/AkShare 重叠期跨源一致性验证。
-9. `check_qlib_data.py`：最终 provider 日历/股票池校验。
+4. `download_global_daily.py --incremental`：从 Yahoo Chart 下载配置内 78 个美股、9 个日股、8 个韩股，分别写入 `quant_data/parquet/global_1d/{us,jp,kr}/<symbol>.parquet`。每个代码始终只有一个增量文件，原始响应按抓取日期写入 `quant_data/raw/global_1d/yahoo/`。
+5. `download_ashare_news.py --limit 50`：限定股票数抓取东方财富新闻搜索 JSONP，原始响应写入 `quant_data/raw/ashare_news/`；不允许默认无界抓取全市场。
+6. `merge_to_qlib.py`：把 Baostock 长历史、JQData 近期数据和已存在的新冗余源多源合并，在本次 run 的 staging 目录生成 merged parquet 与 Qlib 候选。重叠交易日的 OHLC 覆盖顺序是 Baostock -> JQData -> EastMoney -> AkShare；成交量/成交额在重叠日保留较早来源以避免复权量突变，新来源只补自己独有日期的完整字段。
+7. `add_index_benchmark.py`：为候选 provider 补齐实际使用的 `SH000300`。Baostock 不可用时依次尝试东方财富、AkShare 和经过完整日历校验的本地 provider 缓存；缺日时失败，不做前向填充。
+8. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比候选 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`，并把原始响应写入 `quant_data/raw/ashare_snapshots/`；这是非致命校验，不参与训练。
+9. `report_data_anomalies.py`：对候选 merged 数据做异常检测，产出清洗输入。
+10. `apply_data_cleaning.py`：套用清洗规则，在 staging 目录生成 cleaned parquet/Qlib 候选，并按目标日历重建基准特征。
+11. `report_data_quality.py`：对候选数据执行跨源一致性、结构、规模和基准完整性检查；不可训练时返回非零。
+12. `check_qlib_data.py`：最终候选 provider 日历、股票池和 `SH000300` 完整性校验。
+13. `publish_daily_candidate.py`：只有全部必需检查通过后，才原子切换 merged/cleaned 四个正式目录并同步 `DATA_MANIFEST.json`；发布或 manifest 失败时回滚旧正式目录。
 
-编排器带一个交易日 gate：增量下载后会查看 Baostock、东方财富和 AkShare 三个源目录的最新日期；若没有新交易日（且未加 `--force`），会跳过 4-9 的重建阶段，避免无谓地重跑全市场合并和清洗。三个下载源在全链路中都是非致命阶段：某个免费源失败会写进 `daily_update_summary_latest.json` 并继续跑其他可执行阶段。`--skip-download` 只重建、不下载；`--skip-eastmoney` / `--skip-akshare` / `--skip-snapshot-validation` 可单独跳过新源；`--dry-run` 只打印计划、不执行；`--limit` 用于小样本演练。每次运行写 `daily_update_summary_latest.json` 记录各阶段状态、用时、退出码和各源日期。
+编排器带 A 股交易日和覆盖率双 gate：增量下载后只用 Baostock、东方财富和 AkShare 三个 A 股日线阶段判断全市场是否更新，默认至少 80% 的股票在任一合法来源覆盖该日，才允许进入合并发布。全球日线和新闻原始证据是独立非致命阶段，失败会明确记录警告，但不会被误算成 A 股覆盖失败，也不会放宽 A 股发布门禁。全部 A 股日线下载失败且没有重建时整体返回非零。`--skip-download` 只重建、不下载；各数据源都有独立 skip 参数；`--dry-run` 只打印计划、不执行；`--limit` 用于小样本演练，新闻另用 `--news-limit`。每次运行写 summary 和 runtime status，记录阶段状态、用时、退出码、各源日期、覆盖率以及是否真的发布 official/manifest。
 
 JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baostock 长历史序列之前，只在合并和跨源验证中复用既有 JQData parquet。东方财富和 AkShare 是免费冗余源，首次全市场下载会额外占用约 1GB 量级磁盘；日常增量只补最近窗口。
 
@@ -120,7 +124,7 @@ scripts/launchd/install-quant-daily-update.sh --dry-run  # 只打印解析后的
 scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 plist
 ```
 
-任务 `com.dsa.quant-daily-update` 默认工作日 18:40（A 股收盘且日终数据落定后）本地触发，用 `daily_stock_analysis/.venv` 运行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。`launchctl kickstart gui/<uid>/com.dsa.quant-daily-update` 可手动触发一次。
+任务 `com.dsa.quant-daily-update` 默认工作日 18:40（Asia/Shanghai，A 股收盘且日终数据落定后）本地触发，用 `daily_stock_analysis/.venv` 运行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。任务带单实例锁；重复触发和检测到鲁棒研究进程都会写 `controlled_skip` 状态，不会静默退出或修改共享 provider。`launchctl kickstart gui/<uid>/com.dsa.quant-daily-update` 可手动触发一次。
 
 ### 2.3 只读盘点与报告任务
 

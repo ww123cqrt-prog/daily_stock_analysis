@@ -15,6 +15,8 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   download_baostock.py
   download_eastmoney.py
   download_akshare.py
+  download_global_daily.py
+  download_ashare_news.py
   download_jqdata.py
   merge_to_qlib.py
   validate_latest_snapshot.py
@@ -124,6 +126,10 @@ check_quant_workflow_scripts() {
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     printf 'Missing quant_workflow script(s): %s\n' "${missing[*]}" >&2
+    exit 2
+  fi
+  if [[ ! -f "${QUANT_WORKFLOW_ROOT}/configs/global_daily_symbols.json" ]]; then
+    echo "Missing global daily symbol config: ${QUANT_WORKFLOW_ROOT}/configs/global_daily_symbols.json" >&2
     exit 2
   fi
   # run_dsa_backtest is intentionally a DSA-native job, not a

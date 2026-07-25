@@ -100,11 +100,29 @@ test('preserves run filters, parameter names, and artifacts on the local MLflow 
   await page.addInitScript(() => localStorage.setItem('dsa.uiLanguage', 'en'));
   await page.goto('/experiments/');
 
-  const firstExperiment = page.locator('[data-testid="experiment-list-item-link"]').first();
-  await expect(firstExperiment).toBeVisible();
-  await expect(firstExperiment).toHaveAttribute('href', /#\/experiments\/[^/]+\/runs$/);
-  const experimentName = (await firstExperiment.innerText()).trim();
-  await firstExperiment.click();
+  const experimentLinks = page.locator('[data-testid="experiment-list-item-link"]');
+  await expect(experimentLinks.first()).toBeVisible();
+  const experimentCandidates = await experimentLinks.evaluateAll((links) => (
+    links.map((link) => ({
+      href: link.getAttribute('href') || '',
+      name: (link.textContent || '').trim(),
+    })).filter((candidate) => candidate.href && candidate.name)
+  ));
+  expect(experimentCandidates.length).toBeGreaterThan(0);
+
+  let experimentName = '';
+  for (const candidate of experimentCandidates) {
+    await page.goto(new URL(candidate.href, page.url()).toString());
+    const hasRun = await page.locator('a[href*="/runs/"]').first().waitFor({
+      state: 'visible',
+      timeout: 5_000,
+    }).then(() => true).catch(() => false);
+    if (hasRun) {
+      experimentName = candidate.name;
+      break;
+    }
+  }
+  expect(experimentName, 'Expected at least one local MLflow experiment containing a run.').not.toBe('');
   await expect(page).toHaveURL(/#\/experiments\/[^/]+\/runs/);
 
   const search = page.locator('[data-testid="search-box"]');

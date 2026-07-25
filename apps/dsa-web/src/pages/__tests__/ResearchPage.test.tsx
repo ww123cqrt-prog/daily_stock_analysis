@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
@@ -750,16 +750,15 @@ describe('ResearchPage', () => {
   });
 
   it('permanently deletes a selected experiment run after confirmation', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderResearchPage('zh');
 
     fireEvent.click(await screen.findByRole('button', { name: '永久删除实验 abc123' }));
+    const dialog = screen.getByRole('dialog', { name: '永久删除' });
+    fireEvent.click(within(dialog).getByRole('button', { name: '确定' }));
 
     await waitFor(() => {
       expect(permanentlyDeleteExperimentRun).toHaveBeenCalledWith('abc123');
     });
-    expect(confirmSpy).toHaveBeenCalled();
     expect(screen.queryByText('TopkDropoutStrategy')).not.toBeInTheDocument();
-    confirmSpy.mockRestore();
   });
 });

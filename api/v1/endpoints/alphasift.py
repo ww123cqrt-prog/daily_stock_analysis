@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from api.deps import get_config_dep
 from api.v1.errors import api_error
-from src.config import Config
+from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC
 from src.services.alphasift_service import AlphaSiftService
 from src.services.task_queue import TaskStatus as QueueTaskStatus
 from src.services.task_queue import get_task_queue
@@ -87,6 +87,14 @@ def alphasift_install(
     request: Request,
     config: Config = Depends(get_config_dep),
 ) -> Dict[str, Any]:
+    # 安全检查：安装来源必须是受信任的固定版本
+    spec = config.alphasift_install_spec
+    if spec != DEFAULT_ALPHASIFT_INSTALL_SPEC:
+        raise api_error(
+            403,
+            "alphasift_install_spec_not_allowed",
+            "安装来源已被修改，拒绝执行。如需更新，请联系管理员。",
+        )
     return _service(config).install(request=request)
 
 

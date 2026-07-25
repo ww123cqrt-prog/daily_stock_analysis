@@ -47,6 +47,40 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["calendar_last"], "2026-07-09")
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["instruments_all"], 1)
         self.assertEqual(manifest["documented_inputs"]["canonical_qlib_provider"]["calendar_last"], "")
+        self.assertIn("global_daily", manifest["documented_inputs"])
+        self.assertIn("raw_global_daily", manifest["documented_inputs"])
+        self.assertIn("raw_ashare_snapshots", manifest["documented_inputs"])
+        self.assertIn("raw_ashare_news", manifest["documented_inputs"])
+
+    def test_sync_preserves_robust_entries_and_replaces_stale_checkout_report_paths(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            reports = root / "daily_stock_analysis" / "quant_workflow" / "reports"
+            quant_data.mkdir()
+            reports.mkdir(parents=True)
+            (quant_data / "DATA_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "old",
+                        "source_report": "/old/daily_stock_analysis-robust/quant_workflow/reports/data_hygiene_inventory_latest.json",
+                        "official_entries": {
+                            "robust_price_product": {"path": "/shared/immutable", "status": "do_not_move"}
+                        },
+                        "pending_entries": {"remote": {"status": "pending"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            path = module.sync_data_manifest(quant_data_root=quant_data, reports_root=reports)
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["official_entries"]["robust_price_product"]["path"], "/shared/immutable")
+        self.assertEqual(manifest["pending_entries"]["remote"]["status"], "pending")
+        self.assertEqual(manifest["source_report"], str(reports / "data_hygiene_inventory_latest.json"))
+        self.assertNotIn("daily_stock_analysis-robust", json.dumps(manifest))
 
 
 if __name__ == "__main__":

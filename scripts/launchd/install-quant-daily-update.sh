@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Install (or preview) the launchd job that runs the daily A-share data update.
 #
-# The daily pipeline is: download_baostock (incremental) -> merge_to_qlib ->
-# report_data_anomalies -> apply_data_cleaning -> report_data_quality
-# (Baostock/JQData cross-source validation) -> check_qlib_data.
+# The daily pipeline refreshes independent source caches, builds merged and
+# cleaned candidates, validates benchmark/quality/Qlib state, and publishes
+# official providers only after every required check passes. It records a
+# controlled skip instead of touching shared data while robust research runs.
 #
 # Baostock uses anonymous login, so this job needs no credentials. The plist is
 # machine-specific (absolute paths), so it is generated here from the tracked

@@ -7,6 +7,7 @@ import argparse
 import json
 import shutil
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -263,12 +264,48 @@ def remove_symbol_from_instrument_file(path: Path, symbol: str) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
+def read_qlib_calendar(provider: Path) -> list[str]:
+    path = provider / "calendars" / "day.txt"
+    days = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not days:
+        raise ValueError(f"empty Qlib calendar: {path}")
+    return days
+
+
+def align_feature_bin(source_path: Path, source_calendar: list[str], target_calendar: list[str]) -> np.ndarray:
+    raw = np.fromfile(source_path, dtype="<f4")
+    if len(raw) < 2:
+        raise ValueError(f"invalid Qlib feature bin: {source_path}")
+    start_idx = int(raw[0])
+    values = raw[1:]
+    if start_idx < 0 or start_idx + len(values) > len(source_calendar):
+        raise ValueError(f"Qlib feature bin is outside its source calendar: {source_path}")
+    source_positions = {day: index for index, day in enumerate(source_calendar)}
+    missing_dates = [day for day in target_calendar if day not in source_positions]
+    if missing_dates:
+        raise ValueError(
+            "target calendar dates missing from source provider: "
+            f"count={len(missing_dates)} first={missing_dates[0]} last={missing_dates[-1]}"
+        )
+
+    aligned = np.full(len(target_calendar), np.nan, dtype="<f4")
+    for target_idx, day in enumerate(target_calendar):
+        source_idx = source_positions[day]
+        value_idx = source_idx - start_idx
+        if 0 <= value_idx < len(values):
+            aligned[target_idx] = values[value_idx]
+    return aligned
+
+
+def write_qlib_feature_bin(path: Path, values: np.ndarray) -> None:
+    with path.open("wb") as handle:
+        np.array([0], dtype="<f4").tofile(handle)
+        np.asarray(values, dtype="<f4").tofile(handle)
+
+
 def copy_benchmark_features(source_provider: Path, target_provider: Path, symbols: set[str]) -> list[str]:
-    source_calendar = source_provider / "calendars" / "day.txt"
-    target_calendar = target_provider / "calendars" / "day.txt"
-    if source_calendar.exists() and target_calendar.exists():
-        if source_calendar.read_text(encoding="utf-8") != target_calendar.read_text(encoding="utf-8"):
-            raise ValueError(f"Cannot copy benchmark features because calendars differ: {source_provider} -> {target_provider}")
+    source_calendar = read_qlib_calendar(source_provider)
+    target_calendar = read_qlib_calendar(target_provider)
 
     copied: list[str] = []
     for symbol in sorted(symbols):
@@ -278,10 +315,28 @@ def copy_benchmark_features(source_provider: Path, target_provider: Path, symbol
             continue
 
         target_dir = target_provider / "features" / feature_name
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
         target_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_dir, target_dir)
+        staging_dir = target_dir.with_name(f".{target_dir.name}.{uuid.uuid4().hex}.tmp")
+        staging_dir.mkdir(parents=True)
+        try:
+            for source_path in sorted(source_dir.glob("*.day.bin")):
+                aligned = align_feature_bin(source_path, source_calendar, target_calendar)
+                write_qlib_feature_bin(staging_dir / source_path.name, aligned)
+
+            backup_dir = target_dir.with_name(f".{target_dir.name}.{uuid.uuid4().hex}.old")
+            if target_dir.exists():
+                target_dir.replace(backup_dir)
+            try:
+                staging_dir.replace(target_dir)
+            except Exception:
+                if backup_dir.exists() and not target_dir.exists():
+                    backup_dir.replace(target_dir)
+                raise
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
         copied.append(symbol)
 
         for instrument_name in ["all.txt", "csi300.txt"]:
@@ -360,6 +415,7 @@ def main() -> int:
     parser.add_argument("--events-csv", type=Path, default=ANOMALY_EVENTS_CSV)
     parser.add_argument("--cleaned-merged-dir", type=Path, default=CLEANED_MERGED_DIR)
     parser.add_argument("--qlib-dir", type=Path, default=CLEANED_QLIB_DIR)
+    parser.add_argument("--benchmark-provider-dir", type=Path, default=CANONICAL_QLIB_DIR)
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--no-overwrite", action="store_true")
     parser.add_argument("--skip-qlib-convert", action="store_true")
@@ -383,7 +439,7 @@ def main() -> int:
         print("Converting cleaned parquet to Qlib bin...")
         qlib_return_code = convert_to_bin(args.cleaned_merged_dir, args.qlib_dir, overwrite, dropna_fields=[])
         if qlib_return_code == 0:
-            copied = copy_benchmark_features(CANONICAL_QLIB_DIR, args.qlib_dir, BENCHMARK_SYMBOLS)
+            copied = copy_benchmark_features(args.benchmark_provider_dir, args.qlib_dir, BENCHMARK_SYMBOLS)
             print(f"Copied benchmark feature directories: {', '.join(copied) if copied else 'none'}")
 
     reports = write_reports(

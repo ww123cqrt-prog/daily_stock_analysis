@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,6 +68,24 @@ class ValidateLatestSnapshotTest(unittest.TestCase):
             self.assertAlmostEqual(payload["rows"][0]["close_rel_diff"], 0.02)
             self.assertTrue((out_dir / "latest_snapshot_validation_latest.json").exists())
             self.assertTrue((out_dir / "latest_snapshot_validation_latest.md").exists())
+
+    def test_write_raw_snapshot_capture_preserves_original_response(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = module.write_raw_snapshot_capture(
+                raw_text='var hq_str_sh600519="raw";',
+                symbols=["600519"],
+                raw_root=root,
+                captured_at="2026-07-25T10:11:12+08:00",
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["source"], "sina_snapshot")
+        self.assertEqual(payload["symbols"], ["600519"])
+        self.assertEqual(payload["raw_text"], 'var hq_str_sh600519="raw";')
+        self.assertEqual(len(payload["raw_text_sha256"]), 64)
+        self.assertIn("captured_date=2026-07-25", str(path))
 
 
 if __name__ == "__main__":

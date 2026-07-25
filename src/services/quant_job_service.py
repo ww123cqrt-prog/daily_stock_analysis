@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
-from src.services.quant_workflow_paths import dsa_root, projects_root, reports_root, workflow_root
+from src.services.quant_workflow_paths import dsa_root, projects_root, quant_data_root, reports_root, workflow_root
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ DSA_ROOT = dsa_root()
 PROJECTS_ROOT = projects_root(DSA_ROOT)
 QUANT_WORKFLOW_ROOT = workflow_root(DSA_ROOT)
 REPORTS_ROOT = reports_root(DSA_ROOT)
+QUANT_DATA_ROOT = quant_data_root(DSA_ROOT)
 DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
 DSA_VENV_PYTHON = DSA_ROOT / ".venv" / "bin" / "python"
 QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
@@ -145,6 +146,7 @@ NUMERIC_PARAM_RULES = {
     "max_consecutive_failures": ("integer", 1),
     "overlap_days": ("integer", 1),
     "snapshot_limit": ("integer", 1),
+    "news_limit": ("integer", 1),
     "overlap_sample": ("integer", 1),
     "merged_sample": ("integer", 1),
     "eval_window_days": ("integer", 1),
@@ -167,6 +169,7 @@ NUMERIC_PARAM_MAXIMUMS = {
     "max_consecutive_failures": BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES,
     "overlap_days": BAOSTOCK_WEB_MAX_OVERLAP_DAYS,
     "snapshot_limit": GENERIC_WEB_LIMIT_MAX,
+    "news_limit": GENERIC_WEB_LIMIT_MAX,
     "overlap_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
     "merged_sample": DATA_QUALITY_WEB_MAX_SAMPLE,
     "eval_window_days": DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS,
@@ -566,6 +569,18 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_flag(command, params, "use_system_proxy", "--use-system-proxy")
         return command
 
+    def download_ashare_news(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("download_ashare_news.py")
+        for key, flag in (
+            ("limit", "--limit"),
+            ("sleep", "--sleep"),
+            ("retries", "--retries"),
+            ("timeout", "--timeout"),
+        ):
+            _append_value(command, params, key, flag)
+        _append_flag(command, params, "use_system_proxy", "--use-system-proxy")
+        return command
+
     def download_jqdata(params: Mapping[str, Any]) -> List[str]:
         _ensure_jqdata_web_dry_run(params)
         command = _script_command("download_jqdata.py")
@@ -724,6 +739,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("limit", "--limit"),
             ("end", "--end"),
             ("snapshot_limit", "--snapshot-limit"),
+            ("news_limit", "--news-limit"),
             ("overlap_sample", "--overlap-sample"),
             ("merged_sample", "--merged-sample"),
         ):
@@ -731,6 +747,8 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         for key, flag in (
             ("skip_eastmoney", "--skip-eastmoney"),
             ("skip_akshare", "--skip-akshare"),
+            ("skip_global_daily", "--skip-global-daily"),
+            ("skip_ashare_news", "--skip-ashare-news"),
             ("skip_snapshot_validation", "--skip-snapshot-validation"),
             ("use_system_proxy", "--use-system-proxy"),
         ):
@@ -801,8 +819,11 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "limit",
                 "end",
                 "snapshot_limit",
+                "news_limit",
                 "skip_eastmoney",
                 "skip_akshare",
+                "skip_global_daily",
+                "skip_ashare_news",
                 "skip_snapshot_validation",
                 "use_system_proxy",
                 "overlap_sample",
@@ -846,6 +867,34 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "overlap_days",
                 "use_system_proxy",
             },
+        },
+        "download_global_daily": {
+            "label": "下载全球日线与原始证据",
+            "command": lambda params: download_public_daily("download_global_daily.py", params),
+            "allowed_params": {
+                "start",
+                "end",
+                "sleep",
+                "limit",
+                "retries",
+                "timeout",
+                "incremental",
+                "overlap_days",
+                "use_system_proxy",
+            },
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "download_state" / "global_daily_download_summary_latest.json"),
+                str(QUANT_DATA_ROOT / "raw" / "global_1d" / "yahoo" / "**" / "*.json"),
+            ],
+        },
+        "download_ashare_news": {
+            "label": "下载 A 股新闻原始证据",
+            "command": download_ashare_news,
+            "allowed_params": {"limit", "sleep", "retries", "timeout", "use_system_proxy"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "download_state" / "ashare_news_download_summary_latest.json"),
+                str(QUANT_DATA_ROOT / "raw" / "ashare_news" / "**" / "*.json"),
+            ],
         },
         "validate_latest_snapshot": {
             "label": "校验新浪最新快照",
