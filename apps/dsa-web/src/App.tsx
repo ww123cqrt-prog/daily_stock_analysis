@@ -16,6 +16,7 @@ const HomePage = lazy(() => import('./pages/HomePage'));
 const ResearchPage = lazy(() => import('./pages/ResearchPage'));
 const WorkflowPage = lazy(() => import('./pages/WorkflowPage'));
 const BacktestPage = lazy(() => import('./pages/BacktestPage'));
+const EtfMomentumReportPage = lazy(() => import('./pages/EtfMomentumReportPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const LoginPage = lazy(() => import('./pages/LoginPage'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
@@ -86,6 +87,7 @@ const AppContent: React.FC = () => {
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/screening" element={<StockScreeningPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
+        <Route path="/backtest/etf-momentum" element={<EtfMomentumReportPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />

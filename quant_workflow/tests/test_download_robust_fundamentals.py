@@ -24,6 +24,30 @@ def load_module():
     return module
 
 
+def test_manifest_paths_resolve_v2_relative_storage_paths(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    (quant_data / "DATA_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "official_entries": {
+                    "robust_price_product": {
+                        "cleaned_parquet": "runtime/product/cleaned_parquet",
+                        "qlib_provider": "runtime/product/qlib_provider",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cleaned, provider = module._manifest_paths(quant_data)
+
+    assert cleaned == quant_data / "runtime" / "product" / "cleaned_parquet"
+    assert provider == quant_data / "runtime" / "product" / "qlib_provider"
+
+
 class FakeResponse:
     def __init__(self, payload: dict) -> None:
         self.payload = payload

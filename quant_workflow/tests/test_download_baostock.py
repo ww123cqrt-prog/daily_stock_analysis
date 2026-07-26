@@ -238,6 +238,63 @@ class DownloadBaostockTest(unittest.TestCase):
 
         self.assertEqual(merged["close"].tolist(), [10.0, 12.0, 13.0])
 
+    def test_qfq_anchor_change_triggers_full_history_query(self):
+        module = load_module()
+        existing = pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    ["2020-01-02", "2020-01-03", "2026-07-23"]
+                ),
+                "open": [10.0, 10.1, 20.0],
+                "close": [10.1, 10.2, 20.1],
+                "high": [10.2, 10.3, 20.2],
+                "low": [9.9, 10.0, 19.9],
+                "volume": [1000, 1100, 1200],
+            }
+        )
+        calls: list[tuple[str, str]] = []
+
+        def query_range(start: str, end: str) -> pd.DataFrame:
+            calls.append((start, end))
+            if len(calls) == 1:
+                return pd.DataFrame(
+                    {
+                        "date": ["2020-01-02", "2020-01-03"],
+                        "open": [5.0, 5.05],
+                        "close": [5.05, 5.1],
+                        "high": [5.1, 5.15],
+                        "low": [4.95, 5.0],
+                        "volume": [1000, 1100],
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "date": ["2020-01-02", "2020-01-03", "2026-07-24"],
+                    "open": [5.0, 5.05, 20.1],
+                    "close": [5.05, 5.1, 20.2],
+                    "high": [5.1, 5.15, 20.3],
+                    "low": [4.95, 5.0, 20.0],
+                    "volume": [1000, 1100, 1300],
+                }
+            )
+
+        refreshed, rebased = module.refresh_incremental_frame(
+            existing,
+            query_range=query_range,
+            full_start="2020-01-02",
+            incremental_start="2026-07-21",
+            end="2026-07-24",
+            adjustflag="2",
+            anchor_rows=2,
+        )
+
+        self.assertEqual(calls, [
+            ("2020-01-02", "2020-01-03"),
+            ("2020-01-02", "2026-07-24"),
+        ])
+        self.assertTrue(rebased)
+        self.assertEqual(refreshed["close"].tolist(), [5.05, 5.1, 20.2])
+
     def test_incremental_range_after_end_is_no_new_without_querying_baostock(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

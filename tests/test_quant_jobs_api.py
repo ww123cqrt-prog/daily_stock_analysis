@@ -22,10 +22,10 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from src.services.quant_job_service import (
     MLRUNS_ROOT,
-    QUANT_WORKFLOW_PYTHON,
     QuantJob,
     QuantJobService,
     REPORTS_ROOT,
+    _python_bin,
 )
 
 
@@ -273,8 +273,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
             csi300 = service._build_command("generate_csi300", {})
             benchmark = service._build_command("add_index_benchmark", {})
 
-        self.assertEqual(csi300[0], str(QUANT_WORKFLOW_PYTHON), csi300)
-        self.assertEqual(benchmark[0], str(QUANT_WORKFLOW_PYTHON), benchmark)
+        self.assertEqual(csi300[0], _python_bin(), csi300)
+        self.assertEqual(benchmark[0], _python_bin(), benchmark)
         self.assertIn("generate_csi300.py", csi300[1])
         self.assertIn("add_index_benchmark.py", benchmark[1])
         self.assertIn("--dry-run", csi300)
@@ -360,7 +360,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "report_workbench_capabilities", {"start_training": True}
                 )
 
-        self.assertEqual(command[0], str(QUANT_WORKFLOW_PYTHON), command)
+        self.assertEqual(command[0], _python_bin(), command)
         self.assertIn("report_workbench_capabilities.py", command[1])
         self._assert_reports_dir_arg(command)
         self.assertEqual(
@@ -458,7 +458,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         for job_type, (section, _params) in expected_sections.items():
             command = commands[job_type]
-            self.assertEqual(command[0], str(QUANT_WORKFLOW_PYTHON), command)
+            self.assertEqual(command[0], _python_bin(), command)
             self.assertIn("report_qlib_research.py", command[1])
             self._assert_reports_dir_arg(command)
             self.assertEqual(command[command.index("--section") + 1], section)
@@ -3035,6 +3035,13 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "overlap_days": 7,
                 },
             )
+            etf = service._build_command(
+                "download_etf_momentum",
+                {
+                    "end": "2026-07-08",
+                },
+            )
+            etf_report = service._build_command("generate_etf_momentum_report", {})
             snapshot = service._build_command(
                 "validate_latest_snapshot", {"limit": 3, "timeout": 9}
             )
@@ -3051,6 +3058,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("--use-system-proxy", eastmoney)
         self.assertIn("download_akshare.py", akshare[1])
         self.assertIn("--incremental", akshare)
+        self.assertIn("quant_data_cli.py", etf[1])
+        self.assertIn("etf_momentum_daily_qfq", etf)
+        self.assertIn("--through", etf)
+        self.assertNotIn("--output-dir", etf)
+        self.assertIn("generate_etf_momentum_strategy_report.py", etf_report[1])
         self.assertIn("validate_latest_snapshot.py", snapshot[1])
         self.assertIn("--out-dir", snapshot)
         self.assertEqual(
@@ -3089,9 +3101,22 @@ class QuantJobsApiTestCase(unittest.TestCase):
             status["validate_latest_snapshot"]["allowed_params"],
             ["limit", "timeout", "use_system_proxy"],
         )
+        self.assertEqual(
+            status["download_etf_momentum"]["allowed_params"],
+            ["end"],
+        )
+        self.assertEqual(
+            status["generate_etf_momentum_report"]["allowed_params"], []
+        )
+        self.assertEqual(
+            status["generate_etf_momentum_report"]["label"],
+            "生成 ETF 完整策略报告",
+        )
+        default_etf = service._build_command("download_etf_momentum", {})
         self.assertIn(
             "Unsupported params for download_eastmoney", str(unsafe_ctx.exception)
         )
+        self.assertEqual(default_etf[-2:], ["update", "etf_momentum_daily_qfq"])
 
     def test_market_regime_report_job_is_whitelisted_with_safe_params(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

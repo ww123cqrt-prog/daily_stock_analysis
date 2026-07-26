@@ -390,6 +390,11 @@ describe('BacktestPage', () => {
   it('renders shared surface inputs and prediction tracking outputs', async () => {
     renderPage();
 
+    expect(screen.getByRole('link', { name: 'ETF 动量完整报告' })).toHaveAttribute(
+      'href',
+      '/backtest/etf-momentum',
+    );
+
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
 

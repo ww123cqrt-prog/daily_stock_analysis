@@ -97,6 +97,8 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败，状态为 `signal_diagnosis_complete`，下一门槛明确写成 `build_historical_fundamentals`；这表示“价量阶段完成、基本面阶段尚未执行”，不等于 `signal_not_found`。只有带真实公告日期、至少延迟一个交易日生效且覆盖率达到 98% 的基本面扩展也失败后，才能输出 `signal_not_found`。LightGBM、XGBoost、CatBoost 和 MPS DNN 只允许在 OLS/Ridge 已证明确定性信号存在后作为挑战者运行，不是首轮信号存在性的前置条件。
 
+另设公开策略研究候选清单 `quant_workflow/configs/public_strategy_candidates.yaml`。用户提供的“两只 ETF 20 日动量轮动”已登记为 `etf_20d_two_asset_momentum_rotation`：它只比较 159915 和 513100，收盘计算信号、下一交易日开盘执行，不能与 CSI800 个股模型或 Qlib 选股结果混称。回测使用独立的 ETF 数据目录和报告目录；公开文章的收益数字只保留为未核验声明。该候选在基准成本口径下允许最大回撤 35%，这一放宽只适用于该 ETF 研究候选，不改变 CSI800 鲁棒策略的 20% 开发/确认门槛和 12% 纸面跟踪门槛。
+
 `/workflow` 的“鲁棒策略生命周期”是一条独立研究链路，不覆盖日常 `candidate_pipeline_latest` 或 `latest_training_result`。它以历史时点 CSI800 为股票池，要求按每个历史日期使用当时的 CSI300 与 CSI500 成分股，不能拿今天的成分股回看过去。历史成员默认先查询 JQData；如果历史权限不可用，才整批切换到 Baostock 的历史成分接口，实际来源、回退原因、指数代码和日期范围写入 `reference/pit_csi800/MEMBERSHIP_SOURCE.json`，同一份成员库不得静默混用两个来源。行情、成员区间、行业、ST、停牌、上市日期和板块元数据先通过固定门槛；成员区间覆盖率低于 99%、有效行情覆盖率低于 98%，或存在重复日期、未来数据、基准缺口时，状态必须是 `blocked_data`，训练不会启动。
 
 网页按以下顺序使用：
@@ -130,14 +132,15 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 1. `download_baostock.py --incremental`：Baostock 增量刷新（匿名登录，不需要也不读取任何凭据）。
 2. `download_eastmoney.py --incremental`：东方财富 qfq 日线冗余源，写入 `quant_data/parquet/ashare_1d/eastmoney_qfq/`。
 3. `download_akshare.py --incremental`：AkShare `stock_zh_a_hist(adjust="qfq")` 冗余源，写入 `quant_data/parquet/ashare_1d/akshare_qfq/`。
-4. `merge_to_qlib.py`：把 Baostock 长历史、JQData 近期数据和已存在的新冗余源多源合并，输出目录名仍保持 `merged_baostock_jqdata`，再转换为 canonical Qlib provider。重叠交易日的 OHLC 覆盖顺序是 Baostock -> JQData -> EastMoney -> AkShare；成交量/成交额在重叠日保留较早来源以避免复权量突变，新来源只补自己独有日期的完整字段。
+4. `merge_to_qlib.py`：旧 qfq 线路不再跨供应商按日期拼接。每只股票只能从一个供应商读取完整 qfq 历史；只有明确声明为 raw 的数据才允许按整行补缺，并写入 `source_id`。现有 merged/cleaned/Qlib 目录在 v2 清单中仍是 `legacy_unknown`，完成 raw、因子和新快照迁移前不能冒充新的正式入口。
 5. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`；这是只读校验，不参与训练。
 6. `report_data_anomalies.py`：异常检测，产出清洗输入。
 7. `apply_data_cleaning.py`：套用清洗规则，生成官方 cleaned provider。
 8. `report_data_quality.py`：Baostock/JQData/东方财富/AkShare 重叠期跨源一致性验证。
 9. `check_qlib_data.py`：最终 provider 日历/股票池校验。
+10. `quant_data_cli.py update etf_momentum_daily_qfq`：完整下载两只 ETF 的同源 raw/qfq，校验因子与 513100 拆分后原子发布；失败不阻断 A 股主链路，也不会发布半套 ETF 数据。
 
-编排器带一个交易日 gate：增量下载后会查看 Baostock、东方财富和 AkShare 三个源目录的最新日期；若没有新交易日（且未加 `--force`），会跳过 4-9 的重建阶段，避免无谓地重跑全市场合并和清洗。三个下载源在全链路中都是非致命阶段：某个免费源失败会写进 `daily_update_summary_latest.json` 并继续跑其他可执行阶段。`--skip-download` 只重建、不下载；`--skip-eastmoney` / `--skip-akshare` / `--skip-snapshot-validation` 可单独跳过新源；`--dry-run` 只打印计划、不执行；`--limit` 用于小样本演练。每次运行写 `daily_update_summary_latest.json` 记录各阶段状态、用时、退出码和各源日期。
+编排器带一个交易日 gate：增量下载后会查看 Baostock、东方财富和 AkShare 三个旧源目录的最新日期；若没有新交易日（且未加 `--force`），会跳过 A 股重建阶段，避免无谓地重跑全市场合并和清洗。ETF 最新日期读取 v2 数据集清单，不再读取旧新浪目录。三个 A 股下载源和 ETF 阶段在全链路中都是非致命阶段：某个免费源失败会写进 `daily_update_summary_latest.json` 并继续跑其他可执行阶段。`--skip-download` 只重建、不下载；`--skip-eastmoney` / `--skip-akshare` / `--skip-snapshot-validation` 可单独跳过新源；`--dry-run` 只打印计划、不执行；`--limit` 用于小样本演练。每次运行写 `daily_update_summary_latest.json` 记录各阶段状态、用时、退出码和各源日期。
 
 JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baostock 长历史序列之前，只在合并和跨源验证中复用既有 JQData parquet。东方财富和 AkShare 是免费冗余源，首次全市场下载会额外占用约 1GB 量级磁盘；日常增量只补最近窗口。
 

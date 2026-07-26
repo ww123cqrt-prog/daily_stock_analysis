@@ -99,6 +99,7 @@ def main() -> int:
         sleep_seconds=args.sleep,
         retry_failed=args.retry_failed,
         max_consecutive_failures=args.max_consecutive_failures,
+        price_basis="qfq",
     )
     return 0 if summary["ok"] > 0 or summary["no_new"] > 0 else 1
 

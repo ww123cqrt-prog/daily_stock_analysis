@@ -1527,6 +1527,12 @@ const BacktestPage: React.FC = () => {
         >
           {text.tabQlib}
         </button>
+        <Link
+          to="/backtest/etf-momentum"
+          className="btn-secondary h-9 px-3 text-sm"
+        >
+          {language === 'zh' ? 'ETF 动量完整报告' : 'ETF momentum report'}
+        </Link>
       </div>
 
       {activeTab === 'qlib' ? (

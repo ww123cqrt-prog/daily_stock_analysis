@@ -34,6 +34,7 @@ def _args(**overrides):
         end="20260708",
         skip_eastmoney=False,
         skip_akshare=False,
+        skip_etf_momentum=False,
         skip_snapshot_validation=False,
         use_system_proxy=False,
         snapshot_limit=50,
@@ -96,6 +97,8 @@ class BuildStagesTest(unittest.TestCase):
         self.assertEqual(names[0], "download_baostock")
         self.assertIn("download_eastmoney", names)
         self.assertIn("download_akshare", names)
+        self.assertIn("download_etf_momentum", names)
+        self.assertIn("generate_etf_momentum_report", names)
         self.assertIn("merge_to_qlib", names)
         self.assertIn("add_index_benchmark", names)
         self.assertIn("validate_latest_snapshot", names)
@@ -142,6 +145,32 @@ class BuildStagesTest(unittest.TestCase):
             self.assertIn("--overlap-days", stage.argv)
             self.assertIn("--limit", stage.argv)
             self.assertIn("5", stage.argv)
+
+    def test_etf_momentum_download_writes_isolated_data_and_is_nonfatal(self):
+        stages = self.module.build_stages(_args())
+        stage = next(s for s in stages if s.name == "download_etf_momentum")
+        report_stage = next(
+            s for s in stages if s.name == "generate_etf_momentum_report"
+        )
+        self.assertFalse(stage.heavy)
+        self.assertFalse(stage.required)
+        self.assertIn("quant_data_cli.py", stage.argv[1])
+        self.assertIn("update", stage.argv)
+        self.assertIn("etf_momentum_daily_qfq", stage.argv)
+        self.assertIn("--through", stage.argv)
+        self.assertNotIn("--incremental", stage.argv)
+        self.assertNotIn("--overlap-days", stage.argv)
+        self.assertFalse(report_stage.heavy)
+        self.assertFalse(report_stage.required)
+        self.assertIn("generate_etf_momentum_strategy_report.py", report_stage.argv[1])
+        self.assertLess(stages.index(stage), stages.index(report_stage))
+
+    def test_etf_momentum_download_can_be_skipped(self):
+        stages = self.module.build_stages(_args(skip_etf_momentum=True))
+        self.assertNotIn("download_etf_momentum", [stage.name for stage in stages])
+        self.assertNotIn(
+            "generate_etf_momentum_report", [stage.name for stage in stages]
+        )
 
     def test_rebuild_stages_marked_heavy(self):
         stages = self.module.build_stages(_args())
@@ -286,6 +315,34 @@ class LatestSourceDateTest(unittest.TestCase):
         self.assertEqual(latest, "2026-07-08")
         self.assertEqual(by_source["baostock"], "2026-07-03")
         self.assertEqual(by_source["eastmoney"], "2026-07-08")
+
+    def test_latest_dataset_date_reads_governed_catalog_not_legacy_directory(self):
+        with patch.object(
+            self.module,
+            "describe_dataset",
+            return_value={"latest_trade_date": "2026-07-24"},
+        ) as describe:
+            latest = self.module.latest_dataset_date(
+                "etf_momentum_daily_qfq",
+                root=Path("/tmp/quant-data"),
+            )
+
+        self.assertEqual(latest, "2026-07-24")
+        describe.assert_called_once_with(
+            "etf_momentum_daily_qfq",
+            quant_data_root=Path("/tmp/quant-data"),
+        )
+
+    def test_latest_dataset_date_fails_closed_when_catalog_is_unavailable(self):
+        with patch.object(
+            self.module,
+            "describe_dataset",
+            side_effect=self.module.DataContractError("missing"),
+        ):
+            self.assertEqual(
+                self.module.latest_dataset_date("etf_momentum_daily_qfq"),
+                "",
+            )
 
 
 class DryRunMainTest(unittest.TestCase):

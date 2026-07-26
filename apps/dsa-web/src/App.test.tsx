@@ -56,6 +56,10 @@ vi.mock('./pages/BacktestPage', () => ({
   default: () => <div data-testid="backtest-page">Backtest</div>,
 }));
 
+vi.mock('./pages/EtfMomentumReportPage', () => ({
+  default: () => <div data-testid="etf-momentum-report-page">ETF Momentum Report</div>,
+}));
+
 vi.mock('./pages/AlertsPage', () => ({
   default: () => <div data-testid="alerts-page">Alerts</div>,
 }));
@@ -148,6 +152,15 @@ describe('App routing behavior', () => {
 
     expect(await screen.findByTestId('workflow-page')).toBeInTheDocument();
     expect(setCurrentRoute).toHaveBeenCalledWith('/workflow');
+  });
+
+  it('renders the dedicated ETF momentum report route', async () => {
+    window.history.pushState({}, '', '/backtest/etf-momentum');
+
+    render(<App />);
+
+    expect(await screen.findByTestId('etf-momentum-report-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/backtest/etf-momentum');
   });
 
   it('redirects authenticated login visits back to the home page', async () => {

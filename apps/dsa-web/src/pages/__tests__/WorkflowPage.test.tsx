@@ -198,6 +198,8 @@ describe('WorkflowPage', () => {
         download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
         download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
         download_akshare: { label: '下载 AkShare 日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        download_etf_momentum: { label: '更新 ETF 动量数据', allowedParams: ['end'] },
+        generate_etf_momentum_report: { label: '生成 ETF 完整策略报告', allowedParams: [] },
         validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
         merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
@@ -341,6 +343,13 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。')).toBeInTheDocument();
     expect(screen.getByText('下载 AkShare 日线')).toBeInTheDocument();
     expect(screen.getByText('调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。')).toBeInTheDocument();
+    expect(screen.getByText('更新 ETF 动量数据')).toBeInTheDocument();
+    expect(screen.getByText('只更新创业板 ETF（159915）和纳指 ETF（513100），写入 quant_data 的独立 ETF 目录，不进入 A 股个股 Qlib provider。')).toBeInTheDocument();
+    expect(screen.getByText('生成 ETF 完整策略报告')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看 ETF 完整策略报告' })).toHaveAttribute(
+      'href',
+      '/backtest/etf-momentum',
+    );
     expect(screen.getByText('合并 Qlib')).toBeInTheDocument();
     expect(screen.getByText('校验新浪最新快照')).toBeInTheDocument();
     expect(screen.getByText('抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。')).toBeInTheDocument();

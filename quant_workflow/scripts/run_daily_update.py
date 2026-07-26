@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the daily local A-share data update pipeline end to end.
+"""Run the daily local market-data update pipeline end to end.
 
 Chains the existing stable quant_workflow scripts into one auditable run:
 
@@ -20,6 +20,8 @@ locations the running DSA service reads.
 Safety:
     * Baostock/EastMoney/AkShare/Sina use anonymous public interfaces; no
       credentials are needed or read here.
+    * The two-ETF momentum candidate is refreshed into its isolated ETF
+      parquet directory. It is not merged into the A-share Qlib provider.
     * JQData is NOT downloaded here (its account data window ends before the
       Baostock series); existing JQData parquet is only reused during merge and
       cross-source validation.
@@ -44,6 +46,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from quant_data_contract import (  # noqa: E402
+    DataContractError,
+    describe_dataset,
+)
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -57,6 +63,7 @@ SOURCE_DIRS = {
     "eastmoney": EASTMONEY_DIR,
     "akshare": AKSHARE_DIR,
 }
+CORE_SOURCE_DOWNLOAD_NAMES = {"download_baostock", "download_eastmoney", "download_akshare"}
 
 
 @dataclass
@@ -124,6 +131,18 @@ def latest_any_source_date(
     return latest, by_source
 
 
+def latest_dataset_date(dataset_id: str, root: Path | None = None) -> str:
+    try:
+        payload = describe_dataset(
+            dataset_id,
+            quant_data_root=Path(root or QUANT_DATA),
+        )
+    except (DataContractError, OSError, ValueError):
+        return ""
+    value = payload.get("latest_trade_date")
+    return str(value) if value else ""
+
+
 def should_run_heavy(
     *, force: bool, download_ran: bool, before: str, after: str
 ) -> bool:
@@ -188,6 +207,24 @@ def build_stages(args: argparse.Namespace) -> "list[Stage]":
             ):
                 dl += ["--use-system-proxy"]
             stages.append(Stage(stage_name, dl, heavy=False, required=required))
+        if not getattr(args, "skip_etf_momentum", False):
+            etf = _script("quant_data_cli.py") + [
+                "--root",
+                str(QUANT_DATA),
+                "update",
+                "etf_momentum_daily_qfq",
+                "--through",
+                str(args.end),
+            ]
+            stages.append(Stage("download_etf_momentum", etf, heavy=False, required=False))
+            stages.append(
+                Stage(
+                    "generate_etf_momentum_report",
+                    _script("generate_etf_momentum_strategy_report.py"),
+                    heavy=False,
+                    required=False,
+                )
+            )
 
     stages.append(Stage("merge_to_qlib", _script("merge_to_qlib.py"), heavy=True))
     stages.append(
@@ -240,7 +277,7 @@ def source_refresh_failed_without_rebuild(results: list[StageResult]) -> bool:
     was skipped, the daily run produced no useful update and should not be
     reported as successful.
     """
-    download_results = [r for r in results if r.name.startswith("download_")]
+    download_results = [r for r in results if r.name in CORE_SOURCE_DOWNLOAD_NAMES]
     if not download_results or not all(r.status == "failed" for r in download_results):
         return False
     heavy_results = [
@@ -371,6 +408,11 @@ def main() -> int:
         help="Skip AkShare public-source refresh.",
     )
     parser.add_argument(
+        "--skip-etf-momentum",
+        action="store_true",
+        help="Skip the isolated 159915/513100 ETF momentum data refresh.",
+    )
+    parser.add_argument(
         "--skip-snapshot-validation",
         action="store_true",
         help="Skip Sina latest snapshot validation.",
@@ -413,7 +455,9 @@ def main() -> int:
     _log(f"daily update start; reports={REPORTS_ROOT} quant_data={QUANT_DATA}")
 
     before, before_by_source = latest_any_source_date(SOURCE_DIRS)
+    etf_before = latest_dataset_date("etf_momentum_daily_qfq")
     _log(f"latest source date before: {before or 'n/a'} {before_by_source}")
+    _log(f"latest ETF momentum date before: {etf_before or 'n/a'}")
 
     stages = build_stages(args)
     results: list[StageResult] = []
@@ -482,6 +526,7 @@ def main() -> int:
         )
 
     after_final, after_final_by_source = latest_any_source_date(SOURCE_DIRS)
+    etf_after = latest_dataset_date("etf_momentum_daily_qfq")
     summary_path = write_summary(
         results,
         {
@@ -489,8 +534,11 @@ def main() -> int:
             "source_date_after": after_final,
             "source_dates_before": before_by_source,
             "source_dates_after": after_final_by_source,
+            "etf_momentum_date_before": etf_before,
+            "etf_momentum_date_after": etf_after,
             "dry_run": bool(args.dry_run),
             "skip_download": bool(args.skip_download),
+            "skip_etf_momentum": bool(args.skip_etf_momentum),
             "forced": bool(args.force),
         },
     )

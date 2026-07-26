@@ -1,0 +1,53 @@
+version: 1
+strategy_id: etf_20d_two_asset_momentum_rotation
+research_only: true
+
+primary_rule:
+  lookback_days: 20
+  moving_average_days: 20
+  signal_at: close
+  execution_at: next_open
+
+data:
+  preferred_sources:
+    - akshare.fund_etf_hist_em_qfq
+    - tencent.ifzq_qfq
+  audit_source: akshare.fund_etf_hist_sina
+  adjustment: qfq
+  symbols:
+    - SZ159915
+    - SH513100
+  require_common_trading_days: true
+  independent_source_cross_check: false
+
+evaluation:
+  warmup_excluded: true
+  complete_quarters_only: true
+  include_current_partial_period: false
+  parameter_lookbacks: [15, 20, 25]
+  parameter_moving_averages: [15, 20, 25]
+  costs_total_bps:
+    zero: 0
+    low: 10
+    baseline: 20
+    stress: 40
+  earlier_comparison_total_bps: 15
+  delayed_execution_lag_days: 2
+
+reference_lines:
+  positive_quarter_ratio_min: 0.70
+  baseline_annualized_return_min: 0.05
+  baseline_max_drawdown_abs_max: 0.35
+  stress_annualized_return_min_exclusive: 0.0
+  delayed_annualized_return_min_exclusive: 0.0
+  parameter_positive_ratio_min: 0.70
+  parameter_max_drawdown_pass_ratio_min: 0.70
+
+policy:
+  final_decision: manual_review
+  automatic_rejection_disabled: true
+  reference_lines_are_not_vetoes: true
+  parameter_grid_is_diagnostic_only: true
+  cannot_select_best_neighbor: true
+  no_broker_connection: true
+  no_automatic_orders: true

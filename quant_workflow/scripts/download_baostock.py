@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import signal
 import socket
 import sys
@@ -26,15 +27,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root  # noqa: E402
+from _ashare_sources import qfq_anchor_matches  # noqa: E402
+from _paths import quant_data_root, reports_root  # noqa: E402
+from quant_data_contract import atomic_write_json  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
 PARQUET_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
-EMPTY_CODES_FILE = QUANT_DATA / "baostock_empty_codes.json"
-TIMEOUT_CODES_FILE = QUANT_DATA / "baostock_timeout_codes.json"
-CURRENT_FILE = QUANT_DATA / "baostock_current.json"
+DOWNLOAD_STATE_DIR = reports_root() / "download_state"
+EMPTY_CODES_FILE = DOWNLOAD_STATE_DIR / "baostock_empty_codes.json"
+TIMEOUT_CODES_FILE = DOWNLOAD_STATE_DIR / "baostock_timeout_codes.json"
+CURRENT_FILE = DOWNLOAD_STATE_DIR / "baostock_current.json"
 
 FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
 BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
@@ -231,6 +235,7 @@ def load_timeout_codes() -> set[str]:
 
 
 def save_empty_codes(codes: set[str]) -> None:
+    EMPTY_CODES_FILE.parent.mkdir(parents=True, exist_ok=True)
     EMPTY_CODES_FILE.write_text(
         json.dumps(sorted(codes), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -332,6 +337,50 @@ def merge_existing_frame(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
+def refresh_incremental_frame(
+    existing: pd.DataFrame,
+    *,
+    query_range,
+    full_start: str,
+    incremental_start: str,
+    end: str,
+    adjustflag: str,
+    anchor_rows: int = 5,
+) -> tuple[pd.DataFrame, bool]:
+    if anchor_rows <= 0:
+        raise ValueError("anchor_rows must be positive")
+    if adjustflag != "2":
+        fresh = normalize_frame(query_range(incremental_start, end))
+        return (
+            merge_existing_frame(existing, fresh) if not fresh.empty else fresh,
+            False,
+        )
+
+    normalized_existing = normalize_frame(existing)
+    if normalized_existing.empty:
+        return normalize_frame(query_range(full_start, end)), True
+    anchor_existing = normalized_existing.head(anchor_rows)
+    anchor_start = anchor_existing["date"].iloc[0].date().isoformat()
+    anchor_end = anchor_existing["date"].iloc[-1].date().isoformat()
+    anchor_fresh = normalize_frame(query_range(anchor_start, anchor_end))
+    if not qfq_anchor_matches(anchor_existing, anchor_fresh):
+        return normalize_frame(query_range(full_start, end)), True
+    fresh = normalize_frame(query_range(incremental_start, end))
+    if fresh.empty:
+        return fresh, False
+    return merge_existing_frame(normalized_existing, fresh), False
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_parquet(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="20200101")
@@ -360,6 +409,7 @@ def main() -> int:
     end = normalize_date(args.end)
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
+    CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     codes = load_codes(args.symbols_file)
     if args.symbols_file:
@@ -391,6 +441,8 @@ def main() -> int:
     no_new = 0
     consecutive_failures = 0
     failures: list[tuple[str, str]] = []
+    anchor_checked = 0
+    rebased = 0
     t0 = time.time()
 
     try:
@@ -434,8 +486,44 @@ def main() -> int:
                         )
                     continue
 
-                df = query_one(bs, bs_code, symbol_start, end, args.adjustflag, args.retries, args.timeout)
-                df = normalize_frame(df)
+                if args.incremental and out_path.exists():
+                    existing = pd.read_parquet(out_path)
+
+                    def query_range(range_start: str, range_end: str) -> pd.DataFrame:
+                        return query_one(
+                            bs,
+                            bs_code,
+                            range_start,
+                            range_end,
+                            args.adjustflag,
+                            args.retries,
+                            args.timeout,
+                        )
+
+                    df, symbol_rebased = refresh_incremental_frame(
+                        existing,
+                        query_range=query_range,
+                        full_start=start,
+                        incremental_start=symbol_start,
+                        end=end,
+                        adjustflag=args.adjustflag,
+                    )
+                    if args.adjustflag == "2":
+                        anchor_checked += 1
+                    if symbol_rebased:
+                        rebased += 1
+                else:
+                    df = normalize_frame(
+                        query_one(
+                            bs,
+                            bs_code,
+                            symbol_start,
+                            end,
+                            args.adjustflag,
+                            args.retries,
+                            args.timeout,
+                        )
+                    )
                 if df.empty:
                     if args.incremental and out_path.exists():
                         no_new += 1
@@ -445,11 +533,8 @@ def main() -> int:
                         continue
                     raise EmptyResult("empty result")
 
-                if args.incremental and out_path.exists():
-                    existing = pd.read_parquet(out_path)
-                    df = merge_existing_frame(existing, df)
-
-                df.to_parquet(out_path, index=False)
+                df["source_id"] = "baostock"
+                _atomic_parquet(df, out_path)
                 ok += 1
                 consecutive_failures = 0
 
@@ -494,9 +579,46 @@ def main() -> int:
         flush=True,
     )
     if failures:
-        fail_log = QUANT_DATA / "baostock_failures.json"
+        fail_log = DOWNLOAD_STATE_DIR / "baostock_failures.json"
+        fail_log.parent.mkdir(parents=True, exist_ok=True)
         fail_log.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Failure details saved to {fail_log}", flush=True)
+
+    atomic_write_json(
+        out_dir / "SOURCE_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "dataset": "ashare_baostock_price_legacy",
+            "role": "audit",
+            "status": "legacy_unknown" if args.adjustflag in {"1", "2"} else "ready",
+            "generated_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+            "source": "baostock",
+            "interface": "query_history_k_data_plus",
+            "price_basis": {"1": "hfq", "2": "qfq", "3": "raw"}[args.adjustflag],
+            "adjustment_method": "unknown" if args.adjustflag in {"1", "2"} else "none",
+            "adjustment_evidence": (
+                "anchor_fingerprint_only_not_a_factor_curve"
+                if args.adjustflag in {"1", "2"}
+                else "not_applicable"
+            ),
+            "update_contract": (
+                "anchor_check_then_full_symbol_refresh_on_rebase"
+                if args.adjustflag == "2"
+                else "incremental_whole_row_merge"
+            ),
+            "requested_start": start,
+            "requested_end": end,
+            "anchor_checked": anchor_checked,
+            "rebased": rebased,
+            "summary": {
+                "total": len(codes),
+                "ok": ok,
+                "no_new": no_new,
+                "empty": empty,
+                "fail": fail,
+            },
+        },
+    )
 
     return 0 if ok > 0 or no_new > 0 else 1
 

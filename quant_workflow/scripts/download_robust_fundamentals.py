@@ -630,10 +630,18 @@ def _load_membership(
 
 
 def _manifest_paths(quant_data_dir: Path) -> tuple[Path, Path]:
-    manifest_path = Path(quant_data_dir) / "DATA_MANIFEST.json"
+    root = Path(quant_data_dir).expanduser().resolve()
+    manifest_path = root / "DATA_MANIFEST.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     product = payload["official_entries"]["robust_price_product"]
-    return Path(product["cleaned_parquet"]), Path(product["qlib_provider"])
+
+    def resolve_relative(value: object) -> Path:
+        path = Path(str(value)).expanduser()
+        return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+    return resolve_relative(product["cleaned_parquet"]), resolve_relative(
+        product["qlib_provider"]
+    )
 
 
 def _load_calendar(provider_dir: Path, *, end_date: str) -> pd.DatetimeIndex:
@@ -668,20 +676,22 @@ def _download_raw_statements(
     for period in periods:
         for statement in ("income", "balance", "cashflow"):
             if statement == "income":
-                fetcher = lambda period=period: _retry_source_call(
-                    lambda: fetch_income_period(
-                        session, report_date=period, timeout=timeout
+                def fetcher(period=period):
+                    return _retry_source_call(
+                        lambda: fetch_income_period(
+                            session, report_date=period, timeout=timeout
+                        )
                     )
-                )
             else:
-                fetcher = lambda statement=statement, period=period: _retry_source_call(
-                    lambda: fetch_summary_period(
-                        session,
-                        statement=statement,
-                        report_date=period,
-                        timeout=timeout,
+                def fetcher(statement=statement, period=period):
+                    return _retry_source_call(
+                        lambda: fetch_summary_period(
+                            session,
+                            statement=statement,
+                            report_date=period,
+                            timeout=timeout,
+                        )
                     )
-                )
             frame = load_or_fetch_period(
                 cache_dir=cache_dir,
                 statement=statement,

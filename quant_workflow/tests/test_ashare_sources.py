@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -192,6 +193,144 @@ class AShareSourcesTest(unittest.TestCase):
                 module.STOCK_LIST = original_stock_list
 
         self.assertEqual(symbols, ["600519", "000001"])
+
+    def test_qfq_incremental_rechecks_early_anchor_before_appending(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "eastmoney_qfq"
+            out_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "date": ["2020-01-02", "2020-01-03", "2026-07-23"],
+                    "open": [10.0, 10.1, 20.0],
+                    "close": [10.1, 10.2, 20.1],
+                    "high": [10.2, 10.3, 20.2],
+                    "low": [9.9, 10.0, 19.9],
+                    "volume": [1000, 1100, 1200],
+                }
+            ).to_parquet(out_dir / "000001.parquet", index=False)
+            calls: list[tuple[str, str]] = []
+
+            def fetch_one(symbol: str, start: str, end: str) -> pd.DataFrame:
+                calls.append((start, end))
+                if start == "2020-01-02":
+                    return pd.DataFrame(
+                        {
+                            "date": ["2020-01-02", "2020-01-03"],
+                            "open": [10.0, 10.1],
+                            "close": [10.1, 10.2],
+                            "high": [10.2, 10.3],
+                            "low": [9.9, 10.0],
+                            "volume": [1000, 1100],
+                        }
+                    )
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-07-23", "2026-07-24"],
+                        "open": [20.0, 20.1],
+                        "close": [20.1, 20.2],
+                        "high": [20.2, 20.3],
+                        "low": [19.9, 20.0],
+                        "volume": [1200, 1300],
+                    }
+                )
+
+            summary = module.run_daily_download(
+                source_name="eastmoney",
+                output_dir=out_dir,
+                symbols=["000001"],
+                fetch_one=fetch_one,
+                start="2020-01-02",
+                end="2026-07-24",
+                incremental=True,
+                overlap_days=2,
+                sleep_seconds=0,
+                summary_dir=base,
+                price_basis="qfq",
+                anchor_rows=2,
+            )
+
+            merged = pd.read_parquet(out_dir / "000001.parquet")
+            source_manifest = json.loads(
+                (out_dir / "SOURCE_MANIFEST.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(calls[0], ("2020-01-02", "2020-01-03"))
+        self.assertEqual(calls[1], ("2026-07-21", "2026-07-24"))
+        self.assertEqual(merged["close"].tolist(), [10.1, 10.2, 20.1, 20.2])
+        self.assertEqual(summary["anchor_checked"], 1)
+        self.assertEqual(summary["rebased"], 0)
+        self.assertEqual(source_manifest["price_basis"], "qfq")
+        self.assertEqual(
+            source_manifest["update_contract"],
+            "anchor_check_then_full_symbol_refresh_on_rebase",
+        )
+
+    def test_qfq_anchor_change_forces_full_symbol_refresh(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "eastmoney_qfq"
+            out_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "date": ["2020-01-02", "2020-01-03", "2026-07-23"],
+                    "open": [10.0, 10.1, 20.0],
+                    "close": [10.1, 10.2, 20.1],
+                    "high": [10.2, 10.3, 20.2],
+                    "low": [9.9, 10.0, 19.9],
+                    "volume": [1000, 1100, 1200],
+                }
+            ).to_parquet(out_dir / "000001.parquet", index=False)
+            calls: list[tuple[str, str]] = []
+
+            def fetch_one(symbol: str, start: str, end: str) -> pd.DataFrame:
+                calls.append((start, end))
+                if len(calls) == 1:
+                    return pd.DataFrame(
+                        {
+                            "date": ["2020-01-02", "2020-01-03"],
+                            "open": [5.0, 5.05],
+                            "close": [5.05, 5.1],
+                            "high": [5.1, 5.15],
+                            "low": [4.95, 5.0],
+                            "volume": [1000, 1100],
+                        }
+                    )
+                return pd.DataFrame(
+                    {
+                        "date": ["2020-01-02", "2020-01-03", "2026-07-24"],
+                        "open": [5.0, 5.05, 20.1],
+                        "close": [5.05, 5.1, 20.2],
+                        "high": [5.1, 5.15, 20.3],
+                        "low": [4.95, 5.0, 20.0],
+                        "volume": [1000, 1100, 1300],
+                    }
+                )
+
+            summary = module.run_daily_download(
+                source_name="eastmoney",
+                output_dir=out_dir,
+                symbols=["000001"],
+                fetch_one=fetch_one,
+                start="2020-01-02",
+                end="2026-07-24",
+                incremental=True,
+                overlap_days=2,
+                sleep_seconds=0,
+                summary_dir=base,
+                price_basis="qfq",
+                anchor_rows=2,
+            )
+            refreshed = pd.read_parquet(out_dir / "000001.parquet")
+
+        self.assertEqual(calls, [
+            ("2020-01-02", "2020-01-03"),
+            ("2020-01-02", "2026-07-24"),
+        ])
+        self.assertEqual(refreshed["close"].tolist(), [5.05, 5.1, 20.2])
+        self.assertEqual(summary["rebased"], 1)
 
 
 if __name__ == "__main__":

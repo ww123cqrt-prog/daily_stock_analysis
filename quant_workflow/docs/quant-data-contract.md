@@ -1,106 +1,165 @@
-# quant_data 数据契约
+# quant_data 数据治理与更新契约 v2
 
-本文档是 `quant_data/` 的受 Git 管理版本。数据根目录中的 `README.md` 和
-`DATA_MANIFEST.json` 用于本机接手；本文档用于代码审查、跨线程交接和仓库升级。
+本文档说明 `${QUANT_DATA_ROOT}` 中每套数据是什么、如何产生、能否使用，以及更新失败时如何保护旧数据。新 Agent 不应根据目录名猜数据口径。
 
-## 接手顺序
-
-1. 读取 `${QUANT_DATA_ROOT}/README.md`。
-2. 读取 `${QUANT_DATA_ROOT}/DATA_MANIFEST.json`，只把 `official_entries` 当作正式入口。
-3. 读取目标子目录的 `README.md`。
-4. 运行 `quant_workflow/scripts/preflight_robust_data.py`；报告为
-   `blocked_data` 时不得启动鲁棒策略训练。
-
-README 说明存储规则，manifest 记录当前磁盘实况，preflight 证明数据能否用于当前
-鲁棒策略。三者冲突时停止任务并报告差异，不自行选择看起来可用的数据。
-
-## 数据分层
-
-| 路径 | 内容 | 是否正式入口 |
-|---|---|---|
-| `parquet/ashare_1d/` | 按股票拆分的 A 股日线 Parquet | 只有 manifest 登记的 cleaned 目录是正式入口 |
-| `qlib/` | Qlib 二进制 provider | 只有 manifest 登记的 cleaned provider 是正式入口 |
-| `reference/` | PIT 股票池、证券主表、行业、ST、停牌 | 只有完整事务快照是正式入口 |
-| `cache/` | 可恢复下载缓存 | 否，禁止直接训练 |
-| `raw/` | 供应商原始数据 | 否，必须经过规范化和校验 |
-| `qlib_csv/` | 转换中间态或历史产物 | 否 |
-| `parquet/etf_1d/` | ETF 衍生数据 | 未登记来源和生产脚本前不是鲁棒策略输入 |
-
-运行状态、日志和阶段报告不属于数据湖正式数据。状态写入
-`quant_workflow/reports/`，日志写入 `quant_workflow/logs/`。
-
-## A 股日线契约
-
-- 文件组织：每只股票一个 `<6位代码>.parquet`。
-- 主键：单文件内 `date` 唯一。
-- 必需列：`date, open, close, high, low, volume`。
-- 可选列：`amount, turn, pctChg`；合并产物还可包含 `factor`。
-- 价格口径：源目录均为前复权/预复权价格空间。不同供应商的复权曲线不能在同一
-  日期逐列混合。
-- 合并顺序：Baostock、JQData、EastMoney、AkShare。前一个来源已有的日期保持不变，
-  后一个来源只按整行补缺失日期。
-- 正式 cleaned 数据由 `apply_data_cleaning.py` 从合并数据生成，不覆盖原合并数据。
-
-生产脚本：
-
-| 数据 | 生产脚本 |
-|---|---|
-| `baostock_qfq/` | `download_baostock.py` |
-| `jqdata/` | `download_jqdata.py` |
-| `eastmoney_qfq/` | `download_eastmoney.py` |
-| `akshare_qfq/` | `download_akshare.py` |
-| `merged_baostock_jqdata/` | `merge_to_qlib.py` |
-| `merged_baostock_jqdata_cleaned/` | `apply_data_cleaning.py` |
-| `qlib/cn_data_baostock_jqdata_cleaned/` | `apply_data_cleaning.py` |
-
-## 鲁棒策略数据门槛
-
-鲁棒策略必须同时具备：
-
-- PIT CSI800 日级成员和成员区间；
-- `security_master.parquet`；
-- `industry_intervals.parquet`；
-- `st_status.parquet`；
-- `suspension_status.parquet`；
-- `REFERENCE_SOURCE.json`；
-- 清洗后价格和 `SH000300/SH000905/SH000906` 基准；
-- 通过 `preflight_robust_data.py` 的覆盖率、主键、前视和来源校验。
-
-不能用今天的成分股回填历史，不能直接从 `cache/` 训练，不能因为数据不完整降低
-验收门槛。
-
-## 下载与复用
-
-正式鲁棒策略配置默认使用：
-
-- `universe.reference_mode: reuse_existing`：只验证并复用已经发布的参考快照，不再次访问 Baostock/JQData；
-- `universe.benchmark_mode: reuse_existing`：只验证三个基准的 Qlib bin 是否覆盖完整日历，不再次访问网络。
-
-参考数据的首次全量下载必须在隔离 staging 中完成，再校验来源、日期范围、成员股票池哈希、字段、主键和内容哈希，最后事务发布到 `reference/`。指数基准也必须先完成下载和校验，再写入 Qlib provider。校验失败时状态为 `blocked_data`，不能自动退回联网下载，也不能用部分缓存训练。
-
-远端工作站生成的数据传回本机后仍然只是 staging，不能用 `cp`/`rsync` 直接覆盖正式目录。标准导入入口是：
+## 接手只做这四步
 
 ```bash
-python quant_workflow/scripts/download_robust_reference.py \
-  --pit-dir "${QUANT_DATA_ROOT}/reference/pit_csi800" \
-  --reference-dir "${QUANT_DATA_ROOT}/reference" \
-  --start-date 2014-01-02 --end-date 2026-07-16 \
-  --import-dir <本机参考数据暂存目录>
-
-python quant_workflow/scripts/add_index_benchmark.py \
-  --provider-dir "${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned" \
-  --required-start-date 2014-01-02 \
-  --import-provider-dir <本机基准指数暂存 provider>
+python quant_workflow/scripts/quant_data_cli.py list
+python quant_workflow/scripts/quant_data_cli.py describe <dataset_id>
+python quant_workflow/scripts/quant_data_cli.py resolve <dataset_id> --require-basis qfq
+python quant_workflow/scripts/sync_data_manifest.py --check
 ```
 
-第一条命令重新核对本机 PIT 股票池哈希、参考表结构和时点内容，再复用参考数据下载器已有的可恢复事务发布。第二条命令要求暂存 provider 与正式 provider 的日历文件字节完全一致，验证三个指数的六个 Qlib bin 及股票池隔离后，再用可恢复目录事务安装。两条导入路径都不访问 Baostock/JQData；失败时不得改走联网下载。
+- `list` 查看所有已登记数据。
+- `describe` 查看来源、原始证券代码、价格口径、复权时间、复权算法、因子、公司行为、最新交易日和内容哈希。
+- `resolve` 只返回状态和价格口径都符合要求的不可变快照，并校验文件哈希。
+- `--check` 检查根清单、绝对路径、未登记目录和 README 自动表格漂移。
 
-后续日常更新只补新增交易日；如果 PIT 股票池历史分区发生变化，成员哈希会变化，相关参考数据必须重新生成，旧快照不能继续复用。
+`legacy_unknown` 只能审计，不能通过 `resolve` 进入新训练或回测。README 与清单冲突时停止读取并修复清单，不得选择“看起来能用”的目录。
 
-## 变更规则
+## 当前迁移状态
 
-- 新增正式数据时，同步更新数据根 README、子目录 README 和 `DATA_MANIFEST.json`
-  生成逻辑。
-- 多文件正式数据必须事务发布；存在 transaction 标记时读取方应拒绝使用。
-- 移动、归档或删除前必须先生成 dry-run 盘点，并取得用户明确确认。
-- 不把账号、密码、token、券商信息、行情数据、模型或 `mlruns` 提交到 Git。
+| 数据 | v2 状态 | 当前边界 |
+|---|---|---|
+| 两只 ETF raw | `audit/ready` | 腾讯同源原始价快照，可做复权证据和交叉检查 |
+| 两只 ETF qfq | `canonical/ready` | 腾讯同源 raw/qfq 配对，正式可解析 |
+| A 股 Baostock/JQData/东方财富/AkShare qfq | `audit/legacy_unknown` | 缺完整因子或同源 raw 配对证据 |
+| 旧 A 股 merged/cleaned/Qlib | `legacy_unknown` | 旧流程兼容入口，尚未切换成 v2 正式入口 |
+| PIT CSI800 和参考表 | `canonical/ready`（完整时） | 由原有事务锁和内容哈希保护，仍在逐步迁移到统一快照结构 |
+
+因此，v2 契约和 ETF 迁移已经落地；A 股全市场因子快照和新 Qlib provider 尚未完成迁移。旧 A 股数据没有被移动、删除或冒充成已经具备复权证据的新快照。
+
+## 清单结构
+
+根 `DATA_MANIFEST.json` 使用 `schema_version: 2`。`datasets` 是唯一的新接口目录，每项至少包含：
+
+- `dataset_id`、`data_kind`、`role`、`status`；
+- `source.provider`、`source.interface`、供应商证券代码；
+- `price_basis`；
+- 原始取得时间、复权时间、复权覆盖日期；
+- 复权方法、字段、归一规则和算法版本；
+- 日期范围、最新交易日、行数、证券数；
+- bar/因子索引、公司行为文件及内容哈希；
+- 上游快照、生成脚本和版本。
+
+清单中的数据路径全部相对 `${QUANT_DATA_ROOT}`。`official_entries` 和 `documented_inputs` 仅为旧页面兼容，不是 v2 解析依据。
+
+## 不可变快照
+
+```text
+<dataset_id>/
+  LATEST.json
+  snapshots/<snapshot_id>/
+    DATASET_MANIFEST.json
+    FILE_INDEX.parquet
+    FACTOR_INDEX.parquet
+    bars/<symbol>.parquet
+    factors/<symbol>.parquet
+    corporate_actions.parquet
+```
+
+- 下载和计算先写入 `staging/<run_id>/`。
+- 快照通过字段、日期、主键、价格关系、复权证据和哈希校验后才发布。
+- `LATEST.json` 最后原子更新，只指向完整快照。
+- 失败时旧 `LATEST.json` 不变；新训练锁定启动时解析到的快照路径，不随之后的更新跳转。
+- bar、因子和公司行为都有独立哈希，整个快照另有 `content_sha256`。
+
+## 复权证据
+
+正式 qfq/hfq 数据只接受：
+
+1. `local_factor`：保存完整因子、本地公式和算法版本；或
+2. `provider_native_paired`：保存同一供应商、同一抓取时点的完整 raw 与 qfq，并保存逐日对应因子。
+
+只有供应商 qfq 标签、但无因子和配对 raw 的数据一律是 `legacy_unknown`。不同供应商已经复权的价格不得按日期拼接。
+
+## ETF 更新
+
+正式数据集：
+
+- `etf_momentum_daily_raw`：`audit/ready/raw`；
+- `etf_momentum_daily_qfq`：`canonical/ready/qfq`。
+
+每次更新都完整下载 `SZ159915` 和 `SH513100` 的同源 raw/qfq。腾讯优先，东方财富备用，新浪旧原始价只做独立审计。发布条件：
+
+- 每只 ETF 自己的 raw/qfq 日期完全一致；
+- 两只 ETF 的最新交易日一致；
+- 两只 ETF 历史日历可因停牌而不同，回测使用交集日历；
+- qfq OHLC 与 raw 乘因子的关系通过校验；
+- 最新有效交易日的前复权因子为 1；
+- 513100 的 2022 年 1:5 拆分同时有公告和因子曲线证据；
+- 两只 ETF 全部成功后才更新正式 qfq 指针。
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py update \
+  etf_momentum_daily_qfq --through YYYY-MM-DD
+```
+
+每日更新编排器调用同一命令，不再只刷新最近五天。
+
+## A 股更新边界
+
+现有下载器已增加两项保护：
+
+- qfq 增量更新先检查历史锚点；供应商重算历史尺度时整只股票全历史刷新；锚点无法核验时不更新该股票。
+- `merge_to_qlib.py` 的 qfq 模式只能为每只股票选一个完整供应商，禁止跨供应商按日期拼接；只有 raw 模式允许整行补缺，并记录 `source_id`。
+
+这两项防止继续扩大旧数据风险，但不等于 A 股 v2 迁移完成。正式 A 股迁移仍需：Baostock raw 增量、`query_adjust_factor`/分红证据、因子变化股票全历史重算、cleaned 快照和 Qlib provider 重建。完成新旧一致性对比前，旧目录继续保留且标记 `legacy_unknown`。
+
+### A 股 v2 Baostock 事务
+
+`download_baostock_v2.py` 使用一个受限、可恢复的来源 bundle：
+
+- 每只股票完整下载 `adjustflag=3` raw 行情；
+- 每只股票完整下载 `query_adjust_factor` 因子事件；
+- 将 `foreAdjustFactor` 按事件日向后生效，生成逐日因子；
+- 用 `raw OHLC × foreAdjustFactor` 重建正式 qfq，成交量和成交额不复权；
+- 对最近发生因子变化的股票和固定哈希抽样股票下载供应商完整 qfq，逐日核对本地公式；
+- qfq 对照只用于验证，不作为正式行情来源，也不与其他供应商 qfq 拼接。
+
+少数新股的 raw 首日可能比第一条因子事件早 1 天。下载器只允许最多 7 个自然日的上市边界缺口，并将事件前的上市日明确记录为单位因子 1；凡发生这种补齐的股票，必须额外下载供应商完整 qfq 严格核对。超过 7 天、或核对不一致时立即停止，不能扩大补齐范围。
+
+代码重组、重新上市等情况可能导致 `query_adjust_factor` 晚于 raw 历史多年。此时不向前套用第一条事件因子，而是下载同一 Baostock、同一抓取时点的完整 qfq，用逐日 qfq/raw OHLC 四组比值反推出缺失期因子；四组比值必须一致，推导因子变化必须写入公司行为证据。该同源配对证据不完整时，整套 A 股 v2 仍然阻止发布。
+
+正式发布前还会对旧 `baostock_qfq` 做全量重叠审计。固定比例缩放属于可解释的前复权重归一；旧文件若因增量覆盖出现尺度拼接，只有在新 close-to-close 收益与旧文件保存的供应商 `pctChg` 对齐、而旧 close-to-close 收益不对齐时，才明确归因于旧文件。无法解释的日期缺口或价格路径差异会阻止发布，逐股票明细保存在新 qfq 快照的 `LEGACY_COMPARISON.parquet`。
+
+下载器要求单实例、请求间隔不少于 0.2 秒、有限请求预算、最多两次尝试，并在服务端拒绝或连续失败时立即熔断。远端机器只负责生成来源 bundle；本机必须核对压缩包 SHA-256、路径安全、bundle 内文件哈希和数据契约后才能发布。
+
+```bash
+# 由受控远端 runner 生成 bundle；运行参数和远端路径写入私有运行记录
+python quant_workflow/scripts/download_baostock_v2.py download \
+  --universe-file stock_lists.json \
+  --output-dir <staging-bundle> \
+  --through YYYY-MM-DD \
+  --resume
+
+# bundle 安全传回并验证后，raw/qfq 两个指针作为一组切换
+python quant_workflow/scripts/quant_data_cli.py update \
+  ashare_daily_qfq --bundle-dir <verified-bundle>
+```
+
+任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。raw 和 qfq staging 都通过哈希校验后才切换两个正式指针；任一指针或根 `DATA_MANIFEST.json` 写入失败时，两个指针、根清单和 staging 全部恢复到更新前状态。
+
+## Qlib 血缘
+
+新生成的 Qlib 目录必须包含 `PROVIDER_MANIFEST.json`，记录准确的行情快照、价格口径和转换配置。训练启动后锁定该 provider；数据更新不会改变正在运行的训练输入。
+
+```bash
+python quant_workflow/scripts/build_qlib_v2.py --publish
+```
+
+该命令只解析 `ashare_daily_qfq` 的 `ready/qfq` 快照，生成不可变 `qlib_ashare_v2`，并将精确的上游快照 ID 和内容哈希写进 provider 清单。Qlib 指针与根清单使用同一回滚事务。
+
+当前旧 `cn_data_baostock_jqdata*` provider 仍是兼容数据。只有从 v2 行情快照重建并通过一致性校验的 provider 才能成为新正式入口。
+
+## 失败规则
+
+- raw 下载成功、复权失败：qfq 正式指针不前进。
+- 两只 ETF 只成功一只：不发布。
+- 因子日期不覆盖行情、哈希变化、公司行为缺失：拒绝解析或发布。
+- 请求 qfq 却解析到 raw：明确报错。
+- 清单过期、README 漂移或出现未登记目录：`sync_data_manifest.py --check` 返回非零。
+- 旧数据清理、移动或删除：必须另行 dry-run 并取得用户明确确认。
+
+运行状态和日志不属于正式数据：状态写入 `quant_workflow/reports/`，日志写入 `quant_workflow/logs/`。账号、密码、token、券商信息、行情数据、模型和 `mlruns` 不进入 Git。

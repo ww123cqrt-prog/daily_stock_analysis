@@ -631,6 +631,16 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_flag(command, params, key, flag)
         return command
 
+    def download_etf_momentum(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("quant_data_cli.py")
+        command.extend(["update", "etf_momentum_daily_qfq"])
+        _append_value(command, params, "end", "--through")
+        return command
+
+    def generate_etf_momentum_report(params: Mapping[str, Any]) -> List[str]:
+        del params
+        return _script_command("generate_etf_momentum_strategy_report.py")
+
     def validate_latest_snapshot(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("validate_latest_snapshot.py")
         _append_reports_out_dir(command)
@@ -812,6 +822,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         for key, flag in (
             ("skip_eastmoney", "--skip-eastmoney"),
             ("skip_akshare", "--skip-akshare"),
+            ("skip_etf_momentum", "--skip-etf-momentum"),
             ("skip_snapshot_validation", "--skip-snapshot-validation"),
             ("skip_robust_shadow", "--skip-robust-shadow"),
             ("use_system_proxy", "--use-system-proxy"),
@@ -970,6 +981,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "snapshot_limit",
                 "skip_eastmoney",
                 "skip_akshare",
+                "skip_etf_momentum",
                 "skip_snapshot_validation",
                 "skip_robust_shadow",
                 "use_system_proxy",
@@ -1018,6 +1030,51 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "overlap_days",
                 "use_system_proxy",
             },
+        },
+        "download_etf_momentum": {
+            "label": "更新 ETF 动量数据",
+            "command": download_etf_momentum,
+            "allowed_params": {"end"},
+            "artifact_patterns": [
+                str(
+                    quant_data_root(DSA_ROOT)
+                    / "parquet"
+                    / "etf_1d"
+                    / "etf_momentum_daily_raw"
+                    / "LATEST.json"
+                ),
+                str(
+                    quant_data_root(DSA_ROOT)
+                    / "parquet"
+                    / "etf_1d"
+                    / "etf_momentum_daily_qfq"
+                    / "LATEST.json"
+                ),
+            ],
+        },
+        "generate_etf_momentum_report": {
+            "label": "生成 ETF 完整策略报告",
+            "command": generate_etf_momentum_report,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "strategy_report_latest.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "strategy_report_latest.md"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "runs"
+                    / "*"
+                    / "strategy_report.json"
+                ),
+            ],
         },
         "validate_latest_snapshot": {
             "label": "校验新浪最新快照",

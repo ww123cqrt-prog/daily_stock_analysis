@@ -76,6 +76,54 @@ Naming convention:
   does not train, connect to broker software, place orders, or modify Qlib
   provider files. Run the non-dry-run path manually only when you explicitly
   want a longer local experiment.
+- `quant_data_cli.py` is the governed entrypoint for `list`, `describe`,
+  `resolve`, `validate`, and `update`. `resolve` checks status, requested price
+  basis, manifest hash, bar hashes, factor hashes and company-action hash.
+- `download_etf_momentum_data.py` is the producer behind
+  `quant_data_cli.py update etf_momentum_daily_qfq`. It downloads complete
+  same-provider raw/qfq histories for 159915 and 513100, validates the factor
+  curve and 513100 split, stages both ETFs, then atomically publishes immutable
+  raw and qfq snapshots. Tencent is preferred and EastMoney is the fallback;
+  the old Sina directory remains audit-only.
+- `download_baostock_v2.py` creates a restartable full-market Baostock source
+  bundle containing complete raw bars and `query_adjust_factor` events. It
+  rebuilds qfq locally as raw OHLC times `foreAdjustFactor`, while provider qfq
+  is retained only for recent-event, bounded factor-start-gap, and
+  deterministic-sample verification. For long factor-history gaps caused by
+  code restructuring, it derives the missing daily factor only from a complete
+  same-provider raw/qfq OHLC pair and records the derived transitions. Before
+  publication it audits all overlap
+  against legacy Baostock qfq, separating constant renormalization and proven
+  legacy incremental splices from unexplained price-path drift.
+  `quant_data_cli.py update ashare_daily_qfq --bundle-dir <verified-bundle>`
+  validates all hashes and switches raw/qfq snapshots plus the root catalog as
+  one rollback transaction.
+- `build_qlib_v2.py` resolves the exact governed A-share qfq snapshot, converts
+  it to an immutable Qlib provider, records the upstream snapshot ID and
+  content hash in `PROVIDER_MANIFEST.json`, and publishes the Qlib pointer and
+  root catalog with rollback on failure.
+- `sync_data_manifest.py` writes schema-v2 `DATA_MANIFEST.json`, keeps all data
+  paths relative to `QUANT_DATA_ROOT`, refreshes generated README catalog
+  blocks, and supports `--check` for catalog/path/README drift.
+- `backtest_etf_momentum_rotation.py` replays the fixed 20-day ranking and
+  20-day moving-average rule with close-to-next-open execution. It writes an
+  isolated report under `reports/etf_momentum_rotation/`, including zero-cost
+  and costed variants. The result is a research candidate, not a promoted
+  model or an order instruction.
+- `evaluate_etf_momentum_robustness.py` keeps that 20/20 rule fixed and writes
+  a manual-review robustness report under
+  `reports/etf_momentum_rotation/robustness/`. It reports complete-quarter
+  consistency, 10/20/40bp total-cost cases, one-session execution delay,
+  pre-declared 15/20/25-day parameter sensitivity, explicit `CASH` periods,
+  and unresolved price discontinuities. It never promotes a parameter-grid
+  winner or issues an order.
+- `research_etf_momentum_improvement.py` applies the user-supplied single-side
+  commission from `configs/etf_momentum_improvement.yaml`, selects one bounded
+  15/20/25-day candidate from the 2019-2022 development split only, and reports
+  2023-2024 validation plus later observations separately. Outputs stay under
+  `reports/etf_momentum_rotation/improvement/`; the original 20/20 rule and its
+  reports are not overwritten. Because the grid was visible in earlier work,
+  any selected rule remains a retrospective research candidate.
 
 Research-only model comparison scripts live under:
 

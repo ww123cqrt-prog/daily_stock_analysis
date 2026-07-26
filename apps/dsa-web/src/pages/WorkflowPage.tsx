@@ -194,6 +194,18 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         ],
       },
       {
+        type: 'download_etf_momentum',
+        label: '更新 ETF 动量数据',
+        description: '只更新创业板 ETF（159915）和纳指 ETF（513100），写入 quant_data 的独立 ETF 目录，不进入 A 股个股 Qlib provider。',
+        defaultParams: { incremental: true },
+        params: [
+          { key: 'start', label: '开始日期', kind: 'date', placeholder: '留空使用默认起始日' },
+          { key: 'end', label: '结束日期', kind: 'date' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 365, placeholder: '5' },
+          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
+        ],
+      },
+      {
         type: 'download_jqdata',
         label: '验证 JQData 连接',
         description: '只做认证、股票池解析和小样本 dry-run，不写入真实 Parquet 数据目录。',
@@ -342,6 +354,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           },
           { key: 'dry_run', label: '只做小样本预演', kind: 'checkbox' },
         ],
+      },
+      {
+        type: 'generate_etf_momentum_report',
+        label: '生成 ETF 完整策略报告',
+        description: '读取两只 ETF 的隔离行情，统一生成收益、回撤、稳定性、持仓和数据质量报告；只做研究，不连接券商、不自动下单。',
       },
       {
         type: 'report_market_regime',
@@ -710,6 +727,7 @@ function buildDailyGuideSteps(
     'download_baostock',
     'download_eastmoney',
     'download_akshare',
+    'download_etf_momentum',
     'download_jqdata',
   ]);
   const qualityJob = latestJobs.report_data_quality;
@@ -1313,6 +1331,13 @@ const WorkflowPage: React.FC = () => {
             </Link>
             <Link to="/backtest" className="btn-secondary h-9 gap-2 px-3 text-sm">
               回测结果
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+            <Link
+              to="/backtest/etf-momentum"
+              className="btn-secondary h-9 gap-2 px-3 text-sm"
+            >
+              查看 ETF 完整策略报告
               <ArrowRight className="h-4 w-4" />
             </Link>
             <button type="button" className="btn-primary h-9 gap-2 px-3 text-sm" onClick={() => void refresh()}>

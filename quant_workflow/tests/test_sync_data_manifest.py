@@ -168,7 +168,82 @@ def seed_robust_price_product(quant_data: Path) -> Path:
     return product
 
 
+def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
+    contract_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "quant_data_contract.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "quant_data_contract_sync_fixture", contract_path
+    )
+    contract = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(contract)
+    snapshot = quant_data / "staging" / "qlib-sync" / "qlib-sync-001"
+    (snapshot / "calendars").mkdir(parents=True)
+    (snapshot / "instruments").mkdir(parents=True)
+    (snapshot / "features" / "sh600000").mkdir(parents=True)
+    (snapshot / "calendars" / "day.txt").write_text(
+        "2026-07-23\n2026-07-24\n", encoding="utf-8"
+    )
+    (snapshot / "instruments" / "all.txt").write_text(
+        "SH600000\t2026-07-23\t2026-07-24\n", encoding="utf-8"
+    )
+    (snapshot / "features" / "sh600000" / "close.day.bin").write_bytes(
+        b"feature-bytes"
+    )
+    upstream = {
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-source-001",
+        "content_sha256": "a" * 64,
+        "price_basis": "qfq",
+    }
+    contract.atomic_write_json(
+        snapshot / "PROVIDER_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "status": "ready",
+            "source_snapshot": upstream,
+        },
+    )
+    contract.finalize_qlib_snapshot(
+        snapshot,
+        dataset_id="qlib_ashare_v2",
+        snapshot_id="qlib-sync-001",
+        source={
+            "provider": "quant_workflow",
+            "interface": "v2_snapshot_to_qlib",
+        },
+        source_retrieved_at="2026-07-25T22:59:00+08:00",
+        producer={"script": "build_qlib_v2.py", "version": "2"},
+        upstream_snapshot=upstream,
+    )
+    return contract.publish_qlib_snapshot(
+        snapshot,
+        dataset_root=quant_data / "qlib" / "cn_data_ashare_v2",
+        quant_data_root=quant_data,
+    )
+
+
 class SyncDataManifestTest(unittest.TestCase):
+    def test_manifest_discovers_published_qlib_v2_snapshot(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            published = seed_qlib_v2_snapshot(module, quant_data)
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["datasets"]["qlib_ashare_v2"]
+        self.assertEqual(entry["status"], "ready")
+        self.assertEqual(entry["latest_trade_date"], "2026-07-24")
+        self.assertEqual(entry["snapshot_id"], published.name)
+
     def test_sync_manifest_reflects_actual_cleaned_provider_calendar(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,18 +269,42 @@ class SyncDataManifestTest(unittest.TestCase):
             manifest_path = module.sync_data_manifest(quant_data_root=quant_data, reports_root=reports)
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            root_readme = (quant_data / "README.md").read_text(encoding="utf-8")
+            ashare_readme = (
+                quant_data / "parquet" / "ashare_1d" / "README.md"
+            ).read_text(encoding="utf-8")
+            manifest_issues = module.check_manifest(
+                quant_data_root=quant_data,
+                reports_root=reports,
+            )
 
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["path_format"], "relative_to_quant_data_root")
+        cleaned = manifest["datasets"]["ashare_cleaned_qfq_legacy"]
+        self.assertEqual(
+            cleaned["path"],
+            "parquet/ashare_1d/merged_baostock_jqdata_cleaned",
+        )
+        self.assertEqual(cleaned["price_basis"], "qfq")
+        self.assertEqual(cleaned["status"], "legacy_unknown")
         self.assertEqual(manifest["official_entries"]["cleaned_parquet"]["file_count"], 1)
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["calendar_last"], "2026-07-09")
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["instruments_all"], 1)
         self.assertEqual(manifest["documented_inputs"]["canonical_qlib_provider"]["calendar_last"], "")
+        self.assertEqual(manifest["datasets"]["ashare_daily_raw"]["status"], "blocked")
+        self.assertEqual(manifest["datasets"]["ashare_daily_qfq"]["status"], "blocked")
+        self.assertEqual(manifest["datasets"]["qlib_ashare_v2"]["status"], "blocked")
+        self.assertNotIn(str(root), json.dumps(manifest))
+        self.assertIn(module.README_BLOCK_START, root_readme)
+        self.assertIn("ashare_cleaned_qfq_legacy", ashare_readme)
+        self.assertEqual(manifest_issues, [])
 
     def test_manifest_registers_complete_pit_and_marks_reference_pending(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             quant_data = root / "quant_data"
-            pit_dir = seed_pit_membership(quant_data)
+            seed_pit_membership(quant_data)
 
             manifest = module.build_manifest(
                 quant_data_root=quant_data,
@@ -213,7 +312,7 @@ class SyncDataManifestTest(unittest.TestCase):
             )
 
         pit = manifest["official_entries"]["pit_csi800"]
-        self.assertEqual(pit["path"], str(pit_dir))
+        self.assertEqual(pit["path"], "reference/pit_csi800")
         self.assertEqual(pit["date_range"]["end_date"], "2025-01-03")
         self.assertEqual(pit["daily_file_count"], 1)
         self.assertEqual(pit["member_day_count"], 2)
@@ -233,7 +332,7 @@ class SyncDataManifestTest(unittest.TestCase):
             pit_dir = seed_pit_membership(quant_data)
             with module.membership_read_lock(pit_dir) as snapshot:
                 membership_hash = snapshot.fingerprint()
-            reference = seed_reference_snapshot(quant_data, membership_hash)
+            seed_reference_snapshot(quant_data, membership_hash)
 
             manifest = module.build_manifest(
                 quant_data_root=quant_data,
@@ -241,7 +340,7 @@ class SyncDataManifestTest(unittest.TestCase):
             )
 
         entry = manifest["official_entries"]["robust_reference"]
-        self.assertEqual(entry["path"], str(reference))
+        self.assertEqual(entry["path"], "reference")
         self.assertEqual(entry["selected_source"], "baostock")
         self.assertEqual(entry["build_run_id"], "reference_20260718_cache_v2")
         self.assertEqual(entry["date_range"]["start_date"], "2025-01-02")
@@ -266,7 +365,14 @@ class SyncDataManifestTest(unittest.TestCase):
             )
 
         entry = manifest["official_entries"]["robust_price_product"]
-        self.assertEqual(entry["path"], str(product.resolve()))
+        self.assertEqual(
+            entry["path"],
+            "runtime/robust_strategy/price_products/0123456789abcdef",
+        )
+        self.assertEqual(
+            entry["cleaned_parquet"],
+            "runtime/robust_strategy/price_products/0123456789abcdef/cleaned_parquet",
+        )
         self.assertEqual(entry["product_key"], product.name)
         self.assertEqual(entry["cleaned_symbols"], 1)
         self.assertNotIn("robust_price_product", manifest["pending_entries"])
@@ -378,6 +484,58 @@ class SyncDataManifestTest(unittest.TestCase):
         replace_index = events.index("replace")
         self.assertIn("fsync", events[:replace_index])
         self.assertIn("fsync", events[replace_index + 1 :])
+
+    def test_check_manifest_reports_unregistered_governed_dataset_directory(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            module.sync_data_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+            self.assertEqual(
+                module.check_manifest(
+                    quant_data_root=quant_data,
+                    reports_root=root / "reports",
+                ),
+                [],
+            )
+
+            unknown = quant_data / "parquet" / "ashare_1d" / "unknown_source"
+            unknown.mkdir(parents=True)
+            pd.DataFrame({"date": ["2026-07-24"]}).to_parquet(
+                unknown / "000001.parquet", index=False
+            )
+            issues = module.check_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        self.assertTrue(
+            any("unregistered governed data path" in issue for issue in issues),
+            issues,
+        )
+
+    def test_check_manifest_reports_generated_readme_drift(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            module.sync_data_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+            readme = quant_data / "README.md"
+            readme.write_text("# stale\n", encoding="utf-8")
+
+            issues = module.check_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        self.assertIn("dataset README catalog is stale: README.md", issues)
 
 
 if __name__ == "__main__":

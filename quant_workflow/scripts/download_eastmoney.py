@@ -111,6 +111,7 @@ def main() -> int:
             sleep_seconds=args.sleep,
             retry_failed=args.retry_failed,
             max_consecutive_failures=args.max_consecutive_failures,
+            price_basis="qfq",
         )
     finally:
         session.close()

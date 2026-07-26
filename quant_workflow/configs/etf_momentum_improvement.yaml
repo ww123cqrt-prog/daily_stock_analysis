@@ -1,0 +1,62 @@
+version: 1
+research_id: etf_momentum_rule_improvement
+research_only: true
+
+strategy:
+  name: 创业板ETF-纳指ETF 20日动量轮动交易策略
+  symbols:
+    - SZ159915
+    - SH513100
+  original_rule:
+    lookback_days: 20
+    moving_average_days: 20
+  signal_at: close
+  execution_at: next_common_open
+
+fee:
+  commission_wan_each_side: 0.574
+  minimum_commission_applied: false
+  minimum_commission_note: 用户只提供了比例费率，未提供最低佣金规则。
+  etf_stamp_duty_applied: false
+  base_slippage_bps_each_side: 0.0
+  stress_slippage_bps_each_side: [1.0, 2.0]
+  legacy_report_total_cost_bps_round_trip: 20.0
+
+data:
+  dataset_id: etf_momentum_daily_qfq
+  required_status: ready
+  required_price_basis: qfq
+
+time_splits:
+  development:
+    start: 2019-01-02
+    end: 2022-12-31
+  validation:
+    start: 2023-01-01
+    end: 2024-12-31
+  later_observation:
+    start: 2025-01-01
+    end: 2026-07-24
+
+parameter_research:
+  lookback_days: [15, 20, 25]
+  moving_average_days: [15, 20, 25]
+  selection_split: development
+  selection_metric: annualized_return
+  max_development_drawdown_abs: 0.35
+  tie_breakers:
+    - lower_max_drawdown_abs
+    - fewer_switches
+    - smaller_parameter_distance_from_original
+
+evidence_policy:
+  grid_previously_exposed: true
+  preserve_original_rule: true
+  candidate_label: retrospective_improvement_candidate
+  qualified_strategy: false
+  no_broker_connection: true
+  no_automatic_orders: true
+
+dsa_replay:
+  initial_capital_cny: 100000.0
+  lot_size: 100

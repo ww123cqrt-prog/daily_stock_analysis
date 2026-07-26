@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -54,7 +55,7 @@ class MergeToQlibTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(preserved["close"].tolist(), [99.0])
 
-    def test_merge_sources_keeps_base_and_only_fills_missing_dates(self):
+    def test_qfq_merge_uses_one_provider_for_the_whole_symbol(self):
         module = load_module()
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -117,17 +118,46 @@ class MergeToQlibTest(unittest.TestCase):
         self.assertEqual(merged["date"].dt.strftime("%Y-%m-%d").tolist(), [
             "2026-07-01",
             "2026-07-02",
-            "2026-07-03",
-            "2026-07-04",
-            "2026-07-05",
         ])
-        # Base (baostock) is authoritative for the dates it covers (07-01, 07-02);
-        # each later source fills ONLY the dates still missing, so its whole row
-        # (close + volume together) lands for that new date without overwriting
-        # any overlapping base date. 07-03 <- jqdata, 07-04 <- eastmoney,
-        # 07-05 <- akshare.
-        self.assertEqual(merged["close"].tolist(), [10.1, 10.2, 20.3, 30.3, 40.3])
-        self.assertEqual(merged["volume"].tolist(), [1000.0, 1100.0, 1200.0, 1300.0, 1400.0])
+        self.assertEqual(merged["close"].tolist(), [10.1, 10.2])
+        self.assertEqual(merged["volume"].tolist(), [1000.0, 1100.0])
+        self.assertEqual(merged["source_id"].unique().tolist(), ["baostock"])
+
+    def test_raw_merge_can_fill_whole_rows_and_records_source_id(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            first = base / "first.parquet"
+            second = base / "second.parquet"
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-01"],
+                    "open": [10.0],
+                    "high": [10.2],
+                    "low": [9.9],
+                    "close": [10.1],
+                    "volume": [1000.0],
+                }
+            ).to_parquet(first, index=False)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-01", "2026-07-02"],
+                    "open": [20.0, 20.1],
+                    "high": [20.2, 20.3],
+                    "low": [19.9, 20.0],
+                    "close": [20.1, 20.2],
+                    "volume": [9000.0, 1100.0],
+                }
+            ).to_parquet(second, index=False)
+
+            merged = module.merge_sources(
+                "000001",
+                [("first", first), ("second", second)],
+                price_basis="raw",
+            )
+
+        self.assertEqual(merged["close"].tolist(), [10.1, 20.2])
+        self.assertEqual(merged["source_id"].tolist(), ["first", "second"])
 
     def test_build_merged_parquet_accepts_extra_source_directories_without_renaming_output(self):
         module = load_module()
@@ -171,7 +201,8 @@ class MergeToQlibTest(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(out_dir.name, "merged_baostock_jqdata")
-        self.assertEqual(merged["close"].tolist(), [10.1, 10.3])
+        self.assertEqual(merged["close"].tolist(), [10.1])
+        self.assertEqual(merged["source_id"].tolist(), ["baostock"])
 
     def test_convert_to_bin_no_overwrite_preserves_existing_feature_file(self):
         module = load_module()
@@ -293,6 +324,49 @@ class MergeToQlibTest(unittest.TestCase):
             )
             self.assertEqual(float(close_bin[0]), 1.0)
             np.testing.assert_allclose(close_bin[1:], [10.1, 10.2])
+
+    def test_qlib_provider_manifest_points_to_exact_price_snapshot(self):
+        module = load_module()
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            src_dir = base / "snapshot" / "bars"
+            dst_dir = base / "qlib"
+            src_dir.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "date": ["2026-07-23", "2026-07-24"],
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1100.0],
+                    "factor": [1.0, 1.0],
+                }
+            ).to_parquet(src_dir / "000001.parquet", index=False)
+
+            result = module.convert_to_bin(
+                src_dir,
+                dst_dir,
+                overwrite=True,
+                source_contract={
+                    "dataset_id": "ashare_daily_qfq",
+                    "snapshot_id": "snapshot-001",
+                    "content_sha256": "a" * 64,
+                    "price_basis": "qfq",
+                },
+            )
+            provider_manifest = json.loads(
+                (dst_dir / "PROVIDER_MANIFEST.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(provider_manifest["schema_version"], 2)
+        self.assertEqual(
+            provider_manifest["source_snapshot"]["snapshot_id"],
+            "snapshot-001",
+        )
+        self.assertEqual(provider_manifest["price_basis"], "qfq")
+        self.assertEqual(provider_manifest["status"], "ready")
 
 
 if __name__ == "__main__":

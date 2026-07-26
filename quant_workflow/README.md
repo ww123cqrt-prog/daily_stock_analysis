@@ -34,6 +34,19 @@ china-astock-quant adapters, and every stable script here. Data paths use
 # Download Baostock long-history data
 .venv/bin/python quant_workflow/scripts/download_baostock.py --retry-failed
 
+# Build a governed A-share raw/factor/qfq source bundle (normally on a durable remote runner)
+.venv/bin/python quant_workflow/scripts/download_baostock_v2.py download \
+  --universe-file /path/to/stock_lists.json \
+  --output-dir /path/to/staging-bundle \
+  --through YYYY-MM-DD --resume
+
+# Publish a verified A-share v2 raw/qfq pair atomically
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
+  ashare_daily_qfq --bundle-dir /path/to/verified-bundle
+
+# Build and publish Qlib from the exact governed qfq snapshot
+.venv/bin/python quant_workflow/scripts/build_qlib_v2.py --publish
+
 # Supervise Baostock in restartable batches
 .venv/bin/python quant_workflow/scripts/supervise_baostock.py
 
@@ -48,6 +61,15 @@ china-astock-quant adapters, and every stable script here. Data paths use
 
 # Apply anomaly cleaning rules into a separate cleaned provider
 .venv/bin/python quant_workflow/scripts/apply_data_cleaning.py
+
+# Refresh and atomically publish the governed two-ETF raw/qfq snapshots
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update etf_momentum_daily_qfq
+
+# Inspect data basis, adjustment evidence, date range and lineage
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py describe etf_momentum_daily_qfq
+
+# Fail when the catalog, governed paths or generated README tables drift
+.venv/bin/python quant_workflow/scripts/sync_data_manifest.py --check
 
 # Run the canonical Qlib Alpha158 + LightGBM baseline
 .venv/bin/python quant_workflow/scripts/train_baseline_lgb.py
@@ -64,12 +86,19 @@ china-astock-quant adapters, and every stable script here. Data paths use
 - Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata`
 - Cleaned merged Parquet: `quant_data/parquet/ashare_1d/merged_baostock_jqdata_cleaned`
 - Cleaned Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata_cleaned`
+- Governed ETF raw evidence: `quant_data/parquet/etf_1d/etf_momentum_daily_raw`
+- Governed ETF qfq snapshot: `quant_data/parquet/etf_1d/etf_momentum_daily_qfq`
 
 The canonical storage, schema, merge, and handoff rules are documented in
 [`docs/quant-data-contract.md`](docs/quant-data-contract.md). The live local
 paths and readiness state remain authoritative in
 `${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
 `preflight_robust_data.py`.
+
+The existing A-share source, merged, cleaned and Qlib directories are registered
+as `legacy_unknown` in the v2 dataset catalog until full raw/factor evidence is
+published. They remain available to legacy consumers but cannot be resolved as
+new canonical v2 datasets. Do not infer readiness from their directory names.
 
 The robust strategy configuration uses verified offline reuse for the one-time
 reference snapshot and the three Qlib benchmarks. It does not silently redownload
