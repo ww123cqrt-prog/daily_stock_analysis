@@ -38,7 +38,7 @@ DEFAULT_TOPK = 20
 SECTION_TITLES = {
     "model_explainability": "模型效果深度解释",
     "backtest_detail": "回测详细分解",
-    "model_comparison": "多模型/多实验对比",
+    "model_comparison": "多选股模型/多实验对比",
     "factor_analysis": "因子挖掘辅助",
     "rolling_training": "滚动训练计划",
     "risk_model": "风险模型集成诊断",

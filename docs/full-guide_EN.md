@@ -1132,9 +1132,26 @@ Unknown or ambiguous advice is not coerced into `watch` or `hold`; it returns em
 
 ## Backtesting
 
-The backtesting module automatically validates historical AI analysis records against actual price movements, evaluating the accuracy of analysis recommendations.
+`/backtest` exposes exactly two continuous-account backtest modes. Both use the same price, execution, and equity engine:
 
-### How It Works
+1. **Script backtest**: edit a DSA Python strategy directly, similar to a JoinQuant research page. The script runs in a constrained child process only after static security checks pass.
+2. **Form backtest**: select an explicit built-in strategy and enter symbols, dates, capital, costs, and strategy parameters without writing code.
+
+Qlib training runs, parameters, metrics, and artifacts are viewed under `/experiments/`, not as a `/backtest` sub-tab. Legacy DSA judgment evaluation and signal-strategy APIs remain for compatibility, but they are no longer presented as the default Web trading strategy.
+
+### Strategy Backtest
+
+The generic engine only understands instrument symbols, open/close prices, and target weights. It does not branch on stock versus ETF. Single-instrument timing, ETF rotation, and multi-instrument portfolios use the same cash and execution calculations; each strategy adapter is responsible for producing target weights.
+
+Script mode requires `on_bar(context, data)` and optionally accepts `initialize(context)`. Scripts produce target weights after each close and execute at the next common trading-day open. Form mode currently provides momentum rotation with a moving-average filter, dual-moving-average timing, and equal-weight buy and hold. Stocks and ETFs use the same interface when the requested symbols exist in a canonical, ready, qfq daily-bar dataset under `quant_data`.
+
+There is no hidden transaction-cost default. The Web form starts at `0%`, meaning fees and slippage are not deducted; only the per-buy/per-sell cost entered by the user is applied. A backfilled report whose creation date is later than its signal date is excluded so hindsight output cannot masquerade as a point-in-time signal.
+
+### Historical Judgment Review
+
+The legacy validation function checks historical AI analysis against subsequent price movement. Its “average simulated return” is a per-record fixed-window evaluation value, not a continuous account equity curve, and must not be compared directly with buy and hold as a strategy return.
+
+#### How It Works
 
 1. Selects `AnalysisHistory` records past the cooldown period (default 14 days)
 2. Fetches daily bar data after the analysis date (forward bars)
@@ -1142,7 +1159,7 @@ The backtesting module automatically validates historical AI analysis records ag
 4. Evaluates stop-loss/take-profit hit conditions and simulates execution returns
 5. Aggregates into overall and per-stock performance metrics
 
-### Operation Advice Mapping
+#### Operation Advice Mapping
 
 | Operation Advice | Position | Expected Direction | Win Condition |
 |-----------------|----------|-------------------|---------------|
@@ -1151,7 +1168,7 @@ The backtesting module automatically validates historical AI analysis records ag
 | Hold / Hold and Watch / Range-bound Watch / Shakeout Watch / Hold and watch | long | not_down | No significant decline |
 | Wait / Observe | cash | flat | Price within neutral band |
 
-### Configuration
+#### Configuration
 
 Set the following variables in `.env` (all optional, have defaults):
 
@@ -1163,11 +1180,11 @@ Set the following variables in `.env` (all optional, have defaults):
 | `BACKTEST_ENGINE_VERSION` | `v1` | Engine version, used to distinguish results when logic is updated |
 | `BACKTEST_NEUTRAL_BAND_PCT` | `2.0` | Neutral band threshold (%), ±2% treated as range-bound |
 
-### Auto-run
+#### Auto-run
 
 Backtesting triggers automatically after the daily analysis flow completes (non-blocking; failures do not affect notifications). It can also be triggered manually via API.
 
-### Evaluation Metrics
+#### Evaluation Metrics
 
 | Metric | Description |
 |--------|-------------|
@@ -1234,7 +1251,10 @@ For this feature, the product behavior is:
 | `/api/v1/history` | GET | Query analysis history |
 | `/api/v1/history/{record_id}/diagnostics` | GET | Query a historical report run diagnostic summary and sanitized copy text |
 | `/api/v1/usage/summary?period=today|month|all` | GET | Query LLM call counts and token usage grouped by call type and model |
-| `/api/v1/backtest/run` | POST | Trigger backtest |
+| `/api/v1/backtest/strategy/run` | POST | Run an explicitly selected and configured built-in form strategy |
+| `/api/v1/backtest/strategy/script` | POST | Statically check and isolate a DSA Python strategy script |
+| `/api/v1/backtest/strategy/dsa-signal` | POST | Legacy DSA signal backtest compatibility; not a primary Web entry point |
+| `/api/v1/backtest/run` | POST | Trigger the legacy historical judgment review |
 | `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
 | `/api/v1/backtest/performance` | GET | Get overall backtest performance |
 | `/api/v1/backtest/performance/{code}` | GET | Get per-stock backtest performance |

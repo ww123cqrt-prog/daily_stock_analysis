@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -25,6 +26,162 @@ class BacktestRunResponse(BaseModel):
     completed: int = Field(..., description="完成回测数")
     insufficient: int = Field(..., description="数据不足数")
     errors: int = Field(..., description="错误数")
+
+
+class StrategyBacktestRunRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=20, description="标的代码（股票或ETF）")
+    start_date: Optional[date] = Field(None, description="信号开始日期（含）")
+    end_date: Optional[date] = Field(None, description="信号结束日期（含）")
+    initial_capital: float = Field(1_000_000.0, gt=0, le=1_000_000_000_000.0)
+    side_cost_pct: float = Field(
+        0.0,
+        ge=0,
+        le=5,
+        description="每次买入或卖出的成本百分比；0表示未计成本",
+    )
+    lot_size: int = Field(100, ge=1, le=1_000_000, description="最小交易数量")
+
+
+class FormStrategyBacktestRunRequest(BaseModel):
+    strategy_id: str = Field(..., min_length=1, max_length=64, description="内置策略标识")
+    symbols: List[str] = Field(..., min_length=1, max_length=50, description="股票或ETF代码列表")
+    start_date: Optional[date] = Field(None, description="信号开始日期（含）")
+    end_date: Optional[date] = Field(None, description="信号结束日期（含）")
+    initial_capital: float = Field(1_000_000.0, gt=0, le=1_000_000_000_000.0)
+    side_cost_pct: float = Field(0.0, ge=0, le=5)
+    lot_size: int = Field(100, ge=1, le=1_000_000)
+    lookback_days: int = Field(20, ge=1, le=500)
+    moving_average_days: int = Field(20, ge=1, le=500)
+    fast_ma_days: int = Field(5, ge=1, le=500)
+    slow_ma_days: int = Field(20, ge=2, le=1000)
+    top_n: int = Field(1, ge=1, le=50)
+
+
+class ScriptStrategyBacktestRunRequest(BaseModel):
+    script: str = Field(..., min_length=1, max_length=50_000, description="DSA Python交易策略脚本")
+    symbols: List[str] = Field(..., min_length=1, max_length=50, description="脚本可访问的标的列表")
+    start_date: Optional[date] = Field(None, description="信号开始日期（含）")
+    end_date: Optional[date] = Field(None, description="信号结束日期（含）")
+    initial_capital: float = Field(1_000_000.0, gt=0, le=1_000_000_000_000.0)
+    side_cost_pct: float = Field(0.0, ge=0, le=5)
+    lot_size: int = Field(100, ge=1, le=1_000_000)
+
+
+class TrainedStrategyBacktestRunRequest(BaseModel):
+    run_id: str = Field(..., pattern=r"^[0-9a-f]{32}$", description="本地 MLflow Run ID")
+    model_id: str = Field(..., min_length=1, max_length=64)
+    strategy_id: str = Field(..., min_length=1, max_length=64)
+    start_date: date
+    end_date: date
+    topk: int = Field(50, ge=1, le=500, description="每次持有的模型评分前K只股票")
+    cost_bps: float = Field(15.0, ge=0, le=1000, description="按换手扣除的成本；1基点=0.01%")
+
+
+class TrainedStrategyBacktestMetrics(BaseModel):
+    days: int
+    total_return: float
+    benchmark_total_return: float
+    annual_return: float
+    benchmark_annual_return: float
+    annual_excess_return: float
+    information_ratio: Optional[float] = None
+    sharpe: Optional[float] = None
+    max_drawdown: float
+    avg_turnover: float
+    avg_position: float
+
+
+class TrainedStrategyBacktestPoint(BaseModel):
+    date: str
+    strategy_cumulative_return: float
+    benchmark_cumulative_return: float
+    drawdown: float
+    benchmark_drawdown: float
+    daily_return: float
+    benchmark_return: float
+    turnover: float
+    position_pct: float
+
+
+class TrainedStrategyBacktestResponse(BaseModel):
+    status: str
+    generated_at: str
+    run_id: str
+    model_id: str
+    model_label: str
+    strategy_id: str
+    strategy_label: str
+    provider: str
+    period: Dict[str, str]
+    parameters: Dict[str, Any]
+    metrics: TrainedStrategyBacktestMetrics
+    equity_curve: List[TrainedStrategyBacktestPoint] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class StrategyBacktestMetrics(BaseModel):
+    initial_capital: float
+    final_equity: float
+    total_return_pct: float
+    annualized_return_pct: float
+    benchmark_return_pct: float
+    excess_return_pct: float
+    max_drawdown_pct: float
+    benchmark_max_drawdown_pct: float
+    trade_count: int
+    exposure_pct: float
+    total_cost: float
+    turnover_pct: float
+    signal_count: int
+    executed_signal_count: int
+    skipped_signal_count: int
+    trading_days: int
+    annualized_volatility_pct: float = 0.0
+    sharpe_ratio: Optional[float] = None
+    alpha_pct: Optional[float] = None
+    beta: Optional[float] = None
+    win_rate_pct: float = 0.0
+
+
+class StrategyBacktestEquityPoint(BaseModel):
+    date: str
+    strategy_equity: float
+    benchmark_equity: float
+    strategy_return_pct: float
+    benchmark_return_pct: float
+    drawdown_pct: float
+    benchmark_drawdown_pct: float
+    position: str
+
+
+class StrategyBacktestTrade(BaseModel):
+    source_id: str
+    signal_date: str
+    execution_date: str
+    symbol: str
+    action: str
+    shares: int
+    price: float
+    notional: float
+    fee: float
+    reason: Optional[str] = None
+
+
+class StrategyBacktestResponse(BaseModel):
+    status: str
+    strategy_name: str
+    symbols: List[str] = Field(default_factory=list)
+    period: Optional[Dict[str, str]] = None
+    strategy: Dict[str, Any] = Field(default_factory=dict)
+    data_quality: Dict[str, Any] = Field(default_factory=dict)
+    metrics: StrategyBacktestMetrics
+    benchmark: Dict[str, Any] = Field(default_factory=dict)
+    assumptions: Dict[str, Any] = Field(default_factory=dict)
+    equity_curve: List[StrategyBacktestEquityPoint] = Field(default_factory=list)
+    trades: List[StrategyBacktestTrade] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    logs: List[str] = Field(default_factory=list)
+    script_check: Dict[str, Any] = Field(default_factory=dict)
 
 
 class BacktestResultItem(BaseModel):

@@ -17,6 +17,63 @@ def load_module():
 
 
 class AShareSourcesTest(unittest.TestCase):
+    def test_conservative_source_profile_rejects_unsafe_cli_values(self):
+        module = load_module()
+
+        module.validate_source_safety_profile(
+            sleep_seconds=2,
+            retries=1,
+            max_consecutive_failures=3,
+            max_requests=6000,
+            overlap_days=7,
+        )
+
+        unsafe_cases = [
+            ({"sleep_seconds": 1.9}, "sleep must be at least 2"),
+            ({"retries": 2}, "retries must be exactly 1"),
+            ({"max_consecutive_failures": 4}, "max_consecutive_failures must be between 1 and 3"),
+            ({"max_requests": 6001}, "max_requests must be between 1 and 6000"),
+            ({"overlap_days": 8}, "overlap_days must be between 0 and 7"),
+        ]
+        safe = {
+            "sleep_seconds": 2,
+            "retries": 1,
+            "max_consecutive_failures": 3,
+            "max_requests": 6000,
+            "overlap_days": 7,
+        }
+        for override, expected_message in unsafe_cases:
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError) as ctx:
+                    module.validate_source_safety_profile(**(safe | override))
+                self.assertIn(expected_message, str(ctx.exception))
+
+    def test_source_entrypoint_lock_rejects_a_second_downloader_process(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "source_download.lock.json"
+            owner = module.DailyUpdateLock(lock_path)
+            owner.acquire("first-source")
+            entrypoint = Mock(return_value=0)
+            try:
+                rc = module.run_source_entrypoint(
+                    "eastmoney",
+                    entrypoint,
+                    lock_path=lock_path,
+                )
+            finally:
+                owner.release()
+
+            accepted_rc = module.run_source_entrypoint(
+                "eastmoney",
+                entrypoint,
+                lock_path=lock_path,
+            )
+
+        self.assertEqual(rc, 3)
+        self.assertEqual(accepted_rc, 0)
+        entrypoint.assert_called_once_with()
+
     def test_normalizes_dates_symbols_and_chinese_daily_columns(self):
         module = load_module()
 
@@ -177,6 +234,114 @@ class AShareSourcesTest(unittest.TestCase):
         self.assertEqual(summary["fail"], 0)
         self.assertEqual(summary["ok"], 0)
         fetch_one.assert_not_called()
+
+    def test_remote_denial_trips_immediate_circuit_breaker(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            fetch_one = Mock(side_effect=RuntimeError("Remote end closed connection without response"))
+
+            summary = module.run_daily_download(
+                source_name="eastmoney",
+                output_dir=base / "eastmoney_qfq",
+                symbols=["000001", "000002", "000004"],
+                fetch_one=fetch_one,
+                start="2026-07-01",
+                end="2026-07-08",
+                incremental=True,
+                overlap_days=7,
+                sleep_seconds=0,
+                summary_dir=base,
+                runtime_status_dir=base / "runtime" / "status",
+            )
+
+        self.assertEqual(fetch_one.call_count, 1)
+        self.assertEqual(summary["fail"], 1)
+        self.assertEqual(summary["stopped_reason"], "source_denied")
+
+    def test_provider_denial_signatures_cover_common_http_errors(self):
+        module = load_module()
+
+        for message in [
+            "403 Client Error: Forbidden",
+            "429 Client Error: Too Many Requests",
+            "HTTP Error 403: Forbidden",
+            "10001011 黑名单用户",
+        ]:
+            with self.subTest(message=message):
+                self.assertTrue(module.is_source_denial_error(RuntimeError(message)))
+
+    def test_safety_stop_never_reports_a_success_exit_code(self):
+        module = load_module()
+
+        for reason in ["source_denied", "consecutive_failures", "request_budget"]:
+            with self.subTest(reason=reason):
+                self.assertNotEqual(
+                    module.download_exit_code({"ok": 10, "no_new": 5, "stopped_reason": reason}),
+                    0,
+                )
+
+        self.assertEqual(module.download_exit_code({"ok": 1, "no_new": 0, "stopped_reason": "completed"}), 0)
+
+    def test_default_failure_limit_stops_after_three_symbols(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            fetch_one = Mock(side_effect=RuntimeError("temporary network failure"))
+
+            summary = module.run_daily_download(
+                source_name="eastmoney",
+                output_dir=base / "eastmoney_qfq",
+                symbols=["000001", "000002", "000004", "000005"],
+                fetch_one=fetch_one,
+                start="2026-07-01",
+                end="2026-07-08",
+                incremental=True,
+                overlap_days=7,
+                sleep_seconds=0,
+                summary_dir=base,
+                runtime_status_dir=base / "runtime" / "status",
+            )
+
+        self.assertEqual(fetch_one.call_count, 3)
+        self.assertEqual(summary["stopped_reason"], "consecutive_failures")
+
+    def test_request_budget_stops_before_fetching_another_symbol(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            fetch_one = Mock(
+                return_value=pd.DataFrame(
+                    {
+                        "date": ["2026-07-08"],
+                        "open": [10.0],
+                        "close": [10.1],
+                        "high": [10.2],
+                        "low": [9.9],
+                        "volume": [1000],
+                    }
+                )
+            )
+
+            summary = module.run_daily_download(
+                source_name="eastmoney",
+                output_dir=base / "eastmoney_qfq",
+                symbols=["000001", "000002"],
+                fetch_one=fetch_one,
+                start="2026-07-01",
+                end="2026-07-08",
+                incremental=False,
+                overlap_days=7,
+                sleep_seconds=0,
+                max_requests=1,
+                summary_dir=base,
+                runtime_status_dir=base / "runtime" / "status",
+            )
+
+        self.assertEqual(fetch_one.call_count, 1)
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["requests_made"], 1)
+        self.assertEqual(summary["stopped_reason"], "request_budget")
 
     def test_load_symbols_file_is_explicit_universe_and_preserves_order(self):
         module = load_module()

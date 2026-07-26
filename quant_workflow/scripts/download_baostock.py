@@ -23,6 +23,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _daily_update_runtime import write_json_atomic  # noqa: E402
+from _ashare_sources import (  # noqa: E402
+    download_exit_code,
+    is_source_denial_error,
+    run_source_entrypoint,
+    validate_source_safety_profile,
+)
 from _paths import quant_data_root, reports_root  # noqa: E402
 
 
@@ -271,17 +277,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="20200101")
     parser.add_argument("--end", default="20250611")
-    parser.add_argument("--sleep", type=float, default=0.15)
+    parser.add_argument("--sleep", type=float, default=2.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true", help="Only download stocks not yet cached")
     parser.add_argument("--retry-empty", action="store_true", help="Retry symbols previously recorded as empty")
     parser.add_argument("--retry-timeout", action="store_true", help="Retry symbols previously recorded as timed out")
-    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=45, help="Seconds before aborting one symbol query")
-    parser.add_argument("--max-consecutive-failures", type=int, default=50)
+    parser.add_argument("--max-consecutive-failures", type=int, default=3)
+    parser.add_argument("--max-requests", type=int, default=6000)
     parser.add_argument("--symbols-file", type=Path, help="Optional text file of six-digit symbols to download")
     parser.add_argument("--incremental", action="store_true", help="Merge fresh rows into existing parquet files")
-    parser.add_argument("--overlap-days", type=int, default=30, help="Calendar-day overlap used in incremental mode")
+    parser.add_argument("--overlap-days", type=int, default=7, help="Calendar-day overlap used in incremental mode")
     parser.add_argument(
         "--adjustflag",
         default="2",
@@ -290,6 +297,16 @@ def main() -> int:
     )
     parser.add_argument("--out", type=Path, default=PARQUET_DIR)
     args = parser.parse_args()
+    try:
+        validate_source_safety_profile(
+            sleep_seconds=args.sleep,
+            retries=args.retries,
+            max_consecutive_failures=args.max_consecutive_failures,
+            max_requests=args.max_requests,
+            overlap_days=args.overlap_days,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     start = normalize_date(args.start)
     end = normalize_date(args.end)
@@ -318,11 +335,16 @@ def main() -> int:
     login_result = bs.login()
     print(f"Baostock login: {login_result.error_code} {login_result.error_msg}", flush=True)
     if login_result.error_code != "0":
+        blacklisted = login_result.error_code == "10001011" or "黑名单" in str(login_result.error_msg)
         write_download_status(
             {
                 "source": "baostock",
                 "status": "failed",
-                "failure_type": "login_failed",
+                "failure_type": "source_blacklisted" if blacklisted else "login_failed",
+                "manual_review_required": blacklisted,
+                "requests_made": 0,
+                "request_budget": args.max_requests,
+                "stopped_reason": "source_denied" if blacklisted else "login_failed",
                 "total": len(codes),
                 "ok": 0,
                 "no_new": 0,
@@ -340,6 +362,8 @@ def main() -> int:
     fail = 0
     no_new = 0
     consecutive_failures = 0
+    requests_made = 0
+    stopped_reason = "completed"
     failures: list[tuple[str, str]] = []
     t0 = time.time()
 
@@ -380,6 +404,15 @@ def main() -> int:
                         )
                     continue
 
+                if requests_made >= args.max_requests:
+                    stopped_reason = "request_budget"
+                    print(
+                        f"Stopping after reaching the {args.max_requests} request budget.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
+                requests_made += 1
                 df = query_one(bs, bs_code, symbol_start, end, args.adjustflag, args.retries, args.timeout)
                 df = normalize_frame(df)
                 if df.empty:
@@ -388,6 +421,7 @@ def main() -> int:
                         consecutive_failures = 0
                         if no_new <= 5 or no_new % 50 == 0:
                             print(f"NO_NEW {sym} ({bs_code}) from {symbol_start} to {end}", flush=True)
+                        time.sleep(args.sleep)
                         continue
                     raise EmptyResult("empty result")
 
@@ -422,7 +456,16 @@ def main() -> int:
                 failures.append((sym, bs_code, str(exc)[:160]))
                 if fail <= 5 or fail % 50 == 0:
                     print(f"FAIL {sym} ({bs_code}): {exc}", file=sys.stderr, flush=True)
+                if is_source_denial_error(exc):
+                    stopped_reason = "source_denied"
+                    print(
+                        "Stopping immediately because Baostock denied the source request.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
                 if consecutive_failures >= args.max_consecutive_failures:
+                    stopped_reason = "consecutive_failures"
                     print(
                         f"Stopping after {consecutive_failures} consecutive failures.",
                         file=sys.stderr,
@@ -444,29 +487,30 @@ def main() -> int:
         fail_log.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Failure details saved to {fail_log}", flush=True)
 
-    status = "ok" if ok > 0 or no_new > 0 else "failed"
-    write_download_status(
-        {
-            "source": "baostock",
-            "status": status,
-            "output_dir": str(out_dir),
-            "start": start,
-            "end": end,
-            "total": len(codes),
-            "ok": ok,
-            "no_new": no_new,
-            "empty": empty,
-            "fail": fail,
-            "seconds": round(elapsed, 2),
-            "failures": [
-                {"symbol": symbol, "provider_symbol": provider_symbol, "error": error}
-                for symbol, provider_symbol, error in failures[:100]
-            ],
-        }
-    )
+    summary = {
+        "source": "baostock",
+        "output_dir": str(out_dir),
+        "start": start,
+        "end": end,
+        "total": len(codes),
+        "ok": ok,
+        "no_new": no_new,
+        "empty": empty,
+        "fail": fail,
+        "requests_made": requests_made,
+        "request_budget": args.max_requests,
+        "stopped_reason": stopped_reason,
+        "seconds": round(elapsed, 2),
+        "failures": [
+            {"symbol": symbol, "provider_symbol": provider_symbol, "error": error}
+            for symbol, provider_symbol, error in failures[:100]
+        ],
+    }
+    summary["status"] = "ok" if download_exit_code(summary) == 0 else "failed"
+    write_download_status(summary)
 
-    return 0 if ok > 0 or no_new > 0 else 1
+    return download_exit_code(summary)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_source_entrypoint("baostock", main))

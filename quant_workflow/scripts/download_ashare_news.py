@@ -19,7 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _ashare_sources import load_symbols  # noqa: E402
+from _ashare_sources import is_source_denial_error, load_symbols, run_source_entrypoint  # noqa: E402
 from _daily_update_runtime import write_json_atomic  # noqa: E402
 from _paths import quant_data_root, reports_root  # noqa: E402
 from market_data_clients import fetch_eastmoney_news_text, parse_eastmoney_news_jsonp  # noqa: E402
@@ -48,6 +48,8 @@ def run_download(
     selected = symbols[:limit] if limit > 0 else symbols
     ok = fail = 0
     failures: list[dict[str, str]] = []
+    consecutive_failures = 0
+    stopped_reason = "completed"
     started = time.time()
     for symbol in selected:
         try:
@@ -74,9 +76,17 @@ def run_download(
                 },
             )
             ok += 1
+            consecutive_failures = 0
         except Exception as exc:
             fail += 1
+            consecutive_failures += 1
             failures.append({"symbol": symbol, "error": str(exc)[:300]})
+            if is_source_denial_error(exc):
+                stopped_reason = "source_denied"
+                break
+            if consecutive_failures >= 3:
+                stopped_reason = "consecutive_failures"
+                break
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
@@ -87,6 +97,7 @@ def run_download(
         "total": len(selected),
         "ok": ok,
         "fail": fail,
+        "stopped_reason": stopped_reason,
         "seconds": round(time.time() - started, 2),
         "failures": failures,
     }
@@ -101,14 +112,20 @@ def main() -> int:
     parser.add_argument("--symbols-file", type=Path)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--page-size", type=int, default=10)
-    parser.add_argument("--sleep", type=float, default=0.1)
+    parser.add_argument("--sleep", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=20)
-    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--use-system-proxy", action="store_true")
     parser.add_argument("--raw-dir", type=Path, default=RAW_ROOT)
     parser.add_argument("--summary-dir", type=Path, default=SUMMARY_ROOT)
     args = parser.parse_args()
     validate_bounded_request(symbols_file=args.symbols_file, limit=args.limit)
+    if args.sleep < 2:
+        parser.error("sleep must be at least 2 seconds")
+    if args.retries != 1:
+        parser.error("retries must be exactly 1")
+    if args.limit > 6000:
+        parser.error("limit must be at most 6000")
     symbols = load_symbols(args.symbols_file)
 
     session = requests.Session()
@@ -146,8 +163,8 @@ def main() -> int:
         session.close()
 
     print(f"A-share news download: OK={result['ok']} FAIL={result['fail']}")
-    return 0 if result["ok"] > 0 else 1
+    return 0 if result["ok"] > 0 and result["stopped_reason"] == "completed" else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_source_entrypoint("eastmoney_news", main))

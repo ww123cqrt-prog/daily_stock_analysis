@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { BarChart3, Bell, BriefcaseBusiness, Compass, FlaskConical, Home, LogOut, MessageSquareQuote, Search, Settings2, Workflow } from 'lucide-react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
 import { useAgentChatStore } from '../../stores/agentChatStore';
@@ -43,6 +43,7 @@ const NAV_ITEMS: NavItem[] = [
 export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNavigate, variant = 'default' }) => {
   const { authEnabled, logout } = useAuth();
   const { t } = useUiLanguage();
+  const location = useLocation();
   const completionBadge = useAgentChatStore((state) => state.completionBadge);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [showAlphaSiftNav, setShowAlphaSiftNav] = useState(false);
@@ -118,15 +119,17 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
         {navItems.map(({ key, labelKey, to, icon: Icon, exact, badge }) => {
           const label = t(labelKey);
           if (key === 'experiments') {
+            const isActive = location.pathname === '/experiments' || location.pathname.startsWith('/experiments/');
             return (
               <a
                 key={key}
                 href={to}
                 onClick={onNavigate}
                 aria-label={label}
-                className={itemInteractiveClass}
+                aria-current={isActive ? 'page' : undefined}
+                className={cn(itemInteractiveClass, isActive ? itemActiveClass : '')}
               >
-                <Icon className={cn(itemIconClass, 'text-current')} />
+                <Icon className={cn(itemIconClass, isActive ? 'text-[var(--nav-icon-active)]' : 'text-current')} />
                 {!collapsed ? <span className={itemLabelClass}>{label}</span> : null}
               </a>
             );
@@ -180,7 +183,6 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
           collapsed={collapsed}
           wrapperClassName="w-full"
           triggerClassName={itemInteractiveClass}
-          triggerActiveClassName={itemActiveClass}
           iconClassName={itemIconClass}
           labelClassName={itemLabelClass}
         />

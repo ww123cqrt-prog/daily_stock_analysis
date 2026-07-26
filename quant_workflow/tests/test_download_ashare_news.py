@@ -48,3 +48,24 @@ class DownloadAshareNewsTest(unittest.TestCase):
         self.assertEqual(payload["raw_text"], raw_text)
         self.assertEqual(len(payload["raw_text_sha256"]), 64)
         self.assertEqual(payload["payload"]["result"]["cmsArticleWebOld"][0]["title"], "news")
+
+    def test_provider_denial_stops_news_download_after_one_request(self):
+        calls = []
+
+        def denied(symbol, page_size):
+            calls.append((symbol, page_size))
+            raise RuntimeError("429 Client Error: Too Many Requests")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.module.run_download(
+                symbols=["600519", "000001", "000002"],
+                raw_root=root / "raw" / "ashare_news",
+                summary_dir=root / "reports" / "download_state",
+                limit=3,
+                sleep_seconds=0,
+                fetch_text=denied,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["stopped_reason"], "source_denied")

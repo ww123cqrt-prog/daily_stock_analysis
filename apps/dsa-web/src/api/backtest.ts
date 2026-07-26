@@ -7,11 +7,95 @@ import type {
   BacktestResultItem,
   PerformanceMetrics,
   BacktestPhaseFilter,
+  StrategyBacktestResponse,
+  StrategyBacktestRunRequest,
+  FormStrategyBacktestRunRequest,
+  ScriptStrategyBacktestRunRequest,
+  TrainedStrategyBacktestResponse,
+  TrainedStrategyBacktestRunRequest,
 } from '../types/backtest';
 
 // ============ API ============
 
 export const backtestApi = {
+  runTrainedStrategy: async (
+    params: TrainedStrategyBacktestRunRequest,
+  ): Promise<TrainedStrategyBacktestResponse> => {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/trained',
+      {
+        run_id: params.runId,
+        model_id: params.modelId,
+        strategy_id: params.strategyId,
+        start_date: params.startDate,
+        end_date: params.endDate,
+        topk: params.topk,
+        cost_bps: params.costBps,
+      },
+    );
+    return toCamelCase<TrainedStrategyBacktestResponse>(response.data);
+  },
+
+  runFormStrategy: async (
+    params: FormStrategyBacktestRunRequest,
+  ): Promise<StrategyBacktestResponse> => {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/run',
+      {
+        strategy_id: params.strategyId,
+        symbols: params.symbols,
+        start_date: params.startDate || undefined,
+        end_date: params.endDate || undefined,
+        initial_capital: params.initialCapital,
+        side_cost_pct: params.sideCostPct,
+        lot_size: params.lotSize,
+        lookback_days: params.lookbackDays,
+        moving_average_days: params.movingAverageDays,
+        fast_ma_days: params.fastMaDays,
+        slow_ma_days: params.slowMaDays,
+        top_n: params.topN,
+      },
+    );
+    return toCamelCase<StrategyBacktestResponse>(response.data);
+  },
+
+  runScriptStrategy: async (
+    params: ScriptStrategyBacktestRunRequest,
+  ): Promise<StrategyBacktestResponse> => {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/script',
+      {
+        script: params.script,
+        symbols: params.symbols,
+        start_date: params.startDate || undefined,
+        end_date: params.endDate || undefined,
+        initial_capital: params.initialCapital,
+        side_cost_pct: params.sideCostPct,
+        lot_size: params.lotSize,
+      },
+    );
+    return toCamelCase<StrategyBacktestResponse>(response.data);
+  },
+
+  runStrategy: async (
+    params: StrategyBacktestRunRequest,
+  ): Promise<StrategyBacktestResponse> => {
+    const requestData: Record<string, unknown> = {
+      code: params.code,
+      initial_capital: params.initialCapital,
+      side_cost_pct: params.sideCostPct,
+      lot_size: params.lotSize,
+    };
+    if (params.startDate) requestData.start_date = params.startDate;
+    if (params.endDate) requestData.end_date = params.endDate;
+
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/dsa-signal',
+      requestData,
+    );
+    return toCamelCase<StrategyBacktestResponse>(response.data);
+  },
+
   /**
    * Trigger backtest evaluation
    */

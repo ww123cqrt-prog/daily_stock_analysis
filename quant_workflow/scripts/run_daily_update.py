@@ -214,12 +214,15 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
     stages: list[Stage] = []
 
     if not args.skip_download:
-        download_specs = [
-            ("download_baostock", "download_baostock.py", False, False),
-            ("download_eastmoney", "download_eastmoney.py", args.skip_eastmoney, False),
-            ("download_akshare", "download_akshare.py", args.skip_akshare, False),
-        ]
-        for stage_name, script_name, skip, required in download_specs:
+        selected_source = getattr(args, "ashare_source", "none")
+        download_specs = {
+            "baostock": ("download_baostock", "download_baostock.py", args.skip_baostock, False),
+            "eastmoney": ("download_eastmoney", "download_eastmoney.py", args.skip_eastmoney, False),
+            "akshare": ("download_akshare", "download_akshare.py", args.skip_akshare, False),
+        }
+        selected_spec = download_specs.get(selected_source)
+        selected_specs = [selected_spec] if selected_spec is not None else []
+        for stage_name, script_name, skip, required in selected_specs:
             if skip:
                 continue
             command = _script(script_name) + [
@@ -229,6 +232,7 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 "--timeout", str(args.timeout),
                 "--retries", str(args.retries),
                 "--max-consecutive-failures", str(args.max_consecutive_failures),
+                "--max-requests", str(args.max_requests),
                 "--end", str(args.end),
             ]
             if args.limit > 0:
@@ -498,13 +502,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the daily A-share data update pipeline.")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--overlap-days", type=int, default=45)
-    parser.add_argument("--sleep", type=float, default=0.3)
+    parser.add_argument(
+        "--ashare-source",
+        choices=["none", "baostock", "eastmoney", "akshare"],
+        default="none",
+        help="Run at most one A-share history source; none keeps network history quarantined.",
+    )
+    parser.add_argument("--overlap-days", type=int, default=7)
+    parser.add_argument("--sleep", type=float, default=2.0)
     parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--max-consecutive-failures", type=int, default=50)
+    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--max-consecutive-failures", type=int, default=3)
+    parser.add_argument("--max-requests", type=int, default=6000)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"))
+    parser.add_argument("--skip-baostock", action="store_true")
     parser.add_argument("--skip-eastmoney", action="store_true")
     parser.add_argument("--skip-akshare", action="store_true")
     parser.add_argument("--skip-global-daily", action="store_true")
@@ -512,18 +524,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-snapshot-validation", action="store_true")
     parser.add_argument("--use-system-proxy", action="store_true")
     parser.add_argument("--snapshot-limit", type=int, default=50)
-    parser.add_argument("--news-limit", type=int, default=50)
+    parser.add_argument("--news-limit", type=int, default=0)
     parser.add_argument("--overlap-sample", type=int, default=0)
     parser.add_argument("--merged-sample", type=int, default=0)
     parser.add_argument("--min-source-coverage", type=float, default=0.8)
     parser.add_argument("--benchmark-cache-dir", type=Path, default=None)
-    parser.add_argument("--benchmark-offline", action="store_true")
+    parser.add_argument(
+        "--benchmark-offline",
+        dest="benchmark_offline",
+        action="store_true",
+        default=True,
+        help="Use validated local benchmark caches only (default).",
+    )
+    parser.add_argument(
+        "--allow-benchmark-network",
+        dest="benchmark_offline",
+        action="store_false",
+        help="Explicitly allow benchmark fallback requests; never used by the scheduled or web profile.",
+    )
     parser.add_argument("--quality-min-calendar-days", type=int, default=252)
     parser.add_argument("--quality-min-instruments", type=int, default=100)
     parser.add_argument("--skip-if-robust-training", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.overlap_days < 0 or args.overlap_days > 7:
+        parser.error("--overlap-days must be between 0 and 7 for scheduled source safety")
+    if args.sleep < 2.0:
+        parser.error("--sleep must be at least 2 seconds for scheduled source safety")
+    if args.retries != 1:
+        parser.error("--retries must be 1 for scheduled source safety")
+    if args.max_consecutive_failures < 1 or args.max_consecutive_failures > 3:
+        parser.error("--max-consecutive-failures must be between 1 and 3")
+    if args.max_requests < 1 or args.max_requests > 6000:
+        parser.error("--max-requests must be between 1 and 6000")
+    return args
 
 
 def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:

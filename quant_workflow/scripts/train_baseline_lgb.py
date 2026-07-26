@@ -37,6 +37,7 @@ from _paths import (  # noqa: E402
     workflow_root,
 )
 from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
+from generate_csi300 import load_csi300_symbols as load_cached_csi300_symbols  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -49,6 +50,7 @@ EXPERIMENT_RUNS = REPORT_DIR / "experiment_runs.jsonl"
 MLRUNS_DIR = mlruns_root()
 MLFLOW_TRACKING_URI = f"file://{MLRUNS_DIR}"
 QUANT_DATA = quant_data_root()
+STOCK_LIST_PATH = QUANT_DATA / "stock_lists.json"
 CANONICAL_DATA_DIR = qlib_provider_uri()
 CLEANED_DATA_DIR = qlib_provider_uri("cleaned")
 PROVIDER_URIS = {
@@ -115,13 +117,12 @@ def build_csi300_lines(symbols: Iterable[str], ranges: dict[str, tuple[str, str]
     return lines
 
 
-def load_csi300_symbols() -> list[str]:
-    if not ASTOCK_PROJECT.exists():
-        raise FileNotFoundError(f"Missing project for CSI300 universe: {ASTOCK_PROJECT}")
-    sys.path.insert(0, str(ASTOCK_PROJECT))
-    from data_fetcher.universe import csi300
-
-    return list(csi300())
+def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
+    return load_cached_csi300_symbols(
+        stock_list_path,
+        ASTOCK_PROJECT,
+        allow_network_fallback=False,
+    )
 
 
 def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):

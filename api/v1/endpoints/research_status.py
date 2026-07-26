@@ -60,7 +60,7 @@ CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
 QLIB_RESEARCH_REPORTS = {
     "model_explainability": ("模型效果深度解释", "qlib_research_model_explainability_latest.json"),
     "backtest_detail": ("回测详细分解", "qlib_research_backtest_detail_latest.json"),
-    "model_comparison": ("多模型/多实验对比", "qlib_research_model_comparison_latest.json"),
+    "model_comparison": ("多选股模型/多实验对比", "qlib_research_model_comparison_latest.json"),
     "factor_analysis": ("因子挖掘辅助", "qlib_research_factor_analysis_latest.json"),
     "rolling_training": ("滚动训练计划", "qlib_research_rolling_training_latest.json"),
     "risk_model": ("风险模型集成诊断", "qlib_research_risk_model_latest.json"),
@@ -814,8 +814,8 @@ def _function_inventory_payload() -> list[Dict[str, Any]]:
             "route": "/backtest",
             "owner": "daily_stock_analysis",
             "coverage": "已有 DSA 历史建议与后续走势一致性展示。",
-            "gaps": "需要与 Qlib 模型回测结果继续统一解释口径。",
-            "next": "在回测页继续拆分 DSA 准确性和 Qlib 策略结果。",
+            "gaps": "需要与 Qlib 选股模型和交易策略组合的回测结果继续统一解释口径。",
+            "next": "在回测页继续拆分 DSA 准确性和 Qlib 交易策略回测结果。",
             "verification": "BacktestPage/API 测试 + 浏览器 smoke。",
         },
         {
@@ -855,7 +855,7 @@ def _function_inventory_payload() -> list[Dict[str, Any]]:
             "coverage": (
                 "网页白名单覆盖下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、"
                 "数据治理盘点和 dry-run 清理预案、市场状态、现金仓位回测、china-astock 指标报告、"
-                "china-astock 对比、策略优化预演和 baseline 训练；"
+                "china-astock 对比、交易策略优化预演和选股模型基线训练；"
                 "report_data_hygiene.py 可从网页生成 inventory 与 dry-run cleanup plan；"
                 "add_index_benchmark.py 与 generate_csi300.py 已作为 provider 维护预演接入网页任务中心，强制 dry-run。"
             ),

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root, reports_root  # noqa: E402
-from market_data_clients import compact_date, normalize_date, normalize_symbol, proxy_bypass_env  # noqa: E402
+from _daily_update_runtime import DailyUpdateLock, LockHeldError  # noqa: E402
+from market_data_clients import normalize_date, normalize_symbol  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
@@ -54,6 +55,81 @@ COLUMN_ALIASES = {
 
 class EmptyResult(RuntimeError):
     """The source returned no usable daily bars for the requested symbol."""
+
+
+def is_source_denial_error(exc: BaseException) -> bool:
+    """Return true for provider responses that must stop the whole source run."""
+    message = str(exc).lower()
+    denial_markers = (
+        "10001011",
+        "黑名单",
+        "remote end closed connection without response",
+        "empty reply from server",
+        "too many requests",
+        "status code 403",
+        "status code 429",
+        "http 403",
+        "http 429",
+        "403 client error",
+        "429 client error",
+        "http error 403",
+        "http error 429",
+    )
+    return any(marker in message for marker in denial_markers)
+
+
+def download_exit_code(summary: Mapping[str, Any]) -> int:
+    """Return non-zero whenever a safety stop left the source run incomplete."""
+    if str(summary.get("stopped_reason") or "completed") != "completed":
+        return 1
+    return 0 if int(summary.get("ok") or 0) > 0 or int(summary.get("no_new") or 0) > 0 else 1
+
+
+def validate_source_safety_profile(
+    *,
+    sleep_seconds: float,
+    retries: int,
+    max_consecutive_failures: int,
+    max_requests: int,
+    overlap_days: int,
+) -> None:
+    """Reject settings that can create an unsafe provider request burst."""
+    if sleep_seconds < 2:
+        raise ValueError("sleep must be at least 2 seconds")
+    if retries != 1:
+        raise ValueError("retries must be exactly 1")
+    if not 1 <= max_consecutive_failures <= 3:
+        raise ValueError("max_consecutive_failures must be between 1 and 3")
+    if not 1 <= max_requests <= 6000:
+        raise ValueError("max_requests must be between 1 and 6000")
+    if not 0 <= overlap_days <= 7:
+        raise ValueError("overlap_days must be between 0 and 7")
+
+
+def run_source_entrypoint(
+    source_name: str,
+    entrypoint: Callable[[], int],
+    *,
+    lock_path: Path | None = None,
+) -> int:
+    """Run one provider downloader while holding the shared source-process lock."""
+    path = lock_path or (reports_root() / "runtime" / "status" / "source_download.lock.json")
+    lock = DailyUpdateLock(path)
+    run_id = f"{source_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    try:
+        lock.acquire(run_id)
+    except LockHeldError as exc:
+        active = str(exc.owner.get("run_id") or "unknown")
+        print(
+            f"Source downloader not started: another source process is active ({active}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
+    try:
+        return int(entrypoint())
+    finally:
+        lock.release()
 
 
 def load_symbols_file(path: Path) -> list[str]:
@@ -180,7 +256,8 @@ def run_daily_download(
     summary_dir: Path | None = None,
     runtime_status_dir: Path | None = None,
     retry_failed: bool = False,
-    max_consecutive_failures: int = 50,
+    max_consecutive_failures: int = 3,
+    max_requests: int = 6000,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_root = reports_root()
@@ -196,6 +273,8 @@ def run_daily_download(
     no_new = 0
     failures: list[dict[str, str]] = []
     consecutive_failures = 0
+    requests_made = 0
+    stopped_reason = "completed"
     total = len(symbols)
     t0 = time.time()
 
@@ -237,11 +316,17 @@ def run_daily_download(
             continue
 
         try:
+            if requests_made >= max_requests:
+                stopped_reason = "request_budget"
+                print(f"Stopping after reaching the {max_requests} request budget.", file=sys.stderr, flush=True)
+                break
+            requests_made += 1
             fresh = normalize_daily_frame(fetch_one(symbol, symbol_start, normalize_date(end)))
             if fresh.empty:
                 if incremental and out_path.exists():
                     no_new += 1
                     consecutive_failures = 0
+                    time.sleep(sleep_seconds)
                     continue
                 raise EmptyResult("empty result")
 
@@ -271,7 +356,12 @@ def run_daily_download(
             failures.append({"symbol": symbol, "error": str(exc)[:200]})
             if fail <= 5 or fail % 50 == 0:
                 print(f"FAIL {symbol}: {exc}", file=sys.stderr, flush=True)
+            if is_source_denial_error(exc):
+                stopped_reason = "source_denied"
+                print("Stopping immediately because the provider denied the source request.", file=sys.stderr, flush=True)
+                break
             if consecutive_failures >= max_consecutive_failures:
+                stopped_reason = "consecutive_failures"
                 print(
                     f"Stopping after {consecutive_failures} consecutive failures.",
                     file=sys.stderr,
@@ -291,6 +381,9 @@ def run_daily_download(
         "no_new": no_new,
         "empty": empty,
         "fail": fail,
+        "requests_made": requests_made,
+        "request_budget": max_requests,
+        "stopped_reason": stopped_reason,
         "seconds": round(elapsed, 2),
         "failures": failures[:100],
     }

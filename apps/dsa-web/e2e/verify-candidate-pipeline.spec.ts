@@ -15,9 +15,9 @@ test('shows the five-model candidate pipeline controls', async ({ page }) => {
   page.on('pageerror', (error) => consoleErrors.push(error.message));
 
   await page.goto('/workflow');
-  await expect(page.getByText('运行五模型完整量化流程', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('运行五模型完整量化流程 数据版本')).toBeVisible();
-  await expect(page.getByLabel('运行五模型完整量化流程 只做小样本预演')).toBeVisible();
-  await expect(page.getByRole('button', { name: '运行 运行五模型完整量化流程' })).toBeVisible();
+  await expect(page.getByText('运行五个选股模型候选流程', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('运行五个选股模型候选流程 数据版本')).toBeVisible();
+  await expect(page.getByLabel('运行五个选股模型候选流程 只做小样本预演')).toBeVisible();
+  await expect(page.getByRole('button', { name: '运行 运行五个选股模型候选流程' })).toBeVisible();
   expect(consoleErrors).toEqual([]);
 });

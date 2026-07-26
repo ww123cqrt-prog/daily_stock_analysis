@@ -25,6 +25,170 @@ export interface BacktestRunResponse {
   errors: number;
 }
 
+export interface StrategyBacktestRunRequest {
+  code: string;
+  startDate?: string;
+  endDate?: string;
+  initialCapital: number;
+  sideCostPct: number;
+  lotSize: number;
+}
+
+export type FormStrategyId = 'momentum_rotation' | 'dual_moving_average' | 'buy_and_hold';
+
+export interface FormStrategyBacktestRunRequest {
+  strategyId: FormStrategyId;
+  symbols: string[];
+  startDate?: string;
+  endDate?: string;
+  initialCapital: number;
+  sideCostPct: number;
+  lotSize: number;
+  lookbackDays: number;
+  movingAverageDays: number;
+  fastMaDays: number;
+  slowMaDays: number;
+  topN: number;
+}
+
+export interface ScriptStrategyBacktestRunRequest {
+  script: string;
+  symbols: string[];
+  startDate?: string;
+  endDate?: string;
+  initialCapital: number;
+  sideCostPct: number;
+  lotSize: number;
+}
+
+export interface TrainedStrategyBacktestRunRequest {
+  runId: string;
+  modelId: string;
+  strategyId: string;
+  startDate: string;
+  endDate: string;
+  topk: number;
+  costBps: number;
+}
+
+export interface TrainedStrategyBacktestMetrics {
+  days: number;
+  totalReturn: number;
+  benchmarkTotalReturn: number;
+  annualReturn: number;
+  benchmarkAnnualReturn: number;
+  annualExcessReturn: number;
+  informationRatio?: number | null;
+  sharpe?: number | null;
+  maxDrawdown: number;
+  avgTurnover: number;
+  avgPosition: number;
+}
+
+export interface TrainedStrategyBacktestPoint {
+  date: string;
+  strategyCumulativeReturn: number;
+  benchmarkCumulativeReturn: number;
+  drawdown: number;
+  benchmarkDrawdown: number;
+  dailyReturn: number;
+  benchmarkReturn: number;
+  turnover: number;
+  positionPct: number;
+}
+
+export interface TrainedStrategyBacktestResponse {
+  status: string;
+  generatedAt: string;
+  runId: string;
+  modelId: string;
+  modelLabel: string;
+  strategyId: string;
+  strategyLabel: string;
+  provider: string;
+  period: { startDate: string; endDate: string };
+  parameters: {
+    startDate: string;
+    endDate: string;
+    topk: number;
+    costBps: number;
+  };
+  metrics: TrainedStrategyBacktestMetrics;
+  equityCurve: TrainedStrategyBacktestPoint[];
+  warnings: string[];
+}
+
+export interface StrategyBacktestMetrics {
+  initialCapital: number;
+  finalEquity: number;
+  totalReturnPct: number;
+  annualizedReturnPct: number;
+  benchmarkReturnPct: number;
+  excessReturnPct: number;
+  maxDrawdownPct: number;
+  benchmarkMaxDrawdownPct: number;
+  tradeCount: number;
+  exposurePct: number;
+  totalCost: number;
+  turnoverPct: number;
+  signalCount: number;
+  executedSignalCount: number;
+  skippedSignalCount: number;
+  tradingDays: number;
+  annualizedVolatilityPct: number;
+  sharpeRatio?: number | null;
+  alphaPct?: number | null;
+  beta?: number | null;
+  winRatePct: number;
+}
+
+export interface StrategyBacktestEquityPoint {
+  date: string;
+  strategyEquity: number;
+  benchmarkEquity: number;
+  strategyReturnPct: number;
+  benchmarkReturnPct: number;
+  drawdownPct: number;
+  benchmarkDrawdownPct: number;
+  position: string;
+}
+
+export interface StrategyBacktestTrade {
+  sourceId: string;
+  signalDate: string;
+  executionDate: string;
+  symbol: string;
+  action: 'buy' | 'sell' | string;
+  shares: number;
+  price: number;
+  notional: number;
+  fee: number;
+  reason?: string;
+}
+
+export interface StrategyBacktestResponse {
+  status: string;
+  strategyName: string;
+  symbols: string[];
+  period?: { startDate: string; endDate: string };
+  strategy: Record<string, unknown>;
+  dataQuality: Record<string, unknown>;
+  metrics: StrategyBacktestMetrics;
+  benchmark: Record<string, unknown>;
+  assumptions: {
+    execution?: string;
+    initialCapital?: number;
+    sideCostPct?: number;
+    lotSize?: number;
+    [key: string]: unknown;
+  };
+  equityCurve: StrategyBacktestEquityPoint[];
+  trades: StrategyBacktestTrade[];
+  warnings: string[];
+  logs: string[];
+  scriptCheck: Record<string, unknown>;
+}
+
 // ============ Result Item ============
 
 export interface BacktestResultItem {

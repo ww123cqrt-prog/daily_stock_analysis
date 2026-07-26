@@ -39,6 +39,14 @@ vi.mock('./pages/WorkflowPage', () => ({
   default: () => <div data-testid="workflow-page">Workflow</div>,
 }));
 
+vi.mock('./pages/DataPage', () => ({
+  default: () => <div data-testid="data-page">Data</div>,
+}));
+
+vi.mock('./pages/OtherPage', () => ({
+  default: () => <div data-testid="other-page">Other</div>,
+}));
+
 vi.mock('./pages/ChatPage', () => ({
   default: () => {
     if (chatPageShouldThrow.value) {
@@ -148,6 +156,19 @@ describe('App routing behavior', () => {
 
     expect(await screen.findByTestId('workflow-page')).toBeInTheDocument();
     expect(setCurrentRoute).toHaveBeenCalledWith('/workflow');
+  });
+
+  it('renders the separate data and other quant task routes', async () => {
+    window.history.pushState({}, '', '/data');
+    const { unmount } = render(<App />);
+    expect(await screen.findByTestId('data-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/data');
+
+    unmount();
+    window.history.pushState({}, '', '/other');
+    render(<App />);
+    expect(await screen.findByTestId('other-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/other');
   });
 
   it('redirects authenticated login visits back to the home page', async () => {

@@ -75,7 +75,7 @@ models:
 
 strategies:
   - id: baseline_daily
-    label: 每日 Top50 基线
+    label: 每日 TopK 等权基线
     kwargs:
       rebalance_freq: 1
       turnover_cap: 1.0

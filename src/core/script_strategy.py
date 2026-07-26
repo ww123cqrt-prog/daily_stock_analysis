@@ -1,0 +1,344 @@
+# -*- coding: utf-8 -*-
+"""Static checks and deterministic execution for the DSA Python strategy API."""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass
+from datetime import date
+import math
+import statistics
+from types import MappingProxyType
+from typing import Any, Sequence
+
+from src.core.strategy_backtest import PriceBar, TargetAllocation
+
+
+SCRIPT_API_VERSION = "dsa-script-v1"
+MAX_SCRIPT_BYTES = 50_000
+MAX_AST_NODES = 5_000
+_FORBIDDEN_CALLS = {
+    "breakpoint",
+    "compile",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "hasattr",
+    "help",
+    "input",
+    "locals",
+    "open",
+    "setattr",
+    "delattr",
+    "vars",
+    "__import__",
+}
+_FORBIDDEN_NODES = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.ClassDef,
+    ast.Global,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Nonlocal,
+    ast.With,
+)
+
+
+class ScriptValidationError(ValueError):
+    pass
+
+
+class ScriptExecutionError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class StrategyScriptResult:
+    allocations: tuple[TargetAllocation, ...]
+    logs: tuple[str, ...]
+    check: dict[str, Any]
+
+
+def validate_strategy_script(source: str) -> dict[str, Any]:
+    encoded = str(source or "").encode("utf-8")
+    if not encoded:
+        raise ScriptValidationError("script must not be empty")
+    if len(encoded) > MAX_SCRIPT_BYTES:
+        raise ScriptValidationError(f"script must not exceed {MAX_SCRIPT_BYTES} bytes")
+    try:
+        tree = ast.parse(source, filename="strategy.py", mode="exec")
+    except SyntaxError as exc:
+        raise ScriptValidationError(f"syntax error at line {exc.lineno}: {exc.msg}") from exc
+    nodes = list(ast.walk(tree))
+    if len(nodes) > MAX_AST_NODES:
+        raise ScriptValidationError("script is too complex")
+
+    function_names = {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if "on_bar" not in function_names:
+        raise ScriptValidationError("script must define on_bar(context, data)")
+    for node in nodes:
+        if isinstance(node, _FORBIDDEN_NODES):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                raise ScriptValidationError("imports are not allowed; math and statistics are provided")
+            raise ScriptValidationError(f"{type(node).__name__} is not allowed")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise ScriptValidationError("private attributes are not allowed")
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise ScriptValidationError("private names are not allowed")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_CALLS:
+            raise ScriptValidationError(f"{node.func.id} is not allowed")
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef):
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
+            continue
+        raise ScriptValidationError("top-level code is not allowed; define initialize and on_bar functions")
+    return {
+        "status": "passed",
+        "api_version": SCRIPT_API_VERSION,
+        "ast_nodes": len(nodes),
+        "script_bytes": len(encoded),
+    }
+
+
+def _normalize_history(
+    bars: Sequence[PriceBar],
+    symbols: Sequence[str],
+) -> tuple[tuple[str, ...], list[date], dict[str, dict[date, PriceBar]]]:
+    normalized_symbols = tuple(str(symbol).strip().upper() for symbol in symbols)
+    if not normalized_symbols or len(set(normalized_symbols)) != len(normalized_symbols):
+        raise ValueError("symbols must be non-empty and unique")
+    by_symbol: dict[str, dict[date, PriceBar]] = {symbol: {} for symbol in normalized_symbols}
+    for bar in bars:
+        symbol = str(bar.symbol).strip().upper()
+        if symbol in by_symbol:
+            by_symbol[symbol][bar.date] = bar
+    if any(not by_symbol[symbol] for symbol in normalized_symbols):
+        raise ValueError("every script symbol requires price bars")
+    common = set(by_symbol[normalized_symbols[0]])
+    for symbol in normalized_symbols[1:]:
+        common &= set(by_symbol[symbol])
+    calendar = sorted(common)
+    if not calendar:
+        raise ValueError("script symbols have no common trading dates")
+    return normalized_symbols, calendar, by_symbol
+
+
+class _StrategyData:
+    def __init__(
+        self,
+        symbols: tuple[str, ...],
+        calendar: list[date],
+        bars: dict[str, dict[date, PriceBar]],
+    ) -> None:
+        self.symbols = symbols
+        self._calendar = calendar
+        self._bars = bars
+        self._index = 0
+
+    @property
+    def current_date(self) -> date:
+        return self._calendar[self._index]
+
+    def _symbol(self, symbol: str) -> str:
+        normalized = str(symbol).strip().upper()
+        if normalized not in self.symbols:
+            raise ValueError(f"symbol is outside the requested universe: {symbol}")
+        return normalized
+
+    def _history_value(self, symbol: str, field: str, ago: int) -> float:
+        normalized = self._symbol(symbol)
+        if isinstance(ago, bool) or not isinstance(ago, int) or ago < 0:
+            raise ValueError("ago must be non-negative")
+        target = self._index - ago
+        if target < 0:
+            raise ValueError("requested history is not available yet")
+        bar = self._bars[normalized][self._calendar[target]]
+        return float(getattr(bar, field))
+
+    def close(self, symbol: str, ago: int = 0) -> float:
+        return self._history_value(symbol, "close", ago)
+
+    def open(self, symbol: str, ago: int = 0) -> float:
+        return self._history_value(symbol, "open", ago)
+
+    def history(self, symbol: str, count: int, field: str = "close") -> tuple[float, ...]:
+        if field not in {"open", "close"}:
+            raise ValueError("history field must be open or close")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("history count must be a positive integer")
+        start = self._index - count + 1
+        if start < 0:
+            return ()
+        normalized = self._symbol(symbol)
+        return tuple(
+            float(getattr(self._bars[normalized][self._calendar[index]], field))
+            for index in range(start, self._index + 1)
+        )
+
+    def returns(self, symbol: str, days: int) -> float | None:
+        if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+            raise ValueError("return days must be a positive integer")
+        if self._index < days:
+            return None
+        current = self.close(symbol)
+        previous = self.close(symbol, ago=days)
+        return current / previous - 1.0
+
+    def sma(self, symbol: str, days: int) -> float | None:
+        values = self.history(symbol, days, "close")
+        return sum(values) / len(values) if values else None
+
+    def rank_by_return(self, days: int, descending: bool = True) -> list[str]:
+        values = []
+        for order, symbol in enumerate(self.symbols):
+            value = self.returns(symbol, days)
+            if value is not None:
+                values.append((symbol, value, order))
+        values.sort(key=lambda item: ((-item[1]) if descending else item[1], item[2]))
+        return [symbol for symbol, _, _ in values]
+
+
+class _StrategyContext:
+    def __init__(self, symbols: tuple[str, ...], logs: list[str]) -> None:
+        self.symbols = symbols
+        self.current_date: date | None = None
+        self.current_weights = MappingProxyType({})
+        self._target: dict[str, float] = {}
+        self._touched = False
+        self._logs = logs
+
+    def _begin_bar(self, current_date: date, current_weights: dict[str, float]) -> None:
+        self.current_date = current_date
+        self.current_weights = MappingProxyType(dict(current_weights))
+        self._target = dict(current_weights)
+        self._touched = False
+
+    def target_percent(self, symbol: str, weight: float) -> None:
+        normalized = str(symbol).strip().upper()
+        if normalized not in self.symbols:
+            raise ValueError(f"symbol is outside the requested universe: {symbol}")
+        numeric_weight = float(weight)
+        if not math.isfinite(numeric_weight) or numeric_weight < 0 or numeric_weight > 1:
+            raise ValueError("target weight must be between 0 and 1")
+        if numeric_weight == 0:
+            self._target.pop(normalized, None)
+        else:
+            self._target[normalized] = numeric_weight
+        if sum(self._target.values()) > 1.0 + 1e-9:
+            raise ValueError("target weights must sum to at most 1")
+        self._touched = True
+
+    def target_equal(self, symbols: Sequence[str]) -> None:
+        selected = tuple(str(symbol).strip().upper() for symbol in symbols)
+        if not selected:
+            self.target_cash()
+            return
+        if len(set(selected)) != len(selected) or any(symbol not in self.symbols for symbol in selected):
+            raise ValueError("target_equal symbols must be unique members of the requested universe")
+        weight = 1.0 / len(selected)
+        self._target = {symbol: weight for symbol in selected}
+        self._touched = True
+
+    def target_cash(self) -> None:
+        self._target = {}
+        self._touched = True
+
+    def log(self, message: object) -> None:
+        prefix = self.current_date.isoformat() if self.current_date else "initialize"
+        self._logs.append(f"{prefix} {str(message)[:500]}")
+
+
+_SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "filter": filter,
+    "float": float,
+    "int": int,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "range": range,
+    "reversed": reversed,
+    "round": round,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+}
+
+
+def execute_strategy_script(
+    source: str,
+    *,
+    bars: Sequence[PriceBar],
+    symbols: Sequence[str],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> StrategyScriptResult:
+    check = validate_strategy_script(source)
+    normalized_symbols, calendar, by_symbol = _normalize_history(bars, symbols)
+    namespace: dict[str, Any] = {
+        "__builtins__": _SAFE_BUILTINS,
+        "math": math,
+        "statistics": statistics,
+    }
+    try:
+        exec(compile(source, "strategy.py", "exec"), namespace, namespace)
+        initialize = namespace.get("initialize")
+        on_bar = namespace["on_bar"]
+        if initialize is not None and not callable(initialize):
+            raise ScriptExecutionError("initialize must be callable")
+        if not callable(on_bar):
+            raise ScriptExecutionError("on_bar must be callable")
+        logs: list[str] = []
+        context = _StrategyContext(normalized_symbols, logs)
+        data = _StrategyData(normalized_symbols, calendar, by_symbol)
+        if initialize is not None:
+            initialize(context)
+
+        allocations: list[TargetAllocation] = []
+        current_target: dict[str, float] = {}
+        for index, current_date in enumerate(calendar):
+            if start_date is not None and current_date < start_date:
+                continue
+            if end_date is not None and current_date > end_date:
+                break
+            data._index = index
+            context._begin_bar(current_date, current_target)
+            on_bar(context, data)
+            if context._touched and context._target != current_target:
+                current_target = dict(sorted(context._target.items()))
+                allocations.append(
+                    TargetAllocation(
+                        source_id=f"python_script:{current_date.isoformat()}",
+                        signal_date=current_date,
+                        target_weights=current_target,
+                        reason=f"DSA Python strategy target on {current_date.isoformat()}",
+                    )
+                )
+        return StrategyScriptResult(
+            allocations=tuple(allocations),
+            logs=tuple(logs[-500:]),
+            check=check,
+        )
+    except ScriptValidationError:
+        raise
+    except ScriptExecutionError:
+        raise
+    except Exception as exc:
+        raise ScriptExecutionError(f"script failed: {type(exc).__name__}: {exc}") from exc

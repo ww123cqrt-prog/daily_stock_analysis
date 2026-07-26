@@ -24,7 +24,7 @@ import glob
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from src.services.quant_workflow_paths import dsa_root, projects_root, quant_data_root, reports_root, workflow_root
 
@@ -101,6 +101,23 @@ CHINA_ASTOCK_SYMBOL_MAX_LENGTH = 20
 BAOSTOCK_WEB_MAX_RETRIES = 20
 BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES = 1000
 BAOSTOCK_WEB_MAX_OVERLAP_DAYS = 365
+ASHARE_SOURCE_MIN_SLEEP_SECONDS = 2.0
+ASHARE_SOURCE_REQUIRED_RETRIES = 1
+ASHARE_SOURCE_MAX_CONSECUTIVE_FAILURES = 3
+ASHARE_SOURCE_MAX_REQUESTS = 6000
+ASHARE_SOURCE_MAX_OVERLAP_DAYS = 7
+ASHARE_SOURCE_JOB_TYPES = {
+    "download_baostock",
+    "download_eastmoney",
+    "download_akshare",
+    "download_ashare_news",
+    "run_daily_update",
+}
+QUANT_DATA_NETWORK_JOB_TYPES = ASHARE_SOURCE_JOB_TYPES | {
+    "download_global_daily",
+    "download_jqdata",
+    "validate_latest_snapshot",
+}
 DATA_QUALITY_WEB_MAX_SAMPLE = 100000
 DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS = 3650
 MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS = 5000
@@ -144,7 +161,8 @@ NUMERIC_PARAM_RULES = {
     "retries": ("integer", 0),
     "timeout": ("number", 1),
     "max_consecutive_failures": ("integer", 1),
-    "overlap_days": ("integer", 1),
+    "max_requests": ("integer", 1),
+    "overlap_days": ("integer", 0),
     "snapshot_limit": ("integer", 1),
     "news_limit": ("integer", 1),
     "overlap_sample": ("integer", 1),
@@ -167,6 +185,7 @@ NUMERIC_PARAM_MAXIMUMS = {
     "retries": BAOSTOCK_WEB_MAX_RETRIES,
     "timeout": 86400,
     "max_consecutive_failures": BAOSTOCK_WEB_MAX_CONSECUTIVE_FAILURES,
+    "max_requests": ASHARE_SOURCE_MAX_REQUESTS,
     "overlap_days": BAOSTOCK_WEB_MAX_OVERLAP_DAYS,
     "snapshot_limit": GENERIC_WEB_LIMIT_MAX,
     "news_limit": GENERIC_WEB_LIMIT_MAX,
@@ -285,6 +304,55 @@ def _validate_numeric_params(params: Mapping[str, Any]) -> None:
         maximum = NUMERIC_PARAM_MAXIMUMS.get(key)
         if maximum is not None and number > maximum:
             raise ValueError(f"Param {key} must be <= {maximum}.")
+
+
+def _numeric_param_value(params: Mapping[str, Any], key: str) -> float | None:
+    value = params.get(key)
+    if value is None or value == "":
+        return None
+    return float(str(value))
+
+
+def _validate_ashare_source_safety(job_type: str, params: Mapping[str, Any]) -> None:
+    if job_type not in ASHARE_SOURCE_JOB_TYPES:
+        return
+
+    sleep_seconds = _numeric_param_value(params, "sleep")
+    if sleep_seconds is not None and sleep_seconds < ASHARE_SOURCE_MIN_SLEEP_SECONDS:
+        raise ValueError(
+            f"Param sleep must be >= {ASHARE_SOURCE_MIN_SLEEP_SECONDS:g} for A-share source jobs."
+        )
+
+    retries = _numeric_param_value(params, "retries")
+    if retries is not None and retries != ASHARE_SOURCE_REQUIRED_RETRIES:
+        raise ValueError(
+            f"Param retries must equal {ASHARE_SOURCE_REQUIRED_RETRIES} for A-share source jobs."
+        )
+
+    consecutive_failures = _numeric_param_value(params, "max_consecutive_failures")
+    if consecutive_failures is not None and consecutive_failures > ASHARE_SOURCE_MAX_CONSECUTIVE_FAILURES:
+        raise ValueError(
+            f"Param max_consecutive_failures must be <= {ASHARE_SOURCE_MAX_CONSECUTIVE_FAILURES} "
+            "for A-share source jobs."
+        )
+
+    request_budget = _numeric_param_value(params, "max_requests")
+    if request_budget is not None and request_budget > ASHARE_SOURCE_MAX_REQUESTS:
+        raise ValueError(
+            f"Param max_requests must be <= {ASHARE_SOURCE_MAX_REQUESTS} for A-share source jobs."
+        )
+
+    overlap_days = _numeric_param_value(params, "overlap_days")
+    if overlap_days is not None and overlap_days > ASHARE_SOURCE_MAX_OVERLAP_DAYS:
+        raise ValueError(
+            f"Param overlap_days must be <= {ASHARE_SOURCE_MAX_OVERLAP_DAYS} for A-share source jobs."
+        )
+
+    if job_type == "run_daily_update":
+        source = str(params.get("ashare_source") or "none")
+        allowed_sources = {"none", "baostock", "eastmoney", "akshare"}
+        if source not in allowed_sources:
+            raise ValueError(f"Param ashare_source must be one of: {', '.join(sorted(allowed_sources))}.")
 
 
 def _int_param(value: Any, key: str) -> int:
@@ -529,6 +597,8 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("retries", "--retries"),
             ("timeout", "--timeout"),
             ("max_consecutive_failures", "--max-consecutive-failures"),
+            ("max_requests", "--max-requests"),
+            ("overlap_days", "--overlap-days"),
         ):
             _append_value(command, params, key, flag)
         for key, flag in (
@@ -550,6 +620,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("retries", "--retries"),
             ("timeout", "--timeout"),
             ("max_consecutive_failures", "--max-consecutive-failures"),
+            ("max_requests", "--max-requests"),
             ("overlap_days", "--overlap-days"),
         ):
             _append_value(command, params, key, flag)
@@ -723,6 +794,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def run_daily_update(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("run_daily_update.py")
+        _append_value(command, params, "ashare_source", "--ashare-source")
         for key, flag in (
             ("skip_download", "--skip-download"),
             ("force", "--force"),
@@ -736,6 +808,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("timeout", "--timeout"),
             ("retries", "--retries"),
             ("max_consecutive_failures", "--max-consecutive-failures"),
+            ("max_requests", "--max-requests"),
             ("limit", "--limit"),
             ("end", "--end"),
             ("snapshot_limit", "--snapshot-limit"),
@@ -745,6 +818,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         ):
             _append_value(command, params, key, flag)
         for key, flag in (
+            ("skip_baostock", "--skip-baostock"),
             ("skip_eastmoney", "--skip-eastmoney"),
             ("skip_akshare", "--skip-akshare"),
             ("skip_global_daily", "--skip-global-daily"),
@@ -793,6 +867,8 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "retries",
                 "timeout",
                 "max_consecutive_failures",
+                "max_requests",
+                "overlap_days",
                 "retry_failed",
                 "retry_empty",
                 "retry_timeout",
@@ -808,6 +884,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "command": run_daily_update,
             "allowed_params": {
                 "skip_download",
+                "ashare_source",
                 "force",
                 "dry_run",
                 "continue_on_error",
@@ -816,10 +893,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "timeout",
                 "retries",
                 "max_consecutive_failures",
+                "max_requests",
                 "limit",
                 "end",
                 "snapshot_limit",
                 "news_limit",
+                "skip_baostock",
                 "skip_eastmoney",
                 "skip_akshare",
                 "skip_global_daily",
@@ -845,6 +924,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "retries",
                 "timeout",
                 "max_consecutive_failures",
+                "max_requests",
                 "retry_failed",
                 "incremental",
                 "overlap_days",
@@ -862,6 +942,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "retries",
                 "timeout",
                 "max_consecutive_failures",
+                "max_requests",
                 "retry_failed",
                 "incremental",
                 "overlap_days",
@@ -1030,7 +1111,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "report_qlib_model_explainability": {
-            "label": "生成 Qlib 模型解释报告",
+            "label": "生成 Qlib 选股模型解释报告",
             "command": lambda params: report_qlib_research("model_explainability", params),
             "allowed_params": {"run_id", "topk"},
             "artifact_patterns": qlib_research_artifacts("model_explainability"),
@@ -1042,7 +1123,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": qlib_research_artifacts("backtest_detail"),
         },
         "report_qlib_model_comparison": {
-            "label": "生成 Qlib 多模型/多实验对比",
+            "label": "生成 Qlib 多选股模型/多实验对比",
             "command": lambda params: report_qlib_research("model_comparison", params),
             "allowed_params": {"max_runs"},
             "artifact_patterns": qlib_research_artifacts("model_comparison"),
@@ -1060,7 +1141,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": qlib_research_artifacts("rolling_training"),
         },
         "report_qlib_risk_model": {
-            "label": "生成 Qlib 风险模型诊断",
+            "label": "生成 Qlib 组合风险诊断",
             "command": lambda params: report_qlib_research("risk_model", params),
             "allowed_params": {"run_id"},
             "artifact_patterns": qlib_research_artifacts("risk_model"),
@@ -1089,7 +1170,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "optimize_strategy": {
-            "label": "策略优化预演",
+            "label": "交易策略优化预演",
             "command": optimize_strategy,
             "allowed_params": {"dry_run", "phase", "topk"},
             "artifact_patterns": [
@@ -1100,7 +1181,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "train_baseline_lgb": {
-            "label": "训练 Qlib LightGBM 基线",
+            "label": "训练 Qlib LightGBM 选股模型基线",
             "command": train_baseline_lgb,
             "allowed_params": {"config", "experiment_name", "provider"},
             "artifact_patterns": [
@@ -1114,7 +1195,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "run_candidate_pipeline": {
-            "label": "运行五模型完整量化流程",
+            "label": "运行五个选股模型候选流程",
             "command": run_candidate_pipeline,
             "allowed_params": {"dry_run", "provider"},
             "artifact_patterns": [
@@ -1166,26 +1247,35 @@ class QuantJobService:
         params_dict = dict(params or {})
         spec = self._get_spec(job_type)
         command = self._build_command(job_type, params_dict)
-        job_id = f"qj_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        job_dir = self.jobs_root / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        log_path = job_dir / "job.log"
-        timestamp = _now()
-        job = QuantJob(
-            job_id=job_id,
-            job_type=job_type,
-            label=str(spec.get("label") or job_type),
-            status="pending",
-            params=params_dict,
-            command=command,
-            cwd=str(spec.get("cwd") or self.default_cwd),
-            created_at=timestamp,
-            updated_at=timestamp,
-            log_path=str(log_path),
-        )
-        self._insert_job(job)
-        self._start_job(job)
-        return self.get_job(job_id)
+        with self._lock:
+            if job_type in QUANT_DATA_NETWORK_JOB_TYPES:
+                active = self._active_quant_data_network_job()
+                if active is not None:
+                    raise ValueError(
+                        "A quant_data network job is already active: "
+                        f"{active.job_type} ({active.job_id}). Wait for it to finish or cancel it first."
+                    )
+
+            job_id = f"qj_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            job_dir = self.jobs_root / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            log_path = job_dir / "job.log"
+            timestamp = _now()
+            job = QuantJob(
+                job_id=job_id,
+                job_type=job_type,
+                label=str(spec.get("label") or job_type),
+                status="pending",
+                params=params_dict,
+                command=command,
+                cwd=str(spec.get("cwd") or self.default_cwd),
+                created_at=timestamp,
+                updated_at=timestamp,
+                log_path=str(log_path),
+            )
+            self._insert_job(job)
+            self._start_job(job)
+            return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> QuantJob:
         row = self._fetch_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
@@ -1227,6 +1317,20 @@ class QuantJobService:
             (),
         )
         return int(row["count"]) if row is not None else 0
+
+    def _active_quant_data_network_job(self) -> Optional[QuantJob]:
+        placeholders = ", ".join("?" for _item in QUANT_DATA_NETWORK_JOB_TYPES)
+        row = self._fetch_one(
+            f"""
+            SELECT * FROM jobs
+            WHERE status IN ('pending', 'running')
+              AND job_type IN ({placeholders})
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            tuple(sorted(QUANT_DATA_NETWORK_JOB_TYPES)),
+        )
+        return self._row_to_job(row) if row is not None else None
 
     def get_log(self, job_id: str, max_bytes: int = 20000) -> Dict[str, Any]:
         job = self.get_job(job_id)
@@ -1314,6 +1418,7 @@ class QuantJobService:
             if unknown:
                 raise ValueError(f"Unsupported params for {job_type}: {', '.join(unknown)}")
         _validate_numeric_params(params)
+        _validate_ashare_source_safety(job_type, params)
 
         command_spec = spec.get("command")
         if callable(command_spec):

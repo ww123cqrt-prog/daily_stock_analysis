@@ -2509,6 +2509,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 "incremental",
                 "limit",
                 "max_consecutive_failures",
+                "max_requests",
                 "overlap_days",
                 "retries",
                 "retry_failed",
@@ -2525,6 +2526,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 "incremental",
                 "limit",
                 "max_consecutive_failures",
+                "max_requests",
                 "overlap_days",
                 "retries",
                 "retry_failed",
@@ -2544,6 +2546,82 @@ class QuantJobsApiTestCase(unittest.TestCase):
             ["limit", "retries", "sleep", "timeout", "use_system_proxy"],
         )
         self.assertIn("Unsupported params for download_eastmoney", str(unsafe_ctx.exception))
+
+    def test_ashare_source_jobs_enforce_conservative_request_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            eastmoney = service._build_command(
+                "download_eastmoney",
+                {
+                    "sleep": 2,
+                    "retries": 1,
+                    "max_consecutive_failures": 3,
+                    "max_requests": 6000,
+                    "overlap_days": 0,
+                },
+            )
+            daily = service._build_command(
+                "run_daily_update",
+                {
+                    "ashare_source": "none",
+                    "sleep": 2,
+                    "retries": 1,
+                    "max_consecutive_failures": 3,
+                    "max_requests": 6000,
+                    "overlap_days": 7,
+                },
+            )
+
+            unsafe_cases = [
+                ("download_baostock", {"sleep": 1.99}, "Param sleep must be >= 2"),
+                ("download_eastmoney", {"retries": 2}, "Param retries must equal 1"),
+                (
+                    "download_akshare",
+                    {"max_consecutive_failures": 4},
+                    "Param max_consecutive_failures must be <= 3",
+                ),
+                ("download_eastmoney", {"max_requests": 6001}, "Param max_requests must be <= 6000"),
+                ("run_daily_update", {"overlap_days": 8}, "Param overlap_days must be <= 7"),
+                ("run_daily_update", {"ashare_source": "all"}, "Param ashare_source must be one of"),
+            ]
+            for job_type, params, expected_message in unsafe_cases:
+                with self.subTest(job_type=job_type, params=params):
+                    with self.assertRaises(ValueError) as ctx:
+                        service._build_command(job_type, params)
+                    self.assertIn(expected_message, str(ctx.exception))
+
+        self.assertEqual(eastmoney[eastmoney.index("--max-requests") + 1], "6000")
+        self.assertEqual(daily[daily.index("--ashare-source") + 1], "none")
+        self.assertEqual(daily[daily.index("--max-requests") + 1], "6000")
+
+    def test_only_one_quant_data_network_job_can_be_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "download_eastmoney": {
+                        "label": "下载东方财富日线",
+                        "command": [sys.executable, "-c", "import time; time.sleep(5)"],
+                        "allowed_params": set(),
+                    },
+                    "download_akshare": {
+                        "label": "下载 AkShare 日线",
+                        "command": [sys.executable, "-c", "print('must not start')"],
+                        "allowed_params": set(),
+                    },
+                },
+            )
+            first = service.submit_job("download_eastmoney")
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    service.submit_job("download_akshare")
+                jobs = service.list_jobs()
+            finally:
+                service.cancel_job(first.job_id)
+
+        self.assertIn("quant_data network job is already active", str(ctx.exception))
+        self.assertEqual([job.job_type for job in jobs], ["download_eastmoney"])
 
     def test_market_regime_report_job_is_whitelisted_with_safe_params(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2813,7 +2891,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("4", command)
         self.assertIn("--topk", command)
         self.assertIn("30", command)
-        self.assertEqual(status["optimize_strategy"]["label"], "策略优化预演")
+        self.assertEqual(status["optimize_strategy"]["label"], "交易策略优化预演")
         self.assertEqual(status["optimize_strategy"]["allowed_params"], ["dry_run", "phase", "topk"])
         self.assertTrue(any("optimization_results_latest.json" in item for item in spec["artifact_patterns"]))
         self.assertTrue(any("optimization_results_latest.md" in item for item in spec["artifact_patterns"]))
@@ -2849,7 +2927,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("--dry-run", real_command)
         self.assertIn("cleaned", dry_command)
         self.assertIn("--dry-run", dry_command)
-        self.assertEqual(status["run_candidate_pipeline"]["label"], "运行五模型完整量化流程")
+        self.assertEqual(status["run_candidate_pipeline"]["label"], "运行五个选股模型候选流程")
         self.assertEqual(status["run_candidate_pipeline"]["allowed_params"], ["dry_run", "provider"])
         self.assertTrue(any("candidate_pipeline_latest.json" in item for item in spec["artifact_patterns"]))
 

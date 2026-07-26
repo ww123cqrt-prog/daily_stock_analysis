@@ -26,7 +26,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import mlruns_root, qlib_provider_uri, reports_root, workflow_root  # noqa: E402
-from optimize_strategy import OptimizedStrategy  # noqa: E402
+from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -620,7 +620,7 @@ def _progress(output_dir: Path, batch_id: str, stage: str, completed: int, total
 
 def _report_markdown(payload: dict[str, Any]) -> str:
     lines = [
-        "# 五模型完整量化流程报告",
+        "# 五个选股模型候选流程报告",
         "",
         f"- 状态：`{payload['status']}`",
         f"- 批次：`{payload['batch_id']}`",
@@ -657,9 +657,9 @@ def _report_markdown(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## 模型与策略组合",
+            "## 选股模型与交易策略组合",
             "",
-            "| 模型 | 策略 | 开发期IR | 开发期超额年化 | 开发期最大回撤 | 留出期IR | 留出期超额年化 | 留出期最大回撤 |",
+            "| 选股模型 | 交易策略 | 开发期IR | 开发期超额年化 | 开发期最大回撤 | 留出期IR | 留出期超额年化 | 留出期最大回撤 |",
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -898,7 +898,7 @@ def main() -> int:
         timestamp=args.timestamp,
         dry_run=args.dry_run,
     )
-    print(f"\n[完成] 五模型流程状态: {payload['status']}")
+    print(f"\n[完成] 五个选股模型候选流程状态: {payload['status']}")
     print(f"[报告] {payload['artifacts']['json']}")
     return 0 if payload["status"] == "completed" else 1
 

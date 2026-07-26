@@ -17,9 +17,14 @@ test('serves the official MLflow UI under DSA and preserves language across relo
 
   await page.goto('/experiments/');
   await expect(page).toHaveTitle(/MLflow/);
+  const toolbarBox = await page.locator('#dsa-mlflow-language-toolbar').boundingBox();
+  const mlflowRootBox = await page.locator('#root.mlflow-ui-container').boundingBox();
+  expect(toolbarBox).not.toBeNull();
+  expect(mlflowRootBox).not.toBeNull();
+  expect(mlflowRootBox!.y).toBeGreaterThanOrEqual(toolbarBox!.y + toolbarBox!.height - 1);
   await expect(page.getByRole('button', { name: '中文' })).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByRole('link', { name: '实验', exact: true })).toBeVisible();
-  await expect(page.getByText('GenAI', { exact: true })).toBeHidden();
+  await expect(page.getByText('GenAI', { exact: true }).first()).toBeVisible();
 
   const originalUrl = page.url();
   await page.getByRole('button', { name: 'English' }).click();
@@ -34,7 +39,7 @@ test('serves the official MLflow UI under DSA and preserves language across relo
   await expect(page.getByRole('link', { name: '实验', exact: true })).toBeVisible();
 });
 
-test('keeps MLflow business data verbatim and limits the page to experiment workflows', async ({ page }) => {
+test('keeps MLflow business data verbatim and preserves the complete upstream navigation', async ({ page }) => {
   await page.goto('/experiments/#/experiments');
   const runtimeResponse = await page.request.get('/experiments/__dsa_i18n__/runtime.js');
   expect(runtimeResponse.ok()).toBe(true);
@@ -52,6 +57,7 @@ test('keeps MLflow business data verbatim and limits the page to experiment work
     </nav>
     <div role="columnheader" data-ui-label>Model</div>
     <button type="button" data-ui-action>Status</button>
+    <div data-natural-counter><span>4</span><span data-natural-slash title="/">/</span><span>17</span></div>
     <div role="cell" data-business="experiment">Home</div>
     <div role="gridcell" data-business="run">Model</div>
     <div role="cell" data-business="parameter">Status</div>
@@ -74,31 +80,34 @@ test('keeps MLflow business data verbatim and limits the page to experiment work
   await expect(page.locator('[data-business="artifact"]')).toHaveText('Model');
   await expect(page.locator('[data-business="key-value-key"]')).toHaveText('Home');
   await expect(page.locator('[data-business="key-value-value"]')).toHaveText('Model');
-  await expect(page.locator('a[href="#/prompts"]')).toBeHidden();
-  await expect(page.locator('a[href="#/gateway"]')).toBeHidden();
-  await expect(page.locator('[data-nonquant="genai"]')).toBeHidden();
-  await expect(page.locator('[data-nonquant="assistant"]')).toBeHidden();
-  await expect(page.locator('[data-nonquant="docs"]')).toBeHidden();
+  await expect(page.locator('a[href="#/"]')).toBeVisible();
+  await expect(page.locator('a[href="#/prompts"]')).toBeVisible();
+  await expect(page.locator('a[href="#/gateway"]')).toBeVisible();
+  await expect(page.locator('[data-nonquant="genai"]')).toBeVisible();
+  await expect(page.locator('[data-nonquant="assistant"]')).toBeVisible();
+  await expect(page.locator('[data-nonquant="docs"]')).toBeVisible();
 
   await page.evaluate(() => window.scrollTo(0, 700));
   const scrollBefore = await page.evaluate(() => window.scrollY);
   await page.getByRole('button', { name: 'English' }).click();
   expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
+  await expect(page.locator('[data-natural-counter]')).toHaveText('4/17');
+  await expect(page.locator('[data-natural-slash]')).toHaveAttribute('title', '/');
 
-  await expect(page.getByRole('link', { name: 'Research' })).toHaveAttribute('href', '/research');
-  await expect(page.getByRole('link', { name: 'Workflow' })).toHaveAttribute('href', '/workflow');
-  await expect(page.getByRole('link', { name: 'Backtest' })).toHaveAttribute('href', '/backtest');
+  await expect(page.getByRole('link', { name: 'DSA', exact: true })).toHaveAttribute('href', '/research');
 
   await page.evaluate(() => {
     window.location.hash = '#/gateway';
     window.dispatchEvent(new HashChangeEvent('hashchange'));
   });
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/experiments');
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/gateway');
 });
 
 test('preserves run filters, parameter names, and artifacts on the local MLflow data', async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('dsa.uiLanguage', 'en'));
   await page.goto('/experiments/');
+  await page.getByRole('button', { name: 'Model training', exact: true }).click();
+  await expect(page.getByRole('link', { name: 'Experiments', exact: true })).toBeVisible();
 
   const experimentLinks = page.locator('[data-testid="experiment-list-item-link"]');
   await expect(experimentLinks.first()).toBeVisible();
@@ -156,26 +165,4 @@ test('preserves run filters, parameter names, and artifacts on the local MLflow 
   await page.getByRole('button', { name: '中文' }).click();
   await expect(firstArtifact).toHaveAttribute('artifact-name', artifactName);
   await expect(firstArtifact).toContainText(artifactName);
-});
-
-test('keeps the experiment list readable on a mobile viewport', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.addInitScript(() => localStorage.setItem('dsa.uiLanguage', 'zh'));
-  await page.goto('/experiments/');
-
-  await expect(page.getByRole('heading', { name: '实验', exact: true })).toBeVisible();
-  await expect(page.locator('aside').first()).toBeHidden();
-
-  const table = page.getByRole('table').first();
-  await expect(table).toBeVisible();
-  const tableBox = await table.boundingBox();
-  expect(tableBox).not.toBeNull();
-  expect(tableBox!.width).toBeGreaterThanOrEqual(340);
-
-  const toolbar = page.locator('#dsa-mlflow-language-toolbar');
-  await expect(toolbar).toBeVisible();
-  const toolbarBox = await toolbar.boundingBox();
-  expect(toolbarBox).not.toBeNull();
-  expect(toolbarBox!.y).toBeGreaterThan(700);
-  expect(toolbarBox!.y + toolbarBox!.height).toBeLessThanOrEqual(840);
 });

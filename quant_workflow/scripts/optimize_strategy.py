@@ -32,6 +32,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import mlruns_root, qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -60,11 +61,11 @@ def init_qlib(data_dir: Path = DATA_DIR):
 
 
 # ═══════════════════════════════════════════════════════════
-#  Step 0: 训练基线模型并获取预测
+#  Step 0: 训练基线选股模型并获取预测
 # ═══════════════════════════════════════════════════════════
 
 def train_and_predict(config_path: str, experiment_name: str):
-    """训练模型并返回预测结果。"""
+    """训练选股模型并返回预测结果。"""
     configure_mlflow_env()
     from qlib.cli.run import workflow
 
@@ -192,184 +193,6 @@ def get_market_indicators(start_time: str, end_time: str):
 # ═══════════════════════════════════════════════════════════
 #  策略实现
 # ═══════════════════════════════════════════════════════════
-
-class OptimizedStrategy:
-    """带市场择时和风控的TopK策略。"""
-
-    def __init__(
-        self,
-        topk: int = 50,
-        n_drop: int = 5,
-        cost_bps: float = 15,
-        rebalance_freq: int = 1,
-        turnover_cap: float = 0.20,
-        # 市场择时
-        trend_filter: bool = False,
-        trend_ma: str = "ma200",
-        trend_reduce_pct: float = 0.5,
-        vol_sizing: bool = False,
-        vol_reduce_threshold: float = 0.8,
-        # 风险控制
-        max_drawdown_stop: float = -0.08,
-        max_dd_cooldown_days: int = 20,
-        max_single_weight: float = 0.05,
-        max_sector_weight: float = 0.30,
-        # 行业信息
-        sector_map: dict = None,
-    ):
-        self.topk = topk
-        self.n_drop = n_drop
-        self.cost_bps = cost_bps
-        self.rebalance_freq = rebalance_freq
-        self.turnover_cap = turnover_cap
-        self.trend_filter = trend_filter
-        self.trend_ma = trend_ma
-        self.trend_reduce_pct = trend_reduce_pct
-        self.vol_sizing = vol_sizing
-        self.vol_reduce_threshold = vol_reduce_threshold
-        self.max_drawdown_stop = max_drawdown_stop
-        self.max_dd_cooldown_days = max_dd_cooldown_days
-        self.max_single_weight = max_single_weight
-        self.max_sector_weight = max_sector_weight
-        self.sector_map = sector_map or {}
-
-    def run(
-        self,
-        pred: pd.DataFrame,
-        label: pd.DataFrame,
-        market_indicators: pd.DataFrame = None,
-    ) -> pd.DataFrame:
-        """运行策略回测。"""
-        pred_label = pd.concat([pred, label], axis=1).dropna()
-        pred_label.columns = ["score", "label"]
-
-        daily_results = []
-        prev_holdings = set()
-        cum_return = 1.0
-        peak_return = 1.0
-        in_cooldown = False
-        cooldown_counter = 0
-        day_counter = 0
-        rebalance_day = 0
-
-        dates = sorted(pred_label.index.get_level_values("datetime").unique())
-
-        for dt in dates:
-            day_data = pred_label.loc[dt].copy()
-            if len(day_data) < self.topk:
-                continue
-
-            day_counter += 1
-
-            # ── 市场择时：仓位系数 ──
-            position_pct = 1.0
-
-            if market_indicators is not None and dt in market_indicators.index:
-                mi = market_indicators.loc[dt]
-
-                # 趋势过滤
-                if self.trend_filter and not pd.isna(mi.get(self.trend_ma, np.nan)):
-                    trend_signal = mi.get(f"trend_{self.trend_ma.replace('ma', '')}", 1.0)
-                    if trend_signal < 0.5:  # 趋势向下
-                        position_pct *= (1.0 - self.trend_reduce_pct)
-
-                # 波动率仓位调整
-                if self.vol_sizing and not pd.isna(mi.get("vol_percentile", np.nan)):
-                    vol_pct = mi["vol_percentile"]
-                    if vol_pct > self.vol_reduce_threshold:
-                        # 波动率越高，仓位越低
-                        vol_factor = 1.0 - (vol_pct - self.vol_reduce_threshold) / (1.0 - self.vol_reduce_threshold) * 0.5
-                        position_pct *= vol_factor
-
-            # ── 回撤保护 ──
-            if self.max_drawdown_stop < 0:
-                current_dd = cum_return / peak_return - 1
-                if current_dd < self.max_drawdown_stop and not in_cooldown:
-                    in_cooldown = True
-                    cooldown_counter = 0
-                    position_pct = 0.0  # 清仓
-
-                if in_cooldown:
-                    cooldown_counter += 1
-                    # 回撤恢复或冷却期结束后恢复
-                    if current_dd > self.max_drawdown_stop * 0.5 or cooldown_counter > self.max_dd_cooldown_days:
-                        in_cooldown = False
-                    else:
-                        position_pct = 0.0
-
-            # ── 调仓频率 ──
-            rebalance_day += 1
-            if self.rebalance_freq > 1 and rebalance_day % self.rebalance_freq != 0 and prev_holdings:
-                # 非调仓日，持有不变
-                port_data = day_data.loc[day_data.index.isin(prev_holdings)]
-                if len(port_data) > 0:
-                    port_ret = port_data["label"].mean() * position_pct
-                    cum_return *= (1 + port_ret)
-                    peak_return = max(peak_return, cum_return)
-                    daily_results.append({
-                        "date": dt,
-                        "return": port_ret,
-                        "gross_return": port_data["label"].mean(),
-                        "turnover": 0.0,
-                        "position_pct": position_pct,
-                        "n_stocks": len(prev_holdings),
-                    })
-                continue
-
-            # ── 选股 ──
-            if position_pct < 0.01:
-                # 不持仓
-                daily_results.append({
-                    "date": dt,
-                    "return": 0.0,
-                    "gross_return": 0.0,
-                    "turnover": len(prev_holdings) / max(self.topk, 1) if prev_holdings else 0.0,
-                    "position_pct": 0.0,
-                    "n_stocks": 0,
-                })
-                prev_holdings = set()
-                continue
-
-            top_stocks = set(day_data.nlargest(self.topk, "score").index)
-
-            # ── 换手率限制 ──
-            new_stocks = top_stocks - prev_holdings
-            removed_stocks = prev_holdings - top_stocks
-            turnover = (len(new_stocks) + len(removed_stocks)) / (2 * max(self.topk, 1))
-
-            if self.turnover_cap and turnover > self.turnover_cap and prev_holdings:
-                n_keep = int(self.topk * (1 - self.turnover_cap))
-                keep = set(s for s in prev_holdings if s in day_data.index)
-                if len(keep) > n_keep:
-                    # 保留排名最高的旧持仓
-                    keep_scores = day_data.loc[list(keep), "score"].nlargest(n_keep)
-                    keep = set(keep_scores.index)
-                n_new = self.topk - len(keep)
-                candidates = day_data.drop(index=list(keep), errors="ignore").nlargest(n_new, "score")
-                top_stocks = keep | set(candidates.index)
-                turnover = min(turnover, self.turnover_cap)
-
-            # ── 组合收益 ──
-            port_data = day_data.loc[day_data.index.isin(top_stocks)]
-            port_ret = port_data["label"].mean() * position_pct
-            cost = turnover * (self.cost_bps / 10000)
-            net_ret = port_ret - cost
-
-            cum_return *= (1 + net_ret)
-            peak_return = max(peak_return, cum_return)
-
-            daily_results.append({
-                "date": dt,
-                "return": net_ret,
-                "gross_return": port_data["label"].mean(),
-                "turnover": turnover,
-                "position_pct": position_pct,
-                "n_stocks": len(top_stocks),
-            })
-            prev_holdings = top_stocks
-
-        return pd.DataFrame(daily_results).set_index("date")
-
 
 def print_stats(bt: pd.DataFrame, label: str):
     """打印回测统计指标。"""
@@ -614,7 +437,7 @@ def write_reports(
     lines = [
         "# Qlib 策略优化实验报告",
         "",
-        "只读策略优化预演" if dry_run else "只读策略优化实验",
+        "只读交易策略优化预演" if dry_run else "只读交易策略优化实验",
         "",
         f"- Phase: {phase}",
         f"- TopK: {topk}",
@@ -712,7 +535,7 @@ def main() -> int:
         output_dir=args.output_dir,
         timestamp=args.timestamp,
     )
-    print("\n[完成] 只读策略优化{}已生成".format("预演" if args.dry_run else "实验"))
+    print("\n[完成] 只读交易策略优化{}已生成".format("预演" if args.dry_run else "实验"))
     print(f"[保存] JSON: {status['output_json']}")
     print(f"[保存] Markdown: {status['output_md']}")
     return 0

@@ -1303,9 +1303,26 @@ python main.py --debug
 
 ## 回测功能
 
-回测模块自动对历史 AI 分析记录进行事后验证，评估分析建议的准确性。
+`/backtest` 只提供两种真正的连续账户回测，两者共用同一套行情、成交和净值引擎：
 
-### 工作原理
+1. **脚本回测**：像聚宽研究页一样直接编辑 DSA Python 策略脚本，静态安全检查通过后才在受限子进程中运行。
+2. **条件回测**：不写代码，先选择明确的内置策略，再填写标的、日期、资金、成本和策略参数。
+
+Qlib 的训练 Run、参数、指标和 artifact 统一在 `/experiments/` 查看，不再作为 `/backtest` 的子选项。旧 DSA 历史判断评估和历史信号策略 API 仍为兼容能力，但不再伪装成网页默认交易策略。
+
+### 策略回测
+
+通用回测引擎只识别证券代码、开盘价、收盘价和目标仓位，不判断标的是股票还是 ETF。单股择时、ETF 轮动和多标的组合使用同一套资金与成交计算；具体策略适配器负责生成目标仓位。
+
+脚本回测要求脚本定义 `on_bar(context, data)`，可选定义 `initialize(context)`；脚本在每个交易日收盘后生成目标仓位，下一共同交易日开盘执行。条件回测当前提供动量轮动与均线过滤、双均线择时、等权买入持有三种明确规则。股票和 ETF 都使用相同接口，前提是请求标的存在于 `quant_data` 中状态为 `ready` 的规范前复权日线数据集。
+
+交易成本没有隐藏默认值。网页默认 `0%`，表示未扣手续费和滑点；只有用户填写的“每次买入或卖出成本”才会进入计算。历史回填报告若生成日期晚于其信号日期，会被排除，避免把事后生成的结论当成当时可用信号。
+
+### 历史判断复盘
+
+旧验证功能自动对历史 AI 分析记录进行事后检查，评估分析建议的方向准确性。其“平均模拟收益”是逐条固定窗口验证值，不是连续账户净值，也不能当作策略收益与买入持有直接比较。
+
+#### 工作原理
 
 1. 选取已过冷却期（默认 14 天）的 `AnalysisHistory` 记录
 2. 获取分析日之后的日线数据（前向 K 线）
@@ -1313,7 +1330,7 @@ python main.py --debug
 4. 评估止盈/止损命中情况，模拟执行收益
 5. 汇总为整体和单股两个维度的表现指标
 
-### 操作建议映射
+#### 操作建议映射
 
 | 操作建议 | 仓位推断 | 预期方向 | 胜利条件 |
 |---------|---------|---------|---------|
@@ -1322,7 +1339,7 @@ python main.py --debug
 | 持有/持有观察/震荡观望/洗盘观察/hold/hold and watch/range-bound watch/shakeout watch | long | not_down | 未显著下跌 |
 | 观望/等待/wait | cash | flat | 价格在中性带内 |
 
-### 配置
+#### 配置
 
 在 `.env` 中设置以下变量（均有默认值，可选）：
 
@@ -1334,11 +1351,11 @@ python main.py --debug
 | `BACKTEST_ENGINE_VERSION` | `v1` | 引擎版本号，升级逻辑时用于区分结果 |
 | `BACKTEST_NEUTRAL_BAND_PCT` | `2.0` | 中性区间阈值（%），±2% 内视为震荡 |
 
-### 自动运行
+#### 自动运行
 
 回测在每日分析流程完成后自动触发（非阻塞，失败不影响通知推送）。也可通过 API 手动触发。
 
-### 评估指标
+#### 评估指标
 
 | 指标 | 说明 |
 |------|------|
@@ -1404,7 +1421,10 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/history` | GET | 查询分析历史 |
 | `/api/v1/history/{record_id}/diagnostics` | GET | 查询历史报告运行诊断摘要与脱敏复制文本 |
 | `/api/v1/usage/summary?period=today|month|all` | GET | 按调用类型与模型维度汇总 LLM 调用次数和 Token 用量 |
-| `/api/v1/backtest/run` | POST | 触发回测 |
+| `/api/v1/backtest/strategy/run` | POST | 运行用户明确选择和配置的内置条件交易策略 |
+| `/api/v1/backtest/strategy/script` | POST | 静态检查并隔离运行 DSA Python 策略脚本 |
+| `/api/v1/backtest/strategy/dsa-signal` | POST | 兼容旧 DSA 历史信号连续回测，不作为网页主入口 |
+| `/api/v1/backtest/run` | POST | 触发旧版历史判断复盘 |
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
 | `/api/v1/backtest/performance` | GET | 获取整体回测表现 |
 | `/api/v1/backtest/performance/{code}` | GET | 获取单股回测表现 |

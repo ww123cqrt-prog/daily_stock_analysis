@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createParsedApiError } from '../../api/error';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
-import WorkflowPage from '../WorkflowPage';
+import DataPage from '../DataPage';
+import OtherPage from '../OtherPage';
+import WorkflowPage, { QuantTaskPage } from '../WorkflowPage';
 
 type FakeEventSourceListener = (event: MessageEvent) => void;
 
@@ -56,8 +58,9 @@ class FakeEventSource {
   }
 }
 
-const { getQuantStatus, listQuantJobs, submitQuantJob, getQuantJobLog, getQuantJobArtifactText, cancelQuantJob } = vi.hoisted(() => ({
+const { getQuantStatus, getResearchStatus, listQuantJobs, submitQuantJob, getQuantJobLog, getQuantJobArtifactText, cancelQuantJob } = vi.hoisted(() => ({
   getQuantStatus: vi.fn(),
+  getResearchStatus: vi.fn(),
   listQuantJobs: vi.fn(),
   submitQuantJob: vi.fn(),
   getQuantJobLog: vi.fn(),
@@ -81,7 +84,12 @@ vi.mock('../../api/quant', () => ({
 
 vi.mock('../../api/research', () => ({
   researchApi: {
-    getStatus: () => Promise.resolve({
+    getStatus: () => getResearchStatus(),
+  },
+}));
+
+function readyResearchStatus() {
+  return {
       generatedAt: '2026-07-03T21:00:00+08:00',
       trainable: true,
       trainingReadiness: { status: 'trainable', summary: 'Qlib provider 已可训练。' },
@@ -106,16 +114,15 @@ vi.mock('../../api/research', () => ({
         latestNote: 'baseline note',
         runs: [],
       },
-    }),
-  },
-}));
+    };
+}
 
 function renderWorkflowPage() {
   localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
   return render(
     <UiLanguageProvider>
       <MemoryRouter>
-        <WorkflowPage />
+        <QuantTaskPage surface="all" />
       </MemoryRouter>
     </UiLanguageProvider>,
   );
@@ -130,6 +137,7 @@ describe('WorkflowPage', () => {
   beforeEach(() => {
     localStorage.clear();
     getQuantStatus.mockReset();
+    getResearchStatus.mockReset();
     listQuantJobs.mockReset();
     submitQuantJob.mockReset();
     getQuantJobLog.mockReset();
@@ -141,12 +149,14 @@ describe('WorkflowPage', () => {
       configurable: true,
     });
 
+    getResearchStatus.mockResolvedValue(readyResearchStatus());
+
     getQuantStatus.mockResolvedValue({
       availableJobTypes: {
         prepare_baostock_refresh: { label: '准备 Baostock 增量清单', allowedParams: ['target_end', 'limit'] },
-        download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
-        download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
-        download_akshare: { label: '下载 AkShare 日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'overlap_days', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
+        download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        download_akshare: { label: '下载 AkShare 日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
         validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
         merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
@@ -160,19 +170,19 @@ describe('WorkflowPage', () => {
         report_market_regime: { label: '生成市场状态和现金仓位信号', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_cash_control_backtest: { label: '生成现金仓位叠加回测', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_qlib_predictions: { label: '生成 Qlib 预测摘要', allowedParams: ['run_id', 'topk'] },
-        report_qlib_model_explainability: { label: '生成 Qlib 模型解释报告', allowedParams: ['run_id', 'topk'] },
+        report_qlib_model_explainability: { label: '生成 Qlib 选股模型解释报告', allowedParams: ['run_id', 'topk'] },
         report_qlib_backtest_detail: { label: '生成 Qlib 回测明细报告', allowedParams: ['run_id'] },
-        report_qlib_model_comparison: { label: '生成 Qlib 多模型/多实验对比', allowedParams: ['max_runs'] },
+        report_qlib_model_comparison: { label: '生成 Qlib 多选股模型/多实验对比', allowedParams: ['max_runs'] },
         report_qlib_factor_analysis: { label: '生成 Qlib 因子分析报告', allowedParams: ['run_id', 'topk'] },
         report_qlib_rolling_training: { label: '生成 Qlib 滚动训练计划', allowedParams: ['config', 'windows', 'train_years', 'valid_months', 'test_months', 'step_months'] },
-        report_qlib_risk_model: { label: '生成 Qlib 风险模型诊断', allowedParams: ['run_id'] },
-        train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config', 'experiment_name', 'provider'] },
-        run_candidate_pipeline: { label: '运行五模型完整量化流程', allowedParams: ['dry_run', 'provider'] },
+        report_qlib_risk_model: { label: '生成 Qlib 组合风险诊断', allowedParams: ['run_id'] },
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config', 'experiment_name', 'provider'] },
+        run_candidate_pipeline: { label: '运行五个选股模型候选流程', allowedParams: ['dry_run', 'provider'] },
         generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
         add_index_benchmark: { label: '预演添加沪深300 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
         report_china_astock_indicators: { label: '生成 china-astock 技术指标报告', allowedParams: ['symbols', 'lookback_days', 'limit'] },
-        optimize_strategy: { label: '策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
+        optimize_strategy: { label: '交易策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
         run_dsa_backtest: { label: '运行 DSA 分析准确性回测', allowedParams: ['code', 'eval_window_days', 'force'] },
       },
       activeCount: 0,
@@ -180,7 +190,7 @@ describe('WorkflowPage', () => {
         train_baseline_lgb: {
           jobId: 'qj_train',
           jobType: 'train_baseline_lgb',
-          label: '训练 Qlib LightGBM 基线',
+          label: '训练 Qlib LightGBM 选股模型基线',
           status: 'completed',
           params: {},
           command: [],
@@ -228,7 +238,7 @@ describe('WorkflowPage', () => {
         {
           jobId: 'qj_train',
           jobType: 'train_baseline_lgb',
-          label: '训练 Qlib LightGBM 基线',
+          label: '训练 Qlib LightGBM 选股模型基线',
           status: 'completed',
           params: {},
           command: [],
@@ -262,6 +272,111 @@ describe('WorkflowPage', () => {
     getQuantJobArtifactText.mockResolvedValue('# Training Result\n\nIC: 0.01');
   });
 
+  it('keeps the public workflow page focused on model training', async () => {
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter initialEntries={['/workflow']}>
+          <WorkflowPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: '选股模型训练' })).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-train_baseline_lgb')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-run_daily_update')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-report_qlib_predictions')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '数据更新与检查' })).toHaveAttribute('href', '/data');
+    expect(screen.getByRole('link', { name: '其他量化任务' })).toHaveAttribute('href', '/other');
+    expect(screen.queryByText('Latest Training')).not.toBeInTheDocument();
+    expect(screen.queryByText('最近训练')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '实验记录' })).not.toBeInTheDocument();
+    expect(screen.queryByText('训练 Qlib LightGBM 基线')).not.toBeInTheDocument();
+
+    const trainingHeading = screen.getByRole('heading', { name: '训练选股模型' });
+    const resultsHeading = screen.getByRole('heading', { name: '可回测的选股模型与交易策略' });
+    expect(trainingHeading.compareDocumentPosition(resultsHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    const backtestLink = screen.getByRole('link', { name: '回测 baseline_lgb_alpha158 每日 TopK 等权基线' });
+    expect(backtestLink).toHaveAttribute(
+      'href',
+      '/backtest?tab=trained&runId=abc123&modelId=latest&strategyId=baseline_daily',
+    );
+  });
+
+  it('blocks formal training when the data gate fails but still allows the explicit dry-run preview', async () => {
+    getResearchStatus.mockResolvedValue({
+      ...readyResearchStatus(),
+      trainable: false,
+      trainingReadiness: {
+        status: 'blocked_data',
+        summary: 'SH000300 benchmark is missing or incomplete (8710 missing days)',
+      },
+    });
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter initialEntries={['/workflow']}>
+          <WorkflowPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByText('数据暂不可训练')).toBeInTheDocument();
+    expect(screen.getByText('正式训练已锁定')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '去数据页修复' })).toHaveAttribute('href', '/data');
+
+    const baselineRun = screen.getByTestId('workflow-run-train_baseline_lgb');
+    const candidateRun = screen.getByTestId('workflow-run-run_candidate_pipeline');
+    expect(baselineRun).toBeDisabled();
+    expect(candidateRun).toBeDisabled();
+
+    fireEvent.click(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演'));
+    expect(candidateRun).toBeEnabled();
+    fireEvent.click(candidateRun);
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('run_candidate_pipeline', {
+        provider: 'canonical',
+        dry_run: true,
+      });
+    });
+    expect(submitQuantJob).not.toHaveBeenCalledWith('train_baseline_lgb', expect.anything());
+  });
+
+  it('separates data tasks from the remaining quant tasks', async () => {
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
+    const dataView = render(
+      <UiLanguageProvider>
+        <MemoryRouter initialEntries={['/data']}>
+          <DataPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: '数据更新与检查' })).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-run_daily_update')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-check_qlib_data')).toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-train_baseline_lgb')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-report_qlib_predictions')).not.toBeInTheDocument();
+
+    dataView.unmount();
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter initialEntries={['/other']}>
+          <OtherPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: '其他量化任务' })).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-report_qlib_predictions')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-report_workbench_capabilities')).toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-run_daily_update')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-train_baseline_lgb')).not.toBeInTheDocument();
+  });
+
   it('renders a Chinese web-first quant workflow console', async () => {
     renderWorkflowPage();
 
@@ -292,12 +407,12 @@ describe('WorkflowPage', () => {
     expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
     expect(screen.getByText('应用清洗策略')).toBeInTheDocument();
     expect(screen.getAllByText('质量报告').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText('训练+回测')).toBeInTheDocument();
-    expect(screen.getByText('运行五模型完整量化流程')).toBeInTheDocument();
+    expect(screen.getByText('选股模型训练与交易策略验证')).toBeInTheDocument();
+    expect(screen.getByText('运行五个选股模型候选流程')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五模型完整量化流程');
-    expect(screen.getByLabelText('运行五模型完整量化流程 数据版本')).toBeInTheDocument();
-    expect(screen.getByLabelText('运行五模型完整量化流程 只做小样本预演')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五个选股模型候选流程');
+    expect(screen.getByLabelText('运行五个选股模型候选流程 数据版本')).toBeInTheDocument();
+    expect(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
     expect(screen.getByText('生成现金仓位叠加回测')).toBeInTheDocument();
@@ -305,15 +420,15 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('生成 Qlib 预测摘要')).toBeInTheDocument();
     expect(screen.getByLabelText('生成 Qlib 预测摘要 TopK')).toBeInTheDocument();
     expect(screen.getByText('Qlib研究增强')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 模型解释报告')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 模型解释报告 TopK')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 选股模型解释报告')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 选股模型解释报告 TopK')).toBeInTheDocument();
     expect(screen.getByText('生成 Qlib 回测明细报告')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 多模型/多实验对比')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 多模型/多实验对比 对比 Run 数')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 多选股模型/多实验对比')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成 Qlib 多选股模型/多实验对比 对比 Run 数')).toBeInTheDocument();
     expect(screen.getByText('生成 Qlib 因子分析报告')).toBeInTheDocument();
     expect(screen.getByText('生成 Qlib 滚动训练计划')).toBeInTheDocument();
     expect(screen.getByLabelText('生成 Qlib 滚动训练计划 窗口数')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 风险模型诊断')).toBeInTheDocument();
+    expect(screen.getByText('生成 Qlib 组合风险诊断')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
     expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 技术指标报告')).toBeInTheDocument();
@@ -332,7 +447,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByRole('link', { name: '实验记录' })).toHaveAttribute('href', '/research');
     expect(screen.getByRole('link', { name: '回测页' })).toHaveAttribute('href', '/backtest');
     expect(screen.getByText('检查 Qlib 数据')).toBeInTheDocument();
-    expect(screen.getAllByText('训练 Qlib LightGBM 基线')).toHaveLength(2);
+    expect(screen.getAllByText('训练 Qlib LightGBM 选股模型基线')).toHaveLength(2);
     expect(screen.getByText('latest_training_result.json')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'latest_training_result.json' })).toHaveAttribute(
       'href',
@@ -382,7 +497,7 @@ describe('WorkflowPage', () => {
     render(
       <UiLanguageProvider>
         <MemoryRouter>
-          <WorkflowPage />
+          <QuantTaskPage surface="all" />
         </MemoryRouter>
       </UiLanguageProvider>,
     );
@@ -565,9 +680,9 @@ describe('WorkflowPage', () => {
   it('submits Qlib research enhancement jobs with fixed whitelist params', async () => {
     renderWorkflowPage();
 
-    const explainTopk = await screen.findByLabelText('生成 Qlib 模型解释报告 TopK');
+    const explainTopk = await screen.findByLabelText('生成 Qlib 选股模型解释报告 TopK');
     fireEvent.change(explainTopk, { target: { value: '12' } });
-    fireEvent.click(screen.getByRole('button', { name: '运行 生成 Qlib 模型解释报告' }));
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成 Qlib 选股模型解释报告' }));
 
     const rollingWindows = screen.getByLabelText('生成 Qlib 滚动训练计划 窗口数');
     fireEvent.change(rollingWindows, { target: { value: '4' } });
@@ -651,13 +766,30 @@ describe('WorkflowPage', () => {
     });
   });
 
+  it('submits conservative defaults for an A-share network source job', async () => {
+    renderWorkflowPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '运行 下载东方财富日线' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('download_eastmoney', {
+        incremental: true,
+        sleep: '2',
+        retries: '1',
+        max_consecutive_failures: '3',
+        max_requests: '6000',
+        overlap_days: '7',
+      });
+    });
+  });
+
   it('submits the selected Qlib provider for training jobs', async () => {
     renderWorkflowPage();
 
-    fireEvent.change(await screen.findByLabelText('训练 Qlib LightGBM 基线 数据版本'), {
+    fireEvent.change(await screen.findByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'), {
       target: { value: 'cleaned' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 基线' }));
+    fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 选股模型基线' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {
@@ -669,7 +801,7 @@ describe('WorkflowPage', () => {
   it('renders and submits only parameters advertised by the backend whitelist', async () => {
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
-        train_baseline_lgb: { label: '训练 Qlib LightGBM 基线', allowedParams: ['config'] },
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config'] },
       },
       activeCount: 0,
       latestJobs: {},
@@ -678,11 +810,11 @@ describe('WorkflowPage', () => {
 
     renderWorkflowPage();
 
-    expect(await screen.findByLabelText('训练 Qlib LightGBM 基线 配置文件')).toBeInTheDocument();
-    expect(screen.queryByLabelText('训练 Qlib LightGBM 基线 数据版本')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('训练 Qlib LightGBM 基线 实验名称')).not.toBeInTheDocument();
+    expect(await screen.findByLabelText('训练 Qlib LightGBM 选股模型基线 配置文件')).toBeInTheDocument();
+    expect(screen.queryByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('训练 Qlib LightGBM 选股模型基线 实验名称')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 基线' }));
+    fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 选股模型基线' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {});
@@ -886,13 +1018,13 @@ describe('WorkflowPage', () => {
   it('submits browser-safe strategy optimization dry-run parameters', async () => {
     renderWorkflowPage();
 
-    fireEvent.change(await screen.findByLabelText('策略优化预演 阶段'), {
+    fireEvent.change(await screen.findByLabelText('交易策略优化预演 阶段'), {
       target: { value: '4' },
     });
-    fireEvent.change(screen.getByLabelText('策略优化预演 TopK'), {
+    fireEvent.change(screen.getByLabelText('交易策略优化预演 TopK'), {
       target: { value: '30' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '运行 策略优化预演' }));
+    fireEvent.click(screen.getByRole('button', { name: '运行 交易策略优化预演' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('optimize_strategy', {
@@ -1038,7 +1170,7 @@ describe('WorkflowPage', () => {
     render(
       <UiLanguageProvider>
         <MemoryRouter>
-          <WorkflowPage />
+          <QuantTaskPage surface="all" />
         </MemoryRouter>
       </UiLanguageProvider>,
     );

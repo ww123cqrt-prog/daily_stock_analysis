@@ -18,10 +18,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _ashare_sources import (  # noqa: E402
     QUANT_DATA,
+    download_exit_code,
     load_symbols,
     normalize_daily_frame,
     normalize_date,
     run_daily_download,
+    run_source_entrypoint,
+    validate_source_safety_profile,
 )
 from market_data_clients import fetch_akshare_qfq_daily  # noqa: E402
 
@@ -52,18 +55,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Download AkShare qfq A-share daily bars.")
     parser.add_argument("--start", default="19900101")
     parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"))
-    parser.add_argument("--sleep", type=float, default=0.2)
+    parser.add_argument("--sleep", type=float, default=2.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true", help="Only download symbols not yet cached.")
-    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=30, help="AkShare request timeout in seconds.")
-    parser.add_argument("--max-consecutive-failures", type=int, default=50)
+    parser.add_argument("--max-consecutive-failures", type=int, default=3)
+    parser.add_argument("--max-requests", type=int, default=6000)
     parser.add_argument("--symbols-file", type=Path, help="Optional text file of six-digit symbols to download.")
     parser.add_argument("--incremental", action="store_true", help="Merge fresh rows into existing parquet files.")
-    parser.add_argument("--overlap-days", type=int, default=30, help="Calendar-day overlap used in incremental mode.")
+    parser.add_argument("--overlap-days", type=int, default=7, help="Calendar-day overlap used in incremental mode.")
     parser.add_argument("--use-system-proxy", action="store_true", help="Opt into macOS/system proxy settings.")
     parser.add_argument("--out", "--output-dir", dest="out", type=Path, default=PARQUET_DIR)
     args = parser.parse_args()
+    try:
+        validate_source_safety_profile(
+            sleep_seconds=args.sleep,
+            retries=args.retries,
+            max_consecutive_failures=args.max_consecutive_failures,
+            max_requests=args.max_requests,
+            overlap_days=args.overlap_days,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     symbols = load_symbols(args.symbols_file)
     if args.limit > 0:
@@ -99,9 +113,10 @@ def main() -> int:
         sleep_seconds=args.sleep,
         retry_failed=args.retry_failed,
         max_consecutive_failures=args.max_consecutive_failures,
+        max_requests=args.max_requests,
     )
-    return 0 if summary["ok"] > 0 or summary["no_new"] > 0 else 1
+    return download_exit_code(summary)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_source_entrypoint("akshare", main))

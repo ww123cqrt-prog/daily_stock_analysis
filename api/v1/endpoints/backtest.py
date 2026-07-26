@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date
 from typing import Literal, Optional
@@ -15,10 +16,17 @@ from api.v1.schemas.backtest import (
     BacktestRunResponse,
     BacktestResultItem,
     BacktestResultsResponse,
+    FormStrategyBacktestRunRequest,
     PerformanceMetrics,
+    ScriptStrategyBacktestRunRequest,
+    StrategyBacktestResponse,
+    StrategyBacktestRunRequest,
+    TrainedStrategyBacktestResponse,
+    TrainedStrategyBacktestRunRequest,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.services.backtest_service import BacktestService
+from src.services.trained_strategy_backtest_service import TrainedStrategyBacktestService
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -71,6 +79,181 @@ def run_backtest(
         raise HTTPException(
             status_code=500,
             detail={"error": "internal_error", "message": f"回测执行失败: {str(exc)}"},
+        )
+
+
+@router.post(
+    "/strategy/dsa-signal",
+    response_model=StrategyBacktestResponse,
+    responses={
+        200: {"description": "DSA历史信号交易策略回测完成"},
+        400: {"description": "请求参数错误", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="运行DSA历史信号交易策略回测",
+    description=(
+        "将DSA历史分析转换为目标仓位，在下一交易日开盘执行，连续计算"
+        "资金、持仓、交易成本、净值、回撤和买入持有基准。"
+    ),
+)
+def run_dsa_signal_strategy_backtest(
+    request: StrategyBacktestRunRequest,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> StrategyBacktestResponse:
+    try:
+        _validate_analysis_date_range(request.start_date, request.end_date)
+        service = BacktestService(db_manager)
+        report = service.run_dsa_signal_strategy(
+            code=request.code,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            initial_capital=request.initial_capital,
+            side_cost_pct=request.side_cost_pct,
+            lot_size=request.lot_size,
+        )
+        return StrategyBacktestResponse(**report)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"DSA交易策略回测失败: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"DSA交易策略回测失败: {str(exc)}"},
+        )
+
+
+@router.post(
+    "/strategy/run",
+    response_model=StrategyBacktestResponse,
+    responses={
+        200: {"description": "条件交易策略回测完成"},
+        400: {"description": "请求参数或数据错误", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="运行条件交易策略回测",
+    description="运行明确选择的通用交易策略；规则在收盘后产生目标仓位，下一共同交易日开盘执行。",
+)
+def run_form_strategy_backtest(
+    request: FormStrategyBacktestRunRequest,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> StrategyBacktestResponse:
+    try:
+        _validate_analysis_date_range(request.start_date, request.end_date)
+        report = BacktestService(db_manager).run_strategy(
+            strategy_id=request.strategy_id,
+            symbols=request.symbols,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            initial_capital=request.initial_capital,
+            side_cost_pct=request.side_cost_pct,
+            lot_size=request.lot_size,
+            lookback_days=request.lookback_days,
+            moving_average_days=request.moving_average_days,
+            fast_ma_days=request.fast_ma_days,
+            slow_ma_days=request.slow_ma_days,
+            top_n=request.top_n,
+        )
+        return StrategyBacktestResponse(**report)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_params", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("条件交易策略回测失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "条件交易策略回测失败"},
+        )
+
+
+@router.post(
+    "/strategy/script",
+    response_model=StrategyBacktestResponse,
+    responses={
+        200: {"description": "脚本交易策略回测完成"},
+        400: {"description": "脚本、参数或数据错误", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="运行DSA Python脚本回测",
+    description="静态检查脚本后在受限子进程中逐日生成目标仓位，再由统一回测引擎执行。",
+)
+def run_script_strategy_backtest(
+    request: ScriptStrategyBacktestRunRequest,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> StrategyBacktestResponse:
+    try:
+        _validate_analysis_date_range(request.start_date, request.end_date)
+        report = BacktestService(db_manager).run_script_strategy(
+            script=request.script,
+            symbols=request.symbols,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            initial_capital=request.initial_capital,
+            side_cost_pct=request.side_cost_pct,
+            lot_size=request.lot_size,
+        )
+        return StrategyBacktestResponse(**report)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_script_or_params", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("脚本交易策略回测失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "脚本交易策略回测失败"},
+        )
+
+
+@router.post(
+    "/strategy/trained",
+    response_model=TrainedStrategyBacktestResponse,
+    responses={
+        200: {"description": "已保存选股模型与交易策略重新回测完成"},
+        400: {"description": "Run、交易策略、参数或本地选股模型训练产物不可用", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="重新运行已训练选股模型的交易策略回测",
+    description="读取指定本地 MLflow Run 的 pred.pkl 和 label.pkl，按页面参数重新计算，不重新训练选股模型。",
+)
+def run_trained_strategy_backtest(
+    request: TrainedStrategyBacktestRunRequest,
+) -> TrainedStrategyBacktestResponse:
+    try:
+        _validate_analysis_date_range(request.start_date, request.end_date)
+        report = TrainedStrategyBacktestService().run(
+            run_id=request.run_id,
+            model_id=request.model_id,
+            strategy_id=request.strategy_id,
+            start_date=request.start_date.isoformat(),
+            end_date=request.end_date.isoformat(),
+            topk=request.topk,
+            cost_bps=float(request.cost_bps),
+        )
+        return TrainedStrategyBacktestResponse(**report)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "trained_backtest_unavailable", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("选股模型结果的交易策略回测失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "选股模型结果的交易策略回测失败"},
         )
 
 

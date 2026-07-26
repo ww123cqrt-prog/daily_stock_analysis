@@ -74,6 +74,31 @@ class BacktestRepository:
             rows = session.execute(query).scalars().all()
             return list(rows)
 
+    def list_strategy_analyses(
+        self,
+        *,
+        code: str,
+        limit: int = 5000,
+    ) -> List[AnalysisHistory]:
+        """Return chronological non-market reports for a strategy adapter."""
+
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(AnalysisHistory)
+                .where(
+                    and_(
+                        AnalysisHistory.code == code,
+                        or_(
+                            AnalysisHistory.report_type.is_(None),
+                            AnalysisHistory.report_type != MARKET_REVIEW_REPORT_TYPE,
+                        ),
+                    )
+                )
+                .order_by(AnalysisHistory.created_at, AnalysisHistory.id)
+                .limit(limit)
+            ).scalars().all()
+            return list(rows)
+
     def save_result(self, result: BacktestResult) -> None:
         with self.db.get_session() as session:
             session.add(result)

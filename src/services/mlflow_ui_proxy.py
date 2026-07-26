@@ -87,7 +87,6 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
     return f"""(() => {{
   'use strict';
   const CATALOG = {encoded_catalog};
-  const REVERSE = new Map(Object.entries(CATALOG).map(([source, translated]) => [translated, source]));
   const DYNAMIC_TRANSLATIONS = [
     [/^Metrics \\((\\d+)\\)$/, '指标 ($1)'],
     [/^Parameters \\((\\d+)\\)$/, '参数 ($1)'],
@@ -184,10 +183,7 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
     if (remembered) {{
       if (trimmed === translatedValue(remembered)) node.nodeValue = `${{leading}}${{remembered}}${{trailing}}`;
       textSources.delete(node);
-      return;
     }}
-    const source = REVERSE.get(trimmed);
-    if (source) node.nodeValue = `${{leading}}${{source}}${{trailing}}`;
   }}
 
   function translateAttributes(element) {{
@@ -213,17 +209,12 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
       }} else if (source) {{
         if (current === translatedValue(source)) element.setAttribute(attribute, source);
         remembered.delete(attribute);
-      }} else {{
-        const original = REVERSE.get(current);
-        if (original) element.setAttribute(attribute, original);
       }}
     }}
   }}
 
   function applyTranslations(root = document.body) {{
     if (!root) return;
-    enforceRouteScope();
-    applyScope(root);
     if (root.nodeType === Node.TEXT_NODE) translateTextNode(root);
     if (root.nodeType === Node.ELEMENT_NODE) translateAttributes(root);
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
@@ -270,53 +261,6 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
     window.requestAnimationFrame(() => restoreScrollPositions(scrollSnapshot));
   }}
 
-  function experimentRunsHash(experimentId) {{
-    return '#/experiments/' + experimentId + '/runs';
-  }}
-
-  function scopedHash(hash) {{
-    if (!hash || hash === '#' || hash === '#/') return '#/experiments';
-    if (/^#\/experiments(?:\?|$)/.test(hash)) return hash;
-    if (/^#\/compare-runs(?:[/?]|$)/.test(hash)) return hash;
-    if (/^#\/experiments\/[^/?]+\/runs(?:[/?]|$)/.test(hash)) return hash;
-    const experimentRoute = hash.match(/^#\/experiments\/([^/?]+)/);
-    if (experimentRoute) return experimentRunsHash(experimentRoute[1]);
-    return '#/experiments';
-  }}
-
-  function enforceRouteScope() {{
-    const nextHash = scopedHash(window.location.hash);
-    if (nextHash !== window.location.hash) window.location.replace(nextHash);
-  }}
-
-  function applyScope(root) {{
-    if (!root.querySelectorAll) return;
-    root.querySelectorAll('a[href]').forEach((link) => {{
-      const href = link.getAttribute('href') || '';
-      if (/mlflow\.org\/docs\/latest\/genai\//.test(href)) {{
-        (link.closest('li') || link).setAttribute('data-dsa-scope-hidden', 'true');
-        return;
-      }}
-      const experiment = href.match(/^#\/experiments\/([^/?]+)(?:\?.*)?$/);
-      if (experiment) link.setAttribute('href', experimentRunsHash(experiment[1]));
-      const currentHref = link.getAttribute('href') || '';
-      if (currentHref.startsWith('#') && scopedHash(currentHref) !== currentHref) {{
-        (link.closest('li') || link).setAttribute('data-dsa-scope-hidden', 'true');
-      }}
-    }});
-    root.querySelectorAll('nav *, aside *').forEach((element) => {{
-      if (!element.children.length && element.textContent.trim() === 'GenAI') {{
-        element.setAttribute('data-dsa-scope-hidden', 'true');
-      }}
-    }});
-    root.querySelectorAll('nav [role="button"], aside [role="button"]').forEach((element) => {{
-      const text = element.textContent.trim();
-      if (text === 'GenAI' || text.startsWith('Assistant') || text.startsWith('助手')) {{
-        element.setAttribute('data-dsa-scope-hidden', 'true');
-      }}
-    }});
-  }}
-
   function createToolbar() {{
     if (document.getElementById(TOOLBAR_ID)) return;
     const toolbar = document.createElement('div');
@@ -325,32 +269,25 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
     toolbar.innerHTML = `
       <a href="/research" title="返回 DSA 研究页">DSA</a>
       <span class="dsa-divider"></span>
-      <a href="/research" data-dsa-nav="research"></a>
-      <a href="/workflow" data-dsa-nav="workflow"></a>
-      <a href="/backtest" data-dsa-nav="backtest"></a>
-      <span class="dsa-divider"></span>
       <button type="button" data-language="zh">中文</button>
       <span class="dsa-separator">|</span>
       <button type="button" data-language="en">English</button>`;
     const style = document.createElement('style');
     style.textContent = `
-      #${{TOOLBAR_ID}} {{ position: fixed; top: 10px; right: 18px; z-index: 2147483647;
-        display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-height: 32px; max-width: calc(100vw - 36px); padding: 0 10px;
-        border: 1px solid rgba(107,114,128,.35); border-radius: 6px;
+      #${{TOOLBAR_ID}} {{ position: fixed; top: 0; right: 0; left: 0; z-index: 2147483647;
+        display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 7px;
+        min-height: 42px; max-width: none; padding: 0 18px; box-sizing: border-box;
+        border: 0; border-bottom: 1px solid rgba(107,114,128,.35); border-radius: 0;
         background: rgba(255,255,255,.96); color: #374151; font: 12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         box-shadow: 0 2px 8px rgba(0,0,0,.12); }}
+      #root.mlflow-ui-container {{ position: fixed; inset: 42px 0 0; height: auto !important; min-height: 0 !important; }}
       #${{TOOLBAR_ID}} a, #${{TOOLBAR_ID}} button {{ color: inherit; text-decoration: none; background: none;
         border: 0; padding: 3px 1px; font: inherit; cursor: pointer; }}
       #${{TOOLBAR_ID}} a:hover, #${{TOOLBAR_ID}} button:hover {{ color: #0b57d0; }}
       #${{TOOLBAR_ID}} button[aria-pressed="true"] {{ color: #0b57d0; font-weight: 600; }}
       #${{TOOLBAR_ID}} .dsa-divider {{ width: 1px; height: 14px; background: rgba(107,114,128,.35); }}
       #${{TOOLBAR_ID}} .dsa-separator {{ color: #9ca3af; }}
-      [data-dsa-scope-hidden="true"] {{ display: none !important; }}
       @media (prefers-color-scheme: dark) {{ #${{TOOLBAR_ID}} {{ background: rgba(31,41,55,.96); color: #e5e7eb; }} }}
-      @media (max-width: 640px) {{
-        aside {{ display: none !important; }}
-        #${{TOOLBAR_ID}} {{ top: auto; right: 8px; bottom: 8px; max-width: calc(100vw - 16px); gap: 5px; }}
-      }}
     `;
     document.head.appendChild(style);
     document.body.appendChild(toolbar);
@@ -362,19 +299,12 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
   function updateToolbar() {{
     const toolbar = document.getElementById(TOOLBAR_ID);
     if (!toolbar) return;
-    const labels = language === 'zh'
-      ? {{ research: '研究', workflow: '工作流', backtest: '回测' }}
-      : {{ research: 'Research', workflow: 'Workflow', backtest: 'Backtest' }};
-    toolbar.querySelectorAll('[data-dsa-nav]').forEach((link) => {{
-      link.textContent = labels[link.dataset.dsaNav] || '';
-    }});
     toolbar.querySelectorAll('button[data-language]').forEach((button) => {{
       button.setAttribute('aria-pressed', String(button.dataset.language === language));
     }});
   }}
 
   function start() {{
-    enforceRouteScope();
     createToolbar();
     applyTranslations();
     new MutationObserver(scheduleTranslations).observe(document.body, {{
@@ -392,7 +322,6 @@ def build_runtime_script(catalog: dict[str, str]) -> str:
         applyTranslations();
       }}
     }});
-    window.addEventListener('hashchange', enforceRouteScope);
   }}
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{ once: true }});

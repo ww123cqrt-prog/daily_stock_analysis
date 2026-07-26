@@ -48,7 +48,7 @@ class DownloadBaostockTest(unittest.TestCase):
         self.assertTrue(result.empty)
         query.assert_called_once()
 
-    def test_login_failure_writes_runtime_status_summary(self):
+    def test_blacklist_login_failure_is_recorded_as_immediate_circuit_break(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -56,7 +56,7 @@ class DownloadBaostockTest(unittest.TestCase):
             stock_list = root / "stock_lists.json"
             stock_list.write_text(json.dumps({"all": ["000001.XSHE"]}), encoding="utf-8")
             fake_bs = types.SimpleNamespace(
-                login=lambda: types.SimpleNamespace(error_code="1001", error_msg="blocked"),
+                login=lambda: types.SimpleNamespace(error_code="10001011", error_msg="黑名单用户，请与管理员联系"),
                 logout=lambda: None,
             )
             with patch.object(module, "STOCK_LIST", stock_list), \
@@ -71,7 +71,10 @@ class DownloadBaostockTest(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertEqual(status["status"], "failed")
-        self.assertEqual(status["failure_type"], "login_failed")
+        self.assertEqual(status["failure_type"], "source_blacklisted")
+        self.assertTrue(status["manual_review_required"])
+        self.assertEqual(status["stopped_reason"], "source_denied")
+        self.assertEqual(status["requests_made"], 0)
 
     def test_loads_symbols_file_with_comments_and_suffixes(self):
         module = load_module()
@@ -159,7 +162,7 @@ class DownloadBaostockTest(unittest.TestCase):
                 "--end",
                 "20260703",
                 "--sleep",
-                "0",
+                "2",
                 "--out",
                 str(out_dir),
             ]

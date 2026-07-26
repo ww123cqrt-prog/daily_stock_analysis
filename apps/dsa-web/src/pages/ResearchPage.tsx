@@ -343,7 +343,7 @@ const RESEARCH_TEXT = {
         title: '量化/模型实验',
         status: 'available',
         description: 'Qlib、LightGBM、因子与回测结果在本地串联，MLflow 单独记录实验。',
-        focus: ['因子与特征', '模型训练/回测', 'MLflow 实验记录'],
+        focus: ['因子与特征', '选股模型训练 / 交易策略回测', 'MLflow 实验记录'],
         route: '/backtest',
         routeLabel: '查看回测',
         icon: BrainCircuit,
@@ -384,7 +384,7 @@ const RESEARCH_TEXT = {
     ] satisfies EtfBoundaryItem[],
     projectMap: [
       { name: 'daily_stock_analysis', role: '本地中文 WebUI 与综合分析入口', detail: '承接首页、问股、回测、告警、持仓和研究页。', icon: Network },
-      { name: 'quant_workflow + qlib', role: '量化训练与实验记录', detail: '负责 Qlib 数据、因子、模型训练、LightGBM baseline 和 MLflow。', icon: FlaskConical },
+      { name: 'quant_workflow + qlib', role: '选股模型训练与实验记录', detail: '负责 Qlib 数据、因子、选股模型训练、LightGBM 选股模型基线和 MLflow。', icon: FlaskConical },
       { name: 'china-astock-quant', role: 'A股量化脚本与策略参考', detail: '提供选股、回测、规则策略和工程参考，可按需复用。', icon: Landmark },
       { name: 'quant_data', role: '本地数据仓库', detail: '沉淀 AkShare、JQData 和转换后的 Qlib 格式数据。', icon: Database },
     ] satisfies ProjectItem[],

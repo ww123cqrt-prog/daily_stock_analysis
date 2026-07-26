@@ -20,6 +20,7 @@ import {
   TerminalSquare,
 } from 'lucide-react';
 import { Badge, Card, InlineAlert, StatusDot } from '../components/common';
+import TrainingResultsPanel from '../components/workflow/TrainingResultsPanel';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { getParsedApiError } from '../api/error';
 import { parseQuantJobStreamEvent, quantApi, type QuantJob, type QuantJobTypeInfo, type QuantStatus } from '../api/quant';
@@ -51,6 +52,8 @@ type WorkflowStep = {
   icon: React.ComponentType<{ className?: string }>;
   jobs: WorkflowJob[];
 };
+
+export type QuantTaskSurface = 'all' | 'data' | 'training' | 'other';
 
 type DailyGuideStep = {
   id: string;
@@ -96,25 +99,42 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'run_daily_update',
         label: '运行每日数据更新全链路',
         description:
-          '按顺序执行：A 股三源增量下载、全球日线和限定新闻原始证据下载 → 合并转换 Qlib → 新浪快照校验 → 异常检测 → 清洗 → 多源交叉验证 → provider 校验。' +
-          '下载源彼此独立；全球或新闻下载失败只记录警告，不影响 A 股覆盖率门禁。JQData 只参与合并与交叉验证，不在此下载。',
+          'A 股历史源默认关闭；手动启用时一次只运行 Baostock、东方财富或 AkShare 中的一个。之后再执行合并、校验、清洗和 provider 检查。',
+        defaultParams: {
+          ashare_source: 'none',
+          overlap_days: '7',
+          sleep: '2',
+          retries: '1',
+          max_consecutive_failures: '3',
+          max_requests: '6000',
+        },
         params: [
+          {
+            key: 'ashare_source',
+            label: 'A股历史来源',
+            kind: 'select',
+            options: [
+              { value: 'none', label: '关闭（默认）' },
+              { value: 'baostock', label: 'Baostock' },
+              { value: 'eastmoney', label: '东方财富' },
+              { value: 'akshare', label: 'AkShare（使用东财接口）' },
+            ],
+          },
           { key: 'skip_download', label: '跳过下载只重建', kind: 'checkbox' },
           { key: 'force', label: '强制重建（无新数据也跑）', kind: 'checkbox' },
           { key: 'dry_run', label: '仅预演不执行', kind: 'checkbox' },
           { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
-          { key: 'skip_eastmoney', label: '跳过东方财富', kind: 'checkbox' },
-          { key: 'skip_akshare', label: '跳过 AkShare', kind: 'checkbox' },
           { key: 'skip_global_daily', label: '跳过全球日线', kind: 'checkbox' },
           { key: 'skip_ashare_news', label: '跳过新闻原始证据', kind: 'checkbox' },
           { key: 'skip_snapshot_validation', label: '跳过快照校验', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
           { key: 'end', label: '结束日期', kind: 'date' },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '45' },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.3' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
           { key: 'timeout', label: '超时秒数', kind: 'number', min: 1, placeholder: '60' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 0, placeholder: '3' },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, placeholder: '50' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
+          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
           { key: 'snapshot_limit', label: '快照校验样本', kind: 'number', min: 1, placeholder: '50' },
           { key: 'news_limit', label: '新闻下载股票数', kind: 'number', min: 1, placeholder: '50' },
@@ -142,14 +162,17 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'download_baostock',
         label: '下载 Baostock 长历史',
         description: '补齐 A 股日线长历史，本地缓存为 Parquet。',
+        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
         params: [
           { key: 'start', label: '开始日期', kind: 'date' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.2' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
           { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1 },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
+          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
           { key: 'incremental', label: '增量下载', kind: 'checkbox' },
           { key: 'retry_failed', label: '重试失败', kind: 'checkbox' },
           { key: 'retry_empty', label: '重试空数据', kind: 'checkbox' },
@@ -160,16 +183,17 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'download_eastmoney',
         label: '下载东方财富日线',
         description: '匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。',
-        defaultParams: { incremental: true },
+        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
         params: [
           { key: 'start', label: '开始日期', kind: 'date' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.1' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
           { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1 },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '30' },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
+          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
           { key: 'incremental', label: '增量下载', kind: 'checkbox' },
           { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
@@ -179,16 +203,17 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'download_akshare',
         label: '下载 AkShare 日线',
         description: '调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。',
-        defaultParams: { incremental: true },
+        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
         params: [
           { key: 'start', label: '开始日期', kind: 'date' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.2' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
           { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1 },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '30' },
+          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
+          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
+          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
           { key: 'incremental', label: '增量下载', kind: 'checkbox' },
           { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
@@ -203,8 +228,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'start', label: '开始日期', kind: 'date' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'limit', label: '代码数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 0, step: 0.1, placeholder: '0.1' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 0 },
+          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
+          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
           { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
           { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 1, max: 365, placeholder: '7' },
           { key: 'incremental', label: '增量下载', kind: 'checkbox' },
@@ -246,7 +271,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'merge_to_qlib',
         label: '合并并转换为 Qlib',
-        description: '生成 canonical Qlib provider，供模型训练读取。',
+        description: '生成 canonical Qlib provider，供选股模型训练读取。',
         params: [
           { key: 'smoke', label: '使用隔离小样本演练', kind: 'checkbox' },
           { key: 'no_overwrite', label: '跳过已有输出文件', kind: 'checkbox' },
@@ -333,14 +358,14 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     ],
   },
   {
-    title: '训练+回测',
-    description: '运行单模型基线或五模型完整候选流程，并记录 MLflow 实验。',
+    title: '选股模型训练与交易策略验证',
+    description: '运行单个选股模型基线或五个选股模型候选流程，并记录 MLflow 实验。',
     icon: FlaskConical,
     jobs: [
       {
         type: 'train_baseline_lgb',
-        label: '训练 Qlib LightGBM 基线',
-        description: '执行 Qlib 训练和组合回测，写入最新训练摘要。',
+        label: '训练 Qlib LightGBM 选股模型基线',
+        description: '执行 Qlib 选股模型训练和默认交易策略回测，写入最新训练摘要。',
         params: [
           {
             key: 'provider',
@@ -357,8 +382,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'run_candidate_pipeline',
-        label: '运行五模型完整量化流程',
-        description: '依次训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost；只用 2024-2025 选择前两名及五套交易方法，再用 2026 留出期终审。结果写入 MLflow 和候选流程报告，不自动下单。',
+        label: '运行五个选股模型候选流程',
+        description: '依次训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost 五个选股模型；只用 2024-2025 选择候选选股模型及五套交易策略，再用 2026 留出期终审。结果写入 MLflow 和候选流程报告，不自动下单。',
         defaultParams: { provider: 'canonical', dry_run: false },
         params: [
           {
@@ -396,7 +421,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'report_qlib_predictions',
         label: '生成 Qlib 预测摘要',
-        description: '读取最新 Qlib/MLflow pred.pkl，生成最新交易日 Top/Bottom 模型评分摘要；只读排行，不连接券商、不自动下单。',
+        description: '读取最新 Qlib/MLflow pred.pkl，生成最新交易日 Top/Bottom 选股模型评分摘要；只读排行，不连接券商、不自动下单。',
         defaultParams: { topk: '20' },
         params: [
           { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '20' },
@@ -405,7 +430,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'optimize_strategy',
-        label: '策略优化预演',
+        label: '交易策略优化预演',
         description: '用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；只读生成报告，不训练、不连接券商、不自动下单。',
         defaultParams: { dry_run: true, phase: '4', topk: '30' },
         params: [
@@ -418,7 +443,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
               { value: '1', label: '低换手' },
               { value: '2', label: '市场择时' },
               { value: '3', label: '回撤保护' },
-              { value: '4', label: '综合策略' },
+              { value: '4', label: '综合交易策略' },
             ],
           },
           { key: 'topk', label: 'TopK', kind: 'number', min: 1, max: 500, placeholder: '30' },
@@ -438,12 +463,12 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
   {
     title: 'Qlib研究增强',
-    description: '把已有 Qlib/MLflow 产物拆成模型解释、回测明细、对比、因子、滚动训练和风险诊断报告。',
+    description: '把已有 Qlib/MLflow 产物拆成选股模型解释、交易策略回测明细、选股模型对比、因子、滚动训练和组合风险诊断报告。',
     icon: Activity,
     jobs: [
       {
         type: 'report_qlib_model_explainability',
-        label: '生成 Qlib 模型解释报告',
+        label: '生成 Qlib 选股模型解释报告',
         description: '读取最新或指定 run 的 params/pred/label，输出特征重要性、Top/Bottom 预测差异和过拟合诊断；只读报告。',
         defaultParams: { topk: '20' },
         params: [
@@ -461,7 +486,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'report_qlib_model_comparison',
-        label: '生成 Qlib 多模型/多实验对比',
+        label: '生成 Qlib 多选股模型/多实验对比',
         description: '扫描本地 MLflow 最近 runs，对比关键指标和预测相关性；可用于 LightGBM、Linear、CatBoost 等实验横向比较。',
         defaultParams: { max_runs: '8' },
         params: [
@@ -494,7 +519,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'report_qlib_risk_model',
-        label: '生成 Qlib 风险模型诊断',
+        label: '生成 Qlib 组合风险诊断',
         description: '从组合收益、benchmark、换手和最新持仓中估算 beta、集中度、权重上限和风险约束缺口；只读报告。',
         params: [
           { key: 'run_id', label: 'MLflow Run ID', kind: 'text', placeholder: '留空读取最新训练' },
@@ -504,9 +529,118 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
 ];
 
+const DATA_JOB_TYPES = new Set([
+  'run_daily_update',
+  'prepare_baostock_refresh',
+  'download_baostock',
+  'download_eastmoney',
+  'download_akshare',
+  'download_global_daily',
+  'download_ashare_news',
+  'download_jqdata',
+  'merge_to_qlib',
+  'repair_qlib_provider',
+  'generate_csi300',
+  'add_index_benchmark',
+  'check_qlib_data',
+  'report_data_quality',
+  'report_data_anomalies',
+  'validate_latest_snapshot',
+  'report_data_hygiene',
+  'apply_data_cleaning',
+]);
+
+const TRAINING_JOB_TYPES = new Set([
+  'train_baseline_lgb',
+  'run_candidate_pipeline',
+]);
+
+function isTrainingDryRun(jobType: string, params: Record<string, unknown>): boolean {
+  return jobType === 'run_candidate_pipeline' && params.dry_run === true;
+}
+
+function isFormalTrainingBlocked(
+  jobType: string,
+  params: Record<string, unknown>,
+  trainable: boolean | undefined,
+): boolean {
+  return TRAINING_JOB_TYPES.has(jobType) && !isTrainingDryRun(jobType, params) && trainable !== true;
+}
+
+function surfaceForJob(jobType: string): Exclude<QuantTaskSurface, 'all'> {
+  if (DATA_JOB_TYPES.has(jobType)) return 'data';
+  if (TRAINING_JOB_TYPES.has(jobType)) return 'training';
+  return 'other';
+}
+
+function stepsForSurface(surface: QuantTaskSurface): WorkflowStep[] {
+  if (surface === 'all') return WORKFLOW_STEPS;
+  return WORKFLOW_STEPS.flatMap((step) => {
+    const jobs = step.jobs.filter((job) => surfaceForJob(job.type) === surface);
+    if (!jobs.length) return [];
+    if (surface === 'training') {
+      return [{
+        ...step,
+        title: '训练选股模型',
+        description: '训练单个选股模型基线或五个选股模型候选流程；训练完成后把选股模型和交易策略组合送入回测页。',
+        jobs,
+      }];
+    }
+    if (surface === 'other' && step.title === '质量报告') {
+      return [{ ...step, title: '工作台与外部项目报告', description: '集中查看尚未归入数据、训练和正式回测页面的辅助能力。', jobs }];
+    }
+    if (surface === 'other' && step.title === '选股模型训练与交易策略验证') {
+      return [{ ...step, title: '市场、预测与历史结果', description: '保留市场状态、预测摘要和旧版历史验证任务，等待后续决定。', jobs }];
+    }
+    return [{ ...step, jobs }];
+  });
+}
+
+function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
+  const zh = language === 'zh';
+  if (surface === 'data') {
+    return {
+      eyebrow: 'Quant Data',
+      title: zh ? '数据更新与检查' : 'Data Updates and Checks',
+      description: zh
+        ? '更新行情与参考数据，合并 Qlib 数据，并独立完成质量、异常和可训练性检查。'
+        : 'Update market and reference data, merge Qlib data, and run quality and training-readiness checks.',
+    };
+  }
+  if (surface === 'training') {
+    return {
+      eyebrow: 'Model Training',
+      title: zh ? '选股模型训练' : 'Stock Selection Model Training',
+      description: zh
+        ? '训练选股模型，查看候选选股模型与交易策略组合，并把指定结果加载到回测页。'
+        : 'Train stock-selection models, inspect model and trading-strategy combinations, and load a result into backtesting.',
+    };
+  }
+  if (surface === 'other') {
+    return {
+      eyebrow: 'Other Quant Tasks',
+      title: zh ? '其他量化任务' : 'Other Quant Tasks',
+      description: zh
+        ? '集中放置暂未归入数据、选股模型训练或正式回测页面的报告和辅助任务。'
+        : 'Reports and supporting tasks not yet assigned to data, model training, or formal backtesting.',
+    };
+  }
+  return {
+    eyebrow: 'Quant Workflow',
+    title: zh ? '量化任务中心' : 'Quant Workflow',
+    description: zh
+      ? '在网页端完成数据更新、Qlib 转换、质量检查、选股模型训练、实验追踪和交易策略回测查看；后台只执行白名单脚本。'
+      : 'Run data, Qlib, quality, training, experiment and backtest tasks through a browser-safe whitelist.',
+  };
+}
+
 const WORKFLOW_JOBS_BY_TYPE = Object.fromEntries(
   WORKFLOW_STEPS.flatMap((step) => step.jobs).map((job) => [job.type, job]),
 );
+
+function displayQuantJobLabel(job: Pick<QuantJob, 'jobType' | 'label'>): string {
+  return WORKFLOW_JOBS_BY_TYPE[job.jobType]?.label || job.label;
+}
 
 type JobParamValue = string | boolean;
 type JobParamState = Record<string, Record<string, JobParamValue>>;
@@ -941,7 +1075,7 @@ const WorkflowParamControls: React.FC<{
   );
 };
 
-const WorkflowPage: React.FC = () => {
+export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surface = 'all' }) => {
   const { language, t } = useUiLanguage();
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [quantStatus, setQuantStatus] = useState<QuantStatus | null>(null);
@@ -956,6 +1090,12 @@ const WorkflowPage: React.FC = () => {
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
 
   const latestJobs = useMemo(() => quantStatus?.latestJobs ?? {}, [quantStatus]);
+  const visibleWorkflowSteps = useMemo(() => stepsForSurface(surface), [surface]);
+  const visibleJobs = useMemo(
+    () => surface === 'all' ? jobs : jobs.filter((job) => surfaceForJob(job.jobType) === surface),
+    [jobs, surface],
+  );
+  const copy = surfaceCopy(surface, language);
   const externalServices = quantStatus?.externalServices ?? {};
   const mlflow = externalServices.mlflow ?? quantStatus?.mlflow;
   const dsaService = externalServices.dsa ?? {
@@ -1049,7 +1189,7 @@ const WorkflowPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    document.title = '量化任务中心 - DSA';
+    document.title = `${copy.title} - DSA`;
     void refresh();
     const timer = window.setInterval(() => {
       if (typeof window.EventSource === 'undefined') {
@@ -1059,7 +1199,7 @@ const WorkflowPage: React.FC = () => {
       }
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [refresh, refreshSummary]);
+  }, [copy.title, refresh, refreshSummary]);
 
   useEffect(() => {
     if (typeof window.EventSource === 'undefined') {
@@ -1152,6 +1292,13 @@ const WorkflowPage: React.FC = () => {
       setError(`后端未启用任务：${workflowJob.label}`);
       return;
     }
+    const params = explicitParams
+      ? filterJobParams(explicitParams, backendJobInfo.allowedParamKeys)
+      : buildJobParams(workflowJob, jobParams[jobType], backendJobInfo.allowedParamKeys);
+    if (isFormalTrainingBlocked(jobType, params, trainable)) {
+      setError('当前数据没有通过训练检查。请先到“数据更新与检查”页面修复；五个选股模型的小样本预演仍可运行。');
+      return;
+    }
     if (submittingJobTypesRef.current.has(jobType)) {
       return;
     }
@@ -1159,9 +1306,6 @@ const WorkflowPage: React.FC = () => {
     setSubmittingTypes((current) => ({ ...current, [jobType]: true }));
     setError(null);
     try {
-      const params = explicitParams
-        ? filterJobParams(explicitParams, backendJobInfo.allowedParamKeys)
-        : buildJobParams(workflowJob, jobParams[jobType], backendJobInfo.allowedParamKeys);
       const job = await quantApi.submitJob(jobType, params);
       setJobs((current) => [job, ...current.filter((item) => item.jobId !== job.jobId)]);
       setQuantStatus((current) => current
@@ -1231,6 +1375,7 @@ const WorkflowPage: React.FC = () => {
 
   const trainable = workflowStatus?.trainable;
   const latestTraining = workflowStatus?.latestTraining;
+  const candidatePipeline = workflowStatus?.candidatePipeline;
   const dailyGuideSteps = useMemo(
     () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
     [workflowStatus, latestJobs, mlflowUrl],
@@ -1241,12 +1386,12 @@ const WorkflowPage: React.FC = () => {
       <div className="mx-auto flex max-w-7xl flex-col gap-5">
         <header className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <span className="label-uppercase">Quant Workflow</span>
+            <span className="label-uppercase">{copy.eyebrow}</span>
             <h1 className="mt-2 text-2xl font-semibold tracking-normal text-foreground sm:text-3xl">
-              量化任务中心
+              {copy.title}
             </h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">
-              在网页端完成数据更新、Qlib 转换、质量检查、模型训练、实验追踪和回测查看；后台只执行白名单脚本。
+              {copy.description}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1265,9 +1410,29 @@ const WorkflowPage: React.FC = () => {
           </div>
         </header>
 
+        {surface !== 'all' ? (
+          <nav className="flex flex-wrap border-b border-border/70" aria-label={language === 'zh' ? '量化任务分类' : 'Quant task sections'}>
+            {[
+              { to: '/data', label: language === 'zh' ? '数据更新与检查' : 'Data' , key: 'data' },
+              { to: '/workflow', label: language === 'zh' ? '选股模型训练' : 'Model training', key: 'training' },
+              { to: '/other', label: language === 'zh' ? '其他量化任务' : 'Other', key: 'other' },
+            ].map((item) => (
+              <Link
+                key={item.key}
+                to={item.to}
+                aria-current={surface === item.key ? 'page' : undefined}
+                className={`inline-flex h-10 items-center border-b-2 px-4 text-sm font-medium transition-colors ${surface === item.key ? 'border-cyan text-cyan' : 'border-transparent text-secondary-text hover:text-foreground'}`}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+        ) : null}
+
         {error ? <InlineAlert variant="danger" title="工作流接口异常" message={error} /> : null}
 
-        <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <section className={`grid gap-3 md:grid-cols-2 ${surface === 'training' ? 'xl:grid-cols-2' : 'xl:grid-cols-3'}`}>
+          {surface === 'all' || surface === 'data' || surface === 'training' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <div className="flex items-center justify-between gap-3">
               <span className="label-uppercase">Data</span>
@@ -1287,7 +1452,9 @@ const WorkflowPage: React.FC = () => {
                   : 'Run a data quality report to see training readiness here.')}
             </p>
           </Card>
+          ) : null}
 
+          {surface === 'all' || surface === 'data' || surface === 'training' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <span className="label-uppercase">Qlib Provider</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
@@ -1297,31 +1464,25 @@ const WorkflowPage: React.FC = () => {
               {language === 'zh' ? '股票池' : 'Universe'} {formatNumber(workflowStatus?.qlibProvider?.instruments)} · {language === 'zh' ? '日历' : 'Calendar'} {formatNumber(workflowStatus?.qlibProvider?.calendarDays)}
             </p>
           </Card>
+          ) : null}
 
+          {surface === 'all' || surface === 'data' || surface === 'other' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <span className="label-uppercase">Jobs</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
               {language === 'zh'
-                ? `${quantStatus?.activeCount ?? 0} 个运行中`
-                : `${quantStatus?.activeCount ?? 0} running`}
+                ? `${surface === 'all' ? quantStatus?.activeCount ?? 0 : activeJobCount(visibleJobs)} 个运行中`
+                : `${surface === 'all' ? quantStatus?.activeCount ?? 0 : activeJobCount(visibleJobs)} running`}
             </p>
             <p className="mt-2 text-sm text-secondary-text">
               {language === 'zh'
-                ? `最近任务 ${jobs.length} 条，状态和日志保存在本地 reports/jobs。`
-                : `${jobs.length} recent jobs; status and logs are stored locally under reports/jobs.`}
+                ? `当前分类最近任务 ${visibleJobs.length} 条，状态和日志保存在本地。`
+                : `${visibleJobs.length} recent jobs in this section; status and logs are stored locally.`}
             </p>
           </Card>
+          ) : null}
 
-          <Card variant="bordered" padding="md" className="min-h-[132px]">
-            <span className="label-uppercase">Latest Training</span>
-            <p className="mt-3 truncate text-lg font-semibold text-foreground">
-              {latestTraining?.experimentName || (language === 'zh' ? '暂无训练记录' : 'No training runs yet')}
-            </p>
-            <p className="mt-2 truncate text-sm text-secondary-text">
-              Run ID: {latestTraining?.runId || '-'}
-            </p>
-          </Card>
-
+          {surface === 'all' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <div className="flex items-start justify-between gap-3">
               <span className="label-uppercase">Services</span>
@@ -1370,11 +1531,45 @@ const WorkflowPage: React.FC = () => {
               })}
             </div>
           </Card>
+          ) : null}
+
+          {surface === 'other' ? (
+          <Card variant="bordered" padding="md" className="min-h-[132px]">
+            <span className="label-uppercase">Pending Classification</span>
+            <p className="mt-3 text-lg font-semibold text-foreground">
+              {visibleWorkflowSteps.reduce((total, step) => total + step.jobs.length, 0)} {language === 'zh' ? '个待分类任务' : 'tasks awaiting classification'}
+            </p>
+            <p className="mt-2 text-sm leading-5 text-secondary-text">
+              {language === 'zh'
+                ? '这些能力暂时集中在本页，确认用途后再分别归入训练、回测或研究页面。'
+                : 'These capabilities remain here until they are assigned to training, backtesting, or research.'}
+            </p>
+          </Card>
+          ) : null}
         </section>
+
+        {surface === 'training' && !loading && trainable === false ? (
+          <section className="flex flex-wrap items-center justify-between gap-3 border border-warning/35 bg-warning/5 px-4 py-3">
+            <div>
+              <p className="text-sm font-semibold text-warning">
+                {language === 'zh' ? '正式训练已锁定' : 'Formal training is locked'}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-secondary-text">
+                {language === 'zh'
+                  ? '原因见上方数据状态。LightGBM 选股模型基线和五个选股模型正式训练不会启动；勾选“五个选股模型小样本预演”后只运行内置测试数据。'
+                  : 'See the data status above. Formal baseline and five-model training cannot start; the explicit dry-run uses built-in test data only.'}
+              </p>
+            </div>
+            <Link to="/data" className="btn-secondary h-9 gap-2 px-3 text-sm">
+              {language === 'zh' ? '去数据页修复' : 'Open data page'}
+              <ArrowRight className="h-4 w-4" />
+            </Link>
+          </section>
+        ) : null}
 
         <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <div className="flex flex-col gap-4">
-            {WORKFLOW_STEPS.map((step) => {
+            {visibleWorkflowSteps.map((step) => {
               const Icon = step.icon;
               return (
                 <Card key={step.title} variant="bordered" padding="none" className="overflow-hidden">
@@ -1396,6 +1591,8 @@ const WorkflowPage: React.FC = () => {
                       const paramValues = jobParams[job.type] || {};
                       const isKnownJobType = Boolean(WORKFLOW_JOBS_BY_TYPE[job.type]);
                       const backendJobInfo = getBackendJobInfo(quantStatus, job.type);
+                      const effectiveParams = buildJobParams(job, paramValues, backendJobInfo.allowedParamKeys);
+                      const formalTrainingBlocked = isFormalTrainingBlocked(job.type, effectiveParams, trainable);
                       return (
                         <div
                           key={job.type}
@@ -1410,6 +1607,11 @@ const WorkflowPage: React.FC = () => {
                               {backendJobInfo.isDisabled ? (
                                 <Badge variant="warning" size="sm" className="shadow-none">
                                   后端未启用
+                                </Badge>
+                              ) : null}
+                              {formalTrainingBlocked && !loading ? (
+                                <Badge variant="warning" size="sm" className="shadow-none">
+                                  {language === 'zh' ? '等待数据修复' : 'Waiting for data'}
                                 </Badge>
                               ) : null}
                             </div>
@@ -1482,7 +1684,7 @@ const WorkflowPage: React.FC = () => {
                               data-testid={`workflow-run-${job.type}`}
                               className="btn-primary h-9 min-w-[8rem] gap-2 px-3 text-sm"
                               onClick={() => void submitJob(job)}
-                              disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled}
+                              disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled || formalTrainingBlocked}
                               aria-label={`运行 ${job.label}`}
                             >
                               {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -1498,8 +1700,18 @@ const WorkflowPage: React.FC = () => {
             })}
           </div>
 
-          <aside className="flex flex-col gap-4">
-            <Card variant="bordered" padding="md">
+          {surface === 'training' ? (
+            <div className="xl:col-span-2 xl:row-start-2">
+              <TrainingResultsPanel
+                latestTraining={latestTraining}
+                candidatePipeline={candidatePipeline}
+                language={language}
+              />
+            </div>
+          ) : null}
+
+          <aside className={`flex flex-col gap-4 ${surface === 'training' ? 'xl:col-start-2 xl:row-start-1' : ''}`}>
+            {surface === 'all' ? <Card variant="bordered" padding="md">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
@@ -1586,7 +1798,7 @@ const WorkflowPage: React.FC = () => {
                   </div>
                 ))}
               </div>
-            </Card>
+            </Card> : null}
 
             <Card variant="bordered" padding="md">
               <div className="flex items-center gap-2">
@@ -1594,9 +1806,9 @@ const WorkflowPage: React.FC = () => {
                 <h2 className="text-sm font-semibold text-foreground">最近任务</h2>
               </div>
               <div className="mt-3 flex flex-col gap-2">
-                {jobs.length === 0 ? (
-                  <p className="text-sm text-secondary-text">暂无任务。点击左侧按钮后会出现在这里。</p>
-                ) : jobs.slice(0, 12).map((job) => (
+                {visibleJobs.length === 0 ? (
+                  <p className="text-sm text-secondary-text">暂无任务。运行当前页面的任务后会出现在这里。</p>
+                ) : visibleJobs.slice(0, 12).map((job) => (
                   <button
                     type="button"
                     key={job.jobId}
@@ -1604,7 +1816,7 @@ const WorkflowPage: React.FC = () => {
                     onClick={() => void openLog(job)}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="min-w-0 truncate text-sm font-medium text-foreground">{job.label}</span>
+                      <span className="min-w-0 truncate text-sm font-medium text-foreground">{displayQuantJobLabel(job)}</span>
                       <StatusDot tone={statusTone(job.status)} pulse={job.status === 'running'} className="h-2 w-2" />
                     </div>
                     <div className="mt-1 flex items-center gap-2 text-xs text-muted-text">
@@ -1648,5 +1860,7 @@ const WorkflowPage: React.FC = () => {
     </main>
   );
 };
+
+const WorkflowPage: React.FC = () => <QuantTaskPage surface="training" />;
 
 export default WorkflowPage;

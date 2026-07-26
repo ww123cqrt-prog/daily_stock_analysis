@@ -9,7 +9,7 @@ import re
 import shutil
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 from pathlib import Path
 from typing import Callable
@@ -128,6 +128,50 @@ def _download_eastmoney_index(start_date: str, end_date: str, *, use_system_prox
         parts = str(line).split(",")
         if len(parts) >= 3 and parts[2] not in {"", "-"}:
             data[parts[0]] = float(parts[2])
+    return data
+
+
+def _download_tencent_index(start_date: str, end_date: str, *, use_system_proxy: bool = False) -> dict[str, float]:
+    import requests
+
+    session = requests.Session()
+    session.trust_env = use_system_proxy
+    data: dict[str, float] = {}
+    cursor_end = end_date
+    try:
+        for _ in range(64):
+            response = session.get(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                params={"param": f"sh000300,day,,{cursor_end},640,qfq"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            instrument = ((payload or {}).get("data") or {}).get("sh000300") or {}
+            rows = instrument.get("day") or instrument.get("qfqday") or []
+            if not rows:
+                break
+
+            page_dates: list[str] = []
+            for row in rows:
+                if len(row) < 3:
+                    continue
+                day = str(row[0])[:10]
+                page_dates.append(day)
+                if start_date <= day <= end_date and row[2] not in {"", "-"}:
+                    data[day] = float(row[2])
+
+            if not page_dates:
+                break
+            earliest = min(page_dates)
+            if earliest <= start_date:
+                break
+            next_end = (datetime.strptime(earliest, "%Y-%m-%d").date() - timedelta(days=1)).isoformat()
+            if next_end >= cursor_end:
+                break
+            cursor_end = next_end
+    finally:
+        session.close()
     return data
 
 
@@ -281,6 +325,14 @@ def add_benchmark(
             source_fetchers.extend(
                 [
                     ("baostock", lambda start, end: _download_index_data(bs, start, end)),
+                    (
+                        "tencent",
+                        lambda start, end: _download_tencent_index(
+                            start,
+                            end,
+                            use_system_proxy=use_system_proxy,
+                        ),
+                    ),
                     (
                         "eastmoney",
                         lambda start, end: _download_eastmoney_index(

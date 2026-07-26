@@ -25,13 +25,16 @@ def _args(**overrides):
     base = dict(
         skip_download=False,
         force=False,
-        overlap_days=45,
-        sleep=0.3,
+        ashare_source="none",
+        overlap_days=7,
+        sleep=2.0,
         timeout=60,
-        retries=3,
-        max_consecutive_failures=50,
+        retries=1,
+        max_consecutive_failures=3,
+        max_requests=6000,
         limit=0,
         end="20260708",
+        skip_baostock=False,
         skip_eastmoney=False,
         skip_akshare=False,
         skip_global_daily=False,
@@ -39,12 +42,12 @@ def _args(**overrides):
         skip_snapshot_validation=False,
         use_system_proxy=False,
         snapshot_limit=50,
-        news_limit=50,
+        news_limit=0,
         overlap_sample=0,
         merged_sample=0,
         min_source_coverage=0.8,
         benchmark_cache_dir=None,
-        benchmark_offline=False,
+        benchmark_offline=True,
         quality_min_calendar_days=252,
         quality_min_instruments=100,
         skip_if_robust_training=False,
@@ -103,11 +106,11 @@ class BuildStagesTest(unittest.TestCase):
         self.module = load_module()
 
     def test_full_chain_includes_download_first(self):
-        stages = self.module.build_stages(_args())
+        stages = self.module.build_stages(_args(ashare_source="baostock", news_limit=50))
         names = [s.name for s in stages]
         self.assertEqual(names[0], "download_baostock")
-        self.assertIn("download_eastmoney", names)
-        self.assertIn("download_akshare", names)
+        self.assertNotIn("download_eastmoney", names)
+        self.assertNotIn("download_akshare", names)
         self.assertIn("download_global_daily", names)
         self.assertIn("download_ashare_news", names)
         self.assertIn("merge_to_qlib", names)
@@ -131,7 +134,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertEqual(names[0], "merge_to_qlib")
 
     def test_download_stage_is_incremental_nonfatal_and_not_heavy(self):
-        stages = self.module.build_stages(_args(limit=5))
+        stages = self.module.build_stages(_args(ashare_source="baostock", limit=5))
         download = next(s for s in stages if s.name == "download_baostock")
         self.assertFalse(download.heavy)
         # Baostock download is non-fatal: merge reads on-disk parquet, so a
@@ -140,10 +143,13 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("--incremental", download.argv)
         self.assertIn("--limit", download.argv)
         self.assertIn("5", download.argv)
+        self.assertEqual(download.argv[download.argv.index("--max-requests") + 1], "6000")
 
-    def test_new_public_source_downloads_are_incremental_and_nonfatal(self):
-        stages = self.module.build_stages(_args(limit=5))
-        for name in ["download_eastmoney", "download_akshare"]:
+    def test_eastmoney_family_sources_are_mutually_exclusive(self):
+        for source, name in [("eastmoney", "download_eastmoney"), ("akshare", "download_akshare")]:
+            stages = self.module.build_stages(_args(ashare_source=source, limit=5))
+            names = [stage.name for stage in stages]
+            self.assertEqual(len({item for item in names if item in {"download_eastmoney", "download_akshare"}}), 1)
             stage = next(s for s in stages if s.name == name)
             self.assertFalse(stage.heavy)
             self.assertFalse(stage.required)
@@ -152,16 +158,31 @@ class BuildStagesTest(unittest.TestCase):
             self.assertIn("--limit", stage.argv)
             self.assertIn("5", stage.argv)
 
+        stages = self.module.build_stages(_args(ashare_source="eastmoney", limit=5))
         global_daily = next(s for s in stages if s.name == "download_global_daily")
         self.assertFalse(global_daily.heavy)
         self.assertFalse(global_daily.required)
         self.assertIn("--incremental", global_daily.argv)
         self.assertIn("--limit", global_daily.argv)
 
-        news = next(s for s in stages if s.name == "download_ashare_news")
-        self.assertFalse(news.heavy)
-        self.assertFalse(news.required)
-        self.assertEqual(news.argv[news.argv.index("--limit") + 1], "50")
+        self.assertNotIn("download_ashare_news", [stage.name for stage in stages])
+
+    def test_default_arguments_quarantine_blocked_ashare_sources(self):
+        args = self.module.parse_args([])
+
+        self.assertEqual(args.ashare_source, "none")
+        self.assertEqual(args.sleep, 2.0)
+        self.assertEqual(args.retries, 1)
+        self.assertEqual(args.max_consecutive_failures, 3)
+        self.assertEqual(args.max_requests, 6000)
+        self.assertEqual(args.overlap_days, 7)
+        self.assertEqual(args.news_limit, 0)
+        names = [stage.name for stage in self.module.build_stages(args)]
+        self.assertFalse(set(names) & self.module.ASHARE_DOWNLOAD_STAGE_NAMES)
+        self.assertNotIn("download_ashare_news", names)
+        benchmark = next(stage for stage in self.module.build_stages(args) if stage.name == "add_index_benchmark")
+        self.assertTrue(args.benchmark_offline)
+        self.assertIn("--offline", benchmark.argv)
 
     def test_rebuild_stages_marked_heavy(self):
         stages = self.module.build_stages(_args())
@@ -177,20 +198,24 @@ class BuildStagesTest(unittest.TestCase):
         self.assertTrue(publish.required)
 
     def test_source_downloads_can_be_individually_disabled(self):
-        stages = self.module.build_stages(_args(skip_eastmoney=True, skip_akshare=True, skip_snapshot_validation=True))
+        stages = self.module.build_stages(
+            _args(ashare_source="baostock", skip_baostock=True, skip_snapshot_validation=True)
+        )
         names = [s.name for s in stages]
 
-        self.assertIn("download_baostock", names)
+        self.assertNotIn("download_baostock", names)
         self.assertNotIn("download_eastmoney", names)
         self.assertNotIn("download_akshare", names)
         self.assertNotIn("validate_latest_snapshot", names)
 
     def test_system_proxy_flag_only_applies_to_public_sources(self):
-        stages = self.module.build_stages(_args(use_system_proxy=True))
-        baostock = next(s for s in stages if s.name == "download_baostock")
-        eastmoney = next(s for s in stages if s.name == "download_eastmoney")
-        akshare = next(s for s in stages if s.name == "download_akshare")
-        snapshot = next(s for s in stages if s.name == "validate_latest_snapshot")
+        baostock_stages = self.module.build_stages(_args(ashare_source="baostock", use_system_proxy=True))
+        eastmoney_stages = self.module.build_stages(_args(ashare_source="eastmoney", use_system_proxy=True))
+        akshare_stages = self.module.build_stages(_args(ashare_source="akshare", use_system_proxy=True))
+        baostock = next(s for s in baostock_stages if s.name == "download_baostock")
+        eastmoney = next(s for s in eastmoney_stages if s.name == "download_eastmoney")
+        akshare = next(s for s in akshare_stages if s.name == "download_akshare")
+        snapshot = next(s for s in eastmoney_stages if s.name == "validate_latest_snapshot")
 
         self.assertNotIn("--use-system-proxy", baostock.argv)
         self.assertIn("--use-system-proxy", eastmoney.argv)
@@ -392,7 +417,11 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(module, "load_expected_symbols", return_value={"000001"}), \
                     patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py", "--continue-on-error"]):
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
+                    ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -400,12 +429,11 @@ class DryRunMainTest(unittest.TestCase):
         self.assertEqual(summary["status"], "ok_with_warnings")
         self.assertTrue(any(s["name"] == "download_eastmoney" and s["status"] == "failed" for s in summary["stages"]))
 
-    def test_one_covered_source_succeeds_when_two_sources_fail(self):
+    def test_one_selected_source_can_publish_when_coverage_passes(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
-            failed = stage.name in {"download_baostock", "download_akshare"}
-            return module.StageResult(stage.name, "failed" if failed else "ok", 0.0, 1 if failed else 0, required=stage.required)
+            return module.StageResult(stage.name, "ok", 0.0, 0, required=stage.required)
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
@@ -413,12 +441,16 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(module, "load_expected_symbols", return_value={"000001"}), \
                     patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py", "--continue-on-error"]):
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
+                    ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
         self.assertEqual(rc, 0)
-        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertEqual(summary["status"], "ok")
         self.assertTrue(any(item["name"] == "publish_official" and item["status"] == "ok" for item in summary["stages"]))
 
     def test_cleaning_failure_never_reaches_official_publish(self):
@@ -460,7 +492,11 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(module, "load_expected_symbols", return_value={"000001"}), \
                     patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py", "--force"]):
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["run_daily_update.py", "--ashare-source", "baostock", "--force"],
+                    ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -487,7 +523,7 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(module, "load_expected_symbols", return_value={"000001"}), \
                     patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py"]):
+                    patch.object(sys, "argv", ["run_daily_update.py", "--ashare-source", "baostock"]):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 

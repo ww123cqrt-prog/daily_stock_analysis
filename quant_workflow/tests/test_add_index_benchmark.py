@@ -18,6 +18,63 @@ def load_module():
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
+    def test_tencent_source_pages_backward_and_returns_close_by_date(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 0, "data": {"sh000300": {"day": self._rows}}}
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = None
+                self.params = []
+
+            def get(self, _url, *, params, timeout):
+                self.params.append((params["param"], timeout))
+                if ",,2026-07-21," in params["param"]:
+                    return FakeResponse(
+                        [
+                            ["2026-07-20", "4575.67", "4598.32"],
+                            ["2026-07-21", "4630.85", "4739.23"],
+                        ]
+                    )
+                return FakeResponse(
+                    [
+                        ["2026-07-17", "4661.62", "4529.10"],
+                        ["2026-07-19", "4500.00", "4510.00"],
+                    ]
+                )
+
+            def close(self):
+                return None
+
+        session = FakeSession()
+        with patch("requests.Session", return_value=session):
+            data = module._download_tencent_index(
+                "2026-07-17",
+                "2026-07-21",
+                use_system_proxy=True,
+            )
+
+        self.assertTrue(session.trust_env)
+        self.assertEqual(len(session.params), 2)
+        self.assertEqual(
+            data,
+            {
+                "2026-07-17": 4529.10,
+                "2026-07-19": 4510.00,
+                "2026-07-20": 4598.32,
+                "2026-07-21": 4739.23,
+            },
+        )
+
     def test_dry_run_does_not_write_or_call_baostock(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

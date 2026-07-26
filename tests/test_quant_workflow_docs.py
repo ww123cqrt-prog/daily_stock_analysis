@@ -54,7 +54,7 @@ def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
         "唯一 Python 虚拟环境",
         "QUANT_DATA_ROOT",
         "MLFLOW_URL",
-        "策略优化预演",
+        "交易策略优化预演",
         "china-astock 技术指标报告",
         "report_china_astock_indicators.py",
         "Qlib 预测摘要",
@@ -103,7 +103,8 @@ def test_mlflow_workbench_docs_keep_user_and_backend_ports_distinct() -> None:
 
     assert "8010` 是 DSA 日常网页入口" in install_doc
     assert "6006` 是 MLflow 后台数据服务" in install_doc
-    assert "普通实验和 Run 页面仍可能残留少量英文" in manual
+    assert "保留 MLflow 3.14.0 官方首页" in manual
+    assert "部分页面仍可能残留少量英文" in manual
     assert "upstreamCommit" in manual
 
 

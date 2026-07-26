@@ -254,6 +254,20 @@ class TrainBaselineLgbTest(unittest.TestCase):
             ],
         )
 
+    def test_load_csi300_symbols_uses_local_quant_data_cache_without_network_project(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_list = Path(temp_dir) / "stock_lists.json"
+            stock_list.write_text(
+                json.dumps({"csi300": ["000001", "600000"]}),
+                encoding="utf-8",
+            )
+            module.ASTOCK_PROJECT = Path(temp_dir) / "missing-network-project"
+
+            symbols = module.load_csi300_symbols(stock_list)
+
+        self.assertEqual(symbols, ["000001", "600000"])
+
     def test_ensure_csi300_instruments_writes_selected_provider_file(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

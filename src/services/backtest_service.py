@@ -6,15 +6,29 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date, datetime, timedelta
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, select
 
 from src.config import get_config
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE, BacktestEngine, EvaluationConfig
+from src.core.strategy_backtest import (
+    PriceBar,
+    StrategyBacktestConfig,
+    TargetAllocation,
+    run_portfolio_backtest,
+)
+from src.core.strategy_signals import (
+    build_buy_and_hold_allocations,
+    build_dual_moving_average_allocations,
+    build_momentum_rotation_allocations,
+)
 from src.market_phase_summary import extract_market_phase_summary, normalize_analysis_phase_bucket
 from src.repositories.backtest_repo import BacktestRepository
+from src.repositories.quant_price_repo import QuantPriceRepository
 from src.repositories.stock_repo import StockRepository
+from src.services.script_strategy_executor import run_script_in_sandbox
 from src.schemas.decision_action import build_action_fields
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager
 from src.utils.data_processing import parse_json_field
@@ -31,6 +45,447 @@ class BacktestService:
         self.db = db_manager or DatabaseManager.get_instance()
         self.repo = BacktestRepository(self.db)
         self.stock_repo = StockRepository(self.db)
+
+    @staticmethod
+    def _form_strategy_metadata(
+        strategy_id: str,
+        *,
+        lookback_days: int,
+        moving_average_days: int,
+        fast_ma_days: int,
+        slow_ma_days: int,
+        top_n: int,
+    ) -> Dict[str, Any]:
+        definitions = {
+            "momentum_rotation": {
+                "name": "Momentum rotation with moving-average filter",
+                "rule": (
+                    "At each close, rank requested symbols by trailing return; hold the top eligible "
+                    "symbols whose close is above their moving average, otherwise hold cash."
+                ),
+                "parameters": {
+                    "lookback_days": lookback_days,
+                    "moving_average_days": moving_average_days,
+                    "top_n": top_n,
+                },
+            },
+            "dual_moving_average": {
+                "name": "Dual moving-average timing",
+                "rule": (
+                    "At each close, hold the single requested symbol when its fast moving average is "
+                    "above its slow moving average; otherwise hold cash."
+                ),
+                "parameters": {
+                    "fast_ma_days": fast_ma_days,
+                    "slow_ma_days": slow_ma_days,
+                },
+            },
+            "buy_and_hold": {
+                "name": "Equal-weight buy and hold",
+                "rule": "Buy all requested symbols at equal weights on the first requested open and keep holding.",
+                "parameters": {},
+            },
+        }
+        if strategy_id not in definitions:
+            raise ValueError(f"unsupported strategy_id: {strategy_id}")
+        return {
+            "strategy_id": strategy_id,
+            "asset_scope": "any_symbol_in_a_ready_canonical_qfq_dataset",
+            "signal_at": "trading_day_close",
+            "execution": "next_common_trading_day_open",
+            **definitions[strategy_id],
+        }
+
+    def run_strategy(
+        self,
+        *,
+        strategy_id: str,
+        symbols: List[str],
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        initial_capital: float = 1_000_000.0,
+        side_cost_pct: float = 0.0,
+        lot_size: int = 100,
+        lookback_days: int = 20,
+        moving_average_days: int = 20,
+        fast_ma_days: int = 5,
+        slow_ma_days: int = 20,
+        top_n: int = 1,
+    ) -> Dict[str, Any]:
+        """Run one explicit form strategy against a governed qfq snapshot."""
+
+        normalized_strategy = str(strategy_id or "").strip().lower()
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+        config = StrategyBacktestConfig(
+            initial_capital=float(initial_capital),
+            side_cost_pct=float(side_cost_pct),
+            lot_size=int(lot_size),
+        )
+        metadata = self._form_strategy_metadata(
+            normalized_strategy,
+            lookback_days=int(lookback_days),
+            moving_average_days=int(moving_average_days),
+            fast_ma_days=int(fast_ma_days),
+            slow_ma_days=int(slow_ma_days),
+            top_n=int(top_n),
+        )
+        price_data = QuantPriceRepository().load(symbols, end_date=end_date)
+        bars = list(price_data.bars)
+
+        if normalized_strategy == "momentum_rotation":
+            allocations = build_momentum_rotation_allocations(
+                bars=bars,
+                symbol_order=price_data.symbols,
+                lookback_days=int(lookback_days),
+                moving_average_days=int(moving_average_days),
+                top_n=int(top_n),
+                start_date=start_date,
+                end_date=end_date,
+            )
+        elif normalized_strategy == "dual_moving_average":
+            if len(price_data.symbols) != 1:
+                raise ValueError("dual_moving_average requires exactly one symbol")
+            allocations = build_dual_moving_average_allocations(
+                bars=bars,
+                symbol=price_data.symbols[0],
+                fast_days=int(fast_ma_days),
+                slow_days=int(slow_ma_days),
+                start_date=start_date,
+                end_date=end_date,
+            )
+        elif normalized_strategy == "buy_and_hold":
+            allocations = build_buy_and_hold_allocations(
+                bars=bars,
+                symbols=price_data.symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        else:
+            raise ValueError(f"unsupported strategy_id: {normalized_strategy}")
+
+        data_quality = {
+            "dataset_id": price_data.dataset_id,
+            "snapshot_id": price_data.snapshot_id,
+            "price_basis": price_data.price_basis,
+            "provider": price_data.provider,
+            "latest_trade_date": price_data.latest_trade_date,
+            "manifest_sha256": price_data.manifest_sha256,
+            "price_bars": len(bars),
+            "valid_signals": len(allocations),
+        }
+        if not allocations:
+            return {
+                **self._empty_dsa_strategy_report(
+                    code=price_data.symbols[0],
+                    status="no_executable_signals",
+                    initial_capital=config.initial_capital,
+                    side_cost_pct=config.side_cost_pct,
+                    lot_size=config.lot_size,
+                    data_quality=data_quality,
+                    warning="The selected strategy produced no executable target in this date range.",
+                ),
+                "strategy_name": normalized_strategy,
+                "symbols": list(price_data.symbols),
+                "strategy": metadata,
+                "benchmark": {
+                    "kind": "single_asset_buy_and_hold"
+                    if len(price_data.symbols) == 1
+                    else "equal_weight_buy_and_hold",
+                    "symbols": list(price_data.symbols),
+                },
+            }
+
+        report = run_portfolio_backtest(
+            strategy_name=normalized_strategy,
+            allocations=allocations,
+            bars=bars,
+            config=config,
+        )
+        report["strategy"] = metadata
+        report["data_quality"] = data_quality
+        return report
+
+    def run_script_strategy(
+        self,
+        *,
+        script: str,
+        symbols: List[str],
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        initial_capital: float = 1_000_000.0,
+        side_cost_pct: float = 0.0,
+        lot_size: int = 100,
+    ) -> Dict[str, Any]:
+        """Run a browser-authored DSA Python strategy in the constrained runner."""
+
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+        config = StrategyBacktestConfig(
+            initial_capital=float(initial_capital),
+            side_cost_pct=float(side_cost_pct),
+            lot_size=int(lot_size),
+        )
+        price_data = QuantPriceRepository().load(symbols, end_date=end_date)
+        bars = list(price_data.bars)
+        allocations, logs, check = run_script_in_sandbox(
+            script,
+            bars=bars,
+            symbols=price_data.symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        metadata = {
+            "strategy_id": "python_script",
+            "name": "DSA Python strategy",
+            "asset_scope": "any_symbol_in_a_ready_canonical_qfq_dataset",
+            "signal_at": "trading_day_close",
+            "execution": "next_common_trading_day_open",
+            "script_api_version": check.get("api_version"),
+            "script_sha256": hashlib.sha256(script.encode("utf-8")).hexdigest(),
+        }
+        data_quality = {
+            "dataset_id": price_data.dataset_id,
+            "snapshot_id": price_data.snapshot_id,
+            "price_basis": price_data.price_basis,
+            "provider": price_data.provider,
+            "latest_trade_date": price_data.latest_trade_date,
+            "manifest_sha256": price_data.manifest_sha256,
+            "price_bars": len(bars),
+            "valid_signals": len(allocations),
+        }
+        if not allocations:
+            report = {
+                **self._empty_dsa_strategy_report(
+                    code=price_data.symbols[0],
+                    status="no_executable_signals",
+                    initial_capital=config.initial_capital,
+                    side_cost_pct=config.side_cost_pct,
+                    lot_size=config.lot_size,
+                    data_quality=data_quality,
+                    warning="The script produced no target changes in this date range.",
+                ),
+                "strategy_name": "python_script",
+                "symbols": list(price_data.symbols),
+                "strategy": metadata,
+            }
+        else:
+            report = run_portfolio_backtest(
+                strategy_name="python_script",
+                allocations=allocations,
+                bars=bars,
+                config=config,
+            )
+            report["strategy"] = metadata
+            report["data_quality"] = data_quality
+        report["logs"] = logs
+        report["script_check"] = check
+        return report
+
+    @staticmethod
+    def _dsa_strategy_metadata() -> Dict[str, Any]:
+        return {
+            "adapter": "dsa_history_signal",
+            "asset_scope": "any_supported_instrument",
+            "signal_mapping": {
+                "long": "buy/add/hold",
+                "cash": "reduce/sell/watch/avoid/unrecognized",
+            },
+            "execution": "signal_date_plus_next_trading_day_open",
+        }
+
+    @classmethod
+    def _empty_dsa_strategy_report(
+        cls,
+        *,
+        code: str,
+        status: str,
+        initial_capital: float,
+        side_cost_pct: float,
+        lot_size: int,
+        data_quality: Dict[str, Any],
+        warning: str,
+    ) -> Dict[str, Any]:
+        return {
+            "status": status,
+            "strategy_name": "dsa_history_signal",
+            "symbols": [code],
+            "strategy": cls._dsa_strategy_metadata(),
+            "data_quality": data_quality,
+            "metrics": {
+                "initial_capital": float(initial_capital),
+                "final_equity": float(initial_capital),
+                "total_return_pct": 0.0,
+                "annualized_return_pct": 0.0,
+                "benchmark_return_pct": 0.0,
+                "excess_return_pct": 0.0,
+                "max_drawdown_pct": 0.0,
+                "benchmark_max_drawdown_pct": 0.0,
+                "trade_count": 0,
+                "exposure_pct": 0.0,
+                "total_cost": 0.0,
+                "turnover_pct": 0.0,
+                "signal_count": int(data_quality.get("valid_signals", 0)),
+                "executed_signal_count": 0,
+                "skipped_signal_count": 0,
+                "trading_days": 0,
+                "annualized_volatility_pct": 0.0,
+                "sharpe_ratio": None,
+                "alpha_pct": None,
+                "beta": None,
+                "win_rate_pct": 0.0,
+            },
+            "benchmark": {
+                "kind": "single_asset_buy_and_hold",
+                "symbols": [code],
+            },
+            "assumptions": {
+                "execution": "next_common_trading_day_open",
+                "initial_capital": float(initial_capital),
+                "side_cost_pct": float(side_cost_pct),
+                "lot_size": int(lot_size),
+            },
+            "equity_curve": [],
+            "trades": [],
+            "warnings": [warning],
+        }
+
+    def run_dsa_signal_strategy(
+        self,
+        *,
+        code: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        initial_capital: float = 1_000_000.0,
+        side_cost_pct: float = 0.0,
+        lot_size: int = 100,
+    ) -> Dict[str, Any]:
+        """Backtest DSA reports as a continuous target-allocation strategy."""
+
+        normalized_code = str(code or "").strip().upper()
+        if not normalized_code:
+            raise ValueError("code is required")
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+
+        config = StrategyBacktestConfig(
+            initial_capital=float(initial_capital),
+            side_cost_pct=float(side_cost_pct),
+            lot_size=int(lot_size),
+        )
+        analyses = self.repo.list_strategy_analyses(code=normalized_code)
+        backfilled_skipped = 0
+        outside_range_skipped = 0
+        missing_date_skipped = 0
+        duplicate_date_signals_replaced = 0
+        allocations_by_date: Dict[date, TargetAllocation] = {}
+
+        for analysis in analyses:
+            signal_date = self._resolve_analysis_date(analysis)
+            if signal_date is None:
+                missing_date_skipped += 1
+                continue
+            if start_date and signal_date < start_date:
+                outside_range_skipped += 1
+                continue
+            if end_date and signal_date > end_date:
+                outside_range_skipped += 1
+                continue
+            created_at = getattr(analysis, "created_at", None)
+            if created_at is not None and created_at.date() > signal_date:
+                backfilled_skipped += 1
+                continue
+
+            position = BacktestEngine.infer_position_recommendation(
+                analysis.operation_advice
+            )
+            target_weights = (
+                {normalized_code: 1.0}
+                if position == "long"
+                else {}
+            )
+            if signal_date in allocations_by_date:
+                duplicate_date_signals_replaced += 1
+            allocations_by_date[signal_date] = TargetAllocation(
+                source_id=str(analysis.id),
+                signal_date=signal_date,
+                target_weights=target_weights,
+                reason=analysis.operation_advice,
+            )
+
+        allocations = [
+            allocations_by_date[signal_date]
+            for signal_date in sorted(allocations_by_date)
+        ]
+        data_quality: Dict[str, Any] = {
+            "analysis_records": len(analyses),
+            "valid_signals": len(allocations),
+            "backfilled_signals_skipped": backfilled_skipped,
+            "outside_range_signals_skipped": outside_range_skipped,
+            "missing_date_signals_skipped": missing_date_skipped,
+            "duplicate_date_signals_replaced": duplicate_date_signals_replaced,
+            "price_bars": 0,
+            "invalid_price_bars_skipped": 0,
+        }
+        if not allocations:
+            return self._empty_dsa_strategy_report(
+                code=normalized_code,
+                status="no_valid_signals",
+                initial_capital=config.initial_capital,
+                side_cost_pct=config.side_cost_pct,
+                lot_size=config.lot_size,
+                data_quality=data_quality,
+                warning="No point-in-time DSA signal is available for this instrument and date range.",
+            )
+
+        price_start = min(allocation.signal_date for allocation in allocations)
+        price_end = end_date or date.today()
+        raw_bars = self.stock_repo.get_range(
+            normalized_code,
+            price_start,
+            price_end,
+        )
+        price_bars: List[PriceBar] = []
+        invalid_price_bars = 0
+        for bar in raw_bars:
+            if (
+                bar.open is None
+                or bar.close is None
+                or float(bar.open) <= 0
+                or float(bar.close) <= 0
+            ):
+                invalid_price_bars += 1
+                continue
+            price_bars.append(
+                PriceBar(
+                    symbol=normalized_code,
+                    date=bar.date,
+                    open=float(bar.open),
+                    close=float(bar.close),
+                )
+            )
+        data_quality["price_bars"] = len(price_bars)
+        data_quality["invalid_price_bars_skipped"] = invalid_price_bars
+        if not price_bars:
+            return self._empty_dsa_strategy_report(
+                code=normalized_code,
+                status="insufficient_price_data",
+                initial_capital=config.initial_capital,
+                side_cost_pct=config.side_cost_pct,
+                lot_size=config.lot_size,
+                data_quality=data_quality,
+                warning="No usable open/close price bars are available after the first signal.",
+            )
+
+        report = run_portfolio_backtest(
+            strategy_name="dsa_history_signal",
+            allocations=allocations,
+            bars=price_bars,
+            config=config,
+        )
+        report["strategy"] = self._dsa_strategy_metadata()
+        report["data_quality"] = data_quality
+        return report
 
     def run_backtest(
         self,

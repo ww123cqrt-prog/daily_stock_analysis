@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- [新功能] 量化任务中心新增五模型完整候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择前两名及五套策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常模型或下单。
+- [安全] A 股公开源下载改为保守请求配置：默认关闭自动历史源和东方财富新闻，一次只允许 Baostock、东方财富或 AkShare 之一；请求间隔至少 2 秒、只尝试 1 次、连续失败最多 3 次、单次请求预算 6000、增量重叠最多 7 天，遇到黑名单、403/429 或远端拒绝立即熔断。DSA 网页同时只允许一个 `quant_data` 网络任务；本机 18:40 LaunchAgent 保持禁用。
+- [新功能] `/backtest` 改为两个真实策略入口：“脚本回测”提供带静态安全检查、隔离子进程和超时限制的 DSA Python 策略编辑器；“条件回测”提供动量轮动、双均线和等权持有表单。两者共用与资产类型无关的目标仓位引擎，股票、ETF 和多标的组合统一计算现金、整手、用户显式成本、下一交易日开盘成交、净值、基准、回撤、换手及成交；网页成本默认 `0%`。Qlib 训练结果统一到 `/experiments/`，旧 DSA 历史判断不再作为网页策略入口。
+- [新功能] 量化任务中心新增五个选股模型候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择候选选股模型及五套交易策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常选股模型或下单。
 - [新功能] DSA 新增唯一实验入口 `/experiments/`：后端流式代理现有 MLflow 3.14.0 `6006` 服务，并在官方页面上叠加中文/English 即时切换；本机 MLflow 链接统一改写到 8010，6006 退为后台且不再需要 6007 或额外代理进程。
-- [修复] MLflow 双语层保护实验名、Run 名、参数名、指标名和 artifact 文件名，不再把与界面词汇同名的业务数据翻译；第一版隐藏 GenAI、Prompt、AI Gateway、LLM Connections 和模型注册入口，并把越界路由重定向回训练实验。
+- [修复] MLflow 双语层保护实验名、Run 名、参数名、指标名和 artifact 文件名，不再把与界面词汇同名的业务数据翻译；恢复官方首页、Prompts、AI Gateway、Assistant、Settings 等完整导航和路由，不再把非实验页面隐藏或重定向回实验列表。
 - [修复] MLflow 离线页新增固定本机服务启动按钮和可追溯启动记录；补齐 DSA 研究、工作流、回测返回入口、IPv6 loopback 链接转换和翻译目录版本/上游 commit 校验。
 - [安全] `/experiments/*` 纳入 DSA 管理员认证和本机 Origin/Referer 保护；跨站浏览器读写均拒绝，JS、CSS、API 和 artifact 保持流式转发，只有 HTML 首页会为插入双语脚本而重写。
 - [维护] 新增基于官方 MLflow 3.14.0 `zh-CN.json` 的 1235 条紧凑翻译目录生成器、代理单测、前端链接测试和真实浏览器双语验收；普通实验和 Run 页面仍可能残留少量英文，按已知显示差异维护。
@@ -41,11 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] #1390 P0 为个股分析与历史/回测展示新增可选八态 `action` / `action_label` 建议动作字段，保留 `operation_advice` 自由文本和 `decision_type=buy|hold|sell` 统计口径，不新增迁移或配置项。
 - [修复] #1390 收紧建议动作 legacy fallback：英文 `not to ...` 与 `avoid selling/reducing/trimming ...` 等否定/回避表达不再误判为买卖动作，Web 旧记录不再把中文金融上下文、`buy or sell`、多 guard 歧义文本或 `buyback` / `buy-back` / `buy back` / `selloff` / `sell-off` / `sell off` 等英文复合词渲染成 action badge，并在有结构化 `action` 时让回测/历史趋势等入口按界面语言显示 action 标签。
 - [改进] 完善运行时日志上下文，补充 logger name、触发来源、市场统计与实时行情预取链路状态，便于排查调度、API、Bot 和数据源降级路径。
-- [新功能] 新增本地量化任务中心 `/workflow`、研究总览 `/research` 和 Qlib 模型/策略回测视图，支持从 Web 运行白名单量化脚本、查看任务日志、读取实验记录与 Qlib 回测摘要。
+- [新功能] 新增本地量化任务中心 `/workflow`、研究总览 `/research` 和 Qlib 选股模型与交易策略回测视图，支持从 Web 运行白名单量化脚本、查看任务日志、读取实验记录与 Qlib 回测摘要。
 - [改进] `/workflow` 任务按钮支持在网页端填写预设白名单参数，例如下载日期、股票数量上限、Qlib 训练配置、实验名称和 DSA 回测窗口。
 - [修复] 量化任务 SSE 流增加连接寿命上限，并修正 Web 取消运行中任务后状态卡计数短暂不刷新的问题。
 - [文档] 新增本地统一量化研究与回测工作台核对手册，说明 DSA、quant_workflow、Qlib、china-astock-quant、MLflow 和同花顺只读观察的职责、网页入口、安全边界和验收命令。
-- [改进] `/backtest` 的 Qlib 模型/策略回测标签页新增“实验复现与产物”区块，展示 provider、配置文件、MLflow run 和训练 artifact，方便用户自行排查和复现实验。
+- [改进] `/backtest` 的 Qlib 选股模型与交易策略回测标签页新增“实验复现与产物”区块，展示 provider、配置文件、MLflow run 和训练 artifact，方便用户自行排查和复现实验。
 - [改进] Qlib 工作流新增只读预测摘要任务，读取 MLflow `pred.pkl` 生成 `qlib_predictions_latest.{json,md}`，并在 `/backtest` 展示最新交易日最高/最低模型评分排行。
 - [测试] 新增本地工作台浏览器 smoke 入口 `npm run test:smoke:local`，默认验证当前 `http://127.0.0.1:8010` 的研究、工作流、回测、问股、组合、告警、设置和选股页面。
 - [测试] 新增 `npm run test:smoke:fake-analysis`，自动托管临时 fake-analysis 后端和 Vite 前端，验证首页提交分析、异步完成、报告展示和历史持久化链路，无需调用真实 LLM。
@@ -60,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 研究页新增“功能入口盘点”和 `china-astock-quant` 复用清单，把网页入口、缺口、验收口径和禁止接入的交易模块显式列账。
 - [改进] `/workflow` 新增只读 `china-astock` 技术指标报告任务，复用 `strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数生成 `china_astock_indicator_report_latest.{json,md}`。
 - [修复] `china-astock` 技术指标报告在网页端和脚本端省略 `limit` 时默认抽样 50 只股票，并限制研究状态 API 只扫描可信 Qlib provider 根目录内的路径。
-- [改进] `/workflow` 新增“策略优化预演”任务，使用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路，只读生成报告且不训练、不连接券商、不自动下单。
+- [改进] `/workflow` 新增“交易策略优化预演”任务，使用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路，只读生成报告且不训练选股模型、不连接券商、不自动下单。
 - [改进] `/workflow` 新增 provider 维护预演任务：`repair_qlib_provider.py`、`generate_csi300.py` 与 `add_index_benchmark.py` 进入网页白名单但后端强制 `--dry-run`，不写入 Qlib provider；CSI300 预演缓存缺失时不走 AkShare fallback。
 - [文档] 本地量化工作台手册补充 `quant_workflow` 脚本覆盖盘点，说明 provider 维护脚本的 dry-run 边界，以及 `supervise_baostock.py` 暂不作为网页按钮暴露的原因。
 - [改进] `/workflow` 新增 `report_data_hygiene.py` 数据治理任务，网页可生成 inventory 与 dry-run 清理计划，计划不包含真实删除动作，迁移/归档建议必须用户确认。

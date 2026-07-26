@@ -690,7 +690,7 @@ test('main workbench routes render in Chinese without runtime errors or horizont
     { path: '/', text: '个股栏' },
     { path: '/research', text: '研究工作台' },
     { path: '/workflow', text: '量化任务中心' },
-    { path: '/backtest', text: 'Qlib模型/策略回测' },
+    { path: '/backtest', text: 'Qlib选股模型与交易策略回测' },
     { path: '/chat', text: '问股' },
     { path: '/portfolio', text: '持仓管理' },
     { path: '/alerts', text: '告警中心' },
@@ -1245,17 +1245,17 @@ test('workflow page can launch a strategy optimization dry-run and preview the r
   try {
     await openWorkbench(page, '/workflow');
     await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: '策略优化预演' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '交易策略优化预演' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/不训练、不连接券商、不自动下单/)).toBeVisible();
 
-    await page.getByLabel('策略优化预演 阶段').selectOption('4');
-    await page.getByLabel('策略优化预演 TopK').fill('30');
+    await page.getByLabel('交易策略优化预演 阶段').selectOption('4');
+    await page.getByLabel('交易策略优化预演 TopK').fill('30');
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 策略优化预演' }).click();
+    await page.getByRole('button', { name: '运行 交易策略优化预演' }).click();
     const submitResponse = await responsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
@@ -1272,7 +1272,7 @@ test('workflow page can launch a strategy optimization dry-run and preview the r
     await expect(previewButton).toBeVisible({ timeout: 15_000 });
     await previewButton.click();
     await expect(page.locator('pre')).toContainText('Qlib 策略优化实验报告', { timeout: 15_000 });
-    await expect(page.locator('pre')).toContainText('只读策略优化预演', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('只读交易策略优化预演', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('不自动下单', { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
@@ -1389,7 +1389,7 @@ test('workflow page can select the cleaned provider for training without launchi
     await openWorkbench(page, '/workflow');
     await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
 
-    const providerSelect = page.getByLabel('训练 Qlib LightGBM 基线 数据版本');
+    const providerSelect = page.getByLabel('训练 Qlib LightGBM 选股模型基线 数据版本');
     await expect(providerSelect).toBeVisible({ timeout: 15_000 });
     await providerSelect.selectOption('cleaned');
     await expect(providerSelect).toHaveValue('cleaned');
@@ -1583,9 +1583,9 @@ test('backtest page can run a narrow DSA validation and switch to the Qlib backt
     await expect(page.getByText('已处理:')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('已保存:')).toBeVisible({ timeout: 15_000 });
 
-    await page.getByRole('button', { name: 'Qlib模型/策略回测' }).click();
-    await expect(page.getByRole('heading', { name: 'Qlib 模型/策略回测' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('模型结果 ≠ 交易建议')).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('button', { name: 'Qlib选股模型与交易策略回测' }).click();
+    await expect(page.getByRole('heading', { name: 'Qlib 选股模型与交易策略回测' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('选股模型结果 ≠ 交易建议')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('heading', { name: '实验复现与产物' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('pred.pkl')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('heading', { name: '现金仓位叠加回测' })).toBeVisible({ timeout: 15_000 });

@@ -33,7 +33,7 @@ MLflow 是独立实验记录服务，不属于 Qlib，也不是 DSA 的替代 UI
 
 `ashare-live-research` 是独立的本机实时观察 skill/MCP 项目，负责同花顺、手机镜像、行情异动和辅助交易研究的只读观察层。它不并入 DSA，不读取密码，不自动下单；DSA 只把它当可发现 skill 和后续只读联动能力。
 
-`a-share-us-catalyst` / CatDesk（九点猫研）是独立的美股催化 A 股题材观察服务。DSA 当前只提供本地跳转和服务状态提示；它的“候选信号历史验证”不等同于 Qlib 模型/策略回测，不应把术语混写。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。
+`a-share-us-catalyst` / CatDesk（九点猫研）是独立的美股催化 A 股题材观察服务。DSA 当前只提供本地跳转和服务状态提示；它的“候选信号历史验证”不等同于 Qlib 选股模型与交易策略回测，不应把术语混写。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。
 
 `quant_data`、Qlib provider、MLflow `mlruns`、下载缓存、日志和报告是本地数据资产。它们不应提交到 Git。
 

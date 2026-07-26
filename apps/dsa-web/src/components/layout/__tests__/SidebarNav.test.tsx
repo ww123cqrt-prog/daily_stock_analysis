@@ -82,6 +82,38 @@ describe('SidebarNav', () => {
     expect(screen.getByRole('link', { name: '实验' })).toHaveAttribute('href', '/experiments/');
   });
 
+  it('marks the experiments entry active without marking the language control active', () => {
+    render(
+      <MemoryRouter initialEntries={['/experiments/']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const experimentsLink = screen.getByRole('link', { name: '实验' });
+    expect(experimentsLink).toHaveAttribute('aria-current', 'page');
+    expect(experimentsLink).toHaveClass('font-medium');
+
+    const languageButton = screen.getByRole('button', { name: '切换界面语言' });
+    expect(languageButton).not.toHaveClass('font-medium');
+    expect(languageButton).toHaveClass('h-[var(--nav-item-height)]', 'w-full');
+  });
+
+  it('passes the same stable dimensions to the theme control as navigation links', () => {
+    render(
+      <MemoryRouter initialEntries={['/workflow']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: '工作流' })).toHaveClass('h-[var(--nav-item-height)]', 'w-full');
+    expect(mockThemeToggle).toHaveBeenCalledWith(expect.objectContaining({
+      triggerClassName: expect.stringContaining('h-[var(--nav-item-height)]'),
+    }));
+    expect(mockThemeToggle).toHaveBeenCalledWith(expect.objectContaining({
+      triggerClassName: expect.stringContaining('w-full'),
+    }));
+  });
+
   it('shows the screening navigation item when AlphaSift is enabled', async () => {
     mockGetAlphaSiftStatus.mockResolvedValueOnce({ enabled: true, available: false, installSpecIsDefault: false });
 

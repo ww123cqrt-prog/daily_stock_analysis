@@ -54,8 +54,8 @@ Parquet or Qlib provider root moves.
 # Apply anomaly cleaning rules into a separate cleaned provider
 .venv/bin/python quant_workflow/scripts/apply_data_cleaning.py
 
-# Run the scheduled chain manually; derived data is staged and published only
-# after benchmark, cleaning, quality, Qlib, and manifest checks all pass
+# Run the chain without Baostock/EastMoney/AkShare history requests. A history
+# source must be selected explicitly after provider access has been reviewed.
 .venv/bin/python quant_workflow/scripts/run_daily_update.py
 
 # Read-only data-governance inventory and dry-run cleanup plan
@@ -96,6 +96,20 @@ Parquet or Qlib provider root moves.
   timestamped raw responses are append-only evidence and are never committed.
 - The A-share news downloader is bounded by default. It refuses an unbounded
   full-market request unless the operator supplies an explicit symbols file.
+- A-share source jobs use a conservative safety profile: at least 2 seconds
+  between requests, exactly one attempt, at most 3 consecutive failures, a
+  6000-request budget, and no more than 7 overlap days. Provider denial signals
+  such as Baostock `10001011` or HTTP 403/429 stop the source run immediately.
+  These bounds reduce load but cannot guarantee provider acceptance because the
+  providers do not publish a complete rate-limit contract.
+- `run_daily_update.py` defaults to `--ashare-source none` and `--news-limit 0`.
+  Baostock, EastMoney, and AkShare are opt-in and mutually exclusive per run;
+  AkShare's A-share history call uses EastMoney underneath and is not a separate
+  provider for request-load purposes.
+- Benchmark repair is also offline by default, so a missing local `SH000300`
+  cache cannot silently reopen Baostock/EastMoney access. Only the explicit
+  command-line flag `--allow-benchmark-network` enables those fallbacks; the
+  scheduled task and DSA web whitelist do not expose that flag.
 - `train_baseline_lgb.py --provider cleaned` rewrites a runtime YAML under
   `reports/runtime_configs/` so the source config stays canonical.
 - `SH000300` benchmark data may exist under `features/sh000300`, but it must
@@ -105,6 +119,12 @@ Parquet or Qlib provider root moves.
   single-instance execution. A duplicate trigger is recorded as
   `controlled_skip`; a dead PID lock is reclaimed, while a live PID lock is
   never removed.
+- DSA also permits only one active `quant_data` network job across the full
+  daily update and individual download buttons, preventing web-triggered jobs
+  from bypassing the daily updater lock.
+- Baostock, EastMoney history, AkShare history, and EastMoney news scripts also
+  share `source_download.lock.json`. Direct shell launches therefore cannot run
+  two of these provider downloaders at the same time.
 - Source parquet caches, run-scoped merged/cleaned candidates, and fixed-path
   official providers have separate roles. Candidates live under
   `quant_data/runtime/daily_update/runs/<run-id>/`; the four official derived

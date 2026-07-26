@@ -145,6 +145,15 @@ def test_runtime_script_contains_catalog_and_syncs_dsa_language() -> None:
     assert "参数 ($1)" in script
 
 
+def test_runtime_script_preserves_complete_upstream_navigation() -> None:
+    script = build_runtime_script({"Experiments": "实验"})
+
+    assert "enforceRouteScope" not in script
+    assert "scopedHash" not in script
+    assert "data-dsa-scope-hidden" not in script
+    assert "window.addEventListener('hashchange'" not in script
+
+
 def test_html_injection_is_idempotent() -> None:
     original = b"<html><body>MLflow</body></html>"
     once = inject_runtime_script(original)

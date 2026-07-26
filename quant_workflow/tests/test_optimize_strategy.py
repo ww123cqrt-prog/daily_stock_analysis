@@ -82,7 +82,7 @@ class OptimizeStrategyTest(unittest.TestCase):
             self.assertIn("phase4_combined", payload["results"])
             self.assertIn("phase4_conservative", payload["results"])
             report_text = result_md.read_text(encoding="utf-8")
-            self.assertIn("只读策略优化预演", report_text)
+            self.assertIn("只读交易策略优化预演", report_text)
             self.assertEqual(payload["metric_basis"]["candidate_return"], "absolute_net_return")
             self.assertIn("不能直接横向比较", report_text)
 
@@ -152,7 +152,7 @@ class OptimizeStrategyTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((Path(temp_dir) / "reports" / "optimization_results_latest.json").exists())
-            self.assertIn("只读策略优化", result.stdout)
+            self.assertIn("只读交易策略优化", result.stdout)
 
 
 if __name__ == "__main__":

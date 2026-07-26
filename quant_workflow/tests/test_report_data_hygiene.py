@@ -54,7 +54,7 @@ def make_jobs_db(path: Path) -> None:
             (
                 "qj_failed",
                 "train_baseline_lgb",
-                "训练 Qlib LightGBM 基线",
+                "训练 Qlib LightGBM 选股模型基线",
                 "failed",
                 "{}",
                 "[]",
