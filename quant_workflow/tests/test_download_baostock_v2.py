@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -48,6 +49,87 @@ def factor_events() -> pd.DataFrame:
             "adjustFactor": [10.0, 10.5],
         }
     )
+
+
+class FakePagedResult:
+    def __init__(
+        self,
+        *,
+        pages: list[list[list[str]]],
+        repeat_last_page: bool = False,
+        fail_after_full_page: bool = False,
+    ) -> None:
+        self.fields = ["date"]
+        self.error_code = "0"
+        self.error_msg = ""
+        self.per_page_count = 2
+        self.cur_page_num = "1"
+        self.cur_row_num = 0
+        self.data = pages[0]
+        self._pages = pages
+        self._page_index = 0
+        self._repeat_last_page = repeat_last_page
+        self._fail_after_full_page = fail_after_full_page
+        self._next_calls = 0
+
+    def next(self) -> bool:
+        self._next_calls += 1
+        if self._next_calls > 10:
+            raise RuntimeError("test safety limit reached")
+        if self.cur_row_num < len(self.data):
+            return True
+        if self._fail_after_full_page:
+            return False
+        if self._page_index + 1 < len(self._pages):
+            self._page_index += 1
+            self.cur_page_num = str(self._page_index + 1)
+            self.data = self._pages[self._page_index]
+            self.cur_row_num = 0
+            return bool(self.data)
+        if self._repeat_last_page:
+            self.cur_row_num = 0
+            return True
+        self.data = []
+        self.cur_row_num = 0
+        return False
+
+    def get_row_data(self) -> list[str]:
+        row = self.data[self.cur_row_num]
+        self.cur_row_num += 1
+        return row
+
+
+def test_collect_result_accepts_normal_final_short_page() -> None:
+    module = load_module()
+    result = FakePagedResult(
+        pages=[[["2026-07-22"], ["2026-07-23"]], [["2026-07-24"]]],
+    )
+
+    frame = module.collect_result(result)
+
+    assert frame["date"].tolist() == ["2026-07-22", "2026-07-23", "2026-07-24"]
+
+
+def test_collect_result_rejects_repeated_provider_page() -> None:
+    module = load_module()
+    result = FakePagedResult(
+        pages=[[["2026-07-22"], ["2026-07-23"]]],
+        repeat_last_page=True,
+    )
+
+    with pytest.raises(module.BaostockV2Error, match="repeated result page"):
+        module.collect_result(result)
+
+
+def test_collect_result_rejects_truncated_full_page() -> None:
+    module = load_module()
+    result = FakePagedResult(
+        pages=[[["2026-07-22"], ["2026-07-23"]]],
+        fail_after_full_page=True,
+    )
+
+    with pytest.raises(module.BaostockV2Error, match="ended after a full page"):
+        module.collect_result(result)
 
 
 def test_expand_daily_factors_uses_factor_effective_on_event_date() -> None:
@@ -327,3 +409,62 @@ def test_resume_accepts_valid_empty_factor_event_file(tmp_path: Path) -> None:
     )
 
     assert module._symbol_source_files_complete(tmp_path, symbol)
+
+
+def test_build_snapshot_records_provider_verified_non_unit_terminal_factor(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    bundle = tmp_path / "bundle"
+    raw = raw_frame()
+    events = factor_events()
+    events.loc[events.index[-1], "foreAdjustFactor"] = 1.034063
+    provider_qfq = raw.copy()
+    expected_factors = pd.Series([0.95, 0.95, 0.95, 1.034063])
+    for column in module.PRICE_COLUMNS:
+        provider_qfq[column] = provider_qfq[column] * expected_factors
+    raw_path = bundle / "raw" / "SH600786.parquet"
+    event_path = bundle / "factor_events" / "SH600786.parquet"
+    qfq_path = bundle / "qfq_provider" / "SH600786.parquet"
+    module.atomic_parquet(raw, raw_path)
+    module.atomic_parquet(events, event_path)
+    module.atomic_parquet(provider_qfq, qfq_path)
+    index = pd.DataFrame(
+        [
+            {
+                "symbol": "SH600786",
+                "raw_path": "raw/SH600786.parquet",
+                "factor_events_path": "factor_events/SH600786.parquet",
+                "qfq_provider_path": "qfq_provider/SH600786.parquet",
+                "raw_sha256": module.sha256_file(raw_path),
+                "factor_events_sha256": module.sha256_file(event_path),
+                "qfq_provider_sha256": module.sha256_file(qfq_path),
+            }
+        ]
+    )
+    module.atomic_parquet(index, bundle / "BUNDLE_FILE_INDEX.parquet")
+    module.atomic_json(
+        bundle / "BUNDLE_MANIFEST.json",
+        {
+            "status": "ready",
+            "completed_symbols": 1,
+            "index_path": "BUNDLE_FILE_INDEX.parquet",
+            "requested_through": "2026-07-24",
+            "source_retrieved_at": "2026-07-24T18:00:00+08:00",
+        },
+    )
+
+    _, qfq_stage = module.build_snapshots_from_bundle(
+        bundle_dir=bundle,
+        quant_data_root=tmp_path / "quant_data",
+    )
+    manifest = json.loads(
+        (qfq_stage / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+
+    adjustment = manifest["adjustment"]
+    assert adjustment["normalization_rule"] == (
+        "provider_native_fore_adjust_factor; "
+        "non_unit_terminal_requires_same_provider_qfq_match"
+    )
+    assert adjustment["non_unit_terminal_factor_symbols"] == 1

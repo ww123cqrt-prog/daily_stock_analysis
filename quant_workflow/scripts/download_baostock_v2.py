@@ -146,7 +146,9 @@ def load_universe(path: Path) -> list[tuple[str, str]]:
     return result
 
 
-def collect_result(result: Any) -> pd.DataFrame:
+def collect_result(result: Any, *, maximum_rows: int = 20_000) -> pd.DataFrame:
+    if maximum_rows < 1:
+        raise BaostockV2Error("maximum result rows must be positive")
     error_code = str(getattr(result, "error_code", ""))
     if error_code in DENIAL_CODES:
         raise ProviderDenied("Baostock access is temporarily restricted")
@@ -155,8 +157,39 @@ def collect_result(result: Any) -> pd.DataFrame:
             f"Baostock query failed: {error_code} {getattr(result, 'error_msg', '')}"
         )
     rows: list[list[str]] = []
+    seen_page_numbers: set[str] = set()
+    seen_page_contents: set[tuple[int, str, str]] = set()
     while result.next():
+        current_row = int(getattr(result, "cur_row_num", 0))
+        if current_row == 0:
+            page_number = str(getattr(result, "cur_page_num", ""))
+            page_data = list(getattr(result, "data", []) or [])
+            content_key = (
+                len(page_data),
+                repr(page_data[0]) if page_data else "",
+                repr(page_data[-1]) if page_data else "",
+            )
+            if page_number in seen_page_numbers or content_key in seen_page_contents:
+                raise BaostockV2Error("Baostock repeated result page")
+            seen_page_numbers.add(page_number)
+            seen_page_contents.add(content_key)
         rows.append(result.get_row_data())
+        if len(rows) > maximum_rows:
+            raise BaostockV2Error(
+                f"Baostock result exceeds {maximum_rows} rows"
+            )
+    error_code = str(getattr(result, "error_code", ""))
+    if error_code in DENIAL_CODES:
+        raise ProviderDenied("Baostock access is temporarily restricted")
+    if error_code != "0":
+        raise BaostockV2Error(
+            f"Baostock query failed: {error_code} {getattr(result, 'error_msg', '')}"
+        )
+    final_page = list(getattr(result, "data", []) or [])
+    page_size = int(getattr(result, "per_page_count", 0) or 0)
+    current_row = int(getattr(result, "cur_row_num", 0) or 0)
+    if page_size > 0 and len(final_page) >= page_size and current_row >= len(final_page):
+        raise BaostockV2Error("Baostock result ended after a full page")
     return pd.DataFrame(rows, columns=result.fields)
 
 
@@ -1106,6 +1139,7 @@ def build_snapshots_from_bundle(
     audited_symbols = 0
     bounded_factor_backfill_symbols = 0
     paired_factor_fallback_symbols = 0
+    non_unit_terminal_factor_symbols = 0
     for row in index.itertuples(index=False):
         symbol = str(row.symbol)
         raw_path = bundle_dir / str(row.raw_path)
@@ -1135,6 +1169,13 @@ def build_snapshots_from_bundle(
         )
         paired_factor_fallback_symbols += int(
             daily_factors["factor_paired_fallback"].any()
+        )
+        non_unit_terminal_factor_symbols += int(
+            not np.isclose(
+                float(daily_factors.sort_values("date")["factor"].iloc[-1]),
+                1.0,
+                atol=1e-6,
+            )
         )
         local_qfq = build_local_qfq(raw, daily_factors)
         if provider_qfq is not None:
@@ -1231,12 +1272,16 @@ def build_snapshots_from_bundle(
             "adjusted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "adjustment_as_of": through,
             "adjusted_fields": list(PRICE_COLUMNS),
-            "normalization_rule": "latest_daily_factor_equals_1",
+            "normalization_rule": (
+                "provider_native_fore_adjust_factor; "
+                "non_unit_terminal_requires_same_provider_qfq_match"
+            ),
             "algorithm_version": "baostock-factor-evidence-v2",
             "provider_qfq_cross_check_max_absolute_error": maximum_error,
             "provider_qfq_cross_check_symbols": audited_symbols,
             "bounded_factor_start_backfill_symbols": bounded_factor_backfill_symbols,
             "paired_qfq_factor_fallback_symbols": paired_factor_fallback_symbols,
+            "non_unit_terminal_factor_symbols": non_unit_terminal_factor_symbols,
             "maximum_factor_start_gap_days": MAX_FACTOR_START_GAP_DAYS,
             "legacy_comparison_path": (
                 "LEGACY_COMPARISON.json" if legacy_comparison else None
