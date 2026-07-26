@@ -20,61 +20,160 @@ def load_module():
 
 
 class DownloadBaostockTest(unittest.TestCase):
-    def test_query_one_runs_without_unix_signal_timer(self):
+    def test_configures_real_baostock_socket_timeout(self):
         module = load_module()
 
-        class EmptySuccessResult:
+        class Socket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        socket = Socket()
+        provider = types.SimpleNamespace(__name__="baostock")
+
+        configured = module._configure_baostock_socket_timeout(
+            provider,
+            37,
+            import_module=lambda name: types.SimpleNamespace(default_socket=socket),
+        )
+
+        self.assertTrue(configured)
+        self.assertEqual(socket.timeouts, [37.0])
+
+    def test_query_without_sigalrm_uses_socket_timeout(self):
+        module = load_module()
+
+        class Result:
             error_code = "0"
             error_msg = "success"
-            fields = ["date", "code"]
+            fields = ["date"]
+
+            def __init__(self):
+                self.done = False
+
+            def next(self):
+                if self.done:
+                    return False
+                self.done = True
+                return True
+
+            def get_row_data(self):
+                return ["2026-01-02"]
+
+        provider = types.SimpleNamespace(
+            __name__="baostock",
+            query_history_k_data_plus=Mock(return_value=Result()),
+        )
+        configure = Mock(return_value=True)
+
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", configure):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
+                "2",
+                retries=1,
+                timeout=37,
+            )
+
+        self.assertEqual(frame["date"].tolist(), ["2026-01-02"])
+        configure.assert_called_once_with(provider, 37)
+
+    def test_query_reconnects_and_retries_after_windows_timeout(self):
+        module = load_module()
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date"]
 
             def next(self):
                 return False
 
-        query = Mock(return_value=EmptySuccessResult())
-        fake_bs = types.SimpleNamespace(query_history_k_data_plus=query)
+        query = Mock(side_effect=[TimeoutError("timed out"), Result()])
+        provider = types.SimpleNamespace(
+            __name__="baostock", query_history_k_data_plus=query
+        )
+        relogin = Mock()
 
-        with patch.object(module, "signal", types.SimpleNamespace()):
-            result = module.query_one(
-                fake_bs,
-                "sz.000001",
-                "2026-07-23",
-                "2026-07-24",
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", return_value=True), \
+                patch.object(module, "_relogin_baostock", relogin), \
+                patch.object(module.time, "sleep"):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
                 "2",
-                retries=1,
-                timeout=5,
+                retries=2,
+                timeout=37,
             )
 
-        self.assertTrue(result.empty)
-        query.assert_called_once()
+        self.assertTrue(frame.empty)
+        self.assertEqual(query.call_count, 2)
+        relogin.assert_called_once_with(provider, 37)
 
-    def test_blacklist_login_failure_is_recorded_as_immediate_circuit_break(self):
+    def test_query_reconnects_after_baostock_wraps_socket_timeout(self):
         module = load_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            reports = root / "reports"
-            stock_list = root / "stock_lists.json"
-            stock_list.write_text(json.dumps({"all": ["000001.XSHE"]}), encoding="utf-8")
-            fake_bs = types.SimpleNamespace(
-                login=lambda: types.SimpleNamespace(error_code="10001011", error_msg="黑名单用户，请与管理员联系"),
-                logout=lambda: None,
-            )
-            with patch.object(module, "STOCK_LIST", stock_list), \
-                    patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.dict(sys.modules, {"baostock": fake_bs}), \
-                    patch.object(sys, "argv", ["download_baostock.py", "--out", str(root / "out")]):
-                rc = module.main()
 
-            status = json.loads(
-                (reports / "runtime" / "status" / "baostock_download_summary_latest.json").read_text(encoding="utf-8")
+        failed = types.SimpleNamespace(
+            error_code="10002007", error_msg="network receive failed"
+        )
+
+        class Result:
+            error_code = "0"
+            error_msg = "success"
+            fields = ["date"]
+
+            def next(self):
+                return False
+
+        query = Mock(side_effect=[failed, Result()])
+        provider = types.SimpleNamespace(
+            __name__="baostock", query_history_k_data_plus=query
+        )
+        relogin = Mock()
+
+        with patch.object(module, "_supports_signal_timeout", return_value=False), \
+                patch.object(module, "_configure_baostock_socket_timeout", return_value=True), \
+                patch.object(module, "_relogin_baostock", relogin), \
+                patch.object(module.time, "sleep"):
+            frame = module.query_one(
+                provider,
+                "sh.600000",
+                "2026-01-02",
+                "2026-01-02",
+                "2",
+                retries=2,
+                timeout=37,
             )
 
-        self.assertEqual(rc, 2)
-        self.assertEqual(status["status"], "failed")
-        self.assertEqual(status["failure_type"], "source_blacklisted")
-        self.assertTrue(status["manual_review_required"])
-        self.assertEqual(status["stopped_reason"], "source_denied")
-        self.assertEqual(status["requests_made"], 0)
+        self.assertTrue(frame.empty)
+        self.assertEqual(query.call_count, 2)
+        relogin.assert_called_once_with(provider, 37)
+
+    def test_login_uses_bounded_socket_timeout_and_restores_default(self):
+        module = load_module()
+        login_result = types.SimpleNamespace(error_code="0", error_msg="success")
+        provider = types.SimpleNamespace(login=Mock(return_value=login_result))
+        configured = Mock(return_value=True)
+
+        with patch.object(module.socket, "getdefaulttimeout", return_value=None), \
+                patch.object(module.socket, "setdefaulttimeout") as set_default, \
+                patch.object(module, "_configure_baostock_socket_timeout", configured):
+            result = module._login_baostock(provider, 37)
+
+        self.assertIs(result, login_result)
+        self.assertEqual(
+            set_default.call_args_list,
+            [unittest.mock.call(37.0), unittest.mock.call(None)],
+        )
+        configured.assert_called_once_with(provider, 37)
 
     def test_loads_symbols_file_with_comments_and_suffixes(self):
         module = load_module()
@@ -139,6 +238,63 @@ class DownloadBaostockTest(unittest.TestCase):
 
         self.assertEqual(merged["close"].tolist(), [10.0, 12.0, 13.0])
 
+    def test_qfq_anchor_change_triggers_full_history_query(self):
+        module = load_module()
+        existing = pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    ["2020-01-02", "2020-01-03", "2026-07-23"]
+                ),
+                "open": [10.0, 10.1, 20.0],
+                "close": [10.1, 10.2, 20.1],
+                "high": [10.2, 10.3, 20.2],
+                "low": [9.9, 10.0, 19.9],
+                "volume": [1000, 1100, 1200],
+            }
+        )
+        calls: list[tuple[str, str]] = []
+
+        def query_range(start: str, end: str) -> pd.DataFrame:
+            calls.append((start, end))
+            if len(calls) == 1:
+                return pd.DataFrame(
+                    {
+                        "date": ["2020-01-02", "2020-01-03"],
+                        "open": [5.0, 5.05],
+                        "close": [5.05, 5.1],
+                        "high": [5.1, 5.15],
+                        "low": [4.95, 5.0],
+                        "volume": [1000, 1100],
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "date": ["2020-01-02", "2020-01-03", "2026-07-24"],
+                    "open": [5.0, 5.05, 20.1],
+                    "close": [5.05, 5.1, 20.2],
+                    "high": [5.1, 5.15, 20.3],
+                    "low": [4.95, 5.0, 20.0],
+                    "volume": [1000, 1100, 1300],
+                }
+            )
+
+        refreshed, rebased = module.refresh_incremental_frame(
+            existing,
+            query_range=query_range,
+            full_start="2020-01-02",
+            incremental_start="2026-07-21",
+            end="2026-07-24",
+            adjustflag="2",
+            anchor_rows=2,
+        )
+
+        self.assertEqual(calls, [
+            ("2020-01-02", "2020-01-03"),
+            ("2020-01-02", "2026-07-24"),
+        ])
+        self.assertTrue(rebased)
+        self.assertEqual(refreshed["close"].tolist(), [5.05, 5.1, 20.2])
+
     def test_incremental_range_after_end_is_no_new_without_querying_baostock(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +334,48 @@ class DownloadBaostockTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         query_one.assert_not_called()
+
+    def test_blacklist_login_failure_is_recorded_as_immediate_circuit_break(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reports = root / "reports"
+            stock_list = root / "stock_lists.json"
+            stock_list.write_text(
+                json.dumps({"all": ["000001.XSHE"]}), encoding="utf-8"
+            )
+            fake_bs = types.SimpleNamespace(
+                login=lambda: types.SimpleNamespace(
+                    error_code="10001011", error_msg="黑名单用户，请与管理员联系"
+                ),
+                logout=lambda: None,
+            )
+            with (
+                patch.object(module, "STOCK_LIST", stock_list),
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.dict(sys.modules, {"baostock": fake_bs}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["download_baostock.py", "--out", str(root / "out")],
+                ),
+            ):
+                rc = module.main()
+
+            status = json.loads(
+                (
+                    reports
+                    / "runtime"
+                    / "status"
+                    / "baostock_download_summary_latest.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(status["failure_type"], "source_blacklisted")
+        self.assertTrue(status["manual_review_required"])
+        self.assertEqual(status["stopped_reason"], "source_denied")
+        self.assertEqual(status["requests_made"], 0)
 
 
 if __name__ == "__main__":

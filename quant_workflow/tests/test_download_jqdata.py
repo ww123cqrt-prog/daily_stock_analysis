@@ -61,6 +61,24 @@ class FakeJQData:
 
 
 class DownloadJQDataTest(unittest.TestCase):
+    def test_multiprocessing_configuration_skips_fork_on_windows(self):
+        module = load_module()
+
+        class SpawnOnlyMultiprocessing:
+            @staticmethod
+            def get_all_start_methods():
+                return ["spawn"]
+
+            @staticmethod
+            def set_start_method(*_args, **_kwargs):
+                raise AssertionError("fork must not be configured on Windows")
+
+        self.assertFalse(
+            module._configure_multiprocessing_start_method(
+                SpawnOnlyMultiprocessing()
+            )
+        )
+
     def test_load_env_file_sets_missing_values_without_overwriting_existing(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

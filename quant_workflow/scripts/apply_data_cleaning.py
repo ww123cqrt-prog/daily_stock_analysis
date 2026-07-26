@@ -27,14 +27,16 @@ from merge_to_qlib import QLIB_FIELDS, convert_to_bin  # noqa: E402
 QUANT_DATA = quant_data_root()
 WORKFLOW = workflow_root()
 MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
-CLEANED_MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
+CLEANED_MERGED_DIR = (
+    QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
+)
 CANONICAL_QLIB_DIR = qlib_provider_uri()
 CLEANED_QLIB_DIR = qlib_provider_uri("cleaned")
 REPORT_DIR = reports_root()
 ANOMALY_STOCKS_CSV = REPORT_DIR / "data_anomaly_stocks_latest.csv"
 ANOMALY_EVENTS_CSV = REPORT_DIR / "data_anomaly_events_latest.csv"
 
-BENCHMARK_SYMBOLS = {"SH000300"}
+BENCHMARK_SYMBOLS = {"SH000300", "SH000905", "SH000906"}
 EXCLUDE_ACTIONS = {"exclude_symbol_from_training_until_repaired"}
 VOLUME_MASK_ACTIONS = {"keep_but_mask_or_impute_volume"}
 RETURN_MASK_ACTIONS = {
@@ -43,7 +45,16 @@ RETURN_MASK_ACTIONS = {
 }
 RETURN_EVENT_TYPES = {"abs_return_gt_50pct", "abs_return_gt_30pct"}
 VOLUME_EVENT_TYPES = {"non_positive_volume"}
-EVENT_MASK_FIELDS = ["open", "close", "high", "low", "volume", "amount", "turn", "pctChg"]
+EVENT_MASK_FIELDS = [
+    "open",
+    "close",
+    "high",
+    "low",
+    "volume",
+    "amount",
+    "turn",
+    "pctChg",
+]
 
 
 class CleaningPlan:
@@ -109,8 +120,16 @@ def parse_sample_dates(value: Any) -> set[pd.Timestamp]:
 
 
 def load_cleaning_plan(stocks_csv: Path, events_csv: Path) -> CleaningPlan:
-    stocks = pd.read_csv(stocks_csv, dtype={"symbol": str}) if stocks_csv.exists() else pd.DataFrame()
-    events = pd.read_csv(events_csv, dtype={"symbol": str}) if events_csv.exists() else pd.DataFrame()
+    stocks = (
+        pd.read_csv(stocks_csv, dtype={"symbol": str})
+        if stocks_csv.exists()
+        else pd.DataFrame()
+    )
+    events = (
+        pd.read_csv(events_csv, dtype={"symbol": str})
+        if events_csv.exists()
+        else pd.DataFrame()
+    )
     excluded_symbols: set[str] = set()
     volume_mask_symbols: set[str] = set()
     return_mask_symbols: set[str] = set()
@@ -139,7 +158,9 @@ def load_cleaning_plan(stocks_csv: Path, events_csv: Path) -> CleaningPlan:
             if issue_type in VOLUME_EVENT_TYPES:
                 volume_mask_symbols.add(symbol)
             if issue_type in RETURN_EVENT_TYPES:
-                event_dates_by_symbol.setdefault(symbol, set()).update(parse_sample_dates(row.get("sample_dates")))
+                event_dates_by_symbol.setdefault(symbol, set()).update(
+                    parse_sample_dates(row.get("sample_dates"))
+                )
                 return_mask_symbols.add(symbol)
 
     return CleaningPlan(
@@ -150,19 +171,28 @@ def load_cleaning_plan(stocks_csv: Path, events_csv: Path) -> CleaningPlan:
     )
 
 
-def detect_large_return_dates(frame: pd.DataFrame, threshold: float = 0.50) -> set[pd.Timestamp]:
+def detect_large_return_dates(
+    frame: pd.DataFrame, threshold: float = 0.50
+) -> set[pd.Timestamp]:
     if "close" not in frame.columns or "date" not in frame.columns:
         return set()
     ordered = frame.copy()
     ordered["date"] = pd.to_datetime(ordered["date"], errors="coerce")
     ordered["_close"] = pd.to_numeric(ordered["close"], errors="coerce")
     ordered = ordered.dropna(subset=["date"]).sort_values("date")
-    abs_return = ordered["_close"].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).abs()
+    abs_return = (
+        ordered["_close"]
+        .pct_change(fill_method=None)
+        .replace([np.inf, -np.inf], np.nan)
+        .abs()
+    )
     dates = ordered.loc[abs_return > threshold, "date"]
     return {pd.Timestamp(value).normalize() for value in dates.dropna()}
 
 
-def clean_frame(symbol: str, frame: pd.DataFrame, plan: CleaningPlan) -> tuple[pd.DataFrame | None, CleaningStats]:
+def clean_frame(
+    symbol: str, frame: pd.DataFrame, plan: CleaningPlan
+) -> tuple[pd.DataFrame | None, CleaningStats]:
     normalized_symbol = normalize_symbol(symbol)
     stats = CleaningStats(symbol=normalized_symbol, source_rows=len(frame))
     if normalized_symbol in plan.excluded_symbols:
@@ -172,7 +202,11 @@ def clean_frame(symbol: str, frame: pd.DataFrame, plan: CleaningPlan) -> tuple[p
     cleaned = frame.copy()
     if "date" in cleaned.columns:
         cleaned["date"] = pd.to_datetime(cleaned["date"], errors="coerce")
-        cleaned = cleaned.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset=["date"])
+        cleaned = (
+            cleaned.dropna(subset=["date"])
+            .sort_values("date")
+            .drop_duplicates(subset=["date"])
+        )
     if "factor" not in cleaned.columns:
         cleaned["factor"] = 1.0
 
@@ -185,8 +219,16 @@ def clean_frame(symbol: str, frame: pd.DataFrame, plan: CleaningPlan) -> tuple[p
     event_dates = set(plan.event_dates_by_symbol.get(normalized_symbol, set()))
     if normalized_symbol in plan.return_mask_symbols:
         event_dates.update(detect_large_return_dates(cleaned))
-    normalized_dates = cleaned["date"].dt.normalize() if "date" in cleaned.columns else pd.Series([], dtype="datetime64[ns]")
-    masked_event_rows = normalized_dates.isin(event_dates) if event_dates else pd.Series(False, index=cleaned.index)
+    normalized_dates = (
+        cleaned["date"].dt.normalize()
+        if "date" in cleaned.columns
+        else pd.Series([], dtype="datetime64[ns]")
+    )
+    masked_event_rows = (
+        normalized_dates.isin(event_dates)
+        if event_dates
+        else pd.Series(False, index=cleaned.index)
+    )
     fields_to_mask = [field for field in EVENT_MASK_FIELDS if field in cleaned.columns]
     if fields_to_mask and not masked_event_rows.empty:
         cleaned.loc[masked_event_rows.fillna(False), fields_to_mask] = np.nan
@@ -224,7 +266,11 @@ def build_cleaned_parquet(
                 if index <= 3 or index % 1000 == 0 or index == len(paths):
                     print(f"  skipped existing {index}/{len(paths)}: {path.stem}")
                 continue
-            keep = ["date"] + [field for field in QLIB_FIELDS + ["amount", "turn", "pctChg"] if field in cleaned.columns]
+            keep = ["date"] + [
+                field
+                for field in QLIB_FIELDS + ["amount", "turn", "pctChg"]
+                if field in cleaned.columns
+            ]
             cleaned[keep].to_parquet(output_path, index=False)
             stats_rows[-1]["written"] = True
         if index <= 3 or index % 1000 == 0 or index == len(paths):
@@ -240,7 +286,9 @@ def build_cleaned_parquet(
         "source_symbols": len(paths),
         "excluded_symbols": sum(1 for row in stats_rows if row["excluded"]),
         "would_write_symbols": sum(1 for row in stats_rows if not row["excluded"]),
-        "skipped_existing_symbols": sum(1 for row in stats_rows if row.get("skipped_existing")),
+        "skipped_existing_symbols": sum(
+            1 for row in stats_rows if row.get("skipped_existing")
+        ),
         "written_symbols": sum(1 for row in stats_rows if row.get("written")),
         "source_rows": total_source_rows,
         "output_rows": total_output_rows,
@@ -260,7 +308,11 @@ def write_latest(path: Path, latest_name: str) -> Path:
 def remove_symbol_from_instrument_file(path: Path, symbol: str) -> None:
     if not path.exists():
         return
-    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if not line.startswith(f"{symbol}\t")]
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.startswith(f"{symbol}\t")
+    ]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
@@ -339,10 +391,29 @@ def copy_benchmark_features(source_provider: Path, target_provider: Path, symbol
                 shutil.rmtree(staging_dir)
         copied.append(symbol)
 
-        for instrument_name in ["all.txt", "csi300.txt"]:
-            remove_symbol_from_instrument_file(target_provider / "instruments" / instrument_name, symbol)
+        for instrument_file in (target_provider / "instruments").glob("*.txt"):
+            remove_symbol_from_instrument_file(instrument_file, symbol)
 
     return copied
+
+
+def convert_cleaned_to_qlib(
+    cleaned_parquet_dir: Path,
+    cleaned_qlib_dir: Path,
+    *,
+    canonical_provider: Path,
+    overwrite: bool,
+) -> int:
+    calendar_path = Path(canonical_provider) / "calendars" / "day.txt"
+    if not calendar_path.is_file():
+        raise ValueError(f"Canonical Qlib calendar is unavailable: {calendar_path}")
+    return convert_to_bin(
+        cleaned_parquet_dir,
+        cleaned_qlib_dir,
+        overwrite,
+        dropna_fields=[],
+        calendar_path=calendar_path,
+    )
 
 
 def write_reports(
@@ -362,11 +433,20 @@ def write_reports(
         "qlib_return_code": qlib_return_code,
         "summary": {key: value for key, value in summary.items() if key != "stats"},
     }
-    title = "Data Cleaning Dry Run" if summary.get("dry_run") else "Applied Data Cleaning"
-    status_line = "- Mode: dry run, no cleaned parquet or Qlib files were written." if summary.get("dry_run") else "- Mode: applied cleaning outputs."
+    title = (
+        "Data Cleaning Dry Run" if summary.get("dry_run") else "Applied Data Cleaning"
+    )
+    status_line = (
+        "- Mode: dry run, no cleaned parquet or Qlib files were written."
+        if summary.get("dry_run")
+        else "- Mode: applied cleaning outputs."
+    )
     json_path = out_dir / f"data_cleaning_applied_{ts}.json"
     md_path = out_dir / f"data_cleaning_applied_{ts}.md"
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     md_path.write_text(
         "\n".join(
             [
@@ -419,7 +499,11 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--no-overwrite", action="store_true")
     parser.add_argument("--skip-qlib-convert", action="store_true")
-    parser.add_argument("--dry-run", action="store_true", help="Generate the cleaning plan report without writing cleaned data.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate the cleaning plan report without writing cleaned data.",
+    )
     args = parser.parse_args()
 
     overwrite = not args.no_overwrite
@@ -430,14 +514,21 @@ def main() -> int:
     print(f"  return-mask symbols: {len(plan.return_mask_symbols)}")
 
     print("Building cleaned merged parquet...")
-    summary = build_cleaned_parquet(args.merged_dir, args.cleaned_merged_dir, plan, overwrite, dry_run=args.dry_run)
+    summary = build_cleaned_parquet(
+        args.merged_dir, args.cleaned_merged_dir, plan, overwrite, dry_run=args.dry_run
+    )
 
     qlib_return_code: int | None = None
     if args.dry_run:
         print("Dry run enabled; skipping cleaned parquet writes and Qlib conversion.")
     elif not args.skip_qlib_convert:
         print("Converting cleaned parquet to Qlib bin...")
-        qlib_return_code = convert_to_bin(args.cleaned_merged_dir, args.qlib_dir, overwrite, dropna_fields=[])
+        qlib_return_code = convert_cleaned_to_qlib(
+            args.cleaned_merged_dir,
+            args.qlib_dir,
+            canonical_provider=CANONICAL_QLIB_DIR,
+            overwrite=overwrite,
+        )
         if qlib_return_code == 0:
             copied = copy_benchmark_features(args.benchmark_provider_dir, args.qlib_dir, BENCHMARK_SYMBOLS)
             print(f"Copied benchmark feature directories: {', '.join(copied) if copied else 'none'}")
@@ -448,7 +539,9 @@ def main() -> int:
         qlib_return_code=qlib_return_code,
         out_dir=args.out_dir,
     )
-    print(f"Cleaned symbols: {summary['written_symbols']} / {summary['source_symbols']}")
+    print(
+        f"Cleaned symbols: {summary['written_symbols']} / {summary['source_symbols']}"
+    )
     print(f"Reports: {reports['latest_json']}, {reports['latest_markdown']}")
     return int(qlib_return_code or 0)
 

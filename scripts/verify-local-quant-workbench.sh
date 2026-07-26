@@ -38,6 +38,32 @@ REQUIRED_QUANT_WORKFLOW_SCRIPTS=(
   optimize_strategy.py
   train_baseline_lgb.py
   run_candidate_pipeline.py
+  build_pit_csi800.py
+  download_robust_reference.py
+  validate_robust_price_bundle.py
+  import_robust_price_bundle.py
+  build_robust_price_provider.py
+  preflight_robust_data.py
+  prepare_robust_provider.py
+  robust_backtest.py
+  robust_dataset.py
+  robust_evaluation.py
+  robust_market_data.py
+  robust_shadow_tracking.py
+  robust_strategy_core.py
+  run_robust_development.py
+  run_robust_strategy.py
+  run_robust_confirmation.py
+  launch_robust_confirmation.py
+  run_robust_shadow_day.py
+  run_robust_shadow_schedule.py
+  launch_robust_strategy.py
+  report_robust_strategy_closure.py
+  robust_signal_dataset.py
+  robust_signal_evaluation.py
+  robust_signal_models.py
+  run_robust_signal_research.py
+  launch_robust_signal_research.py
   run_daily_update.py
 )
 

@@ -7,6 +7,8 @@ import {
   type ResearchQlibPredictions,
   type ResearchQlibResearch,
   type ResearchQlibProvider,
+  type ResearchRobustSignal,
+  type ResearchRobustStrategy,
   type ResearchTrainingReadiness,
   type ResearchTrainingResult,
 } from './research';
@@ -60,6 +62,8 @@ export interface QuantStatus {
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
   qlibResearch?: ResearchQlibResearch | null;
+  robustStrategy?: ResearchRobustStrategy | null;
+  robustSignal?: ResearchRobustSignal | null;
   experimentNotebook?: ResearchExperimentNotebook | null;
   mlflow?: QuantMlflowStatus;
   externalServices?: Record<string, QuantExternalServiceStatus>;
@@ -113,6 +117,8 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     cashControlBacktest: camel.cashControlBacktest ?? null,
     qlibPredictions: camel.qlibPredictions ?? null,
     qlibResearch: convertQlibResearch(data.qlib_research),
+    robustStrategy: camel.robustStrategy ?? null,
+    robustSignal: camel.robustSignal ?? null,
     experimentNotebook: camel.experimentNotebook ?? null,
     mlflow: camel.mlflow,
     externalServices: camel.externalServices ?? {},

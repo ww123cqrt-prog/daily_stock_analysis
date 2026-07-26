@@ -343,6 +343,8 @@ async def get_quant_status() -> QuantStatusResponse:
         cash_control_backtest=research_status.get("cash_control_backtest"),
         qlib_predictions=research_status.get("qlib_predictions"),
         qlib_research=research_status.get("qlib_research"),
+        robust_strategy=research_status.get("robust_strategy"),
+        robust_signal=research_status.get("robust_signal"),
         experiment_notebook=research_status.get("experiment_notebook"),
         mlflow=mlflow_payload,
         external_services=_external_services_payload(mlflow_payload),

@@ -9,6 +9,12 @@
   <!-- Baostock uses anonymous login: this job needs and reads no credentials. -->
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=__HOME__</string>
+    <string>PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+    <string>PYTHONUNBUFFERED=1</string>
+    <string>TZ=Asia/Shanghai</string>
     <string>__PYTHON__</string>
     <string>-u</string>
     <string>__SCRIPT__</string>
@@ -17,16 +23,6 @@
 
   <key>WorkingDirectory</key>
   <string>__WORKDIR__</string>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
-    <key>TZ</key>
-    <string>Asia/Shanghai</string>
-  </dict>
 
   <key>StandardOutPath</key>
   <string>__STDOUT__</string>

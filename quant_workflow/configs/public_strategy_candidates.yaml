@@ -1,0 +1,56 @@
+version: 1
+policy:
+  research_only: true
+  automatic_orders: false
+  broker_connection: false
+  run_external_code_only_after_static_review: true
+  promotion_requires_local_reproduction: true
+
+candidates:
+  - id: etf_20d_two_asset_momentum_rotation
+    status: research_candidate_reproduced
+    source: user_supplied_public_claim
+    strategy_type: deterministic_etf_rotation
+    universe:
+      - symbol: SZ159915
+        code: '159915'
+        name: 创业板ETF
+      - symbol: SH513100
+        code: '513100'
+        name: 纳指ETF
+    rule:
+      lookback_days: 20
+      moving_average_days: 20
+      rank_scope: two_asset_universe
+      buy: top_20d_return_and_close_above_20d_ma
+      sell: held_asset_not_top_or_close_below_20d_ma
+      otherwise: cash
+      signal_time: close
+      execution_time: next_open
+    claimed_results:
+      total_return: 5.228
+      annualized_return: 0.3153
+      max_drawdown: -0.2053
+      claim_status: unverified
+    acceptance:
+      max_drawdown_abs_max: 0.35
+      applies_to: baseline_cost_research_candidate_only
+      note: This does not change the CSI800 robust-strategy development, confirmation, or shadow gates.
+    validation:
+      local_data_source: akshare.fund_etf_hist_sina
+      adjustment: raw_close
+      robustness_decision: manual_review_required
+      automatic_rejection: false
+      independent_source_cross_check: pending
+      dividend_total_return_check: pending
+      price_discontinuity:
+        status: unresolved
+        symbol: SH513100
+        date: '2022-01-14'
+        raw_close_return: -0.8045069337
+      cost_stress: 10_20_40_total_bps_completed
+      execution_delay_stress: completed
+      parameter_neighborhood: diagnostic_only_completed
+      rolling_quarters: completed_manual_review
+      paper_tracking_60_days: not_started
+      robust_strategy_qualification: manual_decision_pending

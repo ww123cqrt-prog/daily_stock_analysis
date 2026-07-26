@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { BrainCircuit, Braces, SlidersHorizontal } from 'lucide-react';
-import { useSearchParams } from 'react-router-dom';
+import { BrainCircuit, Braces, FileChartColumn, SlidersHorizontal } from 'lucide-react';
+import { Link, useSearchParams } from 'react-router-dom';
 import FormStrategyBacktestPanel from '../components/backtest/FormStrategyBacktestPanel';
 import ModelStrategyBacktestPanel from '../components/backtest/ModelStrategyBacktestPanel';
 import ScriptStrategyBacktestPanel from '../components/backtest/ScriptStrategyBacktestPanel';
@@ -45,7 +45,15 @@ const BacktestPage: React.FC = () => {
             {zh ? '脚本交易策略、条件交易策略，以及选股模型与交易策略组合都在这里回测。' : 'Backtest scripted trading strategies, form-based trading strategies, and stock-selection model plus trading-strategy combinations here.'}
           </p>
         </div>
-        <div className="grid w-full grid-cols-3 border border-border/70 bg-card/45 p-1 sm:inline-flex sm:w-auto" role="tablist" aria-label={zh ? '回测方式' : 'Backtest mode'}>
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+          <Link
+            to="/backtest/etf-momentum"
+            className="btn-secondary h-9 justify-center gap-2 px-3 text-sm"
+          >
+            <FileChartColumn className="h-4 w-4" />
+            {zh ? 'ETF 动量完整报告' : 'ETF momentum report'}
+          </Link>
+          <div className="grid w-full grid-cols-3 border border-border/70 bg-card/45 p-1 sm:inline-flex sm:w-auto" role="tablist" aria-label={zh ? '回测方式' : 'Backtest mode'}>
           <button
             type="button"
             role="tab"
@@ -81,6 +89,7 @@ const BacktestPage: React.FC = () => {
               <><span className="sm:hidden">Model + strategy</span><span className="hidden sm:inline">Stock-selection model + trading strategy</span></>
             )}
           </button>
+          </div>
         </div>
       </header>
 

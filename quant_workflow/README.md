@@ -19,9 +19,10 @@ outside the cloned Qlib source tree.
 
 Run commands from the DSA repository root. Python runtime is shared with the
 DSA backend: use `.venv/bin/python` for Qlib, JQData/AkShare,
-china-astock-quant adapters, and every stable script here. Data paths default
-to `quant_data/` under the DSA repository; set `QUANT_DATA_ROOT` when the local
-Parquet or Qlib provider root moves.
+china-astock-quant adapters, and every stable script here. Data paths use
+`QUANT_DATA_ROOT` when configured; otherwise the resolver uses the DSA-local
+`quant_data/` directory when present and then the sibling WorkingProjects
+`quant_data/` directory. Do not construct this path from the workflow directory.
 
 ```bash
 # Verify JQData auth and stock-pool parsing without writing data
@@ -38,6 +39,18 @@ Parquet or Qlib provider root moves.
 
 # Download a bounded A-share news sample and retain each raw EastMoney response
 .venv/bin/python quant_workflow/scripts/download_ashare_news.py --limit 50
+# Build a governed A-share raw/factor/qfq source bundle (normally on a durable remote runner)
+.venv/bin/python quant_workflow/scripts/download_baostock_v2.py download \
+  --universe-file /path/to/stock_lists.json \
+  --output-dir /path/to/staging-bundle \
+  --through YYYY-MM-DD --resume
+
+# Publish a verified A-share v2 raw/qfq pair atomically
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
+  ashare_daily_qfq --bundle-dir /path/to/verified-bundle
+
+# Build and publish Qlib from the exact governed qfq snapshot
+.venv/bin/python quant_workflow/scripts/build_qlib_v2.py --publish
 
 # Supervise Baostock in restartable batches
 .venv/bin/python quant_workflow/scripts/supervise_baostock.py
@@ -60,6 +73,14 @@ Parquet or Qlib provider root moves.
 
 # Read-only data-governance inventory and dry-run cleanup plan
 .venv/bin/python quant_workflow/scripts/report_data_hygiene.py
+# Refresh and atomically publish the governed two-ETF raw/qfq snapshots
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update etf_momentum_daily_qfq
+
+# Inspect data basis, adjustment evidence, date range and lineage
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py describe etf_momentum_daily_qfq
+
+# Fail when the catalog, governed paths or generated README tables drift
+.venv/bin/python quant_workflow/scripts/sync_data_manifest.py --check
 
 # Run the canonical Qlib Alpha158 + LightGBM baseline
 .venv/bin/python quant_workflow/scripts/train_baseline_lgb.py
@@ -80,6 +101,29 @@ Parquet or Qlib provider root moves.
 - Yahoo raw responses: `quant_data/raw/global_1d/yahoo/captured_date=YYYY-MM-DD`
 - Sina snapshot raw responses: `quant_data/raw/ashare_snapshots/captured_date=YYYY-MM-DD`
 - EastMoney news raw responses: `quant_data/raw/ashare_news/captured_date=YYYY-MM-DD`
+- Governed ETF raw evidence: `quant_data/parquet/etf_1d/etf_momentum_daily_raw`
+- Governed ETF qfq snapshot: `quant_data/parquet/etf_1d/etf_momentum_daily_qfq`
+
+The canonical storage, schema, merge, and handoff rules are documented in
+[`docs/quant-data-contract.md`](docs/quant-data-contract.md). The live local
+paths and readiness state remain authoritative in
+`${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
+`preflight_robust_data.py`.
+
+The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`, and
+`qlib_ashare_v2`; resolve them through `quant_data_cli.py` instead of hard-coding
+snapshot paths. Older source, merged, cleaned, and Qlib directories remain
+registered as `legacy_unknown` for compatibility and audit use. Do not infer
+readiness from directory names; the live manifest is authoritative.
+
+The robust strategy configuration uses verified offline reuse for the one-time
+reference snapshot and the three Qlib benchmarks. It does not silently redownload
+when local data is missing or mismatched; the correct state is `blocked_data`.
+Remote artifacts remain staging until they are imported locally with
+`download_robust_reference.py --import-dir` and
+`add_index_benchmark.py --import-provider-dir`. Both commands revalidate local
+identity and use recoverable transactions; direct copies into canonical data
+directories are not supported.
 
 ## Notes
 

@@ -25,6 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _daily_update_runtime import DailyUpdateLock, LockHeldError, write_json_atomic  # noqa: E402
 from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from quant_data_contract import DataContractError, describe_dataset  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -109,6 +110,15 @@ def latest_any_source_date(source_dirs: dict[str, Path], sample: int = 40) -> tu
     by_source = {name: latest_source_date(directory, sample=sample) for name, directory in source_dirs.items()}
     latest = max((value for value in by_source.values() if value), default="")
     return latest, by_source
+
+
+def latest_dataset_date(dataset_id: str, root: Path | None = None) -> str:
+    try:
+        payload = describe_dataset(dataset_id, quant_data_root=Path(root or QUANT_DATA))
+    except (DataContractError, OSError, ValueError):
+        return ""
+    value = payload.get("latest_trade_date")
+    return str(value) if value else ""
 
 
 def load_expected_symbols(path: Path = STOCK_LIST) -> set[str]:
@@ -267,6 +277,24 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 news += ["--use-system-proxy"]
             stages.append(Stage("download_ashare_news", news, required=False))
 
+        if not getattr(args, "skip_etf_momentum", False):
+            etf_update = _script("quant_data_cli.py") + [
+                "--root",
+                str(QUANT_DATA),
+                "update",
+                "etf_momentum_daily_qfq",
+                "--through",
+                str(args.end),
+            ]
+            stages.append(Stage("download_etf_momentum", etf_update, required=False))
+            stages.append(
+                Stage(
+                    "generate_etf_momentum_report",
+                    _script("generate_etf_momentum_strategy_report.py"),
+                    required=False,
+                )
+            )
+
     stages.append(
         Stage(
             "merge_to_qlib",
@@ -279,14 +307,11 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
     )
     benchmark = _script("add_index_benchmark.py") + [
         "--provider-dir", str(paths.merged_qlib),
-        "--status-dir", str(status_dir),
     ]
     if args.benchmark_cache_dir is not None:
-        benchmark += ["--cache-provider", str(args.benchmark_cache_dir)]
-    if args.benchmark_offline:
-        benchmark += ["--offline"]
-    if args.use_system_proxy:
-        benchmark += ["--use-system-proxy"]
+        benchmark += ["--import-provider-dir", str(args.benchmark_cache_dir)]
+    elif args.benchmark_offline:
+        benchmark += ["--reuse-existing"]
     stages.append(Stage("add_index_benchmark", benchmark, heavy=True))
 
     if not args.skip_snapshot_validation:
@@ -521,6 +546,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-akshare", action="store_true")
     parser.add_argument("--skip-global-daily", action="store_true")
     parser.add_argument("--skip-ashare-news", action="store_true")
+    parser.add_argument("--skip-etf-momentum", action="store_true")
     parser.add_argument("--skip-snapshot-validation", action="store_true")
     parser.add_argument("--use-system-proxy", action="store_true")
     parser.add_argument("--snapshot-limit", type=int, default=50)
@@ -573,6 +599,8 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         "source coverage before: "
         f"date={before['candidate_date'] or 'n/a'} ratio={before['coverage_ratio']:.3f}"
     )
+    etf_before = latest_dataset_date("etf_momentum_daily_qfq")
+    _log(f"latest ETF momentum date before: {etf_before or 'n/a'}")
     write_runtime_status(run_id, "running", current_stage="starting", source_coverage_before=before)
 
     stages = build_stages(args, run_id=run_id)
@@ -672,6 +700,7 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             minimum_ratio=args.min_source_coverage,
         )
     published = any(item.name == "publish_official" and item.status == "ok" for item in results)
+    etf_after = latest_dataset_date("etf_momentum_daily_qfq")
     summary_path = write_summary(
         results,
         {
@@ -682,6 +711,8 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             "source_dates_after": after["source_dates"],
             "source_coverage_before": before,
             "source_coverage_after": after,
+            "etf_date_before": etf_before,
+            "etf_date_after": etf_after,
             "dry_run": bool(args.dry_run),
             "skip_download": bool(args.skip_download),
             "forced": bool(args.force),

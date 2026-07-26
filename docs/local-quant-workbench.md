@@ -87,31 +87,65 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 每个任务只能调用后端白名单脚本；网页不能提交任意 shell 命令。
 
-### 2.1 quant_workflow 脚本覆盖盘点
+### 2.1 鲁棒策略生命周期
+
+旧的“一次完成模型、策略、成本和确认期”的鲁棒开发流程已经结案。已完成的 504 个固定参数任务和 20 组 CatBoost 调参结果继续保留，但因为没有模型通过全部稳定性门槛，只能作为第零代失败基线，不能称为合格策略。结案证据由 `report_robust_strategy_closure.py` 写入原 Run 目录，不删除或改写原模型、预测和 MLflow 记录。
+
+新的“选股信号 Goal 1”先回答一个更小但更关键的问题：价量数据里是否存在跨季度、跨 504/756/1008 日训练窗口都稳定的选股信号。正式配置是 `quant_workflow/configs/robust_signal_research.yaml`，入口是 `launch_robust_signal_research.py`，报告独立写入 `quant_workflow/reports/robust_signal/`，MLflow 实验为 `robust_csi800_signal_research`。2018-2022 只用于预注册的八组信号筛选，2023-2025 用于 12 个季度的滚动样本外验收；任何预测产物只要包含 2026 日期就立即拒绝。主验收口径固定为 Top50，不能事后换 Top20、Top30 或 Top100 冒充通过。
+
+`/workflow` 的 Goal 1 卡片可启动正式研究、请求“完成当前完整任务后暂停”，并从同一 Run 恢复。暂停不是强制杀进程：当前季度、窗口和模型必须先原子写完预测、模型、诊断和进度，然后 runner 才退出。恢复时会核对配置、Git commit、数据清单和 provider 上下文；任何一项变化都拒绝续跑。每个任务的因子诊断同时保存原始 Alpha158 数据和处理后的模型输入；后者包含板块标识与基于 CSI800 历史收盘价的四类市场状态 one-hot 特征。市场状态统一从配置冻结的 `2014-01-02` 起点连续计算，每个任务只读到自己的测试期末，并检查训练期之前至少有 60 个交易日用于预热；不能随 504/756/1008 日训练窗口改变计算起点。`/backtest` 只展示已经落盘的因子质量、标签方案、TopK 敏感性、窗口稳定性和四种市场状态归因；状态归因先在全体日期上确定统一的标签/调仓取样日，再按状态拆分，不把 smoke 结果当正式研究证据。
+
+Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败，状态为 `signal_diagnosis_complete`，下一门槛明确写成 `build_historical_fundamentals`；这表示“价量阶段完成、基本面阶段尚未执行”，不等于 `signal_not_found`。只有带真实公告日期、至少延迟一个交易日生效且覆盖率达到 98% 的基本面扩展也失败后，才能输出 `signal_not_found`。LightGBM、XGBoost、CatBoost 和 MPS DNN 只允许在 OLS/Ridge 已证明确定性信号存在后作为挑战者运行，不是首轮信号存在性的前置条件。
+
+另设公开策略研究候选清单 `quant_workflow/configs/public_strategy_candidates.yaml`。用户提供的“两只 ETF 20 日动量轮动”已登记为 `etf_20d_two_asset_momentum_rotation`：它只比较 159915 和 513100，收盘计算信号、下一交易日开盘执行，不能与 CSI800 个股模型或 Qlib 选股结果混称。回测使用独立的 ETF 数据目录和报告目录；公开文章的收益数字只保留为未核验声明。该候选在基准成本口径下允许最大回撤 35%，这一放宽只适用于该 ETF 研究候选，不改变 CSI800 鲁棒策略的 20% 开发/确认门槛和 12% 纸面跟踪门槛。
+
+`/workflow` 的“鲁棒策略生命周期”是一条独立研究链路，不覆盖日常 `candidate_pipeline_latest` 或 `latest_training_result`。它以历史时点 CSI800 为股票池，要求按每个历史日期使用当时的 CSI300 与 CSI500 成分股，不能拿今天的成分股回看过去。历史成员默认先查询 JQData；如果历史权限不可用，才整批切换到 Baostock 的历史成分接口，实际来源、回退原因、指数代码和日期范围写入 `reference/pit_csi800/MEMBERSHIP_SOURCE.json`，同一份成员库不得静默混用两个来源。行情、成员区间、行业、ST、停牌、上市日期和板块元数据先通过固定门槛；成员区间覆盖率低于 99%、有效行情覆盖率低于 98%，或存在重复日期、未来数据、基准缺口时，状态必须是 `blocked_data`，训练不会启动。
+
+网页按以下顺序使用：
+
+1. “运行鲁棒策略开发流程”：执行数据预检、不可变 provider 准备、五类模型的多窗口/多随机种子滚动样本外训练，以及五套交易规则的低成本、基准成本、40bp 压力成本和延迟执行测试。`weekly_top50`、`low_turnover`、`regime_scaled` 和 `sector_constrained` 是用于衡量各模块作用的消融对照，只有同时包含低换手、市场状态减仓、行业与板块分散的 `full_risk_control` 可以成为冻结候选。五套规则都执行单股 3%、单一行业 25%、创业板与科创板合计 30% 的硬上限；卖出因停牌或涨跌停失败时，买入会按实际残留仓位重新计算容量和市场状态总仓位。市场状态归因使用前一交易日收盘后已知的状态，板块归因同时给出主板、创业板、科创板的平均/峰值仓位、组合收益贡献和相对 CSI800 基准的超额贡献；现金相对基准的贡献单独记录，板块与现金贡献按复利财富变化口径与组合总收益和总超额严格对账。开发期只允许输出 `development_failed` 或 `research_candidate_ready`。
+2. “运行冻结策略 2026 确认期”：只对已经冻结的配置、Git commit、数据清单哈希、模型文件哈希和预测文件哈希运行一次确认。2026 结果不能用于回头换冠军；未通过时输出 `development_failed`。
+3. “运行鲁棒策略当日纸面跟踪”：只加载冻结模型做当日推理，不重新训练，按交易日逐日记录任务成功、组合收益、基准收益、净超额和最大回撤。状态 `shadow_observation` 表示仍在观察，不等于合格；完成配置中冻结的 60 个交易日且全部门槛通过后，才允许出现 `robust_strategy_qualified`。开发期、2026 确认期和纸面跟踪的所有数值门槛均读取同一份 `robust_strategy.yaml`，判定结果会保存实际使用的门槛，不使用脚本内另一套隐藏数字。
+
+当前人工控制边界：旧的完整鲁棒策略 runner 仍只有命令行 `--resume`，没有网页安全暂停；新的 Goal 1 runner 已支持网页协作式暂停和同一 Run 恢复。两条流程不能混称为都已支持。Goal 1 的按钮只管理 `robust_signal` Run，不会停止、恢复或覆盖旧 `robust_strategy` Run。
+
+有界调参仍限制为每个失败模型最多 20 组、最多 3 个完整矩阵入围者。筛选阶段必须覆盖 504/756/1008 三个训练窗口，并在配置指定的 756 日参考窗口覆盖 42/2026/3407 三个随机种子；候选排序先看原有稳定性门槛，再看 RankIC。不能恢复成只跑 756 日、只按 RankIC 选前三名的旧逻辑，因为那会在评估稳定性之前淘汰可能更稳定的参数。
+
+开发期一旦产生 `research_candidate_ready`，会冻结入选模型在全部 12 个季度、全部训练窗口和全部随机种子上的模型文件与预测文件。固定参数入选模型只能绑定固定参数矩阵；经有界调参入选的模型只能绑定最佳调参配置重新训练得到的完整矩阵，不能把调参参数和固定参数模型混在同一冻结记录中。冻结记录保存本次开发 run 目录、每个任务的时间切分、上下文哈希、绝对路径和 SHA256，并对完整产物矩阵再计算总哈希；2026 确认期会在开始前和发布结果前核对这套冻结上下文，不能从其他 run、共享 `latest` 文件或后来改写的模型文件中替换证据。三个指数基准必须覆盖 2014 年以来每个必需交易日。历史指数在成分退出和替补生效之间可能短暂少于名义数量；构建器只接受单个指数和 CSI800 并集均不低于名义数量 99% 的原始记录，保留短缺异常，不用前向或后向填充伪造成分，低于 99% 时立即阻断。最终预检仍要求至少 99% 的交易日达到完整 800 只。
+
+固定状态只有 `blocked_data`、`development_failed`、`research_candidate_ready`、`shadow_observation`、`robust_strategy_qualified`。网页会把策略生命周期和最近一次纸面任务分开显示：某天推理失败会显示日期和原因，但不会把一次运行故障伪装成 60 日最终结论；同一失败日期也不能重跑成成功。`/backtest` 展示模型稳定性、策略成本/延迟压力、季度样本外结果、市场状态归因、确认期和纸面跟踪；`/experiments/` 查看 `robust_csi800_development` 与 `robust_csi800_confirmation` 的 MLflow 原始 Runs。
+
+回测市场面板从证券主表读取 `list_date`，并从每只股票的完整日线按真实有成交记录计算 `listing_trading_day`。科创板、注册制创业板和注册制主板上市前五个交易日，以及北交所首个交易日，按当时无涨跌幅限制处理；注册制前主板上市首日保留上涨 44%/下跌 36% 的方向差异，成熟科创板和注册制创业板风险警示股票仍按 20% 处理。价格文件若在上市后 30 天内才开始且缺失上市首日，市场面板直接拒绝；对于远晚于上市日才开始的旧历史文件，只标记为成熟股票，不得误判成上市前五日。缺少上市日期或可交易日年龄时回测拒绝继续，不用自然日或默认 10% 猜测。
+
+正式报告写入 `quant_workflow/reports/robust_strategy/`。核心入口包括 `build_pit_csi800.py`、`download_robust_reference.py`、`validate_robust_price_bundle.py`、`import_robust_price_bundle.py`、`build_robust_price_provider.py`、`preflight_robust_data.py`、`prepare_robust_provider.py`、`run_robust_development.py`、`run_robust_strategy.py`、`run_robust_confirmation.py`、`run_robust_shadow_day.py` 和 `robust_shadow_tracking.py`。远端或离线生成的全历史 K 线必须先由 `validate_robust_price_bundle.py` 逐文件检查股票集合、PIT 成员快照哈希、日期、OHLCV 和 SHA-256；传回本机后由 `import_robust_price_bundle.py` 复验并发布到哈希隔离的只读运行目录，不直接覆盖正式 `quant_data/parquet`。`build_robust_price_provider.py` 再对只读价格包执行异常扫描和清洗，按已验证的完整基准日历生成 Qlib 特征，并事务导入 CSI300、CSI500、CSI800 三个基准目录；输出仍按内容哈希隔离，不覆盖日常 cleaned provider。`sync_data_manifest.py` 只在 `latest_product.json`、`BUILD.json`、`CONTENT.json` 和实际文件集合相互一致时登记 `robust_price_product`，否则固定记入 `pending_entries`，避免训练配置指向未完成或路径漂移的产品。网页和命令行的长开发流程统一通过 `launch_robust_strategy.py` 注册为当前 macOS 用户的 `launchd` 一次性任务；监督进程先用 `/usr/bin/env -i` 清空图形会话继承环境，再只传递非敏感运行白名单，主流程不会继承 GitHub/LLM/API token。启动命令必须显式固定 `--mlruns-dir` 到 DSA 正式 `quant_workflow/mlruns/`，不能写入隔离 worktree 的空目录。监督进程记录主流程 PID、标准输出、错误日志、launch record、退出码和最终状态，并在启动后复核进程与 CPU 占用。历史股票池每完成一个完整年度就事务提交该年度分区和进度；总成员区间只在全部年度完成后发布。`.build_pit_csi800.in-progress.json` 存在期间，读取方固定拒绝半成品。`/workflow` 从当前 run 的专属报告显示 `completed_date_count / expected_date_count`，不读取其他 run 的共享旧进度。不能把正式训练作为 Codex 前台子进程裸跑。模型、行情、报告、MLflow 数据和运行日志不进入 Git。
+
+在真实数据预检通过之前，只能说“实现已就绪”或“数据阻断”，不能说训练完成；开发期与确认期通过后也只能叫“研究候选”，不能说“鲁棒策略合格”。整个流程不连接券商、不读取账号密码、不自动下单。
+
+### 2.2 quant_workflow 脚本覆盖盘点
 
 `quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到网页按钮里。当前网页任务中心已经覆盖核心日常链路：数据下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、数据治理盘点和 dry-run 清理预案、市场状态、现金仓位叠加、Qlib 研究增强、china-astock 技术指标报告、china-astock 对比、交易策略优化预演和选股模型基线训练。
 
-### 2.2 每日数据更新全链路与自动调度
+### 2.3 每日数据更新全链路与自动调度
 
 `run_daily_update.py` 在 `/workflow` 中作为“运行每日数据更新全链路”任务出现，把已有稳定脚本按依赖顺序串成一条可审计的链路：
 
 1. 可选 A 股历史刷新：默认 `--ashare-source none`，不请求 Baostock、东方财富或 AkShare；显式选择时只运行一个来源。AkShare 的 `stock_zh_a_hist(adjust="qfq")` 底层使用东方财富接口，因此不能当作独立流量通道同时运行。
 2. A 股来源安全控制：请求间隔至少 2 秒，只尝试 1 次，连续失败最多 3 次，单次最多 6000 个请求，增量重叠最多 7 天；`10001011`、黑名单、HTTP 403/429 或远端主动断开会立即终止整个来源任务。
-3. `download_ashare_news.py` 默认不进入全链路；只有显式设置正数 `--news-limit` 才请求东方财富新闻接口。
-4. `download_global_daily.py --incremental`：从 Yahoo Chart 下载配置内 78 个美股、9 个日股、8 个韩股，分别写入 `quant_data/parquet/global_1d/{us,jp,kr}/<symbol>.parquet`。每个代码始终只有一个增量文件，原始响应按抓取日期写入 `quant_data/raw/global_1d/yahoo/`。
-5. 可选 `download_ashare_news.py --limit 50`：限定股票数抓取东方财富新闻搜索 JSONP，原始响应写入 `quant_data/raw/ashare_news/`；当前默认不自动运行。
-6. `merge_to_qlib.py`：把 Baostock 长历史、JQData 近期数据和已存在的新冗余源多源合并，在本次 run 的 staging 目录生成 merged parquet 与 Qlib 候选。重叠交易日的 OHLC 覆盖顺序是 Baostock -> JQData -> EastMoney -> AkShare；成交量/成交额在重叠日保留较早来源以避免复权量突变，新来源只补自己独有日期的完整字段。
-7. `add_index_benchmark.py`：为候选 provider 补齐实际使用的 `SH000300`。Baostock 不可用时依次尝试东方财富、AkShare 和经过完整日历校验的本地 provider 缓存；缺日时失败，不做前向填充。
+3. `download_global_daily.py --incremental`：从 Yahoo Chart 下载配置内的美股、日股和韩股，分别写入 `quant_data/parquet/global_1d/{us,jp,kr}/<symbol>.parquet`；原始响应按抓取日期写入 `quant_data/raw/global_1d/yahoo/`。
+4. 可选 `download_ashare_news.py`：只有显式设置正数 `--news-limit` 才抓取限定股票数的东方财富新闻搜索结果；原始响应写入 `quant_data/raw/ashare_news/`。
+5. `quant_data_cli.py update etf_momentum_daily_qfq`：更新两只 ETF 的同源 raw/qfq 快照，校验复权证据后原子发布；随后生成 ETF 策略报告。两步失败只记为警告，不阻断 A 股主链路，也不会发布半套 ETF 数据。
+6. `merge_to_qlib.py`：在本次 run 的 staging 目录生成 merged parquet 与 Qlib 候选。旧 qfq 数据每只股票只采用一个完整来源，不再跨供应商按日期拼接；明确标记为 raw 的数据才允许按整行补缺，并记录 `source_id`。
+7. `add_index_benchmark.py`：严格校验或事务导入 CSI300、CSI500、CSI800 三套基准。任一基准缺日或与目标日历不一致都会失败，不做前向或后向填充。
 8. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比候选 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`，并把原始响应写入 `quant_data/raw/ashare_snapshots/`；这是非致命校验，不参与训练。
 9. `report_data_anomalies.py`：对候选 merged 数据做异常检测，产出清洗输入。
 10. `apply_data_cleaning.py`：套用清洗规则，在 staging 目录生成 cleaned parquet/Qlib 候选，并按目标日历重建基准特征。
 11. `report_data_quality.py`：对候选数据执行跨源一致性、结构、规模和基准完整性检查；不可训练时返回非零。
-12. `check_qlib_data.py`：最终候选 provider 日历、股票池和 `SH000300` 完整性校验。
+12. `check_qlib_data.py`：最终检查候选 provider 的日历、股票池和三套基准完整性。
 13. `publish_daily_candidate.py`：只有全部必需检查通过后，才原子切换 merged/cleaned 四个正式目录并同步 `DATA_MANIFEST.json`；发布或 manifest 失败时回滚旧正式目录。
 
-编排器带 A 股交易日和覆盖率双 gate：只允许本次明确选择的一个 A 股历史来源参与刷新；默认至少 80% 的股票在合法来源覆盖目标日，才允许进入合并发布。全球日线和新闻原始证据是独立非致命阶段，不会放宽 A 股发布门禁。来源被拒绝、连续失败或达到请求预算时下载阶段返回非零；若没有新交易日也没有可发布重建，整条链路不会伪报成功。`--skip-download` 只重建、不下载，`--dry-run` 只打印计划，`--limit` 用于小样本演练。每次运行记录阶段状态、用时、退出码、覆盖率和实际发布结果。
+编排器带 A 股交易日和覆盖率双 gate：只允许本次明确选择的一个 A 股历史来源参与刷新；默认至少 80% 的股票在合法来源覆盖目标日，才允许进入合并发布。全球日线、新闻原始证据和 ETF 更新是独立非致命阶段，不会放宽 A 股发布门禁。来源被拒绝、连续失败或达到请求预算时下载阶段返回非零；若没有新交易日也没有可发布重建，整条链路不会伪报成功。`--skip-download` 只重建、不下载，`--dry-run` 只打印计划，`--limit` 用于小样本演练。每次运行记录阶段状态、用时、退出码、覆盖率、ETF 数据日期和实际发布结果。
 
-`add_index_benchmark.py` 在全链路中默认强制 `--offline`，只读已校验的本地 `SH000300` 缓存，避免基准缺失时暗中重新请求 Baostock、东方财富或 AkShare。只有命令行显式传 `--allow-benchmark-network` 才允许这些后备请求；网页白名单和定时任务都不提供该开关。
+`add_index_benchmark.py` 在全链路中默认使用 `--reuse-existing` 严格校验候选 provider 内的 CSI300、CSI500、CSI800 三套基准；指定 `--benchmark-cache-dir` 时改用事务式导入。缺少任一基准、日历不一致或数据缺日都会失败，不做前向填充。只有命令行显式传 `--allow-benchmark-network` 才允许 Baostock 重新下载三套基准；网页白名单和定时任务都不提供该开关。
 
 JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baostock 长历史序列之前，只在合并和跨源验证中复用既有 JQData parquet。东方财富和 AkShare 是免费冗余源，首次全市场下载会额外占用约 1GB 量级磁盘；日常增量只补最近窗口。
 
@@ -129,6 +163,17 @@ scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 pl
 任务 `com.dsa.quant-daily-update` 的配置仍保留工作日 18:40（Asia/Shanghai），但当前本机因 Baostock `10001011` 和东方财富断开问题已执行 `launchctl disable` 并卸载，不会自动触发。恢复前必须先人工复核来源访问和小样本结果。任务本身带单实例锁；DSA 网页还会阻止不同网络下载按钮并发运行。
 
 四个直接脚本 `download_baostock.py`、`download_eastmoney.py`、`download_akshare.py` 和 `download_ashare_news.py` 共用 `source_download.lock.json`；即使绕过网页从两个终端同时启动，第二个进程也会在发送网络请求前退出。
+模板默认让 `com.dsa.quant-daily-update` 在工作日 18:40 运行，用 `daily_stock_analysis/.venv` 执行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。这个任务只更新数据，不运行 60 日纸面跟踪。
+
+2026 确认期通过后，另行安装纸面跟踪任务：
+
+```bash
+scripts/launchd/install-robust-shadow.sh --dry-run  # 核对 Python、配置和 19:10 调度
+scripts/launchd/install-robust-shadow.sh --load     # 确认期通过后才安装启用
+scripts/launchd/install-robust-shadow.sh --uninstall
+```
+
+`com.dsa.robust-shadow` 在工作日 19:10 启动，并最多等待 4 小时让 18:40 数据任务结束；本机近期全量日更新实测约需 2.5 至 3.5 小时。当天数据更新失败、只是 dry-run、等待超时或推理失败时，该任务返回非零并写 `robust_strategy/shadow_runner/schedule_latest.json`，不能降级成日更新 warning。冻结组合含 `mps_dnn` 时，安装脚本默认使用 `.venv-mps-dnn`，每次推理前保存真实 MPS 探针；不允许自动回退 CPU。尚未通过确认期时任务只返回 `inactive/skipped`，不会伪造纸面观察。正式启用前还必须确认 18:40 数据任务已经恢复成功；最近一次正式记录停在 `apply_data_cleaning` 失败，当前不能据此开始 60 日计数。
 
 ### 2.3 只读盘点与报告任务
 

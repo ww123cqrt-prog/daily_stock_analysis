@@ -7,6 +7,7 @@ sources can be merged without changing the canonical provider directories.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -20,9 +21,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
 from _daily_update_runtime import DailyUpdateLock, LockHeldError  # noqa: E402
+from _paths import quant_data_root, reports_root  # noqa: E402
 from market_data_clients import normalize_date, normalize_symbol  # noqa: E402
+from quant_data_contract import atomic_write_json  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
@@ -237,6 +239,45 @@ def merge_existing_frame(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
+def qfq_anchor_matches(
+    existing: pd.DataFrame,
+    refreshed_anchor: pd.DataFrame,
+    *,
+    relative_tolerance: float = 1e-6,
+) -> bool:
+    left = existing[["date", "close"]].copy()
+    right = refreshed_anchor[["date", "close"]].copy()
+    left["date"] = pd.to_datetime(left["date"], errors="coerce").dt.normalize()
+    right["date"] = pd.to_datetime(right["date"], errors="coerce").dt.normalize()
+    right_dates = set(right["date"].dropna())
+    expected = left[left["date"].isin(right_dates)]
+    compared = expected.merge(
+        right,
+        on="date",
+        how="inner",
+        validate="one_to_one",
+        suffixes=("_existing", "_fresh"),
+    )
+    if compared.empty or len(compared) != len(left) or len(compared) != len(right):
+        return False
+    old = pd.to_numeric(compared["close_existing"], errors="coerce")
+    new = pd.to_numeric(compared["close_fresh"], errors="coerce")
+    if old.isna().any() or new.isna().any():
+        return False
+    denominator = old.abs().clip(lower=1e-12)
+    return bool(((old - new).abs() / denominator <= relative_tolerance).all())
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_parquet(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -258,7 +299,13 @@ def run_daily_download(
     retry_failed: bool = False,
     max_consecutive_failures: int = 3,
     max_requests: int = 6000,
+    price_basis: str = "raw",
+    anchor_rows: int = 5,
 ) -> dict[str, Any]:
+    if price_basis not in {"raw", "qfq"}:
+        raise ValueError("price_basis must be raw or qfq")
+    if anchor_rows <= 0:
+        raise ValueError("anchor_rows must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
     report_root = reports_root()
     summary_root = summary_dir or (report_root / "download_state")
@@ -272,6 +319,8 @@ def run_daily_download(
     fail = 0
     no_new = 0
     failures: list[dict[str, str]] = []
+    anchor_checked = 0
+    rebased = 0
     consecutive_failures = 0
     requests_made = 0
     stopped_reason = "completed"
@@ -321,7 +370,42 @@ def run_daily_download(
                 print(f"Stopping after reaching the {max_requests} request budget.", file=sys.stderr, flush=True)
                 break
             requests_made += 1
-            fresh = normalize_daily_frame(fetch_one(symbol, symbol_start, normalize_date(end)))
+            existing_frame: pd.DataFrame | None = None
+            force_full_refresh = False
+            if incremental and out_path.exists():
+                existing_frame = pd.read_parquet(out_path)
+            if price_basis == "qfq" and existing_frame is not None:
+                existing_dates = pd.to_datetime(
+                    existing_frame["date"], errors="coerce"
+                ).dropna().sort_values()
+                if existing_dates.empty:
+                    force_full_refresh = True
+                else:
+                    anchor_start = existing_dates.iloc[0].date().isoformat()
+                    anchor_end = existing_dates.iloc[
+                        min(anchor_rows, len(existing_dates)) - 1
+                    ].date().isoformat()
+                    refreshed_anchor = normalize_daily_frame(
+                        fetch_one(symbol, anchor_start, anchor_end)
+                    )
+                    anchor_existing = existing_frame.copy()
+                    anchor_existing["date"] = pd.to_datetime(
+                        anchor_existing["date"], errors="coerce"
+                    ).dt.normalize()
+                    anchor_existing = anchor_existing.loc[
+                        (anchor_existing["date"] >= pd.Timestamp(anchor_start))
+                        & (anchor_existing["date"] <= pd.Timestamp(anchor_end))
+                    ]
+                    anchor_checked += 1
+                    force_full_refresh = not qfq_anchor_matches(
+                        anchor_existing,
+                        refreshed_anchor,
+                    )
+
+            requested_start = normalize_date(start) if force_full_refresh else symbol_start
+            fresh = normalize_daily_frame(
+                fetch_one(symbol, requested_start, normalize_date(end))
+            )
             if fresh.empty:
                 if incremental and out_path.exists():
                     no_new += 1
@@ -330,10 +414,13 @@ def run_daily_download(
                     continue
                 raise EmptyResult("empty result")
 
-            if incremental and out_path.exists():
-                fresh = merge_existing_frame(pd.read_parquet(out_path), fresh)
+            if force_full_refresh:
+                rebased += 1
+            elif incremental and existing_frame is not None:
+                fresh = merge_existing_frame(existing_frame, fresh)
 
-            fresh.to_parquet(out_path, index=False)
+            fresh["source_id"] = source_name
+            _atomic_parquet(fresh, out_path)
             ok += 1
             consecutive_failures = 0
             if index <= 3 or index % 100 == 0:
@@ -384,6 +471,9 @@ def run_daily_download(
         "requests_made": requests_made,
         "request_budget": max_requests,
         "stopped_reason": stopped_reason,
+        "price_basis": price_basis,
+        "anchor_checked": anchor_checked,
+        "rebased": rebased,
         "seconds": round(elapsed, 2),
         "failures": failures[:100],
     }
@@ -392,6 +482,37 @@ def run_daily_download(
     if failures:
         write_json(summary_root / f"{source_name}_failures.json", failures)
     write_json(runtime_root / f"{source_name}_failures_latest.json", failures)
+    atomic_write_json(
+        output_dir / "SOURCE_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "dataset": f"ashare_{source_name}_{price_basis}_legacy",
+            "role": "audit",
+            "status": "legacy_unknown" if price_basis == "qfq" else "ready",
+            "generated_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+            "source": source_name,
+            "price_basis": price_basis,
+            "adjustment_method": "unknown" if price_basis == "qfq" else "none",
+            "adjustment_evidence": (
+                "anchor_fingerprint_only_not_a_factor_curve"
+                if price_basis == "qfq"
+                else "not_applicable"
+            ),
+            "update_contract": (
+                "anchor_check_then_full_symbol_refresh_on_rebase"
+                if price_basis == "qfq"
+                else "incremental_raw_whole_row_merge"
+            ),
+            "requested_start": normalize_date(start),
+            "requested_end": normalize_date(end),
+            "anchor_checked": anchor_checked,
+            "rebased": rebased,
+            "summary": {
+                key: summary[key]
+                for key in ("total", "ok", "no_new", "empty", "fail")
+            },
+        },
+    )
     print(
         f"Done {source_name} in {elapsed / 60:.1f} min. OK={ok}, NO_NEW={no_new}, EMPTY={empty}, FAIL={fail}",
         flush=True,

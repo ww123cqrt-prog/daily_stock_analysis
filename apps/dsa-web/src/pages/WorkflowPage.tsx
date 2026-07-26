@@ -220,6 +220,14 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         ],
       },
       {
+        type: 'download_etf_momentum',
+        label: '更新 ETF 动量数据',
+        description: '更新创业板 ETF（159915）和纳指 ETF（513100）的隔离数据，不写入 A 股个股 Qlib provider。',
+        params: [
+          { key: 'end', label: '结束日期', kind: 'date' },
+        ],
+      },
+      {
         type: 'download_global_daily',
         label: '下载全球日线与原始证据',
         description: '从 Yahoo Chart 增量下载美股、日股、韩股日线；每个代码保留一个 canonical parquet，并按抓取日期保存原始响应。',
@@ -329,6 +337,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'report_workbench_capabilities',
         label: '生成工作台能力盘点',
         description: '只读扫描 DSA 页面/API、quant_workflow 脚本、Qlib 接入和 china-astock-quant 可复用能力，输出功能入口和缺口清单。',
+      },
+      {
+        type: 'generate_etf_momentum_report',
+        label: '生成 ETF 完整策略报告',
+        description: '读取两只 ETF 的隔离行情，生成收益、回撤、稳定性、持仓和数据质量报告；不连接券商，不自动下单。',
       },
       {
         type: 'run_china_astock_comparison',
@@ -535,6 +548,7 @@ const DATA_JOB_TYPES = new Set([
   'download_baostock',
   'download_eastmoney',
   'download_akshare',
+  'download_etf_momentum',
   'download_global_daily',
   'download_ashare_news',
   'download_jqdata',

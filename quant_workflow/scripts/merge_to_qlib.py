@@ -1,14 +1,9 @@
-"""
-Merge multi-source A-share daily bars (Baostock/JQData/EastMoney/AkShare),
-then convert to Qlib bin.
+"""Merge governed A-share bars and convert them to Qlib bin.
 
-All sources are in pre-adjusted (qfq/pre) price space, but each provider
-computes its qfq curve against its own base/factors. To avoid splicing two
-differently-normalized curves, the FIRST available source (Baostock long
-history) is authoritative for every date it covers; later sources only FILL
-dates the base still lacks (mid-history gaps and the latest tail), whole-row.
-OHLC on overlapping dates is never overwritten. This keeps a single, internally
-consistent price/volume curve per symbol.
+Provider-native qfq curves are never joined across providers. The first
+available provider supplies the entire symbol so one file cannot contain two
+different adjustment scales. Multi-provider date filling is allowed only for
+raw prices; a later canonical step must then apply one adjustment-factor curve.
 
 `--no-overwrite` means "skip replacing existing output files"; it may still
 create missing directories and missing files required to complete the provider.
@@ -20,6 +15,7 @@ import argparse
 import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +28,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
 from _symbols import to_qlib_name  # noqa: E402
+from quant_data_contract import atomic_write_json, sha256_file  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -71,7 +68,14 @@ def normalize_frame(path: Path) -> pd.DataFrame:
     return df
 
 
-def merge_sources(sym: str, ordered_sources: list[tuple[str, Path | None]]) -> pd.DataFrame | None:
+def merge_sources(
+    sym: str,
+    ordered_sources: list[tuple[str, Path | None]],
+    *,
+    price_basis: str = "qfq",
+) -> pd.DataFrame | None:
+    if price_basis not in {"raw", "qfq"}:
+        raise ValueError("price_basis must be raw or qfq")
     frames: list[tuple[str, pd.DataFrame]] = []
     for name, path in ordered_sources:
         if path is None or not path.exists():
@@ -83,27 +87,24 @@ def merge_sources(sym: str, ordered_sources: list[tuple[str, Path | None]]) -> p
     if not frames:
         return None
 
-    _, first = frames[0]
+    first_name, first = frames[0]
     merged = first.set_index("date")
+    merged["source_id"] = first_name
 
-    for name, frame in frames[1:]:
-        # Base source (Baostock long history) is authoritative for every date it
-        # already covers. Newer sources ONLY fill dates the base lacks — mid-
-        # history gaps and the latest tail. We deliberately do NOT overwrite
-        # OHLC on overlapping dates: each provider computes qfq (forward-adjust)
-        # against its own base/factors, so overwriting the overlap would splice
-        # two differently-normalized curves and inject a price discontinuity
-        # into training/backtest. Rows are appended whole (all fields together)
-        # so a filled date stays internally consistent within one source.
-        existing_dates = merged.index
-        overlay = frame.set_index("date")
-        source_only_dates = overlay.index.difference(existing_dates)
-        if len(source_only_dates) == 0:
-            continue
-        merged = merged.reindex(existing_dates.union(source_only_dates))
-        for col in REQUIRED_FIELDS + OPTIONAL_FIELDS:
-            if col in overlay.columns:
-                merged.loc[source_only_dates, col] = overlay.loc[source_only_dates, col]
+    if price_basis == "raw":
+        for name, frame in frames[1:]:
+            existing_dates = merged.index
+            overlay = frame.set_index("date")
+            source_only_dates = overlay.index.difference(existing_dates)
+            if len(source_only_dates) == 0:
+                continue
+            merged = merged.reindex(existing_dates.union(source_only_dates))
+            for col in REQUIRED_FIELDS + OPTIONAL_FIELDS:
+                if col in overlay.columns:
+                    merged.loc[source_only_dates, col] = overlay.loc[
+                        source_only_dates, col
+                    ]
+            merged.loc[source_only_dates, "source_id"] = name
 
     merged = merged.reset_index().rename(columns={"index": "date"})
 
@@ -122,7 +123,11 @@ def merge_sources(sym: str, ordered_sources: list[tuple[str, Path | None]]) -> p
     if "factor" not in merged.columns:
         merged["factor"] = 1.0
 
-    keep = ["date"] + [c for c in REQUIRED_FIELDS + ["factor"] + OPTIONAL_FIELDS if c in merged.columns]
+    keep = ["date"] + [
+        c
+        for c in REQUIRED_FIELDS + ["factor", "source_id"] + OPTIONAL_FIELDS
+        if c in merged.columns
+    ]
     return merged[keep].sort_values("date").drop_duplicates(subset=["date"])
 
 
@@ -141,6 +146,7 @@ def merge_one(
             ("eastmoney", eastmoney_path),
             ("akshare", akshare_path),
         ],
+        price_basis="qfq",
     )
 
 
@@ -154,6 +160,7 @@ def build_merged_parquet(
     out_dir: Path,
     overwrite: bool,
     extra_source_dirs: list[tuple[str, Path]] | None = None,
+    price_basis: str = "qfq",
 ) -> int:
     if overwrite and out_dir.exists():
         shutil.rmtree(out_dir)
@@ -187,7 +194,11 @@ def build_merged_parquet(
             if i <= 3 or i % 500 == 0 or i == len(symbols):
                 print(f"  [{i}/{len(symbols)}] {sym}: skip existing {out_path}")
             continue
-        df = merge_sources(sym, [(name, files.get(sym)) for name, files in source_maps])
+        df = merge_sources(
+            sym,
+            [(name, files.get(sym)) for name, files in source_maps],
+            price_basis=price_basis,
+        )
         if df is None or df.empty:
             continue
         df.to_parquet(out_path, index=False)
@@ -250,7 +261,14 @@ def run_smoke_fixture(base_dir: Path, overwrite: bool = True) -> int:
     return convert_to_bin(merged_dir, qlib_dir, overwrite=overwrite)
 
 
-def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields: list[str] | None = None) -> int:
+def convert_to_bin(
+    src_dir: Path,
+    dst_dir: Path,
+    overwrite: bool,
+    dropna_fields: list[str] | None = None,
+    calendar_path: Path | None = None,
+    source_contract: dict[str, str] | None = None,
+) -> int:
     if overwrite and dst_dir.exists():
         shutil.rmtree(dst_dir)
 
@@ -287,7 +305,31 @@ def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields:
         if i % 1000 == 0:
             print(f"  read {i}/{len(pq_files)}")
 
-    calendar = sorted(all_dates)
+    if calendar_path is not None:
+        calendar_path = Path(calendar_path)
+        try:
+            calendar = [
+                value.strip()
+                for value in calendar_path.read_text(encoding="utf-8").splitlines()
+                if value.strip()
+            ]
+        except OSError as exc:
+            raise ValueError("verified calendar file is unavailable") from exc
+        parsed_calendar = pd.to_datetime(calendar, errors="coerce")
+        if (
+            not calendar
+            or parsed_calendar.isna().any()
+            or len(set(calendar)) != len(calendar)
+            or calendar != sorted(calendar)
+        ):
+            raise ValueError("verified calendar file is invalid")
+        missing_dates = sorted(all_dates - set(calendar))
+        if missing_dates:
+            raise ValueError(
+                f"price dates are absent from verified calendar: {missing_dates[:10]}"
+            )
+    else:
+        calendar = sorted(all_dates)
     if not calendar:
         print("ERROR: Empty calendar")
         return 1
@@ -303,8 +345,11 @@ def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields:
         path = cal_dir / name
         if not overwrite and path.exists():
             continue
-        with path.open("w", encoding="utf-8") as handle:
-            handle.write("\n".join(calendar) + "\n")
+        if calendar_path is not None:
+            shutil.copy2(calendar_path, path)
+        else:
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write("\n".join(calendar) + "\n")
 
     instruments_path = inst_dir / "all.txt"
     if overwrite or not instruments_path.exists():
@@ -344,6 +389,35 @@ def convert_to_bin(src_dir: Path, dst_dir: Path, overwrite: bool, dropna_fields:
     print(f"  Size: {total_size / 1024 / 1024:.0f} MB")
     if skipped_existing:
         print(f"  Skipped existing bin files: {skipped_existing}")
+    source_payload = dict(source_contract or {})
+    traceable = all(
+        source_payload.get(field)
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    )
+    atomic_write_json(
+        dst_dir / "PROVIDER_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "data_kind": "qlib_provider",
+            "role": "canonical" if traceable else "legacy",
+            "status": "ready" if traceable else "legacy_unknown",
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "price_basis": source_payload.get("price_basis", "qfq"),
+            "source_snapshot": source_payload or {
+                "dataset_id": "legacy_unregistered_parquet",
+                "snapshot_id": None,
+                "content_sha256": None,
+            },
+            "conversion": {
+                "script": "merge_to_qlib.py",
+                "fields": QLIB_FIELDS,
+                "calendar_sha256": sha256_file(dst_dir / "calendars" / "day.txt"),
+                "instruments_sha256": sha256_file(
+                    dst_dir / "instruments" / "all.txt"
+                ),
+            },
+        },
+    )
     return 0
 
 
@@ -355,6 +429,12 @@ def main() -> int:
     parser.add_argument("--akshare-dir", type=Path, default=AKSHARE_DIR)
     parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
     parser.add_argument("--qlib-dir", type=Path, default=QLIB_BIN_DIR)
+    parser.add_argument(
+        "--calendar-file",
+        type=Path,
+        default=None,
+        help="Use this verified Qlib calendar verbatim when writing feature bins.",
+    )
     parser.add_argument(
         "--no-overwrite",
         action="store_true",
@@ -382,7 +462,12 @@ def main() -> int:
     )
     if merged_count == 0:
         return 1
-    return convert_to_bin(args.merged_dir, args.qlib_dir, overwrite)
+    return convert_to_bin(
+        args.merged_dir,
+        args.qlib_dir,
+        overwrite,
+        calendar_path=args.calendar_file,
+    )
 
 
 if __name__ == "__main__":

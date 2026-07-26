@@ -2905,3 +2905,37 @@ textarea {
     text-align: left;
   }
 }
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 12mm;
+  }
+
+  [data-print-hide] {
+    display: none !important;
+  }
+
+  .etf-report-page {
+    min-height: auto !important;
+    padding: 0 !important;
+    background: #fff !important;
+    color: #111827 !important;
+  }
+
+  .etf-report-page > div {
+    max-width: none !important;
+  }
+
+  .etf-report-section {
+    break-inside: avoid;
+    padding-block: 16px !important;
+  }
+
+  .etf-report-page svg,
+  .etf-report-page table,
+  .etf-report-page [data-testid$="-chart"],
+  .etf-report-page [data-testid="parameter-grid"] {
+    break-inside: avoid;
+  }
+}

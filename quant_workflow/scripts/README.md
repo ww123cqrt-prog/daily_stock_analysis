@@ -76,6 +76,54 @@ Naming convention:
   does not train, connect to broker software, place orders, or modify Qlib
   provider files. Run the non-dry-run path manually only when you explicitly
   want a longer local experiment.
+- `quant_data_cli.py` is the governed entrypoint for `list`, `describe`,
+  `resolve`, `validate`, and `update`. `resolve` checks status, requested price
+  basis, manifest hash, bar hashes, factor hashes and company-action hash.
+- `download_etf_momentum_data.py` is the producer behind
+  `quant_data_cli.py update etf_momentum_daily_qfq`. It downloads complete
+  same-provider raw/qfq histories for 159915 and 513100, validates the factor
+  curve and 513100 split, stages both ETFs, then atomically publishes immutable
+  raw and qfq snapshots. Tencent is preferred and EastMoney is the fallback;
+  the old Sina directory remains audit-only.
+- `download_baostock_v2.py` creates a restartable full-market Baostock source
+  bundle containing complete raw bars and `query_adjust_factor` events. It
+  rebuilds qfq locally as raw OHLC times `foreAdjustFactor`, while provider qfq
+  is retained only for recent-event, bounded factor-start-gap, and
+  deterministic-sample verification. For long factor-history gaps caused by
+  code restructuring, it derives the missing daily factor only from a complete
+  same-provider raw/qfq OHLC pair and records the derived transitions. Before
+  publication it audits all overlap
+  against legacy Baostock qfq, separating constant renormalization and proven
+  legacy incremental splices from unexplained price-path drift.
+  `quant_data_cli.py update ashare_daily_qfq --bundle-dir <verified-bundle>`
+  validates all hashes and switches raw/qfq snapshots plus the root catalog as
+  one rollback transaction.
+- `build_qlib_v2.py` resolves the exact governed A-share qfq snapshot, converts
+  it to an immutable Qlib provider, records the upstream snapshot ID and
+  content hash in `PROVIDER_MANIFEST.json`, and publishes the Qlib pointer and
+  root catalog with rollback on failure.
+- `sync_data_manifest.py` writes schema-v2 `DATA_MANIFEST.json`, keeps all data
+  paths relative to `QUANT_DATA_ROOT`, refreshes generated README catalog
+  blocks, and supports `--check` for catalog/path/README drift.
+- `backtest_etf_momentum_rotation.py` replays the fixed 20-day ranking and
+  20-day moving-average rule with close-to-next-open execution. It writes an
+  isolated report under `reports/etf_momentum_rotation/`, including zero-cost
+  and costed variants. The result is a research candidate, not a promoted
+  model or an order instruction.
+- `evaluate_etf_momentum_robustness.py` keeps that 20/20 rule fixed and writes
+  a manual-review robustness report under
+  `reports/etf_momentum_rotation/robustness/`. It reports complete-quarter
+  consistency, 10/20/40bp total-cost cases, one-session execution delay,
+  pre-declared 15/20/25-day parameter sensitivity, explicit `CASH` periods,
+  and unresolved price discontinuities. It never promotes a parameter-grid
+  winner or issues an order.
+- `research_etf_momentum_improvement.py` applies the user-supplied single-side
+  commission from `configs/etf_momentum_improvement.yaml`, selects one bounded
+  15/20/25-day candidate from the 2019-2022 development split only, and reports
+  2023-2024 validation plus later observations separately. Outputs stay under
+  `reports/etf_momentum_rotation/improvement/`; the original 20/20 rule and its
+  reports are not overwritten. Because the grid was visible in earlier work,
+  any selected rule remains a retrospective research candidate.
 
 Research-only model comparison scripts live under:
 
@@ -91,3 +139,41 @@ The current main provider defaults to:
 The optional cleaned provider defaults to:
 
 `${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned`
+
+## Robust Signal Goal 1
+
+The first robust-research goal is isolated from the legacy full-strategy run.
+Formal runs must use the launchd wrapper, a clean Git worktree, and the shared
+quant data root resolved by `_paths.quant_data_root()`:
+
+```bash
+# Start a new durable formal run
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS
+
+# Pause after the currently running atomic job finishes
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS --request-pause
+
+# Resume only the same run and frozen context
+.venv/bin/python quant_workflow/scripts/launch_robust_signal_research.py \
+  --run-id robust_signal_YYYYMMDD_HHMMSS --resume
+```
+
+The formal report namespace is `reports/robust_signal/`, and the MLflow
+experiment is `robust_csi800_signal_research`. A smoke run validates wiring
+only; it is not signal evidence. Goal 1 rejects prediction rows dated 2026 or
+later. If price-volume signals fail, `signal_diagnosis_complete` means the
+conditional historical-fundamental stage is still required; it does not mean
+`signal_not_found`.
+
+Each completed job writes two factor-quality views: `raw` is the Alpha158
+handler output before infer processors and exposes real missing/non-finite
+values; `processed` is the model input after robust normalization, fillna,
+board flags, and four point-in-time CSI800 market-regime one-hot features.
+Market regimes are calculated continuously from the frozen `2014-01-02`
+history start through each job's test end. The runner requires at least 60
+trading days of warm-up before training and never changes the regime-history
+start with the 504/756/1008-day training window. Attribution uses one
+global horizon schedule before splitting dates by regime, so the state periods
+sum back to the total evaluation schedule.

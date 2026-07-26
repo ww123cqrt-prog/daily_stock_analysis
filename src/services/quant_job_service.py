@@ -22,11 +22,18 @@ import time
 import uuid
 import glob
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from src.services.quant_workflow_paths import dsa_root, projects_root, quant_data_root, reports_root, workflow_root
+from src.services.quant_workflow_paths import (
+    dsa_root,
+    mlruns_root,
+    projects_root,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +49,7 @@ PROJECTS_ROOT = projects_root(DSA_ROOT)
 QUANT_WORKFLOW_ROOT = workflow_root(DSA_ROOT)
 REPORTS_ROOT = reports_root(DSA_ROOT)
 QUANT_DATA_ROOT = quant_data_root(DSA_ROOT)
+MLRUNS_ROOT = mlruns_root(DSA_ROOT)
 DEFAULT_JOBS_ROOT = REPORTS_ROOT / "jobs"
 DSA_VENV_PYTHON = DSA_ROOT / ".venv" / "bin" / "python"
 QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
@@ -272,12 +280,16 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _append_flag(command: List[str], params: Mapping[str, Any], key: str, flag: str) -> None:
+def _append_flag(
+    command: List[str], params: Mapping[str, Any], key: str, flag: str
+) -> None:
     if _as_bool(params.get(key)):
         command.append(flag)
 
 
-def _append_value(command: List[str], params: Mapping[str, Any], key: str, flag: str) -> None:
+def _append_value(
+    command: List[str], params: Mapping[str, Any], key: str, flag: str
+) -> None:
     value = params.get(key)
     if value is None or value == "":
         return
@@ -298,7 +310,9 @@ def _validate_numeric_params(params: Mapping[str, Any]) -> None:
         try:
             number = int(str(value)) if kind == "integer" else float(str(value))
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Param {key} must be {_numeric_kind_label(kind)}.") from exc
+            raise ValueError(
+                f"Param {key} must be {_numeric_kind_label(kind)}."
+            ) from exc
         if not math.isfinite(float(number)) or number < minimum:
             raise ValueError(f"Param {key} must be >= {minimum}.")
         maximum = NUMERIC_PARAM_MAXIMUMS.get(key)
@@ -375,18 +389,24 @@ def _safe_jqdata_web_limit(params: Mapping[str, Any]) -> int:
     if value < 1:
         raise ValueError("Param limit must be >= 1.")
     if value > JQDATA_WEB_DRY_RUN_MAX_LIMIT:
-        raise ValueError(f"Param limit must be <= {JQDATA_WEB_DRY_RUN_MAX_LIMIT} for browser JQData dry-run jobs.")
+        raise ValueError(
+            f"Param limit must be <= {JQDATA_WEB_DRY_RUN_MAX_LIMIT} for browser JQData dry-run jobs."
+        )
     return value
 
 
 def _ensure_jqdata_web_dry_run(params: Mapping[str, Any]) -> None:
     if "dry_run" in params and not _as_bool(params.get("dry_run")):
-        raise ValueError("download_jqdata web jobs only support dry_run=true. Use the script directly for real downloads.")
+        raise ValueError(
+            "download_jqdata web jobs only support dry_run=true. Use the script directly for real downloads."
+        )
 
 
 def _ensure_optimize_strategy_web_dry_run(params: Mapping[str, Any]) -> None:
     if "dry_run" in params and not _as_bool(params.get("dry_run")):
-        raise ValueError("optimize_strategy web jobs only support dry_run=true. Use the script directly for full experiments.")
+        raise ValueError(
+            "optimize_strategy web jobs only support dry_run=true. Use the script directly for full experiments."
+        )
     phase = _int_param(params.get("phase", 4), "phase")
     if phase < 0 or phase > 4:
         raise ValueError("phase must be between 0 and 4.")
@@ -398,11 +418,30 @@ def _ensure_optimize_strategy_web_dry_run(params: Mapping[str, Any]) -> None:
 
 
 def _safe_run_id(value: Any) -> str:
-    raw = str(value or "").strip()
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("run_id must be a string.")
+    raw = value.strip()
     if len(raw) > QLIB_RUN_ID_MAX_LENGTH:
         raise ValueError(f"run_id must be <= {QLIB_RUN_ID_MAX_LENGTH} characters.")
     if raw and not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
-        raise ValueError("run_id may only contain letters, numbers, underscores, or hyphens.")
+        raise ValueError(
+            "run_id may only contain letters, numbers, underscores, or hyphens."
+        )
+    return raw
+
+
+def _safe_iso_date(value: Any, key: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"Param {key} must be an ISO date (YYYY-MM-DD).") from exc
+    if parsed.isoformat() != raw:
+        raise ValueError(f"Param {key} must be an ISO date (YYYY-MM-DD).")
     return raw
 
 
@@ -429,16 +468,22 @@ def _ensure_qlib_research_params(params: Mapping[str, Any]) -> None:
     if "windows" in params and params.get("windows") not in (None, ""):
         windows = _int_param(params.get("windows"), "windows")
         if windows > QLIB_RESEARCH_WEB_MAX_WINDOWS:
-            raise ValueError(f"Param windows must be <= {QLIB_RESEARCH_WEB_MAX_WINDOWS}.")
+            raise ValueError(
+                f"Param windows must be <= {QLIB_RESEARCH_WEB_MAX_WINDOWS}."
+            )
     if "train_years" in params and params.get("train_years") not in (None, ""):
         train_years = _int_param(params.get("train_years"), "train_years")
         if train_years > QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS:
-            raise ValueError(f"Param train_years must be <= {QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS}.")
+            raise ValueError(
+                f"Param train_years must be <= {QLIB_RESEARCH_WEB_MAX_TRAIN_YEARS}."
+            )
     for key in ("valid_months", "test_months", "step_months"):
         if key in params and params.get(key) not in (None, ""):
             months = _int_param(params.get(key), key)
             if months > QLIB_RESEARCH_WEB_MAX_MONTHS:
-                raise ValueError(f"Param {key} must be <= {QLIB_RESEARCH_WEB_MAX_MONTHS}.")
+                raise ValueError(
+                    f"Param {key} must be <= {QLIB_RESEARCH_WEB_MAX_MONTHS}."
+                )
     _safe_run_id(params.get("run_id"))
     if "config" in params and params.get("config") not in (None, ""):
         _safe_config_path(params.get("config"))
@@ -451,35 +496,56 @@ def _safe_symbols(value: Any) -> str:
     if len(raw) > 1000:
         raise ValueError("symbols is too long.")
     if not re.fullmatch(r"[A-Za-z0-9,._\- ]+", raw):
-        raise ValueError("symbols may only contain letters, numbers, commas, dots, underscores, hyphens, and spaces.")
+        raise ValueError(
+            "symbols may only contain letters, numbers, commas, dots, underscores, hyphens, and spaces."
+        )
     symbols = [part.strip().upper() for part in raw.split(",") if part.strip()]
     if any(re.search(r"\s", symbol) for symbol in symbols):
-        raise ValueError("symbols must be comma-separated stock codes without embedded spaces.")
+        raise ValueError(
+            "symbols must be comma-separated stock codes without embedded spaces."
+        )
     if len(symbols) > CHINA_ASTOCK_SYMBOL_MAX_COUNT:
-        raise ValueError(f"symbols may include at most {CHINA_ASTOCK_SYMBOL_MAX_COUNT} entries.")
-    too_long = next((symbol for symbol in symbols if len(symbol) > CHINA_ASTOCK_SYMBOL_MAX_LENGTH), None)
+        raise ValueError(
+            f"symbols may include at most {CHINA_ASTOCK_SYMBOL_MAX_COUNT} entries."
+        )
+    too_long = next(
+        (symbol for symbol in symbols if len(symbol) > CHINA_ASTOCK_SYMBOL_MAX_LENGTH),
+        None,
+    )
     if too_long is not None:
-        raise ValueError(f"Each symbol must be <= {CHINA_ASTOCK_SYMBOL_MAX_LENGTH} characters.")
+        raise ValueError(
+            f"Each symbol must be <= {CHINA_ASTOCK_SYMBOL_MAX_LENGTH} characters."
+        )
     return ",".join(symbols)
 
 
 def _ensure_china_astock_indicator_params(params: Mapping[str, Any]) -> None:
     lookback = _int_param(params.get("lookback_days", 120), "lookback_days")
     if lookback < 20:
-        raise ValueError("lookback_days must be >= 20 for china-astock indicator reports.")
+        raise ValueError(
+            "lookback_days must be >= 20 for china-astock indicator reports."
+        )
     if lookback > 2000:
-        raise ValueError("lookback_days must be <= 2000 for china-astock indicator reports.")
+        raise ValueError(
+            "lookback_days must be <= 2000 for china-astock indicator reports."
+        )
     _safe_china_astock_indicator_limit(params)
     _safe_symbols(params.get("symbols"))
 
 
 def _safe_china_astock_indicator_limit(params: Mapping[str, Any]) -> int:
     raw = params.get("limit")
-    limit = CHINA_ASTOCK_INDICATOR_DEFAULT_LIMIT if raw in (None, "") else _int_param(raw, "limit")
+    limit = (
+        CHINA_ASTOCK_INDICATOR_DEFAULT_LIMIT
+        if raw in (None, "")
+        else _int_param(raw, "limit")
+    )
     if limit < 1:
         raise ValueError("Param limit must be >= 1.")
     if limit > CHINA_ASTOCK_INDICATOR_MAX_LIMIT:
-        raise ValueError(f"Param limit must be <= {CHINA_ASTOCK_INDICATOR_MAX_LIMIT} for china-astock indicator reports.")
+        raise ValueError(
+            f"Param limit must be <= {CHINA_ASTOCK_INDICATOR_MAX_LIMIT} for china-astock indicator reports."
+        )
     return limit
 
 
@@ -492,9 +558,13 @@ def _safe_config_path(value: Any) -> str:
     if "/" in raw or "\\" in raw or ".." in raw:
         raise ValueError("Config must be a file name under quant_workflow/configs.")
     if not CONFIG_FILE_NAME_RE.fullmatch(raw):
-        raise ValueError("Config file name may only contain letters, numbers, dots, underscores, and hyphens.")
+        raise ValueError(
+            "Config file name may only contain letters, numbers, dots, underscores, and hyphens."
+        )
     if Path(raw).suffix.lower() not in {".yaml", ".yml"}:
-        raise ValueError("Config must be a .yaml or .yml file under quant_workflow/configs.")
+        raise ValueError(
+            "Config must be a .yaml or .yml file under quant_workflow/configs."
+        )
     configs_root = (QUANT_WORKFLOW_ROOT / "configs").resolve()
     config_path = (configs_root / raw).resolve()
     if not config_path.is_relative_to(configs_root):
@@ -551,11 +621,14 @@ def _quant_job_child_env(
     allowed_prefixes: Iterable[str] = (),
 ) -> Dict[str, str]:
     explicit_names = CHILD_ENV_EXACT_NAMES | {str(name) for name in allowed_names}
-    explicit_prefixes = tuple(CHILD_ENV_PREFIXES) + tuple(str(prefix) for prefix in allowed_prefixes)
+    explicit_prefixes = tuple(CHILD_ENV_PREFIXES) + tuple(
+        str(prefix) for prefix in allowed_prefixes
+    )
     env = {
         key: value
         for key, value in os.environ.items()
-        if key in explicit_names or any(key.startswith(prefix) for prefix in explicit_prefixes)
+        if key in explicit_names
+        or any(key.startswith(prefix) for prefix in explicit_prefixes)
     }
     env.update({key: str(value) for key, value in extra.items()})
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -632,6 +705,16 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_flag(command, params, key, flag)
         return command
 
+    def download_etf_momentum(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("quant_data_cli.py")
+        command.extend(["update", "etf_momentum_daily_qfq"])
+        _append_value(command, params, "end", "--through")
+        return command
+
+    def generate_etf_momentum_report(params: Mapping[str, Any]) -> List[str]:
+        del params
+        return _script_command("generate_etf_momentum_strategy_report.py")
+
     def validate_latest_snapshot(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("validate_latest_snapshot.py")
         _append_reports_out_dir(command)
@@ -668,7 +751,13 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
     def merge_to_qlib(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("merge_to_qlib.py")
         if _as_bool(params.get("smoke")):
-            command.extend(["--smoke-fixture", "--smoke-dir", str(REPORTS_ROOT / "smoke" / "merge_to_qlib")])
+            command.extend(
+                [
+                    "--smoke-fixture",
+                    "--smoke-dir",
+                    str(REPORTS_ROOT / "smoke" / "merge_to_qlib"),
+                ]
+            )
         _append_flag(command, params, "no_overwrite", "--no-overwrite")
         return command
 
@@ -773,7 +862,9 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
     def optimize_strategy(params: Mapping[str, Any]) -> List[str]:
         _ensure_optimize_strategy_web_dry_run(params)
         command = _script_command("optimize_strategy.py")
-        command.extend(["--dry-run", "--skip-training", "--output-dir", str(REPORTS_ROOT)])
+        command.extend(
+            ["--dry-run", "--skip-training", "--output-dir", str(REPORTS_ROOT)]
+        )
         _append_value(command, params, "phase", "--phase")
         _append_value(command, params, "topk", "--topk")
         return command
@@ -823,6 +914,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("skip_akshare", "--skip-akshare"),
             ("skip_global_daily", "--skip-global-daily"),
             ("skip_ashare_news", "--skip-ashare-news"),
+            ("skip_etf_momentum", "--skip-etf-momentum"),
             ("skip_snapshot_validation", "--skip-snapshot-validation"),
             ("use_system_proxy", "--use-system-proxy"),
         ):
@@ -834,6 +926,91 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "code", "--backtest-code")
         _append_value(command, params, "eval_window_days", "--backtest-days")
         _append_flag(command, params, "force", "--backtest-force")
+        return command
+
+    def run_robust_strategy(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("launch_robust_strategy.py")
+        command.extend(["--report-dir", str(REPORTS_ROOT / "robust_strategy")])
+        command.extend(["--mlruns-dir", str(MLRUNS_ROOT)])
+        as_of_date = _safe_iso_date(params.get("as_of_date"), "as_of_date")
+        if as_of_date:
+            command.extend(["--as-of-date", as_of_date])
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        _append_flag(command, params, "resume", "--resume")
+        _append_flag(
+            command, params, "skip_membership_build", "--skip-membership-build"
+        )
+        return command
+
+    def _robust_signal_command(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("launch_robust_signal_research.py")
+        command.extend(
+            [
+                "--config",
+                str(QUANT_WORKFLOW_ROOT / "configs" / "robust_signal_research.yaml"),
+                "--quant-data-dir",
+                str(quant_data_root(DSA_ROOT)),
+                "--report-dir",
+                str(REPORTS_ROOT / "robust_signal"),
+                "--mlruns-dir",
+                str(MLRUNS_ROOT),
+            ]
+        )
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        return command
+
+    def run_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        return _robust_signal_command(params)
+
+    def pause_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        run_id = _safe_run_id(params.get("run_id"))
+        if not run_id:
+            raise ValueError("run_id is required for robust signal pause")
+        command = _robust_signal_command({"run_id": run_id})
+        command.append("--request-pause")
+        return command
+
+    def resume_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        run_id = _safe_run_id(params.get("run_id"))
+        if not run_id:
+            raise ValueError("run_id is required for robust signal resume")
+        command = _robust_signal_command({"run_id": run_id})
+        command.append("--resume")
+        return command
+
+    def run_robust_confirmation(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("run_robust_confirmation.py")
+        command.extend(["--report-dir", str(REPORTS_ROOT / "robust_strategy")])
+        run_id = _safe_run_id(params.get("run_id"))
+        if run_id:
+            command.extend(["--run-id", run_id])
+        _append_flag(command, params, "resume", "--resume")
+        return command
+
+    def run_robust_shadow_day(params: Mapping[str, Any]) -> List[str]:
+        robust_dir = REPORTS_ROOT / "robust_strategy"
+        command = _script_command("run_robust_shadow_day.py")
+        command.extend(
+            [
+                "--report-dir",
+                str(robust_dir),
+                "--frozen",
+                str(robust_dir / "frozen_strategy_latest.json"),
+                "--confirmation-latest",
+                str(robust_dir / "confirmation_latest.json"),
+                "--provider-latest",
+                str(robust_dir / "provider_latest.json"),
+            ]
+        )
+        as_of_date = (
+            _safe_iso_date(params.get("as_of_date"), "as_of_date")
+            or date.today().isoformat()
+        )
+        command.extend(["--as-of-date", as_of_date])
         return command
 
     def qlib_research_artifacts(section: str) -> List[str]:
@@ -903,6 +1080,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "skip_akshare",
                 "skip_global_daily",
                 "skip_ashare_news",
+                "skip_etf_momentum",
                 "skip_snapshot_validation",
                 "use_system_proxy",
                 "overlap_sample",
@@ -915,7 +1093,9 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         },
         "download_eastmoney": {
             "label": "下载东方财富日线",
-            "command": lambda params: download_public_daily("download_eastmoney.py", params),
+            "command": lambda params: download_public_daily(
+                "download_eastmoney.py", params
+            ),
             "allowed_params": {
                 "start",
                 "end",
@@ -933,7 +1113,9 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         },
         "download_akshare": {
             "label": "下载 AkShare 日线",
-            "command": lambda params: download_public_daily("download_akshare.py", params),
+            "command": lambda params: download_public_daily(
+                "download_akshare.py", params
+            ),
             "allowed_params": {
                 "start",
                 "end",
@@ -975,6 +1157,51 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": [
                 str(REPORTS_ROOT / "download_state" / "ashare_news_download_summary_latest.json"),
                 str(QUANT_DATA_ROOT / "raw" / "ashare_news" / "**" / "*.json"),
+            ],
+        },
+        "download_etf_momentum": {
+            "label": "更新 ETF 动量数据",
+            "command": download_etf_momentum,
+            "allowed_params": {"end"},
+            "artifact_patterns": [
+                str(
+                    quant_data_root(DSA_ROOT)
+                    / "parquet"
+                    / "etf_1d"
+                    / "etf_momentum_daily_raw"
+                    / "LATEST.json"
+                ),
+                str(
+                    quant_data_root(DSA_ROOT)
+                    / "parquet"
+                    / "etf_1d"
+                    / "etf_momentum_daily_qfq"
+                    / "LATEST.json"
+                ),
+            ],
+        },
+        "generate_etf_momentum_report": {
+            "label": "生成 ETF 完整策略报告",
+            "command": generate_etf_momentum_report,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "strategy_report_latest.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "strategy_report_latest.md"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "etf_momentum_rotation"
+                    / "runs"
+                    / "*"
+                    / "strategy_report.json"
+                ),
             ],
         },
         "validate_latest_snapshot": {
@@ -1137,7 +1364,14 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         "report_qlib_rolling_training": {
             "label": "生成 Qlib 滚动训练计划",
             "command": lambda params: report_qlib_research("rolling_training", params),
-            "allowed_params": {"config", "windows", "train_years", "valid_months", "test_months", "step_months"},
+            "allowed_params": {
+                "config",
+                "windows",
+                "train_years",
+                "valid_months",
+                "test_months",
+                "step_months",
+            },
             "artifact_patterns": qlib_research_artifacts("rolling_training"),
         },
         "report_qlib_risk_model": {
@@ -1206,6 +1440,72 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "candidate_pipeline_*.md"),
             ],
         },
+        "run_robust_strategy": {
+            "label": "运行鲁棒策略开发流程",
+            "command": run_robust_strategy,
+            "allowed_params": {
+                "as_of_date",
+                "run_id",
+                "resume",
+                "skip_membership_build",
+            },
+            "artifact_patterns": [
+                str(
+                    REPORTS_ROOT
+                    / "robust_strategy"
+                    / "robust_strategy_status_latest.json"
+                ),
+                str(REPORTS_ROOT / "robust_strategy" / "preflight_latest.json"),
+                str(REPORTS_ROOT / "robust_strategy" / "development_latest.json"),
+                str(REPORTS_ROOT / "robust_strategy" / "development_latest.md"),
+                str(REPORTS_ROOT / "robust_strategy" / "frozen_strategy_latest.json"),
+            ],
+        },
+        "run_robust_signal_research": {
+            "label": "启动鲁棒选股信号研究",
+            "command": run_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+                str(REPORTS_ROOT / "robust_signal" / "runs" / "*" / "result.json"),
+            ],
+        },
+        "pause_robust_signal_research": {
+            "label": "暂停鲁棒选股信号研究",
+            "command": pause_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+            ],
+        },
+        "resume_robust_signal_research": {
+            "label": "恢复鲁棒选股信号研究",
+            "command": resume_robust_signal_research,
+            "allowed_params": {"run_id"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+            ],
+        },
+        "run_robust_confirmation": {
+            "label": "运行冻结策略 2026 确认期",
+            "command": run_robust_confirmation,
+            "allowed_params": {"run_id", "resume"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_strategy" / "confirmation_latest.json"),
+                str(
+                    REPORTS_ROOT / "robust_strategy" / "confirmation_state_latest.json"
+                ),
+            ],
+        },
+        "run_robust_shadow_day": {
+            "label": "运行鲁棒策略当日纸面跟踪",
+            "command": run_robust_shadow_day,
+            "allowed_params": {"as_of_date"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_strategy" / "shadow_daily_latest.json"),
+                str(REPORTS_ROOT / "robust_strategy" / "shadow_state_latest.json"),
+            ],
+        },
         "run_dsa_backtest": {
             "label": "运行 DSA 分析准确性回测",
             "command": run_dsa_backtest,
@@ -1227,7 +1527,11 @@ class QuantJobService:
         self.jobs_root = Path(jobs_root)
         self.db_path = self.jobs_root / "index.sqlite"
         self.default_cwd = Path(default_cwd)
-        self.command_specs = command_specs if command_specs is not None else _build_default_command_specs()
+        self.command_specs = (
+            command_specs
+            if command_specs is not None
+            else _build_default_command_specs()
+        )
         self._processes: Dict[str, subprocess.Popen[bytes]] = {}
         self._lock = threading.RLock()
         self.jobs_root.mkdir(parents=True, exist_ok=True)
@@ -1238,12 +1542,16 @@ class QuantJobService:
         return {
             job_type: {
                 "label": str(spec.get("label") or job_type),
-                "allowed_params": sorted(str(item) for item in spec.get("allowed_params", [])),
+                "allowed_params": sorted(
+                    str(item) for item in spec.get("allowed_params", [])
+                ),
             }
             for job_type, spec in self.command_specs.items()
         }
 
-    def submit_job(self, job_type: str, params: Optional[Mapping[str, Any]] = None) -> QuantJob:
+    def submit_job(
+        self, job_type: str, params: Optional[Mapping[str, Any]] = None
+    ) -> QuantJob:
         params_dict = dict(params or {})
         spec = self._get_spec(job_type)
         command = self._build_command(job_type, params_dict)
@@ -1283,7 +1591,9 @@ class QuantJobService:
             raise KeyError(job_id)
         return self._row_to_job(row)
 
-    def list_jobs(self, limit: int = 50, job_type: Optional[str] = None) -> List[QuantJob]:
+    def list_jobs(
+        self, limit: int = 50, job_type: Optional[str] = None
+    ) -> List[QuantJob]:
         bounded_limit = max(1, min(int(limit), 200))
         if job_type:
             rows = self._fetch_all(
@@ -1291,7 +1601,10 @@ class QuantJobService:
                 (job_type, bounded_limit),
             )
         else:
-            rows = self._fetch_all("SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?", (bounded_limit,))
+            rows = self._fetch_all(
+                "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (bounded_limit,),
+            )
         return [self._row_to_job(row) for row in rows]
 
     def get_latest_jobs_by_type(self) -> Dict[str, QuantJob]:
@@ -1336,7 +1649,12 @@ class QuantJobService:
         job = self.get_job(job_id)
         log_path = Path(job.log_path)
         if not log_path.exists():
-            return {"job_id": job_id, "content": "", "truncated": False, "log_path": str(log_path)}
+            return {
+                "job_id": job_id,
+                "content": "",
+                "truncated": False,
+                "log_path": str(log_path),
+            }
 
         size = log_path.stat().st_size
         read_size = max(1, min(int(max_bytes), 200000))
@@ -1382,7 +1700,9 @@ class QuantJobService:
 
         with self._lock:
             current = self.get_job(job_id)
-            if current.status == "failed" and _return_code_indicates_cancel(current.return_code):
+            if current.status == "failed" and _return_code_indicates_cancel(
+                current.return_code
+            ):
                 timestamp = _now()
                 self._update_job(
                     job_id,
@@ -1416,14 +1736,18 @@ class QuantJobService:
         if allowed_params is not None:
             unknown = sorted(set(params) - set(allowed_params))
             if unknown:
-                raise ValueError(f"Unsupported params for {job_type}: {', '.join(unknown)}")
+                raise ValueError(
+                    f"Unsupported params for {job_type}: {', '.join(unknown)}"
+                )
         _validate_numeric_params(params)
         _validate_ashare_source_safety(job_type, params)
 
         command_spec = spec.get("command")
         if callable(command_spec):
             command = list(command_spec(params))
-        elif isinstance(command_spec, Iterable) and not isinstance(command_spec, (str, bytes)):
+        elif isinstance(command_spec, Iterable) and not isinstance(
+            command_spec, (str, bytes)
+        ):
             command = [str(part) for part in command_spec]
         else:
             raise ValueError(f"Job type {job_type} has no runnable command.")
@@ -1433,7 +1757,9 @@ class QuantJobService:
 
     def _start_job(self, job: QuantJob) -> None:
         started_at = _now()
-        self._update_job(job.job_id, status="running", started_at=started_at, updated_at=started_at)
+        self._update_job(
+            job.job_id, status="running", started_at=started_at, updated_at=started_at
+        )
         log_path = Path(job.log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handle: Any = None
@@ -1503,7 +1829,9 @@ class QuantJobService:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or not isinstance(payload.get("return_code"), int):
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("return_code"), int
+        ):
             return None
         return payload
 
@@ -1536,7 +1864,11 @@ class QuantJobService:
     ) -> None:
         with self._lock:
             current = self.get_job(job.job_id)
-            artifact_paths = self._collect_artifact_paths(current.job_type) if return_code == 0 else current.artifact_paths
+            artifact_paths = (
+                self._collect_artifact_paths(current.job_type)
+                if return_code == 0
+                else current.artifact_paths
+            )
             if current.status == "cancelled":
                 updates: Dict[str, Any] = {
                     "return_code": return_code,
@@ -1548,7 +1880,13 @@ class QuantJobService:
                 return
 
             status = "completed" if return_code == 0 else "failed"
-            error = runner_error if runner_error else None if return_code == 0 else f"Process exited with return code {return_code}."
+            error = (
+                runner_error
+                if runner_error
+                else None
+                if return_code == 0
+                else f"Process exited with return code {return_code}."
+            )
             updates = {
                 "status": status,
                 "return_code": return_code,
@@ -1560,14 +1898,20 @@ class QuantJobService:
                 updates["artifact_paths_json"] = _json_dumps(artifact_paths)
             self._update_job(job.job_id, **updates)
 
-    def _wait_for_process(self, job_id: str, process: subprocess.Popen[bytes], handle: Any) -> None:
+    def _wait_for_process(
+        self, job_id: str, process: subprocess.Popen[bytes], handle: Any
+    ) -> None:
         try:
             return_code = process.wait()
             completed_at = _now()
             current = self.get_job(job_id)
             payload = self._read_exit_status(current) or {}
-            runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
-            self._complete_job_from_return_code(current, return_code, completed_at, runner_error)
+            runner_error = (
+                payload.get("error") if isinstance(payload.get("error"), str) else None
+            )
+            self._complete_job_from_return_code(
+                current, return_code, completed_at, runner_error
+            )
         finally:
             try:
                 handle.close()
@@ -1630,8 +1974,14 @@ class QuantJobService:
             job = self._row_to_job(row)
             payload = self._read_exit_status(job)
             if payload is not None:
-                runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
-                self._complete_job_from_return_code(job, int(payload["return_code"]), _now(), runner_error)
+                runner_error = (
+                    payload.get("error")
+                    if isinstance(payload.get("error"), str)
+                    else None
+                )
+                self._complete_job_from_return_code(
+                    job, int(payload["return_code"]), _now(), runner_error
+                )
                 continue
             if self._pid_is_alive(job.pid):
                 timestamp = _now()
@@ -1672,14 +2022,26 @@ class QuantJobService:
                 return
             payload = self._read_exit_status(job)
             if payload is not None:
-                runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
-                self._complete_job_from_return_code(job, int(payload["return_code"]), _now(), runner_error)
+                runner_error = (
+                    payload.get("error")
+                    if isinstance(payload.get("error"), str)
+                    else None
+                )
+                self._complete_job_from_return_code(
+                    job, int(payload["return_code"]), _now(), runner_error
+                )
                 return
             if not self._pid_is_alive(pid):
                 payload = self._read_exit_status(job)
                 if payload is not None:
-                    runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
-                    self._complete_job_from_return_code(job, int(payload["return_code"]), _now(), runner_error)
+                    runner_error = (
+                        payload.get("error")
+                        if isinstance(payload.get("error"), str)
+                        else None
+                    )
+                    self._complete_job_from_return_code(
+                        job, int(payload["return_code"]), _now(), runner_error
+                    )
                 else:
                     timestamp = _now()
                     self._update_job(
@@ -1709,8 +2071,12 @@ class QuantJobService:
     def _mark_job_failed_after_restart(self, job: QuantJob) -> None:
         payload = self._read_exit_status(job)
         if payload is not None:
-            runner_error = payload.get("error") if isinstance(payload.get("error"), str) else None
-            self._complete_job_from_return_code(job, int(payload["return_code"]), _now(), runner_error)
+            runner_error = (
+                payload.get("error") if isinstance(payload.get("error"), str) else None
+            )
+            self._complete_job_from_return_code(
+                job, int(payload["return_code"]), _now(), runner_error
+            )
             return
         timestamp = _now()
         self._update_job(

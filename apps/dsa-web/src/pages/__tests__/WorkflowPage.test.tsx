@@ -157,6 +157,8 @@ describe('WorkflowPage', () => {
         download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'overlap_days', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
         download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
         download_akshare: { label: '下载 AkShare 日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
+        download_etf_momentum: { label: '更新 ETF 动量数据', allowedParams: ['end'] },
+        generate_etf_momentum_report: { label: '生成 ETF 完整策略报告', allowedParams: [] },
         validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
         merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
@@ -358,6 +360,7 @@ describe('WorkflowPage', () => {
     expect(await screen.findByRole('heading', { name: '数据更新与检查' })).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-run_daily_update')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-check_qlib_data')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-download_etf_momentum')).toBeInTheDocument();
     expect(screen.queryByTestId('workflow-job-train_baseline_lgb')).not.toBeInTheDocument();
     expect(screen.queryByTestId('workflow-job-report_qlib_predictions')).not.toBeInTheDocument();
 
@@ -373,6 +376,7 @@ describe('WorkflowPage', () => {
     expect(await screen.findByRole('heading', { name: '其他量化任务' })).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-report_qlib_predictions')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-report_workbench_capabilities')).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-job-generate_etf_momentum_report')).toBeInTheDocument();
     expect(screen.queryByTestId('workflow-job-run_daily_update')).not.toBeInTheDocument();
     expect(screen.queryByTestId('workflow-job-train_baseline_lgb')).not.toBeInTheDocument();
   });

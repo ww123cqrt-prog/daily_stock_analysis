@@ -218,6 +218,10 @@ describe('BacktestPage', () => {
     renderPage();
 
     expect(screen.getByRole('heading', { name: '交易策略回测工作台' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'ETF 动量完整报告' })).toHaveAttribute(
+      'href',
+      '/backtest/etf-momentum',
+    );
     expect(screen.getByRole('tab', { name: '脚本交易策略' })).toHaveAttribute('aria-selected', 'true');
     const editor = screen.getByLabelText('Python交易策略脚本');
     expect((editor as HTMLTextAreaElement).value).toContain('def on_bar(context, data):');

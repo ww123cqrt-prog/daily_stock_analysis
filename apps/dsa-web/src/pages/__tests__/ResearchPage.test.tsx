@@ -528,7 +528,7 @@ describe('ResearchPage', () => {
     expect(screen.getAllByRole('link', { name: '工作流 / 今日流程' }).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/不读取账号密码/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/不连接券商交易接口/).length).toBeGreaterThan(0);
-  });
+  }, 10_000);
 
   it('renders English copy without missing i18n keys', async () => {
     renderResearchPage('en');

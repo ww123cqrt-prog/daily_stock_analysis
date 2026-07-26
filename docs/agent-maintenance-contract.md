@@ -76,6 +76,7 @@ sed -n '1,260p' docs/install-local-quant-workbench.md
 6. 不把 DSA、Qlib、MLflow 混成一个概念。文档和 UI 必须分别说明三者职责。
 7. 不将 ETF/场内基金误按单家公司财报逻辑分析。ETF 基本面必须标注降级或待补强。
 8. 不接券商自动交易。本阶段同花顺和手机镜像只作为后续只读观察方向。
+9. `run_daily_update.py` 只负责 18:40 数据更新；60 日纸面跟踪由 19:10 的 `run_robust_shadow_schedule.py` 独立运行。不得重新把跟踪做成可选 warning，也不得在冻结组合含 `mps_dnn` 时用普通 `.venv` 或 CPU 代替 MPS。
 
 ## 用户沟通口径
 

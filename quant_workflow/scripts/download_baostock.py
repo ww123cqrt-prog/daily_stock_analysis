@@ -9,11 +9,16 @@ Parquet file per 6-digit stock code.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import os
 import signal
+import socket
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -22,25 +27,39 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _daily_update_runtime import write_json_atomic  # noqa: E402
 from _ashare_sources import (  # noqa: E402
     download_exit_code,
     is_source_denial_error,
+    qfq_anchor_matches,
     run_source_entrypoint,
     validate_source_safety_profile,
 )
+from _daily_update_runtime import write_json_atomic  # noqa: E402
 from _paths import quant_data_root, reports_root  # noqa: E402
+from quant_data_contract import atomic_write_json  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
 REPORTS_ROOT = reports_root()
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
 PARQUET_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
-EMPTY_CODES_FILE = QUANT_DATA / "baostock_empty_codes.json"
-TIMEOUT_CODES_FILE = QUANT_DATA / "baostock_timeout_codes.json"
+DOWNLOAD_STATE_DIR = REPORTS_ROOT / "download_state"
+EMPTY_CODES_FILE = DOWNLOAD_STATE_DIR / "baostock_empty_codes.json"
+TIMEOUT_CODES_FILE = DOWNLOAD_STATE_DIR / "baostock_timeout_codes.json"
 CURRENT_FILE = REPORTS_ROOT / "runtime" / "status" / "baostock_current.json"
 
 FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
+BAOSTOCK_BLACKLIST_ERROR_CODE = "10001011"
+BAOSTOCK_NETWORK_ERROR_CODES = {
+    "10002001",
+    "10002002",
+    "10002003",
+    "10002004",
+    "10002005",
+    "10002006",
+    "10002007",
+    "10002008",
+}
 KEEP_COLUMNS = [
     "date",
     "open",
@@ -64,6 +83,72 @@ class QueryTimeout(TimeoutError):
 
 def _timeout_handler(signum, frame):
     raise QueryTimeout("single-symbol query timed out")
+
+
+def _supports_signal_timeout() -> bool:
+    return all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "setitimer")
+    )
+
+
+def _configure_baostock_socket_timeout(
+    provider: Any,
+    timeout: float,
+    *,
+    import_module=importlib.import_module,
+) -> bool:
+    if getattr(provider, "__name__", None) != "baostock":
+        return False
+    context = import_module("baostock.common.context")
+    active_socket = getattr(context, "default_socket", None)
+    if active_socket is None or not hasattr(active_socket, "settimeout"):
+        return False
+    active_socket.settimeout(float(timeout))
+    return True
+
+
+@contextmanager
+def _query_deadline(provider: Any, timeout: int):
+    if _supports_signal_timeout():
+        previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        return
+
+    _configure_baostock_socket_timeout(provider, timeout)
+    yield
+
+
+def _login_baostock(provider: Any, timeout: int) -> Any:
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(float(timeout))
+    try:
+        result = provider.login()
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+    if str(getattr(result, "error_code", "")) == "0":
+        _configure_baostock_socket_timeout(provider, timeout)
+    return result
+
+
+def _relogin_baostock(provider: Any, timeout: int) -> None:
+    try:
+        provider.logout()
+    except Exception:
+        pass
+    result = _login_baostock(provider, timeout)
+    error_code = str(getattr(result, "error_code", ""))
+    if error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+        raise RuntimeError("Baostock access is temporarily restricted")
+    if error_code != "0":
+        raise RuntimeError(
+            f"Baostock relogin failed: {error_code} {getattr(result, 'error_msg', '')}"
+        )
 
 
 def normalize_date(value: str) -> str:
@@ -158,6 +243,7 @@ def load_timeout_codes() -> set[str]:
 
 
 def save_empty_codes(codes: set[str]) -> None:
+    EMPTY_CODES_FILE.parent.mkdir(parents=True, exist_ok=True)
     EMPTY_CODES_FILE.write_text(
         json.dumps(sorted(codes), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -181,15 +267,10 @@ def query_one(
     timeout: int,
 ) -> pd.DataFrame:
     last_error = ""
-    for attempt in range(1, retries + 1):
-        supports_signal_timeout = all(
-            hasattr(signal, name)
-            for name in ("signal", "SIGALRM", "setitimer", "ITIMER_REAL")
-        )
-        if supports_signal_timeout:
-            previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout)
-            try:
+    for attempt in range(1, max(int(retries), 1) + 1):
+        reconnect_required = False
+        try:
+            with _query_deadline(bs, timeout):
                 rs = bs.query_history_k_data_plus(
                     code=bs_code,
                     fields=FIELDS,
@@ -198,24 +279,21 @@ def query_one(
                     frequency="d",
                     adjustflag=adjustflag,
                 )
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, previous_handler)
-        else:
-            rs = bs.query_history_k_data_plus(
-                code=bs_code,
-                fields=FIELDS,
-                start_date=start,
-                end_date=end,
-                frequency="d",
-                adjustflag=adjustflag,
-            )
+                error_code = str(getattr(rs, "error_code", ""))
+                if error_code == "0":
+                    return frame_from_result(rs)
+                if error_code == BAOSTOCK_BLACKLIST_ERROR_CODE:
+                    raise RuntimeError("Baostock access is temporarily restricted")
+                last_error = f"{error_code}: {getattr(rs, 'error_msg', '')}"
+                reconnect_required = error_code in BAOSTOCK_NETWORK_ERROR_CODES
+        except (QueryTimeout, TimeoutError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            reconnect_required = True
 
-        if rs.error_code == "0":
-            return frame_from_result(rs)
-
-        last_error = f"{rs.error_code}: {rs.error_msg}"
-        time.sleep(min(2 * attempt, 10))
+        if attempt < max(int(retries), 1):
+            if reconnect_required and getattr(bs, "__name__", None) == "baostock":
+                _relogin_baostock(bs, timeout)
+            time.sleep(min(2 * attempt, 10))
 
     raise RuntimeError(last_error or "Baostock query failed")
 
@@ -267,7 +345,51 @@ def merge_existing_frame(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.Data
     return combined
 
 
-def write_download_status(payload: dict) -> Path:
+def refresh_incremental_frame(
+    existing: pd.DataFrame,
+    *,
+    query_range,
+    full_start: str,
+    incremental_start: str,
+    end: str,
+    adjustflag: str,
+    anchor_rows: int = 5,
+) -> tuple[pd.DataFrame, bool]:
+    if anchor_rows <= 0:
+        raise ValueError("anchor_rows must be positive")
+    if adjustflag != "2":
+        fresh = normalize_frame(query_range(incremental_start, end))
+        return (
+            merge_existing_frame(existing, fresh) if not fresh.empty else fresh,
+            False,
+        )
+
+    normalized_existing = normalize_frame(existing)
+    if normalized_existing.empty:
+        return normalize_frame(query_range(full_start, end)), True
+    anchor_existing = normalized_existing.head(anchor_rows)
+    anchor_start = anchor_existing["date"].iloc[0].date().isoformat()
+    anchor_end = anchor_existing["date"].iloc[-1].date().isoformat()
+    anchor_fresh = normalize_frame(query_range(anchor_start, anchor_end))
+    if not qfq_anchor_matches(anchor_existing, anchor_fresh):
+        return normalize_frame(query_range(full_start, end)), True
+    fresh = normalize_frame(query_range(incremental_start, end))
+    if fresh.empty:
+        return fresh, False
+    return merge_existing_frame(normalized_existing, fresh), False
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_parquet(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_download_status(payload: dict[str, Any]) -> Path:
     path = REPORTS_ROOT / "runtime" / "status" / "baostock_download_summary_latest.json"
     write_json_atomic(path, payload)
     return path
@@ -312,6 +434,7 @@ def main() -> int:
     end = normalize_date(args.end)
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
+    CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     codes = load_codes(args.symbols_file)
     if args.symbols_file:
@@ -332,10 +455,13 @@ def main() -> int:
 
     import baostock as bs
 
-    login_result = bs.login()
+    login_result = _login_baostock(bs, args.timeout)
     print(f"Baostock login: {login_result.error_code} {login_result.error_msg}", flush=True)
     if login_result.error_code != "0":
-        blacklisted = login_result.error_code == "10001011" or "黑名单" in str(login_result.error_msg)
+        blacklisted = (
+            login_result.error_code == BAOSTOCK_BLACKLIST_ERROR_CODE
+            or "黑名单" in str(login_result.error_msg)
+        )
         write_download_status(
             {
                 "source": "baostock",
@@ -365,6 +491,8 @@ def main() -> int:
     requests_made = 0
     stopped_reason = "completed"
     failures: list[tuple[str, str]] = []
+    anchor_checked = 0
+    rebased = 0
     t0 = time.time()
 
     try:
@@ -384,14 +512,14 @@ def main() -> int:
                 write_json_atomic(
                     CURRENT_FILE,
                     {
-                            "index": i,
-                            "total": total,
-                            "symbol": sym,
-                            "baostock_code": bs_code,
-                            "start": symbol_start,
-                            "end": end,
-                            "incremental": args.incremental,
-                            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "index": i,
+                        "total": total,
+                        "symbol": sym,
+                        "baostock_code": bs_code,
+                        "start": symbol_start,
+                        "end": end,
+                        "incremental": args.incremental,
+                        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     },
                 )
                 if args.incremental and out_path.exists() and range_starts_after_end(symbol_start, end):
@@ -413,23 +541,56 @@ def main() -> int:
                     )
                     break
                 requests_made += 1
-                df = query_one(bs, bs_code, symbol_start, end, args.adjustflag, args.retries, args.timeout)
-                df = normalize_frame(df)
+
+                if args.incremental and out_path.exists():
+                    existing = pd.read_parquet(out_path)
+
+                    def query_range(range_start: str, range_end: str) -> pd.DataFrame:
+                        return query_one(
+                            bs,
+                            bs_code,
+                            range_start,
+                            range_end,
+                            args.adjustflag,
+                            args.retries,
+                            args.timeout,
+                        )
+
+                    df, symbol_rebased = refresh_incremental_frame(
+                        existing,
+                        query_range=query_range,
+                        full_start=start,
+                        incremental_start=symbol_start,
+                        end=end,
+                        adjustflag=args.adjustflag,
+                    )
+                    if args.adjustflag == "2":
+                        anchor_checked += 1
+                    if symbol_rebased:
+                        rebased += 1
+                else:
+                    df = normalize_frame(
+                        query_one(
+                            bs,
+                            bs_code,
+                            symbol_start,
+                            end,
+                            args.adjustflag,
+                            args.retries,
+                            args.timeout,
+                        )
+                    )
                 if df.empty:
                     if args.incremental and out_path.exists():
                         no_new += 1
                         consecutive_failures = 0
                         if no_new <= 5 or no_new % 50 == 0:
                             print(f"NO_NEW {sym} ({bs_code}) from {symbol_start} to {end}", flush=True)
-                        time.sleep(args.sleep)
                         continue
                     raise EmptyResult("empty result")
 
-                if args.incremental and out_path.exists():
-                    existing = pd.read_parquet(out_path)
-                    df = merge_existing_frame(existing, df)
-
-                df.to_parquet(out_path, index=False)
+                df["source_id"] = "baostock"
+                _atomic_parquet(df, out_path)
                 ok += 1
                 consecutive_failures = 0
 
@@ -483,9 +644,46 @@ def main() -> int:
         flush=True,
     )
     if failures:
-        fail_log = QUANT_DATA / "baostock_failures.json"
+        fail_log = DOWNLOAD_STATE_DIR / "baostock_failures.json"
+        fail_log.parent.mkdir(parents=True, exist_ok=True)
         fail_log.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Failure details saved to {fail_log}", flush=True)
+
+    atomic_write_json(
+        out_dir / "SOURCE_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "dataset": "ashare_baostock_price_legacy",
+            "role": "audit",
+            "status": "legacy_unknown" if args.adjustflag in {"1", "2"} else "ready",
+            "generated_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+            "source": "baostock",
+            "interface": "query_history_k_data_plus",
+            "price_basis": {"1": "hfq", "2": "qfq", "3": "raw"}[args.adjustflag],
+            "adjustment_method": "unknown" if args.adjustflag in {"1", "2"} else "none",
+            "adjustment_evidence": (
+                "anchor_fingerprint_only_not_a_factor_curve"
+                if args.adjustflag in {"1", "2"}
+                else "not_applicable"
+            ),
+            "update_contract": (
+                "anchor_check_then_full_symbol_refresh_on_rebase"
+                if args.adjustflag == "2"
+                else "incremental_whole_row_merge"
+            ),
+            "requested_start": start,
+            "requested_end": end,
+            "anchor_checked": anchor_checked,
+            "rebased": rebased,
+            "summary": {
+                "total": len(codes),
+                "ok": ok,
+                "no_new": no_new,
+                "empty": empty,
+                "fail": fail,
+            },
+        },
+    )
 
     summary = {
         "source": "baostock",
@@ -501,6 +699,9 @@ def main() -> int:
         "request_budget": args.max_requests,
         "stopped_reason": stopped_reason,
         "seconds": round(elapsed, 2),
+        "price_basis": {"1": "hfq", "2": "qfq", "3": "raw"}[args.adjustflag],
+        "anchor_checked": anchor_checked,
+        "rebased": rebased,
         "failures": [
             {"symbol": symbol, "provider_symbol": provider_symbol, "error": error}
             for symbol, provider_symbol, error in failures[:100]
@@ -508,7 +709,6 @@ def main() -> int:
     }
     summary["status"] = "ok" if download_exit_code(summary) == 0 else "failed"
     write_download_status(summary)
-
     return download_exit_code(summary)
 
 

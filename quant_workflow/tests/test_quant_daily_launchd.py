@@ -9,6 +9,7 @@ class QuantDailyLaunchdTest(unittest.TestCase):
         template = root / "scripts" / "launchd" / "com.dsa.quant-daily-update.plist.template"
         rendered = template.read_text(encoding="utf-8")
         for key, value in {
+            "__HOME__": "/tmp/dsa-home",
             "__PYTHON__": "/tmp/dsa/.venv/bin/python",
             "__SCRIPT__": "/tmp/dsa/quant_workflow/scripts/run_daily_update.py",
             "__WORKDIR__": "/tmp/dsa/quant_workflow",
@@ -20,8 +21,12 @@ class QuantDailyLaunchdTest(unittest.TestCase):
         payload = plistlib.loads(rendered.encode("utf-8"))
 
         self.assertEqual(payload["Label"], "com.dsa.quant-daily-update")
-        self.assertIn("--skip-if-robust-training", payload["ProgramArguments"])
-        self.assertEqual(payload["EnvironmentVariables"]["TZ"], "Asia/Shanghai")
+        arguments = payload["ProgramArguments"]
+        self.assertEqual(arguments[:2], ["/usr/bin/env", "-i"])
+        self.assertIn("HOME=/tmp/dsa-home", arguments)
+        self.assertIn("TZ=Asia/Shanghai", arguments)
+        self.assertIn("--skip-if-robust-training", arguments)
+        self.assertNotIn("EnvironmentVariables", payload)
         self.assertEqual(
             {(item["Weekday"], item["Hour"], item["Minute"]) for item in payload["StartCalendarInterval"]},
             {(weekday, 18, 40) for weekday in range(1, 6)},
