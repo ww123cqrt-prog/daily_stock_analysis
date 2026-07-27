@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 
 
 def load_module():
@@ -48,6 +49,159 @@ def write_complete_provider(
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
+    def test_tencent_robust_source_downloads_all_three_ohlcv_series(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, code):
+                self.code = code
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 0,
+                    "data": {
+                        self.code: {
+                            "day": [
+                                ["2026-07-23", "10.0", "10.1", "10.2", "9.9", "1000"],
+                                ["2026-07-24", "10.2", "10.3", "10.4", "10.1", "1200"],
+                            ]
+                        }
+                    },
+                }
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = None
+                self.codes = []
+
+            def get(self, _url, *, params, timeout):
+                code = params["param"].split(",", 1)[0]
+                self.codes.append((code, timeout))
+                return FakeResponse(code)
+
+            def close(self):
+                return None
+
+        session = FakeSession()
+        with mock.patch("requests.Session", return_value=session):
+            frames = module._download_tencent_benchmarks(
+                "2026-07-23",
+                "2026-07-24",
+                use_system_proxy=True,
+                sleep_fn=lambda _seconds: None,
+            )
+
+        self.assertTrue(session.trust_env)
+        self.assertEqual(set(frames), {"SH000300", "SH000905", "SH000906"})
+        self.assertEqual({code for code, _ in session.codes}, {"sh000300", "sh000905", "sh000906"})
+        self.assertEqual(
+            frames["SH000905"].columns.tolist(),
+            ["open", "high", "low", "close", "volume"],
+        )
+        self.assertEqual(frames["SH000905"].loc["2026-07-24", "close"], 10.3)
+
+    def test_tencent_source_retries_transient_failure_with_bounded_backoff(self):
+        module = load_module()
+        import requests
+
+        class FakeResponse:
+            def __init__(self, code):
+                self.code = code
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {
+                        self.code: {
+                            "day": [
+                                [
+                                    "2026-07-24",
+                                    "10",
+                                    "10",
+                                    "10",
+                                    "10",
+                                    "1000",
+                                ]
+                            ]
+                        }
+                    }
+                }
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = 0
+                self.trust_env = False
+
+            def get(self, _url, *, params, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise requests.ConnectionError("temporary")
+                return FakeResponse(params["param"].split(",", 1)[0])
+
+            def close(self):
+                return None
+
+        sleeps: list[float] = []
+        session = FakeSession()
+        with mock.patch("requests.Session", return_value=session):
+            result = module._download_tencent_benchmarks(
+                "2026-07-24",
+                "2026-07-24",
+                sleep_fn=sleeps.append,
+                request_interval_seconds=0.25,
+                retry_backoff_seconds=1.0,
+                max_attempts=3,
+            )
+
+        self.assertEqual(set(result), set(module.BENCHMARKS))
+        self.assertEqual(session.calls, 4)
+        self.assertIn(1.0, sleeps)
+        self.assertGreaterEqual(sleeps.count(0.25), 4)
+
+    def test_add_benchmark_can_use_tencent_without_loading_baostock(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "provider"
+            (provider / "calendars").mkdir(parents=True)
+            (provider / "calendars" / "day.txt").write_text(
+                "2026-01-02\n2026-01-05\n", encoding="utf-8"
+            )
+            (provider / "instruments").mkdir()
+            (provider / "instruments" / "all.txt").write_text(
+                "SH600000\t2026-01-02\t2026-01-05\n", encoding="utf-8"
+            )
+            frame = pd.DataFrame(
+                {
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1200.0],
+                },
+                index=["2026-01-02", "2026-01-05"],
+            )
+            with mock.patch.object(
+                module,
+                "_download_tencent_benchmarks",
+                return_value={symbol: frame for symbol in module.BENCHMARKS},
+            ), mock.patch.object(
+                module, "_load_baostock", side_effect=AssertionError("Baostock must not load")
+            ):
+                status = module.add_benchmark(
+                    provider,
+                    benchmark_source="tencent",
+                    required_start_date="2026-01-02",
+                )
+
+            self.assertEqual(status["source"], "tencent")
+            for symbol in module.BENCHMARKS:
+                self.assertTrue((provider / "features" / symbol.lower() / "close.day.bin").is_file())
+
     def test_tencent_source_pages_backward_and_returns_close_by_date(self):
         module = load_module()
 

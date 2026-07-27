@@ -45,7 +45,7 @@ china-astock-quant adapters, and every stable script here. Data paths use
   --output-dir /path/to/staging-bundle \
   --through YYYY-MM-DD --resume
 
-# Publish a verified A-share v2 raw/qfq pair atomically
+# Publish verified A-share v2 raw/qfq, Qlib v2, and V1-compatible outputs
 .venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir /path/to/verified-bundle
 
@@ -93,10 +93,11 @@ china-astock-quant adapters, and every stable script here. Data paths use
 
 - Baostock Parquet: `quant_data/parquet/ashare_1d/baostock_qfq`
 - JQData Parquet: `quant_data/parquet/ashare_1d/jqdata`
-- Merged Parquet: `quant_data/parquet/ashare_1d/merged_baostock_jqdata`
-- Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata`
-- Cleaned merged Parquet: `quant_data/parquet/ashare_1d/merged_baostock_jqdata_cleaned`
-- Cleaned Qlib provider: `quant_data/qlib/cn_data_baostock_jqdata_cleaned`
+- V1-compatible merged Parquet generated from V2: `quant_data/parquet/ashare_1d/merged_baostock_jqdata`
+- V1-compatible Qlib provider generated from V2: `quant_data/qlib/cn_data_baostock_jqdata`
+- V1-compatible cleaned Parquet generated from V2: `quant_data/parquet/ashare_1d/merged_baostock_jqdata_cleaned`
+- V1-compatible cleaned Qlib generated from V2: `quant_data/qlib/cn_data_baostock_jqdata_cleaned`
+- Pre-migration rollback/audit copies: the same four names with `_old` suffix
 - Canonical global daily Parquet: `quant_data/parquet/global_1d/{us,jp,kr}`
 - Yahoo raw responses: `quant_data/raw/global_1d/yahoo/captured_date=YYYY-MM-DD`
 - Sina snapshot raw responses: `quant_data/raw/ashare_snapshots/captured_date=YYYY-MM-DD`
@@ -112,9 +113,10 @@ paths and readiness state remain authoritative in
 
 The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`, and
 `qlib_ashare_v2`; resolve them through `quant_data_cli.py` instead of hard-coding
-snapshot paths. Older source, merged, cleaned, and Qlib directories remain
-registered as `legacy_unknown` for compatibility and audit use. Do not infer
-readiness from directory names; the live manifest is authoritative.
+snapshot paths. Existing programs may keep the four original merged/cleaned
+paths: they are generated compatibility outputs from V2. Only the `_old`
+directories and old source directories are audit-only. Do not infer readiness
+from directory names; the live manifest is authoritative.
 
 The robust strategy configuration uses verified offline reuse for the one-time
 reference snapshot and the three Qlib benchmarks. It does not silently redownload

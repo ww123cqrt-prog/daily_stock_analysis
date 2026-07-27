@@ -232,16 +232,141 @@ def _legacy_dataset_entry(
     return entry
 
 
+def _old_dataset_entry(**kwargs: Any) -> dict[str, Any]:
+    entry = _legacy_dataset_entry(**kwargs)
+    entry["role"] = "audit"
+    entry["lifecycle"] = "old"
+    entry["migration_note"] = (
+        "Old V1 data retained only for rollback and audit. Normal consumers "
+        "must use the original path, which is now generated from V2."
+    )
+    return entry
+
+
+def _read_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parquet_compatibility_entry(
+    *, quant_data: Path, dataset_id: str, path: Path
+) -> dict[str, Any] | None:
+    payload = _read_mapping(path / ".metadata" / "COMPATIBILITY_MANIFEST.json")
+    if payload is None or payload.get("contract") != "v1_ashare_qfq_compatibility":
+        return None
+    upstream = payload.get("upstream") if isinstance(payload.get("upstream"), dict) else {}
+    date_range = payload.get("date_range") if isinstance(payload.get("date_range"), dict) else {}
+    return {
+        "dataset_id": dataset_id,
+        "data_kind": "daily_bars",
+        "role": "canonical",
+        "status": "ready",
+        "lifecycle": "compatibility_output",
+        "source": {
+            "provider": "quant_workflow",
+            "interface": "v2_to_v1_compatibility",
+        },
+        "price_basis": "qfq",
+        "path": _relative_path(path, quant_data),
+        "latest_trade_date": str(date_range.get("end") or ""),
+        "date_range": date_range,
+        "symbol_count": int(payload.get("symbol_count") or 0),
+        "row_count": int(payload.get("row_count") or 0),
+        "adjustment": {
+            "method": "local_factor",
+            "evidence_status": "in_upstream_v2_snapshot",
+            "factor_semantics": payload.get("factor_semantics"),
+        },
+        "upstream_dataset_id": str(upstream.get("dataset_id") or "ashare_daily_qfq"),
+        "upstream_snapshot_id": str(upstream.get("snapshot_id") or ""),
+        "snapshot_available": False,
+        "compatibility_note": (
+            "Stable V1 path and schema generated from the governed V2 qfq snapshot. "
+            "Real adjustment factors remain in V2."
+        ),
+    }
+
+
+def _qlib_compatibility_entry(
+    *, quant_data: Path, dataset_id: str, path: Path
+) -> dict[str, Any] | None:
+    payload = _read_mapping(path / "PROVIDER_MANIFEST.json")
+    if payload is None:
+        return None
+    conversion = payload.get("conversion") if isinstance(payload.get("conversion"), dict) else {}
+    if conversion.get("factor_semantics") != "unit_factor_prices_already_qfq":
+        return None
+    upstream = payload.get("source_snapshot") if isinstance(payload.get("source_snapshot"), dict) else {}
+    summary = qlib_entry(path, "V1-compatible Qlib provider generated from V2.")
+    return {
+        "dataset_id": dataset_id,
+        "data_kind": "qlib_provider",
+        "role": "canonical",
+        "status": "ready",
+        "lifecycle": "compatibility_output",
+        "source": {
+            "provider": "quant_workflow",
+            "interface": "v2_to_v1_qlib_compatibility",
+        },
+        "price_basis": "qfq",
+        "path": _relative_path(path, quant_data),
+        "latest_trade_date": str(summary.get("calendar_last") or ""),
+        "calendar_first": summary.get("calendar_first"),
+        "instruments_all": summary.get("instruments_all"),
+        "adjustment": {
+            "method": "local_factor",
+            "evidence_status": "in_upstream_v2_snapshot",
+            "factor_semantics": conversion.get("factor_semantics"),
+        },
+        "upstream_dataset_id": str(upstream.get("dataset_id") or "ashare_daily_qfq"),
+        "upstream_snapshot_id": str(upstream.get("snapshot_id") or ""),
+        "snapshot_available": False,
+        "compatibility_note": (
+            "Stable V1 Qlib path generated from V2; factor.day.bin is one because "
+            "prices are already forward adjusted."
+        ),
+    }
+
+
 def _v2_dataset_catalog(
     *,
     quant_data: Path,
     pit_entry: dict[str, Any] | None,
     reference_entry: dict[str, Any] | None,
     robust_product_entry: dict[str, Any] | None,
+    existing_datasets: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parquet_root = quant_data / "parquet" / "ashare_1d"
     etf_root = quant_data / "parquet" / "etf_1d"
     qlib_root = quant_data / "qlib"
+    compatibility_entries: dict[str, dict[str, Any]] = {}
+    for dataset_id, path in (
+        ("ashare_merged_qfq_compatibility", parquet_root / "merged_baostock_jqdata"),
+        (
+            "ashare_cleaned_qfq_compatibility",
+            parquet_root / "merged_baostock_jqdata_cleaned",
+        ),
+    ):
+        entry = _parquet_compatibility_entry(
+            quant_data=quant_data, dataset_id=dataset_id, path=path
+        )
+        if entry is not None:
+            compatibility_entries[dataset_id] = entry
+    for dataset_id, path in (
+        ("qlib_ashare_merged_compatibility", qlib_root / "cn_data_baostock_jqdata"),
+        (
+            "qlib_ashare_cleaned_compatibility",
+            qlib_root / "cn_data_baostock_jqdata_cleaned",
+        ),
+    ):
+        entry = _qlib_compatibility_entry(
+            quant_data=quant_data, dataset_id=dataset_id, path=path
+        )
+        if entry is not None:
+            compatibility_entries[dataset_id] = entry
     datasets = {
         "ashare_daily_raw": {
             "dataset_id": "ashare_daily_raw",
@@ -357,43 +482,44 @@ def _v2_dataset_catalog(
             price_basis="qfq",
             role="audit",
         ),
-        "ashare_merged_qfq_legacy": _legacy_dataset_entry(
+        "ashare_merged_qfq_old": _old_dataset_entry(
             quant_data=quant_data,
-            dataset_id="ashare_merged_qfq_legacy",
-            path=parquet_root / "merged_baostock_jqdata",
+            dataset_id="ashare_merged_qfq_old",
+            path=parquet_root / "merged_baostock_jqdata_old",
             data_kind="daily_bars",
             source_provider="multi_source",
             source_interface="legacy_provider_qfq_date_fill",
             price_basis="qfq",
         ),
-        "ashare_cleaned_qfq_legacy": _legacy_dataset_entry(
+        "ashare_cleaned_qfq_old": _old_dataset_entry(
             quant_data=quant_data,
-            dataset_id="ashare_cleaned_qfq_legacy",
-            path=parquet_root / "merged_baostock_jqdata_cleaned",
+            dataset_id="ashare_cleaned_qfq_old",
+            path=parquet_root / "merged_baostock_jqdata_cleaned_old",
             data_kind="daily_bars",
             source_provider="multi_source",
             source_interface="legacy_cleaned_provider_qfq",
             price_basis="qfq",
         ),
-        "qlib_ashare_cleaned_legacy": _legacy_dataset_entry(
+        "qlib_ashare_cleaned_old": _old_dataset_entry(
             quant_data=quant_data,
-            dataset_id="qlib_ashare_cleaned_legacy",
-            path=qlib_root / "cn_data_baostock_jqdata_cleaned",
+            dataset_id="qlib_ashare_cleaned_old",
+            path=qlib_root / "cn_data_baostock_jqdata_cleaned_old",
             data_kind="qlib_provider",
             source_provider="quant_workflow",
             source_interface="legacy_merge_to_qlib",
             price_basis="qfq",
         ),
-        "qlib_ashare_merged_legacy": _legacy_dataset_entry(
+        "qlib_ashare_merged_old": _old_dataset_entry(
             quant_data=quant_data,
-            dataset_id="qlib_ashare_merged_legacy",
-            path=qlib_root / "cn_data_baostock_jqdata",
+            dataset_id="qlib_ashare_merged_old",
+            path=qlib_root / "cn_data_baostock_jqdata_old",
             data_kind="qlib_provider",
             source_provider="quant_workflow",
             source_interface="legacy_merge_to_qlib",
             price_basis="qfq",
             role="audit",
         ),
+        **compatibility_entries,
         "etf_momentum_sina_raw_legacy": _legacy_dataset_entry(
             quant_data=quant_data,
             dataset_id="etf_momentum_sina_raw_legacy",
@@ -475,6 +601,53 @@ def _v2_dataset_catalog(
             role="audit",
         ),
     }
+    pre_migration_entries = (
+        (
+            "ashare_merged_qfq_compatibility",
+            "ashare_merged_qfq_legacy",
+            parquet_root / "merged_baostock_jqdata",
+            "daily_bars",
+            "multi_source",
+            "legacy_provider_qfq_date_fill",
+        ),
+        (
+            "ashare_cleaned_qfq_compatibility",
+            "ashare_cleaned_qfq_legacy",
+            parquet_root / "merged_baostock_jqdata_cleaned",
+            "daily_bars",
+            "multi_source",
+            "legacy_cleaned_provider_qfq",
+        ),
+        (
+            "qlib_ashare_merged_compatibility",
+            "qlib_ashare_merged_legacy",
+            qlib_root / "cn_data_baostock_jqdata",
+            "qlib_provider",
+            "quant_workflow",
+            "legacy_merge_to_qlib",
+        ),
+        (
+            "qlib_ashare_cleaned_compatibility",
+            "qlib_ashare_cleaned_legacy",
+            qlib_root / "cn_data_baostock_jqdata_cleaned",
+            "qlib_provider",
+            "quant_workflow",
+            "legacy_merge_to_qlib",
+        ),
+    )
+    for compatibility_id, legacy_id, path, data_kind, provider, interface in pre_migration_entries:
+        if compatibility_id in compatibility_entries:
+            continue
+        datasets[legacy_id] = _legacy_dataset_entry(
+            quant_data=quant_data,
+            dataset_id=legacy_id,
+            path=path,
+            data_kind=data_kind,
+            source_provider=provider,
+            source_interface=interface,
+            price_basis="qfq",
+            role="audit",
+        )
     if pit_entry is not None:
         datasets["pit_csi800"] = {
             "dataset_id": "pit_csi800",
@@ -521,6 +694,7 @@ def _v2_dataset_catalog(
             role="audit",
         )
 
+    known_datasets = existing_datasets or {}
     for search_root in (
         quant_data / "parquet",
         quant_data / "qlib",
@@ -531,7 +705,25 @@ def _v2_dataset_catalog(
         for pointer_path in search_root.rglob("LATEST.json"):
             try:
                 pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                if not isinstance(pointer, dict):
+                    raise TypeError("LATEST.json must contain an object")
+                dataset_id = str(pointer["dataset_id"])
                 snapshot = quant_data / str(pointer["snapshot_path"])
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                dataset_id = _dataset_id_for_pointer(
+                    pointer_path,
+                    quant_data=quant_data,
+                    existing_datasets=known_datasets,
+                )
+                datasets[dataset_id] = _blocked_pointer_entry(
+                    dataset_id=dataset_id,
+                    pointer_path=pointer_path,
+                    quant_data=quant_data,
+                    existing_entry=known_datasets.get(dataset_id),
+                    blocker_code="latest_pointer_invalid",
+                )
+                continue
+            try:
                 entry = catalog_entry_from_snapshot(
                     snapshot,
                     quant_data_root=quant_data,
@@ -545,9 +737,164 @@ def _v2_dataset_catalog(
                 ValueError,
                 json.JSONDecodeError,
             ):
+                datasets[dataset_id] = _blocked_pointer_entry(
+                    dataset_id=dataset_id,
+                    pointer_path=pointer_path,
+                    quant_data=quant_data,
+                    existing_entry=known_datasets.get(dataset_id),
+                    blocker_code="snapshot_manifest_invalid",
+                    pointer=pointer,
+                )
                 continue
             datasets[str(entry["dataset_id"])] = entry
+    _enrich_compatibility_entries(
+        datasets,
+        existing_datasets=known_datasets,
+    )
+    compatibility_ids = sorted(
+        dataset_id
+        for dataset_id, entry in datasets.items()
+        if isinstance(entry, dict)
+        and entry.get("lifecycle") == "compatibility_output"
+    )
+    for canonical_id in ("ashare_daily_qfq", "qlib_ashare_v2"):
+        entry = datasets.get(canonical_id)
+        if isinstance(entry, dict) and compatibility_ids:
+            entry["compatibility_outputs"] = compatibility_ids
     return dict(sorted(datasets.items()))
+
+
+def _enrich_compatibility_entries(
+    datasets: dict[str, Any],
+    *,
+    existing_datasets: dict[str, Any] | None = None,
+) -> None:
+    qfq_entry = datasets.get("ashare_daily_qfq")
+    if not isinstance(qfq_entry, dict):
+        return
+    qfq_adjustment = (
+        dict(qfq_entry.get("adjustment", {}))
+        if isinstance(qfq_entry.get("adjustment"), dict)
+        else {}
+    )
+    dataset_root = str(qfq_entry.get("dataset_root") or "").strip("/")
+    snapshot_id = str(qfq_entry.get("snapshot_id") or "").strip("/")
+    content_sha256 = str(qfq_entry.get("content_sha256") or "")
+    factor_path = str(qfq_adjustment.get("factor_path") or "").strip("/")
+    if qfq_entry.get("status") != "ready" or not snapshot_id or not content_sha256:
+        return
+    if dataset_root and snapshot_id and factor_path:
+        qfq_adjustment["factor_path"] = (
+            Path(dataset_root) / "snapshots" / snapshot_id / factor_path
+        ).as_posix()
+    qfq_adjustment["evidence_status"] = "in_upstream_v2_snapshot"
+    qfq_adjustment["factor_semantics"] = "unit_factor_prices_already_qfq"
+
+    known_datasets = existing_datasets or {}
+    for dataset_id, compatibility in datasets.items():
+        if not isinstance(compatibility, dict) or compatibility.get(
+            "lifecycle"
+        ) != "compatibility_output":
+            continue
+        compatibility["source_retrieved_at"] = qfq_entry.get(
+            "source_retrieved_at", "unknown"
+        )
+        compatibility["adjustment"] = dict(qfq_adjustment)
+        compatibility["upstream_dataset_id"] = qfq_entry.get(
+            "dataset_id", "ashare_daily_qfq"
+        )
+        compatibility["upstream_snapshot_id"] = snapshot_id
+        compatibility["upstream_content_sha256"] = qfq_entry.get(
+            "content_sha256", ""
+        )
+        current_producer = compatibility.get("producer")
+        existing_entry = known_datasets.get(dataset_id)
+        persisted_producer = (
+            existing_entry.get("producer")
+            if isinstance(existing_entry, dict)
+            else None
+        )
+        existing_version = None
+        for producer in (current_producer, persisted_producer):
+            if isinstance(producer, dict) and producer.get("version") not in (
+                None,
+                "",
+            ):
+                existing_version = producer["version"]
+                break
+        compatibility["producer"] = {
+            "script": "publish_v2_compatibility.py",
+            "version": str(existing_version) if existing_version is not None else "1",
+        }
+
+
+def _existing_dataset_catalog(quant_data: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            (Path(quant_data) / "DATA_MANIFEST.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    datasets = payload.get("datasets") if isinstance(payload, dict) else None
+    return dict(datasets) if isinstance(datasets, dict) else {}
+
+
+def _dataset_id_for_pointer(
+    pointer_path: Path,
+    *,
+    quant_data: Path,
+    existing_datasets: dict[str, Any],
+) -> str:
+    relative_pointer = _relative_path(pointer_path, quant_data)
+    relative_root = _relative_path(pointer_path.parent, quant_data)
+    for dataset_id, entry in existing_datasets.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("latest_pointer") == relative_pointer or entry.get(
+            "dataset_root"
+        ) == relative_root:
+            return str(dataset_id)
+    known_roots = {
+        "parquet/ashare_1d/ashare_daily_raw": "ashare_daily_raw",
+        "parquet/ashare_1d/ashare_daily_qfq": "ashare_daily_qfq",
+        "qlib/cn_data_ashare_v2": "qlib_ashare_v2",
+    }
+    return known_roots.get(relative_root, pointer_path.parent.name)
+
+
+def _blocked_pointer_entry(
+    *,
+    dataset_id: str,
+    pointer_path: Path,
+    quant_data: Path,
+    existing_entry: Any,
+    blocker_code: str,
+    pointer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+    dataset_root = _relative_path(pointer_path.parent, quant_data)
+    entry.update(
+        {
+            "dataset_id": dataset_id,
+            "data_kind": entry.get(
+                "data_kind",
+                "qlib_provider" if dataset_root.startswith("qlib/") else "daily_bars",
+            ),
+            "role": entry.get("role", "canonical"),
+            "status": "blocked",
+            "source": entry.get(
+                "source", {"provider": "unknown", "interface": "v2_pointer"}
+            ),
+            "price_basis": entry.get("price_basis", "not_applicable"),
+            "dataset_root": dataset_root,
+            "latest_pointer": _relative_path(pointer_path, quant_data),
+            "snapshot_available": False,
+            "blocker_codes": [blocker_code],
+        }
+    )
+    if isinstance(pointer, dict):
+        entry["snapshot_id"] = str(pointer.get("snapshot_id") or "")
+    return entry
 
 
 def parquet_row_count(path: Path) -> int:
@@ -786,7 +1133,7 @@ def robust_manifest_entries(reference_dir: Path) -> tuple[
 
 
 def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, Any]:
-    quant_data = Path(quant_data_root).expanduser()
+    quant_data = Path(quant_data_root).expanduser().resolve()
     parquet_root = quant_data / "parquet" / "ashare_1d"
     etf_root = quant_data / "parquet" / "etf_1d"
     global_parquet_root = quant_data / "parquet" / "global_1d"
@@ -842,6 +1189,7 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
         pit_entry=pit_entry,
         reference_entry=reference_entry,
         robust_product_entry=robust_product_entry,
+        existing_datasets=_existing_dataset_catalog(quant_data),
     )
     manifest = {
         "schema_version": 2,

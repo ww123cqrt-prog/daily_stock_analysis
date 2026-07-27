@@ -50,6 +50,7 @@ def build_qlib_v2(*, quant_data_root: Path, publish: bool = False) -> Path:
         staging,
         overwrite=True,
         source_contract=upstream,
+        force_unit_factor=True,
     )
     if result != 0:
         raise DataContractError("Qlib v2 conversion failed")

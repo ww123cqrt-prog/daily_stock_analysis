@@ -227,6 +227,354 @@ def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
 
 
 class SyncDataManifestTest(unittest.TestCase):
+    def test_blocked_pointer_replaces_stale_blocker_codes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            quant_data = Path(tmp) / "quant_data"
+            pointer = (
+                quant_data
+                / "parquet"
+                / "etf_1d"
+                / "custom_etf_qfq"
+                / "LATEST.json"
+            )
+
+            entry = module._blocked_pointer_entry(
+                dataset_id="custom_etf_qfq",
+                pointer_path=pointer,
+                quant_data=quant_data,
+                existing_entry={
+                    "dataset_id": "custom_etf_qfq",
+                    "blocker_codes": ["latest_pointer_invalid"],
+                },
+                blocker_code="snapshot_manifest_invalid",
+            )
+
+        self.assertEqual(entry["blocker_codes"], ["snapshot_manifest_invalid"])
+
+    def test_compatibility_enrichment_preserves_existing_producer_version(self):
+        module = load_module()
+        compatibility = {
+            "dataset_id": "ashare_merged_qfq_compatibility",
+            "lifecycle": "compatibility_output",
+        }
+        datasets = {
+            "ashare_daily_qfq": {
+                "dataset_id": "ashare_daily_qfq",
+                "status": "ready",
+                "dataset_root": "parquet/ashare_1d/ashare_daily_qfq",
+                "snapshot_id": "qfq-001",
+                "content_sha256": "a" * 64,
+                "adjustment": {"factor_path": "factors"},
+            },
+            compatibility["dataset_id"]: compatibility,
+        }
+        existing_datasets = {
+            compatibility["dataset_id"]: {
+                "dataset_id": compatibility["dataset_id"],
+                "producer": {"script": "old.py", "version": "7"},
+            }
+        }
+
+        module._enrich_compatibility_entries(
+            datasets,
+            existing_datasets=existing_datasets,
+        )
+
+        self.assertEqual(compatibility["producer"]["version"], "7")
+        self.assertEqual(
+            compatibility["producer"]["script"],
+            "publish_v2_compatibility.py",
+        )
+
+    def test_v2_catalog_passes_existing_datasets_to_compatibility_enrichment(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            quant_data = Path(tmp) / "quant_data"
+            existing_datasets = {
+                "ashare_merged_qfq_compatibility": {
+                    "dataset_id": "ashare_merged_qfq_compatibility",
+                    "producer": {"version": "7"},
+                }
+            }
+            captured = []
+
+            def capture(_datasets, *, existing_datasets=None):
+                captured.append(existing_datasets)
+
+            with patch.object(
+                module,
+                "_enrich_compatibility_entries",
+                side_effect=capture,
+            ):
+                module._v2_dataset_catalog(
+                    quant_data=quant_data,
+                    pit_entry=None,
+                    reference_entry=None,
+                    robust_product_entry=None,
+                    existing_datasets=existing_datasets,
+                )
+
+        self.assertEqual(captured, [existing_datasets])
+
+    def test_build_manifest_resolves_quant_data_root_before_using_helpers(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "nested").mkdir()
+            quant_data = root / "nested" / ".." / "quant_data"
+            seen = []
+
+            def capture_existing(path):
+                seen.append(path)
+                return {}
+
+            with patch.object(
+                module, "_existing_dataset_catalog", side_effect=capture_existing
+            ):
+                module.build_manifest(
+                    quant_data_root=quant_data,
+                    reports_root=root / "reports",
+                )
+
+        self.assertEqual(seen, [quant_data.resolve()])
+
+    def test_manifest_marks_v1_paths_as_compatibility_and_old_paths_as_audit(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            parquet = quant_data / "parquet" / "ashare_1d"
+            qlib = quant_data / "qlib"
+            for name in (
+                "merged_baostock_jqdata",
+                "merged_baostock_jqdata_cleaned",
+            ):
+                current = parquet / name
+                (current / ".metadata").mkdir(parents=True)
+                (current / ".metadata" / "COMPATIBILITY_MANIFEST.json").write_text(
+                    json.dumps(
+                        {
+                            "contract": "v1_ashare_qfq_compatibility",
+                            "upstream": {
+                                "dataset_id": "ashare_daily_qfq",
+                                "snapshot_id": "qfq-001",
+                            },
+                            "date_range": {"start": "2020-01-02", "end": "2026-07-24"},
+                            "symbol_count": 1,
+                            "row_count": 2,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                pd.DataFrame({"date": pd.to_datetime(["2026-07-24"])}).to_parquet(
+                    current / "600000.parquet", index=False
+                )
+                old = parquet / f"{name}_old"
+                old.mkdir()
+                pd.DataFrame({"date": pd.to_datetime(["2026-07-17"])}).to_parquet(
+                    old / "600000.parquet", index=False
+                )
+            for name in (
+                "cn_data_baostock_jqdata",
+                "cn_data_baostock_jqdata_cleaned",
+            ):
+                current = qlib / name
+                (current / "calendars").mkdir(parents=True)
+                (current / "instruments").mkdir()
+                (current / "calendars" / "day.txt").write_text(
+                    "2026-07-24\n", encoding="utf-8"
+                )
+                (current / "instruments" / "all.txt").write_text(
+                    "SH600000\t2026-07-24\t2026-07-24\n", encoding="utf-8"
+                )
+                (current / "PROVIDER_MANIFEST.json").write_text(
+                    json.dumps(
+                        {
+                            "source_snapshot": {
+                                "dataset_id": "ashare_daily_qfq",
+                                "snapshot_id": "qfq-001",
+                            },
+                            "conversion": {
+                                "factor_semantics": "unit_factor_prices_already_qfq"
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                old = qlib / f"{name}_old"
+                (old / "calendars").mkdir(parents=True)
+                (old / "instruments").mkdir()
+                (old / "calendars" / "day.txt").write_text(
+                    "2026-07-17\n", encoding="utf-8"
+                )
+                (old / "instruments" / "all.txt").write_text(
+                    "SH600000\t2026-07-17\t2026-07-17\n", encoding="utf-8"
+                )
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        compatibility = manifest["datasets"]["ashare_merged_qfq_compatibility"]
+        self.assertEqual(compatibility["role"], "canonical")
+        self.assertEqual(compatibility["status"], "ready")
+        self.assertEqual(compatibility["lifecycle"], "compatibility_output")
+        self.assertEqual(
+            compatibility["path"],
+            "parquet/ashare_1d/merged_baostock_jqdata",
+        )
+        old = manifest["datasets"]["ashare_merged_qfq_old"]
+        self.assertEqual(old["role"], "audit")
+        self.assertEqual(old["lifecycle"], "old")
+        self.assertEqual(
+            old["path"],
+            "parquet/ashare_1d/merged_baostock_jqdata_old",
+        )
+        self.assertNotIn("ashare_merged_qfq_legacy", manifest["datasets"])
+
+    def test_compatibility_factor_path_is_qualified_to_the_upstream_snapshot(self):
+        module = load_module()
+        qfq = {
+            "dataset_id": "ashare_daily_qfq",
+            "data_kind": "daily_bars",
+            "role": "canonical",
+            "status": "ready",
+            "source": {"provider": "baostock", "interface": "raw_factor"},
+            "price_basis": "qfq",
+            "dataset_root": "parquet/ashare_1d/ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "source_retrieved_at": "2026-07-25T22:59:00+08:00",
+            "content_sha256": "a" * 64,
+            "adjustment": {
+                "method": "local_factor",
+                "factor_path": "factors",
+                "adjusted_at": "2026-07-25T23:00:00+08:00",
+                "adjustment_as_of": "2026-07-24",
+            },
+        }
+        compatibility = {
+            "dataset_id": "ashare_merged_qfq_compatibility",
+            "lifecycle": "compatibility_output",
+            "adjustment": {"method": "local_factor"},
+        }
+        datasets = {
+            "ashare_daily_qfq": qfq,
+            "ashare_merged_qfq_compatibility": compatibility,
+        }
+
+        module._enrich_compatibility_entries(datasets)
+
+        entry = datasets["ashare_merged_qfq_compatibility"]
+        self.assertEqual(
+            entry["adjustment"]["factor_path"],
+            "parquet/ashare_1d/ashare_daily_qfq/snapshots/qfq-001/factors",
+        )
+        self.assertEqual(
+            entry["adjustment"]["evidence_status"],
+            "in_upstream_v2_snapshot",
+        )
+
+    def test_blocked_qfq_entry_does_not_erase_compatibility_upstream_metadata(self):
+        module = load_module()
+        compatibility = {
+            "dataset_id": "ashare_merged_qfq_compatibility",
+            "lifecycle": "compatibility_output",
+            "adjustment": {
+                "method": "local_factor",
+                "evidence_status": "historical_snapshot",
+            },
+            "upstream_snapshot_id": "qfq-good",
+            "upstream_content_sha256": "b" * 64,
+        }
+        datasets = {
+            "ashare_daily_qfq": {
+                "dataset_id": "ashare_daily_qfq",
+                "status": "blocked",
+                "adjustment": {
+                    "method": "local_factor",
+                    "evidence_status": "raw_factor_snapshot_missing",
+                },
+            },
+            "ashare_merged_qfq_compatibility": compatibility,
+        }
+
+        module._enrich_compatibility_entries(datasets)
+
+        self.assertEqual(compatibility["upstream_snapshot_id"], "qfq-good")
+        self.assertEqual(compatibility["upstream_content_sha256"], "b" * 64)
+        self.assertEqual(
+            compatibility["adjustment"]["evidence_status"],
+            "historical_snapshot",
+        )
+
+    def test_corrupt_dynamic_latest_pointer_remains_visible_as_blocked(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            dataset_root = quant_data / "parquet" / "etf_1d" / "custom_etf_qfq"
+            dataset_root.mkdir(parents=True)
+            (dataset_root / "LATEST.json").write_text("{broken", encoding="utf-8")
+            quant_data.joinpath("DATA_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "datasets": {
+                            "custom_etf_qfq": {
+                                "dataset_id": "custom_etf_qfq",
+                                "data_kind": "daily_bars",
+                                "role": "canonical",
+                                "status": "ready",
+                                "price_basis": "qfq",
+                                "dataset_root": "parquet/etf_1d/custom_etf_qfq",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["datasets"]["custom_etf_qfq"]
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn("latest_pointer_invalid", entry["blocker_codes"])
+
+    def test_corrupt_dynamic_snapshot_manifest_remains_visible_as_blocked(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            dataset_root = quant_data / "parquet" / "etf_1d" / "custom_etf_qfq"
+            snapshot = dataset_root / "snapshots" / "snap-001"
+            snapshot.mkdir(parents=True)
+            (snapshot / "DATASET_MANIFEST.json").write_text("{broken", encoding="utf-8")
+            (dataset_root / "LATEST.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "dataset_id": "custom_etf_qfq",
+                        "snapshot_id": "snap-001",
+                        "snapshot_path": "parquet/etf_1d/custom_etf_qfq/snapshots/snap-001",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["datasets"]["custom_etf_qfq"]
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn("snapshot_manifest_invalid", entry["blocker_codes"])
+
     def test_manifest_discovers_published_qlib_v2_snapshot(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:

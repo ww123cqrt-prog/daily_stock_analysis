@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import uuid
+from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,11 +19,21 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root as default_quant_data_root  # noqa: E402
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from quant_data_contract import (  # noqa: E402
     DataContractError,
+    atomic_write_json,
     describe_dataset,
     resolve_dataset,
     validate_dataset_snapshot,
+)
+
+
+ASHARE_UPDATE_POINTERS = (
+    Path("DATA_MANIFEST.json"),
+    Path("parquet/ashare_1d/ashare_daily_raw/LATEST.json"),
+    Path("parquet/ashare_1d/ashare_daily_qfq/LATEST.json"),
+    Path("qlib/cn_data_ashare_v2/LATEST.json"),
 )
 
 
@@ -37,6 +51,80 @@ def _read_catalog(root: Path) -> dict[str, Any]:
 
 def _json_dump(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _capture_file_state(root: Path) -> dict[Path, bytes | None]:
+    return {
+        root / relative: (root / relative).read_bytes()
+        if (root / relative).is_file()
+        else None
+        for relative in ASHARE_UPDATE_POINTERS
+    }
+
+
+def _atomic_restore_bytes(path: Path, previous: bytes | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if previous is None:
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.restore")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(previous)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_file_state(state: Mapping[Path, bytes | None]) -> None:
+    failures: list[str] = []
+    for path, previous in state.items():
+        try:
+            _atomic_restore_bytes(path, previous)
+        except OSError:
+            failures.append(path.name)
+    if failures:
+        raise DataContractError(
+            "failed to restore formal update pointers: " + ", ".join(failures)
+        )
+
+
+def _write_update_status(root: Path, payload: Mapping[str, Any]) -> None:
+    atomic_write_json(
+        root / "runtime" / "status" / "quant_data_update_latest.json",
+        {"updated_at": _timestamp(), **dict(payload)},
+    )
+
+
+def _try_write_update_status(root: Path, payload: Mapping[str, Any]) -> str | None:
+    try:
+        _write_update_status(root, payload)
+    except Exception as exc:
+        error_type = type(exc).__name__
+        print(
+            f"WARNING: quant_data update status could not be written ({error_type})",
+            file=sys.stderr,
+        )
+        return error_type
+    return None
 
 
 def _human_description(payload: dict[str, Any]) -> str:
@@ -75,11 +163,17 @@ def _human_description(payload: dict[str, Any]) -> str:
         f"因子目录: {adjustment.get('factor_path', 'not_applicable')}",
         f"因子索引: {payload.get('factor_index_path', 'not_applicable')}",
         f"公司行为文件: {payload.get('corporate_actions_path', 'not_applicable')}",
-        f"内容哈希: {payload.get('content_sha256', 'unknown')}",
+        f"内容哈希: {payload.get('content_sha256') or payload.get('upstream_content_sha256', 'unknown')}",
+        f"上游数据集: {payload.get('upstream_dataset_id', 'not_applicable')}",
+        f"上游快照: {payload.get('upstream_snapshot_id', 'not_applicable')}",
         f"生成脚本: {producer.get('script', 'unknown')} / {producer.get('version', 'unknown')}",
         f"存储位置: {payload.get('snapshot_path') or payload.get('path', 'unknown')}",
     ]
-    if not payload.get("snapshot_available", False):
+    if payload.get("lifecycle") == "compatibility_output":
+        lines.append(
+            "正式兼容输出: 是；保持旧程序的固定路径和列结构，真实复权因子请查看上游 V2 快照。"
+        )
+    elif not payload.get("snapshot_available", False):
         lines.append("正式快照: 无；该数据只能审计，不能通过统一解析接口用于训练或回测。")
     return "\n".join(lines)
 
@@ -152,15 +246,110 @@ def _update(
     bundle_dir: Path | None,
 ) -> int:
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
+        from build_qlib_v2 import build_qlib_v2
         from download_baostock_v2 import build_snapshots_from_bundle
+        from publish_v2_compatibility import rebuild_and_publish_v1_compatibility
 
-        raw, qfq = build_snapshots_from_bundle(
-            bundle_dir=bundle_dir,
-            quant_data_root=root,
-            publish=True,
-        )
-        _json_dump({"raw": str(raw), "qfq": str(qfq)})
-        return 0
+        update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
+        update_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        update_lock_handle = update_lock_path.open("a+b")
+        try:
+            lock_file(update_lock_handle, exclusive=True, blocking=False)
+        except BlockingIOError as exc:
+            update_lock_handle.close()
+            raise DataContractError(
+                "A-share v2 update is already in progress"
+            ) from exc
+        except Exception:
+            update_lock_handle.close()
+            raise
+
+        previous_files: dict[Path, bytes | None] = {}
+        completed_steps: list[str] = []
+        failed_step = "capture_state"
+        started_at = _timestamp()
+        try:
+            previous_files = _capture_file_state(root)
+            failed_step = "raw_qfq_v2"
+            raw, qfq = build_snapshots_from_bundle(
+                bundle_dir=bundle_dir,
+                quant_data_root=root,
+                publish=True,
+            )
+            completed_steps.append("raw_qfq_v2")
+            failed_step = "qlib_v2"
+            qlib_v2 = build_qlib_v2(quant_data_root=root, publish=True)
+            completed_steps.append("qlib_v2")
+            failed_step = "compatibility"
+            compatibility = rebuild_and_publish_v1_compatibility(
+                quant_data_root=root,
+            )
+            completed_steps.append("compatibility")
+        except Exception as exc:
+            try:
+                _restore_file_state(previous_files)
+            except Exception as rollback_exc:
+                status_error = _try_write_update_status(
+                    root,
+                    {
+                        "status": "rollback_failed",
+                        "dataset_id": dataset_id,
+                        "started_at": started_at,
+                        "failed_step": failed_step,
+                        "completed_steps": completed_steps,
+                        "error_type": type(exc).__name__,
+                        "rollback_error_type": type(rollback_exc).__name__,
+                    },
+                )
+                message = (
+                    f"A-share update failed during {failed_step} "
+                    f"({type(exc).__name__}); rollback also failed "
+                    f"({type(rollback_exc).__name__})"
+                )
+                if status_error:
+                    message += f"; status record failed ({status_error})"
+                raise DataContractError(message) from rollback_exc
+            status_error = _try_write_update_status(
+                root,
+                {
+                    "status": "rolled_back",
+                    "dataset_id": dataset_id,
+                    "started_at": started_at,
+                    "failed_step": failed_step,
+                    "completed_steps": completed_steps,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            message = f"A-share update failed during {failed_step} and was rolled back"
+            if status_error:
+                message += f"; status record failed ({status_error})"
+            raise DataContractError(message) from exc
+        else:
+            status_error = _try_write_update_status(
+                root,
+                {
+                    "status": "completed",
+                    "dataset_id": dataset_id,
+                    "started_at": started_at,
+                    "completed_steps": completed_steps,
+                },
+            )
+            output = {
+                "raw": str(raw),
+                "qfq": str(qfq),
+                "qlib_v2": str(qlib_v2),
+                "compatibility": compatibility,
+            }
+            if status_error:
+                output["status_record"] = {
+                    "status": "write_failed",
+                    "error_type": status_error,
+                }
+            _json_dump(output)
+            return 0
+        finally:
+            unlock_file(update_lock_handle)
+            update_lock_handle.close()
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"}:
         payload = describe_dataset(dataset_id, quant_data_root=root)
         blockers = payload.get("blocker_codes") or []

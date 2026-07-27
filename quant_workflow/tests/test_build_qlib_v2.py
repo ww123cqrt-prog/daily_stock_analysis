@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,14 +35,14 @@ def publish_qfq_fixture(root: Path) -> None:
             "low": [9.9, 10.0],
             "close": [10.1, 10.2],
             "volume": [1000.0, 1100.0],
-            "factor": [1.0, 1.0],
+            "factor": [0.5, 1.0],
             "source_id": ["baostock", "baostock"],
         }
     ).to_parquet(bars / "SH600000.parquet", index=False)
     pd.DataFrame(
         {
             "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
-            "factor": [1.0, 1.0],
+            "factor": [0.5, 1.0],
         }
     ).to_parquet(factors / "SH600000.parquet", index=False)
     pd.DataFrame(
@@ -108,3 +109,8 @@ def test_build_and_publish_qlib_v2_tracks_exact_qfq_snapshot(tmp_path: Path) -> 
     assert resolved.manifest["latest_trade_date"] == "2026-07-24"
     assert provider["source_snapshot"]["snapshot_id"] == "qfq-source-001"
     assert (published / "features" / "sh600000" / "close.day.bin").is_file()
+    factor_values = np.fromfile(
+        published / "features" / "sh600000" / "factor.day.bin", dtype="<f4"
+    )
+    assert factor_values[1:].tolist() == [1.0, 1.0]
+    assert provider["conversion"]["factor_semantics"] == "unit_factor_prices_already_qfq"

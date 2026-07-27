@@ -141,7 +141,7 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 10. `apply_data_cleaning.py`：套用清洗规则，在 staging 目录生成 cleaned parquet/Qlib 候选，并按目标日历重建基准特征。
 11. `report_data_quality.py`：对候选数据执行跨源一致性、结构、规模和基准完整性检查；不可训练时返回非零。
 12. `check_qlib_data.py`：最终检查候选 provider 的日历、股票池和三套基准完整性。
-13. `publish_daily_candidate.py`：只有全部必需检查通过后，才原子切换 merged/cleaned 四个正式目录并同步 `DATA_MANIFEST.json`；发布或 manifest 失败时回滚旧正式目录。
+13. 当 `ashare_daily_qfq` V2 尚未就绪时，`publish_daily_candidate.py` 只服务旧流程；V2 就绪后它会拒绝覆盖固定路径。正式路径改由 `publish_v2_compatibility.py` 从 V2 快照重建四套候选、全部校验后成组切换，并把迁移前数据保存在 `_old`。
 
 编排器带 A 股交易日和覆盖率双 gate：只允许本次明确选择的一个 A 股历史来源参与刷新；默认至少 80% 的股票在合法来源覆盖目标日，才允许进入合并发布。全球日线、新闻原始证据和 ETF 更新是独立非致命阶段，不会放宽 A 股发布门禁。来源被拒绝、连续失败或达到请求预算时下载阶段返回非零；若没有新交易日也没有可发布重建，整条链路不会伪报成功。`--skip-download` 只重建、不下载，`--dry-run` 只打印计划，`--limit` 用于小样本演练。每次运行记录阶段状态、用时、退出码、覆盖率、ETF 数据日期和实际发布结果。
 

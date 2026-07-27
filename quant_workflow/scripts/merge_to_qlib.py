@@ -268,6 +268,7 @@ def convert_to_bin(
     dropna_fields: list[str] | None = None,
     calendar_path: Path | None = None,
     source_contract: dict[str, str] | None = None,
+    force_unit_factor: bool = False,
 ) -> int:
     if overwrite and dst_dir.exists():
         shutil.rmtree(dst_dir)
@@ -294,7 +295,11 @@ def convert_to_bin(
         if df.empty:
             continue
 
-        if "factor" not in df.columns:
+        if force_unit_factor:
+            # Qlib receives already-forward-adjusted prices. Keep the V1
+            # contract's unit factor; the real factor evidence stays in V2.
+            df["factor"] = 1.0
+        elif "factor" not in df.columns:
             df["factor"] = 1.0
 
         date_str = df["date"].dt.strftime("%Y-%m-%d")
@@ -411,6 +416,11 @@ def convert_to_bin(
             "conversion": {
                 "script": "merge_to_qlib.py",
                 "fields": QLIB_FIELDS,
+                "factor_semantics": (
+                    "unit_factor_prices_already_qfq"
+                    if force_unit_factor
+                    else "source_factor"
+                ),
                 "calendar_sha256": sha256_file(dst_dir / "calendars" / "day.txt"),
                 "instruments_sha256": sha256_file(
                     dst_dir / "instruments" / "all.txt"

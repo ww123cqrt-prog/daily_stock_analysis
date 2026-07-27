@@ -102,6 +102,16 @@ Naming convention:
   it to an immutable Qlib provider, records the upstream snapshot ID and
   content hash in `PROVIDER_MANIFEST.json`, and publishes the Qlib pointer and
   root catalog with rollback on failure.
+- `publish_v2_compatibility.py` rebuilds the four stable V1 Parquet/Qlib paths
+  from the exact governed qfq snapshot. It preserves six-digit Parquet names,
+  nanosecond dates, the V1 column order, and unit Qlib factors because prices
+  are already qfq. It runs a fresh anomaly/cleaning pass, installs Tencent
+  CSI300/CSI500/CSI800 benchmark features, validates all four candidates, then
+  promotes them together under an exclusive publication lock. Candidate
+  publication also verifies the exact `stock_lists.json` hash used to build
+  CSI300. Tencent benchmark requests are rate-limited and use bounded retry;
+  one missing benchmark rejects the full candidate. On the first promotion,
+  previous V1 outputs are retained under `_old` for rollback and audit.
 - `sync_data_manifest.py` writes schema-v2 `DATA_MANIFEST.json`, keeps all data
   paths relative to `QUANT_DATA_ROOT`, refreshes generated README catalog
   blocks, and supports `--check` for catalog/path/README drift.

@@ -27,10 +27,33 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 | A 股 Baostock raw (`ashare_daily_raw`) | `canonical/ready` | 保存完整 raw 行情、来源、逐文件哈希和公司行为记录 |
 | A 股 Baostock qfq (`ashare_daily_qfq`) | `canonical/ready` | 使用 Baostock `foreAdjustFactor` 本地计算，保存完整因子并用同源 qfq 核验 |
 | A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，并锁定准确的上游快照 ID 和内容哈希 |
-| 旧 JQData/东方财富/AkShare、merged/cleaned/Qlib | `audit/legacy_unknown` | 旧流程兼容入口，不得冒充新的正式 v2 数据集 |
+| 旧 JQData/东方财富/AkShare 来源目录 | `audit/legacy_unknown` | 仅审计，不再直接合并生成正式输出 |
+| V1 固定路径 merged/cleaned/Qlib | `canonical/ready` 兼容输出 | 由 `ashare_daily_qfq` 重新生成，旧程序无需改路径 |
+| 带 `_old` 后缀的 merged/cleaned/Qlib | `audit/legacy_unknown` | 迁移前旧数据，只用于回滚和审计 |
 | PIT CSI800 和参考表 | `canonical/ready`（完整时） | 由原有事务锁和内容哈希保护，仍在逐步迁移到统一快照结构 |
 
-首个正式 A 股 v2 快照覆盖到 `2026-07-24`。后续是否已更新到更晚日期，必须以 `quant_data_cli.py describe` 和根 `DATA_MANIFEST.json` 为准，不能把本文日期当成动态状态。旧 A 股数据没有被移动或删除，仍作为兼容和审计数据保留。
+首个正式 A 股 v2 快照覆盖到 `2026-07-24`。后续是否已更新到更晚日期，必须以 `quant_data_cli.py describe` 和根 `DATA_MANIFEST.json` 为准，不能把本文日期当成动态状态。迁移前旧 A 股输出改名为 `_old` 后保留，仅供回滚和审计。
+
+## V2 内部与 V1 对外契约
+
+V2 内部继续使用不可变快照、真实复权因子、公司行为、文件哈希和原子指针：
+
+```text
+parquet/ashare_1d/ashare_daily_raw/snapshots/<snapshot_id>/
+parquet/ashare_1d/ashare_daily_qfq/snapshots/<snapshot_id>/
+qlib/cn_data_ashare_v2/snapshots/<snapshot_id>/
+```
+
+旧程序继续读取原路径，不需要增加路径兼容层：
+
+```text
+parquet/ashare_1d/merged_baostock_jqdata/
+parquet/ashare_1d/merged_baostock_jqdata_cleaned/
+qlib/cn_data_baostock_jqdata/
+qlib/cn_data_baostock_jqdata_cleaned/
+```
+
+这些固定路径由 `publish_v2_compatibility.py` 从同一个 `ashare_daily_qfq` 快照成组生成。Parquet 保持六位文件名、V1 列顺序和 `datetime64[ns]`；价格已经前复权，因此对外 `factor=1.0`。真实逐日因子只保存在 V2 `factors/`，不能把对外单位因子误解为“没有复权”。清单中的兼容输出会把 `factor_path` 写成包含数据集根、快照 ID 和 `factors/` 的完整相对路径，不会伪装成兼容目录自己保存了因子。每次发布前重新做异常扫描、清洗、CSI300、三套指数基准和四套候选校验；候选同时锁定 `stock_lists.json` 内容哈希，股票池或四套产物任一变化都必须重新构建。发布过程持有单实例锁，四套中任一失败，原固定路径全部保持不变。
 
 ## 清单结构
 
@@ -138,12 +161,12 @@ python quant_workflow/scripts/download_baostock_v2.py download \
   --through YYYY-MM-DD \
   --resume
 
-# bundle 安全传回并验证后，raw/qfq 两个指针作为一组切换
+# bundle 安全传回并验证后，更新 raw/qfq、Qlib v2 和四套 V1 兼容输出
 python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir <verified-bundle>
 ```
 
-任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。raw 和 qfq staging 都通过哈希校验后才切换两个正式指针；任一指针或根 `DATA_MANIFEST.json` 写入失败时，两个指针、根清单和 staging 全部恢复到更新前状态。
+任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。完整更新链路持有 `runtime/locks/ashare_v2_update.lock` 单实例锁，第二个并发更新会在改写任何正式指针前退出。raw 和 qfq staging 都通过哈希校验后才切换内部指针。随后重建 Qlib v2 和四套 V1 兼容候选；Qlib 或兼容步骤失败时，命令会把根清单和 raw/qfq/Qlib 三个正式指针恢复到更新前状态，并在 `runtime/status/quant_data_update_latest.json` 写明 `rolled_back`。已经完成校验但失去正式指针的不可变快照可以保留作审计，它们不会被 `resolve` 选中。整个流程完成后才写 `completed`；回滚本身失败则明确写 `rollback_failed`，不能把内部快照更新误报成训练入口已更新。
 
 ## Qlib 血缘
 
@@ -155,7 +178,7 @@ python quant_workflow/scripts/build_qlib_v2.py --publish
 
 该命令只解析 `ashare_daily_qfq` 的 `ready/qfq` 快照，生成不可变 `qlib_ashare_v2`，并将精确的上游快照 ID 和内容哈希写进 provider 清单。Qlib 指针与根清单使用同一回滚事务。
 
-`qlib_ashare_v2` 是当前新的正式 Qlib 入口；旧 `cn_data_baostock_jqdata*` provider 继续作为兼容数据保留。读取方应通过 `quant_data_cli.py resolve qlib_ashare_v2 --require-basis qfq` 解析正式快照，不得根据目录名自行选择 provider。
+`qlib_ashare_v2` 是可追溯的内部正式 Qlib 快照。`cn_data_baostock_jqdata*` 是从同一 V2 快照生成的稳定对外路径，供现有 DSA、训练和回测程序继续读取；它们不再是旧数据。迁移前 provider 位于对应 `_old` 目录，只能审计或回滚。
 
 ## 失败规则
 
@@ -163,6 +186,7 @@ python quant_workflow/scripts/build_qlib_v2.py --publish
 - 两只 ETF 只成功一只：不发布。
 - 因子日期不覆盖行情、哈希变化、公司行为缺失：拒绝解析或发布。
 - 请求 qfq 却解析到 raw：明确报错。
+- 腾讯指数基准请求按固定间隔发送，连接错误、429 和 5xx 最多重试三次并指数退避；任一指数仍失败时，三套基准都不发布。
 - 清单过期、README 漂移或出现未登记目录：`sync_data_manifest.py --check` 返回非零。
 - 旧数据清理、移动或删除：必须另行 dry-run 并取得用户明确确认。
 

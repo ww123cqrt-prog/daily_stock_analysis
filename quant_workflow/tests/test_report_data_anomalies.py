@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -15,6 +16,41 @@ def load_module():
 
 
 class ReportDataAnomaliesTest(unittest.TestCase):
+    def test_scan_uses_compatibility_index_instead_of_loading_dates_twice(self):
+        module = load_module()
+        with self.subTest("compatibility metadata"):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                pd.DataFrame(
+                    {
+                        "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
+                        "open": [10.0, 10.1],
+                        "high": [10.2, 10.3],
+                        "low": [9.9, 10.0],
+                        "close": [10.1, 10.2],
+                        "volume": [1000.0, 1200.0],
+                    }
+                ).to_parquet(directory / "600000.parquet", index=False)
+                metadata = directory / ".metadata"
+                metadata.mkdir()
+                pd.DataFrame(
+                    {
+                        "first_date": ["2026-07-23"],
+                        "last_date": ["2026-07-24"],
+                    }
+                ).to_parquet(metadata / "FILE_INDEX.parquet", index=False)
+                with patch.object(
+                    module,
+                    "dataset_date_range",
+                    side_effect=AssertionError("must not rescan date columns"),
+                ):
+                    _summary, _events, coverage = module.scan_merged_files(directory)
+
+        self.assertEqual(coverage["start"], "2026-07-23")
+        self.assertEqual(coverage["end"], "2026-07-24")
+
     def test_report_records_the_candidate_merged_directory(self):
         module = load_module()
         candidate = Path("/tmp/daily-candidate/cleaned-parquet")

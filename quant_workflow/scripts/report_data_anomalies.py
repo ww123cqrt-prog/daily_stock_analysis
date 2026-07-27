@@ -324,9 +324,26 @@ def dataset_date_range(paths: list[Path]) -> tuple[pd.Timestamp | None, pd.Times
     return min(starts), max(ends)
 
 
+def indexed_date_range(directory: Path) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    index_path = Path(directory) / ".metadata" / "FILE_INDEX.parquet"
+    if not index_path.is_file():
+        return None, None
+    try:
+        index = pd.read_parquet(index_path, columns=["first_date", "last_date"])
+    except Exception:
+        return None, None
+    starts = pd.to_datetime(index["first_date"], errors="coerce").dropna()
+    ends = pd.to_datetime(index["last_date"], errors="coerce").dropna()
+    if starts.empty or ends.empty:
+        return None, None
+    return starts.min(), ends.max()
+
+
 def scan_merged_files(directory: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     paths = sorted(directory.glob("*.parquet"))
-    dataset_start, dataset_end = dataset_date_range(paths)
+    dataset_start, dataset_end = indexed_date_range(directory)
+    if dataset_end is None:
+        dataset_start, dataset_end = dataset_date_range(paths)
     if dataset_end is None:
         dataset_end = pd.Timestamp.today().normalize()
 

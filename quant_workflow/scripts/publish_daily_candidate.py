@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _daily_update_runtime import write_json_atomic  # noqa: E402
 from _paths import quant_data_root as default_quant_data_root, reports_root as default_reports_root  # noqa: E402
+from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
 from sync_data_manifest import sync_data_manifest  # noqa: E402
 
 
@@ -30,15 +31,114 @@ REQUIRED_ARTIFACTS = (
 )
 
 
+def _has_v2_publication_evidence(
+    quant_data_root: Path, targets: dict[str, Path]
+) -> bool:
+    root = Path(quant_data_root)
+    marker_paths = [
+        root
+        / "parquet"
+        / "ashare_1d"
+        / "ashare_daily_qfq"
+        / "LATEST.json",
+        root / "qlib" / "cn_data_ashare_v2" / "LATEST.json",
+    ]
+    if any(path.is_file() for path in marker_paths):
+        return True
+    for name in ("merged_parquet", "cleaned_parquet"):
+        parquet_target = targets.get(name)
+        if parquet_target is None:
+            continue
+        compatibility_marker = (
+            Path(parquet_target)
+            / ".metadata"
+            / "COMPATIBILITY_MANIFEST.json"
+        )
+        if compatibility_marker.is_file():
+            return True
+    for name in ("merged_qlib", "cleaned_qlib"):
+        target = targets.get(name)
+        if target is None:
+            continue
+        provider_marker = Path(target) / "PROVIDER_MANIFEST.json"
+        if provider_marker.is_file():
+            return True
+    return False
+
+
 def _restore_manifest(path: Path, previous: bytes | None) -> None:
     if previous is None:
         if path.exists():
             path.unlink()
+            _fsync_directory(path.parent)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(previous)
-    os.replace(temporary, path)
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(previous)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_with_rollback_retries(source: Path, target: Path) -> None:
+    last_error: OSError | None = None
+    for _attempt in range(3):
+        try:
+            source.replace(target)
+            return
+        except OSError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def _rollback_publication(
+    *,
+    promoted: list[str],
+    backed_up: list[str],
+    candidates: dict[str, Path],
+    targets: dict[str, Path],
+    backup_root: Path,
+) -> list[str]:
+    errors: list[str] = []
+    for name in reversed(promoted):
+        target = targets[name]
+        candidate = candidates[name]
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            continue
+        try:
+            _replace_with_rollback_retries(target, candidate)
+        except OSError as exc:
+            errors.append(f"restore candidate {name}: {type(exc).__name__}")
+    for name in reversed(backed_up):
+        backup = backup_root / name
+        target = targets[name]
+        if not backup.exists():
+            continue
+        if target.exists():
+            errors.append(f"restore official {name}: target is still occupied")
+            continue
+        try:
+            _replace_with_rollback_retries(backup, target)
+        except OSError as exc:
+            errors.append(f"restore official {name}: {type(exc).__name__}")
+    return errors
 
 
 def _validate_artifacts(candidates: dict[str, Path], targets: dict[str, Path], backup_root: Path) -> None:
@@ -72,6 +172,24 @@ def publish_candidates(
     backup_root = Path(backup_root)
     quant_data_root = Path(quant_data_root)
     reports_root = Path(reports_root)
+    try:
+        resolve_dataset(
+            "ashare_daily_qfq",
+            quant_data_root=quant_data_root,
+            require_basis="qfq",
+        )
+    except (DataContractError, OSError, ValueError):
+        if _has_v2_publication_evidence(quant_data_root, targets):
+            raise RuntimeError(
+                "V2 compatibility evidence exists; legacy publisher cannot "
+                "replace the official compatibility paths even though the V2 "
+                "catalog cannot currently be resolved."
+            )
+    else:
+        raise RuntimeError(
+            "V2 canonical data is ready; legacy publisher cannot replace V1 "
+            "compatibility paths. Use publish_v2_compatibility.py."
+        )
     _validate_artifacts(candidates, targets, backup_root)
     backup_root.mkdir(parents=True, exist_ok=True)
 
@@ -94,19 +212,24 @@ def publish_candidates(
             quant_data_root=quant_data_root,
             reports_root=reports_root,
         )
-    except Exception:
-        for name in reversed(promoted):
-            target = targets[name]
-            candidate = candidates[name]
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                target.replace(candidate)
-        for name in reversed(backed_up):
-            backup = backup_root / name
-            target = targets[name]
-            if backup.exists():
-                backup.replace(target)
-        _restore_manifest(manifest_path, previous_manifest)
+    except Exception as publish_error:
+        rollback_errors = _rollback_publication(
+            promoted=promoted,
+            backed_up=backed_up,
+            candidates=candidates,
+            targets=targets,
+            backup_root=backup_root,
+        )
+        try:
+            _restore_manifest(manifest_path, previous_manifest)
+        except Exception as exc:
+            rollback_errors.append(f"restore manifest: {type(exc).__name__}")
+        if rollback_errors:
+            raise RuntimeError(
+                "Legacy publication failed "
+                f"({type(publish_error).__name__}) and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from publish_error
         raise
 
     return {
