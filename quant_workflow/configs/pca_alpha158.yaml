@@ -2,7 +2,7 @@
 # quant_workflow.experimental.pca_handler is validated against Qlib grouped
 # feature/label semantics.
 qlib_init:
-  provider_uri: "quant_data/qlib/cn_data_baostock_jqdata"
+  provider_uri: "RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME"
   region: "cn"
 
 task:

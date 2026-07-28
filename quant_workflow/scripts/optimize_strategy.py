@@ -32,6 +32,13 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import mlruns_root, qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _mlflow_run_provenance import (  # noqa: E402
+    experiment_run_ids,
+    provider_identity,
+    select_matching_prediction_run,
+    select_new_prediction_run,
+    tag_run_with_provider,
+)
 from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
 
 
@@ -51,6 +58,20 @@ def configure_mlflow_env() -> None:
     os.environ["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
 
 
+def _experiment_by_name(client, experiment_name: str):
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is not None:
+        return experiment
+    return next(
+        (
+            item
+            for item in client.search_experiments()
+            if item.name == experiment_name
+        ),
+        None,
+    )
+
+
 def init_qlib(data_dir: Path = DATA_DIR):
     """Initialize Qlib lazily so browser-safe dry-runs can import this module."""
     configure_mlflow_env()
@@ -60,36 +81,80 @@ def init_qlib(data_dir: Path = DATA_DIR):
     return qlib
 
 
+def write_training_config_with_provider(
+    config_path: Path,
+    provider_uri: Path,
+    *,
+    output_dir: Path = REPORT_DIR / "runtime_configs",
+) -> Path:
+    """Create a per-run Qlib config locked to one resolved native snapshot."""
+
+    import yaml
+
+    config_path = Path(config_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    qlib_init = dict(payload.get("qlib_init") or {})
+    qlib_init["provider_uri"] = str(Path(provider_uri))
+    payload["qlib_init"] = qlib_init
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    runtime = output_dir / f"{config_path.stem}_canonical_{stamp}.yaml"
+    temporary = runtime.with_name(f".{runtime.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary, runtime)
+    return runtime
+
+
 # ═══════════════════════════════════════════════════════════
 #  Step 0: 训练基线选股模型并获取预测
 # ═══════════════════════════════════════════════════════════
 
-def train_and_predict(config_path: str, experiment_name: str):
+def train_and_predict(
+    config_path: str,
+    experiment_name: str,
+    provider_uri: Path = DATA_DIR,
+):
     """训练选股模型并返回预测结果。"""
     configure_mlflow_env()
     from qlib.cli.run import workflow
+    import mlflow
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    experiment = _experiment_by_name(client, experiment_name)
+    before_run_ids = (
+        experiment_run_ids(client, str(experiment.experiment_id))
+        if experiment is not None
+        else set()
+    )
 
     print(f"\n{'='*60}")
-    print(f"[训练] Config: {config_path}")
+    runtime_config = write_training_config_with_provider(
+        Path(config_path), Path(provider_uri)
+    )
+    print(f"[训练] Config: {runtime_config}")
     print(f"[训练] Experiment: {experiment_name}")
     print(f"{'='*60}\n")
 
-    workflow(config_path, experiment_name=experiment_name, uri_folder=str(MLRUNS_DIR))
-
-    # 从MLflow加载预测结果
-    import mlflow
-    client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    exp = client.get_experiment_by_name(experiment_name)
-    if exp is None:
-        experiments = client.search_experiments()
-        exp = next((item for item in experiments if item.name == experiment_name), None)
-
-    runs = client.search_runs(
-        experiment_ids=[exp.experiment_id],
-        order_by=["start_time DESC"],
-        max_results=1,
+    workflow(
+        str(runtime_config),
+        experiment_name=experiment_name,
+        uri_folder=str(MLRUNS_DIR),
     )
-    run = runs[0]
+
+    experiment = _experiment_by_name(client, experiment_name)
+    if experiment is None:
+        raise RuntimeError("training experiment was not created")
+    run = select_new_prediction_run(
+        client,
+        str(experiment.experiment_id),
+        before_run_ids,
+    )
+    identity = provider_identity(Path(provider_uri))
+    tag_run_with_provider(client, str(run.info.run_id), identity)
 
     # 下载预测结果
     pred_path = client.download_artifacts(run.info.run_id, "pred.pkl")
@@ -100,41 +165,25 @@ def train_and_predict(config_path: str, experiment_name: str):
     return pred, label, run.data.metrics
 
 
-def load_existing_predictions(experiment_name: str = "baseline_lgb_alpha158"):
+def load_existing_predictions(
+    experiment_name: str = "baseline_lgb_alpha158",
+    provider_uri: Path = DATA_DIR,
+):
     """从已有MLflow run加载预测，不重新训练。"""
     configure_mlflow_env()
     import mlflow
-    import yaml as yaml_mod
 
     client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    exp = client.get_experiment_by_name(experiment_name)
-    if exp is None:
-        experiments = client.search_experiments()
-        exp = next((item for item in experiments if item.name == experiment_name), None)
-    if exp is None:
+    experiment = _experiment_by_name(client, experiment_name)
+    if experiment is None:
         return None, None, {}
-
-    runs = client.search_runs(
-        experiment_ids=[exp.experiment_id],
-        order_by=["start_time DESC"],
-        max_results=1,
+    run = select_matching_prediction_run(
+        client,
+        str(experiment.experiment_id),
+        provider_identity(Path(provider_uri)),
     )
-    if not runs:
-        # Fallback: 直接从文件系统读取
-        exp_dir = MLRUNS_DIR / exp.experiment_id
-        run_dirs = sorted(
-            [p for p in exp_dir.iterdir() if p.is_dir() and (p / "meta.yaml").exists()],
-            key=lambda p: (p / "meta.yaml").stat().st_mtime,
-            reverse=True,
-        )
-        if not run_dirs:
-            return None, None, {}
-        run_dir = run_dirs[0]
-        pred = pd.read_pickle(run_dir / "artifacts" / "pred.pkl")
-        label = pd.read_pickle(run_dir / "artifacts" / "label.pkl")
-        return pred, label, {}
-
-    run = runs[0]
+    if run is None:
+        return None, None, {}
     pred_path = client.download_artifacts(run.info.run_id, "pred.pkl")
     pred = pd.read_pickle(pred_path)
     label_path = client.download_artifacts(run.info.run_id, "label.pkl")

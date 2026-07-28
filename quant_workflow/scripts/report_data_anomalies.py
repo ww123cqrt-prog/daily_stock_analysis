@@ -17,13 +17,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import ashare_qfq_bars_dir, quant_data_root, reports_root, workflow_root  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
 WORKFLOW = workflow_root()
 
-MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+MERGED_DIR: Path | None = None
 REPORT_DIR = reports_root()
 
 REQUIRED_FIELDS = ["open", "close", "high", "low", "volume"]
@@ -487,7 +487,9 @@ Generated: {generated}
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument(
+        "--merged-dir", type=Path, default=MERGED_DIR or ashare_qfq_bars_dir()
+    )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     args = parser.parse_args()
 

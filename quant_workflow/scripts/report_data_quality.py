@@ -19,7 +19,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    ashare_qfq_bars_dir,
+    qlib_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
+from _symbols import normalize_symbol  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
@@ -29,14 +36,16 @@ BAOSTOCK_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "baostock_qfq"
 JQDATA_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
 EASTMONEY_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "eastmoney_qfq"
 AKSHARE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "akshare_qfq"
-MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
-QLIB_DIR = qlib_provider_uri()
+MERGED_DIR: Path | None = None
+QLIB_DIR: Path | None = None
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
 EMPTY_CODES = QUANT_DATA / "baostock_empty_codes.json"
 TIMEOUT_CODES = QUANT_DATA / "baostock_timeout_codes.json"
 REPORT_DIR = reports_root()
 LATEST_TRAINING_RESULT_FILENAME = "latest_training_result.json"
-BENCHMARK_FEATURES = {"sh000300"}
+BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+BENCHMARK_FEATURES = {symbol.lower() for symbol in BENCHMARK_SYMBOLS}
+BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
 
 NUMERIC_FIELDS = ["open", "close", "high", "low", "volume"]
 
@@ -107,7 +116,12 @@ def source_stats(name: str, directory: Path) -> SourceStats:
 
 
 def load_source_index(directory: Path) -> set[str]:
-    return {p.stem for p in directory.glob("*.parquet")} if directory.exists() else set()
+    if not directory.exists():
+        return set()
+    return {
+        normalize_symbol(path.stem, strip_any_suffix=True, strip_prefix=True)
+        for path in directory.glob("*.parquet")
+    }
 
 
 def scan_merged_files(directory: Path, sample_limit: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -261,47 +275,89 @@ def overlap_consistency(sample_limit: int = 0) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict[str, int | bool | str]:
-    close_path = provider_dir / "features" / "sh000300" / "close.day.bin"
-    if not calendar or not close_path.exists():
-        return {
-            "benchmark_complete": False,
-            "benchmark_first_observation": "",
-            "benchmark_missing_days": len(calendar),
-        }
-    raw = np.fromfile(close_path, dtype="<f4")
-    if len(raw) < 2:
-        return {
-            "benchmark_complete": False,
-            "benchmark_first_observation": "",
-            "benchmark_missing_days": len(calendar),
-        }
+def _aligned_benchmark_feature(path: Path, calendar_size: int) -> np.ndarray | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    raw = np.fromfile(path, dtype="<f4")
+    if len(raw) < 2 or not np.isfinite(raw[0]) or raw[0] != int(raw[0]):
+        return None
     start_idx = int(raw[0])
     values = raw[1:]
-    aligned = np.full(len(calendar), np.nan, dtype=np.float32)
-    if start_idx >= 0:
-        available = min(len(values), max(len(calendar) - start_idx, 0))
-        if available > 0:
-            aligned[start_idx:start_idx + available] = values[:available]
-    valid = np.isfinite(aligned) & (aligned > 0)
-    valid_positions = np.flatnonzero(valid)
-    if not len(valid_positions):
-        return {
-            "benchmark_complete": False,
-            "benchmark_first_observation": "",
-            "benchmark_missing_days": len(calendar),
+    if start_idx < 0 or start_idx + len(values) > calendar_size:
+        return None
+    aligned = np.full(calendar_size, np.nan, dtype=np.float32)
+    aligned[start_idx : start_idx + len(values)] = values
+    return aligned
+
+
+def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
+    details: dict[str, dict] = {}
+    total_missing_days = 0
+    first_observations: list[str] = []
+    for symbol in BENCHMARK_SYMBOLS:
+        feature_dir = provider_dir / "features" / symbol.lower()
+        missing_fields: list[str] = []
+        masks: list[np.ndarray] = []
+        first_positions: list[int] = []
+        price_missing_days = len(calendar)
+        factor_missing_days = len(calendar)
+        for field in BENCHMARK_FIELDS:
+            aligned = _aligned_benchmark_feature(
+                feature_dir / f"{field}.day.bin", len(calendar)
+            )
+            if aligned is None:
+                missing_fields.append(field)
+                continue
+            valid = np.isfinite(aligned)
+            valid &= aligned >= 0 if field == "volume" else aligned > 0
+            positions = np.flatnonzero(valid)
+            if not len(positions):
+                missing_fields.append(field)
+                continue
+            if field == "factor":
+                factor_missing_days = int((~valid).sum())
+                if factor_missing_days:
+                    missing_fields.append(field)
+                continue
+            first_positions.append(int(positions[0]))
+            masks.append(valid)
+        prices_complete = len(masks) == 5
+        same_dates = False
+        if prices_complete:
+            first = max(first_positions)
+            same_dates = all(np.array_equal(masks[0], mask) for mask in masks[1:])
+            price_missing_days = int((~masks[0][first:]).sum())
+            first_observation = calendar[first]
+            first_observations.append(first_observation)
+        else:
+            first_observation = ""
+        missing_days = max(price_missing_days, factor_missing_days)
+        complete = (
+            not missing_fields
+            and prices_complete
+            and same_dates
+            and missing_days == 0
+        )
+        details[symbol] = {
+            "complete": complete,
+            "first_observation": first_observation,
+            "missing_days": missing_days,
+            "missing_fields": missing_fields,
         }
-    first = int(valid_positions[0])
-    missing_days = int((~valid[first:]).sum())
+        total_missing_days += missing_days
     return {
-        "benchmark_complete": missing_days == 0,
-        "benchmark_first_observation": calendar[first],
-        "benchmark_missing_days": missing_days,
+        "benchmark_complete": bool(calendar)
+        and all(details[symbol]["complete"] for symbol in BENCHMARK_SYMBOLS),
+        "benchmark_first_observation": min(first_observations)
+        if first_observations
+        else "",
+        "benchmark_missing_days": total_missing_days,
+        "benchmark_details": details,
     }
 
 
-def qlib_provider_stats(provider_dir: Path = QLIB_DIR) -> dict:
-    provider_dir = Path(provider_dir)
+def qlib_provider_stats(provider_dir: Path | None = None) -> dict:
+    provider_dir = Path(provider_dir or qlib_provider_uri())
     cal = provider_dir / "calendars" / "day.txt"
     inst = provider_dir / "instruments" / "all.txt"
     calendar = cal.read_text(encoding="utf-8").splitlines() if cal.exists() else []
@@ -364,7 +420,7 @@ def build_training_readiness(
         blockers.append(f"Merged local dataset has fewer than {min_merged_instruments} instruments")
     if not qlib_stats.get("benchmark_complete", False):
         blockers.append(
-            "SH000300 benchmark is missing or incomplete "
+            "SH000300/SH000905/SH000906 benchmarks are missing or incomplete "
             f"({qlib_stats.get('benchmark_missing_days', 'unknown')} missing days)"
         )
     for key in ["duplicate_dates", "null_dates", "missing_columns", "bad_ohlc_rows"]:
@@ -399,11 +455,12 @@ def write_research_status(
     qlib_stats: dict,
     merged_success: set[str],
     issue_counts: dict[str, int],
-    provider_dir: Path = QLIB_DIR,
+    provider_dir: Path | None = None,
     min_calendar_days: int = 252,
     min_instruments: int = 100,
     min_merged_instruments: int = 100,
 ) -> Path:
+    provider_dir = Path(provider_dir or qlib_provider_uri())
     trainable, training_readiness = build_training_readiness(
         qlib_stats=qlib_stats,
         merged_success=merged_success,
@@ -464,17 +521,19 @@ def markdown_table(rows: list[dict], columns: list[str]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--overlap-sample", type=int, default=0, help="0 means all overlaps")
     parser.add_argument("--merged-sample", type=int, default=0, help="0 means all merged files")
-    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
-    parser.add_argument("--qlib-dir", type=Path, default=QLIB_DIR)
+    parser.add_argument("--merged-dir", type=Path, default=None)
+    parser.add_argument("--qlib-dir", type=Path, default=None)
     parser.add_argument("--min-calendar-days", type=int, default=252)
     parser.add_argument("--min-instruments", type=int, default=100)
     parser.add_argument("--fail-on-not-trainable", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.merged_dir = Path(args.merged_dir or MERGED_DIR or ashare_qfq_bars_dir())
+    args.qlib_dir = Path(args.qlib_dir or QLIB_DIR or qlib_provider_uri())
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)

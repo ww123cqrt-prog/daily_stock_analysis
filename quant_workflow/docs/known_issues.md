@@ -2,23 +2,20 @@
 
 ## Training Failures
 
-### Benchmark SH000300 Missing (2026-07-04)
+### Cleaned compatibility benchmark drift (2026-07-04)
 
 **Issue**: `train_baseline_lgb` fails with error:
 ```
 ValueError: The benchmark ['SH000300'] does not exist. Please provide the right benchmark
 ```
 
-**Root Cause**: The configured Qlib provider, for example `quant_data/qlib/cn_data_baostock_jqdata_cleaned`, is missing CSI 300 index (SH000300) data.
+**Root Cause**: An older cleaned compatibility provider was published without a complete CSI 300 benchmark.
 
-**Impact**: Cannot run baseline LightGBM training with CSI 300 as benchmark.
+**Impact**: A run explicitly selecting that stale cleaned provider cannot complete benchmark backtesting.
 
-**Workaround Options**:
-1. Add CSI 300 index data to Qlib provider using `add_index_benchmark.py` script
-2. Use different benchmark (e.g., SH000001 for Shanghai Composite Index)
-3. Disable benchmark in training config (less recommended for production models)
+**Resolution**: Canonical DSA training, prediction and backtesting now resolve the immutable `qlib_ashare_v2` snapshot, which must contain SH000300, SH000905 and SH000906 before publication. The updater also validates all six required fields through the provider calendar end.
 
-**Status**: Documented, not fixed. Requires user decision on preferred benchmark source.
+**Status**: Fixed for the canonical native provider. A deliberately selected cleaned provider remains an independent data product and must pass its own quality check.
 
 **Related Files**:
 - Failed job: `qj_20260704134523_d891c362`
@@ -26,7 +23,4 @@ ValueError: The benchmark ['SH000300'] does not exist. Please provide the right 
 - Script: `quant_workflow/scripts/train_baseline_lgb.py`
 - Config: `quant_workflow/configs/baseline_lgb_alpha158.yaml`
 
-**Next Steps**:
-1. Check if `add_index_benchmark.py` script exists and can fetch CSI 300 data
-2. Verify benchmark data requirements in Qlib documentation
-3. Offer user choice of benchmark or auto-add CSI 300 from available data source
+**Operational rule**: Do not disable the benchmark or substitute another index to make a failed run pass. Rebuild the cleaned compatibility output from the same governed qfq snapshot, or use the canonical native provider.

@@ -13,11 +13,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri  # noqa: E402
+from _paths import qlib_compatibility_provider_uri  # noqa: E402
 from _symbols import to_qlib_name  # noqa: E402
 
 
-DEFAULT_PROVIDER = qlib_provider_uri()
+DEFAULT_PROVIDER = qlib_compatibility_provider_uri()
 BENCHMARK_SYMBOLS = {"SH000300"}
 
 

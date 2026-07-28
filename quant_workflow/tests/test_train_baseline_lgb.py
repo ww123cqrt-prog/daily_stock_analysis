@@ -23,9 +23,13 @@ class TrainBaselineLgbTest(unittest.TestCase):
     def test_resolves_provider_uris_under_quant_data_root_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             quant_data = Path(temp_dir) / "quant_data"
+            canonical = Path(temp_dir) / "native-qlib-snapshot"
+            cleaned = quant_data / "qlib" / "cn_data_baostock_jqdata_cleaned"
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "train_baseline_lgb.py"
             env = os.environ.copy()
             env["QUANT_DATA_ROOT"] = str(quant_data)
+            env["QLIB_PROVIDER_URI"] = str(canonical)
+            env["QLIB_CLEANED_PROVIDER_URI"] = str(cleaned)
 
             result = subprocess.run(
                 [
@@ -51,8 +55,8 @@ class TrainBaselineLgbTest(unittest.TestCase):
             )
 
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["canonical"], str(quant_data / "qlib" / "cn_data_baostock_jqdata"))
-        self.assertEqual(payload["cleaned"], str(quant_data / "qlib" / "cn_data_baostock_jqdata_cleaned"))
+        self.assertEqual(payload["canonical"], str(canonical))
+        self.assertEqual(payload["cleaned"], str(cleaned))
 
     def test_resolves_canonical_and_cleaned_provider_uris(self):
         module = load_module()
@@ -60,7 +64,11 @@ class TrainBaselineLgbTest(unittest.TestCase):
         canonical = module.resolve_provider_uri("canonical")
         cleaned = module.resolve_provider_uri("cleaned")
 
-        self.assertTrue(str(canonical).endswith("cn_data_baostock_jqdata"))
+        manifest = json.loads(
+            (canonical / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["dataset_id"], "qlib_ashare_v2")
+        self.assertTrue(manifest["benchmark_complete"])
         self.assertTrue(str(cleaned).endswith("cn_data_baostock_jqdata_cleaned"))
 
     def test_rejects_unknown_provider_name(self):
@@ -268,7 +276,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
 
         self.assertEqual(symbols, ["000001", "600000"])
 
-    def test_ensure_csi300_instruments_writes_selected_provider_file(self):
+    def test_ensure_csi300_instruments_refuses_to_mutate_provider(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = Path(temp_dir)
@@ -280,12 +288,12 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            module.ensure_csi300_instruments(provider, csi300_symbols=["000001", "600000"])
+            with self.assertRaisesRegex(FileNotFoundError, "rebuild qlib_ashare_v2"):
+                module.ensure_csi300_instruments(
+                    provider, csi300_symbols=["000001", "600000"]
+                )
 
-            content = (instruments_dir / "csi300.txt").read_text(encoding="utf-8")
-
-        self.assertIn("SZ000001\t2008-01-02\t2026-07-03", content)
-        self.assertIn("SH600000\t2009-01-05\t2026-07-03", content)
+            self.assertFalse((instruments_dir / "csi300.txt").exists())
 
     def test_append_experiment_record_writes_jsonl_and_marked_markdown(self):
         module = load_module()

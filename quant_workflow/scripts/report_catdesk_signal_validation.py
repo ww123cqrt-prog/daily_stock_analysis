@@ -31,7 +31,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import projects_root, quant_data_root, reports_root  # noqa: E402
+from _paths import ashare_qfq_bars_dir, projects_root, reports_root  # noqa: E402
 from _symbols import to_qlib_name  # noqa: E402
 from _trading_calendar import (  # noqa: E402
     WEEKDAY_FALLBACK_SOURCE,
@@ -1124,9 +1124,8 @@ def generate_report(
     validation_date, calendar_source = resolve_validation_date(signal_date, validation_date)
     catdesk_payload, candidates = load_catdesk_candidates(catdesk_report, candidate_set=candidate_set)
     catdesk_quality = classify_catdesk_report(catdesk_payload, signal_date)
-    data_root = quant_data_root()
-    signal_dir = data_root / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
-    validation_dir = data_root / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+    signal_dir = ashare_qfq_bars_dir()
+    validation_dir = signal_dir
     market_regime_path, market_regime_quality = find_market_regime_path(reports_root(), signal_date)
     market_regime = load_market_regime(market_regime_path)
     market_regime.update(market_regime_quality)

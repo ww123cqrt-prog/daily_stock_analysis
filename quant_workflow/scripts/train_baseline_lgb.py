@@ -36,6 +36,12 @@ from _paths import (  # noqa: E402
     reports_root,
     workflow_root,
 )
+from _mlflow_run_provenance import (  # noqa: E402
+    experiment_run_ids,
+    provider_identity,
+    select_new_prediction_run,
+    tag_run_with_provider,
+)
 from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
 from generate_csi300 import load_csi300_symbols as load_cached_csi300_symbols  # noqa: E402
 
@@ -126,20 +132,15 @@ def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
 
 
 def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):
-    """Generate instruments/csi300.txt if missing."""
+    """Require the immutable provider to contain its CSI300 pool."""
     instruments_path = provider_uri / "instruments" / "csi300.txt"
     if instruments_path.exists():
         return
-
-    print(f"[setup] Generating CSI300 instruments file for {provider_uri} ...")
-    symbols = list(csi300_symbols) if csi300_symbols is not None else load_csi300_symbols()
-    lines = build_csi300_lines(symbols, load_provider_instrument_ranges(provider_uri))
-    if not lines:
-        raise ValueError(f"No CSI300 symbols matched provider instruments: {provider_uri}")
-
-    instruments_path.parent.mkdir(parents=True, exist_ok=True)
-    instruments_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"[setup] Written {len(lines)} symbols to {instruments_path}")
+    del csi300_symbols
+    raise FileNotFoundError(
+        "Provider is missing instruments/csi300.txt; rebuild qlib_ashare_v2 "
+        "instead of modifying an immutable snapshot at training time"
+    )
 
 
 def write_runtime_config_with_provider(
@@ -234,11 +235,49 @@ def update_runtime_config_dates(payload: dict, latest_day: str, *, backtest_end_
                 backtest["end_time"] = portfolio_end
 
 
-def run_qrun(config_path: str, experiment_name: str = "baseline_lgb_alpha158"):
-    """Run qrun programmatically (avoids subprocess)."""
+def _experiment_by_name(client, experiment_name: str):
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is not None:
+        return experiment
+    return next(
+        (
+            item
+            for item in client.search_experiments()
+            if item.name == experiment_name
+        ),
+        None,
+    )
+
+
+def run_qrun(
+    config_path: str,
+    experiment_name: str = "baseline_lgb_alpha158",
+    *,
+    provider_uri: Path,
+) -> str:
+    """Run qrun and return the one prediction Run created by this invocation."""
+    import mlflow
     from qlib.cli.run import workflow
 
+    client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    experiment = _experiment_by_name(client, experiment_name)
+    before_run_ids = (
+        experiment_run_ids(client, str(experiment.experiment_id))
+        if experiment is not None
+        else set()
+    )
     workflow(config_path, experiment_name=experiment_name, uri_folder=str(MLRUNS_DIR))
+    experiment = _experiment_by_name(client, experiment_name)
+    if experiment is None:
+        raise RuntimeError("training experiment was not created")
+    run = select_new_prediction_run(
+        client,
+        str(experiment.experiment_id),
+        before_run_ids,
+    )
+    run_id = str(run.info.run_id)
+    tag_run_with_provider(client, run_id, provider_identity(provider_uri))
+    return run_id
 
 
 def ensure_mlruns_artifact_locations(mlruns_dir: Path = MLRUNS_DIR) -> int:
@@ -369,6 +408,31 @@ def load_latest_metrics(experiment_name: str = "baseline_lgb_alpha158") -> dict:
         "metrics": run.data.metrics,
         "params": run.data.params,
         "artifacts": [a.path for a in client.list_artifacts(run.info.run_id)],
+    }
+
+
+def load_run_metrics(run_id: str, experiment_name: str) -> dict:
+    """Load one exact MLflow Run instead of whichever Run happens to be latest."""
+    import mlflow
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    run = client.get_run(str(run_id))
+    experiment = _experiment_by_name(client, experiment_name)
+    if experiment is None or str(run.info.experiment_id) != str(
+        experiment.experiment_id
+    ):
+        raise RuntimeError("training Run does not belong to the requested experiment")
+    status = "completed" if run.info.status == "FINISHED" else run.info.status.lower()
+    return {
+        "status": status,
+        "experiment_name": experiment_name,
+        "experiment_id": str(experiment.experiment_id),
+        "run_id": str(run.info.run_id),
+        "start_time": run.info.start_time,
+        "end_time": run.info.end_time,
+        "metrics": run.data.metrics,
+        "params": run.data.params,
+        "artifacts": [a.path for a in client.list_artifacts(str(run.info.run_id))],
     }
 
 
@@ -552,14 +616,18 @@ def main():
     print(f"[run] Experiment: {args.experiment_name}")
     print(f"{'='*60}\n")
 
-    run_qrun(str(runtime_config_path), experiment_name=args.experiment_name)
+    run_id = run_qrun(
+        str(runtime_config_path),
+        experiment_name=args.experiment_name,
+        provider_uri=provider_uri,
+    )
 
     # ── Step 3: Print summary ──
     print(f"\n{'='*60}")
     print("[done] Training + backtest complete.")
     print(f"{'='*60}")
 
-    info = load_latest_metrics(args.experiment_name)
+    info = load_run_metrics(run_id, args.experiment_name)
     if info:
         mirror_run_artifacts_from_legacy_locations(
             str(info.get("run_id") or ""),

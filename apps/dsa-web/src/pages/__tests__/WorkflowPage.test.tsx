@@ -416,6 +416,8 @@ describe('WorkflowPage', () => {
     expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五个选股模型候选流程');
     expect(screen.getByLabelText('运行五个选股模型候选流程 数据版本')).toBeInTheDocument();
+    expect(screen.getAllByRole('option', { name: '原生 V2（正式）' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: '旧版清洗数据（兼容）' })).toHaveLength(2);
     expect(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();

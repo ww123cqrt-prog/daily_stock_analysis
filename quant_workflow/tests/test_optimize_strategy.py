@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 def load_module():
     path = Path(__file__).resolve().parents[1] / "scripts" / "optimize_strategy.py"
@@ -18,12 +20,12 @@ def load_module():
 
 
 class OptimizeStrategyTest(unittest.TestCase):
-    def test_data_dir_honors_quant_data_root_environment(self):
+    def test_data_dir_honors_explicit_provider_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            quant_data = Path(temp_dir) / "quant_data"
+            provider = Path(temp_dir) / "native-provider"
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "optimize_strategy.py"
             env = os.environ.copy()
-            env["QUANT_DATA_ROOT"] = str(quant_data)
+            env["QLIB_PROVIDER_URI"] = str(provider)
 
             result = subprocess.run(
                 [
@@ -46,7 +48,29 @@ class OptimizeStrategyTest(unittest.TestCase):
             )
 
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["data_dir"], str(quant_data / "qlib" / "cn_data_baostock_jqdata"))
+        self.assertEqual(payload["data_dir"], str(provider))
+
+    def test_training_runtime_config_locks_resolved_native_provider(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "baseline.yaml"
+            source.write_text(
+                "qlib_init:\n  provider_uri: RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME\n"
+                "task: {}\n",
+                encoding="utf-8",
+            )
+            provider = root / "native-snapshot"
+
+            runtime = module.write_training_config_with_provider(
+                source,
+                provider,
+                output_dir=root / "runtime-configs",
+            )
+
+            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
+            self.assertEqual(payload["qlib_init"]["provider_uri"], str(provider))
+            self.assertEqual(payload["task"], {})
 
     def test_dry_run_writes_timestamped_report_and_latest_aliases(self):
         module = load_module()

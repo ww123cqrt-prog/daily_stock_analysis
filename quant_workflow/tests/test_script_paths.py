@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -152,6 +153,7 @@ class ScriptPathsTest(unittest.TestCase):
                 "QUANT_DATA_ROOT": str(root / "data"),
                 "QLIB_PROVIDER_URI": str(root / "provider"),
                 "QLIB_CLEANED_PROVIDER_URI": str(root / "provider-cleaned"),
+                "QLIB_COMPATIBILITY_PROVIDER_URI": str(root / "provider-compat"),
                 "CHINA_ASTOCK_QUANT_ROOT": str(root / "astock"),
             }
             with patch.dict(os.environ, env, clear=False):
@@ -161,6 +163,13 @@ class ScriptPathsTest(unittest.TestCase):
                 self.assertEqual(module.quant_data_root(), root / "data")
                 self.assertEqual(module.qlib_provider_uri(), root / "provider")
                 self.assertEqual(module.qlib_provider_uri("cleaned"), root / "provider-cleaned")
+                self.assertEqual(
+                    module.qlib_compatibility_provider_uri(), root / "provider-compat"
+                )
+                self.assertEqual(
+                    module.qlib_compatibility_provider_uri("cleaned"),
+                    root / "provider-cleaned",
+                )
                 self.assertEqual(module.china_astock_root(), root / "astock")
 
     def test_unknown_provider_name_is_rejected(self):
@@ -168,6 +177,79 @@ class ScriptPathsTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             module.qlib_provider_uri("unknown")
+
+    def test_canonical_provider_resolves_native_v2_snapshot_once_per_process(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            first = root / "qlib" / "native" / "snapshots" / "snapshot-001"
+            second = root / "qlib" / "native" / "snapshots" / "snapshot-002"
+            resolved = [
+                SimpleNamespace(
+                    snapshot_path=first,
+                    manifest={"benchmark_complete": True},
+                ),
+                SimpleNamespace(
+                    snapshot_path=second,
+                    manifest={"benchmark_complete": True},
+                ),
+            ]
+            with patch.dict(
+                os.environ,
+                {"QUANT_DATA_ROOT": str(root), "QLIB_PROVIDER_URI": ""},
+                clear=False,
+            ), patch.object(module, "resolve_dataset", side_effect=resolved) as resolver:
+                module._resolve_native_qlib.cache_clear()
+                self.assertEqual(module.qlib_provider_uri(), first)
+                self.assertEqual(module.qlib_provider_uri(), first)
+
+            self.assertEqual(resolver.call_count, 1)
+            resolver.assert_called_once_with(
+                "qlib_ashare_v2", quant_data_root=root.resolve(), require_basis="qfq"
+            )
+
+    def test_canonical_provider_fails_closed_when_native_benchmarks_are_incomplete(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            resolved = SimpleNamespace(
+                snapshot_path=root / "snapshot",
+                manifest={"benchmark_complete": False},
+            )
+            with patch.dict(
+                os.environ,
+                {"QUANT_DATA_ROOT": str(root), "QLIB_PROVIDER_URI": ""},
+                clear=False,
+            ), patch.object(module, "resolve_dataset", return_value=resolved):
+                module._resolve_native_qlib.cache_clear()
+                with self.assertRaisesRegex(RuntimeError, "benchmarks are incomplete"):
+                    module.qlib_provider_uri()
+
+    def test_ashare_qfq_bars_resolve_native_snapshot_once_per_process(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            first = root / "parquet" / "native" / "snapshots" / "snapshot-001"
+            second = root / "parquet" / "native" / "snapshots" / "snapshot-002"
+            resolved = [
+                SimpleNamespace(snapshot_path=first, manifest={}),
+                SimpleNamespace(snapshot_path=second, manifest={}),
+            ]
+            with patch.dict(
+                os.environ,
+                {"QUANT_DATA_ROOT": str(root)},
+                clear=False,
+            ), patch.object(module, "resolve_dataset", side_effect=resolved) as resolver:
+                module._resolve_native_ashare_qfq.cache_clear()
+                self.assertEqual(module.ashare_qfq_bars_dir(), first / "bars")
+                self.assertEqual(module.ashare_qfq_bars_dir(), first / "bars")
+
+            self.assertEqual(resolver.call_count, 1)
+            resolver.assert_called_once_with(
+                "ashare_daily_qfq",
+                quant_data_root=root.resolve(),
+                require_basis="qfq",
+            )
 
 
 if __name__ == "__main__":

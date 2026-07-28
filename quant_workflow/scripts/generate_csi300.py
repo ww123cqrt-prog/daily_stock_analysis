@@ -12,14 +12,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import _env_path, china_astock_root, qlib_provider_uri, quant_data_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    _env_path,
+    china_astock_root,
+    qlib_compatibility_provider_uri,
+    quant_data_root,
+    workflow_root,
+)
 from _symbols import normalize_symbol as _normalize_symbol, to_qlib_name as _to_qlib_name  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
 QUANT_DATA = quant_data_root()
 ASTOCK_PROJECT = china_astock_root()
-PROVIDER_DIR = qlib_provider_uri()
+PROVIDER_DIR = qlib_compatibility_provider_uri()
 OUTPUT_PATH = PROVIDER_DIR / "instruments" / "csi300.txt"
 CALENDAR_PATH = PROVIDER_DIR / "calendars" / "day.txt"
 STOCK_LIST_PATH = _env_path("QUANT_STOCK_LIST_PATH", QUANT_DATA / "stock_lists.json")

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [数据] DSA canonical 训练、预测、回测、交易日历、数据质量和 CatDesk 历史价格验证改为通过 `DATA_MANIFEST.json` 直接锁定原生 `qlib_ashare_v2` / `ashare_daily_qfq` 快照；原生 Qlib 已包含 SH000300、SH000905、SH000906 及 CSI300/500/800 股票池。每日编排器不再构建或发布旧 merged provider，普通 A 股下载仅作审计缓存，只有显式核验 bundle 才能事务发布 V2。
 - [安全] A 股公开源下载改为保守请求配置：默认关闭自动历史源和东方财富新闻，一次只允许 Baostock、东方财富或 AkShare 之一；请求间隔至少 2 秒、只尝试 1 次、连续失败最多 3 次、单次请求预算 6000、增量重叠最多 7 天，遇到黑名单、403/429 或远端拒绝立即熔断。DSA 网页同时只允许一个 `quant_data` 网络任务；本机 18:40 LaunchAgent 保持禁用。
 - [新功能] `/backtest` 改为两个真实策略入口：“脚本回测”提供带静态安全检查、隔离子进程和超时限制的 DSA Python 策略编辑器；“条件回测”提供动量轮动、双均线和等权持有表单。两者共用与资产类型无关的目标仓位引擎，股票、ETF 和多标的组合统一计算现金、整手、用户显式成本、下一交易日开盘成交、净值、基准、回撤、换手及成交；网页成本默认 `0%`。Qlib 训练结果统一到 `/experiments/`，旧 DSA 历史判断不再作为网页策略入口。
 - [新功能] 量化任务中心新增五个选股模型候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择候选选股模型及五套交易策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常选股模型或下单。

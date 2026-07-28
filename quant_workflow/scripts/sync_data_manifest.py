@@ -32,6 +32,8 @@ from _robust_reference_integrity import (  # noqa: E402
 from quant_data_contract import (  # noqa: E402
     DataContractError,
     catalog_entry_from_snapshot,
+    dataset_publication_lock,
+    validate_latest_pointer,
 )
 
 
@@ -262,7 +264,7 @@ def _parquet_compatibility_entry(
     return {
         "dataset_id": dataset_id,
         "data_kind": "daily_bars",
-        "role": "canonical",
+        "role": "legacy",
         "status": "ready",
         "lifecycle": "compatibility_output",
         "source": {
@@ -282,6 +284,7 @@ def _parquet_compatibility_entry(
         },
         "upstream_dataset_id": str(upstream.get("dataset_id") or "ashare_daily_qfq"),
         "upstream_snapshot_id": str(upstream.get("snapshot_id") or ""),
+        "upstream_content_sha256": str(upstream.get("content_sha256") or ""),
         "snapshot_available": False,
         "compatibility_note": (
             "Stable V1 path and schema generated from the governed V2 qfq snapshot. "
@@ -304,7 +307,7 @@ def _qlib_compatibility_entry(
     return {
         "dataset_id": dataset_id,
         "data_kind": "qlib_provider",
-        "role": "canonical",
+        "role": "legacy",
         "status": "ready",
         "lifecycle": "compatibility_output",
         "source": {
@@ -323,6 +326,7 @@ def _qlib_compatibility_entry(
         },
         "upstream_dataset_id": str(upstream.get("dataset_id") or "ashare_daily_qfq"),
         "upstream_snapshot_id": str(upstream.get("snapshot_id") or ""),
+        "upstream_content_sha256": str(upstream.get("content_sha256") or ""),
         "snapshot_available": False,
         "compatibility_note": (
             "Stable V1 Qlib path generated from V2; factor.day.bin is one because "
@@ -695,6 +699,7 @@ def _v2_dataset_catalog(
         )
 
     known_datasets = existing_datasets or {}
+    discovered_pointer_roots: dict[str, Path] = {}
     for search_root in (
         quant_data / "parquet",
         quant_data / "qlib",
@@ -703,18 +708,18 @@ def _v2_dataset_catalog(
         if not search_root.is_dir():
             continue
         for pointer_path in search_root.rglob("LATEST.json"):
+            expected_dataset_id = _dataset_id_for_pointer(
+                pointer_path,
+                quant_data=quant_data,
+                existing_datasets=known_datasets,
+            )
             try:
                 pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
                 if not isinstance(pointer, dict):
                     raise TypeError("LATEST.json must contain an object")
                 dataset_id = str(pointer["dataset_id"])
-                snapshot = quant_data / str(pointer["snapshot_path"])
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-                dataset_id = _dataset_id_for_pointer(
-                    pointer_path,
-                    quant_data=quant_data,
-                    existing_datasets=known_datasets,
-                )
+                dataset_id = expected_dataset_id
                 datasets[dataset_id] = _blocked_pointer_entry(
                     dataset_id=dataset_id,
                     pointer_path=pointer_path,
@@ -723,12 +728,57 @@ def _v2_dataset_catalog(
                     blocker_code="latest_pointer_invalid",
                 )
                 continue
+            if dataset_id != expected_dataset_id:
+                datasets[expected_dataset_id] = _blocked_pointer_entry(
+                    dataset_id=expected_dataset_id,
+                    pointer_path=pointer_path,
+                    quant_data=quant_data,
+                    existing_entry=known_datasets.get(expected_dataset_id),
+                    blocker_code="dataset_id_root_mismatch",
+                    pointer=pointer,
+                )
+                continue
+            previous_root = discovered_pointer_roots.get(dataset_id)
+            if previous_root is not None and previous_root != pointer_path.parent:
+                datasets[dataset_id] = _blocked_pointer_entry(
+                    dataset_id=dataset_id,
+                    pointer_path=pointer_path,
+                    quant_data=quant_data,
+                    existing_entry=datasets.get(dataset_id),
+                    blocker_code="duplicate_dataset_id",
+                    pointer=pointer,
+                )
+                continue
+            discovered_pointer_roots[dataset_id] = pointer_path.parent
+            try:
+                pointer, snapshot = validate_latest_pointer(
+                    pointer_path,
+                    quant_data_root=quant_data,
+                    expected_dataset_id=dataset_id,
+                )
+            except (DataContractError, OSError, TypeError, ValueError):
+                datasets[dataset_id] = _blocked_pointer_entry(
+                    dataset_id=dataset_id,
+                    pointer_path=pointer_path,
+                    quant_data=quant_data,
+                    existing_entry=known_datasets.get(dataset_id),
+                    blocker_code="latest_pointer_invalid",
+                    pointer=pointer,
+                )
+                continue
             try:
                 entry = catalog_entry_from_snapshot(
                     snapshot,
                     quant_data_root=quant_data,
                     dataset_root=pointer_path.parent,
                 )
+                if (
+                    entry.get("dataset_id") != dataset_id
+                    or entry.get("snapshot_id") != pointer.get("snapshot_id")
+                ):
+                    raise DataContractError(
+                        "latest pointer and snapshot identity disagree"
+                    )
             except (
                 DataContractError,
                 KeyError,
@@ -747,6 +797,7 @@ def _v2_dataset_catalog(
                 )
                 continue
             datasets[str(entry["dataset_id"])] = entry
+    _enrich_derived_entries(datasets)
     _enrich_compatibility_entries(
         datasets,
         existing_datasets=known_datasets,
@@ -762,6 +813,53 @@ def _v2_dataset_catalog(
         if isinstance(entry, dict) and compatibility_ids:
             entry["compatibility_outputs"] = compatibility_ids
     return dict(sorted(datasets.items()))
+
+
+def _enrich_derived_entries(datasets: dict[str, Any]) -> None:
+    """Mark native derived providers stale when their frozen input has moved."""
+
+    for entry in datasets.values():
+        if (
+            not isinstance(entry, dict)
+            or entry.get("data_kind") != "qlib_provider"
+            or entry.get("role") != "canonical"
+            or entry.get("status") not in {"ready", "stale"}
+        ):
+            continue
+        upstream_snapshots = entry.get("upstream_snapshots")
+        upstream = (
+            upstream_snapshots[0]
+            if isinstance(upstream_snapshots, list)
+            and len(upstream_snapshots) == 1
+            and isinstance(upstream_snapshots[0], dict)
+            else None
+        )
+        current = (
+            datasets.get(str(upstream.get("dataset_id") or ""))
+            if upstream is not None
+            else None
+        )
+        matches = bool(
+            isinstance(current, dict)
+            and current.get("status") == "ready"
+            and upstream.get("snapshot_id") == current.get("snapshot_id")
+            and upstream.get("content_sha256") == current.get("content_sha256")
+            and upstream.get("price_basis") == current.get("price_basis")
+        )
+        if matches:
+            if entry.get("blocker_codes") == ["upstream_snapshot_mismatch"]:
+                entry["status"] = "ready"
+                entry.pop("blocker_codes", None)
+                entry.pop("current_upstream_snapshot_id", None)
+                entry.pop("current_upstream_content_sha256", None)
+            continue
+        entry["status"] = "stale"
+        entry["blocker_codes"] = ["upstream_snapshot_mismatch"]
+        if isinstance(current, dict):
+            entry["current_upstream_snapshot_id"] = current.get("snapshot_id")
+            entry["current_upstream_content_sha256"] = current.get(
+                "content_sha256"
+            )
 
 
 def _enrich_compatibility_entries(
@@ -796,17 +894,30 @@ def _enrich_compatibility_entries(
             "lifecycle"
         ) != "compatibility_output":
             continue
-        compatibility["source_retrieved_at"] = qfq_entry.get(
-            "source_retrieved_at", "unknown"
+        actual_dataset_id = str(compatibility.get("upstream_dataset_id") or "")
+        actual_snapshot_id = str(compatibility.get("upstream_snapshot_id") or "")
+        actual_content_sha256 = str(
+            compatibility.get("upstream_content_sha256") or ""
         )
-        compatibility["adjustment"] = dict(qfq_adjustment)
-        compatibility["upstream_dataset_id"] = qfq_entry.get(
-            "dataset_id", "ashare_daily_qfq"
+        upstream_matches = (
+            actual_dataset_id == str(qfq_entry.get("dataset_id") or "")
+            and actual_snapshot_id == snapshot_id
+            and actual_content_sha256 == content_sha256
         )
-        compatibility["upstream_snapshot_id"] = snapshot_id
-        compatibility["upstream_content_sha256"] = qfq_entry.get(
-            "content_sha256", ""
-        )
+        if upstream_matches:
+            compatibility["status"] = "ready"
+            compatibility.pop("blocker_codes", None)
+            compatibility.pop("current_upstream_snapshot_id", None)
+            compatibility.pop("current_upstream_content_sha256", None)
+            compatibility["source_retrieved_at"] = qfq_entry.get(
+                "source_retrieved_at", "unknown"
+            )
+            compatibility["adjustment"] = dict(qfq_adjustment)
+        else:
+            compatibility["status"] = "stale"
+            compatibility["blocker_codes"] = ["upstream_snapshot_mismatch"]
+            compatibility["current_upstream_snapshot_id"] = snapshot_id
+            compatibility["current_upstream_content_sha256"] = content_sha256
         current_producer = compatibility.get("producer")
         existing_entry = known_datasets.get(dataset_id)
         persisted_producer = (
@@ -1156,16 +1267,20 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
         "cleaned_parquet": {
             **parquet_entry(
                 cleaned_parquet,
-                "Official cleaned A-share daily parquet dataset for DSA and Qlib conversion.",
+                "Legacy cleaned A-share parquet retained for explicit compatibility workflows.",
             ),
             "status": "do_not_move",
+            "role": "legacy",
+            "lifecycle": "compatibility_output",
         },
         "cleaned_qlib_provider": {
             **qlib_entry(
                 cleaned_provider,
-                "Official Qlib provider for current training and backtesting.",
+                "Legacy cleaned Qlib provider; default DSA training and backtesting use qlib_ashare_v2.",
             ),
             "status": "do_not_move",
+            "role": "legacy",
+            "lifecycle": "compatibility_output",
         },
     }
     if pit_entry is not None:
@@ -1331,7 +1446,7 @@ def _render_catalog_block(manifest: dict[str, Any], prefix: str) -> str:
         "## DATA_MANIFEST v2 自动清单",
         "",
         "本表由 `sync_data_manifest.py` 根据实际清单生成。不要手工修改本区块。",
-        "正式读取必须使用 `quant_data_cli.py resolve`；`legacy_unknown` 只能审计。",
+        "原生不可变快照必须使用 `quant_data_cli.py resolve`；`compatibility_output` 仅供旧程序读取清单中的固定路径；`legacy_unknown` 只能审计。",
         "",
         "| dataset_id | 角色 | 状态 | 价格口径 | 最新交易日 | 来源 | 相对路径 |",
         "|---|---|---|---|---|---|---|",
@@ -1418,8 +1533,12 @@ def merge_existing_manifest(existing: dict[str, Any], generated: dict[str, Any])
     return merged
 
 
-def sync_data_manifest(*, quant_data_root: Path | None = None, reports_root: Path | None = None) -> Path:
-    quant_data = Path(quant_data_root or default_quant_data_root()).expanduser()
+def _sync_data_manifest_unlocked(
+    *,
+    quant_data_root: Path,
+    reports_root: Path | None = None,
+) -> Path:
+    quant_data = Path(quant_data_root).expanduser()
     reports = Path(reports_root or default_reports_root()).expanduser()
     quant_data.mkdir(parents=True, exist_ok=True)
     path = quant_data / "DATA_MANIFEST.json"
@@ -1449,6 +1568,25 @@ def sync_data_manifest(*, quant_data_root: Path | None = None, reports_root: Pat
         temporary.unlink(missing_ok=True)
     sync_catalog_readmes(quant_data, manifest)
     return path
+
+
+def sync_data_manifest(
+    *,
+    quant_data_root: Path | None = None,
+    reports_root: Path | None = None,
+    publication_lock_held: bool = False,
+) -> Path:
+    quant_data = Path(quant_data_root or default_quant_data_root()).expanduser()
+    if publication_lock_held:
+        return _sync_data_manifest_unlocked(
+            quant_data_root=quant_data,
+            reports_root=reports_root,
+        )
+    with dataset_publication_lock(quant_data):
+        return _sync_data_manifest_unlocked(
+            quant_data_root=quant_data,
+            reports_root=reports_root,
+        )
 
 
 def _is_covered(candidate: Path, roots: list[Path]) -> bool:

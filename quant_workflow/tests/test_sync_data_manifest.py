@@ -1,6 +1,8 @@
 import fcntl
+import hashlib
 import importlib.util
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -180,6 +182,65 @@ def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
     contract = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(contract)
+    qfq_snapshot = (
+        quant_data
+        / "staging"
+        / "qfq-sync"
+        / "qfq-source-001"
+    )
+    (qfq_snapshot / "bars").mkdir(parents=True)
+    (qfq_snapshot / "factors").mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
+            "open": [10.0, 10.1],
+            "high": [10.2, 10.3],
+            "low": [9.9, 10.0],
+            "close": [10.1, 10.2],
+            "volume": [1000.0, 1100.0],
+            "source_id": ["baostock", "baostock"],
+        }
+    ).to_parquet(qfq_snapshot / "bars" / "SH600000.parquet", index=False)
+    pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
+            "factor": [0.5, 1.0],
+        }
+    ).to_parquet(qfq_snapshot / "factors" / "SH600000.parquet", index=False)
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "event_date": pd.to_datetime(["2026-07-23"]),
+            "action_type": ["adjustment_factor_event"],
+        }
+    ).to_parquet(qfq_snapshot / "corporate_actions.parquet", index=False)
+    contract.finalize_price_snapshot(
+        qfq_snapshot,
+        dataset_id="ashare_daily_qfq",
+        snapshot_id="qfq-source-001",
+        role="canonical",
+        status="ready",
+        source={"provider": "baostock", "interface": "raw_factor"},
+        price_basis="qfq",
+        adjustment={
+            "method": "local_factor",
+            "adjusted_at": "2026-07-25T23:00:00+08:00",
+            "adjustment_as_of": "2026-07-24",
+            "adjusted_fields": ["open", "high", "low", "close"],
+            "normalization_rule": "latest_factor_equals_1",
+            "algorithm_version": "test-v1",
+        },
+        producer={"script": "test", "version": "1"},
+        source_retrieved_at="2026-07-25T22:59:00+08:00",
+    )
+    published_qfq = contract.publish_snapshot(
+        qfq_snapshot,
+        dataset_root=(
+            quant_data / "parquet" / "ashare_1d" / "ashare_daily_qfq"
+        ),
+        quant_data_root=quant_data,
+    )
+    qfq_manifest = contract.validate_dataset_snapshot(published_qfq)
     snapshot = quant_data / "staging" / "qlib-sync" / "qlib-sync-001"
     (snapshot / "calendars").mkdir(parents=True)
     (snapshot / "instruments").mkdir(parents=True)
@@ -194,10 +255,8 @@ def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
         b"feature-bytes"
     )
     upstream = {
-        "dataset_id": "ashare_daily_qfq",
-        "snapshot_id": "qfq-source-001",
-        "content_sha256": "a" * 64,
-        "price_basis": "qfq",
+        field: str(qfq_manifest[field])
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
     }
     contract.atomic_write_json(
         snapshot / "PROVIDER_MANIFEST.json",
@@ -418,7 +477,13 @@ class SyncDataManifestTest(unittest.TestCase):
             )
 
         compatibility = manifest["datasets"]["ashare_merged_qfq_compatibility"]
-        self.assertEqual(compatibility["role"], "canonical")
+        for dataset_id in (
+            "ashare_merged_qfq_compatibility",
+            "ashare_cleaned_qfq_compatibility",
+            "qlib_ashare_merged_compatibility",
+            "qlib_ashare_cleaned_compatibility",
+        ):
+            self.assertEqual(manifest["datasets"][dataset_id]["role"], "legacy")
         self.assertEqual(compatibility["status"], "ready")
         self.assertEqual(compatibility["lifecycle"], "compatibility_output")
         self.assertEqual(
@@ -457,6 +522,9 @@ class SyncDataManifestTest(unittest.TestCase):
         compatibility = {
             "dataset_id": "ashare_merged_qfq_compatibility",
             "lifecycle": "compatibility_output",
+            "upstream_dataset_id": "ashare_daily_qfq",
+            "upstream_snapshot_id": "qfq-001",
+            "upstream_content_sha256": "a" * 64,
             "adjustment": {"method": "local_factor"},
         }
         datasets = {
@@ -509,6 +577,47 @@ class SyncDataManifestTest(unittest.TestCase):
             "historical_snapshot",
         )
 
+    def test_stale_compatibility_keeps_actual_upstream_lineage(self):
+        module = load_module()
+        compatibility = {
+            "dataset_id": "ashare_merged_qfq_compatibility",
+            "lifecycle": "compatibility_output",
+            "status": "ready",
+            "upstream_dataset_id": "ashare_daily_qfq",
+            "upstream_snapshot_id": "qfq-old",
+            "upstream_content_sha256": "b" * 64,
+            "adjustment": {
+                "method": "local_factor",
+                "evidence_status": "in_upstream_v2_snapshot",
+            },
+        }
+        datasets = {
+            "ashare_daily_qfq": {
+                "dataset_id": "ashare_daily_qfq",
+                "status": "ready",
+                "dataset_root": "parquet/ashare_1d/ashare_daily_qfq",
+                "snapshot_id": "qfq-current",
+                "content_sha256": "a" * 64,
+                "source_retrieved_at": "2026-07-28T12:00:00+08:00",
+                "adjustment": {"factor_path": "factors"},
+            },
+            compatibility["dataset_id"]: compatibility,
+        }
+
+        module._enrich_compatibility_entries(datasets)
+
+        self.assertEqual(compatibility["status"], "stale")
+        self.assertEqual(compatibility["upstream_snapshot_id"], "qfq-old")
+        self.assertEqual(compatibility["upstream_content_sha256"], "b" * 64)
+        self.assertEqual(
+            compatibility["blocker_codes"],
+            ["upstream_snapshot_mismatch"],
+        )
+        self.assertEqual(
+            compatibility["current_upstream_snapshot_id"],
+            "qfq-current",
+        )
+
     def test_corrupt_dynamic_latest_pointer_remains_visible_as_blocked(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +663,9 @@ class SyncDataManifestTest(unittest.TestCase):
             snapshot = dataset_root / "snapshots" / "snap-001"
             snapshot.mkdir(parents=True)
             (snapshot / "DATASET_MANIFEST.json").write_text("{broken", encoding="utf-8")
+            broken_hash = hashlib.sha256(
+                (snapshot / "DATASET_MANIFEST.json").read_bytes()
+            ).hexdigest()
             (dataset_root / "LATEST.json").write_text(
                 json.dumps(
                     {
@@ -561,6 +673,7 @@ class SyncDataManifestTest(unittest.TestCase):
                         "dataset_id": "custom_etf_qfq",
                         "snapshot_id": "snap-001",
                         "snapshot_path": "parquet/etf_1d/custom_etf_qfq/snapshots/snap-001",
+                        "manifest_sha256": broken_hash,
                     }
                 ),
                 encoding="utf-8",
@@ -574,6 +687,57 @@ class SyncDataManifestTest(unittest.TestCase):
         entry = manifest["datasets"]["custom_etf_qfq"]
         self.assertEqual(entry["status"], "blocked")
         self.assertIn("snapshot_manifest_invalid", entry["blocker_codes"])
+
+    def test_dynamic_latest_pointer_hash_mismatch_is_blocked(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            published = seed_qlib_v2_snapshot(module, quant_data)
+            pointer_path = published.parents[1] / "LATEST.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer["manifest_sha256"] = "0" * 64
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["datasets"]["qlib_ashare_v2"]
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn("latest_pointer_invalid", entry["blocker_codes"])
+
+    def test_duplicate_dataset_id_cannot_replace_the_registered_dataset_root(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            published = seed_qlib_v2_snapshot(module, quant_data)
+            official_root = published.parents[1]
+            rogue_root = quant_data / "qlib" / "rogue_provider"
+            shutil.copytree(official_root, rogue_root)
+            rogue_pointer_path = rogue_root / "LATEST.json"
+            rogue_pointer = json.loads(rogue_pointer_path.read_text(encoding="utf-8"))
+            rogue_pointer["snapshot_path"] = (
+                rogue_root / "snapshots" / published.name
+            ).relative_to(quant_data).as_posix()
+            rogue_pointer_path.write_text(
+                json.dumps(rogue_pointer),
+                encoding="utf-8",
+            )
+
+            manifest = module.build_manifest(
+                quant_data_root=quant_data,
+                reports_root=root / "reports",
+            )
+
+        entry = manifest["datasets"]["qlib_ashare_v2"]
+        self.assertEqual(entry["status"], "ready")
+        self.assertEqual(entry["dataset_root"], "qlib/cn_data_ashare_v2")
+        rogue = manifest["datasets"]["rogue_provider"]
+        self.assertEqual(rogue["status"], "blocked")
+        self.assertIn("dataset_id_root_mismatch", rogue["blocker_codes"])
 
     def test_manifest_discovers_published_qlib_v2_snapshot(self):
         module = load_module()
@@ -591,6 +755,63 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(entry["status"], "ready")
         self.assertEqual(entry["latest_trade_date"], "2026-07-24")
         self.assertEqual(entry["snapshot_id"], published.name)
+
+    def test_native_qlib_is_stale_when_current_qfq_snapshot_changes(self):
+        module = load_module()
+        qlib = {
+            "dataset_id": "qlib_ashare_v2",
+            "data_kind": "qlib_provider",
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "upstream_snapshots": [
+                {
+                    "dataset_id": "ashare_daily_qfq",
+                    "snapshot_id": "qfq-old",
+                    "content_sha256": "a" * 64,
+                    "price_basis": "qfq",
+                }
+            ],
+        }
+        datasets = {
+            "ashare_daily_qfq": {
+                "dataset_id": "ashare_daily_qfq",
+                "status": "ready",
+                "snapshot_id": "qfq-current",
+                "content_sha256": "b" * 64,
+                "price_basis": "qfq",
+            },
+            "qlib_ashare_v2": qlib,
+        }
+
+        module._enrich_derived_entries(datasets)
+
+        self.assertEqual(qlib["status"], "stale")
+        self.assertEqual(qlib["blocker_codes"], ["upstream_snapshot_mismatch"])
+        self.assertEqual(qlib["current_upstream_snapshot_id"], "qfq-current")
+
+    def test_sync_refuses_to_write_while_dataset_publication_is_in_progress(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quant_data = root / "quant_data"
+            lock_path = (
+                quant_data / "runtime" / "locks" / "dataset_publication.lock"
+            )
+            lock_path.parent.mkdir(parents=True)
+            with lock_path.open("a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with self.assertRaisesRegex(
+                        module.DataContractError,
+                        "already in progress",
+                    ):
+                        module.sync_data_manifest(
+                            quant_data_root=quant_data,
+                            reports_root=root / "reports",
+                        )
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def test_sync_manifest_reflects_actual_cleaned_provider_calendar(self):
         module = load_module()
@@ -638,6 +859,8 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(manifest["official_entries"]["cleaned_parquet"]["file_count"], 1)
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["calendar_last"], "2026-07-09")
         self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["instruments_all"], 1)
+        self.assertEqual(manifest["official_entries"]["cleaned_parquet"]["role"], "legacy")
+        self.assertEqual(manifest["official_entries"]["cleaned_qlib_provider"]["role"], "legacy")
         self.assertEqual(manifest["documented_inputs"]["canonical_qlib_provider"]["calendar_last"], "")
         self.assertIn("global_daily", manifest["documented_inputs"])
         self.assertIn("raw_global_daily", manifest["documented_inputs"])

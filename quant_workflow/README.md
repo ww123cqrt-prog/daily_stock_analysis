@@ -55,20 +55,21 @@ china-astock-quant adapters, and every stable script here. Data paths use
 # Supervise Baostock in restartable batches
 .venv/bin/python quant_workflow/scripts/supervise_baostock.py
 
-# Merge Baostock + JQData and convert to Qlib bin
+# Rebuild mutable V1-compatible merged output (not canonical V2)
 .venv/bin/python quant_workflow/scripts/merge_to_qlib.py
 
 # Repair provider metadata after manual benchmark/instrument edits
 .venv/bin/python quant_workflow/scripts/repair_qlib_provider.py
 
-# Smoke-check the converted Qlib provider
+# Smoke-check the resolved native Qlib V2 provider
 .venv/bin/python quant_workflow/scripts/check_qlib_data.py
 
 # Apply anomaly cleaning rules into a separate cleaned provider
 .venv/bin/python quant_workflow/scripts/apply_data_cleaning.py
 
-# Run the chain without Baostock/EastMoney/AkShare history requests. A history
-# source must be selected explicitly after provider access has been reviewed.
+# Update independent sources and validate existing native A-share V2. A history
+# source selected here updates audit cache only; canonical publication requires
+# --ashare-v2-bundle-dir /path/to/verified-bundle on the command line.
 .venv/bin/python quant_workflow/scripts/run_daily_update.py
 
 # Read-only data-governance inventory and dry-run cleanup plan
@@ -91,6 +92,7 @@ china-astock-quant adapters, and every stable script here. Data paths use
 
 ## Current Data Outputs
 
+- Canonical A-share Qlib v2 snapshots: `quant_data/qlib/cn_data_ashare_v2/snapshots/<snapshot_id>`
 - Baostock Parquet: `quant_data/parquet/ashare_1d/baostock_qfq`
 - JQData Parquet: `quant_data/parquet/ashare_1d/jqdata`
 - V1-compatible merged Parquet generated from V2: `quant_data/parquet/ashare_1d/merged_baostock_jqdata`
@@ -113,10 +115,13 @@ paths and readiness state remain authoritative in
 
 The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`, and
 `qlib_ashare_v2`; resolve them through `quant_data_cli.py` instead of hard-coding
-snapshot paths. Existing programs may keep the four original merged/cleaned
-paths: they are generated compatibility outputs from V2. Only the `_old`
-directories and old source directories are audit-only. Do not infer readiness
-from directory names; the live manifest is authoritative.
+snapshot paths. DSA canonical training, prediction, backtesting, trading-calendar
+and quality checks resolve `qlib_ashare_v2` once per process. The original
+merged paths remain generated compatibility outputs for rollback, mutable
+maintenance tools and callers that still require cleaned semantics; they are
+not the canonical DSA input. Only the `_old` directories and old source
+directories are audit-only. Do not infer readiness from directory names; the
+live manifest is authoritative.
 
 The robust strategy configuration uses verified offline reuse for the one-time
 reference snapshot and the three Qlib benchmarks. It does not silently redownload
@@ -151,13 +156,19 @@ directories are not supported.
 - `run_daily_update.py` defaults to `--ashare-source none` and `--news-limit 0`.
   Baostock, EastMoney, and AkShare are opt-in and mutually exclusive per run;
   AkShare's A-share history call uses EastMoney underneath and is not a separate
-  provider for request-load purposes.
-- Benchmark repair is also offline by default, so a missing local `SH000300`
-  cache cannot silently reopen Baostock/EastMoney access. Only the explicit
-  command-line flag `--allow-benchmark-network` enables those fallbacks; the
-  scheduled task and DSA web whitelist do not expose that flag.
+  provider for request-load purposes. These source jobs update audit caches
+  only and can never publish canonical V2 data.
+- A canonical A-share daily publication requires
+  `--ashare-v2-bundle-dir <verified-bundle>`. The runner delegates that bundle
+  to `quant_data_cli.py`; the web whitelist intentionally does not accept an
+  arbitrary local bundle path. Without a bundle, the A-share portion is a
+  validation-only run.
 - `train_baseline_lgb.py --provider cleaned` rewrites a runtime YAML under
   `reports/runtime_configs/` so the source config stays canonical.
+- Qlib YAML files under `configs/` contain the
+  `RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME` sentinel. Run them through the DSA
+  wrappers, which replace the sentinel with one immutable snapshot path before
+  Qlib starts. Direct `qrun` use of a source template is unsupported.
 - `SH000300` benchmark data may exist under `features/sh000300`, but it must
   not be listed in `instruments/all.txt` or `instruments/csi300.txt`; otherwise
   model training can treat the index as a tradable stock.
@@ -171,12 +182,10 @@ directories are not supported.
 - Baostock, EastMoney history, AkShare history, and EastMoney news scripts also
   share `source_download.lock.json`. Direct shell launches therefore cannot run
   two of these provider downloaders at the same time.
-- Source parquet caches, run-scoped merged/cleaned candidates, and fixed-path
-  official providers have separate roles. Candidates live under
-  `quant_data/runtime/daily_update/runs/<run-id>/`; the four official derived
-  directories and `DATA_MANIFEST.json` are promoted together only after every
-  required check passes. Previous official directories remain under that
-  run's `previous_official/` rollback directory.
+- The daily runner never invokes the legacy merged/cleaned candidate publisher.
+  V2 bundle publication follows immutable staging, validation and pointer
+  rollback inside `quant_data_cli.py`; fixed-path compatibility outputs are
+  maintained by `publish_v2_compatibility.py` only.
 - Benchmark fallback is fail-closed. Baostock, anonymous public-source
   fallbacks, and validated local provider caches are tried in order; missing
   benchmark dates are never silently forward-filled as real closes.

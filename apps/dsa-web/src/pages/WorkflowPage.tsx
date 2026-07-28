@@ -91,15 +91,15 @@ const WORKFLOW_INPUT_CLASS =
 
 const WORKFLOW_STEPS: WorkflowStep[] = [
   {
-    title: '一键全链路',
-    description: '把下载、合并、清洗和交叉验证串成一次自动运行；无新交易日时自动跳过重建。',
+    title: '每日更新与校验',
+    description: '更新独立数据源，并直接校验当前 A 股 qfq 与原生 Qlib V2 快照。',
     icon: RefreshCw,
     jobs: [
       {
         type: 'run_daily_update',
-        label: '运行每日数据更新全链路',
+        label: '运行每日数据更新与 V2 校验',
         description:
-          'A 股历史源默认关闭；手动启用时一次只运行 Baostock、东方财富或 AkShare 中的一个。之后再执行合并、校验、清洗和 provider 检查。',
+          'A 股历史源默认关闭；手动启用时只更新审计缓存，不会发布正式行情。正式 A 股更新必须使用已核验的 V2 bundle；本任务随后直接校验 ashare_daily_qfq 与 qlib_ashare_v2。',
         defaultParams: {
           ashare_source: 'none',
           overlap_days: '7',
@@ -111,7 +111,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         params: [
           {
             key: 'ashare_source',
-            label: 'A股历史来源',
+            label: 'A股审计缓存来源',
             kind: 'select',
             options: [
               { value: 'none', label: '关闭（默认）' },
@@ -120,13 +120,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
               { value: 'akshare', label: 'AkShare（使用东财接口）' },
             ],
           },
-          { key: 'skip_download', label: '跳过下载只重建', kind: 'checkbox' },
-          { key: 'force', label: '强制重建（无新数据也跑）', kind: 'checkbox' },
+          { key: 'skip_download', label: '跳过下载，只校验 V2', kind: 'checkbox' },
           { key: 'dry_run', label: '仅预演不执行', kind: 'checkbox' },
           { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
           { key: 'skip_global_daily', label: '跳过全球日线', kind: 'checkbox' },
           { key: 'skip_ashare_news', label: '跳过新闻原始证据', kind: 'checkbox' },
-          { key: 'skip_snapshot_validation', label: '跳过快照校验', kind: 'checkbox' },
           { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
           { key: 'end', label: '结束日期', kind: 'date' },
           { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
@@ -136,7 +134,6 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
           { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
-          { key: 'snapshot_limit', label: '快照校验样本', kind: 'number', min: 1, placeholder: '50' },
           { key: 'news_limit', label: '新闻下载股票数', kind: 'number', min: 1, placeholder: '50' },
           { key: 'overlap_sample', label: '交叉验证重叠样本', kind: 'number', min: 1, placeholder: '留空为全部' },
           { key: 'merged_sample', label: '质量报告合并样本', kind: 'number', min: 1, placeholder: '留空为全部' },
@@ -361,7 +358,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'apply_data_cleaning',
         label: '应用清洗策略',
-        description: '根据异常清单生成 cleaned Qlib provider，不覆盖原始 canonical provider。',
+        description: '根据异常清单生成旧版 cleaned 兼容 provider，不覆盖原生 V2 正式 provider。',
         params: [
           { key: 'dry_run', label: '只预演不写入', kind: 'checkbox' },
           { key: 'no_overwrite', label: '不覆盖已有文件', kind: 'checkbox' },
@@ -385,8 +382,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: '原始合并数据' },
-              { value: 'cleaned', label: '清洗后数据' },
+              { value: 'canonical', label: '原生 V2（正式）' },
+              { value: 'cleaned', label: '旧版清洗数据（兼容）' },
             ],
           },
           { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
@@ -404,8 +401,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: '原始合并数据' },
-              { value: 'cleaned', label: '清洗后数据' },
+              { value: 'canonical', label: '原生 V2（正式）' },
+              { value: 'cleaned', label: '旧版清洗数据（兼容）' },
             ],
           },
           { key: 'dry_run', label: '只做小样本预演', kind: 'checkbox' },
@@ -617,8 +614,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
       eyebrow: 'Quant Data',
       title: zh ? '数据更新与检查' : 'Data Updates and Checks',
       description: zh
-        ? '更新行情与参考数据，合并 Qlib 数据，并独立完成质量、异常和可训练性检查。'
-        : 'Update market and reference data, merge Qlib data, and run quality and training-readiness checks.',
+        ? '更新独立行情与参考数据，并校验正式 A 股 qfq 和原生 Qlib V2 快照。'
+        : 'Update independent market and reference data, then validate the canonical A-share qfq and native Qlib V2 snapshots.',
     };
   }
   if (surface === 'training') {

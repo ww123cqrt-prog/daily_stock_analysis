@@ -78,7 +78,7 @@ describe('ResearchPage', () => {
         },
       ],
       qlibProvider: {
-        path: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata',
+        path: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_ashare_v2/snapshots/qlib-v2-001',
         calendarDays: 1316,
         calendarRange: '2020-01-02 ~ 2025-06-11',
         instruments: 5340,
@@ -120,10 +120,23 @@ describe('ResearchPage', () => {
             },
           },
           {
+            runId: 'legacy123',
+            experimentName: 'legacy_lgb_alpha158',
+            status: 'completed',
+            provider: 'canonical',
+            qlibProvider: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata',
+            model: 'LGBModel',
+            strategy: 'TopkDropoutStrategy',
+            datasetRange: '2020-01-02 ~ 2026-07-01',
+            metrics: {
+              '1day.excess_return_with_cost.annualized_return': 0.999,
+            },
+          },
+          {
             runId: 'abc123',
             experimentName: 'baseline_lgb_alpha158',
             status: 'completed',
-            qlibProvider: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata',
+            qlibProvider: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_ashare_v2/snapshots/qlib-v2-001',
             model: 'LGBModel',
             strategy: 'TopkDropoutStrategy',
             datasetRange: '2020-01-02 ~ 2026-07-01',
@@ -464,7 +477,10 @@ describe('ResearchPage', () => {
     expect(screen.getByText('最近 2 次实验')).toBeInTheDocument();
     expect(screen.getByText('清洗对比')).toBeInTheDocument();
     expect(screen.getByText('清洗后数据')).toBeInTheDocument();
-    expect(screen.getByText('原始合并数据')).toBeInTheDocument();
+    expect(screen.getByText('原生 V2 数据')).toBeInTheDocument();
+    const canonicalCard = screen.getByText('原生 V2 数据').parentElement;
+    expect(canonicalCard).toHaveTextContent('baseline_lgb_alpha158');
+    expect(canonicalCard).not.toHaveTextContent('legacy_lgb_alpha158');
     expect(screen.getByText('+0.1647')).toBeInTheDocument();
     expect(screen.getAllByText('LGBModel').length).toBeGreaterThan(0);
     expect(screen.getAllByText('TopkDropoutStrategy').length).toBeGreaterThan(0);

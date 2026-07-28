@@ -34,7 +34,41 @@ def write_prices(directory: Path, symbol: str) -> None:
     frame.to_parquet(directory / f"{symbol}.parquet", index=False)
 
 
+def write_benchmark_features(
+    provider: Path,
+    *,
+    symbols: tuple[str, ...] = ("SH000300", "SH000905", "SH000906"),
+) -> None:
+    calendar = ["2026-07-17", "2026-07-20"]
+    for symbol_index, symbol in enumerate(symbols, start=1):
+        feature_dir = provider / "features" / symbol.lower()
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        for field in ("open", "high", "low", "close", "volume", "factor"):
+            values = np.array(
+                [
+                    0.0,
+                    1.0 if field == "factor" else 10.0 * symbol_index,
+                    1.0 if field == "factor" else 10.0 * symbol_index + 1.0,
+                ],
+                dtype="<f4",
+            )
+            if field == "volume":
+                values[1:] = [1000.0, 1100.0]
+            values.tofile(feature_dir / f"{field}.day.bin")
+
+
 class ReportDataQualityTest(unittest.TestCase):
+    def test_source_index_normalizes_native_v2_exchange_prefixes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("SH600000.parquet", "SZ000001.parquet", "830001.parquet"):
+                (root / name).write_bytes(b"")
+
+            symbols = module.load_source_index(root)
+
+        self.assertEqual(symbols, {"600000", "000001", "830001"})
+
     def test_incomplete_benchmark_is_a_training_readiness_blocker(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -59,6 +93,74 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertFalse(stats["benchmark_complete"])
         self.assertFalse(ready)
         self.assertIn("benchmark", detail["summary"].lower())
+
+    def test_all_three_benchmarks_and_six_fields_are_required(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "qlib"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-17\n2026-07-20\n", encoding="utf-8")
+            instruments = provider / "instruments" / "all.txt"
+            instruments.parent.mkdir(parents=True)
+            instruments.write_text(
+                "SZ000001\t2026-07-17\t2026-07-20\n", encoding="utf-8"
+            )
+            write_benchmark_features(provider)
+
+            complete = module.qlib_provider_stats(provider)
+            (provider / "features" / "sh000906" / "volume.day.bin").unlink()
+            incomplete = module.qlib_provider_stats(provider)
+
+        self.assertTrue(complete["benchmark_complete"])
+        self.assertEqual(complete["benchmark_feature_dirs"], 3)
+        self.assertEqual(set(complete["benchmark_details"]), set(module.BENCHMARK_SYMBOLS))
+        self.assertFalse(incomplete["benchmark_complete"])
+        self.assertIn(
+            "volume", incomplete["benchmark_details"]["SH000906"]["missing_fields"]
+        )
+
+    def test_benchmark_factor_must_cover_every_calendar_day(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "qlib"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-17\n2026-07-20\n", encoding="utf-8")
+            instruments = provider / "instruments" / "all.txt"
+            instruments.parent.mkdir(parents=True)
+            instruments.write_text(
+                "SZ000001\t2026-07-17\t2026-07-20\n", encoding="utf-8"
+            )
+            write_benchmark_features(provider)
+            np.array([0.0, 1.0, np.nan], dtype="<f4").tofile(
+                provider / "features" / "sh000300" / "factor.day.bin"
+            )
+
+            stats = module.qlib_provider_stats(provider)
+
+        self.assertFalse(stats["benchmark_complete"])
+        self.assertEqual(stats["benchmark_details"]["SH000300"]["missing_days"], 1)
+        self.assertIn(
+            "factor", stats["benchmark_details"]["SH000300"]["missing_fields"]
+        )
+
+    def test_help_does_not_resolve_large_dataset_defaults(self):
+        module = load_module()
+        with patch.object(
+            module,
+            "ashare_qfq_bars_dir",
+            side_effect=AssertionError("A-share snapshot was resolved for --help"),
+        ), patch.object(
+            module,
+            "qlib_provider_uri",
+            side_effect=AssertionError("Qlib snapshot was resolved for --help"),
+        ), patch.object(sys, "argv", ["report_data_quality.py", "--help"]):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+
+        self.assertEqual(raised.exception.code, 0)
+
     def test_scan_merged_files_respects_sample_limit(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

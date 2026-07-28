@@ -26,12 +26,12 @@ class CheckQlibDataTest(unittest.TestCase):
 
         self.assertEqual(args.provider_dir, provider)
 
-    def test_provider_uri_honors_quant_data_root_environment(self):
+    def test_provider_uri_honors_explicit_environment_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            quant_data = Path(temp_dir) / "quant_data"
+            provider = Path(temp_dir) / "native-provider"
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_qlib_data.py"
             env = os.environ.copy()
-            env["QUANT_DATA_ROOT"] = str(quant_data)
+            env["QLIB_PROVIDER_URI"] = str(provider)
 
             result = subprocess.run(
                 [
@@ -56,7 +56,19 @@ class CheckQlibDataTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(
             payload["provider_uri"],
-            str(quant_data / "qlib" / "cn_data_baostock_jqdata"),
+            str(provider),
+        )
+
+    def test_required_sample_covers_stock_indexes_and_all_ohlcv_factor_fields(self):
+        module = load_module()
+
+        self.assertEqual(
+            module.REQUIRED_INSTRUMENTS,
+            ("SH600000", "SH000300", "SH000905", "SH000906"),
+        )
+        self.assertEqual(
+            module.REQUIRED_FIELDS,
+            ("$open", "$high", "$low", "$close", "$volume", "$factor"),
         )
 
     def test_reads_provider_calendar_range(self):

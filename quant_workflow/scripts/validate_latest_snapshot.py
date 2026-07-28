@@ -19,7 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _daily_update_runtime import write_json_atomic  # noqa: E402
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import ashare_qfq_bars_dir, quant_data_root, reports_root  # noqa: E402
 from market_data_clients import (  # noqa: E402
     fetch_sina_a_snapshot_text,
     fetch_sina_a_snapshots,
@@ -29,7 +29,7 @@ from market_data_clients import (  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
-MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+MERGED_DIR: Path | None = None
 REPORT_DIR = reports_root()
 RAW_DIR = QUANT_DATA / "raw" / "ashare_snapshots"
 
@@ -198,7 +198,9 @@ def load_symbols_from_merged(merged_dir: Path, limit: int) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate merged latest close against Sina snapshot.")
-    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument(
+        "--merged-dir", type=Path, default=MERGED_DIR or ashare_qfq_bars_dir()
+    )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DIR)
     parser.add_argument("--limit", type=int, default=50)

@@ -24,7 +24,6 @@ def load_module():
 def _args(**overrides):
     base = dict(
         skip_download=False,
-        force=False,
         ashare_source="none",
         overlap_days=7,
         sleep=2.0,
@@ -40,15 +39,12 @@ def _args(**overrides):
         skip_global_daily=False,
         skip_ashare_news=False,
         skip_etf_momentum=False,
-        skip_snapshot_validation=False,
         use_system_proxy=False,
-        snapshot_limit=50,
         news_limit=0,
         overlap_sample=0,
         merged_sample=0,
         min_source_coverage=0.8,
-        benchmark_cache_dir=None,
-        benchmark_offline=True,
+        ashare_v2_bundle_dir=None,
         quality_min_calendar_days=252,
         quality_min_instruments=100,
         skip_if_robust_training=False,
@@ -72,36 +68,6 @@ def _snapshot(day: str, *, eligible: bool = True, ratio: float = 1.0):
     }
 
 
-class ShouldRunHeavyTest(unittest.TestCase):
-    def setUp(self):
-        self.module = load_module()
-
-    def test_forced_always_runs(self):
-        self.assertTrue(
-            self.module.should_run_heavy(force=True, download_ran=True, before="2026-07-03", after="2026-07-03")
-        )
-
-    def test_skipped_download_runs_rebuild(self):
-        self.assertTrue(
-            self.module.should_run_heavy(force=False, download_ran=False, before="2026-07-03", after="2026-07-03")
-        )
-
-    def test_new_trading_day_runs(self):
-        self.assertTrue(
-            self.module.should_run_heavy(force=False, download_ran=True, before="2026-07-03", after="2026-07-04")
-        )
-
-    def test_no_new_trading_day_skips(self):
-        self.assertFalse(
-            self.module.should_run_heavy(force=False, download_ran=True, before="2026-07-03", after="2026-07-03")
-        )
-
-    def test_missing_dates_are_conservative(self):
-        self.assertTrue(
-            self.module.should_run_heavy(force=False, download_ran=True, before="", after="")
-        )
-
-
 class BuildStagesTest(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -116,17 +82,17 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("download_ashare_news", names)
         self.assertIn("download_etf_momentum", names)
         self.assertIn("generate_etf_momentum_report", names)
-        self.assertIn("merge_to_qlib", names)
-        self.assertIn("add_index_benchmark", names)
-        self.assertIn("validate_latest_snapshot", names)
-        self.assertIn("apply_data_cleaning", names)
+        self.assertIn("validate_ashare_daily_qfq", names)
+        self.assertIn("validate_qlib_ashare_v2", names)
         self.assertIn("check_qlib_data", names)
-        self.assertIn("publish_official", names)
-        self.assertNotIn("sync_data_manifest", names)
-        # anomaly detection must precede cleaning (cleaning consumes its output)
-        self.assertLess(names.index("report_data_anomalies"), names.index("apply_data_cleaning"))
-        self.assertLess(names.index("add_index_benchmark"), names.index("apply_data_cleaning"))
-        self.assertLess(names.index("check_qlib_data"), names.index("publish_official"))
+        self.assertIn("report_data_quality", names)
+        self.assertIn("sync_data_manifest_check", names)
+        self.assertNotIn("merge_to_qlib", names)
+        self.assertNotIn("publish_official", names)
+        self.assertLess(
+            names.index("validate_qlib_ashare_v2"),
+            names.index("check_qlib_data"),
+        )
 
     def test_skip_download_omits_download_stage(self):
         stages = self.module.build_stages(_args(skip_download=True))
@@ -134,14 +100,12 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("download_baostock", names)
         self.assertNotIn("download_eastmoney", names)
         self.assertNotIn("download_akshare", names)
-        self.assertEqual(names[0], "merge_to_qlib")
+        self.assertEqual(names[0], "validate_ashare_daily_qfq")
 
-    def test_download_stage_is_incremental_nonfatal_and_not_heavy(self):
+    def test_download_stage_is_incremental_nonfatal(self):
         stages = self.module.build_stages(_args(ashare_source="baostock", limit=5))
         download = next(s for s in stages if s.name == "download_baostock")
-        self.assertFalse(download.heavy)
-        # Baostock download is non-fatal: merge reads on-disk parquet, so a
-        # transient download failure must not block the rebuild.
+        # Source downloads update audit caches only. They never publish V2.
         self.assertFalse(download.required)
         self.assertIn("--incremental", download.argv)
         self.assertIn("--limit", download.argv)
@@ -154,7 +118,6 @@ class BuildStagesTest(unittest.TestCase):
             names = [stage.name for stage in stages]
             self.assertEqual(len({item for item in names if item in {"download_eastmoney", "download_akshare"}}), 1)
             stage = next(s for s in stages if s.name == name)
-            self.assertFalse(stage.heavy)
             self.assertFalse(stage.required)
             self.assertIn("--incremental", stage.argv)
             self.assertIn("--overlap-days", stage.argv)
@@ -163,7 +126,6 @@ class BuildStagesTest(unittest.TestCase):
 
         stages = self.module.build_stages(_args(ashare_source="eastmoney", limit=5))
         global_daily = next(s for s in stages if s.name == "download_global_daily")
-        self.assertFalse(global_daily.heavy)
         self.assertFalse(global_daily.required)
         self.assertIn("--incremental", global_daily.argv)
         self.assertIn("--limit", global_daily.argv)
@@ -183,9 +145,8 @@ class BuildStagesTest(unittest.TestCase):
         names = [stage.name for stage in self.module.build_stages(args)]
         self.assertFalse(set(names) & self.module.ASHARE_DOWNLOAD_STAGE_NAMES)
         self.assertNotIn("download_ashare_news", names)
-        benchmark = next(stage for stage in self.module.build_stages(args) if stage.name == "add_index_benchmark")
-        self.assertTrue(args.benchmark_offline)
-        self.assertIn("--reuse-existing", benchmark.argv)
+        self.assertNotIn("update_ashare_v2_bundle", names)
+        self.assertIn("validate_qlib_ashare_v2", names)
 
     def test_etf_momentum_update_and_report_are_isolated_nonfatal_stages(self):
         stages = self.module.build_stages(_args())
@@ -194,13 +155,11 @@ class BuildStagesTest(unittest.TestCase):
             stage for stage in stages if stage.name == "generate_etf_momentum_report"
         )
 
-        self.assertFalse(update.heavy)
         self.assertFalse(update.required)
         self.assertIn("quant_data_cli.py", update.argv[1])
         self.assertIn("update", update.argv)
         self.assertIn("etf_momentum_daily_qfq", update.argv)
         self.assertIn("--through", update.argv)
-        self.assertFalse(report.heavy)
         self.assertFalse(report.required)
         self.assertIn("generate_etf_momentum_strategy_report.py", report.argv[1])
         self.assertLess(stages.index(update), stages.index(report))
@@ -211,29 +170,32 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("download_etf_momentum", names)
         self.assertNotIn("generate_etf_momentum_report", names)
 
-    def test_rebuild_stages_marked_heavy(self):
-        stages = self.module.build_stages(_args())
-        heavy = {s.name for s in stages if s.heavy}
-        self.assertEqual(
-            heavy,
-            {"merge_to_qlib", "report_data_anomalies", "apply_data_cleaning",
-             "report_data_quality", "validate_latest_snapshot", "check_qlib_data",
-             "add_index_benchmark", "publish_official"},
+    def test_verified_bundle_uses_contract_updater_before_native_validation(self):
+        bundle = Path("/verified/bundle")
+        stages = self.module.build_stages(_args(ashare_v2_bundle_dir=bundle))
+        names = [stage.name for stage in stages]
+        update = next(stage for stage in stages if stage.name == "update_ashare_v2_bundle")
+
+        self.assertTrue(update.required)
+        self.assertIn("quant_data_cli.py", update.argv[1])
+        self.assertIn("ashare_daily_qfq", update.argv)
+        self.assertEqual(update.argv[update.argv.index("--bundle-dir") + 1], str(bundle))
+        self.assertLess(
+            names.index("update_ashare_v2_bundle"),
+            names.index("validate_ashare_daily_qfq"),
         )
-        publish = next(s for s in stages if s.name == "publish_official")
-        self.assertTrue(publish.heavy)
-        self.assertTrue(publish.required)
+        self.assertNotIn("publish_official", names)
 
     def test_source_downloads_can_be_individually_disabled(self):
         stages = self.module.build_stages(
-            _args(ashare_source="baostock", skip_baostock=True, skip_snapshot_validation=True)
+            _args(ashare_source="baostock", skip_baostock=True)
         )
         names = [s.name for s in stages]
 
         self.assertNotIn("download_baostock", names)
         self.assertNotIn("download_eastmoney", names)
         self.assertNotIn("download_akshare", names)
-        self.assertNotIn("validate_latest_snapshot", names)
+        self.assertIn("validate_qlib_ashare_v2", names)
 
     def test_system_proxy_flag_only_applies_to_public_sources(self):
         baostock_stages = self.module.build_stages(_args(ashare_source="baostock", use_system_proxy=True))
@@ -242,12 +204,10 @@ class BuildStagesTest(unittest.TestCase):
         baostock = next(s for s in baostock_stages if s.name == "download_baostock")
         eastmoney = next(s for s in eastmoney_stages if s.name == "download_eastmoney")
         akshare = next(s for s in akshare_stages if s.name == "download_akshare")
-        snapshot = next(s for s in eastmoney_stages if s.name == "validate_latest_snapshot")
 
         self.assertNotIn("--use-system-proxy", baostock.argv)
         self.assertIn("--use-system-proxy", eastmoney.argv)
         self.assertIn("--use-system-proxy", akshare.argv)
-        self.assertIn("--use-system-proxy", snapshot.argv)
 
 
 class LatestSourceDateTest(unittest.TestCase):
@@ -281,29 +241,34 @@ class LatestSourceDateTest(unittest.TestCase):
         self.assertEqual(by_source["eastmoney"], "2026-07-08")
 
     def test_latest_dataset_date_reads_governed_catalog(self):
-        with patch.object(
-            self.module,
-            "describe_dataset",
-            return_value={"latest_trade_date": "2026-07-24"},
-        ) as describe:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "DATA_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "datasets": {
+                            "etf_momentum_daily_qfq": {
+                                "latest_trade_date": "2026-07-24"
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             latest = self.module.latest_dataset_date(
-                "etf_momentum_daily_qfq", root=Path("/tmp/quant-data")
+                "etf_momentum_daily_qfq", root=root
             )
 
         self.assertEqual(latest, "2026-07-24")
-        describe.assert_called_once_with(
-            "etf_momentum_daily_qfq",
-            quant_data_root=Path("/tmp/quant-data"),
-        )
 
     def test_latest_dataset_date_fails_closed_when_catalog_is_unavailable(self):
-        with patch.object(
-            self.module,
-            "describe_dataset",
-            side_effect=self.module.DataContractError("missing"),
-        ):
+        with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
-                self.module.latest_dataset_date("etf_momentum_daily_qfq"), ""
+                self.module.latest_dataset_date(
+                    "etf_momentum_daily_qfq", root=Path(tmp)
+                ),
+                "",
             )
 
 
@@ -321,7 +286,7 @@ class SourceRefreshFailureGateTest(unittest.TestCase):
             self.module.StageResult("merge_to_qlib", "skipped", 0, 0, required=True),
         ]
 
-        self.assertFalse(self.module.source_refresh_failed_without_rebuild(results))
+        self.assertFalse(self.module.selected_ashare_refresh_failed(results))
 
     def test_all_ashare_downloads_failed_still_triggers_gate_with_global_success(self):
         results = [
@@ -332,7 +297,7 @@ class SourceRefreshFailureGateTest(unittest.TestCase):
             self.module.StageResult("merge_to_qlib", "skipped", 0, 0, required=True),
         ]
 
-        self.assertTrue(self.module.source_refresh_failed_without_rebuild(results))
+        self.assertTrue(self.module.selected_ashare_refresh_failed(results))
 
 
 class SourceCoverageTest(unittest.TestCase):
@@ -399,8 +364,12 @@ class DryRunMainTest(unittest.TestCase):
             self.assertTrue(summary["dry_run"])
             self.assertEqual(summary["status"], "planned")
             self.assertTrue(all(s["status"] == "planned" for s in summary["stages"]))
-            # dry-run previews the full pipeline regardless of the trading-day gate
-            self.assertTrue(any(s["name"] == "apply_data_cleaning" for s in summary["stages"]))
+            self.assertTrue(
+                any(s["name"] == "validate_qlib_ashare_v2" for s in summary["stages"])
+            )
+            self.assertFalse(
+                any(s["name"] == "publish_official" for s in summary["stages"])
+            )
 
     def test_duplicate_trigger_records_controlled_skip(self):
         module = self.module
@@ -457,7 +426,7 @@ class DryRunMainTest(unittest.TestCase):
 
         self.assertTrue(active)
 
-    def test_optional_source_download_failure_does_not_fail_daily_update(self):
+    def test_selected_source_download_failure_fails_refresh_request(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
@@ -478,11 +447,19 @@ class DryRunMainTest(unittest.TestCase):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["status"], "failed")
         self.assertTrue(any(s["name"] == "download_eastmoney" and s["status"] == "failed" for s in summary["stages"]))
+        self.assertTrue(
+            any(
+                s["name"] == "source_refresh_gate"
+                and s["required"]
+                and s["status"] == "failed"
+                for s in summary["stages"]
+            )
+        )
 
-    def test_one_selected_source_can_publish_when_coverage_passes(self):
+    def test_selected_legacy_source_never_claims_canonical_publication(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
@@ -504,15 +481,17 @@ class DryRunMainTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(summary["status"], "ok")
-        self.assertTrue(any(item["name"] == "publish_official" and item["status"] == "ok" for item in summary["stages"]))
+        self.assertFalse(summary["official_published"])
+        self.assertFalse(summary["manifest_synced"])
+        self.assertNotIn("publish_official", [item["name"] for item in summary["stages"]])
 
-    def test_cleaning_failure_never_reaches_official_publish(self):
+    def test_native_validation_failure_stops_before_downstream_checks(self):
         module = self.module
         called: list[str] = []
 
         def fake_run_stage(stage, dry_run):
             called.append(stage.name)
-            failed = stage.name == "apply_data_cleaning"
+            failed = stage.name == "validate_qlib_ashare_v2"
             return module.StageResult(stage.name, "failed" if failed else "ok", 0.0, 1 if failed else 0, required=stage.required)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -525,14 +504,10 @@ class DryRunMainTest(unittest.TestCase):
                 rc = module.main()
 
         self.assertEqual(rc, 1)
-        self.assertIn("apply_data_cleaning", called)
-        self.assertNotIn("publish_official", called)
+        self.assertIn("validate_qlib_ashare_v2", called)
+        self.assertNotIn("check_qlib_data", called)
 
-    def test_all_source_downloads_failing_is_nonfatal_when_forced_rebuild_still_runs(self):
-        # Redundancy contract: every source download is non-fatal. Even if all
-        # of them fail on the network, the on-disk parquet is intact, so the
-        # rebuild (merge/clean/quality) must still run and the run must NOT
-        # fail — it completes with ok_with_warnings.
+    def test_failed_audit_download_never_triggers_legacy_rebuild(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
@@ -548,20 +523,22 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(
                         sys,
                         "argv",
-                        ["run_daily_update.py", "--ashare-source", "baostock", "--force"],
+                        ["run_daily_update.py", "--ashare-source", "baostock"],
                     ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["status"], "failed")
         # baostock download failure is recorded but non-required (non-fatal)
         self.assertTrue(any(
             s["name"] == "download_baostock" and not s["required"] and s["status"] == "failed"
             for s in summary["stages"]
         ))
-        # rebuild still ran (forced), proving a dead source did not block it
-        self.assertTrue(any(s["name"] == "merge_to_qlib" and s["status"] == "ok" for s in summary["stages"]))
+        self.assertNotIn("merge_to_qlib", [s["name"] for s in summary["stages"]])
+        self.assertTrue(
+            any(s["name"] == "validate_qlib_ashare_v2" and s["status"] == "ok" for s in summary["stages"])
+        )
 
     def test_all_source_downloads_failing_without_rebuild_fails_daily_update(self):
         module = self.module
@@ -587,11 +564,11 @@ class DryRunMainTest(unittest.TestCase):
             for s in summary["stages"]
         ))
 
-    def test_publish_failure_is_required_and_fails_daily_update(self):
+    def test_bundle_update_failure_is_required_and_fails_daily_update(self):
         module = self.module
 
         def fake_run_stage(stage, dry_run):
-            status = "failed" if stage.name == "publish_official" else "ok"
+            status = "failed" if stage.name == "update_ashare_v2_bundle" else "ok"
             return module.StageResult(stage.name, status, 0.0, 1 if status == "failed" else 0, required=stage.required)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -600,16 +577,53 @@ class DryRunMainTest(unittest.TestCase):
                     patch.object(module, "load_expected_symbols", return_value={"000001"}), \
                     patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
                     patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py"]):
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "run_daily_update.py",
+                            "--ashare-v2-bundle-dir",
+                            str(Path(tmp) / "bundle"),
+                        ],
+                    ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
         self.assertEqual(rc, 1)
         self.assertEqual(summary["status"], "failed")
         self.assertTrue(any(
-            s["name"] == "publish_official" and s["required"] and s["status"] == "failed"
+            s["name"] == "update_ashare_v2_bundle" and s["required"] and s["status"] == "failed"
             for s in summary["stages"]
         ))
+
+    def test_successful_bundle_update_is_the_only_canonical_publication(self):
+        module = self.module
+
+        def fake_run_stage(stage, dry_run):
+            return module.StageResult(stage.name, "ok", 0.0, 0, required=stage.required)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp) / "reports"
+            bundle = Path(tmp) / "bundle"
+            with patch.object(module, "REPORTS_ROOT", reports), \
+                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
+                    patch.object(module, "source_coverage_snapshot", return_value=_snapshot("2026-07-08")), \
+                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
+                    patch.object(
+                        sys,
+                        "argv",
+                        ["run_daily_update.py", "--ashare-v2-bundle-dir", str(bundle)],
+                    ):
+                rc = module.main()
+            summary = json.loads(
+                (reports / "daily_update_summary_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(summary["official_published"])
+        self.assertTrue(summary["manifest_synced"])
 
 
 if __name__ == "__main__":

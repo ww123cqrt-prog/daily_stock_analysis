@@ -15,6 +15,8 @@ from _paths import qlib_provider_uri, quant_data_root  # noqa: E402
 
 QUANT_DATA = quant_data_root()
 PROVIDER_URI = qlib_provider_uri()
+REQUIRED_INSTRUMENTS = ("SH600000", "SH000300", "SH000905", "SH000906")
+REQUIRED_FIELDS = ("$open", "$high", "$low", "$close", "$volume", "$factor")
 
 
 def read_provider_calendar_range(provider: Path) -> tuple[str, str]:
@@ -43,6 +45,46 @@ def read_instrument_sample(provider: Path, limit: int = 2) -> list[str]:
     return symbols[:limit]
 
 
+def validate_feature_sample(features, sample_days: list[str]) -> None:
+    import numpy as np
+    import pandas as pd
+
+    if not isinstance(features, pd.DataFrame) or features.empty:
+        raise ValueError("Qlib returned no required sample features")
+    if not isinstance(features.index, pd.MultiIndex) or not {
+        "instrument",
+        "datetime",
+    }.issubset(features.index.names):
+        raise ValueError("Qlib sample index is invalid")
+    if list(features.columns) != list(REQUIRED_FIELDS):
+        raise ValueError("Qlib sample fields are incomplete")
+    expected_days = set(sample_days)
+    for instrument in REQUIRED_INSTRUMENTS:
+        try:
+            frame = features.xs(instrument, level="instrument")
+        except KeyError as exc:
+            raise ValueError(f"Qlib sample is missing {instrument}") from exc
+        actual_days = {
+            str(pd.Timestamp(value).date()) for value in frame.index.tolist()
+        }
+        missing_days = sorted(expected_days.difference(actual_days))
+        if missing_days:
+            raise ValueError(
+                f"Qlib sample is missing dates for {instrument}: "
+                + ", ".join(missing_days)
+            )
+        required = frame.loc[
+            [str(pd.Timestamp(value).date()) in expected_days for value in frame.index]
+        ]
+        values = required.loc[:, list(REQUIRED_FIELDS)].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Qlib sample contains non-finite values for {instrument}")
+        if (required.loc[:, ["$open", "$high", "$low", "$close", "$factor"]] <= 0).any(
+            axis=None
+        ) or (required["$volume"] < 0).any():
+            raise ValueError(f"Qlib sample contains invalid values for {instrument}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     multiprocessing.set_start_method("fork", force=True)
@@ -60,18 +102,17 @@ def main(argv: list[str] | None = None) -> int:
 
     sample_start = str(calendar[-min(5, len(calendar))].date())
     sample_end = str(calendar[-1].date())
-    instruments = read_instrument_sample(args.provider_dir)
+    sample_days = [str(value.date()) for value in calendar[-min(5, len(calendar)) :]]
     features = D.features(
-        instruments,
-        ["$close", "$volume"],
+        list(REQUIRED_INSTRUMENTS),
+        list(REQUIRED_FIELDS),
         start_time=sample_start,
         end_time=sample_end,
         freq="day",
         disk_cache=0,
     )
+    validate_feature_sample(features, sample_days)
     print(features)
-    if features.empty:
-        raise ValueError(f"Qlib returned no sample features: {args.provider_dir}")
     return 0
 
 

@@ -25,7 +25,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import mlruns_root, projects_root, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    ashare_qfq_bars_dir,
+    mlruns_root,
+    projects_root,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from report_market_regime import classify_regime  # noqa: E402
 
 
@@ -35,7 +42,7 @@ QUANT_DATA = quant_data_root()
 REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
 LATEST_TRAINING_RESULT = REPORT_DIR / "latest_training_result.json"
-MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+MERGED_DIR: Path | None = None
 DEFAULT_TRADING_DAYS_PER_YEAR = 244
 
 
@@ -469,7 +476,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only cash-control overlay report for Qlib backtests.")
     parser.add_argument("--portfolio-report", type=Path, default=None, help="Path to Qlib report_normal_1day.pkl. Defaults to latest MLflow run.")
     parser.add_argument("--run-id", default="", help="Optional MLflow run id used to locate report_normal_1day.pkl.")
-    parser.add_argument("--market-data-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument(
+        "--market-data-dir",
+        type=Path,
+        default=MERGED_DIR or ashare_qfq_bars_dir(),
+    )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--lookback-days", type=int, default=60)
     parser.add_argument("--min-symbols", type=int, default=100)

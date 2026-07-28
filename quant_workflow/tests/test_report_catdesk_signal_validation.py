@@ -64,7 +64,13 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             root = Path(temp_dir)
             out_dir = root / "reports"
             with ExitStack() as stack:
-                stack.enter_context(patch.object(module, "quant_data_root", return_value=root / "quant_data"))
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "ashare_qfq_bars_dir",
+                        return_value=root / "quant_data" / "bars",
+                    )
+                )
                 stack.enter_context(patch.object(module, "reports_root", return_value=root / "reports_root"))
                 stack.enter_context(
                     patch.object(
@@ -264,7 +270,7 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
                 "2026-09-29\n2026-09-30\n2026-10-08\n2026-10-09\n",
                 encoding="utf-8",
             )
-            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}):
+            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}):
                 module = load_module()
                 pairs = module.business_day_pairs("2026-09-30", 2)
 
@@ -279,7 +285,7 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
     def test_validation_date_uses_explicit_weekday_fallback_when_calendar_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = Path(temp_dir)
-            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}):
+            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}):
                 module = load_module()
                 validation_date, source = module.resolve_validation_date("2026-07-03", None)
 
@@ -713,7 +719,7 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
                 "2026-09-30\n2026-10-08\n",
                 encoding="utf-8",
             )
-            with patch.dict("os.environ", {"QLIB_CLEANED_PROVIDER_URI": str(provider)}), patch.object(
+            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}), patch.object(
                 module.sys, "argv", argv
             ):
                 exit_code = module.main()

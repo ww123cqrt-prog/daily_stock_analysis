@@ -50,7 +50,7 @@ class TradingCalendar:
 
 
 def load_trading_calendar(path: Path | None = None) -> TradingCalendar:
-    calendar_path = path or (qlib_provider_uri("cleaned") / "calendars" / "day.txt")
+    calendar_path = path or (qlib_provider_uri() / "calendars" / "day.txt")
     days: list[date] = []
     if calendar_path.is_file():
         for raw in calendar_path.read_text(encoding="utf-8").splitlines():

@@ -26,7 +26,7 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 | 两只 ETF qfq | `canonical/ready` | 腾讯同源 raw/qfq 配对，正式可解析 |
 | A 股 Baostock raw (`ashare_daily_raw`) | `canonical/ready` | 保存完整 raw 行情、来源、逐文件哈希和公司行为记录 |
 | A 股 Baostock qfq (`ashare_daily_qfq`) | `canonical/ready` | 使用 Baostock `foreAdjustFactor` 本地计算，保存完整因子并用同源 qfq 核验 |
-| A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，并锁定准确的上游快照 ID 和内容哈希 |
+| A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，包含三套指数基准和 CSI300/500/800 股票池，并锁定准确的上游快照 ID 和内容哈希 |
 | 旧 JQData/东方财富/AkShare 来源目录 | `audit/legacy_unknown` | 仅审计，不再直接合并生成正式输出 |
 | V1 固定路径 merged/cleaned/Qlib | `canonical/ready` 兼容输出 | 由 `ashare_daily_qfq` 重新生成，旧程序无需改路径 |
 | 带 `_old` 后缀的 merged/cleaned/Qlib | `audit/legacy_unknown` | 迁移前旧数据，只用于回滚和审计 |
@@ -44,7 +44,7 @@ parquet/ashare_1d/ashare_daily_qfq/snapshots/<snapshot_id>/
 qlib/cn_data_ashare_v2/snapshots/<snapshot_id>/
 ```
 
-旧程序继续读取原路径，不需要增加路径兼容层：
+尚未迁移的旧程序和 cleaned 调用继续读取原路径：
 
 ```text
 parquet/ashare_1d/merged_baostock_jqdata/
@@ -53,7 +53,7 @@ qlib/cn_data_baostock_jqdata/
 qlib/cn_data_baostock_jqdata_cleaned/
 ```
 
-这些固定路径由 `publish_v2_compatibility.py` 从同一个 `ashare_daily_qfq` 快照成组生成。Parquet 保持六位文件名、V1 列顺序和 `datetime64[ns]`；价格已经前复权，因此对外 `factor=1.0`。真实逐日因子只保存在 V2 `factors/`，不能把对外单位因子误解为“没有复权”。清单中的兼容输出会把 `factor_path` 写成包含数据集根、快照 ID 和 `factors/` 的完整相对路径，不会伪装成兼容目录自己保存了因子。每次发布前重新做异常扫描、清洗、CSI300、三套指数基准和四套候选校验；候选同时锁定 `stock_lists.json` 内容哈希，股票池或四套产物任一变化都必须重新构建。发布过程持有单实例锁，四套中任一失败，原固定路径全部保持不变。
+这些固定路径由 `publish_v2_compatibility.py` 从同一个 `ashare_daily_qfq` 快照成组生成。DSA canonical 训练、预测、回测、交易日历和质量检查不再读取它们，而是通过根清单解析原生 `qlib_ashare_v2`。Parquet 保持六位文件名、V1 列顺序和 `datetime64[ns]`；价格已经前复权，因此对外 `factor=1.0`。真实逐日因子只保存在 V2 `factors/`，不能把对外单位因子误解为“没有复权”。清单中的兼容输出会把 `factor_path` 写成包含数据集根、快照 ID 和 `factors/` 的完整相对路径，不会伪装成兼容目录自己保存了因子。每次发布前重新做异常扫描、清洗、CSI300、三套指数基准和四套候选校验；候选同时锁定 `stock_lists.json` 内容哈希，股票池或四套产物任一变化都必须重新构建。发布过程持有单实例锁，四套中任一失败，原固定路径全部保持不变。
 
 ## 清单结构
 
@@ -176,9 +176,17 @@ python quant_workflow/scripts/quant_data_cli.py update \
 python quant_workflow/scripts/build_qlib_v2.py --publish
 ```
 
-该命令只解析 `ashare_daily_qfq` 的 `ready/qfq` 快照，生成不可变 `qlib_ashare_v2`，并将精确的上游快照 ID 和内容哈希写进 provider 清单。Qlib 指针与根清单使用同一回滚事务。
+该命令只解析 `ashare_daily_qfq` 的 `ready/qfq` 快照，生成不可变 `qlib_ashare_v2`，并将精确的上游快照 ID 和内容哈希写进 provider 清单。构建阶段同时写入 CSI300/500/800 股票池，训练过程不得修改快照。Qlib 指针与根清单使用同一回滚事务。
 
-`qlib_ashare_v2` 是可追溯的内部正式 Qlib 快照。`cn_data_baostock_jqdata*` 是从同一 V2 快照生成的稳定对外路径，供现有 DSA、训练和回测程序继续读取；它们不再是旧数据。迁移前 provider 位于对应 `_old` 目录，只能审计或回滚。
+`qlib_ashare_v2` 是 DSA 的正式 Qlib 快照，包含 `SH000300`、`SH000905`、`SH000906` 的 open/high/low/close/volume/factor。构建器优先复用与当前 qfq 快照、交易日历完全一致的已验证指数；不一致时只从腾讯按日期重建三个指数，把原始 Parquet、来源清单、覆盖日期和哈希保存在 `runtime/qlib_v2_upgrade/runs/`，不会重下全市场行情。任一必要交易日缺失则不发布。
+
+`cn_data_baostock_jqdata*` 仍是从同一 V2 快照生成的稳定兼容输出，但 canonical DSA 主流程已经不再依赖它。CatDesk 历史信号验证已直接读取 `ashare_daily_qfq` 的 bars；cleaned 严格鲁棒流程和其他明确需要清洗语义的调用方仍可显式使用 cleaned 输出。迁移前 provider 位于对应 `_old` 目录，只能审计或回滚。
+
+`run_daily_update.py` 不再构建 merged/cleaned 候选，也不再调用 `publish_daily_candidate.py`。普通 Baostock、东方财富和 AkShare 下载只更新审计缓存；只有命令行显式传入 `--ashare-v2-bundle-dir` 时，编排器才委托 `quant_data_cli.py update ashare_daily_qfq --bundle-dir ...` 事务发布正式 raw/qfq、原生 Qlib V2 及兼容输出。随后直接验证 `ashare_daily_qfq`、`qlib_ashare_v2`、Qlib 可读性、数据质量和根清单漂移。网页不接受任意 bundle 路径。
+
+### 兼容输出退役边界
+
+本轮不删除兼容输出。清单将这些输出登记为 `role: legacy` 和 `lifecycle: compatibility_output`；`status: ready` 只表示旧程序仍可读取，不代表它们是正式主入口。以后只有在生产代码不再引用旧路径、训练/预测/回测均有原生实跑证据、CatDesk 等调用方已迁移或明确保留 cleaned 需求，并获得用户单独授权后，才能提出删除计划。回滚时可设置 `QLIB_PROVIDER_URI` 指向一个已验证的兼容 provider；不得改写或删除原生快照和 `_old` 审计数据。
 
 ## 失败规则
 

@@ -23,6 +23,7 @@ from _file_lock import lock_file, unlock_file  # noqa: E402
 from quant_data_contract import (  # noqa: E402
     DataContractError,
     atomic_write_json,
+    dataset_publication_lock,
     describe_dataset,
     resolve_dataset,
     validate_dataset_snapshot,
@@ -139,6 +140,44 @@ def _human_description(payload: dict[str, Any]) -> str:
         if isinstance(payload.get("producer"), dict)
         else {}
     )
+    upstream_snapshots = payload.get("upstream_snapshots")
+    upstream = (
+        upstream_snapshots[0]
+        if isinstance(upstream_snapshots, list)
+        and upstream_snapshots
+        and isinstance(upstream_snapshots[0], dict)
+        else {}
+    )
+    upstream_dataset_id = (
+        upstream.get("dataset_id")
+        or payload.get("upstream_dataset_id")
+        or "not_applicable"
+    )
+    upstream_snapshot_id = (
+        upstream.get("snapshot_id")
+        or payload.get("upstream_snapshot_id")
+        or "not_applicable"
+    )
+    upstream_content_sha256 = (
+        upstream.get("content_sha256")
+        or payload.get("upstream_content_sha256")
+        or "not_applicable"
+    )
+    benchmarks = (
+        payload.get("benchmarks")
+        if isinstance(payload.get("benchmarks"), dict)
+        else {}
+    )
+    benchmark_source = (
+        benchmarks.get("source")
+        if isinstance(benchmarks.get("source"), dict)
+        else {}
+    )
+    benchmark_symbols = (
+        benchmarks.get("symbols")
+        if isinstance(benchmarks.get("symbols"), dict)
+        else {}
+    )
     raw_codes = source.get("raw_security_codes")
     raw_code_text = (
         ", ".join(f"{key}={value}" for key, value in sorted(raw_codes.items()))
@@ -164,11 +203,33 @@ def _human_description(payload: dict[str, Any]) -> str:
         f"因子索引: {payload.get('factor_index_path', 'not_applicable')}",
         f"公司行为文件: {payload.get('corporate_actions_path', 'not_applicable')}",
         f"内容哈希: {payload.get('content_sha256') or payload.get('upstream_content_sha256', 'unknown')}",
-        f"上游数据集: {payload.get('upstream_dataset_id', 'not_applicable')}",
-        f"上游快照: {payload.get('upstream_snapshot_id', 'not_applicable')}",
+        f"上游数据集: {upstream_dataset_id}",
+        f"上游快照: {upstream_snapshot_id}",
+        f"上游内容哈希: {upstream_content_sha256}",
         f"生成脚本: {producer.get('script', 'unknown')} / {producer.get('version', 'unknown')}",
         f"存储位置: {payload.get('snapshot_path') or payload.get('path', 'unknown')}",
     ]
+    if benchmarks or "benchmark_complete" in payload:
+        lines.extend(
+            [
+                f"指数完整: {'是' if payload.get('benchmark_complete') is True else '否'}",
+                "指数来源: "
+                f"{benchmark_source.get('provider', 'unknown')} / "
+                f"{benchmark_source.get('interface', 'unknown')}",
+                f"交易日历哈希: {benchmarks.get('calendar_sha256', 'unknown')}",
+            ]
+        )
+        for symbol, details in sorted(benchmark_symbols.items()):
+            coverage = (
+                details.get("coverage")
+                if isinstance(details, dict)
+                and isinstance(details.get("coverage"), dict)
+                else {}
+            )
+            lines.append(
+                f"指数 {symbol}: {coverage.get('start', 'unknown')} 至 "
+                f"{coverage.get('end', 'unknown')}"
+            )
     if payload.get("lifecycle") == "compatibility_output":
         lines.append(
             "正式兼容输出: 是；保持旧程序的固定路径和列结构，真实复权因子请查看上游 V2 快照。"
@@ -239,6 +300,106 @@ def _validate(root: Path, target: str) -> int:
     return 0
 
 
+def _update_ashare_from_bundle(
+    root: Path,
+    dataset_id: str,
+    bundle_dir: Path,
+) -> int:
+    from build_qlib_v2 import build_qlib_v2
+    from download_baostock_v2 import build_snapshots_from_bundle
+    from publish_v2_compatibility import rebuild_and_publish_v1_compatibility
+
+    previous_files: dict[Path, bytes | None] = {}
+    completed_steps: list[str] = []
+    failed_step = "capture_state"
+    started_at = _timestamp()
+    try:
+        previous_files = _capture_file_state(root)
+        failed_step = "raw_qfq_v2"
+        raw, qfq = build_snapshots_from_bundle(
+            bundle_dir=bundle_dir,
+            quant_data_root=root,
+            publish=True,
+            publication_lock_held=True,
+        )
+        completed_steps.append("raw_qfq_v2")
+        failed_step = "qlib_v2"
+        qlib_v2 = build_qlib_v2(
+            quant_data_root=root,
+            publish=True,
+            publication_lock_held=True,
+        )
+        completed_steps.append("qlib_v2")
+        failed_step = "compatibility"
+        compatibility = rebuild_and_publish_v1_compatibility(
+            quant_data_root=root,
+            publication_lock_held=True,
+        )
+        completed_steps.append("compatibility")
+    except Exception as exc:
+        try:
+            _restore_file_state(previous_files)
+        except Exception as rollback_exc:
+            status_error = _try_write_update_status(
+                root,
+                {
+                    "status": "rollback_failed",
+                    "dataset_id": dataset_id,
+                    "started_at": started_at,
+                    "failed_step": failed_step,
+                    "completed_steps": completed_steps,
+                    "error_type": type(exc).__name__,
+                    "rollback_error_type": type(rollback_exc).__name__,
+                },
+            )
+            message = (
+                f"A-share update failed during {failed_step} "
+                f"({type(exc).__name__}); rollback also failed "
+                f"({type(rollback_exc).__name__})"
+            )
+            if status_error:
+                message += f"; status record failed ({status_error})"
+            raise DataContractError(message) from rollback_exc
+        status_error = _try_write_update_status(
+            root,
+            {
+                "status": "rolled_back",
+                "dataset_id": dataset_id,
+                "started_at": started_at,
+                "failed_step": failed_step,
+                "completed_steps": completed_steps,
+                "error_type": type(exc).__name__,
+            },
+        )
+        message = f"A-share update failed during {failed_step} and was rolled back"
+        if status_error:
+            message += f"; status record failed ({status_error})"
+        raise DataContractError(message) from exc
+
+    status_error = _try_write_update_status(
+        root,
+        {
+            "status": "completed",
+            "dataset_id": dataset_id,
+            "started_at": started_at,
+            "completed_steps": completed_steps,
+        },
+    )
+    output = {
+        "raw": str(raw),
+        "qfq": str(qfq),
+        "qlib_v2": str(qlib_v2),
+        "compatibility": compatibility,
+    }
+    if status_error:
+        output["status_record"] = {
+            "status": "write_failed",
+            "error_type": status_error,
+        }
+    _json_dump(output)
+    return 0
+
+
 def _update(
     root: Path,
     dataset_id: str,
@@ -246,10 +407,6 @@ def _update(
     bundle_dir: Path | None,
 ) -> int:
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
-        from build_qlib_v2 import build_qlib_v2
-        from download_baostock_v2 import build_snapshots_from_bundle
-        from publish_v2_compatibility import rebuild_and_publish_v1_compatibility
-
         update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
         update_lock_path.parent.mkdir(parents=True, exist_ok=True)
         update_lock_handle = update_lock_path.open("a+b")
@@ -264,89 +421,9 @@ def _update(
             update_lock_handle.close()
             raise
 
-        previous_files: dict[Path, bytes | None] = {}
-        completed_steps: list[str] = []
-        failed_step = "capture_state"
-        started_at = _timestamp()
         try:
-            previous_files = _capture_file_state(root)
-            failed_step = "raw_qfq_v2"
-            raw, qfq = build_snapshots_from_bundle(
-                bundle_dir=bundle_dir,
-                quant_data_root=root,
-                publish=True,
-            )
-            completed_steps.append("raw_qfq_v2")
-            failed_step = "qlib_v2"
-            qlib_v2 = build_qlib_v2(quant_data_root=root, publish=True)
-            completed_steps.append("qlib_v2")
-            failed_step = "compatibility"
-            compatibility = rebuild_and_publish_v1_compatibility(
-                quant_data_root=root,
-            )
-            completed_steps.append("compatibility")
-        except Exception as exc:
-            try:
-                _restore_file_state(previous_files)
-            except Exception as rollback_exc:
-                status_error = _try_write_update_status(
-                    root,
-                    {
-                        "status": "rollback_failed",
-                        "dataset_id": dataset_id,
-                        "started_at": started_at,
-                        "failed_step": failed_step,
-                        "completed_steps": completed_steps,
-                        "error_type": type(exc).__name__,
-                        "rollback_error_type": type(rollback_exc).__name__,
-                    },
-                )
-                message = (
-                    f"A-share update failed during {failed_step} "
-                    f"({type(exc).__name__}); rollback also failed "
-                    f"({type(rollback_exc).__name__})"
-                )
-                if status_error:
-                    message += f"; status record failed ({status_error})"
-                raise DataContractError(message) from rollback_exc
-            status_error = _try_write_update_status(
-                root,
-                {
-                    "status": "rolled_back",
-                    "dataset_id": dataset_id,
-                    "started_at": started_at,
-                    "failed_step": failed_step,
-                    "completed_steps": completed_steps,
-                    "error_type": type(exc).__name__,
-                },
-            )
-            message = f"A-share update failed during {failed_step} and was rolled back"
-            if status_error:
-                message += f"; status record failed ({status_error})"
-            raise DataContractError(message) from exc
-        else:
-            status_error = _try_write_update_status(
-                root,
-                {
-                    "status": "completed",
-                    "dataset_id": dataset_id,
-                    "started_at": started_at,
-                    "completed_steps": completed_steps,
-                },
-            )
-            output = {
-                "raw": str(raw),
-                "qfq": str(qfq),
-                "qlib_v2": str(qlib_v2),
-                "compatibility": compatibility,
-            }
-            if status_error:
-                output["status_record"] = {
-                    "status": "write_failed",
-                    "error_type": status_error,
-                }
-            _json_dump(output)
-            return 0
+            with dataset_publication_lock(root):
+                return _update_ashare_from_bundle(root, dataset_id, bundle_dir)
         finally:
             unlock_file(update_lock_handle)
             update_lock_handle.close()

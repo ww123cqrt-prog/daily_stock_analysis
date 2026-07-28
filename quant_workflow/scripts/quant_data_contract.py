@@ -8,12 +8,21 @@ import json
 import os
 import re
 import shutil
+import sys
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
 
 import numpy as np
 import pandas as pd
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _file_lock import lock_file, unlock_file  # noqa: E402
 
 
 SCHEMA_VERSION = 2
@@ -29,6 +38,9 @@ ADJUSTMENT_METHODS = {
 }
 REQUIRED_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume")
 ADJUSTED_PRICE_BASES = {"qfq", "hfq"}
+QLIB_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+QLIB_BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DataContractError(RuntimeError):
@@ -115,6 +127,28 @@ def _safe_child(root: Path, relative: object, field: str) -> Path:
         candidate.relative_to(Path(root).resolve())
     except ValueError as exc:
         raise DataContractError(f"{field} escapes quant_data root") from exc
+    return candidate
+
+
+def _snapshot_file(snapshot: Path, relative: object, field: str) -> Path:
+    if not isinstance(relative, str) or not relative:
+        raise DataContractError(f"{field} is required")
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise DataContractError(f"{field} must stay inside snapshot")
+    unresolved = Path(snapshot) / relative_path
+    candidate = unresolved.resolve()
+    try:
+        candidate.relative_to(Path(snapshot).resolve())
+    except ValueError as exc:
+        raise DataContractError(f"{field} must stay inside snapshot") from exc
+    current = Path(snapshot)
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise DataContractError(f"{field} cannot use symlinks")
+    if not candidate.is_file():
+        raise DataContractError(f"{field} is unavailable")
     return candidate
 
 
@@ -498,6 +532,10 @@ def validate_snapshot(snapshot: Path, *, verify_hashes: bool = True) -> dict[str
 def _build_qlib_file_index(snapshot: Path) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for path in sorted(Path(snapshot).rglob("*")):
+        if path.is_symlink():
+            raise DataContractError(
+                f"Qlib snapshot cannot contain symlinks: {path.relative_to(snapshot)}"
+            )
         if (
             not path.is_file()
             or path.name in {"DATASET_MANIFEST.json", "FILE_INDEX.parquet"}
@@ -524,6 +562,8 @@ def finalize_qlib_snapshot(
     source_retrieved_at: str,
     producer: Mapping[str, Any],
     upstream_snapshot: Mapping[str, str],
+    benchmark_evidence: Mapping[str, Any] | None = None,
+    instrument_pool_evidence: Mapping[str, Any] | None = None,
 ) -> Path:
     snapshot = Path(snapshot).resolve()
     if not DATASET_ID_RE.fullmatch(dataset_id):
@@ -570,6 +610,17 @@ def finalize_qlib_snapshot(
     provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != dict(upstream_snapshot):
         raise DataContractError("Qlib provider points to the wrong upstream snapshot")
+    if benchmark_evidence is not None:
+        normalized_benchmarks = json.loads(json.dumps(dict(benchmark_evidence)))
+        _validate_qlib_benchmark_evidence(snapshot, normalized_benchmarks)
+        provider_manifest["benchmark_complete"] = True
+        provider_manifest["benchmarks"] = normalized_benchmarks
+    if instrument_pool_evidence is not None:
+        normalized_pools = json.loads(json.dumps(dict(instrument_pool_evidence)))
+        _validate_qlib_instrument_pool_evidence(snapshot, normalized_pools)
+        provider_manifest["instrument_pools"] = normalized_pools
+    if benchmark_evidence is not None or instrument_pool_evidence is not None:
+        atomic_write_json(provider_manifest_path, provider_manifest)
     index = _build_qlib_file_index(snapshot)
     index.to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
     feature_files = index["relative_path"].str.startswith("features/")
@@ -596,10 +647,206 @@ def finalize_qlib_snapshot(
         "provider_manifest_path": "PROVIDER_MANIFEST.json",
         "file_index_path": "FILE_INDEX.parquet",
     }
+    if benchmark_evidence is not None:
+        manifest["benchmark_complete"] = True
+        manifest["benchmarks"] = normalized_benchmarks
+    if instrument_pool_evidence is not None:
+        manifest["instrument_pools"] = normalized_pools
     manifest["content_sha256"] = _content_hash(snapshot, manifest)
     atomic_write_json(snapshot / "DATASET_MANIFEST.json", manifest)
     validate_qlib_snapshot(snapshot, verify_hashes=True)
     return snapshot / "DATASET_MANIFEST.json"
+
+
+def _read_qlib_feature(path: Path, calendar_size: int) -> np.ndarray:
+    try:
+        raw = np.fromfile(path, dtype="<f4")
+    except OSError as exc:
+        raise DataContractError(f"Qlib benchmark feature is unavailable: {path}") from exc
+    if len(raw) < 2 or not np.isfinite(raw[0]) or raw[0] != int(raw[0]):
+        raise DataContractError(f"Qlib benchmark feature is invalid: {path}")
+    start = int(raw[0])
+    values = raw[1:]
+    if start < 0 or start + len(values) > calendar_size:
+        raise DataContractError(f"Qlib benchmark feature range is invalid: {path}")
+    aligned = np.full(calendar_size, np.nan, dtype=np.float32)
+    aligned[start : start + len(values)] = values
+    return aligned
+
+
+def _validate_qlib_instrument_pool_evidence(
+    snapshot: Path,
+    evidence: Mapping[str, Any],
+) -> None:
+    if not isinstance(evidence, Mapping):
+        raise DataContractError("Qlib instrument pool evidence is invalid")
+    source = evidence.get("source")
+    pools = evidence.get("pools")
+    if (
+        not isinstance(source, Mapping)
+        or not {"dataset_id", "path", "sha256"}.issubset(source)
+        or not isinstance(pools, Mapping)
+        or set(pools) != {"csi300", "csi500", "csi800"}
+    ):
+        raise DataContractError("Qlib instrument pool evidence is incomplete")
+    source_path = Path(str(source.get("path", "")))
+    if source_path.is_absolute() or ".." in source_path.parts or not source_path.parts:
+        raise DataContractError("Qlib instrument pool source path is invalid")
+    if not isinstance(source.get("sha256"), str) or not SHA256_RE.fullmatch(
+        str(source["sha256"])
+    ):
+        raise DataContractError("Qlib instrument pool source hash is invalid")
+    all_path = snapshot / "instruments" / "all.txt"
+    try:
+        all_symbols = {
+            line.split()[0].upper()
+            for line in all_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    except OSError as exc:
+        raise DataContractError("Qlib all-instrument pool is unavailable") from exc
+    if not all_symbols:
+        raise DataContractError("Qlib all-instrument pool is empty")
+    for pool_name in ("csi300", "csi500", "csi800"):
+        item = pools[pool_name]
+        expected_relative = f"instruments/{pool_name}.txt"
+        if (
+            not isinstance(item, Mapping)
+            or item.get("relative_path") != expected_relative
+            or not isinstance(item.get("sha256"), str)
+            or not SHA256_RE.fullmatch(str(item["sha256"]))
+        ):
+            raise DataContractError(f"Qlib instrument pool evidence is invalid: {pool_name}")
+        path = snapshot / expected_relative
+        if path.is_symlink() or not path.is_file():
+            raise DataContractError(f"Qlib instrument pool is unavailable: {pool_name}")
+        if item["sha256"] != sha256_file(path):
+            raise DataContractError(f"Qlib instrument pool hash mismatch: {pool_name}")
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        symbols = [line.split()[0].upper() for line in lines if len(line.split()) == 3]
+        if (
+            len(symbols) != len(lines)
+            or len(symbols) != int(item.get("instrument_count", -1))
+            or len(symbols) != len(set(symbols))
+            or not set(symbols).issubset(all_symbols)
+            or set(symbols).intersection(QLIB_BENCHMARK_SYMBOLS)
+        ):
+            raise DataContractError(f"Qlib instrument pool contents are invalid: {pool_name}")
+
+
+def _validate_qlib_benchmark_evidence(
+    snapshot: Path,
+    evidence: Mapping[str, Any],
+) -> None:
+    if not isinstance(evidence, Mapping):
+        raise DataContractError("Qlib benchmark evidence is invalid")
+    calendar_path = snapshot / "calendars" / "day.txt"
+    try:
+        calendar = [
+            value.strip()
+            for value in calendar_path.read_text(encoding="utf-8").splitlines()
+            if value.strip()
+        ]
+    except OSError as exc:
+        raise DataContractError("Qlib benchmark calendar is unavailable") from exc
+    if evidence.get("calendar_sha256") != sha256_file(calendar_path):
+        raise DataContractError("Qlib benchmark calendar hash mismatch")
+    source = evidence.get("source")
+    required_source = {
+        "provider",
+        "interface",
+        "source_dataset_id",
+        "source_path",
+        "source_run_id",
+        "evidence_path",
+        "evidence_sha256",
+    }
+    if not isinstance(source, Mapping) or not required_source.issubset(source):
+        raise DataContractError("Qlib benchmark source evidence is incomplete")
+    source_manifest_hash = source.get("source_manifest_sha256") or source.get(
+        "provider_manifest_sha256"
+    )
+    if not isinstance(source_manifest_hash, str) or not SHA256_RE.fullmatch(
+        source_manifest_hash
+    ):
+        raise DataContractError("Qlib benchmark source manifest hash is invalid")
+    for hash_field in (
+        "evidence_sha256",
+        "source_manifest_sha256",
+        "provider_manifest_sha256",
+    ):
+        if hash_field not in source:
+            continue
+        if not isinstance(source.get(hash_field), str) or not SHA256_RE.fullmatch(
+            str(source[hash_field])
+        ):
+            raise DataContractError("Qlib benchmark source hash is invalid")
+    for path_field in ("source_path", "evidence_path"):
+        raw_path = Path(str(source.get(path_field, "")))
+        if raw_path.is_absolute() or ".." in raw_path.parts or not raw_path.parts:
+            raise DataContractError("Qlib benchmark source path is invalid")
+    symbols = evidence.get("symbols")
+    if not isinstance(symbols, Mapping) or set(symbols) != set(QLIB_BENCHMARK_SYMBOLS):
+        raise DataContractError("Qlib benchmark symbol evidence is incomplete")
+    for symbol in QLIB_BENCHMARK_SYMBOLS:
+        item = symbols[symbol]
+        if not isinstance(item, Mapping):
+            raise DataContractError(f"Qlib benchmark evidence is invalid: {symbol}")
+        coverage = item.get("coverage")
+        features = item.get("features")
+        if (
+            not isinstance(coverage, Mapping)
+            or not isinstance(features, Mapping)
+            or set(features) != set(QLIB_BENCHMARK_FIELDS)
+        ):
+            raise DataContractError(f"Qlib benchmark evidence is incomplete: {symbol}")
+        try:
+            start = calendar.index(str(coverage["start"]))
+            end = calendar.index(str(coverage["end"]))
+            observations = int(coverage["observations"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise DataContractError(
+                f"Qlib benchmark coverage is invalid: {symbol}"
+            ) from exc
+        if start > end or end != len(calendar) - 1 or observations != end - start + 1:
+            raise DataContractError(f"Qlib benchmark coverage is invalid: {symbol}")
+        masks: list[np.ndarray] = []
+        for field in QLIB_BENCHMARK_FIELDS:
+            feature = features[field]
+            expected_relative = f"features/{symbol.lower()}/{field}.day.bin"
+            if not isinstance(feature, Mapping) or feature.get("relative_path") != expected_relative:
+                raise DataContractError(
+                    f"Qlib benchmark feature path is invalid: {symbol} {field}"
+                )
+            path = snapshot / expected_relative
+            if path.is_symlink() or not path.is_file():
+                raise DataContractError(
+                    f"Qlib benchmark feature is unavailable: {symbol} {field}"
+                )
+            if int(feature.get("size_bytes", -1)) != path.stat().st_size:
+                raise DataContractError(
+                    f"Qlib benchmark file size mismatch: {symbol} {field}"
+                )
+            if feature.get("sha256") != sha256_file(path):
+                raise DataContractError(
+                    f"Qlib benchmark file hash mismatch: {symbol} {field}"
+                )
+            aligned = _read_qlib_feature(path, len(calendar))
+            required = aligned if field == "factor" else aligned[start:]
+            valid = np.isfinite(required)
+            valid &= required >= 0 if field == "volume" else required > 0
+            if not bool(valid.all()):
+                raise DataContractError(
+                    f"Qlib benchmark required dates are incomplete: {symbol} {field}"
+                )
+            if field != "factor":
+                masks.append(np.isfinite(aligned))
+        if any(not np.array_equal(masks[0], mask) for mask in masks[1:]):
+            raise DataContractError(f"Qlib benchmark dates disagree: {symbol}")
 
 
 def validate_qlib_snapshot(
@@ -643,11 +890,41 @@ def validate_qlib_snapshot(
     upstream = manifest["upstream_snapshots"]
     if not isinstance(upstream, list) or len(upstream) != 1:
         raise DataContractError("Qlib upstream snapshot contract is invalid")
-    provider_manifest = _read_json(snapshot / str(manifest["provider_manifest_path"]))
+    provider_manifest_path = _snapshot_file(
+        snapshot,
+        manifest["provider_manifest_path"],
+        "Qlib provider manifest",
+    )
+    provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != upstream[0]:
         raise DataContractError("Qlib provider and dataset lineage disagree")
+    benchmark_complete = manifest.get("benchmark_complete")
+    provider_benchmark_complete = provider_manifest.get("benchmark_complete")
+    if benchmark_complete is not None or provider_benchmark_complete is not None:
+        if benchmark_complete is not True or provider_benchmark_complete is not True:
+            raise DataContractError("Qlib benchmark completion state is invalid")
+        if manifest.get("benchmarks") != provider_manifest.get("benchmarks"):
+            raise DataContractError("Qlib provider and dataset benchmark evidence disagree")
+        _validate_qlib_benchmark_evidence(snapshot, manifest["benchmarks"])
+    elif "benchmarks" in manifest or "benchmarks" in provider_manifest:
+        raise DataContractError("Qlib benchmark evidence lacks completion state")
+    if "instrument_pools" in manifest or "instrument_pools" in provider_manifest:
+        if manifest.get("instrument_pools") != provider_manifest.get(
+            "instrument_pools"
+        ):
+            raise DataContractError(
+                "Qlib provider and dataset instrument pool evidence disagree"
+            )
+        _validate_qlib_instrument_pool_evidence(
+            snapshot, manifest["instrument_pools"]
+        )
     try:
-        recorded = pd.read_parquet(snapshot / str(manifest["file_index_path"]))
+        file_index_path = _snapshot_file(
+            snapshot,
+            manifest["file_index_path"],
+            "Qlib file index",
+        )
+        recorded = pd.read_parquet(file_index_path)
     except Exception as exc:
         raise DataContractError("Qlib file index is unavailable") from exc
     required_index = {"relative_path", "size_bytes", "sha256"}
@@ -687,43 +964,103 @@ def validate_dataset_snapshot(
     return validate_snapshot(snapshot, verify_hashes=verify_hashes)
 
 
+def validate_latest_pointer(
+    pointer_path: Path,
+    *,
+    quant_data_root: Path,
+    expected_dataset_id: str | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Validate a LATEST pointer before following it to an immutable snapshot."""
+
+    quant_data_root = Path(quant_data_root).expanduser().resolve()
+    pointer_path = Path(pointer_path).expanduser().resolve()
+    _safe_relative(pointer_path, quant_data_root, "latest_pointer")
+    if pointer_path.name != "LATEST.json":
+        raise DataContractError("latest pointer filename is invalid")
+    pointer = _read_json(pointer_path)
+    required = {
+        "schema_version",
+        "dataset_id",
+        "snapshot_id",
+        "snapshot_path",
+        "manifest_sha256",
+    }
+    if not required.issubset(pointer) or pointer.get("schema_version") != SCHEMA_VERSION:
+        raise DataContractError("latest pointer contract is incomplete")
+    dataset_id = str(pointer.get("dataset_id") or "")
+    snapshot_id = str(pointer.get("snapshot_id") or "")
+    if not DATASET_ID_RE.fullmatch(dataset_id):
+        raise DataContractError("latest pointer dataset_id is invalid")
+    if expected_dataset_id is not None and dataset_id != expected_dataset_id:
+        raise DataContractError("latest pointer belongs to another dataset")
+    if not snapshot_id or Path(snapshot_id).name != snapshot_id:
+        raise DataContractError("latest pointer snapshot_id is invalid")
+    manifest_sha256 = str(pointer.get("manifest_sha256") or "")
+    if not SHA256_RE.fullmatch(manifest_sha256):
+        raise DataContractError("latest pointer manifest hash is invalid")
+    snapshot = _safe_child(
+        quant_data_root, pointer.get("snapshot_path"), "snapshot_path"
+    )
+    snapshots_root = (pointer_path.parent / "snapshots").resolve()
+    try:
+        snapshot.relative_to(snapshots_root)
+    except ValueError as exc:
+        raise DataContractError(
+            "latest pointer snapshot is outside its dataset root"
+        ) from exc
+    if snapshot.parent != snapshots_root or snapshot.name != snapshot_id:
+        raise DataContractError("latest pointer snapshot path is invalid")
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    try:
+        actual_manifest_sha256 = sha256_file(manifest_path)
+    except OSError as exc:
+        raise DataContractError("latest pointer snapshot manifest is unavailable") from exc
+    if actual_manifest_sha256 != manifest_sha256:
+        raise DataContractError("latest pointer manifest hash mismatch")
+    return pointer, snapshot
+
+
+@contextmanager
+def dataset_publication_lock(quant_data_root: Path):
+    """Serialize every formal V2 snapshot and root-catalog publication."""
+
+    root = Path(quant_data_root).expanduser().resolve()
+    lock_path = root / "runtime" / "locks" / "dataset_publication.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        try:
+            lock_file(handle, exclusive=True, blocking=False)
+            acquired = True
+        except BlockingIOError as exc:
+            raise DataContractError(
+                "dataset publication is already in progress"
+            ) from exc
+        yield
+    finally:
+        try:
+            if acquired:
+                unlock_file(handle)
+        finally:
+            handle.close()
+
+
 def publish_snapshot(
     staging_snapshot: Path,
     *,
     dataset_root: Path,
     quant_data_root: Path,
+    publication_lock_held: bool = False,
 ) -> Path:
-    quant_data_root = Path(quant_data_root).expanduser().resolve()
-    staging_snapshot = Path(staging_snapshot).expanduser().resolve()
-    dataset_root = Path(dataset_root).expanduser().resolve()
-    _safe_relative(dataset_root, quant_data_root, "dataset_root")
-    staging_root = quant_data_root / "staging"
-    try:
-        staging_snapshot.relative_to(staging_root)
-    except ValueError as exc:
-        raise DataContractError("staging snapshot must be under quant_data/staging") from exc
-    manifest = validate_snapshot(staging_snapshot, verify_hashes=True)
-    if manifest["status"] != "ready":
-        raise DataContractError("only ready snapshots can be published")
-    snapshot_id = str(manifest["snapshot_id"])
-    destination = dataset_root / "snapshots" / snapshot_id
-    if destination.exists():
-        raise DataContractError("snapshot_id is already published")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staging_snapshot, destination)
-    pointer = {
-        "schema_version": SCHEMA_VERSION,
-        "dataset_id": manifest["dataset_id"],
-        "snapshot_id": snapshot_id,
-        "snapshot_path": _safe_relative(destination, quant_data_root, "snapshot_path"),
-        "manifest_sha256": sha256_file(destination / "DATASET_MANIFEST.json"),
-        "published_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
-    atomic_write_json(dataset_root / "LATEST.json", pointer)
-    return destination
+    return publish_snapshot_group(
+        [(staging_snapshot, dataset_root)],
+        quant_data_root=quant_data_root,
+        publication_lock_held=publication_lock_held,
+    )[0]
 
 
-def publish_snapshot_group(
+def _publish_snapshot_group_unlocked(
     snapshots: list[tuple[Path, Path]],
     *,
     quant_data_root: Path,
@@ -814,30 +1151,65 @@ def publish_snapshot_group(
                 datasets,
                 existing=catalog_backup,
             )
-    except Exception:
+    except Exception as publish_error:
+        rollback_errors: list[tuple[str, Exception]] = []
         for pointer_path, backup in pointer_backups.items():
             try:
                 if backup is None:
                     pointer_path.unlink(missing_ok=True)
                 else:
                     atomic_write_json(pointer_path, backup)
-            except Exception:
-                pass
+            except Exception as exc:
+                rollback_errors.append((f"restore pointer {pointer_path}", exc))
         if catalog_backup is not None:
             try:
                 atomic_write_json(
                     quant_data_root / "DATA_MANIFEST.json", catalog_backup
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                rollback_errors.append(("restore DATA_MANIFEST.json", exc))
         for item in reversed(moved):
             try:
                 item["staging"].parent.mkdir(parents=True, exist_ok=True)
                 os.replace(item["destination"], item["staging"])
-            except Exception:
-                pass
+            except Exception as exc:
+                rollback_errors.append(
+                    (f"restore staged snapshot {item['manifest']['snapshot_id']}", exc)
+                )
+        if rollback_errors:
+            failures = "; ".join(
+                f"{label}: {type(exc).__name__}: {exc}"
+                for label, exc in rollback_errors
+            )
+            raise OSError(
+                "snapshot publication failed: "
+                f"{type(publish_error).__name__}: {publish_error}; "
+                f"rollback failed: {failures}"
+            ) from publish_error
         raise
     return [item["destination"] for item in prepared]
+
+
+def publish_snapshot_group(
+    snapshots: list[tuple[Path, Path]],
+    *,
+    quant_data_root: Path,
+    update_root_catalog: bool = False,
+    publication_lock_held: bool = False,
+) -> list[Path]:
+    quant_data_root = Path(quant_data_root).expanduser().resolve()
+    if publication_lock_held:
+        return _publish_snapshot_group_unlocked(
+            snapshots,
+            quant_data_root=quant_data_root,
+            update_root_catalog=update_root_catalog,
+        )
+    with dataset_publication_lock(quant_data_root):
+        return _publish_snapshot_group_unlocked(
+            snapshots,
+            quant_data_root=quant_data_root,
+            update_root_catalog=update_root_catalog,
+        )
 
 
 def publish_qlib_snapshot(
@@ -846,11 +1218,13 @@ def publish_qlib_snapshot(
     dataset_root: Path,
     quant_data_root: Path,
     update_root_catalog: bool = False,
+    publication_lock_held: bool = False,
 ) -> Path:
     return publish_snapshot_group(
         [(staging_snapshot, dataset_root)],
         quant_data_root=quant_data_root,
         update_root_catalog=update_root_catalog,
+        publication_lock_held=publication_lock_held,
     )[0]
 
 
@@ -865,7 +1239,7 @@ def catalog_entry_from_snapshot(
     snapshot = Path(snapshot).resolve()
     manifest = validate_dataset_snapshot(snapshot, verify_hashes=True)
     if manifest["data_kind"] == "qlib_provider":
-        return {
+        entry = {
             "dataset_id": manifest["dataset_id"],
             "data_kind": manifest["data_kind"],
             "role": manifest["role"],
@@ -894,6 +1268,12 @@ def catalog_entry_from_snapshot(
                 snapshot / "DATASET_MANIFEST.json"
             ),
         }
+        if "benchmark_complete" in manifest:
+            entry["benchmark_complete"] = manifest["benchmark_complete"]
+            entry["benchmarks"] = manifest["benchmarks"]
+        if "instrument_pools" in manifest:
+            entry["instrument_pools"] = manifest["instrument_pools"]
+        return entry
     return {
         "dataset_id": manifest["dataset_id"],
         "data_kind": manifest["data_kind"],
@@ -955,6 +1335,29 @@ def _load_root_manifest(quant_data_root: Path) -> dict[str, Any]:
     return manifest
 
 
+def _validate_current_upstream(
+    catalog: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    """Reject a derived provider whose frozen input is no longer current."""
+
+    if manifest.get("data_kind") != "qlib_provider":
+        return
+    upstream_snapshots = manifest.get("upstream_snapshots")
+    if not isinstance(upstream_snapshots, list) or len(upstream_snapshots) != 1:
+        raise DataContractError("dataset upstream snapshot contract is invalid")
+    upstream = upstream_snapshots[0]
+    if not isinstance(upstream, Mapping):
+        raise DataContractError("dataset upstream snapshot contract is invalid")
+    upstream_dataset_id = str(upstream.get("dataset_id") or "")
+    current = catalog.get("datasets", {}).get(upstream_dataset_id)
+    if not isinstance(current, Mapping) or current.get("status") != "ready":
+        raise DataContractError("dataset upstream snapshot is stale")
+    for field in ("snapshot_id", "content_sha256", "price_basis"):
+        if not upstream.get(field) or upstream.get(field) != current.get(field):
+            raise DataContractError("dataset upstream snapshot is stale")
+
+
 def resolve_dataset(
     dataset_id: str,
     *,
@@ -978,20 +1381,18 @@ def resolve_dataset(
     pointer_path = _safe_child(
         quant_data_root, entry.get("latest_pointer"), "latest_pointer"
     )
-    pointer = _read_json(pointer_path)
-    if pointer.get("dataset_id") != dataset_id:
-        raise DataContractError("latest pointer belongs to another dataset")
+    pointer, snapshot = validate_latest_pointer(
+        pointer_path,
+        quant_data_root=quant_data_root,
+        expected_dataset_id=dataset_id,
+    )
     if entry.get("snapshot_id") != pointer.get("snapshot_id"):
         raise DataContractError("dataset catalog and latest pointer are out of sync")
     if entry.get("snapshot_manifest_sha256") != pointer.get("manifest_sha256"):
         raise DataContractError("dataset catalog and latest pointer are out of sync")
-    snapshot = _safe_child(
-        quant_data_root, pointer.get("snapshot_path"), "snapshot_path"
-    )
-    manifest_path = snapshot / "DATASET_MANIFEST.json"
-    if sha256_file(manifest_path) != pointer.get("manifest_sha256"):
-        raise DataContractError("latest pointer manifest hash mismatch")
     manifest = validate_dataset_snapshot(snapshot, verify_hashes=True)
+    if manifest.get("dataset_id") != dataset_id:
+        raise DataContractError("latest pointer belongs to another dataset")
     if manifest.get("snapshot_id") != pointer.get("snapshot_id"):
         raise DataContractError("latest pointer snapshot_id mismatch")
     if manifest.get("status") != require_status:
@@ -1007,6 +1408,7 @@ def resolve_dataset(
             raise DataContractError(
                 f"dataset catalog and snapshot disagree on {field}"
             )
+    _validate_current_upstream(catalog, manifest)
     return ResolvedDataset(dataset_id, snapshot, manifest, dict(entry))
 
 

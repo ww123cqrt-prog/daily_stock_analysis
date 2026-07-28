@@ -1108,6 +1108,7 @@ def build_snapshots_from_bundle(
     quant_data_root: Path,
     publish: bool = False,
     legacy_qfq_dir: Path | None = None,
+    publication_lock_held: bool = False,
 ) -> tuple[Path, Path]:
     script_dir = Path(__file__).resolve().parent
     if str(script_dir) not in sys.path:
@@ -1305,6 +1306,7 @@ def build_snapshots_from_bundle(
         [(raw_stage, raw_root), (qfq_stage, qfq_root)],
         quant_data_root=root,
         update_root_catalog=True,
+        publication_lock_held=publication_lock_held,
     )
     return published_raw, published_qfq
 

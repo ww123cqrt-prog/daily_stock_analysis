@@ -244,9 +244,9 @@ const RESEARCH_TEXT = {
     developmentActionLabel: '下一步动作',
     developmentVerificationLabel: '验收口径',
     experimentComparisonTitle: '清洗对比',
-    experimentComparisonDescription: '同一 baseline 在原始合并数据和清洗后数据上的核心回测指标。',
+    experimentComparisonDescription: '同一 baseline 在原生 V2 数据和旧版清洗数据上的核心回测指标。',
     cleanedDataLabel: '清洗后数据',
-    canonicalDataLabel: '原始合并数据',
+    canonicalDataLabel: '原生 V2 数据',
     comparisonMetricLabel: '扣成本年化超额收益',
     comparisonDeltaLabel: '差值',
     comparisonNoData: '需要至少一条 cleaned 和一条 canonical 实验记录后才能生成对比。',
@@ -503,9 +503,9 @@ const RESEARCH_TEXT = {
     developmentActionLabel: 'Next action',
     developmentVerificationLabel: 'Verification',
     experimentComparisonTitle: 'Cleaned vs Canonical',
-    experimentComparisonDescription: 'Core backtest metric for the same baseline on cleaned data versus the canonical merged provider.',
+    experimentComparisonDescription: 'Core backtest metric for the same baseline on native V2 data versus legacy cleaned data.',
     cleanedDataLabel: 'Cleaned data',
-    canonicalDataLabel: 'Canonical merged data',
+    canonicalDataLabel: 'Native V2 data',
     comparisonMetricLabel: 'Annualized excess return with cost',
     comparisonDeltaLabel: 'Delta',
     comparisonNoData: 'At least one cleaned run and one canonical run are required for comparison.',
@@ -758,17 +758,8 @@ function isCanonicalExperiment(run: ResearchExperimentRun, cleanedRun: ResearchE
   if (run === cleanedRun) {
     return false;
   }
-  const provider = runText(run, 'provider');
-  const experimentName = runText(run, 'experimentName');
   const providerPath = runText(run, 'qlibProvider') || runText(run, 'providerUri');
-  return (
-    provider === 'canonical'
-    || experimentName === 'baseline_lgb_alpha158'
-    || (
-      providerPath.includes('cn_data_baostock_jqdata')
-      && !providerPath.includes('_cleaned')
-    )
-  );
+  return providerPath.includes('cn_data_ashare_v2') && !providerPath.includes('_cleaned');
 }
 
 function metricValue(run: ResearchExperimentRun | undefined, metricKey: string): number | undefined {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,7 +107,13 @@ def finalize_raw_snapshot(module, quant_data: Path, snapshot_id: str) -> Path:
     return snapshot
 
 
-def finalize_qlib_snapshot(module, quant_data: Path, snapshot_id: str) -> Path:
+def finalize_qlib_snapshot(
+    module,
+    quant_data: Path,
+    snapshot_id: str,
+    *,
+    upstream_snapshot: dict[str, str] | None = None,
+) -> Path:
     snapshot = quant_data / "staging" / f"run-{snapshot_id}" / snapshot_id
     (snapshot / "calendars").mkdir(parents=True)
     (snapshot / "instruments").mkdir(parents=True)
@@ -120,17 +127,18 @@ def finalize_qlib_snapshot(module, quant_data: Path, snapshot_id: str) -> Path:
     (snapshot / "features" / "sh600000" / "close.day.bin").write_bytes(
         b"feature-bytes"
     )
+    upstream_snapshot = upstream_snapshot or {
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-source-001",
+        "content_sha256": "a" * 64,
+        "price_basis": "qfq",
+    }
     module.atomic_write_json(
         snapshot / "PROVIDER_MANIFEST.json",
         {
             "schema_version": 2,
             "status": "ready",
-            "source_snapshot": {
-                "dataset_id": "ashare_daily_qfq",
-                "snapshot_id": "qfq-source-001",
-                "content_sha256": "a" * 64,
-                "price_basis": "qfq",
-            },
+            "source_snapshot": upstream_snapshot,
         },
     )
     module.finalize_qlib_snapshot(
@@ -140,12 +148,7 @@ def finalize_qlib_snapshot(module, quant_data: Path, snapshot_id: str) -> Path:
         source={"provider": "quant_workflow", "interface": "v2_snapshot_to_qlib"},
         source_retrieved_at="2026-07-25T22:59:00+08:00",
         producer={"script": "build_qlib_v2.py", "version": "2"},
-        upstream_snapshot={
-            "dataset_id": "ashare_daily_qfq",
-            "snapshot_id": "qfq-source-001",
-            "content_sha256": "a" * 64,
-            "price_basis": "qfq",
-        },
+        upstream_snapshot=upstream_snapshot,
     )
     return snapshot
 
@@ -353,6 +356,57 @@ def test_resolve_rejects_catalog_and_latest_pointer_drift(tmp_path: Path) -> Non
         )
 
 
+def test_validate_latest_pointer_rejects_snapshot_outside_its_dataset_root(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    staging = finalize_qfq_snapshot(module, quant_data)
+    dataset_root = quant_data / "datasets" / "etf_qfq"
+    published = module.publish_snapshot(
+        staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    pointer_path = dataset_root / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    escaped = quant_data / "datasets" / "other" / "snapshots" / published.name
+    escaped.parent.mkdir(parents=True)
+    os.replace(published, escaped)
+    pointer["snapshot_path"] = escaped.relative_to(quant_data).as_posix()
+    module.atomic_write_json(pointer_path, pointer)
+
+    with pytest.raises(module.DataContractError, match="dataset root"):
+        module.validate_latest_pointer(
+            pointer_path,
+            quant_data_root=quant_data,
+            expected_dataset_id="etf_momentum_daily_qfq",
+        )
+
+
+def test_validate_latest_pointer_rejects_manifest_hash_mismatch(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    staging = finalize_qfq_snapshot(module, quant_data)
+    dataset_root = quant_data / "datasets" / "etf_qfq"
+    module.publish_snapshot(
+        staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    pointer_path = dataset_root / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["manifest_sha256"] = "0" * 64
+    module.atomic_write_json(pointer_path, pointer)
+
+    with pytest.raises(module.DataContractError, match="manifest hash mismatch"):
+        module.validate_latest_pointer(
+            pointer_path,
+            quant_data_root=quant_data,
+            expected_dataset_id="etf_momentum_daily_qfq",
+        )
+
+
 def test_catalog_entry_contains_lineage_and_content_metadata(tmp_path: Path) -> None:
     module = load_module()
     quant_data = tmp_path / "quant_data"
@@ -507,6 +561,23 @@ def test_publish_snapshot_group_switches_both_latest_pointers(
     assert json.loads((qfq_root / "LATEST.json").read_text())["snapshot_id"] == "qfq-001"
 
 
+def test_publish_snapshot_group_rejects_a_concurrent_publisher(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    raw_stage = finalize_raw_snapshot(module, quant_data, "raw-locked")
+    raw_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_raw"
+
+    with module.dataset_publication_lock(quant_data):
+        with pytest.raises(module.DataContractError, match="already in progress"):
+            module.publish_snapshot_group(
+                [(raw_stage, raw_root)],
+                quant_data_root=quant_data,
+            )
+
+    assert raw_stage.is_dir()
+    assert not (raw_root / "LATEST.json").exists()
+
+
 def test_publish_snapshot_group_rolls_back_all_pointers_on_write_failure(
     tmp_path: Path,
 ) -> None:
@@ -544,6 +615,56 @@ def test_publish_snapshot_group_rolls_back_all_pointers_on_write_failure(
             )
 
     assert json.loads((raw_root / "LATEST.json").read_text())["snapshot_id"] == "old-raw"
+    assert json.loads((qfq_root / "LATEST.json").read_text())["snapshot_id"] == "old-qfq"
+
+
+def test_publish_snapshot_group_reports_rollback_failures(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    raw_stage = finalize_raw_snapshot(module, quant_data, "raw-rollback-error")
+    qfq_stage = finalize_qfq_snapshot(
+        module,
+        quant_data,
+        snapshot_id="qfq-rollback-error",
+        dataset_id="ashare_daily_qfq",
+    )
+    raw_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_raw"
+    qfq_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_qfq"
+    raw_root.mkdir(parents=True)
+    qfq_root.mkdir(parents=True)
+    module.atomic_write_json(raw_root / "LATEST.json", {"snapshot_id": "old-raw"})
+    module.atomic_write_json(qfq_root / "LATEST.json", {"snapshot_id": "old-qfq"})
+    original_write = module.atomic_write_json
+    publishing = True
+
+    def fail_publish_and_raw_restore(path, payload):
+        nonlocal publishing
+        path = Path(path)
+        if path == qfq_root / "LATEST.json" and publishing:
+            publishing = False
+            raise OSError("simulated publication failure")
+        if (
+            path == raw_root / "LATEST.json"
+            and payload.get("snapshot_id") == "old-raw"
+            and not publishing
+        ):
+            raise OSError("simulated rollback failure")
+        return original_write(path, payload)
+
+    with patch.object(
+        module, "atomic_write_json", side_effect=fail_publish_and_raw_restore
+    ):
+        with pytest.raises(OSError) as raised:
+            module.publish_snapshot_group(
+                [(raw_stage, raw_root), (qfq_stage, qfq_root)],
+                quant_data_root=quant_data,
+            )
+
+    message = str(raised.value)
+    assert "simulated publication failure" in message
+    assert "simulated rollback failure" in message
+    assert isinstance(raised.value.__cause__, OSError)
+    assert "simulated publication failure" in str(raised.value.__cause__)
     assert json.loads((qfq_root / "LATEST.json").read_text())["snapshot_id"] == "old-qfq"
 
 
@@ -621,7 +742,29 @@ def test_publish_snapshot_group_rolls_back_pointers_when_catalog_write_fails(
 def test_finalize_publish_and_resolve_qlib_v2_snapshot(tmp_path: Path) -> None:
     module = load_module()
     quant_data = tmp_path / "quant_data"
-    staging = finalize_qlib_snapshot(module, quant_data, "qlib-001")
+    qfq_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_qfq"
+    qfq_stage = finalize_qfq_snapshot(
+        module,
+        quant_data,
+        snapshot_id="qfq-source-001",
+        dataset_id="ashare_daily_qfq",
+    )
+    qfq = module.publish_snapshot(
+        qfq_stage,
+        dataset_root=qfq_root,
+        quant_data_root=quant_data,
+    )
+    qfq_manifest = module.validate_dataset_snapshot(qfq)
+    upstream = {
+        field: str(qfq_manifest[field])
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    }
+    staging = finalize_qlib_snapshot(
+        module,
+        quant_data,
+        "qlib-001",
+        upstream_snapshot=upstream,
+    )
     dataset_root = quant_data / "qlib" / "cn_data_ashare_v2"
 
     published = module.publish_qlib_snapshot(
@@ -632,6 +775,11 @@ def test_finalize_publish_and_resolve_qlib_v2_snapshot(tmp_path: Path) -> None:
     module.write_root_manifest(
         quant_data,
         {
+            "ashare_daily_qfq": module.catalog_entry_from_snapshot(
+                qfq,
+                quant_data_root=quant_data,
+                dataset_root=qfq_root,
+            ),
             "qlib_ashare_v2": module.catalog_entry_from_snapshot(
                 published,
                 quant_data_root=quant_data,
@@ -651,6 +799,75 @@ def test_finalize_publish_and_resolve_qlib_v2_snapshot(tmp_path: Path) -> None:
     assert resolved.catalog_entry["upstream_snapshots"][0]["snapshot_id"] == "qfq-source-001"
 
 
+def test_resolve_rejects_qlib_when_current_qfq_snapshot_changes(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    qfq_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_qfq"
+    qlib_root = quant_data / "qlib" / "cn_data_ashare_v2"
+    first_qfq_stage = finalize_qfq_snapshot(
+        module,
+        quant_data,
+        snapshot_id="qfq-source-001",
+        dataset_id="ashare_daily_qfq",
+    )
+    first_qfq = module.publish_snapshot(
+        first_qfq_stage,
+        dataset_root=qfq_root,
+        quant_data_root=quant_data,
+    )
+    first_manifest = module.validate_dataset_snapshot(first_qfq)
+    upstream = {
+        field: str(first_manifest[field])
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    }
+    qlib_stage = finalize_qlib_snapshot(
+        module,
+        quant_data,
+        "qlib-001",
+        upstream_snapshot=upstream,
+    )
+    qlib = module.publish_qlib_snapshot(
+        qlib_stage,
+        dataset_root=qlib_root,
+        quant_data_root=quant_data,
+    )
+    module.write_root_manifest(
+        quant_data,
+        {
+            "ashare_daily_qfq": module.catalog_entry_from_snapshot(
+                first_qfq,
+                quant_data_root=quant_data,
+                dataset_root=qfq_root,
+            ),
+            "qlib_ashare_v2": module.catalog_entry_from_snapshot(
+                qlib,
+                quant_data_root=quant_data,
+                dataset_root=qlib_root,
+            ),
+        },
+    )
+    second_qfq_stage = finalize_qfq_snapshot(
+        module,
+        quant_data,
+        snapshot_id="qfq-source-002",
+        dataset_id="ashare_daily_qfq",
+    )
+    module.publish_snapshot_group(
+        [(second_qfq_stage, qfq_root)],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+    )
+
+    with pytest.raises(module.DataContractError, match="upstream snapshot is stale"):
+        module.resolve_dataset(
+            "qlib_ashare_v2",
+            quant_data_root=quant_data,
+            require_basis="qfq",
+        )
+
+
 def test_qlib_snapshot_validation_rejects_unindexed_feature_tampering(
     tmp_path: Path,
 ) -> None:
@@ -661,4 +878,36 @@ def test_qlib_snapshot_validation_rejects_unindexed_feature_tampering(
     feature.write_bytes(b"tamper-bytes!")
 
     with pytest.raises(module.DataContractError, match="Qlib file hash mismatch"):
+        module.validate_dataset_snapshot(snapshot, verify_hashes=True)
+
+
+def test_qlib_snapshot_validation_rejects_symlinked_files(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    snapshot = finalize_qlib_snapshot(module, quant_data, "qlib-symlink")
+    feature = snapshot / "features" / "sh600000" / "close.day.bin"
+    external = tmp_path / "external-close.day.bin"
+    external.write_bytes(feature.read_bytes())
+    feature.unlink()
+    feature.symlink_to(external)
+
+    with pytest.raises(module.DataContractError, match="symlink"):
+        module.validate_dataset_snapshot(snapshot, verify_hashes=True)
+
+
+def test_qlib_snapshot_validation_rejects_manifest_path_escape(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    snapshot = finalize_qlib_snapshot(module, quant_data, "qlib-path-escape")
+    external = tmp_path / "outside-provider-manifest.json"
+    external.write_bytes((snapshot / "PROVIDER_MANIFEST.json").read_bytes())
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["provider_manifest_path"] = os.path.relpath(external, snapshot)
+    manifest["content_sha256"] = module._content_hash(snapshot, manifest)
+    module.atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(module.DataContractError, match="must stay inside snapshot"):
         module.validate_dataset_snapshot(snapshot, verify_hashes=True)

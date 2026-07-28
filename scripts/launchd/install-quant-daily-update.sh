@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Install (or preview) the launchd job that runs the daily A-share data update.
 #
-# The daily pipeline refreshes independent source caches, builds merged and
-# cleaned candidates, validates benchmark/quality/Qlib state, and publishes
-# official providers only after every required check passes. It records a
-# controlled skip instead of touching shared data while robust research runs.
+# The daily pipeline refreshes independent audit caches and validates the
+# governed A-share V2 datasets. It publishes official data only when an
+# explicitly supplied V2 bundle passes every required check; it never promotes
+# the fixed-path V1 compatibility providers itself. It records a controlled
+# skip instead of touching shared data while robust research runs.
 #
 # Baostock uses anonymous login, so this job needs no credentials. The plist is
 # machine-specific (absolute paths), so it is generated here from the tracked

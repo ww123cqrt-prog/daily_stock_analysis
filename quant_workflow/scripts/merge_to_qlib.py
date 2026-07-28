@@ -26,7 +26,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    qlib_compatibility_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from _symbols import to_qlib_name  # noqa: E402
 from quant_data_contract import atomic_write_json, sha256_file  # noqa: E402
 
@@ -38,7 +43,7 @@ JQ_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "jqdata"
 EASTMONEY_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "eastmoney_qfq"
 AKSHARE_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "akshare_qfq"
 MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
-QLIB_BIN_DIR = qlib_provider_uri()
+QLIB_BIN_DIR = qlib_compatibility_provider_uri()
 
 REQUIRED_FIELDS = ["open", "close", "high", "low", "volume"]
 OPTIONAL_FIELDS = ["amount", "turn", "pctChg"]

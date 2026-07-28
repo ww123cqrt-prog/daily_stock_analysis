@@ -415,6 +415,60 @@ def test_update_refuses_when_another_ashare_update_holds_the_lock(
             module.unlock_file(handle)
 
 
+def test_update_holds_dataset_publication_lock_across_all_publish_steps(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    write_catalog(quant_data)
+    observed_steps: list[str] = []
+
+    def assert_publication_lock(step: str, **kwargs):
+        assert kwargs["publication_lock_held"] is True
+        lock_path = (
+            quant_data / "runtime" / "locks" / "dataset_publication.lock"
+        )
+        with lock_path.open("a+b") as handle:
+            with pytest.raises(BlockingIOError):
+                module.lock_file(handle, exclusive=True, blocking=False)
+        observed_steps.append(step)
+
+    def build_snapshots(**kwargs):
+        assert_publication_lock("raw_qfq_v2", **kwargs)
+        return quant_data / "new-raw", quant_data / "new-qfq"
+
+    def build_qlib(**kwargs):
+        assert_publication_lock("qlib_v2", **kwargs)
+        return quant_data / "new-qlib"
+
+    def build_compatibility(**kwargs):
+        assert_publication_lock("compatibility", **kwargs)
+        return {"status": "published"}
+
+    fake_modules = {
+        "download_baostock_v2": types.SimpleNamespace(
+            build_snapshots_from_bundle=build_snapshots
+        ),
+        "build_qlib_v2": types.SimpleNamespace(build_qlib_v2=build_qlib),
+        "publish_v2_compatibility": types.SimpleNamespace(
+            rebuild_and_publish_v1_compatibility=build_compatibility
+        ),
+    }
+
+    with patch.dict(sys.modules, fake_modules):
+        assert (
+            module._update(
+                quant_data,
+                "ashare_daily_qfq",
+                None,
+                tmp_path / "bundle",
+            )
+            == 0
+        )
+
+    assert observed_steps == ["raw_qfq_v2", "qlib_v2", "compatibility"]
+
+
 def test_human_description_does_not_call_compatibility_output_audit_only() -> None:
     module = load_module()
     text = module._human_description(
@@ -433,3 +487,60 @@ def test_human_description_does_not_call_compatibility_output_audit_only() -> No
 
     assert "正式兼容输出" in text
     assert "只能审计" not in text
+
+
+def test_human_description_reports_native_upstream_and_benchmark_lineage() -> None:
+    module = load_module()
+    text = module._human_description(
+        {
+            "dataset_id": "qlib_ashare_v2",
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "snapshot_available": True,
+            "snapshot_id": "qlib-v2-001",
+            "snapshot_path": "qlib/cn_data_ashare_v2/snapshots/qlib-v2-001",
+            "source": {
+                "provider": "quant_workflow",
+                "interface": "v2_snapshot_to_qlib",
+            },
+            "adjustment": {"method": "upstream_qfq_snapshot"},
+            "upstream_snapshots": [
+                {
+                    "dataset_id": "ashare_daily_qfq",
+                    "snapshot_id": "qfq-001",
+                    "content_sha256": "a" * 64,
+                }
+            ],
+            "benchmark_complete": True,
+            "benchmarks": {
+                "calendar_sha256": "b" * 64,
+                "source": {
+                    "provider": "tencent",
+                    "interface": "qt.gtimg.cn historical daily",
+                    "evidence_sha256": "c" * 64,
+                },
+                "symbols": {
+                    "SH000300": {
+                        "coverage": {"start": "2005-04-08", "end": "2026-07-24"}
+                    },
+                    "SH000905": {
+                        "coverage": {"start": "2007-01-15", "end": "2026-07-24"}
+                    },
+                    "SH000906": {
+                        "coverage": {"start": "2007-01-15", "end": "2026-07-24"}
+                    },
+                },
+            },
+            "producer": {"script": "build_qlib_v2.py", "version": "4"},
+        }
+    )
+
+    assert "上游数据集: ashare_daily_qfq" in text
+    assert "上游快照: qfq-001" in text
+    assert f"上游内容哈希: {'a' * 64}" in text
+    assert "指数完整: 是" in text
+    assert "指数来源: tencent / qt.gtimg.cn historical daily" in text
+    assert f"交易日历哈希: {'b' * 64}" in text
+    for symbol in ("SH000300", "SH000905", "SH000906"):
+        assert symbol in text

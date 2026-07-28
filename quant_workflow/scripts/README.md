@@ -15,7 +15,8 @@ Path convention:
 - `WORKING_PROJECTS_ROOT` moves the default project family roots together.
 - `QUANT_WORKFLOW_ROOT`, `QUANT_WORKFLOW_REPORTS_ROOT`,
   `QUANT_WORKFLOW_MLRUNS_DIR`, `QUANT_DATA_ROOT`, `QLIB_PROVIDER_URI`,
-  `QLIB_CLEANED_PROVIDER_URI`, and `CHINA_ASTOCK_QUANT_ROOT` override specific
+  `QLIB_CLEANED_PROVIDER_URI`, `QLIB_COMPATIBILITY_PROVIDER_URI`, and
+  `CHINA_ASTOCK_QUANT_ROOT` override specific
   paths when needed.
 - Do not add new hardcoded local absolute paths in scripts.
 
@@ -26,10 +27,11 @@ Naming convention:
   parsing check used by the web workflow; omit `--dry-run` only when you intend
   to write real Parquet files.
 - `supervise_<source>.py` runs a restartable long download.
-- `merge_to_qlib.py` creates the merged Parquet and Qlib bin provider.
+- `merge_to_qlib.py` creates mutable V1-compatible merged Parquet/Qlib output;
+  it is not the canonical native V2 builder.
 - `apply_data_cleaning.py` applies anomaly reports into a separate cleaned
   Parquet + Qlib provider without overwriting the canonical provider.
-- `check_qlib_data.py` smoke-checks the converted provider.
+- `check_qlib_data.py` smoke-checks the resolved native V2 provider by default.
 - `repair_qlib_provider.py` fixes provider instrument metadata without a full rebuild.
 - `add_index_benchmark.py` and `generate_csi300.py` are provider-maintenance
   scripts. They now support `--dry-run` and parameterized paths, but should
@@ -38,8 +40,9 @@ Naming convention:
 - `supervise_baostock.py` is a restartable long-download supervisor. It is not
   exposed as a separate DSA web button because the web task center already wraps
   Baostock downloads with durable job logs and cancellation.
-- `report_data_quality.py` generates coverage, overlap, merged-data, Qlib
-  provider, and training-readiness reports. Use `--overlap-sample` to limit
+- `report_data_quality.py` scans native `ashare_daily_qfq` bars and native
+  `qlib_ashare_v2` by default, while retaining legacy-source overlap evidence.
+  Use `--overlap-sample` to limit
   Baostock/JQData overlap comparisons and `--merged-sample` to limit merged
   Parquet scans for browser smoke checks; omit both for a full report.
 - `report_workbench_capabilities.py` generates a read-only inventory of DSA
@@ -58,7 +61,7 @@ Naming convention:
   promotes a candidate or places an order automatically. Use `--dry-run` for a
   deterministic small-sample pipeline check.
 - `report_market_regime.py` generates a read-only market regime and cash-ratio
-  report from local merged Parquet data. It does not connect to broker software,
+  report from resolved native qfq bars. It does not connect to broker software,
   place orders, or modify Qlib provider files.
 - `report_cash_control_backtest.py` reads the latest Qlib daily portfolio
   backtest report and applies the market-regime cash ratio as a read-only
@@ -142,13 +145,20 @@ Research-only model comparison scripts live under:
 Do not promote a script from that folder into `scripts/` until its assumptions,
 data splits, and output paths are documented here.
 
-The current main provider defaults to:
-
-`${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata`
+The current main provider is resolved from `DATA_MANIFEST.json` as
+`qlib_ashare_v2`. Each process receives the exact immutable snapshot path and
+keeps it for the whole training or backtest run. `QLIB_PROVIDER_URI` is an
+explicit emergency/test override, not the normal path.
 
 The optional cleaned provider defaults to:
 
 `${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned`
+
+Mutable maintenance scripts such as `merge_to_qlib.py`,
+`add_index_benchmark.py`, `generate_csi300.py` and
+`repair_qlib_provider.py` default to the compatibility output instead of the
+immutable native snapshot. Qlib config files are runtime templates; the DSA
+wrappers replace `RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME` before invoking Qlib.
 
 ## Robust Signal Goal 1
 

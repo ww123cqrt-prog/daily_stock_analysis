@@ -125,27 +125,17 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 
 `quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到网页按钮里。当前网页任务中心已经覆盖核心日常链路：数据下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、数据治理盘点和 dry-run 清理预案、市场状态、现金仓位叠加、Qlib 研究增强、china-astock 技术指标报告、china-astock 对比、交易策略优化预演和选股模型基线训练。
 
-### 2.3 每日数据更新全链路与自动调度
+### 2.3 每日数据更新与原生 V2 校验
 
-`run_daily_update.py` 在 `/workflow` 中作为“运行每日数据更新全链路”任务出现，把已有稳定脚本按依赖顺序串成一条可审计的链路：
+`run_daily_update.py` 在 `/workflow` 中显示为“运行每日数据更新与 V2 校验”。它不再生成旧 merged/cleaned 候选，也不再调用 `publish_daily_candidate.py`：
 
-1. 可选 A 股历史刷新：默认 `--ashare-source none`，不请求 Baostock、东方财富或 AkShare；显式选择时只运行一个来源。AkShare 的 `stock_zh_a_hist(adjust="qfq")` 底层使用东方财富接口，因此不能当作独立流量通道同时运行。
-2. A 股来源安全控制：请求间隔至少 2 秒，只尝试 1 次，连续失败最多 3 次，单次最多 6000 个请求，增量重叠最多 7 天；`10001011`、黑名单、HTTP 403/429 或远端主动断开会立即终止整个来源任务。
-3. `download_global_daily.py --incremental`：从 Yahoo Chart 下载配置内的美股、日股和韩股，分别写入 `quant_data/parquet/global_1d/{us,jp,kr}/<symbol>.parquet`；原始响应按抓取日期写入 `quant_data/raw/global_1d/yahoo/`。
-4. 可选 `download_ashare_news.py`：只有显式设置正数 `--news-limit` 才抓取限定股票数的东方财富新闻搜索结果；原始响应写入 `quant_data/raw/ashare_news/`。
-5. `quant_data_cli.py update etf_momentum_daily_qfq`：更新两只 ETF 的同源 raw/qfq 快照，校验复权证据后原子发布；随后生成 ETF 策略报告。两步失败只记为警告，不阻断 A 股主链路，也不会发布半套 ETF 数据。
-6. `merge_to_qlib.py`：在本次 run 的 staging 目录生成 merged parquet 与 Qlib 候选。旧 qfq 数据每只股票只采用一个完整来源，不再跨供应商按日期拼接；明确标记为 raw 的数据才允许按整行补缺，并记录 `source_id`。
-7. `add_index_benchmark.py`：严格校验或事务导入 CSI300、CSI500、CSI800 三套基准。任一基准缺日或与目标日历不一致都会失败，不做前向或后向填充。
-8. `validate_latest_snapshot.py`：抽样读取新浪行情快照，对比候选 merged 最新收盘价，生成 `latest_snapshot_validation_latest.{json,md}`，并把原始响应写入 `quant_data/raw/ashare_snapshots/`；这是非致命校验，不参与训练。
-9. `report_data_anomalies.py`：对候选 merged 数据做异常检测，产出清洗输入。
-10. `apply_data_cleaning.py`：套用清洗规则，在 staging 目录生成 cleaned parquet/Qlib 候选，并按目标日历重建基准特征。
-11. `report_data_quality.py`：对候选数据执行跨源一致性、结构、规模和基准完整性检查；不可训练时返回非零。
-12. `check_qlib_data.py`：最终检查候选 provider 的日历、股票池和三套基准完整性。
-13. 当 `ashare_daily_qfq` V2 尚未就绪时，`publish_daily_candidate.py` 只服务旧流程；V2 就绪后它会拒绝覆盖固定路径。正式路径改由 `publish_v2_compatibility.py` 从 V2 快照重建四套候选、全部校验后成组切换，并把迁移前数据保存在 `_old`。
+1. 可选 A 股来源刷新默认关闭。显式选择 Baostock、东方财富或 AkShare 时，一次只运行一个来源，并沿用至少 2 秒间隔、1 次尝试、连续失败最多 3 次和最多 7 天重叠窗口。这些结果只进入审计缓存，不能发布正式 V2；明确选择的来源失败时本轮返回非零。
+2. 全球日线、限定范围的 A 股新闻和 ETF raw/qfq 各自独立更新。ETF 仍通过 `quant_data_cli.py update etf_momentum_daily_qfq` 原子发布，失败不会生成半套 ETF 数据。
+3. 正式 A 股更新只能由已核验的 raw/factor/qfq bundle 触发。命令行显式传 `--ashare-v2-bundle-dir <bundle>` 后，编排器委托 `quant_data_cli.py update ashare_daily_qfq --bundle-dir <bundle>`；该事务构建新的 `ashare_daily_raw`、`ashare_daily_qfq` 和 `qlib_ashare_v2` 不可变快照，并在失败时恢复原指针。网页不接受任意本机 bundle 路径。
+4. 无论是否发布新 bundle，编排器最后直接运行 `quant_data_cli validate ashare_daily_qfq`、`quant_data_cli validate qlib_ashare_v2`、`check_qlib_data.py`、`report_data_quality.py --fail-on-not-trainable` 和 `sync_data_manifest.py --check`。质量报告默认扫描原生 qfq bars 和原生 Qlib V2，不再把兼容目录当 canonical 输入。
+5. `official_published=true` 只表示本轮 V2 bundle 事务真实成功；普通审计缓存下载成功不会设置该标志。运行摘要同时记录 qfq、Qlib V2 和 ETF 更新前后的日期以及 `legacy_source_role=audit_cache_only`。
 
-编排器带 A 股交易日和覆盖率双 gate：只允许本次明确选择的一个 A 股历史来源参与刷新；默认至少 80% 的股票在合法来源覆盖目标日，才允许进入合并发布。全球日线、新闻原始证据和 ETF 更新是独立非致命阶段，不会放宽 A 股发布门禁。来源被拒绝、连续失败或达到请求预算时下载阶段返回非零；若没有新交易日也没有可发布重建，整条链路不会伪报成功。`--skip-download` 只重建、不下载，`--dry-run` 只打印计划，`--limit` 用于小样本演练。每次运行记录阶段状态、用时、退出码、覆盖率、ETF 数据日期和实际发布结果。
-
-`add_index_benchmark.py` 在全链路中默认使用 `--reuse-existing` 严格校验候选 provider 内的 CSI300、CSI500、CSI800 三套基准；指定 `--benchmark-cache-dir` 时改用事务式导入。缺少任一基准、日历不一致或数据缺日都会失败，不做前向填充。只有命令行显式传 `--allow-benchmark-network` 才允许 Baostock 重新下载三套基准；网页白名单和定时任务都不提供该开关。
+`--skip-download` 表示跳过独立下载、只校验现有 V2；`--dry-run` 只列出计划且不启动子进程。固定路径兼容输出只能由 `publish_v2_compatibility.py` 维护；mutable 修复工具不得写入原生快照。
 
 JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baostock 长历史序列之前，只在合并和跨源验证中复用既有 JQData parquet。东方财富和 AkShare 是免费冗余源，首次全市场下载会额外占用约 1GB 量级磁盘；日常增量只补最近窗口。
 
@@ -160,7 +150,7 @@ scripts/launchd/install-quant-daily-update.sh --dry-run  # 只打印解析后的
 scripts/launchd/install-quant-daily-update.sh --uninstall # bootout 并删除 plist
 ```
 
-任务 `com.dsa.quant-daily-update` 的配置仍保留工作日 18:40（Asia/Shanghai），但当前本机因 Baostock `10001011` 和东方财富断开问题已执行 `launchctl disable` 并卸载，不会自动触发。恢复前必须先人工复核来源访问和小样本结果。任务本身带单实例锁；DSA 网页还会阻止不同网络下载按钮并发运行。
+任务 `com.dsa.quant-daily-update` 的配置仍保留工作日 18:40（Asia/Shanghai），但当前本机因 Baostock `10001011` 和东方财富断开问题已执行 `launchctl disable` 并卸载，不会自动触发。恢复时应保持 `--ashare-source none`，只运行独立数据更新和原生 V2 校验；不得因为换了编排器就重新开启被暂停的 Baostock/东方财富自动请求。任务本身带单实例锁；DSA 网页还会阻止不同网络下载按钮并发运行。
 
 四个直接脚本 `download_baostock.py`、`download_eastmoney.py`、`download_akshare.py` 和 `download_ashare_news.py` 共用 `source_download.lock.json`；即使绕过网页从两个终端同时启动，第二个进程也会在发送网络请求前退出。
 模板默认让 `com.dsa.quant-daily-update` 在工作日 18:40 运行，用 `daily_stock_analysis/.venv` 执行仓内 `run_daily_update.py`，日志写入 `quant_workflow/logs/`。这个任务只更新数据，不运行 60 日纸面跟踪。
@@ -173,7 +163,7 @@ scripts/launchd/install-robust-shadow.sh --load     # 确认期通过后才安�
 scripts/launchd/install-robust-shadow.sh --uninstall
 ```
 
-`com.dsa.robust-shadow` 在工作日 19:10 启动，并最多等待 4 小时让 18:40 数据任务结束；本机近期全量日更新实测约需 2.5 至 3.5 小时。当天数据更新失败、只是 dry-run、等待超时或推理失败时，该任务返回非零并写 `robust_strategy/shadow_runner/schedule_latest.json`，不能降级成日更新 warning。冻结组合含 `mps_dnn` 时，安装脚本默认使用 `.venv-mps-dnn`，每次推理前保存真实 MPS 探针；不允许自动回退 CPU。尚未通过确认期时任务只返回 `inactive/skipped`，不会伪造纸面观察。正式启用前还必须确认 18:40 数据任务已经恢复成功；最近一次正式记录停在 `apply_data_cleaning` 失败，当前不能据此开始 60 日计数。
+`com.dsa.robust-shadow` 在工作日 19:10 启动，并最多等待 4 小时让 18:40 数据任务结束。当天数据更新失败、只是 dry-run、等待超时或推理失败时，该任务返回非零并写 `robust_strategy/shadow_runner/schedule_latest.json`，不能降级成日更新 warning。冻结组合含 `mps_dnn` 时，安装脚本默认使用 `.venv-mps-dnn`，每次推理前保存真实 MPS 探针；不允许自动回退 CPU。尚未通过确认期时任务只返回 `inactive/skipped`，不会伪造纸面观察。正式启用前还必须确认 18:40 数据任务已经恢复成功；旧流程停在 `apply_data_cleaning` 的记录不能据此开始 60 日计数，新流程必须以原生 V2 校验阶段全部通过为准。
 
 ### 2.3 只读盘点与报告任务
 

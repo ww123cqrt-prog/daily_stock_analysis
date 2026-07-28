@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run the scheduled A-share source refresh and candidate publication pipeline.
+"""Run scheduled market refreshes and validate the governed A-share V2 data.
 
-Source caches are updated independently. Derived merged and cleaned artifacts
-are built under a run-scoped staging directory, validated there, and promoted
-only by the final rollback-capable publish stage.
+Legacy network downloaders update audit caches only. A canonical A-share
+publication is allowed only from an explicitly supplied, previously verified
+V2 bundle and is delegated to ``quant_data_cli.py``. The daily runner never
+rebuilds or promotes the fixed-path V1 compatibility providers itself.
 """
 
 from __future__ import annotations
@@ -25,18 +26,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _daily_update_runtime import DailyUpdateLock, LockHeldError, write_json_atomic  # noqa: E402
 from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
-from quant_data_contract import DataContractError, describe_dataset  # noqa: E402
-
-
 WORKFLOW_ROOT = workflow_root()
 REPORTS_ROOT = reports_root()
 QUANT_DATA = quant_data_root()
 PARQUET_ROOT = QUANT_DATA / "parquet" / "ashare_1d"
-QLIB_ROOT = QUANT_DATA / "qlib"
 BAOSTOCK_DIR = PARQUET_ROOT / "baostock_qfq"
 EASTMONEY_DIR = PARQUET_ROOT / "eastmoney_qfq"
 AKSHARE_DIR = PARQUET_ROOT / "akshare_qfq"
-JQDATA_DIR = PARQUET_ROOT / "jqdata"
 STOCK_LIST = QUANT_DATA / "stock_lists.json"
 SOURCE_DIRS = {
     "baostock": BAOSTOCK_DIR,
@@ -52,7 +48,6 @@ ASHARE_DOWNLOAD_STAGE_NAMES = frozenset(
 class Stage:
     name: str
     argv: list[str]
-    heavy: bool = False
     required: bool = True
 
 
@@ -64,16 +59,6 @@ class StageResult:
     returncode: int
     required: bool = True
     details: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class CandidatePaths:
-    run_root: Path
-    merged_parquet: Path
-    merged_qlib: Path
-    cleaned_parquet: Path
-    cleaned_qlib: Path
-    backup_root: Path
 
 
 def _log(message: str) -> None:
@@ -112,13 +97,33 @@ def latest_any_source_date(source_dirs: dict[str, Path], sample: int = 40) -> tu
     return latest, by_source
 
 
-def latest_dataset_date(dataset_id: str, root: Path | None = None) -> str:
+def latest_dataset_dates(
+    dataset_ids: tuple[str, ...], root: Path | None = None
+) -> dict[str, str]:
+    result = {dataset_id: "" for dataset_id in dataset_ids}
     try:
-        payload = describe_dataset(dataset_id, quant_data_root=Path(root or QUANT_DATA))
-    except (DataContractError, OSError, ValueError):
-        return ""
-    value = payload.get("latest_trade_date")
-    return str(value) if value else ""
+        payload = json.loads(
+            (Path(root or QUANT_DATA) / "DATA_MANIFEST.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        datasets = payload.get("datasets") if isinstance(payload, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return result
+    if not isinstance(datasets, dict):
+        return result
+    for dataset_id in dataset_ids:
+        entry = datasets.get(dataset_id)
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("latest_trade_date")
+        if value:
+            result[dataset_id] = str(value)
+    return result
+
+
+def latest_dataset_date(dataset_id: str, root: Path | None = None) -> str:
+    return latest_dataset_dates((dataset_id,), root=root)[dataset_id]
 
 
 def load_expected_symbols(path: Path = STOCK_LIST) -> set[str]:
@@ -188,14 +193,6 @@ def source_coverage_snapshot(
     }
 
 
-def should_run_heavy(*, force: bool, download_ran: bool, before: str, after: str) -> bool:
-    if force or not download_ran:
-        return True
-    if not before or not after:
-        return True
-    return after > before
-
-
 def _python() -> str:
     return sys.executable
 
@@ -204,23 +201,9 @@ def _script(name: str) -> list[str]:
     return [_python(), str(WORKFLOW_ROOT / "scripts" / name)]
 
 
-def candidate_paths(run_id: str) -> CandidatePaths:
-    run_root = QUANT_DATA / "runtime" / "daily_update" / "runs" / run_id
-    staging = run_root / "staging"
-    return CandidatePaths(
-        run_root=run_root,
-        merged_parquet=staging / "merged_parquet",
-        merged_qlib=staging / "merged_qlib",
-        cleaned_parquet=staging / "cleaned_parquet",
-        cleaned_qlib=staging / "cleaned_qlib",
-        backup_root=run_root / "previous_official",
-    )
-
-
 def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stage]:
-    paths = candidate_paths(run_id)
+    del run_id
     out = ["--out-dir", str(REPORTS_ROOT)]
-    status_dir = REPORTS_ROOT / "runtime" / "status"
     stages: list[Stage] = []
 
     if not args.skip_download:
@@ -295,59 +278,33 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 )
             )
 
-    stages.append(
-        Stage(
-            "merge_to_qlib",
-            _script("merge_to_qlib.py") + [
-                "--merged-dir", str(paths.merged_parquet),
-                "--qlib-dir", str(paths.merged_qlib),
-            ],
-            heavy=True,
+    bundle_dir = getattr(args, "ashare_v2_bundle_dir", None)
+    if bundle_dir is not None:
+        stages.append(
+            Stage(
+                "update_ashare_v2_bundle",
+                _script("quant_data_cli.py")
+                + [
+                    "--root",
+                    str(QUANT_DATA),
+                    "update",
+                    "ashare_daily_qfq",
+                    "--bundle-dir",
+                    str(bundle_dir),
+                ],
+            )
         )
-    )
-    benchmark = _script("add_index_benchmark.py") + [
-        "--provider-dir", str(paths.merged_qlib),
-    ]
-    if args.benchmark_cache_dir is not None:
-        benchmark += ["--import-provider-dir", str(args.benchmark_cache_dir)]
-    elif args.benchmark_offline:
-        benchmark += ["--reuse-existing"]
-    stages.append(Stage("add_index_benchmark", benchmark, heavy=True))
 
-    if not args.skip_snapshot_validation:
-        snapshot = _script("validate_latest_snapshot.py") + [
-            "--merged-dir", str(paths.merged_parquet),
-            *out,
-        ]
-        if args.snapshot_limit > 0:
-            snapshot += ["--limit", str(args.snapshot_limit)]
-        if args.use_system_proxy:
-            snapshot += ["--use-system-proxy"]
-        stages.append(Stage("validate_latest_snapshot", snapshot, heavy=True, required=False))
-
-    stages.append(
-        Stage(
-            "report_data_anomalies",
-            _script("report_data_anomalies.py") + ["--merged-dir", str(paths.merged_parquet), *out],
-            heavy=True,
+    for dataset_id in ("ashare_daily_qfq", "qlib_ashare_v2"):
+        stages.append(
+            Stage(
+                f"validate_{dataset_id}",
+                _script("quant_data_cli.py")
+                + ["--root", str(QUANT_DATA), "validate", dataset_id],
+            )
         )
-    )
-    stages.append(
-        Stage(
-            "apply_data_cleaning",
-            _script("apply_data_cleaning.py") + [
-                "--merged-dir", str(paths.merged_parquet),
-                "--cleaned-merged-dir", str(paths.cleaned_parquet),
-                "--qlib-dir", str(paths.cleaned_qlib),
-                "--benchmark-provider-dir", str(paths.merged_qlib),
-                *out,
-            ],
-            heavy=True,
-        )
-    )
+    stages.append(Stage("check_qlib_data", _script("check_qlib_data.py")))
     quality = _script("report_data_quality.py") + [
-        "--merged-dir", str(paths.cleaned_parquet),
-        "--qlib-dir", str(paths.cleaned_qlib),
         "--min-calendar-days", str(args.quality_min_calendar_days),
         "--min-instruments", str(args.quality_min_instruments),
         "--fail-on-not-trainable",
@@ -357,49 +314,31 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
         quality += ["--overlap-sample", str(args.overlap_sample)]
     if args.merged_sample > 0:
         quality += ["--merged-sample", str(args.merged_sample)]
-    stages.append(Stage("report_data_quality", quality, heavy=True))
+    stages.append(Stage("report_data_quality", quality))
     stages.append(
         Stage(
-            "check_qlib_data",
-            _script("check_qlib_data.py") + ["--provider-dir", str(paths.cleaned_qlib)],
-            heavy=True,
+            "sync_data_manifest_check",
+            _script("sync_data_manifest.py")
+            + [
+                "--check",
+                "--quant-data-root",
+                str(QUANT_DATA),
+                "--out-dir",
+                str(REPORTS_ROOT),
+            ],
         )
     )
-
-    publish = _script("publish_daily_candidate.py") + [
-        "--candidate-merged-parquet", str(paths.merged_parquet),
-        "--target-merged-parquet", str(PARQUET_ROOT / "merged_baostock_jqdata"),
-        "--candidate-merged-qlib", str(paths.merged_qlib),
-        "--target-merged-qlib", str(QLIB_ROOT / "cn_data_baostock_jqdata"),
-        "--candidate-cleaned-parquet", str(paths.cleaned_parquet),
-        "--target-cleaned-parquet", str(PARQUET_ROOT / "merged_baostock_jqdata_cleaned"),
-        "--candidate-cleaned-qlib", str(paths.cleaned_qlib),
-        "--target-cleaned-qlib", str(QLIB_ROOT / "cn_data_baostock_jqdata_cleaned"),
-        "--backup-root", str(paths.backup_root),
-        "--quant-data-root", str(QUANT_DATA),
-        "--reports-root", str(REPORTS_ROOT),
-        "--status-dir", str(status_dir),
-    ]
-    stages.append(Stage("publish_official", publish, heavy=True))
     return stages
 
 
-def source_refresh_failed_without_rebuild(results: list[StageResult]) -> bool:
+def selected_ashare_refresh_failed(results: list[StageResult]) -> bool:
     download_results = [result for result in results if result.name in ASHARE_DOWNLOAD_STAGE_NAMES]
     if not download_results or not all(result.status == "failed" for result in download_results):
         return False
-    heavy_names = {
-        "merge_to_qlib",
-        "add_index_benchmark",
-        "validate_latest_snapshot",
-        "report_data_anomalies",
-        "apply_data_cleaning",
-        "report_data_quality",
-        "check_qlib_data",
-        "publish_official",
-    }
-    heavy_results = [result for result in results if result.name in heavy_names]
-    return bool(heavy_results) and all(result.status == "skipped" for result in heavy_results)
+    bundle_results = [
+        result for result in results if result.name == "update_ashare_v2_bundle"
+    ]
+    return not any(result.status == "ok" for result in bundle_results)
 
 
 def _download_details(stage_name: str) -> dict[str, Any] | None:
@@ -526,7 +465,6 @@ def robust_training_active() -> bool:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the daily A-share data update pipeline.")
     parser.add_argument("--skip-download", action="store_true")
-    parser.add_argument("--force", action="store_true")
     parser.add_argument(
         "--ashare-source",
         choices=["none", "baostock", "eastmoney", "akshare"],
@@ -547,26 +485,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-global-daily", action="store_true")
     parser.add_argument("--skip-ashare-news", action="store_true")
     parser.add_argument("--skip-etf-momentum", action="store_true")
-    parser.add_argument("--skip-snapshot-validation", action="store_true")
     parser.add_argument("--use-system-proxy", action="store_true")
-    parser.add_argument("--snapshot-limit", type=int, default=50)
     parser.add_argument("--news-limit", type=int, default=0)
     parser.add_argument("--overlap-sample", type=int, default=0)
     parser.add_argument("--merged-sample", type=int, default=0)
     parser.add_argument("--min-source-coverage", type=float, default=0.8)
-    parser.add_argument("--benchmark-cache-dir", type=Path, default=None)
     parser.add_argument(
-        "--benchmark-offline",
-        dest="benchmark_offline",
-        action="store_true",
-        default=True,
-        help="Use validated local benchmark caches only (default).",
-    )
-    parser.add_argument(
-        "--allow-benchmark-network",
-        dest="benchmark_offline",
-        action="store_false",
-        help="Explicitly allow benchmark fallback requests; never used by the scheduled or web profile.",
+        "--ashare-v2-bundle-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Publish A-share V2 only from this verified raw/factor/qfq bundle. "
+            "Legacy source-cache downloads are never promoted."
+        ),
     )
     parser.add_argument("--quality-min-calendar-days", type=int, default=252)
     parser.add_argument("--quality-min-instruments", type=int, default=100)
@@ -599,72 +530,26 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         "source coverage before: "
         f"date={before['candidate_date'] or 'n/a'} ratio={before['coverage_ratio']:.3f}"
     )
-    etf_before = latest_dataset_date("etf_momentum_daily_qfq")
+    governed_before = latest_dataset_dates(
+        ("etf_momentum_daily_qfq", "ashare_daily_qfq", "qlib_ashare_v2")
+    )
+    etf_before = governed_before["etf_momentum_daily_qfq"]
+    qfq_before = governed_before["ashare_daily_qfq"]
+    qlib_before = governed_before["qlib_ashare_v2"]
     _log(f"latest ETF momentum date before: {etf_before or 'n/a'}")
     write_runtime_status(run_id, "running", current_stage="starting", source_coverage_before=before)
 
     stages = build_stages(args, run_id=run_id)
     results: list[StageResult] = []
-    download_ran = not args.skip_download
-    heavy_enabled: bool | None = None
-    coverage_rejected = False
-    after = before
 
     for stage in stages:
-        if stage.heavy:
-            if heavy_enabled is None:
-                if args.dry_run:
-                    heavy_enabled = True
-                elif args.force or not download_ran:
-                    after = source_coverage_snapshot(
-                        SOURCE_DIRS,
-                        expected_symbols=expected_symbols,
-                        minimum_ratio=args.min_source_coverage,
-                    )
-                    heavy_enabled = True
-                else:
-                    after = source_coverage_snapshot(
-                        SOURCE_DIRS,
-                        expected_symbols=expected_symbols,
-                        minimum_ratio=args.min_source_coverage,
-                    )
-                    date_advanced = should_run_heavy(
-                        force=False,
-                        download_ran=True,
-                        before=before["candidate_date"],
-                        after=after["candidate_date"],
-                    )
-                    heavy_enabled = bool(date_advanced and after["eligible"])
-                    coverage_rejected = bool(date_advanced and not after["eligible"])
-                _log(
-                    "source coverage after: "
-                    f"date={after['candidate_date'] or 'n/a'} ratio={after['coverage_ratio']:.3f}; "
-                    f"heavy stages {'enabled' if heavy_enabled else 'skipped'}"
-                )
-            if not heavy_enabled:
-                result = StageResult(stage.name, "skipped", 0.0, 0, required=stage.required)
-                results.append(result)
-                write_runtime_status(
-                    run_id,
-                    "running",
-                    current_stage=stage.name,
-                    stage_status="skipped",
-                    stages=[stage_payload(item) for item in results],
-                )
-                continue
-
-        if stage.name == "publish_official" and any(
-            item.required and item.status == "failed" for item in results
-        ):
-            result = StageResult(stage.name, "skipped", 0.0, 0, required=True)
-        else:
-            write_runtime_status(
-                run_id,
-                "running",
-                current_stage=stage.name,
-                stages=[stage_payload(item) for item in results],
-            )
-            result = run_stage(stage, args.dry_run)
+        write_runtime_status(
+            run_id,
+            "running",
+            current_stage=stage.name,
+            stages=[stage_payload(item) for item in results],
+        )
+        result = run_stage(stage, args.dry_run)
         results.append(result)
         write_runtime_status(
             run_id,
@@ -679,28 +564,24 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         if result.status == "failed" and not result.required:
             _log(f"stage {stage.name} failed but is non-fatal; continuing")
 
-    if coverage_rejected:
-        results.append(
-            StageResult(
-                "source_coverage_gate",
-                "failed",
-                0.0,
-                1,
-                required=True,
-                details=after,
-            )
-        )
-    if source_refresh_failed_without_rebuild(results):
+    if not args.dry_run and selected_ashare_refresh_failed(results):
         results.append(StageResult("source_refresh_gate", "failed", 0.0, 1, required=True))
 
-    if not args.dry_run and after is before:
-        after = source_coverage_snapshot(
-            SOURCE_DIRS,
-            expected_symbols=expected_symbols,
-            minimum_ratio=args.min_source_coverage,
-        )
-    published = any(item.name == "publish_official" and item.status == "ok" for item in results)
-    etf_after = latest_dataset_date("etf_momentum_daily_qfq")
+    after = source_coverage_snapshot(
+        SOURCE_DIRS,
+        expected_symbols=expected_symbols,
+        minimum_ratio=args.min_source_coverage,
+    )
+    published = any(
+        item.name == "update_ashare_v2_bundle" and item.status == "ok"
+        for item in results
+    )
+    governed_after = latest_dataset_dates(
+        ("etf_momentum_daily_qfq", "ashare_daily_qfq", "qlib_ashare_v2")
+    )
+    etf_after = governed_after["etf_momentum_daily_qfq"]
+    qfq_after = governed_after["ashare_daily_qfq"]
+    qlib_after = governed_after["qlib_ashare_v2"]
     summary_path = write_summary(
         results,
         {
@@ -713,12 +594,20 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             "source_coverage_after": after,
             "etf_date_before": etf_before,
             "etf_date_after": etf_after,
+            "ashare_qfq_date_before": qfq_before,
+            "ashare_qfq_date_after": qfq_after,
+            "qlib_v2_date_before": qlib_before,
+            "qlib_v2_date_after": qlib_after,
             "dry_run": bool(args.dry_run),
             "skip_download": bool(args.skip_download),
-            "forced": bool(args.force),
             "official_published": published,
             "manifest_synced": published,
-            "candidate_root": str(candidate_paths(run_id).run_root),
+            "ashare_update_mode": (
+                "verified_v2_bundle"
+                if args.ashare_v2_bundle_dir is not None
+                else "validate_existing_v2"
+            ),
+            "legacy_source_role": "audit_cache_only",
         },
     )
     final_status = summary_status(results)

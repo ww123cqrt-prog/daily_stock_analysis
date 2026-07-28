@@ -737,6 +737,17 @@ def test_publish_candidate_rejects_changed_stock_list(
         module._publish_candidate_result(candidate, quant_data_root=quant_data)
 
 
+def test_publish_candidate_refuses_when_dataset_publication_is_locked(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+
+    with module.dataset_publication_lock(quant_data):
+        with pytest.raises(module.DataContractError, match="already in progress"):
+            module._publish_candidate_result({}, quant_data_root=quant_data)
+
+
 def test_publish_candidate_rejects_stale_qfq_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

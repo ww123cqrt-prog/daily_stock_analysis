@@ -34,7 +34,11 @@ from apply_data_cleaning import (  # noqa: E402
 )
 from generate_csi300 import write_csi300  # noqa: E402
 from merge_to_qlib import convert_to_bin  # noqa: E402
-from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
+from quant_data_contract import (  # noqa: E402
+    DataContractError,
+    dataset_publication_lock,
+    resolve_dataset,
+)
 from report_data_anomalies import (  # noqa: E402
     SEVERITY_RANK,
     build_report as build_anomaly_report,
@@ -860,6 +864,31 @@ def _publish_candidate_result(
     *,
     quant_data_root: Path,
     reports_root: Path | None = None,
+    publication_lock_held: bool = False,
+) -> dict[str, Any]:
+    root = Path(quant_data_root).expanduser().resolve()
+    if publication_lock_held:
+        return _publish_candidate_result_unlocked(
+            candidate,
+            quant_data_root=root,
+            reports_root=reports_root,
+            publication_lock_held=True,
+        )
+    with dataset_publication_lock(root):
+        return _publish_candidate_result_unlocked(
+            candidate,
+            quant_data_root=root,
+            reports_root=reports_root,
+            publication_lock_held=True,
+        )
+
+
+def _publish_candidate_result_unlocked(
+    candidate: Mapping[str, Any],
+    *,
+    quant_data_root: Path,
+    reports_root: Path | None = None,
+    publication_lock_held: bool = False,
 ) -> dict[str, Any]:
     root = Path(quant_data_root).expanduser().resolve()
     current = resolve_dataset(
@@ -915,6 +944,7 @@ def _publish_candidate_result(
         sync_data_manifest(
             quant_data_root=root,
             reports_root=Path(reports_root) if reports_root is not None else None,
+            publication_lock_held=publication_lock_held,
         )
 
     def full_result(published: Mapping[str, Any]) -> dict[str, Any]:
@@ -985,6 +1015,7 @@ def rebuild_and_publish_v1_compatibility(
     reports_root: Path | None = None,
     run_id: str | None = None,
     benchmark_source: str = "tencent",
+    publication_lock_held: bool = False,
 ) -> dict[str, Any]:
     root = Path(quant_data_root).expanduser().resolve()
     candidate = build_compatibility_candidates(
@@ -996,6 +1027,7 @@ def rebuild_and_publish_v1_compatibility(
         candidate,
         quant_data_root=root,
         reports_root=reports_root,
+        publication_lock_held=publication_lock_held,
     )
 
 

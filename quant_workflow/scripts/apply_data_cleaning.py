@@ -20,13 +20,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    ashare_qfq_bars_dir,
+    qlib_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from merge_to_qlib import QLIB_FIELDS, convert_to_bin  # noqa: E402
 
 
 QUANT_DATA = quant_data_root()
 WORKFLOW = workflow_root()
-MERGED_DIR = QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata"
+MERGED_DIR: Path | None = None
 CLEANED_MERGED_DIR = (
     QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
 )
@@ -490,7 +496,9 @@ def write_reports(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    parser.add_argument(
+        "--merged-dir", type=Path, default=MERGED_DIR or ashare_qfq_bars_dir()
+    )
     parser.add_argument("--stocks-csv", type=Path, default=ANOMALY_STOCKS_CSV)
     parser.add_argument("--events-csv", type=Path, default=ANOMALY_EVENTS_CSV)
     parser.add_argument("--cleaned-merged-dir", type=Path, default=CLEANED_MERGED_DIR)

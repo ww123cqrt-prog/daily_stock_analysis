@@ -70,6 +70,7 @@ CHILD_ENV_EXACT_NAMES = {
     "PYTHONPATH",
     "PYTHONUNBUFFERED",
     "QLIB_CLEANED_PROVIDER_URI",
+    "QLIB_COMPATIBILITY_PROVIDER_URI",
     "QLIB_PROVIDER_ROOT",
     "QLIB_PROVIDER_URI",
     "QUANT_DATA_ROOT",
@@ -888,7 +889,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "ashare_source", "--ashare-source")
         for key, flag in (
             ("skip_download", "--skip-download"),
-            ("force", "--force"),
             ("dry_run", "--dry-run"),
             ("continue_on_error", "--continue-on-error"),
         ):
@@ -902,7 +902,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("max_requests", "--max-requests"),
             ("limit", "--limit"),
             ("end", "--end"),
-            ("snapshot_limit", "--snapshot-limit"),
             ("news_limit", "--news-limit"),
             ("overlap_sample", "--overlap-sample"),
             ("merged_sample", "--merged-sample"),
@@ -915,7 +914,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ("skip_global_daily", "--skip-global-daily"),
             ("skip_ashare_news", "--skip-ashare-news"),
             ("skip_etf_momentum", "--skip-etf-momentum"),
-            ("skip_snapshot_validation", "--skip-snapshot-validation"),
             ("use_system_proxy", "--use-system-proxy"),
         ):
             _append_flag(command, params, key, flag)
@@ -1057,12 +1055,11 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "run_daily_update": {
-            "label": "运行每日数据更新全链路",
+            "label": "运行每日数据更新与 V2 校验",
             "command": run_daily_update,
             "allowed_params": {
                 "skip_download",
                 "ashare_source",
-                "force",
                 "dry_run",
                 "continue_on_error",
                 "overlap_days",
@@ -1073,7 +1070,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "max_requests",
                 "limit",
                 "end",
-                "snapshot_limit",
                 "news_limit",
                 "skip_baostock",
                 "skip_eastmoney",
@@ -1081,7 +1077,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 "skip_global_daily",
                 "skip_ashare_news",
                 "skip_etf_momentum",
-                "skip_snapshot_validation",
                 "use_system_proxy",
                 "overlap_sample",
                 "merged_sample",
