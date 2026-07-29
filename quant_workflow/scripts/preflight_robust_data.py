@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root, reports_root  # noqa: E402
+from _paths import quant_data_root, reports_root  # noqa: E402
 from _robust_reference_integrity import (  # noqa: E402
     ReferenceIntegrityError,
     reference_read_lock,
@@ -37,10 +37,6 @@ from _robust_reference_policy import (  # noqa: E402
 QUANT_DATA = quant_data_root()
 DEFAULT_REFERENCE_DIR = QUANT_DATA / "reference"
 DEFAULT_PIT_DIR = DEFAULT_REFERENCE_DIR / "pit_csi800"
-DEFAULT_PRICE_DIR = (
-    QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
-)
-DEFAULT_PROVIDER_DIR = qlib_provider_uri("cleaned")
 DEFAULT_OUT_DIR = reports_root() / "robust_strategy"
 REQUIRED_BENCHMARKS = ("SH000300", "SH000905", "SH000906")
 REFERENCE_TABLES = {
@@ -917,8 +913,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Validate all data required by the robust PIT CSI800 strategy."
     )
     parser.add_argument("--pit-dir", type=Path, default=DEFAULT_PIT_DIR)
-    parser.add_argument("--price-dir", type=Path, default=DEFAULT_PRICE_DIR)
-    parser.add_argument("--provider-dir", type=Path, default=DEFAULT_PROVIDER_DIR)
+    parser.add_argument("--price-dir", type=Path, required=True)
+    parser.add_argument("--provider-dir", type=Path, required=True)
     parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIR)
     parser.add_argument("--start-date", default="2014-01-02")
     parser.add_argument("--end-date", default=date.today().isoformat())

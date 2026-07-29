@@ -5,10 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
-import yaml
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_candidate_pipeline.py"
@@ -33,6 +33,114 @@ def prediction_frame(start: str, periods: int = 5, instruments: int = 6) -> tupl
 
 
 class CandidatePipelineTest(unittest.TestCase):
+    def test_model_training_command_pins_the_parent_snapshot(self):
+        module = load_module()
+        provider = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+
+        command = module._training_command(
+            config_path=Path("/tmp/candidate.yaml"),
+            experiment_name="candidate-test",
+            provider="canonical",
+            provider_uri=provider,
+        )
+
+        self.assertEqual(command[command.index("--provider-uri") + 1], str(provider))
+
+    def test_model_result_must_match_the_parent_snapshot_identity(self):
+        module = load_module()
+        expected = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+
+        module._require_provider_identity(expected, expected)
+        changed = {**expected, "snapshot_id": "native-v2-new"}
+        with self.assertRaisesRegex(RuntimeError, "different immutable provider"):
+            module._require_provider_identity(changed, expected)
+
+    def test_candidate_artifacts_are_all_validated_before_pickle_loading(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mlruns = root / "mlruns"
+            artifacts = mlruns / "123" / "safe_run" / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "pred.pkl").write_bytes(b"prediction")
+            (artifacts / "label.pkl").write_bytes(b"label")
+            info = {"experiment_id": "123", "run_id": "safe_run"}
+
+            with (
+                patch.object(
+                    module,
+                    "validate_file_store_run_artifact",
+                    side_effect=[
+                        {"artifact_sha256": "a" * 64},
+                        module.RunProvenanceError("label hash mismatch"),
+                    ],
+                ) as validate,
+                patch.object(
+                    module.pd,
+                    "read_pickle",
+                    side_effect=AssertionError("unvalidated pickle was read"),
+                ) as read_pickle,
+                self.assertRaisesRegex(RuntimeError, "label hash mismatch"),
+            ):
+                module._load_artifacts(
+                    info,
+                    mlruns_dir=mlruns,
+                    quant_data_root_path=root / "quant_data",
+                )
+
+        self.assertEqual(validate.call_count, 2)
+        read_pickle.assert_not_called()
+
+    def test_candidate_artifacts_must_match_the_batch_provider_identity(self):
+        module = load_module()
+        expected = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mlruns = root / "mlruns"
+            artifacts = mlruns / "123" / "safe_run" / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "pred.pkl").write_bytes(b"prediction")
+            (artifacts / "label.pkl").write_bytes(b"label")
+            info = {"experiment_id": "123", "run_id": "safe_run"}
+            mismatched = {**expected, "snapshot_id": "another-snapshot"}
+
+            with (
+                patch.object(
+                    module,
+                    "validate_file_store_run_artifact",
+                    side_effect=[
+                        {"provider_identity": expected, "artifact_sha256": "c" * 64},
+                        {"provider_identity": mismatched, "artifact_sha256": "d" * 64},
+                    ],
+                ),
+                patch.object(
+                    module.pd,
+                    "read_pickle",
+                    side_effect=AssertionError("cross-provider pickle was read"),
+                ) as read_pickle,
+                self.assertRaisesRegex(RuntimeError, "different immutable provider"),
+            ):
+                module._load_artifacts(
+                    info,
+                    mlruns_dir=mlruns,
+                    quant_data_root_path=root / "quant_data",
+                    expected_provider_identity=expected,
+                )
+
+        read_pickle.assert_not_called()
+
     def test_checked_in_spec_defines_five_distinct_models_and_holdout(self):
         module = load_module()
 
@@ -211,6 +319,10 @@ class CandidatePipelineTest(unittest.TestCase):
         self.assertEqual(len(report["selected_models"]), 2)
         self.assertEqual(len(report["strategy_evaluations"]), 10)
         self.assertEqual(report["selection_basis"], "selection_period_only")
+        self.assertEqual(
+            report["provider_identity"]["provider_contract"],
+            "path_only_override",
+        )
         self.assertFalse(report["experiment_notebook_appended"])
         self.assertIn("candidate", report["experiment_notebook_policy"])
         self.assertIn("不自动下单", markdown)

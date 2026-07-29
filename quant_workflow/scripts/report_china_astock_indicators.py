@@ -17,12 +17,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _paths import ashare_qfq_bars_dir  # noqa: E402
 from _paths import china_astock_root as default_china_astock_root  # noqa: E402
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import reports_root  # noqa: E402
 
 
 REQUIRED_PRICE_COLUMNS = {"date", "open", "high", "low", "close", "volume"}
-DEFAULT_INPUT_DIR = quant_data_root() / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 
@@ -119,7 +119,9 @@ def _read_prices(
         if df.empty:
             raise ValueError("No CSV rows matched the requested symbols or limit.")
         return df
-    return _read_input_dir(Path(input_dir or DEFAULT_INPUT_DIR).expanduser().resolve(), symbols, limit)
+    if input_dir is None:
+        raise ValueError("A governed V2 input directory must be resolved before reading")
+    return _read_input_dir(Path(input_dir).expanduser().resolve(), symbols, limit)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -270,6 +272,11 @@ def run_report(
     parsed_symbols = _parse_symbols(symbols)
     parsed_lookback = _as_int(lookback_days, default=120, minimum=20)
     parsed_limit = _as_int(limit, default=DEFAULT_LIMIT, minimum=1, maximum=MAX_LIMIT)
+    resolved_input_dir = (
+        Path(input_dir).expanduser().resolve()
+        if input_dir is not None
+        else (None if input_csv else ashare_qfq_bars_dir().resolve())
+    )
     unavailable_reason = ""
     try:
         indicators, project_root = _load_indicator_module(china_astock_root)
@@ -278,7 +285,12 @@ def run_report(
         project_root = Path(china_astock_root).expanduser().resolve() if china_astock_root else default_china_astock_root().expanduser().resolve()
         unavailable_reason = str(exc)
     try:
-        prices = _read_prices(input_csv=input_csv, input_dir=input_dir, symbols=parsed_symbols, limit=parsed_limit)
+        prices = _read_prices(
+            input_csv=input_csv,
+            input_dir=resolved_input_dir,
+            symbols=parsed_symbols,
+            limit=parsed_limit,
+        )
     except (FileNotFoundError, ValueError) as exc:
         if input_csv:
             raise
@@ -291,7 +303,11 @@ def run_report(
         else:
             rows = _build_rows(prices, indicators, parsed_lookback)
 
-    source = str(Path(input_csv).expanduser().resolve()) if input_csv else str(Path(input_dir or DEFAULT_INPUT_DIR).expanduser().resolve())
+    source = (
+        str(Path(input_csv).expanduser().resolve())
+        if input_csv
+        else str(resolved_input_dir)
+    )
     payload = {
         "status": "completed",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),

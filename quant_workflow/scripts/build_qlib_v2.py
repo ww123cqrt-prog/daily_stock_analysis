@@ -31,6 +31,7 @@ from _symbols import to_qlib_name  # noqa: E402
 from merge_to_qlib import convert_to_bin  # noqa: E402
 from quant_data_contract import (  # noqa: E402
     DataContractError,
+    ValidatedResolutionCache,
     atomic_write_json,
     finalize_qlib_snapshot,
     publish_qlib_snapshot,
@@ -132,7 +133,68 @@ def _validate_source_metadata(
         raise DataContractError("benchmark source evidence path is invalid")
     if not SHA256_RE.fullmatch(normalized["evidence_sha256"]):
         raise DataContractError("benchmark source evidence hash is invalid")
+    resolved_evidence = (root / evidence_path).resolve()
+    try:
+        resolved_evidence.relative_to(root.resolve())
+    except ValueError as exc:
+        raise DataContractError("benchmark source evidence path is invalid") from exc
+    if resolved_evidence.is_symlink() or not resolved_evidence.is_file():
+        raise DataContractError("benchmark source evidence is unavailable")
+    if sha256_file(resolved_evidence) != normalized["evidence_sha256"]:
+        raise DataContractError("benchmark source evidence hash mismatch")
     return normalized
+
+
+def native_benchmark_source(
+    resolved_provider: Any,
+    *,
+    root: Path,
+) -> dict[str, str]:
+    manifest_path = resolved_provider.snapshot_path / "DATASET_MANIFEST.json"
+    source = (
+        resolved_provider.manifest.get("benchmarks", {}).get("source", {})
+        if isinstance(resolved_provider.manifest.get("benchmarks"), Mapping)
+        else {}
+    )
+    origin: dict[str, str] = {}
+    if isinstance(source, Mapping):
+        if source.get("origin_provider"):
+            origin = {
+                str(key): str(value)
+                for key, value in source.items()
+                if str(key).startswith("origin_") and str(value).strip()
+            }
+        else:
+            for key in (
+                "provider",
+                "interface",
+                "source_dataset_id",
+                "source_path",
+                "source_run_id",
+                "evidence_path",
+                "evidence_sha256",
+            ):
+                value = source.get(key)
+                if value is not None and str(value).strip():
+                    origin[f"origin_{key}"] = str(value)
+    return {
+        "provider": "quant_workflow",
+        "interface": "native_v2_benchmark_copy",
+        "source_dataset_id": str(resolved_provider.dataset_id),
+        "source_path": _safe_relative(
+            resolved_provider.snapshot_path,
+            root,
+            label="native benchmark provider",
+        ),
+        "source_run_id": str(resolved_provider.manifest["snapshot_id"]),
+        "evidence_path": _safe_relative(
+            manifest_path,
+            root,
+            label="native benchmark evidence",
+        ),
+        "evidence_sha256": sha256_file(manifest_path),
+        **origin,
+    }
 
 
 def _discover_benchmark_source(
@@ -564,12 +626,14 @@ def build_qlib_v2(
     benchmark_source: Mapping[str, str] | None = None,
     benchmark_use_system_proxy: bool = False,
     publication_lock_held: bool = False,
+    validated_cache: ValidatedResolutionCache | None = None,
 ) -> Path:
     root = Path(quant_data_root).expanduser().resolve()
     qfq = resolve_dataset(
         "ashare_daily_qfq",
         quant_data_root=root,
         require_basis="qfq",
+        validated_cache=validated_cache,
     )
     run_id = (
         datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
@@ -594,33 +658,44 @@ def build_qlib_v2(
     if result != 0:
         raise DataContractError("Qlib v2 conversion failed")
     benchmark_provider_is_explicit = benchmark_provider is not None
-    benchmark_provider = (
-        Path(benchmark_provider)
-        if benchmark_provider_is_explicit
-        else root / "qlib" / "cn_data_baostock_jqdata"
-    )
-    try:
+    if benchmark_provider_is_explicit:
         benchmark_evidence = _import_benchmarks(
-            benchmark_provider,
+            Path(benchmark_provider),
             staging,
             root=root,
             upstream=upstream,
             source_metadata=benchmark_source,
         )
-    except DataContractError as exc:
-        if benchmark_provider_is_explicit:
-            raise
-        for symbol in BENCHMARK_START_DATES:
-            shutil.rmtree(
-                staging / "features" / symbol.lower(), ignore_errors=True
+    else:
+        fallback_error: DataContractError | None = None
+        try:
+            current_native = resolve_dataset(
+                "qlib_ashare_v2",
+                quant_data_root=root,
+                require_basis="qfq",
+                validated_cache=validated_cache,
             )
-        benchmark_evidence = _download_benchmark_evidence(
-            staging,
-            root=root,
-            run_id=run_id,
-            use_system_proxy=benchmark_use_system_proxy,
-            fallback_error=exc,
-        )
+            benchmark_evidence = _import_benchmarks(
+                current_native.snapshot_path,
+                staging,
+                root=root,
+                upstream=upstream,
+                source_metadata=native_benchmark_source(current_native, root=root),
+            )
+        except DataContractError as exc:
+            fallback_error = exc
+        if fallback_error is not None:
+            for symbol in BENCHMARK_START_DATES:
+                shutil.rmtree(
+                    staging / "features" / symbol.lower(), ignore_errors=True
+                )
+            benchmark_evidence = _download_benchmark_evidence(
+                staging,
+                root=root,
+                run_id=run_id,
+                use_system_proxy=benchmark_use_system_proxy,
+                fallback_error=fallback_error,
+            )
     instrument_pool_evidence = _install_instrument_pools(staging, root=root)
     finalize_qlib_snapshot(
         staging,
@@ -631,7 +706,7 @@ def build_qlib_v2(
             "interface": "v2_snapshot_to_qlib",
         },
         source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-        producer={"script": "build_qlib_v2.py", "version": "4"},
+        producer={"script": "build_qlib_v2.py", "version": "5"},
         upstream_snapshot=upstream,
         benchmark_evidence=benchmark_evidence,
         instrument_pool_evidence=instrument_pool_evidence,
@@ -645,6 +720,7 @@ def build_qlib_v2(
         quant_data_root=root,
         update_root_catalog=True,
         publication_lock_held=publication_lock_held,
+        validated_cache=validated_cache,
     )
     return published
 

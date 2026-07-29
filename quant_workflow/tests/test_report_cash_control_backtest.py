@@ -97,6 +97,73 @@ class ReportCashControlBacktestTest(unittest.TestCase):
                     run_id="../unsafe",
                 )
 
+    def test_find_portfolio_report_does_not_fall_back_to_another_run(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mlruns = root / "mlruns"
+            other = (
+                mlruns
+                / "0"
+                / "other_run"
+                / "artifacts"
+                / "portfolio_analysis"
+                / "report_normal_1day.pkl"
+            )
+            other.parent.mkdir(parents=True)
+            other.write_bytes(b"placeholder")
+            latest = root / "latest.json"
+            latest.write_text(json.dumps({"run_id": "missing_run"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing_run"):
+                module.find_portfolio_report_path(
+                    latest_training_path=latest,
+                    mlruns_dir=mlruns,
+                )
+
+    def test_cash_control_report_validates_run_artifact_provenance(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report = (
+                root
+                / "mlruns"
+                / "0"
+                / "safe_run"
+                / "artifacts"
+                / "portfolio_analysis"
+                / "report_normal_1day.pkl"
+            )
+            report.parent.mkdir(parents=True)
+            report.write_bytes(b"placeholder")
+            expected = {
+                "provider_identity": {"snapshot_id": "snapshot-001"},
+                "provider_path": str(root / "snapshot-001"),
+            }
+
+            with patch.object(
+                module,
+                "validate_file_store_run_artifact",
+                return_value=expected,
+            ) as validate:
+                provenance = module.validate_portfolio_provenance(
+                    portfolio_report_path=report,
+                    run_id="safe_run",
+                    mlruns_dir=root / "mlruns",
+                    quant_data_root_path=root / "quant_data",
+                )
+
+            self.assertEqual(provenance, expected)
+            validate.assert_called_once_with(
+                artifact_path=report,
+                artifact_relative_path=Path(
+                    "portfolio_analysis/report_normal_1day.pkl"
+                ),
+                run_id="safe_run",
+                mlruns_dir=root / "mlruns",
+                quant_data_root=root / "quant_data",
+            )
+
     def test_return_metrics_use_a_share_trading_days_and_sharpe_name(self):
         module = load_module()
         returns = pd.Series(
@@ -155,6 +222,16 @@ class ReportCashControlBacktestTest(unittest.TestCase):
                 out_dir=out_dir,
                 lookback_days=20,
                 min_symbols=2,
+                run_id="safe_run",
+                provenance={
+                    "artifact_sha256": "b" * 64,
+                    "provider_identity": {
+                        "provider_contract": "immutable_snapshot_v2",
+                        "dataset_id": "qlib_ashare_v2",
+                        "snapshot_id": "snapshot-001",
+                    },
+                    "provider_path": str(root / "snapshot-001"),
+                },
             )
 
             latest_json = out_dir / "cash_control_backtest_latest.json"
@@ -166,6 +243,13 @@ class ReportCashControlBacktestTest(unittest.TestCase):
         self.assertIn("baseline", payload["comparison"])
         self.assertIn("cash_control", payload["comparison"])
         self.assertIn("regime_counts", payload["signal_summary"])
+        self.assertEqual(payload["run_id"], "safe_run")
+        self.assertEqual(payload["artifact_sha256"], "b" * 64)
+        self.assertEqual(payload["provenance_status"], "validated")
+        self.assertEqual(
+            payload["provider_identity"]["provider_contract"],
+            "immutable_snapshot_v2",
+        )
         self.assertEqual(serialized["mode"], "read_only_cash_control_overlay")
         self.assertIn("Cash-Control Backtest", markdown)
         self.assertIn("read-only", markdown)
@@ -193,6 +277,118 @@ class ReportCashControlBacktestTest(unittest.TestCase):
         self.assertIn("missing_report_normal_1day.pkl", payload["unavailable_reason"])
         self.assertIn("Cash-Control Backtest", markdown)
         self.assertIn("read-only research report", markdown)
+
+    def test_preflight_failure_does_not_read_unvalidated_portfolio_artifact(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report_path = root / "report_normal_1day.pkl"
+            report_path.write_bytes(b"untrusted pickle")
+
+            with patch.object(
+                module,
+                "load_portfolio_returns",
+                side_effect=AssertionError("unvalidated pickle was read"),
+            ):
+                payload = module.generate_report(
+                    portfolio_report_path=report_path,
+                    market_data_dir=root / "market",
+                    out_dir=root / "reports",
+                    run_id="safe_run",
+                    preflight_unavailable_reason="provider validation failed",
+                )
+
+        self.assertEqual(payload["comparison"]["baseline"]["days"], 0)
+        self.assertEqual(payload["provenance_status"], "unavailable")
+        self.assertEqual(payload["unavailable_reason"], "provider validation failed")
+
+    def test_direct_report_call_refuses_existing_pickle_without_provenance(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report_path = root / "report_normal_1day.pkl"
+            report_path.write_bytes(b"untrusted pickle")
+
+            with patch.object(
+                module,
+                "load_portfolio_returns",
+                side_effect=AssertionError("unvalidated pickle was read"),
+            ) as load_returns:
+                payload = module.generate_report(
+                    portfolio_report_path=report_path,
+                    market_data_dir=root / "market",
+                    out_dir=root / "reports",
+                    run_id="safe_run",
+                )
+
+        self.assertEqual(payload["provenance_status"], "unavailable")
+        self.assertIn("provenance was not validated", payload["unavailable_reason"])
+        load_returns.assert_not_called()
+
+    def test_main_validates_exact_run_and_returns_nonzero_on_provenance_failure(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mlruns = root / "mlruns"
+            report = (
+                mlruns
+                / "0"
+                / "safe_run"
+                / "artifacts"
+                / "portfolio_analysis"
+                / "report_normal_1day.pkl"
+            )
+            report.parent.mkdir(parents=True)
+            report.write_bytes(b"untrusted pickle")
+            latest = root / "latest_training_result.json"
+            latest.write_text(json.dumps({"run_id": "safe_run"}), encoding="utf-8")
+            out_dir = root / "reports"
+
+            with (
+                patch.object(
+                    module.sys,
+                    "argv",
+                    [
+                        "report_cash_control_backtest.py",
+                        "--latest-training",
+                        str(latest),
+                        "--mlruns-dir",
+                        str(mlruns),
+                        "--market-data-dir",
+                        str(root / "market"),
+                        "--out-dir",
+                        str(out_dir),
+                    ],
+                ),
+                patch.object(
+                    module,
+                    "validate_portfolio_provenance",
+                    side_effect=ValueError("provider validation failed"),
+                ) as validate,
+                patch.object(
+                    module,
+                    "load_portfolio_returns",
+                    side_effect=AssertionError("unvalidated pickle was read"),
+                ),
+            ):
+                exit_code = module.main()
+
+            payload = json.loads(
+                (out_dir / "cash_control_backtest_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 1)
+        validate.assert_called_once_with(
+            portfolio_report_path=report,
+            run_id="safe_run",
+            mlruns_dir=mlruns,
+            quant_data_root_path=module.QUANT_DATA.resolve(),
+        )
+        self.assertEqual(payload["run_id"], "safe_run")
+        self.assertEqual(payload["provenance_status"], "unavailable")
+        self.assertIn("provider validation failed", payload["unavailable_reason"])
 
 
 if __name__ == "__main__":

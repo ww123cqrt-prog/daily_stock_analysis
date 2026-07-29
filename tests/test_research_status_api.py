@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,9 +19,280 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from quant_workflow.scripts.quant_data_contract import (
+    atomic_write_json,
+    finalize_qlib_snapshot,
+)
 
 
 class ResearchStatusApiTestCase(unittest.TestCase):
+    def _write_native_qlib_fixture(
+        self,
+        data_root: Path,
+        *,
+        snapshot_id: str = "native-v2",
+        dataset_id: str = "qlib_ashare_v2",
+        dataset_root: Path = Path("qlib/cn_data_ashare_v2"),
+        dependency_snapshots: list[dict[str, str]] | None = None,
+    ) -> Path:
+        provider = data_root / dataset_root / "snapshots" / snapshot_id
+        (provider / "calendars").mkdir(parents=True)
+        (provider / "instruments").mkdir(parents=True)
+        (provider / "features" / "sh600000").mkdir(parents=True)
+        (provider / "calendars" / "day.txt").write_text(
+            "2026-07-23\n2026-07-24\n", encoding="utf-8"
+        )
+        (provider / "instruments" / "all.txt").write_text(
+            "SH600000\t2026-07-23\t2026-07-24\n", encoding="utf-8"
+        )
+        (provider / "features" / "sh600000" / "close.day.bin").write_bytes(
+            b"feature-bytes"
+        )
+        upstream_snapshot = {
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-source-001",
+            "content_sha256": "a" * 64,
+            "price_basis": "qfq",
+        }
+        atomic_write_json(
+            provider / "PROVIDER_MANIFEST.json",
+            {
+                "schema_version": 2,
+                "status": "ready",
+                "source_snapshot": upstream_snapshot,
+            },
+        )
+        finalize_qlib_snapshot(
+            provider,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            source={
+                "provider": "quant_workflow",
+                "interface": "v2_snapshot_to_qlib",
+            },
+            source_retrieved_at="2026-07-28T18:42:05+08:00",
+            producer={"script": "build_qlib_v2.py", "version": "2"},
+            upstream_snapshot=upstream_snapshot,
+            dependency_snapshots=dependency_snapshots,
+        )
+        dataset_manifest_path = provider / "DATASET_MANIFEST.json"
+        dataset_manifest_bytes = dataset_manifest_path.read_bytes()
+        dataset_manifest = json.loads(dataset_manifest_bytes.decode("utf-8"))
+        manifest_sha256 = hashlib.sha256(dataset_manifest_bytes).hexdigest()
+        data_root.mkdir(parents=True, exist_ok=True)
+        catalog_path = data_root / "DATA_MANIFEST.json"
+        catalog = (
+            json.loads(catalog_path.read_text(encoding="utf-8"))
+            if catalog_path.is_file()
+            else {
+                "schema_version": 2,
+                "path_format": "relative_to_quant_data_root",
+                "datasets": {},
+            }
+        )
+        catalog.setdefault("schema_version", 2)
+        catalog.setdefault("path_format", "relative_to_quant_data_root")
+        catalog.setdefault("datasets", {}).setdefault(
+            "ashare_daily_qfq",
+            {
+                "dataset_id": "ashare_daily_qfq",
+                "role": "canonical",
+                "status": "ready",
+                "price_basis": upstream_snapshot["price_basis"],
+                "snapshot_id": upstream_snapshot["snapshot_id"],
+                "content_sha256": upstream_snapshot["content_sha256"],
+            },
+        )
+        catalog.setdefault("datasets", {})[dataset_id] = {
+            "dataset_id": dataset_id,
+            "dataset_root": dataset_root.as_posix(),
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "content_sha256": dataset_manifest["content_sha256"],
+            "snapshot_id": snapshot_id,
+            "snapshot_manifest_sha256": manifest_sha256,
+            "latest_pointer": (dataset_root / "LATEST.json").as_posix(),
+            "upstream_snapshots": [upstream_snapshot],
+            "dependency_snapshots": dependency_snapshots or [],
+        }
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        latest_pointer = data_root / dataset_root / "LATEST.json"
+        latest_pointer.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "dataset_id": dataset_id,
+                    "snapshot_id": snapshot_id,
+                    "manifest_sha256": manifest_sha256,
+                    "snapshot_path": (dataset_root / "snapshots" / snapshot_id).as_posix(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return provider
+
+    def test_status_rejects_root_catalog_without_v2_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            catalog_path = data_root / "DATA_MANIFEST.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog.pop("schema_version")
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertIn("根清单", payload["qlib_provider"]["provider_error"])
+
+    def test_status_rejects_latest_pointer_without_v2_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            pointer_path = data_root / "qlib" / "cn_data_ashare_v2" / "LATEST.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer.pop("schema_version")
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertIn("LATEST", payload["qlib_provider"]["provider_error"])
+
+    def test_saved_cleaned_v2_result_is_current_against_cleaned_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            canonical = self._write_native_qlib_fixture(data_root)
+            canonical_manifest = json.loads(
+                (canonical / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+            )
+            canonical_identity = {
+                field: str(canonical_manifest[field])
+                for field in (
+                    "dataset_id",
+                    "snapshot_id",
+                    "content_sha256",
+                    "price_basis",
+                )
+            }
+            cleaned = self._write_native_qlib_fixture(
+                data_root,
+                snapshot_id="cleaned-v2",
+                dataset_id="qlib_ashare_cleaned_v2",
+                dataset_root=Path("qlib/cn_data_ashare_cleaned_v2"),
+                dependency_snapshots=[canonical_identity],
+            )
+            manifest_bytes = (cleaned / "DATASET_MANIFEST.json").read_bytes()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            (reports_dir / "latest_training_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "provider": "cleaned",
+                        "provider_uri": str(cleaned),
+                        "provider_identity": {
+                            "provider_contract": "immutable_snapshot_v2",
+                            "dataset_id": "qlib_ashare_cleaned_v2",
+                            "snapshot_id": "cleaned-v2",
+                            "content_sha256": manifest["content_sha256"],
+                            "manifest_sha256": hashlib.sha256(
+                                manifest_bytes
+                            ).hexdigest(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = self._build_status_for_roots(reports_dir, data_root)
+
+        self.assertTrue(payload["latest_training"]["provider_current"])
+        self.assertEqual(
+            payload["latest_training"]["provider_status"],
+            "current_native_v2",
+        )
+        self.assertTrue(payload["latest_training_provider"]["provider_current"])
+        self.assertEqual(
+            payload["qlib_provider"]["dataset_id"],
+            "qlib_ashare_v2",
+        )
+        self.assertEqual(
+            Path(payload["qlib_provider"]["path"]).resolve(),
+            canonical.resolve(),
+        )
+        self.assertEqual(
+            payload["latest_training_provider"]["dataset_id"],
+            "qlib_ashare_cleaned_v2",
+        )
+        self.assertEqual(
+            Path(payload["latest_training_provider"]["path"]).resolve(),
+            cleaned.resolve(),
+        )
+
+    def test_incomplete_saved_identity_is_never_current_native_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            manifest_bytes = (provider / "DATASET_MANIFEST.json").read_bytes()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            (reports_dir / "latest_training_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "provider_uri": str(provider),
+                        "provider_identity": {
+                            "dataset_id": manifest["dataset_id"],
+                            "snapshot_id": manifest["snapshot_id"],
+                            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = self._build_status_for_roots(reports_dir, data_root)
+
+        self.assertFalse(payload["latest_training"]["provider_current"])
+        self.assertEqual(payload["latest_training"]["provider_status"], "unknown")
+
+    def _build_status_for_roots(
+        self, reports_dir: Path, data_root: Path
+    ) -> dict[str, object]:
+        from api.v1.endpoints.research_status import build_research_status_payload
+
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        status_path = reports_dir / "research_status_latest.json"
+        if not status_path.exists():
+            status_path.write_text("{}", encoding="utf-8")
+        with (
+            patch(
+                "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                status_path,
+            ),
+            patch(
+                "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                reports_dir,
+            ),
+            patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                data_root,
+            ),
+            patch(
+                "api.v1.endpoints.research_status.QLIB_PROVIDER_ROOT",
+                data_root / "qlib",
+            ),
+        ):
+            return build_research_status_payload()
+
     def test_robust_signal_status_exposes_bounded_sanitized_matrices(self) -> None:
         from api.v1.endpoints.research_status import _robust_signal_payload
 
@@ -1213,7 +1486,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             fake_msvcrt.calls, [(FakeMsvcrt.LK_LOCK, 1), (FakeMsvcrt.LK_UNLCK, 1)]
         )
 
-    def test_status_prefers_latest_training_result_over_stale_status_snapshot(
+    def test_status_keeps_data_entry_separate_from_latest_training_provider(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1292,12 +1565,433 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["latest_training"]["run_id"], "new-cleaned-run")
         self.assertEqual(body["latest_training"]["provider"], "cleaned")
-        self.assertEqual(body["qlib_provider"]["path"], str(cleaned_provider))
+        self.assertEqual(body["qlib_provider"]["path"], "/tmp/stale-cn-data")
         self.assertEqual(
-            body["qlib_provider"]["calendar_range"], "2008-01-02 ~ 2026-07-03"
+            body["latest_training_provider"]["path"], str(cleaned_provider)
         )
-        self.assertEqual(body["qlib_provider"]["calendar_days"], 2)
-        self.assertEqual(body["qlib_provider"]["instruments"], 2)
+        self.assertEqual(
+            body["latest_training_provider"]["calendar_range"],
+            "2008-01-02 ~ 2026-07-03",
+        )
+        self.assertEqual(body["latest_training_provider"]["calendar_days"], 2)
+        self.assertEqual(body["latest_training_provider"]["instruments"], 2)
+        self.assertFalse(body["latest_training_provider"]["provider_current"])
+
+    def test_status_does_not_present_legacy_training_provider_as_current_native_v2(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            legacy_provider = data_root / "qlib" / "cn_data_baostock_jqdata"
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-26T19:10:50+08:00",
+                        "qlib_provider": {"path": str(legacy_provider)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (reports_dir / "latest_training_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "run_id": "legacy-run",
+                        "provider": "canonical",
+                        "provider_uri": str(legacy_provider),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (reports_dir / "candidate_pipeline_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "provider_uri": str(legacy_provider),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QLIB_PROVIDER_ROOT",
+                    data_root / "qlib",
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertEqual(
+            Path(payload["qlib_provider"]["path"]).resolve(), provider.resolve()
+        )
+        self.assertEqual(payload["qlib_provider"]["dataset_id"], "qlib_ashare_v2")
+        self.assertEqual(payload["qlib_provider"]["provider_source"], "native_v2_catalog")
+        self.assertFalse(payload["qlib_provider"]["latest_training_provider_current"])
+        self.assertEqual(payload["latest_training"]["provider_status"], "stale")
+        self.assertFalse(payload["latest_training"]["provider_current"])
+        self.assertEqual(payload["candidate_pipeline"]["provider_status"], "stale")
+        self.assertFalse(payload["candidate_pipeline"]["provider_current"])
+        self.assertIn("历史结果", payload["qlib_provider"]["provider_uri_warning"])
+
+    def test_status_fails_closed_when_native_v2_catalog_hash_is_invalid(self) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            manifest_path = data_root / "DATA_MANIFEST.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["datasets"]["qlib_ashare_v2"][
+                "snapshot_manifest_sha256"
+            ] = "broken-hash"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            legacy_provider = data_root / "qlib" / "cn_data_baostock_jqdata"
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps({"qlib_provider": {"path": str(legacy_provider)}}),
+                encoding="utf-8",
+            )
+            for filename in (
+                "latest_training_result.json",
+                "candidate_pipeline_latest.json",
+            ):
+                (reports_dir / filename).write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "provider_uri": str(legacy_provider),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QLIB_PROVIDER_ROOT",
+                    data_root / "qlib",
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertEqual(
+            payload["qlib_provider"]["provider_source"],
+            "native_v2_catalog",
+        )
+        self.assertNotEqual(payload["qlib_provider"].get("path"), str(legacy_provider))
+        self.assertEqual(
+            payload["latest_training"]["provider_status"], "catalog_invalid"
+        )
+        self.assertFalse(payload["latest_training"]["provider_current"])
+        self.assertEqual(
+            payload["candidate_pipeline"]["provider_status"], "catalog_invalid"
+        )
+        self.assertFalse(payload["candidate_pipeline"]["provider_current"])
+
+    def test_status_fails_closed_when_catalog_content_hash_disagrees_with_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            manifest_path = data_root / "DATA_MANIFEST.json"
+            catalog = json.loads(manifest_path.read_text(encoding="utf-8"))
+            catalog["datasets"]["qlib_ashare_v2"]["content_sha256"] = "b" * 64
+            manifest_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+        self.assertIn("内容哈希", payload["qlib_provider"]["provider_error"])
+
+    def test_status_describes_the_historical_snapshot_used_by_latest_training(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            historical = self._write_native_qlib_fixture(
+                data_root,
+                snapshot_id="qlib-native-historical",
+            )
+            historical_manifest_bytes = (
+                historical / "DATASET_MANIFEST.json"
+            ).read_bytes()
+            historical_manifest = json.loads(historical_manifest_bytes.decode("utf-8"))
+            current = self._write_native_qlib_fixture(
+                data_root,
+                snapshot_id="qlib-native-current",
+            )
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            (reports_dir / "latest_training_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "run_id": "historical-run",
+                        "provider_identity": {
+                            "provider_contract": "immutable_snapshot_v2",
+                            "dataset_id": "qlib_ashare_v2",
+                            "snapshot_id": historical.name,
+                            "content_sha256": historical_manifest["content_sha256"],
+                            "manifest_sha256": hashlib.sha256(
+                                historical_manifest_bytes
+                            ).hexdigest(),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = self._build_status_for_roots(reports_dir, data_root)
+
+        self.assertEqual(Path(payload["qlib_provider"]["path"]).resolve(), current.resolve())
+        self.assertFalse(payload["latest_training"]["provider_current"])
+        self.assertEqual(payload["latest_training"]["provider_status"], "stale")
+        self.assertEqual(
+            Path(payload["latest_training_provider"]["path"]).resolve(),
+            historical.resolve(),
+        )
+        self.assertEqual(
+            payload["latest_training_provider"]["snapshot_id"], historical.name
+        )
+        self.assertTrue(payload["latest_training_provider"]["provider_trusted"])
+        self.assertFalse(payload["latest_training_provider"]["provider_current"])
+
+    def test_status_rejects_native_pointer_to_legacy_dataset_root(self) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            legacy_provider = data_root / "qlib" / "cn_data_baostock_jqdata"
+            (legacy_provider / "calendars").mkdir(parents=True)
+            (legacy_provider / "instruments").mkdir(parents=True)
+            (legacy_provider / "features" / "SH600000").mkdir(parents=True)
+            pointer_path = data_root / "qlib" / "cn_data_ashare_v2" / "LATEST.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer["snapshot_path"] = "qlib/cn_data_baostock_jqdata"
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps({"qlib_provider": {"path": str(legacy_provider)}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QLIB_PROVIDER_ROOT",
+                    data_root / "qlib",
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertNotEqual(payload["qlib_provider"].get("path"), str(legacy_provider))
+        self.assertIn("V2", payload["qlib_provider"]["provider_error"])
+
+    def test_status_blocks_native_snapshot_when_an_indexed_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            (provider / "features" / "sh600000" / "close.day.bin").unlink()
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+
+    def test_status_blocks_same_size_native_feature_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            feature = provider / "features" / "sh600000" / "close.day.bin"
+            self.assertEqual(len(feature.read_bytes()), len(b"tampered-data"))
+            feature.write_bytes(b"tampered-data")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+
+    def test_status_blocks_native_snapshot_with_a_symlinked_child_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            outside_features = root / "outside-features"
+            shutil.copytree(provider / "features", outside_features)
+            shutil.rmtree(provider / "features")
+            try:
+                (provider / "features").symlink_to(
+                    outside_features, target_is_directory=True
+                )
+            except OSError as exc:  # pragma: no cover - platform privilege fallback.
+                self.skipTest(f"symlink unavailable: {exc}")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+
+    def test_path_alias_without_frozen_identity_is_not_current_native_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            alias = data_root / "qlib" / "legacy-provider-alias"
+            try:
+                alias.symlink_to(provider, target_is_directory=True)
+            except OSError as exc:  # pragma: no cover - platform privilege fallback.
+                self.skipTest(f"symlink unavailable: {exc}")
+            reports_dir.mkdir()
+            for filename in (
+                "latest_training_result.json",
+                "candidate_pipeline_latest.json",
+            ):
+                (reports_dir / filename).write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "provider_uri": str(alias),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            payload = self._build_status_for_roots(reports_dir, data_root)
+
+        self.assertFalse(payload["latest_training"]["provider_current"])
+        self.assertEqual(payload["latest_training"]["provider_status"], "unknown")
+        self.assertFalse(payload["candidate_pipeline"]["provider_current"])
+        self.assertEqual(payload["candidate_pipeline"]["provider_status"], "unknown")
+
+    def test_status_blocks_invalid_utf8_native_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
+            (data_root / "DATA_MANIFEST.json").write_bytes(b"\xff\xfe\x00")
+
+            payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+
+    def test_status_blocks_manifest_swapped_between_hash_and_json_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            provider = self._write_native_qlib_fixture(data_root)
+            dataset_manifest_path = provider / "DATASET_MANIFEST.json"
+            original_read_bytes = Path.read_bytes
+            swapped = False
+
+            def swapping_read_bytes(path: Path) -> bytes:
+                nonlocal swapped
+                content = original_read_bytes(path)
+                if path.resolve() == dataset_manifest_path.resolve() and not swapped:
+                    swapped = True
+                    manifest = json.loads(content.decode("utf-8"))
+                    manifest["producer"]["version"] = "tampered"
+                    path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                return content
+
+            with patch.object(Path, "read_bytes", new=swapping_read_bytes):
+                payload = self._build_status_for_roots(root / "reports", data_root)
+
+        self.assertTrue(swapped)
+        self.assertEqual(payload["qlib_provider"]["status"], "blocked")
+        self.assertFalse(payload["trainable"])
+
+    def test_native_snapshot_full_hash_validation_is_reused_until_ttl(self) -> None:
+        from api.v1.endpoints import research_status
+
+        research_status._clear_native_qlib_validation_cache()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                data_root = root / "quant_data"
+                self._write_native_qlib_fixture(data_root)
+                real_validator = research_status.validate_qlib_snapshot
+
+                with patch.object(
+                    research_status,
+                    "validate_qlib_snapshot",
+                    wraps=real_validator,
+                ) as validator:
+                    with patch.object(research_status.time, "monotonic", return_value=0.0):
+                        first = self._build_status_for_roots(root / "reports", data_root)
+                    with patch.object(research_status.time, "monotonic", return_value=10.0):
+                        cached = self._build_status_for_roots(root / "reports", data_root)
+                    with patch.object(research_status.time, "monotonic", return_value=61.0):
+                        refreshed = self._build_status_for_roots(root / "reports", data_root)
+
+            self.assertEqual(first["qlib_provider"]["status"], "ready")
+            self.assertEqual(cached["qlib_provider"]["status"], "ready")
+            self.assertEqual(refreshed["qlib_provider"]["status"], "ready")
+            self.assertEqual(validator.call_count, 2)
+        finally:
+            research_status._clear_native_qlib_validation_cache()
 
     def test_directory_size_cache_avoids_repeated_provider_scans_until_ttl(
         self,

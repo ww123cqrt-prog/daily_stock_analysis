@@ -36,8 +36,8 @@ MERGED_DIR: Path | None = None
 CLEANED_MERGED_DIR = (
     QUANT_DATA / "parquet" / "ashare_1d" / "merged_baostock_jqdata_cleaned"
 )
-CANONICAL_QLIB_DIR = qlib_provider_uri()
-CLEANED_QLIB_DIR = qlib_provider_uri("cleaned")
+CANONICAL_QLIB_DIR: Path | None = None
+CLEANED_QLIB_DIR: Path | None = None
 REPORT_DIR = reports_root()
 ANOMALY_STOCKS_CSV = REPORT_DIR / "data_anomaly_stocks_latest.csv"
 ANOMALY_EVENTS_CSV = REPORT_DIR / "data_anomaly_events_latest.csv"
@@ -403,6 +403,23 @@ def copy_benchmark_features(source_provider: Path, target_provider: Path, symbol
     return copied
 
 
+def require_mutable_qlib_output(path: Path) -> Path:
+    candidate = Path(path).expanduser()
+    if (candidate / "LATEST.json").exists() or (candidate / "snapshots").is_dir():
+        raise ValueError(
+            "refusing to overwrite an immutable V2 dataset root; use "
+            "build_cleaned_qlib_v2.py --publish"
+        )
+    if candidate.parent.name == "snapshots" or (
+        candidate / "DATASET_MANIFEST.json"
+    ).exists():
+        raise ValueError(
+            "refusing to overwrite an immutable V2 snapshot; use "
+            "build_cleaned_qlib_v2.py --publish"
+        )
+    return candidate
+
+
 def convert_cleaned_to_qlib(
     cleaned_parquet_dir: Path,
     cleaned_qlib_dir: Path,
@@ -410,6 +427,7 @@ def convert_cleaned_to_qlib(
     canonical_provider: Path,
     overwrite: bool,
 ) -> int:
+    cleaned_qlib_dir = require_mutable_qlib_output(cleaned_qlib_dir)
     calendar_path = Path(canonical_provider) / "calendars" / "day.txt"
     if not calendar_path.is_file():
         raise ValueError(f"Canonical Qlib calendar is unavailable: {calendar_path}")
@@ -501,9 +519,17 @@ def main() -> int:
     )
     parser.add_argument("--stocks-csv", type=Path, default=ANOMALY_STOCKS_CSV)
     parser.add_argument("--events-csv", type=Path, default=ANOMALY_EVENTS_CSV)
-    parser.add_argument("--cleaned-merged-dir", type=Path, default=CLEANED_MERGED_DIR)
-    parser.add_argument("--qlib-dir", type=Path, default=CLEANED_QLIB_DIR)
-    parser.add_argument("--benchmark-provider-dir", type=Path, default=CANONICAL_QLIB_DIR)
+    parser.add_argument("--cleaned-merged-dir", type=Path, default=None)
+    parser.add_argument(
+        "--qlib-dir",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--benchmark-provider-dir",
+        type=Path,
+        default=CANONICAL_QLIB_DIR or qlib_provider_uri(),
+    )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--no-overwrite", action="store_true")
     parser.add_argument("--skip-qlib-convert", action="store_true")
@@ -514,7 +540,22 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if not args.dry_run and args.cleaned_merged_dir is None:
+        parser.error(
+            "--cleaned-merged-dir is required for mutable legacy output; "
+            "use build_cleaned_qlib_v2.py --publish for native V2"
+        )
+    if not args.dry_run and not args.skip_qlib_convert and args.qlib_dir is None:
+        parser.error(
+            "--qlib-dir is required for mutable legacy output; "
+            "use build_cleaned_qlib_v2.py --publish for native V2"
+        )
+
     overwrite = not args.no_overwrite
+    cleaned_merged_dir = args.cleaned_merged_dir or (
+        QUANT_DATA / "staging" / "cleaning-dry-run"
+    )
+    qlib_dir = args.qlib_dir or Path("not-generated")
     print("Loading anomaly cleaning plan...")
     plan = load_cleaning_plan(args.stocks_csv, args.events_csv)
     print(f"  excluded symbols: {len(plan.excluded_symbols)}")
@@ -523,7 +564,11 @@ def main() -> int:
 
     print("Building cleaned merged parquet...")
     summary = build_cleaned_parquet(
-        args.merged_dir, args.cleaned_merged_dir, plan, overwrite, dry_run=args.dry_run
+        args.merged_dir,
+        cleaned_merged_dir,
+        plan,
+        overwrite,
+        dry_run=args.dry_run,
     )
 
     qlib_return_code: int | None = None
@@ -532,18 +577,22 @@ def main() -> int:
     elif not args.skip_qlib_convert:
         print("Converting cleaned parquet to Qlib bin...")
         qlib_return_code = convert_cleaned_to_qlib(
-            args.cleaned_merged_dir,
-            args.qlib_dir,
-            canonical_provider=CANONICAL_QLIB_DIR,
+            cleaned_merged_dir,
+            qlib_dir,
+            canonical_provider=args.benchmark_provider_dir,
             overwrite=overwrite,
         )
         if qlib_return_code == 0:
-            copied = copy_benchmark_features(args.benchmark_provider_dir, args.qlib_dir, BENCHMARK_SYMBOLS)
+            copied = copy_benchmark_features(
+                args.benchmark_provider_dir,
+                qlib_dir,
+                BENCHMARK_SYMBOLS,
+            )
             print(f"Copied benchmark feature directories: {', '.join(copied) if copied else 'none'}")
 
     reports = write_reports(
         summary=summary,
-        qlib_dir=args.qlib_dir,
+        qlib_dir=qlib_dir,
         qlib_return_code=qlib_return_code,
         out_dir=args.out_dir,
     )

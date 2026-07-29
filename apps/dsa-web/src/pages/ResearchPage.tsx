@@ -43,6 +43,7 @@ import type {
 import { AppPage, Badge, Button, Card, ConfirmDialog, PageHeader, StatusDot } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
+import { providerStatusNotice } from '../utils/providerStatus';
 
 type StatusTone = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
 type BadgeVariant = 'default' | 'success' | 'warning' | 'danger' | 'info' | 'history';
@@ -205,6 +206,9 @@ const RESEARCH_TEXT = {
     notTrainable: '暂不可训练',
     generatedAt: '生成时间',
     qlibProviderTitle: 'Qlib 数据集',
+    qlibNativeV2Label: '当前正式入口：原生 V2',
+    qlibNativeV2BlockedLabel: '原生 V2 已阻断',
+    qlibNativeV2BlockedFallback: '原生 V2 数据清单未通过校验，当前不能训练。',
     latestTrainingTitle: '最近训练结果',
     noTrainingResult: '还没有训练结果',
     experimentNotebookTitle: '实验记录本',
@@ -244,7 +248,7 @@ const RESEARCH_TEXT = {
     developmentActionLabel: '下一步动作',
     developmentVerificationLabel: '验收口径',
     experimentComparisonTitle: '清洗对比',
-    experimentComparisonDescription: '同一 baseline 在原生 V2 数据和旧版清洗数据上的核心回测指标。',
+    experimentComparisonDescription: '同一 baseline 在原生 canonical V2 和原生 cleaned V2 上的核心回测指标。',
     cleanedDataLabel: '清洗后数据',
     canonicalDataLabel: '原生 V2 数据',
     comparisonMetricLabel: '扣成本年化超额收益',
@@ -464,6 +468,9 @@ const RESEARCH_TEXT = {
     notTrainable: 'Not trainable yet',
     generatedAt: 'Generated',
     qlibProviderTitle: 'Qlib Provider',
+    qlibNativeV2Label: 'Current official entry: Native V2',
+    qlibNativeV2BlockedLabel: 'Native V2 blocked',
+    qlibNativeV2BlockedFallback: 'The native V2 data catalog failed validation, so training is blocked.',
     latestTrainingTitle: 'Latest Training Result',
     noTrainingResult: 'No training result yet',
     experimentNotebookTitle: 'Experiment Notebook',
@@ -503,7 +510,7 @@ const RESEARCH_TEXT = {
     developmentActionLabel: 'Next action',
     developmentVerificationLabel: 'Verification',
     experimentComparisonTitle: 'Cleaned vs Canonical',
-    experimentComparisonDescription: 'Core backtest metric for the same baseline on native V2 data versus legacy cleaned data.',
+    experimentComparisonDescription: 'Core backtest metric for the same baseline on native canonical V2 versus native cleaned V2.',
     cleanedDataLabel: 'Cleaned data',
     canonicalDataLabel: 'Native V2 data',
     comparisonMetricLabel: 'Annualized excess return with cost',
@@ -1015,6 +1022,11 @@ const ResearchPage: React.FC = () => {
   const experimentRuns = experimentNotebook?.runs ?? [];
   const experimentComparison = buildExperimentComparison(experimentRuns);
   const experimentRunCount = experimentNotebook?.totalRuns ?? experimentRuns.length;
+  const latestTrainingProviderNotice = providerStatusNotice(
+    researchStatus?.latestTraining,
+    'training',
+    language,
+  );
   const mlflowUrl = resolveMlflowUiUrl(researchStatus?.mlflow?.url || DEFAULT_MLFLOW_URL);
   const mlflowStatus = researchStatus?.mlflow?.status || 'linked';
   const mlflowStatusMeta = dataStatusMeta(mlflowStatus);
@@ -1207,6 +1219,18 @@ const ResearchPage: React.FC = () => {
 
             <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
               <h3 className="text-sm font-semibold text-foreground">{text.qlibProviderTitle}</h3>
+              {researchStatus?.qlibProvider?.providerSource === 'native_v2_catalog'
+              && researchStatus.qlibProvider.status === 'ready' ? (
+                <Badge variant="success" size="sm" className="mt-2 w-fit">
+                  {text.qlibNativeV2Label}
+                </Badge>
+              ) : null}
+              {researchStatus?.qlibProvider?.providerSource === 'native_v2_catalog'
+              && researchStatus.qlibProvider.status === 'blocked' ? (
+                <Badge variant="warning" size="sm" className="mt-2 w-fit">
+                  {text.qlibNativeV2BlockedLabel}
+                </Badge>
+              ) : null}
               <dl className="mt-3 space-y-2 text-xs text-secondary-text">
                 <div className="flex justify-between gap-3">
                   <dt>{text.instrumentsLabel}</dt>
@@ -1218,6 +1242,13 @@ const ResearchPage: React.FC = () => {
                 </div>
                 <div className="leading-5">{researchStatus?.qlibProvider?.calendarRange ?? '-'}</div>
               </dl>
+              {researchStatus?.qlibProvider?.status === 'blocked' ? (
+                <p className="mt-3 rounded-lg border border-warning/30 bg-warning/10 p-2 text-xs leading-5 text-warning">
+                  {language === 'zh'
+                    ? (researchStatus.qlibProvider.providerError ?? text.qlibNativeV2BlockedFallback)
+                    : text.qlibNativeV2BlockedFallback}
+                </p>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
@@ -1237,6 +1268,11 @@ const ResearchPage: React.FC = () => {
                       </Badge>
                     ))}
                   </div>
+                  {latestTrainingProviderNotice ? (
+                    <p className="rounded-lg border border-warning/30 bg-warning/10 p-2 leading-5 text-warning">
+                      {latestTrainingProviderNotice.message}
+                    </p>
+                  ) : null}
                 </div>
               ) : (
                 <p className="mt-3 text-xs leading-5 text-secondary-text">{text.noTrainingResult}</p>

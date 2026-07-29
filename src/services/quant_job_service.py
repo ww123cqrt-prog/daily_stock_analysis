@@ -70,6 +70,7 @@ CHILD_ENV_EXACT_NAMES = {
     "PYTHONPATH",
     "PYTHONUNBUFFERED",
     "QLIB_CLEANED_PROVIDER_URI",
+    "QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI",
     "QLIB_COMPATIBILITY_PROVIDER_URI",
     "QLIB_PROVIDER_ROOT",
     "QLIB_PROVIDER_URI",
@@ -750,8 +751,8 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         return command
 
     def merge_to_qlib(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("merge_to_qlib.py")
         if _as_bool(params.get("smoke")):
+            command = _script_command("merge_to_qlib.py")
             command.extend(
                 [
                     "--smoke-fixture",
@@ -759,16 +760,19 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                     str(REPORTS_ROOT / "smoke" / "merge_to_qlib"),
                 ]
             )
-        _append_flag(command, params, "no_overwrite", "--no-overwrite")
-        return command
+            _append_flag(command, params, "no_overwrite", "--no-overwrite")
+            return command
+        if _as_bool(params.get("no_overwrite")):
+            raise ValueError("no_overwrite is only supported by the isolated smoke fixture")
+        return _script_command("build_qlib_v2.py") + ["--publish"]
 
     def apply_data_cleaning(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("apply_data_cleaning.py")
-        _append_reports_out_dir(command)
-        _append_flag(command, params, "dry_run", "--dry-run")
-        _append_flag(command, params, "no_overwrite", "--no-overwrite")
-        _append_flag(command, params, "skip_qlib_convert", "--skip-qlib-convert")
-        return command
+        if _as_bool(params.get("dry_run")):
+            command = _script_command("apply_data_cleaning.py")
+            _append_reports_out_dir(command)
+            command.append("--dry-run")
+            return command
+        return _script_command("build_cleaned_qlib_v2.py") + ["--publish"]
 
     def repair_qlib_provider(_params: Mapping[str, Any]) -> List[str]:
         return _script_command("repair_qlib_provider.py") + ["--dry-run"]
@@ -1217,14 +1221,14 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
         "merge_to_qlib": {
-            "label": "合并并转换为 Qlib",
+            "label": "构建并发布原生 Qlib V2",
             "command": merge_to_qlib,
             "allowed_params": {"no_overwrite", "smoke"},
         },
         "apply_data_cleaning": {
-            "label": "应用清洗策略生成 cleaned Qlib",
+            "label": "构建原生 cleaned Qlib V2 快照",
             "command": apply_data_cleaning,
-            "allowed_params": {"dry_run", "no_overwrite", "skip_qlib_convert"},
+            "allowed_params": {"dry_run"},
             "artifact_patterns": [
                 str(REPORTS_ROOT / "data_cleaning_applied_latest.json"),
                 str(REPORTS_ROOT / "data_cleaning_applied_latest.md"),
@@ -1233,7 +1237,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "repair_qlib_provider": {
-            "label": "预演修复 Qlib Provider",
+            "label": "预演旧兼容 Qlib 修复",
             "command": repair_qlib_provider,
             "allowed_params": set(),
         },
@@ -1243,12 +1247,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "allowed_params": set(),
         },
         "generate_csi300": {
-            "label": "预演生成 CSI300 股票池",
+            "label": "预演旧兼容 CSI300 股票池",
             "command": generate_csi300,
             "allowed_params": set(),
         },
         "add_index_benchmark": {
-            "label": "预演添加沪深300 benchmark",
+            "label": "预演旧兼容 benchmark",
             "command": add_index_benchmark,
             "allowed_params": set(),
         },

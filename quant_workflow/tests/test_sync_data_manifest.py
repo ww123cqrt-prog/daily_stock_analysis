@@ -286,6 +286,25 @@ def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
 
 
 class SyncDataManifestTest(unittest.TestCase):
+    def test_known_native_cleaned_pointer_resolves_stable_dataset_id(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            quant_data = Path(tmp) / "quant_data"
+            pointer = (
+                quant_data
+                / "qlib"
+                / "cn_data_ashare_cleaned_v2"
+                / "LATEST.json"
+            )
+
+            dataset_id = module._dataset_id_for_pointer(
+                pointer,
+                quant_data=quant_data,
+                existing_datasets={},
+            )
+
+        self.assertEqual(dataset_id, "qlib_ashare_cleaned_v2")
+
     def test_blocked_pointer_replaces_stale_blocker_codes(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -790,6 +809,58 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(qlib["blocker_codes"], ["upstream_snapshot_mismatch"])
         self.assertEqual(qlib["current_upstream_snapshot_id"], "qfq-current")
 
+    def test_cleaned_qlib_is_stale_when_canonical_dependency_changes(self):
+        module = load_module()
+        cleaned = {
+            "dataset_id": "qlib_ashare_cleaned_v2",
+            "data_kind": "qlib_provider",
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "upstream_snapshots": [
+                {
+                    "dataset_id": "ashare_daily_qfq",
+                    "snapshot_id": "qfq-current",
+                    "content_sha256": "a" * 64,
+                    "price_basis": "qfq",
+                }
+            ],
+            "dependency_snapshots": [
+                {
+                    "dataset_id": "qlib_ashare_v2",
+                    "snapshot_id": "canonical-old",
+                    "content_sha256": "b" * 64,
+                    "price_basis": "qfq",
+                }
+            ],
+        }
+        datasets = {
+            "ashare_daily_qfq": {
+                "dataset_id": "ashare_daily_qfq",
+                "status": "ready",
+                "snapshot_id": "qfq-current",
+                "content_sha256": "a" * 64,
+                "price_basis": "qfq",
+            },
+            "qlib_ashare_v2": {
+                "dataset_id": "qlib_ashare_v2",
+                "status": "ready",
+                "snapshot_id": "canonical-current",
+                "content_sha256": "c" * 64,
+                "price_basis": "qfq",
+            },
+            "qlib_ashare_cleaned_v2": cleaned,
+        }
+
+        module._enrich_derived_entries(datasets)
+
+        self.assertEqual(cleaned["status"], "stale")
+        self.assertEqual(cleaned["blocker_codes"], ["dependency_snapshot_mismatch"])
+        self.assertEqual(
+            cleaned["current_dependency_snapshots"]["qlib_ashare_v2"]["snapshot_id"],
+            "canonical-current",
+        )
+
     def test_sync_refuses_to_write_while_dataset_publication_is_in_progress(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -869,6 +940,22 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(manifest["datasets"]["ashare_daily_raw"]["status"], "blocked")
         self.assertEqual(manifest["datasets"]["ashare_daily_qfq"]["status"], "blocked")
         self.assertEqual(manifest["datasets"]["qlib_ashare_v2"]["status"], "blocked")
+        self.assertEqual(
+            manifest["datasets"]["qlib_ashare_cleaned_v2"]["status"],
+            "blocked",
+        )
+        self.assertEqual(
+            manifest["documented_inputs"]["canonical_qlib_provider"]["path"],
+            "qlib/cn_data_ashare_v2",
+        )
+        self.assertEqual(
+            manifest["documented_inputs"]["cleaned_qlib_provider"]["path"],
+            "qlib/cn_data_ashare_cleaned_v2",
+        )
+        self.assertEqual(
+            manifest["documented_inputs"]["compatibility_qlib_provider"]["path"],
+            "qlib/cn_data_baostock_jqdata",
+        )
         self.assertNotIn(str(root), json.dumps(manifest))
         self.assertIn(module.README_BLOCK_START, root_readme)
         self.assertIn("ashare_cleaned_qfq_legacy", ashare_readme)

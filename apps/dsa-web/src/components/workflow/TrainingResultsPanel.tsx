@@ -6,7 +6,8 @@ import type {
   ResearchCandidateStrategy,
   ResearchTrainingResult,
 } from '../../api/research';
-import { Badge } from '../common';
+import { providerStatusNotice } from '../../utils/providerStatus';
+import { Badge, InlineAlert } from '../common';
 
 type TrainingResultsPanelProps = {
   latestTraining?: ResearchTrainingResult | null;
@@ -51,6 +52,8 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
   const baselineStrategy = zh ? '每日 TopK 等权基线' : 'Daily equal-weight TopK baseline';
   const hasBaselineResult = Boolean(latestTraining?.runId || latestTraining?.experimentName);
   const hasResults = hasBaselineResult || strategyRows.length > 0;
+  const latestTrainingNotice = providerStatusNotice(latestTraining, 'training', language);
+  const candidateNotice = providerStatusNotice(candidatePipeline, 'candidate', language);
 
   return (
     <section className="overflow-hidden border border-border/70 bg-card/35" aria-labelledby="training-results-title">
@@ -69,6 +72,26 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
           </p>
         </div>
       </div>
+
+      {latestTrainingNotice ? (
+        <div className="border-b border-border/70 p-4">
+          <InlineAlert
+            variant="warning"
+            title={latestTrainingNotice.title}
+            message={latestTrainingNotice.message}
+          />
+        </div>
+      ) : null}
+
+      {candidateNotice ? (
+        <div className="border-b border-border/70 p-4">
+          <InlineAlert
+            variant="warning"
+            title={candidateNotice.title}
+            message={candidateNotice.message}
+          />
+        </div>
+      ) : null}
 
       {hasResults ? (
         <div className="overflow-x-auto">

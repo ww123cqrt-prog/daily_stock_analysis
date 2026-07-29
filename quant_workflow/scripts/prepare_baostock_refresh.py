@@ -107,7 +107,9 @@ Generated: {generated}
 - Refresh source: Baostock daily qfq bars.
 - Refresh mode: full-history re-download for selected symbols.
 - Reason: 前复权 prices can shift after corporate actions; full-history refresh avoids mixing old qfq factors with newly appended rows.
-- After download finishes: run `merge_to_qlib.py`, `generate_csi300.py`, `add_index_benchmark.py`, `repair_qlib_provider.py`, then regenerate quality/anomaly reports.
+- This list drives the legacy Baostock audit-cache downloader only; it does not publish formal V2 data.
+- To update formal data, build a complete raw/factor/qfq bundle with `download_baostock_v2.py`, then run `quant_data_cli.py update ashare_daily_qfq --bundle-dir <verified-bundle>`.
+- Do not run `merge_to_qlib.py` or refresh fixed-path compatibility output unless an explicitly identified old consumer still requires it.
 
 ## Artifacts
 

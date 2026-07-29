@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import Any, Mapping, MutableMapping, NamedTuple, Sequence
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,9 @@ class ResolvedDataset(NamedTuple):
     catalog_entry: dict[str, Any]
 
 
+ValidatedResolutionCache = MutableMapping[str, ResolvedDataset]
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -79,13 +82,48 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(Path(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_snapshot_tree(snapshot: Path) -> None:
+    """Make every staged file and directory durable before publication."""
+
+    if os.name == "nt":
+        return
+    snapshot = Path(snapshot)
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise DataContractError("staging snapshot directory is unsafe")
+    for current_root, directories, files in os.walk(
+        snapshot,
+        topdown=False,
+        followlinks=False,
+    ):
+        current = Path(current_root)
+        for directory in directories:
+            if (current / directory).is_symlink():
+                raise DataContractError("staging snapshot cannot contain symlinks")
+        for filename in files:
+            path = current / filename
+            if path.is_symlink() or not path.is_file():
+                raise DataContractError("staging snapshot contains an unsafe file")
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        _fsync_directory(current)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -529,7 +567,11 @@ def validate_snapshot(snapshot: Path, *, verify_hashes: bool = True) -> dict[str
     return manifest
 
 
-def _build_qlib_file_index(snapshot: Path) -> pd.DataFrame:
+def _build_qlib_file_index(
+    snapshot: Path,
+    *,
+    hash_files: bool = True,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for path in sorted(Path(snapshot).rglob("*")):
         if path.is_symlink():
@@ -545,7 +587,7 @@ def _build_qlib_file_index(snapshot: Path) -> pd.DataFrame:
             {
                 "relative_path": path.relative_to(snapshot).as_posix(),
                 "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "sha256": sha256_file(path) if hash_files else None,
             }
         )
     if not rows:
@@ -564,6 +606,8 @@ def finalize_qlib_snapshot(
     upstream_snapshot: Mapping[str, str],
     benchmark_evidence: Mapping[str, Any] | None = None,
     instrument_pool_evidence: Mapping[str, Any] | None = None,
+    transformation_evidence: Mapping[str, Any] | None = None,
+    dependency_snapshots: Sequence[Mapping[str, str]] | None = None,
 ) -> Path:
     snapshot = Path(snapshot).resolve()
     if not DATASET_ID_RE.fullmatch(dataset_id):
@@ -583,6 +627,22 @@ def finalize_qlib_snapshot(
         raise DataContractError("Qlib upstream snapshot contract is incomplete")
     if upstream_snapshot["price_basis"] != "qfq":
         raise DataContractError("Qlib v2 requires a qfq upstream snapshot")
+    normalized_dependencies = [
+        json.loads(json.dumps(dict(item))) for item in (dependency_snapshots or [])
+    ]
+    dependency_ids: set[str] = set()
+    for dependency in normalized_dependencies:
+        if (
+            not required_upstream.issubset(dependency)
+            or dependency["price_basis"] != "qfq"
+            or not DATASET_ID_RE.fullmatch(str(dependency["dataset_id"]))
+            or not str(dependency["snapshot_id"]).strip()
+            or not SHA256_RE.fullmatch(str(dependency["content_sha256"]))
+            or dependency["dataset_id"] in dependency_ids
+            or dependency == dict(upstream_snapshot)
+        ):
+            raise DataContractError("Qlib dependency snapshot contract is invalid")
+        dependency_ids.add(str(dependency["dataset_id"]))
     calendar_path = snapshot / "calendars" / "day.txt"
     instruments_path = snapshot / "instruments" / "all.txt"
     provider_manifest_path = snapshot / "PROVIDER_MANIFEST.json"
@@ -610,6 +670,8 @@ def finalize_qlib_snapshot(
     provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != dict(upstream_snapshot):
         raise DataContractError("Qlib provider points to the wrong upstream snapshot")
+    if normalized_dependencies:
+        provider_manifest["dependency_snapshots"] = normalized_dependencies
     if benchmark_evidence is not None:
         normalized_benchmarks = json.loads(json.dumps(dict(benchmark_evidence)))
         _validate_qlib_benchmark_evidence(snapshot, normalized_benchmarks)
@@ -619,7 +681,24 @@ def finalize_qlib_snapshot(
         normalized_pools = json.loads(json.dumps(dict(instrument_pool_evidence)))
         _validate_qlib_instrument_pool_evidence(snapshot, normalized_pools)
         provider_manifest["instrument_pools"] = normalized_pools
-    if benchmark_evidence is not None or instrument_pool_evidence is not None:
+    if transformation_evidence is not None:
+        normalized_transformation = json.loads(
+            json.dumps(dict(transformation_evidence))
+        )
+        if normalized_transformation.get("source_snapshot") != dict(
+            upstream_snapshot
+        ):
+            raise DataContractError(
+                "Qlib transformation points to the wrong upstream snapshot"
+            )
+        _validate_qlib_transformation_evidence(snapshot, normalized_transformation)
+        provider_manifest["transformation"] = normalized_transformation
+    if (
+        benchmark_evidence is not None
+        or instrument_pool_evidence is not None
+        or transformation_evidence is not None
+        or normalized_dependencies
+    ):
         atomic_write_json(provider_manifest_path, provider_manifest)
     index = _build_qlib_file_index(snapshot)
     index.to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
@@ -640,6 +719,7 @@ def finalize_qlib_snapshot(
         },
         "producer": dict(producer),
         "upstream_snapshots": [dict(upstream_snapshot)],
+        "dependency_snapshots": normalized_dependencies,
         "date_range": {"start": calendar[0], "end": calendar[-1]},
         "latest_trade_date": calendar[-1],
         "instrument_count": len(instruments),
@@ -652,6 +732,8 @@ def finalize_qlib_snapshot(
         manifest["benchmarks"] = normalized_benchmarks
     if instrument_pool_evidence is not None:
         manifest["instrument_pools"] = normalized_pools
+    if transformation_evidence is not None:
+        manifest["transformation"] = normalized_transformation
     manifest["content_sha256"] = _content_hash(snapshot, manifest)
     atomic_write_json(snapshot / "DATASET_MANIFEST.json", manifest)
     validate_qlib_snapshot(snapshot, verify_hashes=True)
@@ -738,9 +820,71 @@ def _validate_qlib_instrument_pool_evidence(
             raise DataContractError(f"Qlib instrument pool contents are invalid: {pool_name}")
 
 
+def _validate_qlib_transformation_evidence(
+    snapshot: Path,
+    evidence: Mapping[str, Any],
+) -> None:
+    required = {"name", "algorithm", "source_snapshot", "summary", "artifacts"}
+    if not isinstance(evidence, Mapping) or not required.issubset(evidence):
+        raise DataContractError("Qlib transformation evidence is incomplete")
+    algorithm = evidence.get("algorithm")
+    source_snapshot = evidence.get("source_snapshot")
+    summary = evidence.get("summary")
+    artifacts = evidence.get("artifacts")
+    if (
+        not str(evidence.get("name") or "").strip()
+        or not isinstance(algorithm, Mapping)
+        or not str(algorithm.get("script") or "").strip()
+        or not str(algorithm.get("version") or "").strip()
+        or not isinstance(source_snapshot, Mapping)
+        or not {
+            "dataset_id",
+            "snapshot_id",
+            "content_sha256",
+            "price_basis",
+        }.issubset(source_snapshot)
+        or not isinstance(summary, Mapping)
+        or not isinstance(artifacts, Mapping)
+        or not artifacts
+    ):
+        raise DataContractError("Qlib transformation evidence is invalid")
+    for field in (
+        "source_symbols",
+        "output_symbols",
+        "source_rows",
+        "output_rows",
+        "excluded_symbols",
+        "masked_volume_rows",
+        "masked_event_rows",
+    ):
+        value = summary.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DataContractError("Qlib transformation summary is invalid")
+    for name, artifact in artifacts.items():
+        if not str(name).strip() or not isinstance(artifact, Mapping):
+            raise DataContractError("Qlib transformation artifact is invalid")
+        relative_path = artifact.get("relative_path")
+        expected_hash = artifact.get("sha256")
+        expected_size = artifact.get("size_bytes")
+        if (
+            not isinstance(relative_path, str)
+            or not isinstance(expected_hash, str)
+            or not SHA256_RE.fullmatch(expected_hash)
+            or isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+        ):
+            raise DataContractError("Qlib transformation artifact is invalid")
+        path = _snapshot_file(snapshot, relative_path, "Qlib transformation artifact")
+        if path.stat().st_size != expected_size or sha256_file(path) != expected_hash:
+            raise DataContractError("Qlib transformation artifact hash mismatch")
+
+
 def _validate_qlib_benchmark_evidence(
     snapshot: Path,
     evidence: Mapping[str, Any],
+    *,
+    evidence_root: Path | None = None,
 ) -> None:
     if not isinstance(evidence, Mapping):
         raise DataContractError("Qlib benchmark evidence is invalid")
@@ -789,6 +933,16 @@ def _validate_qlib_benchmark_evidence(
         raw_path = Path(str(source.get(path_field, "")))
         if raw_path.is_absolute() or ".." in raw_path.parts or not raw_path.parts:
             raise DataContractError("Qlib benchmark source path is invalid")
+    if evidence_root is not None:
+        evidence_path = _safe_child(
+            Path(evidence_root),
+            source["evidence_path"],
+            "Qlib benchmark evidence path",
+        )
+        if evidence_path.is_symlink() or not evidence_path.is_file():
+            raise DataContractError("Qlib benchmark source evidence is unavailable")
+        if sha256_file(evidence_path) != source["evidence_sha256"]:
+            raise DataContractError("Qlib benchmark source evidence hash mismatch")
     symbols = evidence.get("symbols")
     if not isinstance(symbols, Mapping) or set(symbols) != set(QLIB_BENCHMARK_SYMBOLS):
         raise DataContractError("Qlib benchmark symbol evidence is incomplete")
@@ -853,6 +1007,7 @@ def validate_qlib_snapshot(
     snapshot: Path,
     *,
     verify_hashes: bool = True,
+    evidence_root: Path | None = None,
 ) -> dict[str, Any]:
     snapshot = Path(snapshot).resolve()
     if snapshot.is_symlink() or not snapshot.is_dir():
@@ -898,6 +1053,37 @@ def validate_qlib_snapshot(
     provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != upstream[0]:
         raise DataContractError("Qlib provider and dataset lineage disagree")
+    dependencies = manifest.get("dependency_snapshots", [])
+    if not isinstance(dependencies, list):
+        raise DataContractError("Qlib dependency snapshot contract is invalid")
+    if provider_manifest.get("dependency_snapshots", []) != dependencies:
+        raise DataContractError("Qlib provider and dataset dependencies disagree")
+    dependency_ids: set[str] = set()
+    for dependency in dependencies:
+        if (
+            not isinstance(dependency, Mapping)
+            or not {
+                "dataset_id",
+                "snapshot_id",
+                "content_sha256",
+                "price_basis",
+            }.issubset(dependency)
+            or dependency.get("price_basis") != "qfq"
+            or not DATASET_ID_RE.fullmatch(str(dependency.get("dataset_id") or ""))
+            or not str(dependency.get("snapshot_id") or "").strip()
+            or not SHA256_RE.fullmatch(str(dependency.get("content_sha256") or ""))
+            or str(dependency["dataset_id"]) in dependency_ids
+            or dependency == upstream[0]
+        ):
+            raise DataContractError("Qlib dependency snapshot contract is invalid")
+        dependency_ids.add(str(dependency["dataset_id"]))
+    if manifest.get("dataset_id") == "qlib_ashare_cleaned_v2" and (
+        len(dependencies) != 1
+        or dependencies[0].get("dataset_id") != "qlib_ashare_v2"
+    ):
+        raise DataContractError(
+            "cleaned Qlib must declare its exact canonical Qlib dependency"
+        )
     benchmark_complete = manifest.get("benchmark_complete")
     provider_benchmark_complete = provider_manifest.get("benchmark_complete")
     if benchmark_complete is not None or provider_benchmark_complete is not None:
@@ -905,7 +1091,11 @@ def validate_qlib_snapshot(
             raise DataContractError("Qlib benchmark completion state is invalid")
         if manifest.get("benchmarks") != provider_manifest.get("benchmarks"):
             raise DataContractError("Qlib provider and dataset benchmark evidence disagree")
-        _validate_qlib_benchmark_evidence(snapshot, manifest["benchmarks"])
+        _validate_qlib_benchmark_evidence(
+            snapshot,
+            manifest["benchmarks"],
+            evidence_root=evidence_root,
+        )
     elif "benchmarks" in manifest or "benchmarks" in provider_manifest:
         raise DataContractError("Qlib benchmark evidence lacks completion state")
     if "instrument_pools" in manifest or "instrument_pools" in provider_manifest:
@@ -918,6 +1108,17 @@ def validate_qlib_snapshot(
         _validate_qlib_instrument_pool_evidence(
             snapshot, manifest["instrument_pools"]
         )
+    if "transformation" in manifest or "transformation" in provider_manifest:
+        if manifest.get("transformation") != provider_manifest.get("transformation"):
+            raise DataContractError(
+                "Qlib provider and dataset transformation evidence disagree"
+            )
+        transformation = manifest["transformation"]
+        if transformation.get("source_snapshot") != upstream[0]:
+            raise DataContractError(
+                "Qlib transformation and dataset lineage disagree"
+            )
+        _validate_qlib_transformation_evidence(snapshot, transformation)
     try:
         file_index_path = _snapshot_file(
             snapshot,
@@ -930,7 +1131,7 @@ def validate_qlib_snapshot(
     required_index = {"relative_path", "size_bytes", "sha256"}
     if recorded.empty or not required_index.issubset(recorded.columns):
         raise DataContractError("Qlib file index is invalid")
-    rebuilt = _build_qlib_file_index(snapshot)
+    rebuilt = _build_qlib_file_index(snapshot, hash_files=verify_hashes)
     recorded = recorded.sort_values("relative_path").reset_index(drop=True)
     rebuilt = rebuilt.sort_values("relative_path").reset_index(drop=True)
     if recorded["relative_path"].tolist() != rebuilt["relative_path"].tolist():
@@ -957,10 +1158,15 @@ def validate_dataset_snapshot(
     snapshot: Path,
     *,
     verify_hashes: bool = True,
+    evidence_root: Path | None = None,
 ) -> dict[str, Any]:
     manifest = _read_json(Path(snapshot) / "DATASET_MANIFEST.json")
     if manifest.get("data_kind") == "qlib_provider":
-        return validate_qlib_snapshot(snapshot, verify_hashes=verify_hashes)
+        return validate_qlib_snapshot(
+            snapshot,
+            verify_hashes=verify_hashes,
+            evidence_root=evidence_root,
+        )
     return validate_snapshot(snapshot, verify_hashes=verify_hashes)
 
 
@@ -1065,6 +1271,7 @@ def _publish_snapshot_group_unlocked(
     *,
     quant_data_root: Path,
     update_root_catalog: bool = False,
+    validated_cache: ValidatedResolutionCache | None = None,
 ) -> list[Path]:
     """Publish related snapshots and roll back every formal pointer on failure."""
 
@@ -1087,7 +1294,11 @@ def _publish_snapshot_group_unlocked(
         if dataset_root in dataset_roots:
             raise DataContractError("snapshot group contains a duplicate dataset root")
         dataset_roots.add(dataset_root)
-        manifest = validate_dataset_snapshot(staging_snapshot, verify_hashes=True)
+        manifest = validate_dataset_snapshot(
+            staging_snapshot,
+            verify_hashes=True,
+            evidence_root=quant_data_root,
+        )
         if manifest["status"] != "ready":
             raise DataContractError("only ready snapshots can be published")
         snapshot_id = str(manifest["snapshot_id"])
@@ -1111,9 +1322,12 @@ def _publish_snapshot_group_unlocked(
     try:
         for item in prepared:
             destination = item["destination"]
+            _fsync_snapshot_tree(item["staging"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(item["staging"], destination)
             moved.append(item)
+            _fsync_directory(item["staging"].parent)
+            _fsync_directory(destination.parent)
         published_at = datetime.now().astimezone().isoformat(timespec="seconds")
         for item in prepared:
             pointer_path = item["dataset_root"] / "LATEST.json"
@@ -1141,11 +1355,14 @@ def _publish_snapshot_group_unlocked(
             datasets = dict(catalog_backup["datasets"])
             for item in prepared:
                 manifest = item["manifest"]
-                datasets[str(manifest["dataset_id"])] = catalog_entry_from_snapshot(
+                catalog_entry = _catalog_entry_from_validated_manifest(
                     item["destination"],
                     quant_data_root=quant_data_root,
                     dataset_root=item["dataset_root"],
+                    manifest=manifest,
                 )
+                datasets[str(manifest["dataset_id"])] = catalog_entry
+                item["catalog_entry"] = catalog_entry
             write_root_manifest(
                 quant_data_root,
                 datasets,
@@ -1172,6 +1389,8 @@ def _publish_snapshot_group_unlocked(
             try:
                 item["staging"].parent.mkdir(parents=True, exist_ok=True)
                 os.replace(item["destination"], item["staging"])
+                _fsync_directory(item["destination"].parent)
+                _fsync_directory(item["staging"].parent)
             except Exception as exc:
                 rollback_errors.append(
                     (f"restore staged snapshot {item['manifest']['snapshot_id']}", exc)
@@ -1187,6 +1406,24 @@ def _publish_snapshot_group_unlocked(
                 f"rollback failed: {failures}"
             ) from publish_error
         raise
+    if validated_cache is not None:
+        for item in prepared:
+            manifest = item["manifest"]
+            catalog_entry = item.get("catalog_entry")
+            if not isinstance(catalog_entry, dict):
+                catalog_entry = _catalog_entry_from_validated_manifest(
+                    item["destination"],
+                    quant_data_root=quant_data_root,
+                    dataset_root=item["dataset_root"],
+                    manifest=manifest,
+                )
+            dataset_id = str(manifest["dataset_id"])
+            validated_cache[dataset_id] = ResolvedDataset(
+                dataset_id,
+                item["destination"],
+                dict(manifest),
+                dict(catalog_entry),
+            )
     return [item["destination"] for item in prepared]
 
 
@@ -1196,6 +1433,7 @@ def publish_snapshot_group(
     quant_data_root: Path,
     update_root_catalog: bool = False,
     publication_lock_held: bool = False,
+    validated_cache: ValidatedResolutionCache | None = None,
 ) -> list[Path]:
     quant_data_root = Path(quant_data_root).expanduser().resolve()
     if publication_lock_held:
@@ -1203,12 +1441,14 @@ def publish_snapshot_group(
             snapshots,
             quant_data_root=quant_data_root,
             update_root_catalog=update_root_catalog,
+            validated_cache=validated_cache,
         )
     with dataset_publication_lock(quant_data_root):
         return _publish_snapshot_group_unlocked(
             snapshots,
             quant_data_root=quant_data_root,
             update_root_catalog=update_root_catalog,
+            validated_cache=validated_cache,
         )
 
 
@@ -1219,25 +1459,27 @@ def publish_qlib_snapshot(
     quant_data_root: Path,
     update_root_catalog: bool = False,
     publication_lock_held: bool = False,
+    validated_cache: ValidatedResolutionCache | None = None,
 ) -> Path:
     return publish_snapshot_group(
         [(staging_snapshot, dataset_root)],
         quant_data_root=quant_data_root,
         update_root_catalog=update_root_catalog,
         publication_lock_held=publication_lock_held,
+        validated_cache=validated_cache,
     )[0]
 
 
-def catalog_entry_from_snapshot(
+def _catalog_entry_from_validated_manifest(
     snapshot: Path,
     *,
     quant_data_root: Path,
     dataset_root: Path,
+    manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     quant_data_root = Path(quant_data_root).resolve()
     dataset_root = Path(dataset_root).resolve()
     snapshot = Path(snapshot).resolve()
-    manifest = validate_dataset_snapshot(snapshot, verify_hashes=True)
     if manifest["data_kind"] == "qlib_provider":
         entry = {
             "dataset_id": manifest["dataset_id"],
@@ -1255,6 +1497,7 @@ def catalog_entry_from_snapshot(
             "content_sha256": manifest["content_sha256"],
             "producer": manifest["producer"],
             "upstream_snapshots": manifest["upstream_snapshots"],
+            "dependency_snapshots": manifest.get("dependency_snapshots", []),
             "provider_manifest_path": manifest["provider_manifest_path"],
             "file_index_path": manifest["file_index_path"],
             "dataset_root": _safe_relative(
@@ -1273,6 +1516,8 @@ def catalog_entry_from_snapshot(
             entry["benchmarks"] = manifest["benchmarks"]
         if "instrument_pools" in manifest:
             entry["instrument_pools"] = manifest["instrument_pools"]
+        if "transformation" in manifest:
+            entry["transformation"] = manifest["transformation"]
         return entry
     return {
         "dataset_id": manifest["dataset_id"],
@@ -1305,6 +1550,27 @@ def catalog_entry_from_snapshot(
     }
 
 
+def catalog_entry_from_snapshot(
+    snapshot: Path,
+    *,
+    quant_data_root: Path,
+    dataset_root: Path,
+) -> dict[str, Any]:
+    quant_data_root = Path(quant_data_root).resolve()
+    snapshot = Path(snapshot).resolve()
+    manifest = validate_dataset_snapshot(
+        snapshot,
+        verify_hashes=True,
+        evidence_root=quant_data_root,
+    )
+    return _catalog_entry_from_validated_manifest(
+        snapshot,
+        quant_data_root=quant_data_root,
+        dataset_root=dataset_root,
+        manifest=manifest,
+    )
+
+
 def write_root_manifest(
     quant_data_root: Path,
     datasets: Mapping[str, Mapping[str, Any]],
@@ -1330,6 +1596,8 @@ def _load_root_manifest(quant_data_root: Path) -> dict[str, Any]:
     manifest = _read_json(Path(quant_data_root) / "DATA_MANIFEST.json")
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise DataContractError("DATA_MANIFEST.json schema version 2 is required")
+    if manifest.get("path_format") != "relative_to_quant_data_root":
+        raise DataContractError("DATA_MANIFEST.json relative path format is required")
     if not isinstance(manifest.get("datasets"), dict):
         raise DataContractError("DATA_MANIFEST.json datasets catalog is missing")
     return manifest
@@ -1346,16 +1614,24 @@ def _validate_current_upstream(
     upstream_snapshots = manifest.get("upstream_snapshots")
     if not isinstance(upstream_snapshots, list) or len(upstream_snapshots) != 1:
         raise DataContractError("dataset upstream snapshot contract is invalid")
-    upstream = upstream_snapshots[0]
-    if not isinstance(upstream, Mapping):
-        raise DataContractError("dataset upstream snapshot contract is invalid")
-    upstream_dataset_id = str(upstream.get("dataset_id") or "")
-    current = catalog.get("datasets", {}).get(upstream_dataset_id)
-    if not isinstance(current, Mapping) or current.get("status") != "ready":
-        raise DataContractError("dataset upstream snapshot is stale")
-    for field in ("snapshot_id", "content_sha256", "price_basis"):
-        if not upstream.get(field) or upstream.get(field) != current.get(field):
+    dependencies = manifest.get("dependency_snapshots", [])
+    if not isinstance(dependencies, list):
+        raise DataContractError("dataset dependency snapshot contract is invalid")
+    identities = [*upstream_snapshots, *dependencies]
+    dataset_ids: set[str] = set()
+    for upstream in identities:
+        if not isinstance(upstream, Mapping):
+            raise DataContractError("dataset upstream snapshot contract is invalid")
+        upstream_dataset_id = str(upstream.get("dataset_id") or "")
+        if not upstream_dataset_id or upstream_dataset_id in dataset_ids:
+            raise DataContractError("dataset upstream snapshot contract is invalid")
+        dataset_ids.add(upstream_dataset_id)
+        current = catalog.get("datasets", {}).get(upstream_dataset_id)
+        if not isinstance(current, Mapping) or current.get("status") != "ready":
             raise DataContractError("dataset upstream snapshot is stale")
+        for field in ("snapshot_id", "content_sha256", "price_basis"):
+            if not upstream.get(field) or upstream.get(field) != current.get(field):
+                raise DataContractError("dataset upstream snapshot is stale")
 
 
 def resolve_dataset(
@@ -1364,6 +1640,7 @@ def resolve_dataset(
     quant_data_root: Path,
     require_basis: str | None = None,
     require_status: str = "ready",
+    validated_cache: ValidatedResolutionCache | None = None,
 ) -> ResolvedDataset:
     quant_data_root = Path(quant_data_root).expanduser().resolve()
     catalog = _load_root_manifest(quant_data_root)
@@ -1390,7 +1667,23 @@ def resolve_dataset(
         raise DataContractError("dataset catalog and latest pointer are out of sync")
     if entry.get("snapshot_manifest_sha256") != pointer.get("manifest_sha256"):
         raise DataContractError("dataset catalog and latest pointer are out of sync")
-    manifest = validate_dataset_snapshot(snapshot, verify_hashes=True)
+    cached = validated_cache.get(dataset_id) if validated_cache is not None else None
+    if (
+        cached is not None
+        and cached.dataset_id == dataset_id
+        and cached.snapshot_path.resolve() == snapshot.resolve()
+        and cached.catalog_entry == entry
+    ):
+        current_manifest = _read_json(snapshot / "DATASET_MANIFEST.json")
+        if current_manifest == cached.manifest:
+            _validate_current_upstream(catalog, current_manifest)
+            return cached
+        validated_cache.pop(dataset_id, None)
+    manifest = validate_dataset_snapshot(
+        snapshot,
+        verify_hashes=True,
+        evidence_root=quant_data_root,
+    )
     if manifest.get("dataset_id") != dataset_id:
         raise DataContractError("latest pointer belongs to another dataset")
     if manifest.get("snapshot_id") != pointer.get("snapshot_id"):
@@ -1408,8 +1701,17 @@ def resolve_dataset(
             raise DataContractError(
                 f"dataset catalog and snapshot disagree on {field}"
             )
+    if manifest.get("data_kind") == "qlib_provider":
+        for field in ("upstream_snapshots", "dependency_snapshots"):
+            if entry.get(field, []) != manifest.get(field, []):
+                raise DataContractError(
+                    f"dataset catalog and snapshot disagree on {field}"
+                )
     _validate_current_upstream(catalog, manifest)
-    return ResolvedDataset(dataset_id, snapshot, manifest, dict(entry))
+    resolved = ResolvedDataset(dataset_id, snapshot, manifest, dict(entry))
+    if validated_cache is not None:
+        validated_cache[dataset_id] = resolved
+    return resolved
 
 
 def describe_dataset(dataset_id: str, *, quant_data_root: Path) -> dict[str, Any]:

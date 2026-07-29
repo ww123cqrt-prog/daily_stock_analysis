@@ -3,18 +3,40 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
 import yaml
 
+from quant_workflow.scripts._mlflow_run_provenance import RunProvenanceError
 from src.services.trained_strategy_backtest_service import TrainedStrategyBacktestService
 
 
 RUN_ID = "a" * 32
 EXPERIMENT_ID = "123456789"
+PROVIDER_IDENTITY = {
+    "provider_contract": "immutable_snapshot_v2",
+    "dataset_id": "qlib_ashare_v2",
+    "snapshot_id": "qlib-native-001",
+    "content_sha256": "a" * 64,
+    "manifest_sha256": "b" * 64,
+}
+
+
+def _matching_artifact_validator(root: Path):
+    def validate(**kwargs):
+        artifact = Path(kwargs["artifact_path"])
+        return {
+            "provider_identity": dict(PROVIDER_IDENTITY),
+            "provider_path": str(root / "resolved-native-provider"),
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        }
+
+    return validate
 
 
 def _write_fixture(root: Path) -> tuple[Path, Path, Path, pd.DataFrame]:
@@ -42,7 +64,8 @@ def _write_fixture(root: Path) -> tuple[Path, Path, Path, pd.DataFrame]:
     report = {
         "status": "completed",
         "provider": "canonical",
-        "provider_uri": str(root / "provider"),
+        "provider_uri": str(root / "legacy-provider"),
+        "provider_identity": PROVIDER_IDENTITY,
         "periods": {"selection": ["2026-01-02", "2026-01-13"]},
         "models": [
             {
@@ -73,7 +96,8 @@ def _write_fixture(root: Path) -> tuple[Path, Path, Path, pd.DataFrame]:
                 "run_id": RUN_ID,
                 "experiment_id": EXPERIMENT_ID,
                 "provider": "canonical",
-                "provider_uri": str(root / "provider"),
+                "provider_uri": str(root / "legacy-provider"),
+                "provider_identity": PROVIDER_IDENTITY,
             },
             ensure_ascii=False,
         ),
@@ -109,17 +133,20 @@ def _write_fixture(root: Path) -> tuple[Path, Path, Path, pd.DataFrame]:
 
 def test_reruns_the_selected_saved_prediction_without_training(tmp_path: Path) -> None:
     reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
-    loaded_ranges: list[tuple[str, str]] = []
+    loaded_ranges: list[tuple[Path, str, str]] = []
 
-    def market_loader(_provider: Path, start: str, end: str) -> pd.DataFrame:
-        loaded_ranges.append((start, end))
+    def market_loader(provider: Path, start: str, end: str) -> pd.DataFrame:
+        loaded_ranges.append((provider, start, end))
         return market
 
     service = TrainedStrategyBacktestService(
         reports_root=reports_root,
         mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
         strategy_config_path=config_path,
         market_loader=market_loader,
+        provider_resolver=lambda identity, root: root / "resolved-native-provider",
+        artifact_validator=_matching_artifact_validator(tmp_path),
     )
     result = service.run(
         run_id=RUN_ID,
@@ -131,9 +158,12 @@ def test_reruns_the_selected_saved_prediction_without_training(tmp_path: Path) -
         cost_bps=20.0,
     )
 
-    assert loaded_ranges == [("2026-01-02", "2026-01-13")]
+    assert loaded_ranges == [
+        (tmp_path / "resolved-native-provider", "2026-01-02", "2026-01-13")
+    ]
     assert result["status"] == "completed"
     assert result["run_id"] == RUN_ID
+    assert set(result["artifact_sha256"]) == {"pred.pkl", "label.pkl"}
     assert result["strategy_id"] == "low_turnover_weekly"
     assert result["parameters"] == {
         "start_date": "2026-01-02",
@@ -154,8 +184,11 @@ def test_rejects_a_run_that_is_not_registered_in_the_training_report(tmp_path: P
     service = TrainedStrategyBacktestService(
         reports_root=reports_root,
         mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
         strategy_config_path=config_path,
         market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-native-provider",
+        artifact_validator=_matching_artifact_validator(tmp_path),
     )
 
     with pytest.raises(ValueError, match="not available in the current training results"):
@@ -175,8 +208,11 @@ def test_latest_trained_model_can_use_a_registered_trading_strategy(tmp_path: Pa
     service = TrainedStrategyBacktestService(
         reports_root=reports_root,
         mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
         strategy_config_path=config_path,
         market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-native-provider",
+        artifact_validator=_matching_artifact_validator(tmp_path),
     )
 
     result = service.run(
@@ -192,3 +228,118 @@ def test_latest_trained_model_can_use_a_registered_trading_strategy(tmp_path: Pa
     assert result["model_label"] == "baseline_lgb_alpha158"
     assert result["strategy_id"] == "low_turnover_weekly"
     assert result["strategy_label"] == "每周低换手"
+
+
+def test_rejects_legacy_report_without_immutable_provider_identity(
+    tmp_path: Path,
+) -> None:
+    reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
+    report_path = reports_root / "candidate_pipeline_latest.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report.pop("provider_identity")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    service = TrainedStrategyBacktestService(
+        reports_root=reports_root,
+        mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
+        strategy_config_path=config_path,
+        market_loader=lambda *_: market,
+        artifact_validator=_matching_artifact_validator(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="immutable native V2 provider"):
+        service.run(
+            run_id=RUN_ID,
+            model_id="xgboost",
+            strategy_id="low_turnover_weekly",
+            start_date="2026-01-02",
+            end_date="2026-01-13",
+            topk=2,
+            cost_bps=20.0,
+        )
+
+
+def test_rejects_artifact_hash_failure_before_pickle_deserialization(
+    tmp_path: Path,
+) -> None:
+    reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
+
+    def reject_artifact(**_kwargs):
+        raise RunProvenanceError("artifact content hash does not match")
+
+    service = TrainedStrategyBacktestService(
+        reports_root=reports_root,
+        mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
+        strategy_config_path=config_path,
+        market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-native-provider",
+        artifact_validator=reject_artifact,
+    )
+
+    with (
+        patch.object(
+            pd,
+            "read_pickle",
+            side_effect=AssertionError("unvalidated pickle was read"),
+        ) as read_pickle,
+        pytest.raises(ValueError, match="artifact provenance cannot be verified"),
+    ):
+        service.run(
+            run_id=RUN_ID,
+            model_id="xgboost",
+            strategy_id="low_turnover_weekly",
+            start_date="2026-01-02",
+            end_date="2026-01-13",
+            topk=2,
+            cost_bps=20.0,
+        )
+
+    read_pickle.assert_not_called()
+
+
+def test_rejects_artifact_from_another_provider_before_pickle_deserialization(
+    tmp_path: Path,
+) -> None:
+    reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
+
+    def mismatched_artifact(**kwargs):
+        artifact = Path(kwargs["artifact_path"])
+        return {
+            "provider_identity": {
+                **PROVIDER_IDENTITY,
+                "snapshot_id": "another-snapshot",
+            },
+            "provider_path": str(tmp_path / "another-provider"),
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        }
+
+    service = TrainedStrategyBacktestService(
+        reports_root=reports_root,
+        mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
+        strategy_config_path=config_path,
+        market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-native-provider",
+        artifact_validator=mismatched_artifact,
+    )
+
+    with (
+        patch.object(
+            pd,
+            "read_pickle",
+            side_effect=AssertionError("cross-provider pickle was read"),
+        ) as read_pickle,
+        pytest.raises(ValueError, match="does not match the training report provider"),
+    ):
+        service.run(
+            run_id=RUN_ID,
+            model_id="xgboost",
+            strategy_id="low_turnover_weekly",
+            start_date="2026-01-02",
+            end_date="2026-01-13",
+            topk=2,
+            cost_bps=20.0,
+        )
+
+    read_pickle.assert_not_called()

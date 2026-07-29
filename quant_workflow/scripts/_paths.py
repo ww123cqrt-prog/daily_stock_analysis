@@ -17,12 +17,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
+from quant_data_contract import (  # noqa: E402
+    DataContractError,
+    resolve_dataset,
+    validate_qlib_snapshot,
+)
 
 
 DEFAULT_WORKFLOW_ROOT = SCRIPT_DIR.parent
 DEFAULT_DSA_ROOT = DEFAULT_WORKFLOW_ROOT.parent
 DEFAULT_PROJECTS_ROOT = DEFAULT_DSA_ROOT.parent
+NATIVE_QLIB_DATASET_ROOTS = {
+    "qlib_ashare_v2": Path("qlib/cn_data_ashare_v2"),
+    "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
+}
+
 
 def _env_path(name: str, default: Path) -> Path:
     value = os.environ.get(name)
@@ -71,19 +80,21 @@ def china_astock_root() -> Path:
     return _env_path("CHINA_ASTOCK_QUANT_ROOT", projects_root() / "china-astock-quant")
 
 
-@lru_cache(maxsize=8)
-def _resolve_native_qlib(root_text: str) -> Path:
+@lru_cache(maxsize=16)
+def _resolve_native_qlib(
+    root_text: str, dataset_id: str = "qlib_ashare_v2"
+) -> Path:
     root = Path(root_text)
     try:
         resolved = resolve_dataset(
-            "qlib_ashare_v2",
+            dataset_id,
             quant_data_root=root,
             require_basis="qfq",
         )
     except DataContractError as exc:
-        raise RuntimeError(f"native qlib_ashare_v2 is unavailable: {exc}") from exc
+        raise RuntimeError(f"native {dataset_id} is unavailable: {exc}") from exc
     if resolved.manifest.get("benchmark_complete") is not True:
-        raise RuntimeError("native qlib_ashare_v2 benchmarks are incomplete")
+        raise RuntimeError(f"native {dataset_id} benchmarks are incomplete")
     return Path(resolved.snapshot_path)
 
 
@@ -110,16 +121,92 @@ def ashare_qfq_bars_dir() -> Path:
     return ashare_qfq_snapshot_uri() / "bars"
 
 
-def qlib_provider_uri(provider: str = "canonical") -> Path:
+def _path_contains_symlink(root: Path, relative: Path) -> bool:
+    current = Path(root)
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _validate_native_provider_override(
+    configured: str | Path,
+    *,
+    dataset_id: str,
+) -> Path:
+    """Accept an override only when it names a complete immutable V2 snapshot."""
+
+    root = quant_data_root().expanduser().resolve()
+    dataset_root = NATIVE_QLIB_DATASET_ROOTS[dataset_id]
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve()
+    expected_parent = (root / dataset_root / "snapshots").resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{dataset_id} override must stay under QUANT_DATA_ROOT and use an immutable V2 snapshot"
+        ) from exc
+    if (
+        candidate.parent != expected_parent
+        or candidate.name in {"", ".", ".."}
+        or _path_contains_symlink(root, relative)
+    ):
+        raise RuntimeError(
+            f"{dataset_id} override must point to {dataset_root}/snapshots/<snapshot_id>; "
+            "legacy compatibility providers are rejected"
+        )
+    try:
+        manifest = validate_qlib_snapshot(
+            candidate,
+            verify_hashes=True,
+            evidence_root=root,
+        )
+    except (DataContractError, OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"{dataset_id} override is not a valid immutable V2 snapshot: {exc}"
+        ) from exc
+    if (
+        manifest.get("dataset_id") != dataset_id
+        or manifest.get("snapshot_id") != candidate.name
+        or manifest.get("role") != "canonical"
+        or manifest.get("status") != "ready"
+        or manifest.get("price_basis") != "qfq"
+        or manifest.get("benchmark_complete") is not True
+    ):
+        raise RuntimeError(
+            f"{dataset_id} override has an invalid native V2 identity; "
+            "legacy compatibility providers are rejected"
+        )
+    return candidate
+
+
+def qlib_provider_uri(
+    provider: str = "canonical",
+    *,
+    snapshot_override: str | Path | None = None,
+) -> Path:
     if provider in {"canonical", "raw"}:
-        configured = os.environ.get("QLIB_PROVIDER_URI")
+        configured = snapshot_override or os.environ.get("QLIB_PROVIDER_URI")
         if configured:
-            return Path(configured).expanduser()
+            return _validate_native_provider_override(
+                configured,
+                dataset_id="qlib_ashare_v2",
+            )
         root = quant_data_root().expanduser().resolve()
         return _resolve_native_qlib(str(root))
     if provider == "cleaned":
-        default = quant_data_root() / "qlib" / "cn_data_baostock_jqdata_cleaned"
-        return _env_path("QLIB_CLEANED_PROVIDER_URI", default)
+        configured = snapshot_override or os.environ.get("QLIB_CLEANED_PROVIDER_URI")
+        if configured:
+            return _validate_native_provider_override(
+                configured,
+                dataset_id="qlib_ashare_cleaned_v2",
+            )
+        root = quant_data_root().expanduser().resolve()
+        return _resolve_native_qlib(str(root), "qlib_ashare_cleaned_v2")
     raise ValueError(f"Unknown Qlib provider: {provider}")
 
 
@@ -134,7 +221,7 @@ def qlib_compatibility_provider_uri(provider: str = "canonical") -> Path:
         )
     if provider == "cleaned":
         return _env_path(
-            "QLIB_CLEANED_PROVIDER_URI",
+            "QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI",
             root / "cn_data_baostock_jqdata_cleaned",
         )
     raise ValueError(f"Unknown compatibility Qlib provider: {provider}")

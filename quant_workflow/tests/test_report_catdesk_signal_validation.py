@@ -262,16 +262,21 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         )
 
     def test_business_day_pairs_use_qlib_calendar_across_market_holiday(self):
+        module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir)
-            calendar_dir = provider / "calendars"
+            calendar_dir = Path(temp_dir) / "calendars"
             calendar_dir.mkdir()
-            (calendar_dir / "day.txt").write_text(
+            calendar_path = calendar_dir / "day.txt"
+            calendar_path.write_text(
                 "2026-09-29\n2026-09-30\n2026-10-08\n2026-10-09\n",
                 encoding="utf-8",
             )
-            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}):
-                module = load_module()
+            calendar = module.load_trading_calendar(calendar_path)
+            with patch.object(
+                module,
+                "load_trading_calendar",
+                return_value=calendar,
+            ):
                 pairs = module.business_day_pairs("2026-09-30", 2)
 
         self.assertEqual(
@@ -283,10 +288,14 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         )
 
     def test_validation_date_uses_explicit_weekday_fallback_when_calendar_is_missing(self):
+        module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir)
-            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}):
-                module = load_module()
+            calendar = module.load_trading_calendar(Path(temp_dir) / "missing.txt")
+            with patch.object(
+                module,
+                "load_trading_calendar",
+                return_value=calendar,
+            ):
                 validation_date, source = module.resolve_validation_date("2026-07-03", None)
 
         self.assertEqual(validation_date, "2026-07-06")
@@ -355,6 +364,12 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             }
         )
         module.find_prediction_path = lambda: Path("/tmp/pred.pkl")
+        module.load_qlib_run_metadata = lambda _path: {"run_id": "run_1"}
+        module.validate_prediction_provenance = lambda **_kwargs: {
+            "artifact_sha256": "a" * 64,
+            "provider_identity": {"dataset_id": "qlib_ashare_v2"},
+            "provider_path": "/tmp/provider",
+        }
         module.load_prediction_scores = lambda _path: frame
 
         payload = module.load_latest_qlib_scores("2026-07-05", top_reference_date="2026-07-05")
@@ -362,6 +377,7 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertTrue(payload["available"])
         self.assertEqual(payload["latest_date"], "2026-07-03")
         self.assertEqual(payload["scores"], {"SZ000001": 0.1})
+        self.assertEqual(payload["artifact_sha256"], "a" * 64)
 
     def test_qlib_scores_are_unavailable_when_only_future_scores_exist(self):
         module = load_module()
@@ -373,6 +389,10 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             }
         )
         module.find_prediction_path = lambda: Path("/tmp/pred.pkl")
+        module.load_qlib_run_metadata = lambda _path: {"run_id": "run_1"}
+        module.validate_prediction_provenance = lambda **_kwargs: {
+            "artifact_sha256": "a" * 64,
+        }
         module.load_prediction_scores = lambda _path: frame
 
         payload = module.load_latest_qlib_scores("2026-07-05", top_reference_date="2026-07-05")
@@ -476,6 +496,9 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
                 encoding="utf-8",
             )
             module.find_prediction_path = lambda: pred_path
+            module.validate_prediction_provenance = lambda **_kwargs: {
+                "artifact_sha256": "a" * 64,
+            }
             module.load_prediction_scores = lambda _path: frame
 
             payload = module.load_latest_qlib_scores(
@@ -487,6 +510,37 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         self.assertTrue(payload["available"])
         self.assertEqual(payload["run_id"], "run_meta")
         self.assertEqual(payload["latest_date"], "2026-07-08")
+
+    def test_qlib_provenance_failure_does_not_read_prediction_pickle(self):
+        module = load_module()
+        pred_path = Path("/tmp/mlruns/1/run_1/artifacts/pred.pkl")
+        module.find_prediction_path = lambda: pred_path
+        module.load_qlib_run_metadata = lambda _path: {
+            "run_id": "run_1",
+            "run_generated_at": "2026-07-09T08:00:00+08:00",
+        }
+
+        with (
+            patch.object(
+                module,
+                "validate_prediction_provenance",
+                side_effect=ValueError("prediction artifact hash mismatch"),
+            ),
+            patch.object(
+                module,
+                "load_prediction_scores",
+                side_effect=AssertionError("unvalidated pickle was read"),
+            ) as load_scores,
+        ):
+            payload = module.load_latest_qlib_scores(
+                "2026-07-08",
+                top_reference_date="2026-07-08",
+                run_cutoff="2026-07-09T09:30:00+08:00",
+            )
+
+        self.assertFalse(payload["available"])
+        self.assertIn("artifact hash mismatch", payload["reason"])
+        load_scores.assert_not_called()
 
     def test_qlib_scores_reject_meta_yaml_end_time_after_validation_cutoff(self):
         module = load_module()
@@ -647,6 +701,9 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
             "run_id": "run_1",
             "run_generated_at": "2026-07-09T14:22:49+08:00",
         }
+        module.validate_prediction_provenance = lambda **_kwargs: {
+            "artifact_sha256": "a" * 64,
+        }
 
         payload = module.load_latest_qlib_scores(
             "2026-07-08",
@@ -712,16 +769,19 @@ class ReportCatdeskSignalValidationTest(unittest.TestCase):
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir)
-            calendar_dir = provider / "calendars"
+            calendar_dir = Path(temp_dir) / "calendars"
             calendar_dir.mkdir()
-            (calendar_dir / "day.txt").write_text(
+            calendar_path = calendar_dir / "day.txt"
+            calendar_path.write_text(
                 "2026-09-30\n2026-10-08\n",
                 encoding="utf-8",
             )
-            with patch.dict("os.environ", {"QLIB_PROVIDER_URI": str(provider)}), patch.object(
-                module.sys, "argv", argv
-            ):
+            calendar = module.load_trading_calendar(calendar_path)
+            with patch.object(
+                module,
+                "load_trading_calendar",
+                return_value=calendar,
+            ), patch.object(module.sys, "argv", argv):
                 exit_code = module.main()
 
         self.assertEqual(exit_code, 0)

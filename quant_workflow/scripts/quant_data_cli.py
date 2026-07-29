@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import os
 import sys
@@ -35,7 +38,13 @@ ASHARE_UPDATE_POINTERS = (
     Path("parquet/ashare_1d/ashare_daily_raw/LATEST.json"),
     Path("parquet/ashare_1d/ashare_daily_qfq/LATEST.json"),
     Path("qlib/cn_data_ashare_v2/LATEST.json"),
+    Path("qlib/cn_data_ashare_cleaned_v2/LATEST.json"),
 )
+ASHARE_UPDATE_TRANSACTION_PATH = Path(
+    "runtime/transactions/ashare_v2_update.json"
+)
+ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION = 1
+ASHARE_UPDATE_TRANSACTION_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _read_catalog(root: Path) -> dict[str, Any]:
@@ -106,6 +115,172 @@ def _restore_file_state(state: Mapping[Path, bytes | None]) -> None:
         raise DataContractError(
             "failed to restore formal update pointers: " + ", ".join(failures)
         )
+
+
+def _transaction_path(root: Path) -> Path:
+    return Path(root) / ASHARE_UPDATE_TRANSACTION_PATH
+
+
+def _transaction_file_records(
+    root: Path,
+    state: Mapping[Path, bytes | None],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for relative in ASHARE_UPDATE_POINTERS:
+        path = Path(root) / relative
+        if path not in state:
+            raise DataContractError(
+                f"update transaction state is missing {relative.as_posix()}"
+            )
+        content = state[path]
+        records.append(
+            {
+                "path": relative.as_posix(),
+                "content_base64": (
+                    base64.b64encode(content).decode("ascii")
+                    if content is not None
+                    else None
+                ),
+                "sha256": (
+                    hashlib.sha256(content).hexdigest()
+                    if content is not None
+                    else None
+                ),
+            }
+        )
+    return records
+
+
+def _write_update_transaction(
+    root: Path,
+    state: Mapping[Path, bytes | None],
+    *,
+    dataset_id: str,
+    started_at: str,
+) -> dict[str, Any]:
+    path = _transaction_path(root)
+    if path.exists() or path.is_symlink():
+        raise DataContractError(
+            "an interrupted A-share update transaction journal must be recovered first"
+        )
+    payload: dict[str, Any] = {
+        "schema_version": ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION,
+        "transaction_id": uuid.uuid4().hex,
+        "dataset_id": dataset_id,
+        "started_at": started_at,
+        "status": "prepared",
+        "active_step": "raw_qfq_v2",
+        "completed_steps": [],
+        "previous_files": _transaction_file_records(root, state),
+    }
+    atomic_write_json(path, payload)
+    return payload
+
+
+def _write_update_transaction_progress(
+    root: Path,
+    transaction: dict[str, Any],
+    *,
+    active_step: str,
+    completed_steps: Sequence[str],
+) -> None:
+    transaction["status"] = "publishing"
+    transaction["active_step"] = active_step
+    transaction["completed_steps"] = list(completed_steps)
+    atomic_write_json(_transaction_path(root), transaction)
+
+
+def _remove_update_transaction(root: Path) -> None:
+    path = _transaction_path(root)
+    if path.is_symlink():
+        raise DataContractError("A-share update transaction journal path is unsafe")
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
+
+
+def _read_update_transaction(
+    root: Path,
+) -> tuple[dict[str, Any], dict[Path, bytes | None]]:
+    path = _transaction_path(root)
+    if path.is_symlink() or not path.is_file():
+        raise DataContractError("A-share update transaction journal is unsafe")
+    try:
+        if path.stat().st_size > ASHARE_UPDATE_TRANSACTION_MAX_BYTES:
+            raise DataContractError("A-share update transaction journal is too large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except DataContractError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DataContractError(
+            "A-share update transaction journal is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION
+        or not isinstance(payload.get("transaction_id"), str)
+        or not payload.get("transaction_id")
+        or payload.get("status") not in {"prepared", "publishing"}
+        or not isinstance(payload.get("previous_files"), list)
+    ):
+        raise DataContractError("A-share update transaction journal is invalid")
+
+    expected = {relative.as_posix() for relative in ASHARE_UPDATE_POINTERS}
+    restored: dict[Path, bytes | None] = {}
+    seen: set[str] = set()
+    for record in payload["previous_files"]:
+        if not isinstance(record, dict):
+            raise DataContractError("A-share update transaction journal is invalid")
+        relative_text = record.get("path")
+        if relative_text not in expected or relative_text in seen:
+            raise DataContractError("A-share update transaction journal is invalid")
+        seen.add(relative_text)
+        encoded = record.get("content_base64")
+        recorded_sha256 = record.get("sha256")
+        if encoded is None:
+            if recorded_sha256 is not None:
+                raise DataContractError(
+                    "A-share update transaction journal is invalid"
+                )
+            content = None
+        elif isinstance(encoded, str) and isinstance(recorded_sha256, str):
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise DataContractError(
+                    "A-share update transaction journal is invalid"
+                ) from exc
+            if hashlib.sha256(content).hexdigest() != recorded_sha256:
+                raise DataContractError(
+                    "A-share update transaction journal hash mismatch"
+                )
+        else:
+            raise DataContractError("A-share update transaction journal is invalid")
+        restored[Path(root) / Path(relative_text)] = content
+    if seen != expected:
+        raise DataContractError("A-share update transaction journal is incomplete")
+    return payload, restored
+
+
+def _recover_interrupted_update(root: Path) -> str | None:
+    path = _transaction_path(root)
+    if not path.exists() and not path.is_symlink():
+        return None
+    transaction, previous_files = _read_update_transaction(root)
+    _restore_file_state(previous_files)
+    _remove_update_transaction(root)
+    _try_write_update_status(
+        root,
+        {
+            "status": "recovered_interrupted_update",
+            "dataset_id": transaction.get("dataset_id"),
+            "started_at": transaction.get("started_at"),
+            "transaction_id": transaction.get("transaction_id"),
+            "interrupted_step": transaction.get("active_step"),
+            "completed_steps": transaction.get("completed_steps", []),
+        },
+    )
+    return str(transaction["transaction_id"])
 
 
 def _write_update_status(root: Path, payload: Mapping[str, Any]) -> None:
@@ -287,7 +462,11 @@ def _validate(root: Path, target: str) -> int:
         snapshot = candidate.resolve()
     else:
         snapshot = resolve_dataset(target, quant_data_root=root).snapshot_path
-    manifest = validate_dataset_snapshot(snapshot, verify_hashes=True)
+    manifest = validate_dataset_snapshot(
+        snapshot,
+        verify_hashes=True,
+        evidence_root=root,
+    )
     _json_dump(
         {
             "status": "ready",
@@ -304,17 +483,28 @@ def _update_ashare_from_bundle(
     root: Path,
     dataset_id: str,
     bundle_dir: Path,
+    *,
+    refresh_legacy_compatibility: bool = False,
 ) -> int:
+    from build_cleaned_qlib_v2 import build_cleaned_qlib_v2
     from build_qlib_v2 import build_qlib_v2
     from download_baostock_v2 import build_snapshots_from_bundle
-    from publish_v2_compatibility import rebuild_and_publish_v1_compatibility
 
     previous_files: dict[Path, bytes | None] = {}
+    validated_cache: dict[str, Any] = {}
     completed_steps: list[str] = []
     failed_step = "capture_state"
     started_at = _timestamp()
+    transaction: dict[str, Any] | None = None
     try:
         previous_files = _capture_file_state(root)
+        failed_step = "prepare_transaction"
+        transaction = _write_update_transaction(
+            root,
+            previous_files,
+            dataset_id=dataset_id,
+            started_at=started_at,
+        )
         failed_step = "raw_qfq_v2"
         raw, qfq = build_snapshots_from_bundle(
             bundle_dir=bundle_dir,
@@ -323,22 +513,48 @@ def _update_ashare_from_bundle(
             publication_lock_held=True,
         )
         completed_steps.append("raw_qfq_v2")
+        _write_update_transaction_progress(
+            root,
+            transaction,
+            active_step="qlib_v2",
+            completed_steps=completed_steps,
+        )
         failed_step = "qlib_v2"
         qlib_v2 = build_qlib_v2(
             quant_data_root=root,
             publish=True,
             publication_lock_held=True,
+            validated_cache=validated_cache,
         )
         completed_steps.append("qlib_v2")
-        failed_step = "compatibility"
-        compatibility = rebuild_and_publish_v1_compatibility(
-            quant_data_root=root,
-            publication_lock_held=True,
+        _write_update_transaction_progress(
+            root,
+            transaction,
+            active_step="qlib_cleaned_v2",
+            completed_steps=completed_steps,
         )
-        completed_steps.append("compatibility")
+        failed_step = "qlib_cleaned_v2"
+        qlib_cleaned_v2 = build_cleaned_qlib_v2(
+            quant_data_root=root,
+            publish=True,
+            publication_lock_held=True,
+            validated_cache=validated_cache,
+        )
+        completed_steps.append("qlib_cleaned_v2")
+        failed_step = "commit_transaction"
+        _write_update_transaction_progress(
+            root,
+            transaction,
+            active_step="commit_transaction",
+            completed_steps=completed_steps,
+        )
+        _remove_update_transaction(root)
+        transaction = None
     except Exception as exc:
         try:
             _restore_file_state(previous_files)
+            if transaction is not None:
+                _remove_update_transaction(root)
         except Exception as rollback_exc:
             status_error = _try_write_update_status(
                 root,
@@ -376,20 +592,39 @@ def _update_ashare_from_bundle(
             message += f"; status record failed ({status_error})"
         raise DataContractError(message) from exc
 
+    legacy_compatibility: dict[str, Any] = {"status": "not_requested"}
+    update_status = "completed"
+    if refresh_legacy_compatibility:
+        try:
+            from publish_v2_compatibility import rebuild_and_publish_v1_compatibility
+
+            legacy_compatibility = rebuild_and_publish_v1_compatibility(
+                quant_data_root=root,
+                publication_lock_held=True,
+            )
+        except Exception as exc:
+            update_status = "completed_with_legacy_warning"
+            legacy_compatibility = {
+                "status": "legacy_refresh_failed",
+                "error_type": type(exc).__name__,
+            }
+
     status_error = _try_write_update_status(
         root,
         {
-            "status": "completed",
+            "status": update_status,
             "dataset_id": dataset_id,
             "started_at": started_at,
             "completed_steps": completed_steps,
+            "legacy_compatibility": legacy_compatibility,
         },
     )
     output = {
         "raw": str(raw),
         "qfq": str(qfq),
         "qlib_v2": str(qlib_v2),
-        "compatibility": compatibility,
+        "qlib_cleaned_v2": str(qlib_cleaned_v2),
+        "legacy_compatibility": legacy_compatibility,
     }
     if status_error:
         output["status_record"] = {
@@ -405,6 +640,8 @@ def _update(
     dataset_id: str,
     through: str | None,
     bundle_dir: Path | None,
+    *,
+    refresh_legacy_compatibility: bool = False,
 ) -> int:
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
         update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
@@ -423,7 +660,13 @@ def _update(
 
         try:
             with dataset_publication_lock(root):
-                return _update_ashare_from_bundle(root, dataset_id, bundle_dir)
+                _recover_interrupted_update(root)
+                return _update_ashare_from_bundle(
+                    root,
+                    dataset_id,
+                    bundle_dir,
+                    refresh_legacy_compatibility=refresh_legacy_compatibility,
+                )
         finally:
             unlock_file(update_lock_handle)
             update_lock_handle.close()
@@ -470,6 +713,11 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("dataset_id")
     update_parser.add_argument("--through")
     update_parser.add_argument("--bundle-dir", type=Path)
+    update_parser.add_argument(
+        "--refresh-legacy-compatibility",
+        action="store_true",
+        help="Explicitly rebuild retained mutable V1 compatibility outputs",
+    )
     return parser
 
 
@@ -486,7 +734,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "validate":
             return _validate(root, args.target)
         if args.command == "update":
-            return _update(root, args.dataset_id, args.through, args.bundle_dir)
+            return _update(
+                root,
+                args.dataset_id,
+                args.through,
+                args.bundle_dir,
+                refresh_legacy_compatibility=args.refresh_legacy_compatibility,
+            )
     except DataContractError as exc:
         print(f"不能使用 quant_data 数据：{exc}", file=sys.stderr)
         return 2

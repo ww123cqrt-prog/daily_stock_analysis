@@ -18,6 +18,26 @@ def load_script(name: str):
 
 
 class ApplyDataCleaningTest(unittest.TestCase):
+    def test_rejects_immutable_v2_snapshot_as_mutable_output(self):
+        module = load_script("apply_data_cleaning")
+        with TemporaryDirectory() as temp_dir:
+            snapshot = Path(temp_dir) / "dataset" / "snapshots" / "snapshot-001"
+            snapshot.mkdir(parents=True)
+            (snapshot / "DATASET_MANIFEST.json").write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "immutable V2 snapshot"):
+                module.require_mutable_qlib_output(snapshot)
+
+    def test_rejects_native_v2_dataset_root_as_mutable_output(self):
+        module = load_script("apply_data_cleaning")
+        with TemporaryDirectory() as temp_dir:
+            dataset_root = Path(temp_dir) / "qlib" / "cn_data_ashare_v2"
+            (dataset_root / "snapshots").mkdir(parents=True)
+            (dataset_root / "LATEST.json").write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "immutable V2 dataset root"):
+                module.require_mutable_qlib_output(dataset_root)
+
     def test_cleaned_qlib_conversion_reuses_canonical_calendar(self):
         module = load_script("apply_data_cleaning")
         with TemporaryDirectory() as temp_dir:

@@ -15,8 +15,14 @@ import pandas as pd
 import yaml
 
 from quant_workflow.scripts._optimized_strategy_core import OptimizedStrategy
+from quant_workflow.scripts._mlflow_run_provenance import (
+    RunProvenanceError,
+    resolve_immutable_provider_identity,
+    validate_file_store_run_artifact,
+)
 from src.services.quant_workflow_paths import (
     mlruns_root as resolve_mlruns_root,
+    quant_data_root as resolve_quant_data_root,
     reports_root as resolve_reports_root,
     workflow_root as resolve_workflow_root,
 )
@@ -42,6 +48,15 @@ ALLOWED_STRATEGY_KWARGS = {
 }
 
 MarketLoader = Callable[[Path, str, str], pd.DataFrame]
+ProviderResolver = Callable[[dict[str, Any], Path], Path]
+ArtifactValidator = Callable[..., dict[str, Any]]
+PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "content_sha256",
+    "manifest_sha256",
+)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -119,16 +134,31 @@ class TrainedStrategyBacktestService:
         *,
         reports_root: Path | None = None,
         mlruns_root: Path | None = None,
+        quant_data_root: Path | None = None,
         strategy_config_path: Path | None = None,
         market_loader: MarketLoader | None = None,
+        provider_resolver: ProviderResolver | None = None,
+        artifact_validator: ArtifactValidator | None = None,
     ) -> None:
         self.reports_root = Path(reports_root or resolve_reports_root()).resolve()
         self.mlruns_root = Path(mlruns_root or resolve_mlruns_root()).resolve()
+        self.quant_data_root = Path(
+            quant_data_root or resolve_quant_data_root()
+        ).resolve()
         self.strategy_config_path = Path(
             strategy_config_path
             or (resolve_workflow_root() / "configs" / "candidate_pipeline.yaml")
         ).resolve()
         self.market_loader = market_loader or _default_market_loader
+        self.provider_resolver = provider_resolver or (
+            lambda identity, root: resolve_immutable_provider_identity(
+                identity,
+                quant_data_root=root,
+            )
+        )
+        self.artifact_validator = (
+            artifact_validator or validate_file_store_run_artifact
+        )
 
     def run(
         self,
@@ -153,8 +183,20 @@ class TrainedStrategyBacktestService:
             raise ValueError("cost_bps must be between 0 and 1000")
 
         selection = self._resolve_selection(run_id, model_id, strategy_id)
-        pred = self._read_artifact(selection["experiment_id"], run_id, "pred.pkl")
-        label = self._read_artifact(selection["experiment_id"], run_id, "label.pkl")
+        pred, pred_provenance = self._read_artifact(
+            selection["experiment_id"],
+            run_id,
+            "pred.pkl",
+            expected_provider_identity=selection["provider_identity"],
+            expected_provider_path=selection["provider_uri"],
+        )
+        label, label_provenance = self._read_artifact(
+            selection["experiment_id"],
+            run_id,
+            "label.pkl",
+            expected_provider_identity=selection["provider_identity"],
+            expected_provider_path=selection["provider_uri"],
+        )
         pred_slice = _single_column(_slice_frame(pred, start_date, end_date), "score")
         label_slice = _single_column(_slice_frame(label, start_date, end_date), "label")
         if pred_slice.empty or label_slice.empty:
@@ -225,6 +267,11 @@ class TrainedStrategyBacktestService:
             "strategy_id": selection["strategy_id"],
             "strategy_label": selection["strategy_label"],
             "provider": selection["provider"],
+            "provider_identity": selection["provider_identity"],
+            "artifact_sha256": {
+                "pred.pkl": pred_provenance["artifact_sha256"],
+                "label.pkl": label_provenance["artifact_sha256"],
+            },
             "period": {"start_date": actual_start, "end_date": actual_end},
             "parameters": {
                 "start_date": start_date,
@@ -269,7 +316,8 @@ class TrainedStrategyBacktestService:
                 "strategy_label": strategy_label,
                 "strategy_kwargs": strategy_kwargs,
                 "provider": str(report.get("provider") or "unknown"),
-                "provider_uri": Path(str(report.get("provider_uri") or "")).expanduser(),
+                "provider_uri": self._resolve_report_provider(report),
+                "provider_identity": dict(report["provider_identity"]),
             }
 
         report = _load_json(self.reports_root / "candidate_pipeline_latest.json")
@@ -314,8 +362,24 @@ class TrainedStrategyBacktestService:
             "strategy_label": str(evaluation.get("strategy_label") or strategy_label),
             "strategy_kwargs": strategy_kwargs,
             "provider": str(report.get("provider") or "unknown"),
-            "provider_uri": Path(str(report.get("provider_uri") or "")).expanduser(),
+            "provider_uri": self._resolve_report_provider(report),
+            "provider_identity": dict(report["provider_identity"]),
         }
+
+    def _resolve_report_provider(self, report: dict[str, Any]) -> Path:
+        identity = report.get("provider_identity")
+        if not isinstance(identity, dict):
+            raise ValueError(
+                "Training result does not record an immutable native V2 provider; "
+                "rerun training before recalculating this strategy"
+            )
+        try:
+            return Path(self.provider_resolver(identity, self.quant_data_root)).resolve()
+        except RunProvenanceError as exc:
+            raise ValueError(
+                "Training result provider identity cannot be verified; "
+                "the strategy backtest was not run"
+            ) from exc
 
     def _strategy_config(self, strategy_id: str) -> tuple[str, dict[str, Any]]:
         payload = yaml.safe_load(self.strategy_config_path.read_text(encoding="utf-8")) or {}
@@ -334,7 +398,15 @@ class TrainedStrategyBacktestService:
             raise ValueError(f"Strategy configuration contains unsupported fields: {', '.join(sorted(unsupported))}")
         return str(row.get("label") or strategy_id), dict(kwargs)
 
-    def _read_artifact(self, experiment_id: str, run_id: str, filename: str) -> pd.DataFrame:
+    def _read_artifact(
+        self,
+        experiment_id: str,
+        run_id: str,
+        filename: str,
+        *,
+        expected_provider_identity: dict[str, Any],
+        expected_provider_path: Path,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
         root = self.mlruns_root.resolve()
         path = (root / experiment_id / run_id / "artifacts" / filename).resolve()
         if not path.is_relative_to(root):
@@ -343,10 +415,43 @@ class TrainedStrategyBacktestService:
             raise FileNotFoundError(f"Saved training artifact is missing: {filename}")
         if path.stat().st_size > MAX_PICKLE_BYTES:
             raise ValueError(f"Saved training artifact is too large: {filename}")
+        try:
+            provenance = self.artifact_validator(
+                artifact_path=path,
+                artifact_relative_path=Path(filename),
+                run_id=run_id,
+                mlruns_dir=root,
+                quant_data_root=self.quant_data_root,
+            )
+        except (RunProvenanceError, OSError, UnicodeError) as exc:
+            raise ValueError(
+                f"Saved training artifact provenance cannot be verified: {filename}"
+            ) from exc
+        actual_identity = provenance.get("provider_identity")
+        if not isinstance(actual_identity, dict) or any(
+            actual_identity.get(field) != expected_provider_identity.get(field)
+            for field in PROVIDER_IDENTITY_FIELDS
+        ):
+            raise ValueError(
+                f"Saved training artifact does not match the training report provider: {filename}"
+            )
+        actual_provider_path = Path(
+            str(provenance.get("provider_path") or "")
+        ).expanduser().resolve()
+        if actual_provider_path != Path(expected_provider_path).expanduser().resolve():
+            raise ValueError(
+                f"Saved training artifact does not match the training report provider: {filename}"
+            )
+        artifact_sha256 = str(provenance.get("artifact_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
+            raise ValueError(
+                f"Saved training artifact provenance is incomplete: {filename}"
+            )
         value = pd.read_pickle(path)
         if not isinstance(value, (pd.DataFrame, pd.Series)):
             raise ValueError(f"Saved training artifact has an unsupported type: {filename}")
-        return value.to_frame() if isinstance(value, pd.Series) else value
+        frame = value.to_frame() if isinstance(value, pd.Series) else value
+        return frame, dict(provenance)
 
     @staticmethod
     def _validate_experiment_id(experiment_id: str) -> None:

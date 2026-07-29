@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -20,11 +21,26 @@ def load_module():
 
 
 class TrainBaselineLgbTest(unittest.TestCase):
-    def test_resolves_provider_uris_under_quant_data_root_environment(self):
+    def test_explicit_provider_uri_is_validated_and_used_without_reresolving_latest(self):
+        module = load_module()
+        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+
+        with patch.object(module, "qlib_provider_uri", return_value=pinned) as resolver:
+            resolved = module.resolve_provider_uri("canonical", pinned)
+
+        self.assertEqual(resolved, pinned)
+        resolver.assert_called_once_with(
+            "canonical",
+            snapshot_override=pinned,
+        )
+
+    def test_rejects_legacy_provider_environment_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             quant_data = Path(temp_dir) / "quant_data"
-            canonical = Path(temp_dir) / "native-qlib-snapshot"
+            canonical = quant_data / "qlib" / "cn_data_baostock_jqdata"
             cleaned = quant_data / "qlib" / "cn_data_baostock_jqdata_cleaned"
+            canonical.mkdir(parents=True)
+            cleaned.mkdir(parents=True)
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "train_baseline_lgb.py"
             env = os.environ.copy()
             env["QUANT_DATA_ROOT"] = str(quant_data)
@@ -51,12 +67,11 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 env=env,
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
 
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["canonical"], str(canonical))
-        self.assertEqual(payload["cleaned"], str(cleaned))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("legacy compatibility providers are rejected", result.stderr)
 
     def test_resolves_canonical_and_cleaned_provider_uris(self):
         module = load_module()
@@ -69,7 +84,11 @@ class TrainBaselineLgbTest(unittest.TestCase):
         )
         self.assertEqual(manifest["dataset_id"], "qlib_ashare_v2")
         self.assertTrue(manifest["benchmark_complete"])
-        self.assertTrue(str(cleaned).endswith("cn_data_baostock_jqdata_cleaned"))
+        cleaned_manifest = json.loads(
+            (cleaned / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(cleaned_manifest["dataset_id"], "qlib_ashare_cleaned_v2")
+        self.assertTrue(cleaned_manifest["benchmark_complete"])
 
     def test_rejects_unknown_provider_name(self):
         module = load_module()
@@ -216,26 +235,30 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(fixed, 1)
         self.assertEqual(payload["artifact_location"], (mlruns / "123").resolve().as_uri())
 
-    def test_mirrors_legacy_run_artifacts_when_target_is_empty(self):
+    def test_required_training_artifacts_must_exist_in_active_mlruns(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            legacy = root / "quant_workflow" / "mlruns" / "123" / "run-1" / "artifacts"
-            target_root = root / "daily_stock_analysis" / "quant_workflow" / "mlruns"
-            legacy.mkdir(parents=True)
-            (legacy / "pred.pkl").write_bytes(b"prediction")
+            mlruns = root / "mlruns"
+            artifacts = mlruns / "123" / "run-1" / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "pred.pkl").write_bytes(b"prediction")
 
-            mirrored = module.mirror_run_artifacts_from_legacy_locations(
+            with self.assertRaisesRegex(RuntimeError, "label.pkl"):
+                module.require_local_training_artifacts(
+                    "run-1",
+                    "123",
+                    mlruns_dir=mlruns,
+                )
+
+            (artifacts / "label.pkl").write_bytes(b"label")
+            local = module.require_local_training_artifacts(
                 "run-1",
                 "123",
-                projects=root,
-                mlruns_dir=target_root,
+                mlruns_dir=mlruns,
             )
 
-            target = target_root / "123" / "run-1" / "artifacts" / "pred.pkl"
-            self.assertTrue(mirrored)
-            self.assertEqual(target.read_bytes(), b"prediction")
-            self.assertEqual(module.local_run_artifacts("run-1", "123", mlruns_dir=target_root), ["pred.pkl"])
+        self.assertEqual(local, ["label.pkl", "pred.pkl"])
 
     def test_local_run_artifacts_returns_empty_for_missing_run(self):
         module = load_module()
@@ -244,6 +267,32 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 module.local_run_artifacts("missing-run", "123", mlruns_dir=Path(temp_dir) / "mlruns"),
                 [],
             )
+
+    def test_training_records_hashes_after_artifacts_are_local(self):
+        module = load_module()
+        client = object()
+        expected = {
+            "pred.pkl": "a" * 64,
+            "label.pkl": "b" * 64,
+        }
+
+        with patch.object(
+            module,
+            "tag_run_artifact_hashes",
+            return_value=expected,
+        ) as tag_hashes:
+            result = module.tag_training_run_artifacts(
+                "run-1",
+                mlruns_dir=Path("/tmp/mlruns"),
+                client=client,
+            )
+
+        self.assertEqual(result, expected)
+        tag_hashes.assert_called_once_with(
+            client,
+            "run-1",
+            mlruns_dir=Path("/tmp/mlruns"),
+        )
 
     def test_builds_csi300_lines_from_provider_instrument_ranges(self):
         module = load_module()
@@ -331,6 +380,34 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(runs[0]["qlib_provider"], "/tmp/qlib_cleaned")
         self.assertIn("<!-- experiment-run:cleaned-run-1 -->", log_text)
         self.assertIn("baseline_lgb_alpha158_cleaned", log_text)
+
+    def test_record_training_result_can_preserve_latest_for_smoke_run(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            latest = report_dir / "latest_training_result.json"
+            latest.write_text('{"run_id":"formal-run"}\n', encoding="utf-8")
+
+            module.record_training_result(
+                {
+                    "run_id": "smoke-run",
+                    "status": "completed",
+                    "experiment_name": "native_v2_smoke",
+                },
+                publish_latest=False,
+                report_dir=report_dir,
+            )
+
+            latest_payload = json.loads(latest.read_text(encoding="utf-8"))
+            history = [
+                json.loads(line)
+                for line in (report_dir / "experiment_runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(latest_payload["run_id"], "formal-run")
+        self.assertEqual(history[0]["run_id"], "smoke-run")
 
 
 if __name__ == "__main__":

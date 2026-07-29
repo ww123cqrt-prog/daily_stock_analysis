@@ -15,8 +15,9 @@ Path convention:
 - `WORKING_PROJECTS_ROOT` moves the default project family roots together.
 - `QUANT_WORKFLOW_ROOT`, `QUANT_WORKFLOW_REPORTS_ROOT`,
   `QUANT_WORKFLOW_MLRUNS_DIR`, `QUANT_DATA_ROOT`, `QLIB_PROVIDER_URI`,
-  `QLIB_CLEANED_PROVIDER_URI`, `QLIB_COMPATIBILITY_PROVIDER_URI`, and
-  `CHINA_ASTOCK_QUANT_ROOT` override specific
+  `QLIB_CLEANED_PROVIDER_URI`, `QLIB_COMPATIBILITY_PROVIDER_URI`,
+  `QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI`, and `CHINA_ASTOCK_QUANT_ROOT`
+  override specific
   paths when needed.
 - Do not add new hardcoded local absolute paths in scripts.
 
@@ -29,9 +30,17 @@ Naming convention:
 - `supervise_<source>.py` runs a restartable long download.
 - `merge_to_qlib.py` creates mutable V1-compatible merged Parquet/Qlib output;
   it is not the canonical native V2 builder.
-- `apply_data_cleaning.py` applies anomaly reports into a separate cleaned
-  Parquet + Qlib provider without overwriting the canonical provider.
+- `build_cleaned_qlib_v2.py` creates and atomically publishes the native
+  immutable cleaned provider from the governed qfq snapshot and canonical
+  benchmark evidence. `apply_data_cleaning.py` remains a bounded legacy/manual
+  candidate tool and cannot overwrite an immutable V2 snapshot.
 - `check_qlib_data.py` smoke-checks the resolved native V2 provider by default.
+  `--provider cleaned` performs the same real Qlib read against the native
+  cleaned snapshot.
+- `compare_native_qlib_benchmarks.py` joins SH000300/SH000905/SH000906 by
+  trading date and requires exact equality for open/high/low/close/volume/factor
+  across the full retained compatibility overlap. Directory existence is not
+  treated as evidence.
 - `repair_qlib_provider.py` fixes provider instrument metadata without a full rebuild.
 - `add_index_benchmark.py` and `generate_csi300.py` are provider-maintenance
   scripts. They now support `--dry-run` and parameterized paths, but should
@@ -100,11 +109,16 @@ Naming convention:
   legacy incremental splices from unexplained price-path drift.
   `quant_data_cli.py update ashare_daily_qfq --bundle-dir <verified-bundle>`
   validates all hashes and switches raw/qfq snapshots plus the root catalog as
-  one rollback transaction.
+  one rollback transaction, then builds canonical and cleaned native Qlib
+  snapshots before the formal update is considered complete.
 - `build_qlib_v2.py` resolves the exact governed A-share qfq snapshot, converts
   it to an immutable Qlib provider, records the upstream snapshot ID and
   content hash in `PROVIDER_MANIFEST.json`, and publishes the Qlib pointer and
   root catalog with rollback on failure.
+- `build_cleaned_qlib_v2.py` resolves the same qfq snapshot plus the matching
+  native canonical provider, applies recorded anomaly masks, imports native
+  benchmark and instrument evidence, and atomically publishes
+  `qlib_ashare_cleaned_v2`.
 - `publish_v2_compatibility.py` rebuilds the four stable V1 Parquet/Qlib paths
   from the exact governed qfq snapshot. It preserves six-digit Parquet names,
   nanosecond dates, the V1 column order, and unit Qlib factors because prices
@@ -115,6 +129,9 @@ Naming convention:
   CSI300. Tencent benchmark requests are rate-limited and use bounded retry;
   one missing benchmark rejects the full candidate. On the first promotion,
   previous V1 outputs are retained under `_old` for rollback and audit.
+  Normal V2 updates do not call this script. Compatibility publication occurs
+  only when `quant_data_cli.py update ashare_daily_qfq` is explicitly given
+  `--refresh-legacy-compatibility`.
 - `sync_data_manifest.py` writes schema-v2 `DATA_MANIFEST.json`, keeps all data
   paths relative to `QUANT_DATA_ROOT`, refreshes generated README catalog
   blocks, and supports `--check` for catalog/path/README drift.
@@ -148,11 +165,13 @@ data splits, and output paths are documented here.
 The current main provider is resolved from `DATA_MANIFEST.json` as
 `qlib_ashare_v2`. Each process receives the exact immutable snapshot path and
 keeps it for the whole training or backtest run. `QLIB_PROVIDER_URI` is an
-explicit emergency/test override, not the normal path.
+explicit pin for a fully validated snapshot under
+`qlib/cn_data_ashare_v2/snapshots/`; compatibility directories are rejected.
 
-The optional cleaned provider defaults to:
-
-`${QUANT_DATA_ROOT}/qlib/cn_data_baostock_jqdata_cleaned`
+The cleaned provider resolves from `DATA_MANIFEST.json` as
+`qlib_ashare_cleaned_v2`. `QLIB_CLEANED_PROVIDER_URI` is an explicit pin and
+must pass the same full snapshot validation under
+`qlib/cn_data_ashare_cleaned_v2/snapshots/`.
 
 Mutable maintenance scripts such as `merge_to_qlib.py`,
 `add_index_benchmark.py`, `generate_csi300.py` and

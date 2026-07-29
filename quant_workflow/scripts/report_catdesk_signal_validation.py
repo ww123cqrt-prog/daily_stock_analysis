@@ -31,7 +31,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import ashare_qfq_bars_dir, projects_root, reports_root  # noqa: E402
+from _paths import (  # noqa: E402
+    ashare_qfq_bars_dir,
+    mlruns_root,
+    projects_root,
+    quant_data_root,
+    reports_root,
+)
 from _symbols import to_qlib_name  # noqa: E402
 from _trading_calendar import (  # noqa: E402
     WEEKDAY_FALLBACK_SOURCE,
@@ -41,6 +47,7 @@ from market_data_clients import fetch_sina_a_snapshots  # noqa: E402
 from report_qlib_predictions import (  # noqa: E402
     find_prediction_path,
     load_prediction_scores,
+    validate_prediction_provenance,
 )
 
 
@@ -467,6 +474,29 @@ def load_latest_qlib_scores(
             signal_date=signal_date,
             metadata=metadata,
         )
+
+    try:
+        provenance = validate_prediction_provenance(
+            prediction_path=pred_path,
+            run_id=str(metadata.get("run_id") or ""),
+            mlruns_dir=mlruns_root(),
+            quant_data_root_path=quant_data_root().expanduser().resolve(),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _qlib_unavailable(
+            str(exc),
+            pred_path=pred_path,
+            signal_date=signal_date,
+            metadata=metadata,
+        )
+    metadata.update(
+        {
+            "provenance_status": "validated",
+            "artifact_sha256": str(provenance.get("artifact_sha256") or ""),
+            "provider_identity": dict(provenance.get("provider_identity") or {}),
+            "provider_path": str(provenance.get("provider_path") or ""),
+        }
+    )
 
     try:
         scores = load_prediction_scores(pred_path)

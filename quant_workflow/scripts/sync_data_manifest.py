@@ -446,6 +446,29 @@ def _v2_dataset_catalog(
                 "new-versus-legacy consistency comparison pass."
             ),
         },
+        "qlib_ashare_cleaned_v2": {
+            "dataset_id": "qlib_ashare_cleaned_v2",
+            "data_kind": "qlib_provider",
+            "role": "canonical",
+            "status": "blocked",
+            "source": {
+                "provider": "quant_workflow",
+                "interface": "v2_anomaly_cleaning_to_qlib",
+            },
+            "price_basis": "qfq",
+            "path": "qlib/cn_data_ashare_cleaned_v2",
+            "source_retrieved_at": "unknown",
+            "adjustment": {
+                "method": "upstream_qfq_snapshot",
+                "evidence_status": "upstream_ashare_daily_qfq_blocked",
+            },
+            "snapshot_available": False,
+            "blocker_codes": ["ashare_daily_qfq_not_ready"],
+            "migration_note": (
+                "Build only after qlib_ashare_v2 and its benchmark evidence "
+                "match the current canonical A-share qfq snapshot."
+            ),
+        },
         "ashare_baostock_qfq_legacy": _legacy_dataset_entry(
             quant_data=quant_data,
             dataset_id="ashare_baostock_qfq_legacy",
@@ -808,7 +831,11 @@ def _v2_dataset_catalog(
         if isinstance(entry, dict)
         and entry.get("lifecycle") == "compatibility_output"
     )
-    for canonical_id in ("ashare_daily_qfq", "qlib_ashare_v2"):
+    for canonical_id in (
+        "ashare_daily_qfq",
+        "qlib_ashare_v2",
+        "qlib_ashare_cleaned_v2",
+    ):
         entry = datasets.get(canonical_id)
         if isinstance(entry, dict) and compatibility_ids:
             entry["compatibility_outputs"] = compatibility_ids
@@ -827,39 +854,73 @@ def _enrich_derived_entries(datasets: dict[str, Any]) -> None:
         ):
             continue
         upstream_snapshots = entry.get("upstream_snapshots")
-        upstream = (
-            upstream_snapshots[0]
-            if isinstance(upstream_snapshots, list)
+        dependencies = entry.get("dependency_snapshots", [])
+        valid_upstream_shape = bool(
+            isinstance(upstream_snapshots, list)
             and len(upstream_snapshots) == 1
             and isinstance(upstream_snapshots[0], dict)
-            else None
         )
-        current = (
-            datasets.get(str(upstream.get("dataset_id") or ""))
-            if upstream is not None
-            else None
+        valid_dependency_shape = bool(
+            isinstance(dependencies, list)
+            and all(isinstance(item, dict) for item in dependencies)
         )
-        matches = bool(
-            isinstance(current, dict)
-            and current.get("status") == "ready"
-            and upstream.get("snapshot_id") == current.get("snapshot_id")
-            and upstream.get("content_sha256") == current.get("content_sha256")
-            and upstream.get("price_basis") == current.get("price_basis")
-        )
-        if matches:
-            if entry.get("blocker_codes") == ["upstream_snapshot_mismatch"]:
+        blockers: list[str] = []
+        current_upstream: dict[str, Any] | None = None
+        current_dependencies: dict[str, dict[str, Any]] = {}
+
+        def identity_matches(identity: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+            current = datasets.get(str(identity.get("dataset_id") or ""))
+            matches = bool(
+                isinstance(current, dict)
+                and current.get("status") == "ready"
+                and identity.get("snapshot_id") == current.get("snapshot_id")
+                and identity.get("content_sha256") == current.get("content_sha256")
+                and identity.get("price_basis") == current.get("price_basis")
+            )
+            return matches, current if isinstance(current, dict) else None
+
+        if valid_upstream_shape:
+            upstream = upstream_snapshots[0]
+            upstream_matches, current_upstream = identity_matches(upstream)
+            if not upstream_matches:
+                blockers.append("upstream_snapshot_mismatch")
+        else:
+            blockers.append("upstream_snapshot_mismatch")
+
+        if valid_dependency_shape:
+            for dependency in dependencies:
+                dependency_id = str(dependency.get("dataset_id") or "")
+                matches, current = identity_matches(dependency)
+                if current is not None and dependency_id:
+                    current_dependencies[dependency_id] = {
+                        field: current.get(field)
+                        for field in ("snapshot_id", "content_sha256", "price_basis", "status")
+                    }
+                if not matches and "dependency_snapshot_mismatch" not in blockers:
+                    blockers.append("dependency_snapshot_mismatch")
+        else:
+            blockers.append("dependency_snapshot_mismatch")
+
+        if not blockers:
+            if set(entry.get("blocker_codes") or []).issubset(
+                {"upstream_snapshot_mismatch", "dependency_snapshot_mismatch"}
+            ):
                 entry["status"] = "ready"
                 entry.pop("blocker_codes", None)
                 entry.pop("current_upstream_snapshot_id", None)
                 entry.pop("current_upstream_content_sha256", None)
+                entry.pop("current_dependency_snapshots", None)
             continue
+
         entry["status"] = "stale"
-        entry["blocker_codes"] = ["upstream_snapshot_mismatch"]
-        if isinstance(current, dict):
-            entry["current_upstream_snapshot_id"] = current.get("snapshot_id")
-            entry["current_upstream_content_sha256"] = current.get(
+        entry["blocker_codes"] = blockers
+        if current_upstream is not None:
+            entry["current_upstream_snapshot_id"] = current_upstream.get("snapshot_id")
+            entry["current_upstream_content_sha256"] = current_upstream.get(
                 "content_sha256"
             )
+        if current_dependencies:
+            entry["current_dependency_snapshots"] = current_dependencies
 
 
 def _enrich_compatibility_entries(
@@ -969,6 +1030,7 @@ def _dataset_id_for_pointer(
         "parquet/ashare_1d/ashare_daily_raw": "ashare_daily_raw",
         "parquet/ashare_1d/ashare_daily_qfq": "ashare_daily_qfq",
         "qlib/cn_data_ashare_v2": "qlib_ashare_v2",
+        "qlib/cn_data_ashare_cleaned_v2": "qlib_ashare_cleaned_v2",
     }
     return known_roots.get(relative_root, pointer_path.parent.name)
 
@@ -1252,8 +1314,10 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
     qlib_root = quant_data / "qlib"
 
     cleaned_parquet = parquet_root / "merged_baostock_jqdata_cleaned"
-    cleaned_provider = qlib_root / "cn_data_baostock_jqdata_cleaned"
-    canonical_provider = qlib_root / "cn_data_baostock_jqdata"
+    compatibility_cleaned_provider = qlib_root / "cn_data_baostock_jqdata_cleaned"
+    compatibility_provider = qlib_root / "cn_data_baostock_jqdata"
+    native_provider = qlib_root / "cn_data_ashare_v2"
+    native_cleaned_provider = qlib_root / "cn_data_ashare_cleaned_v2"
     reference_root = quant_data / "reference"
     robust_runtime_root = quant_data / "runtime" / "robust_strategy"
     pit_entry, pit_pending, reference_entry, reference_pending = (
@@ -1275,8 +1339,8 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
         },
         "cleaned_qlib_provider": {
             **qlib_entry(
-                cleaned_provider,
-                "Legacy cleaned Qlib provider; default DSA training and backtesting use qlib_ashare_v2.",
+                compatibility_cleaned_provider,
+                "Legacy cleaned Qlib provider retained only for old consumers and rollback.",
             ),
             "status": "do_not_move",
             "role": "legacy",
@@ -1346,8 +1410,16 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
                 "Merged pre-cleaning parquet dataset retained for comparison and reproducibility.",
             ),
             "canonical_qlib_provider": qlib_entry(
-                canonical_provider,
-                "Merged pre-cleaning Qlib provider retained as a comparison baseline.",
+                native_provider,
+                "Native immutable qlib_ashare_v2 provider resolved through DATA_MANIFEST.json.",
+            ),
+            "cleaned_qlib_provider": qlib_entry(
+                native_cleaned_provider,
+                "Native immutable cleaned Qlib provider with recorded anomaly-masking evidence.",
+            ),
+            "compatibility_qlib_provider": qlib_entry(
+                compatibility_provider,
+                "Legacy mutable Qlib path retained only for old consumers and rollback.",
             ),
             "etf_momentum_rotation": parquet_entry(
                 etf_root / "etf_momentum_rotation" / "v1",

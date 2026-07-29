@@ -117,12 +117,12 @@ function readyResearchStatus() {
     };
 }
 
-function renderWorkflowPage() {
+function renderWorkflowPage(surface: 'all' | 'training' = 'all') {
   localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
   return render(
     <UiLanguageProvider>
       <MemoryRouter>
-        <QuantTaskPage surface="all" />
+        <QuantTaskPage surface={surface} />
       </MemoryRouter>
     </UiLanguageProvider>,
   );
@@ -161,9 +161,9 @@ describe('WorkflowPage', () => {
         generate_etf_momentum_report: { label: '生成 ETF 完整策略报告', allowedParams: [] },
         validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
-        merge_to_qlib: { label: '合并并转换为 Qlib', allowedParams: ['no_overwrite', 'smoke'] },
-        apply_data_cleaning: { label: '应用清洗策略生成 cleaned Qlib', allowedParams: ['dry_run', 'no_overwrite', 'skip_qlib_convert'] },
-        repair_qlib_provider: { label: '预演修复 Qlib Provider', allowedParams: [] },
+        merge_to_qlib: { label: '构建并发布原生 Qlib V2', allowedParams: ['no_overwrite', 'smoke'] },
+        apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
+        repair_qlib_provider: { label: '预演旧兼容 Qlib 修复', allowedParams: [] },
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
         report_data_quality: { label: '生成数据质量报告', allowedParams: ['overlap_sample', 'merged_sample'] },
         report_data_anomalies: { label: '生成异常股票和清洗策略', allowedParams: [] },
@@ -180,8 +180,8 @@ describe('WorkflowPage', () => {
         report_qlib_risk_model: { label: '生成 Qlib 组合风险诊断', allowedParams: ['run_id'] },
         train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config', 'experiment_name', 'provider'] },
         run_candidate_pipeline: { label: '运行五个选股模型候选流程', allowedParams: ['dry_run', 'provider'] },
-        generate_csi300: { label: '预演生成 CSI300 股票池', allowedParams: [] },
-        add_index_benchmark: { label: '预演添加沪深300 benchmark', allowedParams: [] },
+        generate_csi300: { label: '预演旧兼容 CSI300 股票池', allowedParams: [] },
+        add_index_benchmark: { label: '预演旧兼容 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
         report_china_astock_indicators: { label: '生成 china-astock 技术指标报告', allowedParams: ['symbols', 'lookback_days', 'limit'] },
         optimize_strategy: { label: '交易策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
@@ -403,13 +403,13 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。')).toBeInTheDocument();
     expect(screen.getByText('下载 AkShare 日线')).toBeInTheDocument();
     expect(screen.getByText('调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。')).toBeInTheDocument();
-    expect(screen.getByText('合并 Qlib')).toBeInTheDocument();
+    expect(screen.getByText('原生 Qlib V2')).toBeInTheDocument();
     expect(screen.getByText('校验新浪最新快照')).toBeInTheDocument();
     expect(screen.getByText('抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。')).toBeInTheDocument();
-    expect(screen.getByText('预演生成 CSI300 股票池')).toBeInTheDocument();
-    expect(screen.getByText('预演添加沪深300 benchmark')).toBeInTheDocument();
+    expect(screen.getByText('预演旧兼容 CSI300 股票池')).toBeInTheDocument();
+    expect(screen.getByText('预演旧兼容 benchmark')).toBeInTheDocument();
     expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
-    expect(screen.getByText('应用清洗策略')).toBeInTheDocument();
+    expect(screen.getByText('构建原生 cleaned Qlib V2 快照')).toBeInTheDocument();
     expect(screen.getAllByText('质量报告').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('选股模型训练与交易策略验证')).toBeInTheDocument();
     expect(screen.getByText('运行五个选股模型候选流程')).toBeInTheDocument();
@@ -417,7 +417,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五个选股模型候选流程');
     expect(screen.getByLabelText('运行五个选股模型候选流程 数据版本')).toBeInTheDocument();
     expect(screen.getAllByRole('option', { name: '原生 V2（正式）' })).toHaveLength(2);
-    expect(screen.getAllByRole('option', { name: '旧版清洗数据（兼容）' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: '原生 cleaned V2' })).toHaveLength(2);
     expect(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
@@ -438,7 +438,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
     expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 技术指标报告')).toBeInTheDocument();
-    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取本地 cleaned 行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
+    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取原生 V2 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
     expect(screen.getByLabelText('生成 china-astock 技术指标报告 股票代码')).toBeInTheDocument();
     expect(screen.getByText('生成数据治理盘点和清理预案')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-report_data_hygiene')).toBeInTheDocument();
@@ -482,6 +482,87 @@ describe('WorkflowPage', () => {
     expect(screen.getAllByText('未启动').length).toBeGreaterThan(0);
     expect(screen.getByText('connection refused')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', '/experiments/');
+  });
+
+  it('warns when the candidate pipeline is from the old compatibility provider', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      candidatePipeline: {
+        status: 'completed',
+        providerStatus: 'stale',
+        providerCurrent: false,
+        providerWarning: '该候选报告使用旧兼容数据，只能作为历史参考。',
+        models: [
+          {
+            id: 'xgboost',
+            label: 'XGBoost',
+            status: 'completed',
+            runId: 'run-xgb',
+          },
+        ],
+        strategyEvaluations: [
+          {
+            modelId: 'xgboost',
+            strategyId: 'combined_risk',
+            strategyLabel: '完整组合风控',
+          },
+        ],
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(
+      await screen.findByText('该候选报告使用旧兼容数据，只能作为历史参考。'),
+    ).toBeInTheDocument();
+  });
+
+  it('warns separately when the latest training result is historical', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      latestTraining: {
+        status: 'completed',
+        experimentName: 'baseline_lgb_alpha158',
+        runId: 'abc123',
+        providerStatus: 'stale',
+        providerCurrent: false,
+        providerWarning: '该训练结果使用旧数据，只能作为历史参考。',
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(
+      await screen.findByText('该训练结果使用旧数据，只能作为历史参考。'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('训练结果来自旧数据')).toBeInTheDocument();
+  });
+
+  it('labels an invalid native catalog distinctly in English', async () => {
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      candidatePipeline: {
+        status: 'completed',
+        providerStatus: 'catalog_invalid',
+        providerCurrent: false,
+        providerWarning: '后端中文诊断不应直接显示',
+        models: [],
+        strategyEvaluations: [],
+      },
+    });
+
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter>
+          <QuantTaskPage surface="training" />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByText('Native V2 catalog invalid')).toBeInTheDocument();
+    expect(screen.getByText(/current canonical dataset cannot be verified/i)).toBeInTheDocument();
+    expect(screen.queryByText(/old compatibility data/i)).not.toBeInTheDocument();
   });
 
   it('localizes the MLflow status card in English mode', async () => {
@@ -626,7 +707,7 @@ describe('WorkflowPage', () => {
     await act(async () => {
       resolveStatus({
         availableJobTypes: {
-          apply_data_cleaning: { label: '应用清洗策略生成 cleaned Qlib', allowedParams: ['dry_run', 'no_overwrite'] },
+          apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
         },
         activeCount: 0,
         latestJobs: {},
@@ -664,8 +745,8 @@ describe('WorkflowPage', () => {
   it('submits provider maintenance preview jobs without user params', async () => {
     renderWorkflowPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: '运行 预演生成 CSI300 股票池' }));
-    fireEvent.click(await screen.findByRole('button', { name: '运行 预演添加沪深300 benchmark' }));
+    fireEvent.click(await screen.findByRole('button', { name: '运行 预演旧兼容 CSI300 股票池' }));
+    fireEvent.click(await screen.findByRole('button', { name: '运行 预演旧兼容 benchmark' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('generate_csi300', {});
@@ -830,14 +911,12 @@ describe('WorkflowPage', () => {
   it('submits the isolated smoke fixture flag for Qlib merge jobs', async () => {
     renderWorkflowPage();
 
-    fireEvent.click(await screen.findByLabelText('合并并转换为 Qlib 使用隔离小样本演练'));
-    fireEvent.click(screen.getByLabelText('合并并转换为 Qlib 跳过已有输出文件'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 合并并转换为 Qlib' }));
+    fireEvent.click(await screen.findByLabelText('构建并发布原生 Qlib V2 使用隔离小样本演练'));
+    fireEvent.click(screen.getByRole('button', { name: '运行 构建并发布原生 Qlib V2' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('merge_to_qlib', {
         smoke: true,
-        no_overwrite: true,
       });
     });
   });
@@ -953,14 +1032,12 @@ describe('WorkflowPage', () => {
   it('submits the cleaned Qlib provider task from the workflow page', async () => {
     renderWorkflowPage();
 
-    fireEvent.click(await screen.findByLabelText('应用清洗策略 只预演不写入'));
-    fireEvent.click(await screen.findByLabelText('应用清洗策略 不覆盖已有文件'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 应用清洗策略' }));
+    fireEvent.click(await screen.findByLabelText('构建原生 cleaned Qlib V2 快照 只预演不写入'));
+    fireEvent.click(screen.getByRole('button', { name: '运行 构建原生 cleaned Qlib V2 快照' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('apply_data_cleaning', {
         dry_run: true,
-        no_overwrite: true,
       });
     });
   });
@@ -973,7 +1050,6 @@ describe('WorkflowPage', () => {
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('apply_data_cleaning', {
         dry_run: true,
-        no_overwrite: true,
       });
     });
   });

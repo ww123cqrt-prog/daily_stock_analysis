@@ -45,12 +45,21 @@ china-astock-quant adapters, and every stable script here. Data paths use
   --output-dir /path/to/staging-bundle \
   --through YYYY-MM-DD --resume
 
-# Publish verified A-share v2 raw/qfq, Qlib v2, and V1-compatible outputs
+# Publish verified A-share raw/qfq plus native canonical and cleaned Qlib v2.
+# This does not touch legacy fixed paths unless the explicit refresh flag is added.
 .venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir /path/to/verified-bundle
 
+# Optional maintenance for an explicitly identified old consumer only
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
+  ashare_daily_qfq --bundle-dir /path/to/verified-bundle \
+  --refresh-legacy-compatibility
+
 # Build and publish Qlib from the exact governed qfq snapshot
 .venv/bin/python quant_workflow/scripts/build_qlib_v2.py --publish
+
+# Build and publish the native cleaned Qlib snapshot
+.venv/bin/python quant_workflow/scripts/build_cleaned_qlib_v2.py --publish
 
 # Supervise Baostock in restartable batches
 .venv/bin/python quant_workflow/scripts/supervise_baostock.py
@@ -64,8 +73,8 @@ china-astock-quant adapters, and every stable script here. Data paths use
 # Smoke-check the resolved native Qlib V2 provider
 .venv/bin/python quant_workflow/scripts/check_qlib_data.py
 
-# Apply anomaly cleaning rules into a separate cleaned provider
-.venv/bin/python quant_workflow/scripts/apply_data_cleaning.py
+# Inspect a legacy/manual cleaning candidate without publishing native data
+.venv/bin/python quant_workflow/scripts/apply_data_cleaning.py --dry-run
 
 # Update independent sources and validate existing native A-share V2. A history
 # source selected here updates audit cache only; canonical publication requires
@@ -93,6 +102,7 @@ china-astock-quant adapters, and every stable script here. Data paths use
 ## Current Data Outputs
 
 - Canonical A-share Qlib v2 snapshots: `quant_data/qlib/cn_data_ashare_v2/snapshots/<snapshot_id>`
+- Canonical cleaned A-share Qlib v2 snapshots: `quant_data/qlib/cn_data_ashare_cleaned_v2/snapshots/<snapshot_id>`
 - Baostock Parquet: `quant_data/parquet/ashare_1d/baostock_qfq`
 - JQData Parquet: `quant_data/parquet/ashare_1d/jqdata`
 - V1-compatible merged Parquet generated from V2: `quant_data/parquet/ashare_1d/merged_baostock_jqdata`
@@ -113,15 +123,15 @@ paths and readiness state remain authoritative in
 `${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
 `preflight_robust_data.py`.
 
-The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`, and
-`qlib_ashare_v2`; resolve them through `quant_data_cli.py` instead of hard-coding
-snapshot paths. DSA canonical training, prediction, backtesting, trading-calendar
-and quality checks resolve `qlib_ashare_v2` once per process. The original
-merged paths remain generated compatibility outputs for rollback, mutable
-maintenance tools and callers that still require cleaned semantics; they are
-not the canonical DSA input. Only the `_old` directories and old source
-directories are audit-only. Do not infer readiness from directory names; the
-live manifest is authoritative.
+The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`,
+`qlib_ashare_v2`, and `qlib_ashare_cleaned_v2`; resolve them through
+`quant_data_cli.py` instead of hard-coding snapshot paths. DSA training,
+prediction, backtesting, trading-calendar and quality checks resolve one exact
+native snapshot per process. Canonical and cleaned semantics remain separate.
+The original merged paths remain legacy compatibility outputs for rollback and
+explicit old consumers only; they are not a DSA training input. `_old`
+directories and old source directories are audit-only. Do not infer readiness
+from directory names; the live manifest is authoritative.
 
 The robust strategy configuration uses verified offline reuse for the one-time
 reference snapshot and the three Qlib benchmarks. It does not silently redownload
@@ -183,9 +193,16 @@ directories are not supported.
   share `source_download.lock.json`. Direct shell launches therefore cannot run
   two of these provider downloaders at the same time.
 - The daily runner never invokes the legacy merged/cleaned candidate publisher.
-  V2 bundle publication follows immutable staging, validation and pointer
-  rollback inside `quant_data_cli.py`; fixed-path compatibility outputs are
-  maintained by `publish_v2_compatibility.py` only.
+  V2 bundle publication stages and validates raw, qfq, canonical Qlib and
+  cleaned Qlib. Before the first pointer changes, it fsyncs the old catalog and
+  all four pointers to `runtime/transactions/ashare_v2_update.json`. A normal
+  exception rolls them back immediately; after SIGKILL, a host crash, or power
+  loss, the next locked update restores them before publishing anything new.
+  The transaction journal is removed durably only after all four native steps
+  pass. Fixed-path compatibility output is left unchanged by default. It is
+  rebuilt only when an operator explicitly passes
+  `--refresh-legacy-compatibility`; a failure in that optional maintenance step
+  is reported as a warning and cannot roll back valid native snapshots.
 - Benchmark fallback is fail-closed. Baostock, anonymous public-source
   fallbacks, and validated local provider caches are tried in order; missing
   benchmark dates are never silently forward-filled as real closes.

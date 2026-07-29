@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
@@ -27,6 +29,10 @@ except ImportError:  # pragma: no cover - msvcrt is only available on Windows.
 
 from fastapi import APIRouter, HTTPException, Query
 
+from quant_workflow.scripts.quant_data_contract import (
+    DataContractError,
+    validate_qlib_snapshot,
+)
 from src.safe_errors import sanitize_public_error
 from src.safe_urls import public_http_url
 from src.services.quant_workflow_paths import (
@@ -58,6 +64,14 @@ LATEST_TRAINING_RESULT_FILENAME = "latest_training_result.json"
 CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
 CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
+DATA_MANIFEST_FILENAME = "DATA_MANIFEST.json"
+NATIVE_QLIB_DATASET_ID = "qlib_ashare_v2"
+NATIVE_QLIB_DATASET_ROOT = Path("qlib/cn_data_ashare_v2")
+NATIVE_QLIB_LATEST_POINTER = NATIVE_QLIB_DATASET_ROOT / "LATEST.json"
+NATIVE_QLIB_DATASET_ROOTS = {
+    NATIVE_QLIB_DATASET_ID: NATIVE_QLIB_DATASET_ROOT,
+    "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
+}
 ROBUST_STRATEGY_DIRNAME = "robust_strategy"
 ROBUST_SIGNAL_DIRNAME = "robust_signal"
 QLIB_RESEARCH_REPORTS = {
@@ -74,6 +88,7 @@ QLIB_RESEARCH_REPORTS = {
 EXPERIMENT_FILE_LOCK = threading.RLock()
 DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
 DIRECTORY_SIZE_CACHE_TTL_SECONDS = 60.0
+NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS = 60.0
 DIRECTORY_SIZE_SCAN_MAX_ENTRIES = 50000
 DIRECTORY_SIZE_SCAN_MAX_SECONDS = 0.5
 CLEANUP_ACTION_PREVIEW_LIMIT = 50
@@ -93,11 +108,61 @@ TONGHUASHUN_CANDIDATE_PATHS = (
     Path.home() / "Applications" / "同花顺远航版.app",
     Path.home() / "Applications" / "同花顺iFinD.app",
 )
+
+
+@dataclass(frozen=True)
+class _NativeQlibProviderResolution:
+    authoritative: bool
+    path: Optional[Path] = None
+    error: Optional[str] = None
+    dataset_id: Optional[str] = None
+    snapshot_id: Optional[str] = None
+    manifest_sha256: Optional[str] = None
+    content_sha256: Optional[str] = None
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
 _DIRECTORY_SIZE_CACHE: Dict[str, Tuple[float, float]] = {}
+_NATIVE_QLIB_VALIDATION_CACHE_LOCK = threading.Lock()
+_NATIVE_QLIB_VALIDATION_CACHE: Dict[
+    Tuple[str, str, str], Tuple[float, Dict[str, Any]]
+] = {}
+
+
+def _clear_native_qlib_validation_cache() -> None:
+    with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
+        _NATIVE_QLIB_VALIDATION_CACHE.clear()
+
+
+def _validate_native_qlib_snapshot_cached(
+    provider_path: Path,
+    *,
+    manifest_sha256: str,
+    evidence_root: Path,
+) -> Dict[str, Any]:
+    """Reuse expensive file hashes briefly; catalog and manifest checks stay live."""
+
+    key = (
+        str(provider_path.resolve()),
+        manifest_sha256,
+        str(evidence_root.resolve()),
+    )
+    now = time.monotonic()
+    with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
+        cached = _NATIVE_QLIB_VALIDATION_CACHE.get(key)
+        if cached is not None and now - cached[0] < NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+        validated = validate_qlib_snapshot(
+            provider_path,
+            verify_hashes=True,
+            evidence_root=evidence_root,
+        )
+        _NATIVE_QLIB_VALIDATION_CACHE.clear()
+        _NATIVE_QLIB_VALIDATION_CACHE[key] = (time.monotonic(), dict(validated))
+        return dict(validated)
 
 
 def _lock_experiment_handle(lock_handle) -> None:
@@ -143,14 +208,22 @@ def _experiment_file_guard(reports_dir: Path) -> Iterator[None]:
                 _unlock_experiment_handle(lock_handle)
 
 
-def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
-    if not path.exists():
-        return None
+def _read_json_object_bytes(path: Path) -> tuple[Optional[Dict[str, Any]], Optional[bytes]]:
+    """Read and decode one JSON object from the exact bytes used by callers."""
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, raw
+    return payload, raw
+
+
+def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    payload, _raw = _read_json_object_bytes(path)
+    return payload
 
 
 def _public_path_label(value: Any) -> str:
@@ -246,10 +319,14 @@ def _sanitize_public_tree(value: Any) -> Any:
     return value
 
 
-def _candidate_pipeline_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
+def _candidate_pipeline_payload(
+    reports_dir: Path,
+    native_resolution: Optional[_NativeQlibProviderResolution] = None,
+) -> Optional[Dict[str, Any]]:
     payload = _read_json_object(reports_dir / CANDIDATE_PIPELINE_FILENAME)
     if payload is None:
         return None
+    _annotate_provider_payload(payload, native_resolution)
     if payload.get("provider_uri"):
         payload["provider_uri"] = _public_path_label(payload["provider_uri"])
     payload["artifacts"] = _public_artifacts(payload.get("artifacts"))
@@ -455,11 +532,12 @@ def _missing_robust_section() -> Dict[str, str]:
 def _robust_metrics(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
-    return {
+    payload = {
         key: _sanitize_robust_tree(value)
         for key, value in raw.items()
         if str(key) in ROBUST_METRIC_KEYS
     }
+    return payload
 
 
 def _robust_verdict(raw: Any) -> Dict[str, Any]:
@@ -1049,6 +1127,30 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+def _safe_manifest_path(root: Path, raw_path: Any) -> Optional[Path]:
+    """Resolve a manifest path without allowing it to escape quant_data."""
+
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return None
+    resolved_root = _resolve_for_boundary(root)
+    resolved_candidate = _resolve_for_boundary(root / candidate)
+    if not _is_relative_to(resolved_candidate, resolved_root):
+        return None
+    return resolved_candidate
+
+
+def _manifest_path_contains_symlink(root: Path, relative_path: Path) -> bool:
+    candidate = root
+    for part in relative_path.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            return True
+    return False
+
+
 def _is_trusted_qlib_provider_path(path: Path) -> bool:
     provider_path = _resolve_for_boundary(path)
     provider_root = _resolve_for_boundary(QLIB_PROVIDER_ROOT)
@@ -1058,6 +1160,441 @@ def _is_trusted_qlib_provider_path(path: Path) -> bool:
         return False
     required_children = ("calendars", "instruments", "features")
     return all((provider_path / child).is_dir() for child in required_children)
+
+
+def _resolve_native_qlib_provider(
+    dataset_id: str = NATIVE_QLIB_DATASET_ID,
+) -> _NativeQlibProviderResolution:
+    """Resolve the provider selected by the live v2 catalog.
+
+    A saved training report is historical evidence. It must not decide which
+    provider the current status page calls canonical. The catalog and its
+    immutable LATEST pointer are the source of truth for that decision.
+    """
+
+    # Tests and callers may inspect an isolated report artifact. Do not mix it
+    # with the process-wide live catalog unless it is the configured report
+    # location; this also prevents an arbitrary report path from selecting a
+    # real local provider during diagnostics.
+    if _resolve_for_boundary(RESEARCH_STATUS_PATH.parent) != _resolve_for_boundary(
+        QUANT_WORKFLOW_REPORTS_ROOT
+    ):
+        return _NativeQlibProviderResolution(authoritative=False)
+
+    dataset_root = NATIVE_QLIB_DATASET_ROOTS.get(dataset_id)
+    if dataset_root is None:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="训练结果记录了不受支持的原生 V2 数据集。",
+        )
+    latest_pointer = dataset_root / "LATEST.json"
+    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+    catalog_path = root / DATA_MANIFEST_FILENAME
+    if catalog_path.is_symlink():
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 根清单路径不安全，已阻止回退到旧兼容数据。",
+        )
+    catalog = _read_json_object(catalog_path)
+    if catalog is None:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 根清单缺失或损坏，已阻止回退到旧兼容数据。",
+        )
+    if (
+        catalog.get("schema_version") != 2
+        or catalog.get("path_format") != "relative_to_quant_data_root"
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 根清单契约无效，已阻止回退到旧兼容数据。",
+        )
+    datasets = catalog.get("datasets") if isinstance(catalog, dict) else None
+    entry = (
+        datasets.get(dataset_id)
+        if isinstance(datasets, dict)
+        else None
+    )
+    if not isinstance(entry, dict):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 数据集未在根清单中登记，已阻止回退到旧兼容数据。",
+        )
+    if (
+        entry.get("dataset_id") != dataset_id
+        or entry.get("dataset_root") != dataset_root.as_posix()
+        or entry.get("role") != "canonical"
+        or entry.get("status") != "ready"
+        or entry.get("price_basis") != "qfq"
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 根清单口径无效，已阻止回退到旧兼容数据。",
+        )
+
+    if entry.get("latest_pointer") != latest_pointer.as_posix():
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 的 LATEST 指针位置无效，已阻止回退到旧兼容数据。",
+        )
+    pointer_path = _safe_manifest_path(root, latest_pointer.as_posix())
+    if pointer_path is None or _manifest_path_contains_symlink(
+        root, latest_pointer
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 的 LATEST 指针不安全，已阻止回退到旧兼容数据。",
+        )
+    pointer = _read_json_object(pointer_path)
+    if (
+        not isinstance(pointer, dict)
+        or pointer.get("schema_version") != 2
+        or pointer.get("dataset_id") != dataset_id
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 的 LATEST 指针缺失或损坏，已阻止回退到旧兼容数据。",
+        )
+
+    snapshot_id = entry.get("snapshot_id")
+    manifest_sha256 = entry.get("snapshot_manifest_sha256")
+    if (
+        not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or snapshot_id in {".", ".."}
+        or not isinstance(manifest_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
+        or snapshot_id != pointer.get("snapshot_id")
+        or manifest_sha256 != pointer.get("manifest_sha256")
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照标识或清单哈希不一致，已阻止回退到旧兼容数据。",
+        )
+
+    expected_snapshot_path = dataset_root / "snapshots" / snapshot_id
+    if pointer.get("snapshot_path") != expected_snapshot_path.as_posix():
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照指针指向了错误的数据集目录，已阻止使用。",
+        )
+    provider_path = _safe_manifest_path(root, expected_snapshot_path.as_posix())
+    if provider_path is None or _manifest_path_contains_symlink(
+        root, expected_snapshot_path
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照路径不安全，已阻止使用。",
+        )
+    if not _is_trusted_qlib_provider_path(provider_path):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照目录不完整，已阻止使用。",
+        )
+
+    dataset_manifest_path = provider_path / "DATASET_MANIFEST.json"
+    if dataset_manifest_path.is_symlink() or not dataset_manifest_path.is_file():
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照缺少可信的数据集清单，已阻止使用。",
+        )
+    dataset_manifest, dataset_manifest_bytes = _read_json_object_bytes(
+        dataset_manifest_path
+    )
+    actual_manifest_sha256 = (
+        hashlib.sha256(dataset_manifest_bytes).hexdigest()
+        if dataset_manifest_bytes is not None
+        else None
+    )
+    if actual_manifest_sha256 != manifest_sha256:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。",
+        )
+    try:
+        validated_manifest = _validate_native_qlib_snapshot_cached(
+            provider_path,
+            manifest_sha256=manifest_sha256,
+            evidence_root=root,
+        )
+    except (DataContractError, OSError, UnicodeError, TypeError, ValueError):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照完整性校验失败，已阻止回退到旧兼容数据。",
+        )
+    if entry.get("content_sha256") != dataset_manifest.get("content_sha256"):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 根清单与快照的内容哈希不一致，已阻止使用。",
+        )
+    if (
+        not isinstance(dataset_manifest, dict)
+        or dataset_manifest != validated_manifest
+        or dataset_manifest.get("dataset_id") != dataset_id
+        or dataset_manifest.get("snapshot_id") != snapshot_id
+        or dataset_manifest.get("role") != "canonical"
+        or dataset_manifest.get("status") != "ready"
+        or dataset_manifest.get("price_basis") != "qfq"
+        or entry.get("upstream_snapshots", [])
+        != dataset_manifest.get("upstream_snapshots", [])
+        or entry.get("dependency_snapshots", [])
+        != dataset_manifest.get("dependency_snapshots", [])
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            error="原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。",
+        )
+    lineage = [
+        *dataset_manifest.get("upstream_snapshots", []),
+        *dataset_manifest.get("dependency_snapshots", []),
+    ]
+    for upstream in lineage:
+        upstream_entry = (
+            datasets.get(upstream.get("dataset_id"))
+            if isinstance(upstream, dict) and isinstance(datasets, dict)
+            else None
+        )
+        if not isinstance(upstream_entry, dict) or upstream_entry.get(
+            "status"
+        ) != "ready":
+            return _NativeQlibProviderResolution(
+                authoritative=True,
+                error="原生 V2 上游数据已失效，当前训练入口已阻断。",
+            )
+        if any(
+            upstream.get(field) != upstream_entry.get(field)
+            for field in ("snapshot_id", "content_sha256", "price_basis")
+        ):
+            return _NativeQlibProviderResolution(
+                authoritative=True,
+                error="原生 V2 上游快照已变化，当前训练入口已阻断。",
+            )
+    return _NativeQlibProviderResolution(
+        authoritative=True,
+        path=provider_path,
+        dataset_id=dataset_id,
+        snapshot_id=snapshot_id,
+        manifest_sha256=manifest_sha256,
+        content_sha256=str(dataset_manifest.get("content_sha256") or ""),
+    )
+
+
+def _saved_provider_identity(
+    payload: Dict[str, Any],
+) -> Optional[tuple[str, str, str, str]]:
+    raw_identity = payload.get("provider_identity")
+    if not isinstance(raw_identity, dict):
+        return None
+    identity = raw_identity
+    provider_contract = identity.get("provider_contract")
+    dataset_id = identity.get("dataset_id")
+    snapshot_id = identity.get("snapshot_id")
+    content_sha256 = identity.get("content_sha256")
+    manifest_sha256 = identity.get("manifest_sha256") or identity.get(
+        "snapshot_manifest_sha256"
+    )
+    if (
+        provider_contract != "immutable_snapshot_v2"
+        or not isinstance(dataset_id, str)
+        or not dataset_id
+        or not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or not isinstance(manifest_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
+        or not isinstance(content_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", content_sha256)
+    ):
+        return None
+    return dataset_id, snapshot_id, content_sha256, manifest_sha256
+
+
+def _annotate_saved_provider(
+    payload: Dict[str, Any],
+    resolution: _NativeQlibProviderResolution,
+    *,
+    artifact_label: str,
+) -> None:
+    if not resolution.authoritative:
+        return
+
+    identity = _saved_provider_identity(payload)
+    target_resolution = _current_provider_resolution_for_payload(payload, resolution)
+
+    if target_resolution.path is None:
+        payload["provider_current"] = False
+        payload["provider_status"] = "catalog_invalid"
+        payload["provider_warning"] = target_resolution.error
+        return
+
+    expected_identity = (
+        target_resolution.dataset_id,
+        target_resolution.snapshot_id,
+        target_resolution.content_sha256,
+        target_resolution.manifest_sha256,
+    )
+    if identity is not None:
+        current = identity == expected_identity
+        payload["provider_current"] = current
+        payload["provider_status"] = "current_native_v2" if current else "stale"
+        if not current:
+            payload["provider_warning"] = (
+                f"{artifact_label}记录的不可变快照身份与当前原生 V2 不一致，"
+                "只能作为历史结果。"
+            )
+        return
+
+    provider_uri = payload.get("provider_uri") or payload.get("qlib_provider")
+    path_points_to_current = False
+    if isinstance(provider_uri, str) and provider_uri.strip():
+        path_points_to_current = (
+            _resolve_for_boundary(Path(provider_uri).expanduser())
+            == _resolve_for_boundary(target_resolution.path)
+        )
+    payload["provider_current"] = False
+    payload["provider_status"] = "unknown" if path_points_to_current else "stale"
+    if path_points_to_current:
+        payload["provider_warning"] = (
+            f"{artifact_label}只记录了可变路径，没有记录数据集、快照和清单哈希，"
+            "无法证明它使用了当前原生 V2 数据。"
+        )
+    else:
+        payload["provider_warning"] = (
+            f"{artifact_label}使用的 provider 不是当前原生 V2 数据，"
+            "只能作为历史结果。"
+        )
+
+
+def _current_provider_resolution_for_payload(
+    payload: Dict[str, Any],
+    fallback: _NativeQlibProviderResolution,
+) -> _NativeQlibProviderResolution:
+    identity = _saved_provider_identity(payload)
+    if identity is None or identity[0] not in NATIVE_QLIB_DATASET_ROOTS:
+        return fallback
+    if identity[0] == fallback.dataset_id:
+        return fallback
+    return _resolve_native_qlib_provider(identity[0])
+
+
+def _resolve_saved_native_qlib_snapshot(
+    identity: tuple[str, str, str, str],
+) -> _NativeQlibProviderResolution:
+    dataset_id, snapshot_id, content_sha256, manifest_sha256 = identity
+    dataset_root = NATIVE_QLIB_DATASET_ROOTS.get(dataset_id)
+    if dataset_root is None:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练结果记录了不受支持的原生 V2 数据集。",
+        )
+    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+    relative_snapshot = dataset_root / "snapshots" / snapshot_id
+    provider_path = _safe_manifest_path(root, relative_snapshot.as_posix())
+    if provider_path is None or _manifest_path_contains_symlink(
+        root, relative_snapshot
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练结果记录的原生 V2 历史快照路径不安全。",
+        )
+    if not _is_trusted_qlib_provider_path(provider_path):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练使用的原生 V2 历史快照已不存在或目录不完整。",
+        )
+    manifest_path = provider_path / "DATASET_MANIFEST.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练使用的原生 V2 历史快照缺少可信清单。",
+        )
+    manifest, manifest_bytes = _read_json_object_bytes(manifest_path)
+    actual_manifest_sha256 = (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        if manifest_bytes is not None
+        else None
+    )
+    if actual_manifest_sha256 != manifest_sha256:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练使用的原生 V2 历史快照清单哈希不一致。",
+        )
+    try:
+        validated_manifest = _validate_native_qlib_snapshot_cached(
+            provider_path,
+            manifest_sha256=manifest_sha256,
+            evidence_root=root,
+        )
+    except (DataContractError, OSError, UnicodeError, TypeError, ValueError):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练使用的原生 V2 历史快照完整性校验失败。",
+        )
+    if (
+        not isinstance(manifest, dict)
+        or manifest != validated_manifest
+        or manifest.get("dataset_id") != dataset_id
+        or manifest.get("snapshot_id") != snapshot_id
+        or manifest.get("content_sha256") != content_sha256
+        or manifest.get("role") != "canonical"
+        or manifest.get("status") != "ready"
+        or manifest.get("price_basis") != "qfq"
+    ):
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            dataset_id=dataset_id,
+            snapshot_id=snapshot_id,
+            error="训练使用的原生 V2 历史快照身份校验失败。",
+        )
+    return _NativeQlibProviderResolution(
+        authoritative=True,
+        path=provider_path,
+        dataset_id=dataset_id,
+        snapshot_id=snapshot_id,
+        content_sha256=content_sha256,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _saved_provider_resolution_for_payload(
+    payload: Dict[str, Any],
+    fallback: _NativeQlibProviderResolution,
+) -> _NativeQlibProviderResolution:
+    identity = _saved_provider_identity(payload)
+    if identity is None:
+        return _current_provider_resolution_for_payload(payload, fallback)
+    current = _current_provider_resolution_for_payload(payload, fallback)
+    current_identity = (
+        current.dataset_id,
+        current.snapshot_id,
+        current.content_sha256,
+        current.manifest_sha256,
+    )
+    if current.path is not None and identity == current_identity:
+        return current
+    return _resolve_saved_native_qlib_snapshot(identity)
+
+
+def _annotate_provider_payload(
+    payload: Dict[str, Any],
+    native_resolution: Optional[_NativeQlibProviderResolution] = None,
+) -> None:
+    """Describe whether a saved report used the current native provider."""
+
+    resolution = native_resolution or _resolve_native_qlib_provider()
+    _annotate_saved_provider(payload, resolution, artifact_label="候选报告")
 
 
 def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
@@ -1095,18 +1632,116 @@ def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
     return provider
 
 
-def _sync_qlib_provider_with_latest_training(
-    payload: Dict[str, Any], latest_training: Dict[str, Any]
+def _annotate_latest_training_provider(
+    latest_training: Dict[str, Any],
+    native_resolution: _NativeQlibProviderResolution,
 ) -> None:
-    provider_uri = latest_training.get("provider_uri") or latest_training.get(
-        "qlib_provider"
+    """Mark historical training evidence relative to the live native provider."""
+
+    _annotate_saved_provider(
+        latest_training,
+        native_resolution,
+        artifact_label="训练结果",
     )
+
+
+def _sync_qlib_provider_with_latest_training(
+    payload: Dict[str, Any],
+    latest_training: Dict[str, Any],
+    *,
+    native_resolution: _NativeQlibProviderResolution,
+) -> None:
+    provider_uri = latest_training.get("provider_uri") or latest_training.get("qlib_provider")
+    existing = payload.get("qlib_provider")
+    provider = dict(existing) if isinstance(existing, dict) else {}
+    target_resolution = _saved_provider_resolution_for_payload(
+        latest_training,
+        native_resolution,
+    )
+
+    if target_resolution.authoritative:
+        dataset_id = target_resolution.dataset_id or NATIVE_QLIB_DATASET_ID
+        if target_resolution.path is None:
+            payload["latest_training_provider"] = {
+                "dataset_id": dataset_id,
+                "role": "canonical",
+                "status": "blocked",
+                "price_basis": "qfq",
+                "provider_source": "native_v2_catalog",
+                "provider_error": target_resolution.error,
+                "provider_current": False,
+                "provider_trusted": False,
+            }
+            provider["latest_training_provider_trusted"] = False
+            provider["latest_training_provider_current"] = False
+            payload["qlib_provider"] = provider
+            return
+
+        native_provider_path = target_resolution.path
+        saved_identity = _saved_provider_identity(latest_training)
+        resolved_identity = (
+            target_resolution.dataset_id,
+            target_resolution.snapshot_id,
+            target_resolution.content_sha256,
+            target_resolution.manifest_sha256,
+        )
+        identity_trusted = saved_identity is not None and saved_identity == resolved_identity
+        training_provider = _qlib_provider_from_path(native_provider_path)
+        training_provider.update(
+            {
+                "dataset_id": dataset_id,
+                "role": "canonical",
+                "status": "ready",
+                "price_basis": "qfq",
+                "provider_source": (
+                    "native_v2_catalog"
+                    if latest_training.get("provider_current") is True
+                    else "saved_immutable_v2_identity"
+                ),
+                "snapshot_id": target_resolution.snapshot_id,
+                "manifest_sha256": target_resolution.manifest_sha256,
+                "content_sha256": target_resolution.content_sha256,
+                "provider_current": latest_training.get("provider_current") is True,
+                "provider_trusted": identity_trusted,
+            }
+        )
+        if latest_training.get("provider_current") is True:
+            provider["latest_training_provider_trusted"] = True
+            provider["latest_training_provider_current"] = True
+            provider.pop("latest_training_provider_uri", None)
+            provider.pop("provider_uri_warning", None)
+        elif identity_trusted:
+            provider["latest_training_provider_trusted"] = True
+            provider["latest_training_provider_current"] = False
+            warning = latest_training.get("provider_warning") or (
+                "latest_training 使用的是已验证的原生 V2 历史快照；"
+                "它不是当前训练入口，但可用于复现当时结果。"
+            )
+            provider["provider_uri_warning"] = warning
+            training_provider["provider_warning"] = warning
+        else:
+            if isinstance(provider_uri, str) and provider_uri.strip():
+                provider["latest_training_provider_uri"] = str(
+                    Path(provider_uri).expanduser()
+                )
+            provider["latest_training_provider_trusted"] = False
+            provider["latest_training_provider_current"] = False
+            warning = latest_training.get(
+                "provider_warning"
+            ) or (
+                f"latest_training 无法证明使用了当前原生 {dataset_id}，"
+                "请重新运行训练后再把该结果作为当前结果使用。"
+            )
+            provider["provider_uri_warning"] = warning
+            training_provider["provider_warning"] = warning
+        payload["latest_training_provider"] = training_provider
+        payload["qlib_provider"] = provider
+        return
+
     if not isinstance(provider_uri, str) or not provider_uri.strip():
         return
 
     provider_path = Path(provider_uri).expanduser()
-    existing = payload.get("qlib_provider")
-    provider = dict(existing) if isinstance(existing, dict) else {}
     if not _is_trusted_qlib_provider_path(provider_path):
         provider["latest_training_provider_uri"] = str(provider_path)
         provider["latest_training_provider_trusted"] = False
@@ -1114,11 +1749,21 @@ def _sync_qlib_provider_with_latest_training(
             "latest_training provider_uri is outside configured Qlib provider root "
             "or is not a concrete Qlib provider; skipped provider scan."
         )
+        payload["latest_training_provider"] = {
+            "path": str(provider_path),
+            "provider_current": False,
+            "provider_trusted": False,
+            "provider_warning": provider["provider_uri_warning"],
+        }
         payload["qlib_provider"] = provider
         return
 
-    provider.update(_qlib_provider_from_path(provider_path))
+    training_provider = _qlib_provider_from_path(provider_path)
+    training_provider["provider_current"] = False
+    training_provider["provider_trusted"] = True
     provider["latest_training_provider_trusted"] = True
+    provider["latest_training_provider_current"] = False
+    payload["latest_training_provider"] = training_provider
     payload["qlib_provider"] = provider
 
 
@@ -1780,19 +2425,54 @@ def _acceptance_checklist_payload() -> list[Dict[str, Any]]:
 def _missing_status_payload() -> Dict[str, Any]:
     reports_dir = RESEARCH_STATUS_PATH.parent
     external_tools = _external_tools_payload()
-    return {
+    native_resolution = _resolve_native_qlib_provider()
+    latest_training = _latest_training_payload(reports_dir)
+    if latest_training is not None:
+        _annotate_latest_training_provider(latest_training, native_resolution)
+    qlib_provider = None
+    if native_resolution.authoritative:
+        if native_resolution.path is not None:
+            qlib_provider = {
+                **_qlib_provider_from_path(native_resolution.path),
+                "dataset_id": NATIVE_QLIB_DATASET_ID,
+                "role": "canonical",
+                "status": "ready",
+                "price_basis": "qfq",
+                "provider_source": "native_v2_catalog",
+                "snapshot_id": native_resolution.snapshot_id,
+                "manifest_sha256": native_resolution.manifest_sha256,
+                "content_sha256": native_resolution.content_sha256,
+            }
+        else:
+            qlib_provider = {
+                "dataset_id": NATIVE_QLIB_DATASET_ID,
+                "role": "canonical",
+                "status": "blocked",
+                "price_basis": "qfq",
+                "provider_source": "native_v2_catalog",
+                "provider_error": native_resolution.error,
+            }
+    training_readiness = {
+        "status": "missing",
+        "summary": "Research status artifact is not available yet. Run quant_workflow/scripts/report_data_quality.py first.",
+    }
+    if native_resolution.authoritative and native_resolution.path is None:
+        training_readiness = {
+            "status": "blocked",
+            "summary": native_resolution.error,
+        }
+    payload = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "trainable": False,
-        "training_readiness": {
-            "status": "missing",
-            "summary": "Research status artifact is not available yet. Run quant_workflow/scripts/report_data_quality.py first.",
-        },
+        "training_readiness": training_readiness,
         "data_sources": [],
-        "qlib_provider": None,
-        "latest_training": _latest_training_payload(reports_dir),
+        "qlib_provider": qlib_provider,
+        "latest_training": latest_training,
         "cash_control_backtest": _cash_control_backtest_payload(reports_dir),
         "qlib_predictions": _qlib_predictions_payload(reports_dir),
-        "candidate_pipeline": _candidate_pipeline_payload(reports_dir),
+        "candidate_pipeline": _candidate_pipeline_payload(
+            reports_dir, native_resolution
+        ),
         "robust_strategy": _robust_strategy_payload(reports_dir),
         "experiment_notebook": _experiment_notebook_payload(reports_dir),
         "mlflow": _mlflow_payload(),
@@ -1803,6 +2483,13 @@ def _missing_status_payload() -> Dict[str, Any]:
         "china_astock_reuse": _china_astock_reuse_payload(),
         "acceptance_checklist": _acceptance_checklist_payload(),
     }
+    if latest_training is not None:
+        _sync_qlib_provider_with_latest_training(
+            payload,
+            latest_training,
+            native_resolution=native_resolution,
+        )
+    return payload
 
 
 def _remove_active_experiment_run(reports_dir: Path, run_id: str) -> Dict[str, Any]:
@@ -2001,15 +2688,49 @@ def build_research_status_payload() -> Dict[str, Any]:
         return fallback
 
     reports_dir = RESEARCH_STATUS_PATH.parent
+    native_resolution = _resolve_native_qlib_provider()
+    if native_resolution.path is not None:
+        payload["qlib_provider"] = {
+            **_qlib_provider_from_path(native_resolution.path),
+            "dataset_id": NATIVE_QLIB_DATASET_ID,
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "provider_source": "native_v2_catalog",
+            "snapshot_id": native_resolution.snapshot_id,
+            "manifest_sha256": native_resolution.manifest_sha256,
+            "content_sha256": native_resolution.content_sha256,
+        }
+    elif native_resolution.authoritative:
+        payload["qlib_provider"] = {
+            "dataset_id": NATIVE_QLIB_DATASET_ID,
+            "role": "canonical",
+            "status": "blocked",
+            "price_basis": "qfq",
+            "provider_source": "native_v2_catalog",
+            "provider_error": native_resolution.error,
+        }
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": native_resolution.error,
+        }
     latest_training = _latest_training_payload(reports_dir)
     if latest_training is not None:
+        _annotate_latest_training_provider(latest_training, native_resolution)
         payload["latest_training"] = latest_training
-        _sync_qlib_provider_with_latest_training(payload, latest_training)
+        _sync_qlib_provider_with_latest_training(
+            payload,
+            latest_training,
+            native_resolution=native_resolution,
+        )
     cash_control_backtest = _cash_control_backtest_payload(reports_dir)
     if cash_control_backtest is not None:
         payload["cash_control_backtest"] = cash_control_backtest
     payload["qlib_predictions"] = _qlib_predictions_payload(reports_dir)
-    payload["candidate_pipeline"] = _candidate_pipeline_payload(reports_dir)
+    payload["candidate_pipeline"] = _candidate_pipeline_payload(
+        reports_dir, native_resolution
+    )
     payload["robust_strategy"] = _robust_strategy_payload(reports_dir)
     payload["robust_signal"] = _robust_signal_payload(reports_dir)
     payload["qlib_research"] = _qlib_research_payload(reports_dir)

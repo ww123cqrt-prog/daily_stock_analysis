@@ -10,11 +10,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root  # noqa: E402
+from _paths import qlib_provider_uri  # noqa: E402
 
 
-QUANT_DATA = quant_data_root()
-PROVIDER_URI = qlib_provider_uri()
 REQUIRED_INSTRUMENTS = ("SH600000", "SH000300", "SH000905", "SH000906")
 REQUIRED_FIELDS = ("$open", "$high", "$low", "$close", "$volume", "$factor")
 
@@ -29,7 +27,12 @@ def read_provider_calendar_range(provider: Path) -> tuple[str, str]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Smoke-check a Qlib provider.")
-    parser.add_argument("--provider-dir", type=Path, default=PROVIDER_URI)
+    parser.add_argument(
+        "--provider",
+        choices=("canonical", "cleaned"),
+        default="canonical",
+    )
+    parser.add_argument("--provider-dir", type=Path)
     return parser.parse_args(argv)
 
 
@@ -87,17 +90,18 @@ def validate_feature_sample(features, sample_days: list[str]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    provider_dir = args.provider_dir or qlib_provider_uri(args.provider)
     multiprocessing.set_start_method("fork", force=True)
 
     import qlib
     from qlib.data import D
 
-    start_date, end_date = read_provider_calendar_range(args.provider_dir)
-    qlib.init(provider_uri=str(args.provider_dir), region="cn")
+    start_date, end_date = read_provider_calendar_range(provider_dir)
+    qlib.init(provider_uri=str(provider_dir), region="cn")
 
     calendar = D.calendar(start_time=start_date, end_time=end_date, freq="day")
     if len(calendar) < 1:
-        raise ValueError(f"Qlib returned an empty calendar: {args.provider_dir}")
+        raise ValueError(f"Qlib returned an empty calendar: {provider_dir}")
     print("calendar", len(calendar), calendar[0], calendar[-1])
 
     sample_start = str(calendar[-min(5, len(calendar))].date())

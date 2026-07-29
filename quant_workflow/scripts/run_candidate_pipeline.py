@@ -10,7 +10,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -25,7 +24,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import mlruns_root, qlib_provider_uri, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    mlruns_root,
+    qlib_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
+from _mlflow_run_provenance import (  # noqa: E402
+    RunProvenanceError,
+    provider_identity,
+    validate_file_store_run_artifact,
+)
 from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
 
 
@@ -356,18 +366,55 @@ def load_market_data(provider_uri: Path, start: str, end: str) -> pd.DataFrame:
     return market
 
 
-def _artifact_path(info: dict[str, Any], name: str) -> Path:
-    direct = MLRUNS_DIR / str(info["experiment_id"]) / str(info["run_id"]) / "artifacts" / name
+def _artifact_path(
+    info: dict[str, Any],
+    name: str,
+    *,
+    mlruns_dir: Path = MLRUNS_DIR,
+) -> Path:
+    direct = mlruns_dir / str(info["experiment_id"]) / str(info["run_id"]) / "artifacts" / name
     if direct.exists():
         return direct
     import mlflow
 
-    client = mlflow.tracking.MlflowClient(tracking_uri=f"file://{MLRUNS_DIR}")
+    client = mlflow.tracking.MlflowClient(tracking_uri=f"file://{mlruns_dir}")
     return Path(client.download_artifacts(str(info["run_id"]), name))
 
 
-def _load_artifacts(info: dict[str, Any]) -> tuple[pd.DataFrame | pd.Series, pd.DataFrame | pd.Series]:
-    return pd.read_pickle(_artifact_path(info, "pred.pkl")), pd.read_pickle(_artifact_path(info, "label.pkl"))
+def _load_artifacts(
+    info: dict[str, Any],
+    *,
+    mlruns_dir: Path = MLRUNS_DIR,
+    quant_data_root_path: Path | None = None,
+    expected_provider_identity: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame | pd.Series, pd.DataFrame | pd.Series]:
+    root = (
+        Path(quant_data_root_path).expanduser().resolve()
+        if quant_data_root_path is not None
+        else quant_data_root().expanduser().resolve()
+    )
+    run_id = str(info["run_id"])
+    paths = {
+        name: _artifact_path(info, name, mlruns_dir=mlruns_dir)
+        for name in ("pred.pkl", "label.pkl")
+    }
+    try:
+        for name, path in paths.items():
+            provenance = validate_file_store_run_artifact(
+                artifact_path=path,
+                artifact_relative_path=Path(name),
+                run_id=run_id,
+                mlruns_dir=mlruns_dir,
+                quant_data_root=root,
+            )
+            if expected_provider_identity is not None:
+                _require_provider_identity(
+                    provenance.get("provider_identity"),
+                    expected_provider_identity,
+                )
+    except RunProvenanceError as exc:
+        raise RuntimeError(f"Candidate artifact provenance is invalid: {exc}") from exc
+    return pd.read_pickle(paths["pred.pkl"]), pd.read_pickle(paths["label.pkl"])
 
 
 def _tag_candidate_run(info: dict[str, Any], batch_id: str, model_id: str) -> None:
@@ -435,6 +482,46 @@ def _preflight_dependencies(models: list[dict[str, Any]]) -> None:
         raise RuntimeError(f"Missing candidate model dependencies: {', '.join(sorted(set(missing)))}")
 
 
+def _training_command(
+    *,
+    config_path: Path,
+    experiment_name: str,
+    provider: str,
+    provider_uri: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(TRAIN_SCRIPT),
+        "--config",
+        str(config_path),
+        "--experiment-name",
+        experiment_name,
+        "--provider",
+        provider,
+        "--provider-uri",
+        str(provider_uri),
+    ]
+
+
+def _require_provider_identity(
+    actual: Any,
+    expected: dict[str, Any],
+) -> None:
+    required = (
+        "provider_contract",
+        "dataset_id",
+        "snapshot_id",
+        "content_sha256",
+        "manifest_sha256",
+    )
+    if not isinstance(actual, dict) or any(
+        actual.get(field) != expected.get(field) for field in required
+    ):
+        raise RuntimeError(
+            "Candidate model used a different immutable provider than the batch snapshot"
+        )
+
+
 def _run_model_training(
     model: dict[str, Any],
     spec: dict[str, Any],
@@ -446,6 +533,7 @@ def _run_model_training(
     batch_id: str,
     config_dir: Path,
     experiment_name: str,
+    expected_provider_identity: dict[str, Any],
 ) -> tuple[dict[str, Any], pd.DataFrame | pd.Series, pd.DataFrame | pd.Series]:
     base = yaml.safe_load(_resolve_base_config(spec).read_text(encoding="utf-8")) or {}
     candidate_config = build_candidate_config(base, model)
@@ -459,16 +547,12 @@ def _run_model_training(
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"{model['id']}.yaml"
     _atomic_write(config_path, yaml.safe_dump(candidate_config, allow_unicode=True, sort_keys=False))
-    command = [
-        sys.executable,
-        str(TRAIN_SCRIPT),
-        "--config",
-        str(config_path),
-        "--experiment-name",
-        experiment_name,
-        "--provider",
-        provider,
-    ]
+    command = _training_command(
+        config_path=config_path,
+        experiment_name=experiment_name,
+        provider=provider,
+        provider_uri=provider_uri,
+    )
     print(f"[candidate] command model={model['id']} config={config_path}", flush=True)
     result = subprocess.run(command, cwd=str(WORKFLOW_ROOT), check=False)
     if result.returncode != 0:
@@ -478,8 +562,12 @@ def _run_model_training(
         raise RuntimeError("Training summary does not belong to the current candidate experiment")
     if Path(str(info.get("source_config") or "")).resolve() != config_path.resolve():
         raise RuntimeError("Training summary source config does not match the current candidate")
+    _require_provider_identity(info.get("provider_identity"), expected_provider_identity)
     _tag_candidate_run(info, batch_id, str(model["id"]))
-    pred, label = _load_artifacts(info)
+    pred, label = _load_artifacts(
+        info,
+        expected_provider_identity=expected_provider_identity,
+    )
     return info, pred, label
 
 
@@ -731,12 +819,14 @@ def run_pipeline(
         if dry_run:
             artifacts, market, provider_state = _dry_run_artifacts(spec["models"])
             provider_uri = Path("dry-run-provider")
+            locked_provider_identity = provider_identity(provider_uri)
         else:
             _preflight_dependencies(spec["models"])
             provider_uri = qlib_provider_uri(provider)
             if not provider_uri.exists():
                 raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
             provider_latest_day, latest_prediction_day, latest_label_day = provider_days(provider_uri)
+            locked_provider_identity = provider_identity(provider_uri)
             provider_state = {
                 "provider_latest_day": provider_latest_day,
                 "latest_prediction_day": latest_prediction_day,
@@ -767,6 +857,7 @@ def run_pipeline(
                         batch_id=batch_id,
                         config_dir=config_dir,
                         experiment_name=experiment_name,
+                        expected_provider_identity=locked_provider_identity,
                     )
                     artifacts[model_id] = (pred, label)
                 selection = evaluate_period(
@@ -798,6 +889,7 @@ def run_pipeline(
                         "run_id": info.get("run_id"),
                         "experiment_id": info.get("experiment_id"),
                         "experiment_name": info.get("experiment_name"),
+                        "artifact_sha256": info.get("artifact_sha256") or {},
                         "qlib_metrics": info.get("metrics") or {},
                         "selection": selection,
                         "holdout": holdout,
@@ -840,6 +932,7 @@ def run_pipeline(
             "experiment_name": experiment_name,
             "provider": provider if not dry_run else "dry_run",
             "provider_uri": str(provider_uri),
+            "provider_identity": locked_provider_identity,
             "provider_latest_day": provider_state["provider_latest_day"],
             "latest_prediction_day": provider_state["latest_prediction_day"],
             "latest_label_day": provider_state["latest_label_day"],

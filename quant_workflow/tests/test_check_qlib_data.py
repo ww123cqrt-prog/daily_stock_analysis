@@ -26,9 +26,17 @@ class CheckQlibDataTest(unittest.TestCase):
 
         self.assertEqual(args.provider_dir, provider)
 
-    def test_provider_uri_honors_explicit_environment_override(self):
+    def test_parse_args_accepts_native_cleaned_provider(self):
+        module = load_module()
+
+        args = module.parse_args(["--provider", "cleaned"])
+
+        self.assertEqual(args.provider, "cleaned")
+        self.assertIsNone(args.provider_dir)
+
+    def test_import_does_not_resolve_default_provider(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir) / "native-provider"
+            provider = Path(temp_dir) / "legacy-provider"
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_qlib_data.py"
             env = os.environ.copy()
             env["QLIB_PROVIDER_URI"] = str(provider)
@@ -44,7 +52,7 @@ class CheckQlibDataTest(unittest.TestCase):
                         "spec=importlib.util.spec_from_file_location('check_qlib_data', path); "
                         "module=importlib.util.module_from_spec(spec); "
                         "spec.loader.exec_module(module); "
-                        "print(json.dumps({'provider_uri': str(module.PROVIDER_URI)}))"
+                        "print(json.dumps({'imported': True}))"
                     ),
                 ],
                 env=env,
@@ -54,10 +62,7 @@ class CheckQlibDataTest(unittest.TestCase):
             )
 
         payload = json.loads(result.stdout)
-        self.assertEqual(
-            payload["provider_uri"],
-            str(provider),
-        )
+        self.assertTrue(payload["imported"])
 
     def test_required_sample_covers_stock_indexes_and_all_ohlcv_factor_fields(self):
         module = load_module()

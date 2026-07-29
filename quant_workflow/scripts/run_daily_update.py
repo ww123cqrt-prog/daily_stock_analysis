@@ -295,7 +295,11 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
             )
         )
 
-    for dataset_id in ("ashare_daily_qfq", "qlib_ashare_v2"):
+    for dataset_id in (
+        "ashare_daily_qfq",
+        "qlib_ashare_v2",
+        "qlib_ashare_cleaned_v2",
+    ):
         stages.append(
             Stage(
                 f"validate_{dataset_id}",
@@ -304,6 +308,12 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
             )
         )
     stages.append(Stage("check_qlib_data", _script("check_qlib_data.py")))
+    stages.append(
+        Stage(
+            "check_qlib_cleaned_data",
+            _script("check_qlib_data.py") + ["--provider", "cleaned"],
+        )
+    )
     quality = _script("report_data_quality.py") + [
         "--min-calendar-days", str(args.quality_min_calendar_days),
         "--min-instruments", str(args.quality_min_instruments),
@@ -531,11 +541,17 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         f"date={before['candidate_date'] or 'n/a'} ratio={before['coverage_ratio']:.3f}"
     )
     governed_before = latest_dataset_dates(
-        ("etf_momentum_daily_qfq", "ashare_daily_qfq", "qlib_ashare_v2")
+        (
+            "etf_momentum_daily_qfq",
+            "ashare_daily_qfq",
+            "qlib_ashare_v2",
+            "qlib_ashare_cleaned_v2",
+        )
     )
     etf_before = governed_before["etf_momentum_daily_qfq"]
     qfq_before = governed_before["ashare_daily_qfq"]
     qlib_before = governed_before["qlib_ashare_v2"]
+    qlib_cleaned_before = governed_before["qlib_ashare_cleaned_v2"]
     _log(f"latest ETF momentum date before: {etf_before or 'n/a'}")
     write_runtime_status(run_id, "running", current_stage="starting", source_coverage_before=before)
 
@@ -577,11 +593,17 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         for item in results
     )
     governed_after = latest_dataset_dates(
-        ("etf_momentum_daily_qfq", "ashare_daily_qfq", "qlib_ashare_v2")
+        (
+            "etf_momentum_daily_qfq",
+            "ashare_daily_qfq",
+            "qlib_ashare_v2",
+            "qlib_ashare_cleaned_v2",
+        )
     )
     etf_after = governed_after["etf_momentum_daily_qfq"]
     qfq_after = governed_after["ashare_daily_qfq"]
     qlib_after = governed_after["qlib_ashare_v2"]
+    qlib_cleaned_after = governed_after["qlib_ashare_cleaned_v2"]
     summary_path = write_summary(
         results,
         {
@@ -598,6 +620,8 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             "ashare_qfq_date_after": qfq_after,
             "qlib_v2_date_before": qlib_before,
             "qlib_v2_date_after": qlib_after,
+            "qlib_cleaned_v2_date_before": qlib_cleaned_before,
+            "qlib_cleaned_v2_date_after": qlib_cleaned_after,
             "dry_run": bool(args.dry_run),
             "skip_download": bool(args.skip_download),
             "official_published": published,

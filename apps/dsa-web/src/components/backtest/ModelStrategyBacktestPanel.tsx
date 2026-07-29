@@ -11,6 +11,7 @@ import {
   type ResearchCandidateStrategy,
   type ResearchStatus,
 } from '../../api/research';
+import { providerStatusNotice } from '../../utils/providerStatus';
 import { Badge, InlineAlert } from '../common';
 import type { TrainedStrategyBacktestResponse } from '../../types/backtest';
 import TrainedStrategyBacktestResults from './TrainedStrategyBacktestResults';
@@ -247,6 +248,13 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
     ? strategyName(loadedStrategy, loaded.strategyId, language)
     : '-';
   const periods = status?.candidatePipeline?.periods;
+  const loadedArtifact = loaded?.modelId === 'latest' ? 'training' : 'candidate';
+  const loadedProvider = loadedArtifact === 'training'
+    ? status?.latestTraining
+    : status?.candidatePipeline;
+  const loadedProviderNotice = loaded
+    ? providerStatusNotice(loadedProvider, loadedArtifact, language)
+    : null;
 
   const handleModelChange = (modelId: string) => {
     setDraftModelId(modelId);
@@ -338,9 +346,18 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
               </p>
             </div>
             {!loading && status && loaded ? (
-              <Badge variant="success" size="sm" className="gap-1.5 shadow-none">
-                <CheckCircle2 className="h-3.5 w-3.5" />
-                {zh ? '选股模型已加载' : 'Stock-selection model loaded'}
+              <Badge
+                variant={loadedProviderNotice ? 'warning' : 'success'}
+                size="sm"
+                className="gap-1.5 shadow-none"
+              >
+                {loadedProviderNotice ? (
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                ) : (
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                )}
+                {loadedProviderNotice?.badge
+                  || (zh ? '选股模型已加载' : 'Stock-selection model loaded')}
               </Badge>
             ) : null}
           </div>
@@ -351,6 +368,15 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
                 variant="danger"
                 title={zh ? '加载失败' : 'Load failed'}
                 message={error === 'load_failed' ? (zh ? '训练结果加载失败。' : 'Failed to load training results.') : error}
+              />
+            </div>
+          ) : null}
+          {!loading && loadedProviderNotice ? (
+            <div className="border-b border-border/70 p-4">
+              <InlineAlert
+                variant="warning"
+                title={loadedProviderNotice.title}
+                message={loadedProviderNotice.message}
               />
             </div>
           ) : null}

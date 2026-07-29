@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -80,6 +81,39 @@ def write_price_fixture(path: Path) -> None:
 
 
 class ReportChinaAstockIndicatorsTest(unittest.TestCase):
+    def test_default_input_resolves_governed_qfq_v2_bars(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            china_root = base / "china-astock-quant"
+            bars = base / "quant_data" / "native-v2" / "bars"
+            bars.mkdir(parents=True)
+            write_indicator_fixture(china_root)
+            frame = pd.DataFrame(
+                {
+                    "date": pd.date_range("2026-01-01", periods=25),
+                    "open": range(25),
+                    "high": range(1, 26),
+                    "low": range(25),
+                    "close": range(1, 26),
+                    "volume": range(100, 125),
+                }
+            )
+            frame.to_parquet(bars / "600519.parquet", index=False)
+
+            with patch.object(module, "ashare_qfq_bars_dir", return_value=bars) as resolver:
+                status = module.run_report(
+                    output_dir=base / "reports",
+                    china_astock_root=china_root,
+                    timestamp="20260730_010203",
+                    symbols="600519",
+                    limit=1,
+                )
+
+        resolver.assert_called()
+        self.assertEqual(status["source"], str(bars.resolve()))
+        self.assertEqual(status["rows"][0]["symbol"], "600519")
+
     def test_generates_read_only_indicator_report_and_latest_aliases(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

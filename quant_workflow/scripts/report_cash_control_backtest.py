@@ -15,7 +15,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,10 @@ from _paths import (  # noqa: E402
     quant_data_root,
     reports_root,
     workflow_root,
+)
+from _mlflow_run_provenance import (  # noqa: E402
+    RunProvenanceError,
+    validate_file_store_run_artifact,
 )
 from report_market_regime import classify_regime  # noqa: E402
 
@@ -91,20 +95,54 @@ def find_portfolio_report_path(
         latest = _read_json_object(latest_training_path) or {}
         requested_run_id = _safe_run_id(latest.get("run_id"))
 
-    if requested_run_id:
-        matches = sorted(mlruns_dir.glob(f"*/{requested_run_id}/artifacts/portfolio_analysis/report_normal_1day.pkl"))
-        if matches:
-            return matches[-1]
-
-    fallback = sorted(
-        mlruns_dir.glob("*/*/artifacts/portfolio_analysis/report_normal_1day.pkl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+    if not requested_run_id:
+        raise FileNotFoundError(
+            "Could not determine a Qlib training run id; refusing to select an "
+            "unrelated report_normal_1day.pkl artifact."
+        )
+    matches = sorted(
+        mlruns_dir.glob(
+            f"*/{requested_run_id}/artifacts/portfolio_analysis/"
+            "report_normal_1day.pkl"
+        )
     )
-    if fallback:
-        return fallback[0]
-    detail = f" for run {requested_run_id}" if requested_run_id else ""
-    raise FileNotFoundError(f"Could not find Qlib report_normal_1day.pkl{detail} under {mlruns_dir}.")
+    if len(matches) == 1 and matches[0].is_file() and not matches[0].is_symlink():
+        return matches[0]
+    if len(matches) > 1:
+        raise FileNotFoundError(
+            f"Found multiple Qlib report_normal_1day.pkl artifacts for run "
+            f"{requested_run_id} under {mlruns_dir}."
+        )
+    raise FileNotFoundError(
+        f"Could not find Qlib report_normal_1day.pkl for run {requested_run_id} "
+        f"under {mlruns_dir}."
+    )
+
+
+def validate_portfolio_provenance(
+    *,
+    portfolio_report_path: Path,
+    run_id: str,
+    mlruns_dir: Path,
+    quant_data_root_path: Path,
+) -> dict[str, Any]:
+    safe_run_id = _safe_run_id(run_id)
+    if not safe_run_id:
+        raise ValueError("portfolio report run id is required for provider validation")
+    try:
+        return validate_file_store_run_artifact(
+            artifact_path=portfolio_report_path,
+            artifact_relative_path=Path(
+                "portfolio_analysis/report_normal_1day.pkl"
+            ),
+            run_id=safe_run_id,
+            mlruns_dir=mlruns_dir,
+            quant_data_root=quant_data_root_path,
+        )
+    except RunProvenanceError as exc:
+        raise ValueError(
+            f"portfolio report provider identity is invalid: {exc}"
+        ) from exc
 
 
 def load_portfolio_returns(path: Path, return_column: str = "return") -> pd.Series:
@@ -375,6 +413,9 @@ return by market-regime position ratios. It does not connect to broker software,
 ## Inputs
 
 - Portfolio report: `{payload.get("portfolio_report_path")}`
+- MLflow Run: `{payload.get("run_id") or "unavailable"}`
+- Provider provenance: `{payload.get("provenance_status")}`
+- Provider snapshot: `{payload.get("provider_path") or "unavailable"}`
 - Market data: `{payload.get("market_data_dir")}`
 - Signal lookback days: `{payload.get("lookback_days")}`
 - Annualization trading days: `{payload.get("trading_days_per_year")}`
@@ -415,23 +456,32 @@ def generate_report(
     return_column: str = "return",
     trading_days_per_year: int = DEFAULT_TRADING_DAYS_PER_YEAR,
     preflight_unavailable_reason: str = "",
+    run_id: str = "",
+    provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     unavailable_reason = preflight_unavailable_reason
-    try:
-        returns = load_portfolio_returns(portfolio_report_path, return_column=return_column)
-    except (FileNotFoundError, ValueError) as exc:
-        unavailable_reason = unavailable_reason or str(exc)
+    if not unavailable_reason and portfolio_report_path.exists() and not provenance:
+        unavailable_reason = "portfolio artifact provenance was not validated"
+    if unavailable_reason:
         returns = pd.Series(dtype="float64", index=pd.DatetimeIndex([], name="datetime"), name=return_column)
         signals = pd.DataFrame(columns=["regime", "cash_ratio", "position_ratio"])
         signals.index = pd.DatetimeIndex([], name="datetime")
     else:
-        close_matrix = load_close_matrix(market_data_dir, limit=limit)
-        signals = build_rolling_market_signals(
-            close_matrix,
-            signal_dates=pd.DatetimeIndex(returns.index),
-            lookback_days=lookback_days,
-            min_symbols=min_symbols,
-        )
+        try:
+            returns = load_portfolio_returns(portfolio_report_path, return_column=return_column)
+        except (FileNotFoundError, ValueError) as exc:
+            unavailable_reason = str(exc)
+            returns = pd.Series(dtype="float64", index=pd.DatetimeIndex([], name="datetime"), name=return_column)
+            signals = pd.DataFrame(columns=["regime", "cash_ratio", "position_ratio"])
+            signals.index = pd.DatetimeIndex([], name="datetime")
+        else:
+            close_matrix = load_close_matrix(market_data_dir, limit=limit)
+            signals = build_rolling_market_signals(
+                close_matrix,
+                signal_dates=pd.DatetimeIndex(returns.index),
+                lookback_days=lookback_days,
+                min_symbols=min_symbols,
+            )
     overlay = apply_cash_control_overlay(returns, signals)
     comparison = compare_returns(returns, overlay, trading_days_per_year=trading_days_per_year)
 
@@ -445,6 +495,7 @@ def generate_report(
     payload: dict[str, Any] = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "mode": "read_only_cash_control_overlay",
+        "run_id": _safe_run_id(run_id),
         "portfolio_report_path": str(portfolio_report_path),
         "market_data_dir": str(market_data_dir),
         "lookback_days": int(lookback_days),
@@ -455,6 +506,10 @@ def generate_report(
         "comparison": comparison,
         "signal_summary": summarize_signals(signals),
         "unavailable_reason": unavailable_reason,
+        "provenance_status": "validated" if provenance else "unavailable",
+        "artifact_sha256": str((provenance or {}).get("artifact_sha256") or ""),
+        "provider_identity": dict((provenance or {}).get("provider_identity") or {}),
+        "provider_path": str((provenance or {}).get("provider_path") or ""),
         "sample_signals": signals.tail(10).reset_index().assign(datetime=lambda frame: frame["datetime"].dt.strftime("%Y-%m-%d")).to_dict(orient="records"),
         "artifacts": {
             "json": str(json_path),
@@ -476,6 +531,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only cash-control overlay report for Qlib backtests.")
     parser.add_argument("--portfolio-report", type=Path, default=None, help="Path to Qlib report_normal_1day.pkl. Defaults to latest MLflow run.")
     parser.add_argument("--run-id", default="", help="Optional MLflow run id used to locate report_normal_1day.pkl.")
+    parser.add_argument("--latest-training", type=Path, default=LATEST_TRAINING_RESULT)
+    parser.add_argument("--mlruns-dir", type=Path, default=MLRUNS_DIR)
     parser.add_argument(
         "--market-data-dir",
         type=Path,
@@ -489,10 +546,23 @@ def main() -> int:
     parser.add_argument("--trading-days-per-year", type=int, default=DEFAULT_TRADING_DAYS_PER_YEAR)
     args = parser.parse_args()
 
+    latest_training = _read_json_object(args.latest_training) or {}
+    run_id = _safe_run_id(args.run_id or latest_training.get("run_id"))
     preflight_unavailable_reason = ""
+    provenance: dict[str, Any] | None = None
     try:
-        portfolio_report = args.portfolio_report or find_portfolio_report_path(run_id=args.run_id)
-    except FileNotFoundError as exc:
+        portfolio_report = args.portfolio_report or find_portfolio_report_path(
+            latest_training_path=args.latest_training,
+            mlruns_dir=args.mlruns_dir,
+            run_id=run_id,
+        )
+        provenance = validate_portfolio_provenance(
+            portfolio_report_path=portfolio_report,
+            run_id=run_id,
+            mlruns_dir=args.mlruns_dir,
+            quant_data_root_path=QUANT_DATA.expanduser().resolve(),
+        )
+    except (FileNotFoundError, OSError, UnicodeError, ValueError) as exc:
         preflight_unavailable_reason = str(exc)
         portfolio_report = args.out_dir / "missing_report_normal_1day.pkl"
     payload = generate_report(
@@ -505,6 +575,8 @@ def main() -> int:
         return_column=args.return_column,
         trading_days_per_year=args.trading_days_per_year,
         preflight_unavailable_reason=preflight_unavailable_reason,
+        run_id=run_id,
+        provenance=provenance,
     )
     baseline = payload["comparison"]["baseline"]
     cash_control = payload["comparison"]["cash_control"]
@@ -512,7 +584,7 @@ def main() -> int:
     print(f"Cash-control cumulative return: {_fmt_pct(cash_control.get('cumulative_return'))}")
     print(f"Latest markdown: {payload['artifacts']['latest_markdown']}")
     print(f"Latest JSON: {payload['artifacts']['latest_json']}")
-    return 0
+    return 1 if payload["unavailable_reason"] else 0
 
 
 if __name__ == "__main__":

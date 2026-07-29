@@ -578,6 +578,57 @@ describe('ResearchPage', () => {
     expect(screen.queryByText(/research\./)).not.toBeInTheDocument();
   });
 
+  it('shows native V2 as blocked instead of a healthy official entry', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      generatedAt: '2026-07-28T20:00:00+08:00',
+      trainable: false,
+      trainingReadiness: {
+        status: 'blocked',
+        summary: '原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。',
+      },
+      dataSources: [],
+      qlibProvider: {
+        datasetId: 'qlib_ashare_v2',
+        role: 'canonical',
+        status: 'blocked',
+        priceBasis: 'qfq',
+        providerSource: 'native_v2_catalog',
+        providerError: '原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。',
+      },
+    });
+
+    renderResearchPage('zh');
+
+    expect(await screen.findByText('原生 V2 已阻断')).toBeInTheDocument();
+    expect(
+      screen.getAllByText('原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。').length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText('当前正式入口：原生 V2')).not.toBeInTheDocument();
+  });
+
+  it('describes a stale immutable V2 run as historical instead of legacy compatibility data', async () => {
+    const initialStatus = await getResearchStatus();
+    getResearchStatus.mockReset();
+    getResearchStatus.mockResolvedValueOnce({
+      ...initialStatus,
+      latestTraining: {
+        ...initialStatus.latestTraining,
+        providerCurrent: false,
+        providerStatus: 'stale',
+        providerWarning: 'Saved immutable snapshot is older than the current snapshot.',
+      },
+    });
+
+    renderResearchPage('en');
+
+    expect(
+      await screen.findByText(
+        'Training result is historical only and does not represent the current native V2 dataset.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/used legacy compatibility data/)).not.toBeInTheDocument();
+  });
+
   it('reruns the read-only data hygiene report and refreshes the displayed result', async () => {
     const initialStatus = await getResearchStatus();
     getResearchStatus.mockReset();

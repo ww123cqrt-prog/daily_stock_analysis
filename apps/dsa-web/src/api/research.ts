@@ -18,12 +18,32 @@ export type ResearchTrainingReadiness = {
 };
 
 export type ResearchQlibProvider = {
-  path: string;
-  calendarDays: number;
-  calendarRange: string;
-  instruments: number;
+  path?: string;
+  calendarDays?: number;
+  calendarRange?: string;
+  instruments?: number;
   featureDirs?: number;
   sizeMb?: number;
+  datasetId?: string;
+  role?: string;
+  status?: string;
+  priceBasis?: string;
+  providerSource?: string;
+  latestTrainingProviderCurrent?: boolean;
+  providerUriWarning?: string;
+  providerError?: string;
+  snapshotId?: string;
+  manifestSha256?: string;
+  contentSha256?: string;
+};
+
+export type ResearchProviderIdentity = {
+  providerUri?: string;
+  providerContract?: string;
+  datasetId?: string;
+  snapshotId?: string;
+  contentSha256?: string;
+  manifestSha256?: string;
 };
 
 export type ResearchTrainingResult = {
@@ -33,6 +53,10 @@ export type ResearchTrainingResult = {
   provider?: string;
   providerUri?: string;
   qlibProvider?: string;
+  providerStatus?: string;
+  providerCurrent?: boolean;
+  providerWarning?: string;
+  providerIdentity?: ResearchProviderIdentity;
   sourceConfig?: string;
   runtimeConfig?: string;
   metrics?: Record<string, number>;
@@ -136,6 +160,10 @@ export type ResearchCandidatePipeline = {
   batchId?: string;
   experimentName?: string;
   provider?: string;
+  providerStatus?: string;
+  providerCurrent?: boolean;
+  providerWarning?: string;
+  providerIdentity?: ResearchProviderIdentity;
   providerLatestDay?: string;
   latestPredictionDay?: string;
   latestLabelDay?: string;
@@ -537,6 +565,7 @@ export type ResearchStatus = {
   trainingReadiness: ResearchTrainingReadiness;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
+  latestTrainingProvider?: ResearchQlibProvider | null;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;

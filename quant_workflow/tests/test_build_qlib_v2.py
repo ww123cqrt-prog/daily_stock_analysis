@@ -1,5 +1,7 @@
+import hashlib
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -153,15 +155,24 @@ def write_benchmark_provider(
     return provider
 
 
-def benchmark_source_evidence() -> dict[str, str]:
+def benchmark_source_evidence(root: Path) -> dict[str, str]:
+    relative = Path(
+        "runtime/v2_compatibility/runs/v1-compat-test/candidate_summary.json"
+    )
+    evidence_path = root / relative
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(
+        json.dumps({"status": "candidate_ready", "run_id": "v1-compat-test"}),
+        encoding="utf-8",
+    )
     return {
         "provider": "tencent",
         "interface": "qt.gtimg.cn historical daily",
         "source_dataset_id": "qlib_ashare_merged_compatibility",
         "source_path": "qlib/cn_data_baostock_jqdata",
         "source_run_id": "v1-compat-test",
-        "evidence_path": "runtime/v2_compatibility/runs/v1-compat-test/candidate_summary.json",
-        "evidence_sha256": "b" * 64,
+        "evidence_path": relative.as_posix(),
+        "evidence_sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
     }
 
 
@@ -206,7 +217,7 @@ def test_build_and_publish_qlib_v2_tracks_exact_qfq_snapshot(tmp_path: Path) -> 
         quant_data_root=root,
         publish=True,
         benchmark_provider=benchmark_provider,
-        benchmark_source=benchmark_source_evidence(),
+        benchmark_source=benchmark_source_evidence(root),
     )
     resolved = contract.resolve_dataset(
         "qlib_ashare_v2",
@@ -282,7 +293,7 @@ def test_build_rejects_benchmark_provider_with_different_calendar(tmp_path: Path
         module.build_qlib_v2(
             quant_data_root=root,
             benchmark_provider=provider,
-            benchmark_source=benchmark_source_evidence(),
+            benchmark_source=benchmark_source_evidence(root),
         )
 
 
@@ -325,6 +336,48 @@ def test_default_build_regenerates_benchmarks_when_compatibility_is_stale(
         assert (snapshot / "features" / symbol.lower() / "close.day.bin").is_file()
 
 
+def test_default_rebuild_reuses_current_native_benchmarks_without_compatibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    first = module.build_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+        benchmark_provider=compatibility,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    shutil.rmtree(compatibility)
+
+    def reject_download(*_args, **_kwargs):
+        pytest.fail("current native benchmarks should be reused without a download")
+
+    monkeypatch.setattr(module, "download_tencent_benchmarks", reject_download)
+    second = module.build_qlib_v2(quant_data_root=root)
+    manifest = json.loads(
+        (second / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+
+    assert second != first
+    source = manifest["benchmarks"]["source"]
+    assert source["source_dataset_id"] == "qlib_ashare_v2"
+    assert source["source_path"] == first.relative_to(root).as_posix()
+    assert source["origin_provider"] == "tencent"
+    assert source["origin_interface"] == "qt.gtimg.cn historical daily"
+    assert source["origin_source_dataset_id"] == (
+        "qlib_ashare_merged_compatibility"
+    )
+    assert source["origin_evidence_sha256"] == benchmark_source_evidence(root)[
+        "evidence_sha256"
+    ]
+
+
 def test_build_rejects_missing_required_benchmark_date(tmp_path: Path) -> None:
     root = tmp_path / "quant_data"
     publish_qfq_fixture(root)
@@ -340,7 +393,7 @@ def test_build_rejects_missing_required_benchmark_date(tmp_path: Path) -> None:
         module.build_qlib_v2(
             quant_data_root=root,
             benchmark_provider=provider,
-            benchmark_source=benchmark_source_evidence(),
+            benchmark_source=benchmark_source_evidence(root),
         )
 
 
@@ -357,7 +410,7 @@ def test_failed_rebuild_keeps_published_native_pointer_unchanged(tmp_path: Path)
         quant_data_root=root,
         publish=True,
         benchmark_provider=provider,
-        benchmark_source=benchmark_source_evidence(),
+        benchmark_source=benchmark_source_evidence(root),
     )
     pointer = root / "qlib" / "cn_data_ashare_v2" / "LATEST.json"
     before = pointer.read_bytes()
@@ -372,10 +425,41 @@ def test_failed_rebuild_keeps_published_native_pointer_unchanged(tmp_path: Path)
             quant_data_root=root,
             publish=True,
             benchmark_provider=provider,
-            benchmark_source=benchmark_source_evidence(),
+            benchmark_source=benchmark_source_evidence(root),
         )
 
     assert pointer.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["missing", "hash_mismatch"])
+def test_build_rejects_unverifiable_benchmark_source_evidence(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    provider = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    source = benchmark_source_evidence(root)
+    evidence_path = root / source["evidence_path"]
+    if failure == "missing":
+        evidence_path.unlink()
+    else:
+        evidence_path.write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(
+        module.DataContractError,
+        match="evidence is unavailable|evidence hash mismatch",
+    ):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            benchmark_provider=provider,
+            benchmark_source=source,
+        )
 
 
 def test_qlib_benchmark_tampering_is_rejected(tmp_path: Path) -> None:
@@ -390,10 +474,89 @@ def test_qlib_benchmark_tampering_is_rejected(tmp_path: Path) -> None:
     snapshot = module.build_qlib_v2(
         quant_data_root=root,
         benchmark_provider=provider,
-        benchmark_source=benchmark_source_evidence(),
+        benchmark_source=benchmark_source_evidence(root),
     )
     feature = snapshot / "features" / "sh000300" / "close.day.bin"
     feature.write_bytes(feature.read_bytes() + b"tamper")
 
     with pytest.raises(contract.DataContractError, match="benchmark|Qlib file"):
         contract.validate_qlib_snapshot(snapshot, verify_hashes=True)
+
+
+def test_cleaned_v2_builds_without_compatibility_provider_and_records_cleaning(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    canonical_module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    source_contract = _qfq_source_contract(contract, root)
+    compatibility_provider = write_benchmark_provider(
+        root,
+        source_snapshot=source_contract,
+    )
+    canonical_snapshot = canonical_module.build_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+        benchmark_provider=compatibility_provider,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    canonical_manifest = contract.validate_dataset_snapshot(canonical_snapshot)
+    canonical_identity = {
+        field: str(canonical_manifest[field])
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    }
+    shutil.rmtree(compatibility_provider)
+
+    cleaned_script = SCRIPTS / "build_cleaned_qlib_v2.py"
+    assert cleaned_script.is_file(), "native cleaned V2 builder is missing"
+    cleaned_module = load_script("build_cleaned_qlib_v2")
+    published = cleaned_module.build_cleaned_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+    )
+    resolved = contract.resolve_dataset(
+        "qlib_ashare_cleaned_v2",
+        quant_data_root=root,
+        require_basis="qfq",
+    )
+
+    assert published == resolved.snapshot_path
+    assert resolved.manifest["benchmark_complete"] is True
+    assert resolved.manifest["upstream_snapshots"] == [source_contract]
+    assert resolved.manifest["dependency_snapshots"] == [canonical_identity]
+    transformation = resolved.manifest["transformation"]
+    assert transformation["name"] == "anomaly_masking"
+    assert transformation["algorithm"]["version"] == "2"
+    assert transformation["source_snapshot"] == source_contract
+    assert transformation["summary"]["source_symbols"] == 1
+    assert transformation["summary"]["output_symbols"] == 1
+    assert set(transformation["artifacts"]) == {
+        "anomaly_stocks",
+        "anomaly_events",
+        "cleaning_strategy",
+        "cleaning_summary",
+    }
+    provider_manifest = json.loads(
+        (published / "PROVIDER_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    assert resolved.manifest["producer"]["version"] == "2"
+    assert provider_manifest["transformation"] == transformation
+    assert provider_manifest["dependency_snapshots"] == [canonical_identity]
+    assert (
+        resolved.manifest["benchmarks"]["source"]["source_dataset_id"]
+        == "qlib_ashare_v2"
+    )
+    benchmark_source = resolved.manifest["benchmarks"]["source"]
+    assert benchmark_source["source_dataset_id"] == "qlib_ashare_v2"
+    assert benchmark_source["source_path"].startswith(
+        "qlib/cn_data_ashare_v2/snapshots/"
+    )
+    assert benchmark_source["origin_source_path"] == (
+        "qlib/cn_data_baostock_jqdata"
+    )
+
+    artifact = published / transformation["artifacts"]["cleaning_summary"]["relative_path"]
+    artifact.write_text("tampered", encoding="utf-8")
+    with pytest.raises(contract.DataContractError, match="transformation artifact"):
+        contract.validate_qlib_snapshot(published, verify_hashes=True)

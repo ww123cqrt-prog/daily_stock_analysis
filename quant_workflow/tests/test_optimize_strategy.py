@@ -20,11 +20,14 @@ def load_module():
 
 
 class OptimizeStrategyTest(unittest.TestCase):
-    def test_data_dir_honors_explicit_provider_environment(self):
+    def test_data_dir_rejects_legacy_provider_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir) / "native-provider"
+            quant_data = Path(temp_dir) / "quant_data"
+            provider = quant_data / "qlib" / "cn_data_baostock_jqdata"
+            provider.mkdir(parents=True)
             script_path = Path(__file__).resolve().parents[1] / "scripts" / "optimize_strategy.py"
             env = os.environ.copy()
+            env["QUANT_DATA_ROOT"] = str(quant_data)
             env["QLIB_PROVIDER_URI"] = str(provider)
 
             result = subprocess.run(
@@ -44,11 +47,11 @@ class OptimizeStrategyTest(unittest.TestCase):
                 env=env,
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
 
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["data_dir"], str(provider))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("legacy compatibility providers are rejected", result.stderr)
 
     def test_training_runtime_config_locks_resolved_native_provider(self):
         module = load_module()

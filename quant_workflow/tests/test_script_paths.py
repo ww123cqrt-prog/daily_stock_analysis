@@ -29,11 +29,9 @@ class ScriptPathsTest(unittest.TestCase):
         if not expected_quant_data.exists() and sibling_quant_data.exists():
             expected_quant_data = sibling_quant_data
         self.assertEqual(module.quant_data_root(), expected_quant_data)
-        sibling_reports = dsa_root.parent / "quant_workflow" / "reports"
         expected_reports = workflow_root / "reports"
         self.assertEqual(module.reports_root(), expected_reports)
 
-        sibling_mlruns = dsa_root.parent / "quant_workflow" / "mlruns"
         expected_mlruns = workflow_root / "mlruns"
         self.assertEqual(module.mlruns_root(), expected_mlruns)
 
@@ -154,9 +152,16 @@ class ScriptPathsTest(unittest.TestCase):
                 "QLIB_PROVIDER_URI": str(root / "provider"),
                 "QLIB_CLEANED_PROVIDER_URI": str(root / "provider-cleaned"),
                 "QLIB_COMPATIBILITY_PROVIDER_URI": str(root / "provider-compat"),
+                "QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI": str(
+                    root / "provider-cleaned-compat"
+                ),
                 "CHINA_ASTOCK_QUANT_ROOT": str(root / "astock"),
             }
-            with patch.dict(os.environ, env, clear=False):
+            with patch.dict(os.environ, env, clear=False), patch.object(
+                module,
+                "_validate_native_provider_override",
+                side_effect=lambda configured, **_kwargs: Path(configured),
+            ):
                 self.assertEqual(module.workflow_root(), root / "workflow")
                 self.assertEqual(module.reports_root(), root / "reports")
                 self.assertEqual(module.mlruns_root(), root / "mlruns")
@@ -168,9 +173,77 @@ class ScriptPathsTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     module.qlib_compatibility_provider_uri("cleaned"),
-                    root / "provider-cleaned",
+                    root / "provider-cleaned-compat",
                 )
                 self.assertEqual(module.china_astock_root(), root / "astock")
+
+    def test_native_provider_override_rejects_legacy_compatibility_path(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            legacy = root / "qlib" / "cn_data_baostock_jqdata"
+            legacy.mkdir(parents=True)
+            with patch.dict(
+                os.environ,
+                {
+                    "QUANT_DATA_ROOT": str(root),
+                    "QLIB_PROVIDER_URI": str(legacy),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "legacy compatibility"):
+                    module.qlib_provider_uri()
+
+    def test_cleaned_provider_override_rejects_legacy_compatibility_path(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            legacy = root / "qlib" / "cn_data_baostock_jqdata_cleaned"
+            legacy.mkdir(parents=True)
+            with patch.dict(
+                os.environ,
+                {
+                    "QUANT_DATA_ROOT": str(root),
+                    "QLIB_CLEANED_PROVIDER_URI": str(legacy),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "legacy compatibility"):
+                    module.qlib_provider_uri("cleaned")
+
+    def test_native_provider_override_accepts_validated_snapshot_path(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            snapshot = (
+                root
+                / "qlib"
+                / "cn_data_ashare_v2"
+                / "snapshots"
+                / "qlib-native-001"
+            )
+            snapshot.mkdir(parents=True)
+            manifest = {
+                "dataset_id": "qlib_ashare_v2",
+                "snapshot_id": snapshot.name,
+                "role": "canonical",
+                "status": "ready",
+                "price_basis": "qfq",
+                "benchmark_complete": True,
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "QUANT_DATA_ROOT": str(root),
+                    "QLIB_PROVIDER_URI": str(snapshot),
+                },
+                clear=False,
+            ), patch.object(
+                module,
+                "validate_qlib_snapshot",
+                return_value=manifest,
+            ):
+                self.assertEqual(module.qlib_provider_uri(), snapshot.resolve())
 
     def test_unknown_provider_name_is_rejected(self):
         module = load_module()
@@ -224,6 +297,40 @@ class ScriptPathsTest(unittest.TestCase):
                 module._resolve_native_qlib.cache_clear()
                 with self.assertRaisesRegex(RuntimeError, "benchmarks are incomplete"):
                     module.qlib_provider_uri()
+
+    def test_cleaned_provider_resolves_native_v2_snapshot_once_per_process(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            first = root / "qlib" / "cleaned" / "snapshots" / "snapshot-001"
+            second = root / "qlib" / "cleaned" / "snapshots" / "snapshot-002"
+            resolved = [
+                SimpleNamespace(
+                    snapshot_path=first,
+                    manifest={"benchmark_complete": True},
+                ),
+                SimpleNamespace(
+                    snapshot_path=second,
+                    manifest={"benchmark_complete": True},
+                ),
+            ]
+            with patch.dict(
+                os.environ,
+                {
+                    "QUANT_DATA_ROOT": str(root),
+                    "QLIB_CLEANED_PROVIDER_URI": "",
+                },
+                clear=False,
+            ), patch.object(module, "resolve_dataset", side_effect=resolved) as resolver:
+                self.assertEqual(module.qlib_provider_uri("cleaned"), first)
+                self.assertEqual(module.qlib_provider_uri("cleaned"), first)
+
+            self.assertEqual(resolver.call_count, 1)
+            resolver.assert_called_once_with(
+                "qlib_ashare_cleaned_v2",
+                quant_data_root=root.resolve(),
+                require_basis="qfq",
+            )
 
     def test_ashare_qfq_bars_resolve_native_snapshot_once_per_process(self):
         module = load_module()

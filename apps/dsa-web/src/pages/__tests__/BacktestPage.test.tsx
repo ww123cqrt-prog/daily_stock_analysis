@@ -295,6 +295,76 @@ describe('BacktestPage', () => {
     expect(runFormStrategy).not.toHaveBeenCalled();
   });
 
+  it('marks a candidate result from the compatibility provider as historical', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      trainable: true,
+      trainingReadiness: { status: 'trainable', summary: 'ready' },
+      dataSources: [],
+      candidatePipeline: {
+        status: 'completed',
+        provider: 'canonical',
+        providerStatus: 'stale',
+        providerCurrent: false,
+        providerWarning: '该候选报告使用旧兼容数据，只能作为历史参考。',
+        periods: {
+          selection: ['2024-01-01', '2025-12-31'],
+          holdout: ['2026-01-01', '2026-07-10'],
+        },
+        models: [
+          {
+            id: 'xgboost',
+            label: 'XGBoost',
+            status: 'completed',
+            runId: 'run-xgb',
+          },
+        ],
+        strategyEvaluations: [
+          {
+            modelId: 'xgboost',
+            strategyId: 'combined_risk',
+            strategyLabel: '完整组合风控',
+          },
+        ],
+      },
+    });
+
+    renderPage('/backtest?tab=trained&runId=run-xgb&modelId=xgboost&strategyId=combined_risk');
+
+    expect(
+      await screen.findByText('该候选报告使用旧兼容数据，只能作为历史参考。'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('历史候选结果已加载')).toBeInTheDocument();
+  });
+
+  it('shows a catalog failure instead of calling it old compatibility data', async () => {
+    window.localStorage.setItem('dsa.uiLanguage', 'en');
+    getResearchStatus.mockResolvedValueOnce({
+      trainable: false,
+      trainingReadiness: { status: 'blocked', summary: 'blocked' },
+      dataSources: [],
+      latestTraining: {
+        status: 'completed',
+        experimentName: 'baseline_lgb_alpha158',
+        runId: 'latest-run',
+        providerStatus: 'catalog_invalid',
+        providerCurrent: false,
+        providerWarning: '后端中文诊断不应直接显示',
+      },
+      candidatePipeline: {
+        status: 'completed',
+        models: [],
+        strategyEvaluations: [],
+      },
+    });
+
+    renderPage('/backtest?tab=trained&runId=latest-run&modelId=latest&strategyId=baseline_daily');
+
+    expect(await screen.findByText('Native V2 blocked')).toBeInTheDocument();
+    expect(screen.getByText('Native V2 catalog invalid')).toBeInTheDocument();
+    expect(screen.getByText(/current canonical dataset cannot be verified/i)).toBeInTheDocument();
+    expect(screen.queryByText(/old compatibility data/i)).not.toBeInTheDocument();
+  });
+
   it('lets the latest trained model use any registered trading strategy', async () => {
     renderPage('/backtest?tab=trained&runId=latest-run&modelId=latest&strategyId=low_turnover_weekly');
 

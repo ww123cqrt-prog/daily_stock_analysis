@@ -2923,19 +2923,19 @@ class QuantJobsApiTestCase(unittest.TestCase):
             status = service.available_job_types()
             spec = service.command_specs["apply_data_cleaning"]
 
-        self.assertIn("apply_data_cleaning.py", command[1])
-        self._assert_reports_dir_arg(command)
+        self.assertIn("build_cleaned_qlib_v2.py", command[1])
+        self.assertIn("--publish", command)
         self.assertEqual(
-            status["apply_data_cleaning"]["label"], "应用清洗策略生成 cleaned Qlib"
+            status["apply_data_cleaning"]["label"], "构建原生 cleaned Qlib V2 快照"
         )
         self.assertEqual(
             status["apply_data_cleaning"]["allowed_params"],
-            ["dry_run", "no_overwrite", "skip_qlib_convert"],
+            ["dry_run"],
         )
-        self.assertIn(
-            "--dry-run",
-            service._build_command("apply_data_cleaning", {"dry_run": True}),
-        )
+        dry_run = service._build_command("apply_data_cleaning", {"dry_run": True})
+        self.assertIn("apply_data_cleaning.py", dry_run[1])
+        self.assertIn("--dry-run", dry_run)
+        self._assert_reports_dir_arg(dry_run)
         self.assertTrue(
             any(
                 "data_cleaning_applied_latest.json" in item
@@ -2967,6 +2967,21 @@ class QuantJobsApiTestCase(unittest.TestCase):
             status["merge_to_qlib"]["allowed_params"], ["no_overwrite", "smoke"]
         )
         self.assertIn("Unsupported params for merge_to_qlib", str(ctx.exception))
+
+    def test_merge_to_qlib_job_publishes_native_v2_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+
+            command = service._build_command("merge_to_qlib", {})
+            status = service.available_job_types()
+
+        self.assertIn("build_qlib_v2.py", command[1])
+        self.assertIn("--publish", command)
+        self.assertNotIn("merge_to_qlib.py", command[1])
+        self.assertEqual(
+            status["merge_to_qlib"]["label"],
+            "构建并发布原生 Qlib V2",
+        )
 
     def test_download_jqdata_job_supports_browser_safe_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

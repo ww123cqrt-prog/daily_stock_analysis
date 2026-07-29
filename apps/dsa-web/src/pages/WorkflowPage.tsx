@@ -269,33 +269,32 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     ],
   },
   {
-    title: '合并 Qlib',
-    description: '把多来源 Parquet 合并，并转换成 Qlib provider。',
+    title: '原生 Qlib V2',
+    description: '从正式前复权快照构建不可变 Qlib provider，并通过清单原子发布。',
     icon: RotateCw,
     jobs: [
       {
         type: 'merge_to_qlib',
-        label: '合并并转换为 Qlib',
-        description: '生成 canonical Qlib provider，供选股模型训练读取。',
+        label: '构建并发布原生 Qlib V2',
+        description: '正式运行会生成新的不可变 canonical 快照；隔离演练不会写入正式数据。',
         params: [
           { key: 'smoke', label: '使用隔离小样本演练', kind: 'checkbox' },
-          { key: 'no_overwrite', label: '跳过已有输出文件', kind: 'checkbox' },
         ],
       },
       {
         type: 'repair_qlib_provider',
-        label: '预演修复 Qlib Provider',
-        description: '检查日历、股票池、benchmark 等 provider 元数据修复计划；网页端固定 dry-run，不写入 provider。',
+        label: '预演旧兼容 Qlib 修复',
+        description: '只检查保留的旧兼容目录；网页端固定 dry-run，不影响原生 V2。',
       },
       {
         type: 'generate_csi300',
-        label: '预演生成 CSI300 股票池',
-        description: '读取当前股票池和 Qlib 日历，预演生成 csi300.txt；网页端固定 dry-run，不写入 provider。',
+        label: '预演旧兼容 CSI300 股票池',
+        description: '只检查保留的旧兼容目录；原生 V2 股票池由快照构建器生成。',
       },
       {
         type: 'add_index_benchmark',
-        label: '预演添加沪深300 benchmark',
-        description: '检查当前 provider 日历和 benchmark 目标目录；网页端固定 dry-run，不请求 Baostock、不写 bin、不改股票池。',
+        label: '预演旧兼容 benchmark',
+        description: '只检查保留的旧兼容目录；原生 V2 已在构建时包含三个指数。',
       },
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
     ],
@@ -348,7 +347,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'report_china_astock_indicators',
         label: '生成 china-astock 技术指标报告',
-        description: '复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取本地 cleaned 行情生成只读技术面观察报告，不连接券商、不自动下单。',
+        description: '复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取原生 V2 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。',
         params: [
           { key: 'symbols', label: '股票代码', kind: 'text', placeholder: '000001,600519；留空按数量上限抽样' },
           { key: 'lookback_days', label: '回看交易日', kind: 'number', min: 20, placeholder: '120' },
@@ -357,12 +356,10 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'apply_data_cleaning',
-        label: '应用清洗策略',
-        description: '根据异常清单生成旧版 cleaned 兼容 provider，不覆盖原生 V2 正式 provider。',
+        label: '构建原生 cleaned Qlib V2 快照',
+        description: '正式运行从当前 canonical V2 构建并发布不可变 cleaned V2；勾选预演时只检查清洗计划，不发布数据。',
         params: [
           { key: 'dry_run', label: '只预演不写入', kind: 'checkbox' },
-          { key: 'no_overwrite', label: '不覆盖已有文件', kind: 'checkbox' },
-          { key: 'skip_qlib_convert', label: '仅生成 cleaned Parquet', kind: 'checkbox' },
         ],
       },
     ],
@@ -383,7 +380,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             kind: 'select',
             options: [
               { value: 'canonical', label: '原生 V2（正式）' },
-              { value: 'cleaned', label: '旧版清洗数据（兼容）' },
+              { value: 'cleaned', label: '原生 cleaned V2' },
             ],
           },
           { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
@@ -402,7 +399,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             kind: 'select',
             options: [
               { value: 'canonical', label: '原生 V2（正式）' },
-              { value: 'cleaned', label: '旧版清洗数据（兼容）' },
+              { value: 'cleaned', label: '原生 cleaned V2' },
             ],
           },
           { key: 'dry_run', label: '只做小样本预演', kind: 'checkbox' },
@@ -913,7 +910,7 @@ function buildDailyGuideSteps(
       detail: '默认只做 dry-run，不写 cleaned parquet，不转换 Qlib，适合先核对影响范围。',
       ...cleaningStatus,
       actions: [
-        { kind: 'job', label: '预演', jobType: 'apply_data_cleaning', params: { dry_run: true, no_overwrite: true } },
+        { kind: 'job', label: '预演', jobType: 'apply_data_cleaning', params: { dry_run: true } },
       ],
     },
     {

@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import sys
 from contextlib import contextmanager
 from datetime import datetime
@@ -30,7 +29,6 @@ if str(SCRIPT_DIR) not in sys.path:
 from _paths import (  # noqa: E402
     china_astock_root,
     mlruns_root,
-    projects_root,
     qlib_provider_uri,
     quant_data_root,
     reports_root,
@@ -40,6 +38,7 @@ from _mlflow_run_provenance import (  # noqa: E402
     experiment_run_ids,
     provider_identity,
     select_new_prediction_run,
+    tag_run_artifact_hashes,
     tag_run_with_provider,
 )
 from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
@@ -57,13 +56,9 @@ MLRUNS_DIR = mlruns_root()
 MLFLOW_TRACKING_URI = f"file://{MLRUNS_DIR}"
 QUANT_DATA = quant_data_root()
 STOCK_LIST_PATH = QUANT_DATA / "stock_lists.json"
-CANONICAL_DATA_DIR = qlib_provider_uri()
-CLEANED_DATA_DIR = qlib_provider_uri("cleaned")
-PROVIDER_URIS = {
-    "canonical": CANONICAL_DATA_DIR,
-    "cleaned": CLEANED_DATA_DIR,
-}
+PROVIDER_NAMES = ("canonical", "cleaned")
 ASTOCK_PROJECT = china_astock_root()
+REQUIRED_TRAINING_ARTIFACTS = ("pred.pkl", "label.pkl")
 
 # ── Environment fixes (must run before qlib import) ──────────────────
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
@@ -85,12 +80,15 @@ def experiment_file_lock(report_dir: Path = REPORT_DIR) -> Iterator[None]:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
-def resolve_provider_uri(provider: str | None) -> Path:
+def resolve_provider_uri(
+    provider: str | None,
+    snapshot_override: str | Path | None = None,
+) -> Path:
     name = (provider or "canonical").strip().lower()
-    if name not in PROVIDER_URIS:
-        choices = ", ".join(sorted(PROVIDER_URIS))
+    if name not in PROVIDER_NAMES:
+        choices = ", ".join(PROVIDER_NAMES)
         raise ValueError(f"Provider must be one of: {choices}.")
-    return PROVIDER_URIS[name]
+    return qlib_provider_uri(name, snapshot_override=snapshot_override)
 
 
 def to_qlib_name(sym: str) -> str:
@@ -303,31 +301,6 @@ def ensure_mlruns_artifact_locations(mlruns_dir: Path = MLRUNS_DIR) -> int:
     return fixed
 
 
-def mirror_run_artifacts_from_legacy_locations(
-    run_id: str,
-    experiment_id: str,
-    *,
-    projects: Path | None = None,
-    mlruns_dir: Path = MLRUNS_DIR,
-) -> bool:
-    """Copy artifacts written to a legacy sibling mlruns directory back into this workspace."""
-    if not run_id or not experiment_id:
-        return False
-    projects_root_path = projects or projects_root()
-    legacy_artifacts = projects_root_path / "quant_workflow" / "mlruns" / experiment_id / run_id / "artifacts"
-    target_artifacts = mlruns_dir / experiment_id / run_id / "artifacts"
-    if not legacy_artifacts.exists() or legacy_artifacts.resolve() == target_artifacts.resolve():
-        return False
-    if target_artifacts.exists() and any(target_artifacts.iterdir()):
-        return False
-    target_artifacts.parent.mkdir(parents=True, exist_ok=True)
-    if target_artifacts.exists():
-        shutil.rmtree(target_artifacts)
-    shutil.copytree(legacy_artifacts, target_artifacts)
-    print(f"[setup] Mirrored legacy MLflow artifacts: {legacy_artifacts} -> {target_artifacts}")
-    return True
-
-
 def local_run_artifacts(
     run_id: str,
     experiment_id: str,
@@ -341,6 +314,28 @@ def local_run_artifacts(
     if not artifacts_dir.exists():
         return []
     return sorted(item.name for item in artifacts_dir.iterdir())
+
+
+def require_local_training_artifacts(
+    run_id: str,
+    experiment_id: str,
+    *,
+    mlruns_dir: Path = MLRUNS_DIR,
+) -> list[str]:
+    """Require the current Run to own its artifacts under the active file store."""
+
+    artifacts = local_run_artifacts(
+        run_id,
+        experiment_id,
+        mlruns_dir=mlruns_dir,
+    )
+    missing = [name for name in REQUIRED_TRAINING_ARTIFACTS if name not in artifacts]
+    if missing:
+        raise RuntimeError(
+            "Training Run is missing required artifacts in the active MLflow store: "
+            + ", ".join(missing)
+        )
+    return artifacts
 
 
 def load_latest_metrics(experiment_name: str = "baseline_lgb_alpha158") -> dict:
@@ -436,18 +431,42 @@ def load_run_metrics(run_id: str, experiment_name: str) -> dict:
     }
 
 
-def write_latest_training_result(info: dict) -> None:
+def tag_training_run_artifacts(
+    run_id: str,
+    *,
+    mlruns_dir: Path = MLRUNS_DIR,
+    client: object | None = None,
+) -> dict[str, str]:
+    """Hash local report inputs and bind the hashes to the exact MLflow Run."""
+
+    if client is None:
+        import mlflow
+
+        client = mlflow.tracking.MlflowClient(
+            tracking_uri=f"file://{Path(mlruns_dir).expanduser().resolve()}"
+        )
+    return tag_run_artifact_hashes(
+        client,
+        str(run_id),
+        mlruns_dir=mlruns_dir,
+    )
+
+
+def write_latest_training_result(
+    info: dict,
+    output_path: Path = LATEST_TRAINING_RESULT,
+) -> None:
     """Write a stable JSON summary for the DSA research workspace."""
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         **info,
     }
-    LATEST_TRAINING_RESULT.write_text(
+    output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    print(f"\n[artifact] Latest training summary: {LATEST_TRAINING_RESULT}")
+    print(f"\n[artifact] Latest training summary: {output_path}")
 
 
 def _metric_subset(metrics: dict) -> dict:
@@ -566,6 +585,26 @@ def append_experiment_record(info: dict, report_dir: Path = REPORT_DIR) -> bool:
     return True
 
 
+def record_training_result(
+    info: dict,
+    *,
+    publish_latest: bool = True,
+    report_dir: Path = REPORT_DIR,
+) -> None:
+    recorded = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        **info,
+    }
+    if publish_latest:
+        write_latest_training_result(
+            recorded,
+            output_path=report_dir / LATEST_TRAINING_RESULT.name,
+        )
+    else:
+        print("\n[artifact] Latest training summary unchanged (--no-publish-latest)")
+    append_experiment_record(recorded, report_dir=report_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Qlib Alpha158+LGB baseline")
     parser.add_argument(
@@ -581,8 +620,19 @@ def main():
     parser.add_argument(
         "--provider",
         default="canonical",
-        choices=sorted(PROVIDER_URIS),
+        choices=PROVIDER_NAMES,
         help="Local Qlib provider to use: canonical or cleaned",
+    )
+    parser.add_argument(
+        "--provider-uri",
+        type=Path,
+        default=None,
+        help="Pin one already selected immutable native V2 snapshot for this run",
+    )
+    parser.add_argument(
+        "--no-publish-latest",
+        action="store_true",
+        help="Keep the MLflow/experiment record without replacing the DSA latest result",
     )
     args = parser.parse_args()
 
@@ -591,7 +641,7 @@ def main():
         print(f"[error] Config not found: {config_path}")
         sys.exit(1)
     try:
-        provider_uri = resolve_provider_uri(args.provider)
+        provider_uri = resolve_provider_uri(args.provider, args.provider_uri)
         if not provider_uri.exists():
             raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
     except Exception as exc:
@@ -629,28 +679,29 @@ def main():
 
     info = load_run_metrics(run_id, args.experiment_name)
     if info:
-        mirror_run_artifacts_from_legacy_locations(
+        local_artifacts = require_local_training_artifacts(
             str(info.get("run_id") or ""),
             str(info.get("experiment_id") or ""),
             mlruns_dir=MLRUNS_DIR,
         )
-        mirrored_artifacts = local_run_artifacts(
+        info["artifacts"] = local_artifacts
+        info["artifact_sha256"] = tag_training_run_artifacts(
             str(info.get("run_id") or ""),
-            str(info.get("experiment_id") or ""),
             mlruns_dir=MLRUNS_DIR,
         )
-        if mirrored_artifacts:
-            info["artifacts"] = mirrored_artifacts
         info.update(
             {
                 "provider": args.provider,
                 "provider_uri": str(provider_uri),
+                "provider_identity": provider_identity(provider_uri),
                 "source_config": str(config_path),
                 "runtime_config": str(runtime_config_path),
             }
         )
-        write_latest_training_result(info)
-        append_experiment_record({"generated_at": datetime.now().astimezone().isoformat(timespec="seconds"), **info})
+        record_training_result(
+            info,
+            publish_latest=not args.no_publish_latest,
+        )
         print(f"\nRun ID: {info['run_id']}")
         print("\nMetrics:")
         for k, v in sorted(info["metrics"].items()):

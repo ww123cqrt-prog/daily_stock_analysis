@@ -84,7 +84,9 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("generate_etf_momentum_report", names)
         self.assertIn("validate_ashare_daily_qfq", names)
         self.assertIn("validate_qlib_ashare_v2", names)
+        self.assertIn("validate_qlib_ashare_cleaned_v2", names)
         self.assertIn("check_qlib_data", names)
+        self.assertIn("check_qlib_cleaned_data", names)
         self.assertIn("report_data_quality", names)
         self.assertIn("sync_data_manifest_check", names)
         self.assertNotIn("merge_to_qlib", names)
@@ -92,6 +94,12 @@ class BuildStagesTest(unittest.TestCase):
         self.assertLess(
             names.index("validate_qlib_ashare_v2"),
             names.index("check_qlib_data"),
+        )
+        cleaned_check = next(
+            stage for stage in stages if stage.name == "check_qlib_cleaned_data"
+        )
+        self.assertEqual(
+            cleaned_check.argv[-2:], ["--provider", "cleaned"]
         )
 
     def test_skip_download_omits_download_stage(self):
@@ -147,6 +155,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("download_ashare_news", names)
         self.assertNotIn("update_ashare_v2_bundle", names)
         self.assertIn("validate_qlib_ashare_v2", names)
+        self.assertIn("validate_qlib_ashare_cleaned_v2", names)
 
     def test_etf_momentum_update_and_report_are_isolated_nonfatal_stages(self):
         stages = self.module.build_stages(_args())
@@ -435,15 +444,21 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(
-                        sys,
-                        "argv",
-                        ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
-                    ):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
+                ),
+            ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -467,15 +482,21 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(
-                        sys,
-                        "argv",
-                        ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
-                    ):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["run_daily_update.py", "--ashare-source", "eastmoney", "--continue-on-error"],
+                ),
+            ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -496,11 +517,17 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py"]):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(sys, "argv", ["run_daily_update.py"]),
+            ):
                 rc = module.main()
 
         self.assertEqual(rc, 1)
@@ -516,15 +543,21 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(
-                        sys,
-                        "argv",
-                        ["run_daily_update.py", "--ashare-source", "baostock"],
-                    ):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["run_daily_update.py", "--ashare-source", "baostock"],
+                ),
+            ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -549,11 +582,17 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(sys, "argv", ["run_daily_update.py", "--ashare-source", "baostock"]):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-03")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(sys, "argv", ["run_daily_update.py", "--ashare-source", "baostock"]),
+            ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -573,19 +612,25 @@ class DryRunMainTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")]), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(
-                        sys,
-                        "argv",
-                        [
-                            "run_daily_update.py",
-                            "--ashare-v2-bundle-dir",
-                            str(Path(tmp) / "bundle"),
-                        ],
-                    ):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    side_effect=[_snapshot("2026-07-03"), _snapshot("2026-07-08")],
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "run_daily_update.py",
+                        "--ashare-v2-bundle-dir",
+                        str(Path(tmp) / "bundle"),
+                    ],
+                ),
+            ):
                 rc = module.main()
             summary = json.loads((reports / "daily_update_summary_latest.json").read_text(encoding="utf-8"))
 
@@ -605,15 +650,21 @@ class DryRunMainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp) / "reports"
             bundle = Path(tmp) / "bundle"
-            with patch.object(module, "REPORTS_ROOT", reports), \
-                    patch.object(module, "load_expected_symbols", return_value={"000001"}), \
-                    patch.object(module, "source_coverage_snapshot", return_value=_snapshot("2026-07-08")), \
-                    patch.object(module, "run_stage", side_effect=fake_run_stage), \
-                    patch.object(
-                        sys,
-                        "argv",
-                        ["run_daily_update.py", "--ashare-v2-bundle-dir", str(bundle)],
-                    ):
+            with (
+                patch.object(module, "REPORTS_ROOT", reports),
+                patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                patch.object(
+                    module,
+                    "source_coverage_snapshot",
+                    return_value=_snapshot("2026-07-08"),
+                ),
+                patch.object(module, "run_stage", side_effect=fake_run_stage),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["run_daily_update.py", "--ashare-v2-bundle-dir", str(bundle)],
+                ),
+            ):
                 rc = module.main()
             summary = json.loads(
                 (reports / "daily_update_summary_latest.json").read_text(
