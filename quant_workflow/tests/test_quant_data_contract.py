@@ -115,6 +115,7 @@ def finalize_qlib_snapshot(
     upstream_snapshot: dict[str, str] | None = None,
     dataset_id: str = "qlib_ashare_v2",
     dependency_snapshots: list[dict[str, str]] | None = None,
+    producer: dict[str, str] | None = None,
 ) -> Path:
     snapshot = quant_data / "staging" / f"run-{snapshot_id}" / snapshot_id
     (snapshot / "calendars").mkdir(parents=True)
@@ -149,11 +150,36 @@ def finalize_qlib_snapshot(
         snapshot_id=snapshot_id,
         source={"provider": "quant_workflow", "interface": "v2_snapshot_to_qlib"},
         source_retrieved_at="2026-07-25T22:59:00+08:00",
-        producer={"script": "build_qlib_v2.py", "version": "2"},
+        producer=producer or {"script": "build_qlib_v2.py", "version": "2"},
         upstream_snapshot=upstream_snapshot,
         dependency_snapshots=dependency_snapshots,
     )
     return snapshot
+
+
+def rewrite_as_legacy_qlib_snapshot(
+    module,
+    snapshot: Path,
+    *,
+    omit_dependencies: bool = False,
+) -> None:
+    provider_manifest_path = snapshot / "PROVIDER_MANIFEST.json"
+    provider_manifest = json.loads(provider_manifest_path.read_text(encoding="utf-8"))
+    provider_manifest.pop("producer", None)
+    if omit_dependencies:
+        provider_manifest.pop("dependency_snapshots", None)
+    module.atomic_write_json(provider_manifest_path, provider_manifest)
+    index = module._build_qlib_file_index(snapshot)
+    index.to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
+    dataset_manifest_path = snapshot / "DATASET_MANIFEST.json"
+    dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
+    if omit_dependencies:
+        dataset_manifest.pop("dependency_snapshots", None)
+    dataset_manifest["content_sha256"] = module._content_hash(
+        snapshot,
+        dataset_manifest,
+    )
+    module.atomic_write_json(dataset_manifest_path, dataset_manifest)
 
 
 def test_qlib_structural_validation_skips_file_hashing(tmp_path: Path) -> None:
@@ -168,6 +194,150 @@ def test_qlib_structural_validation_skips_file_hashing(tmp_path: Path) -> None:
         manifest = module.validate_qlib_snapshot(snapshot, verify_hashes=False)
 
     assert manifest["snapshot_id"] == "qlib-001"
+
+
+def test_qlib_provider_manifest_records_and_validates_producer(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    snapshot = finalize_qlib_snapshot(module, tmp_path / "quant_data", "qlib-001")
+    provider_manifest_path = snapshot / "PROVIDER_MANIFEST.json"
+    provider_manifest = json.loads(provider_manifest_path.read_text(encoding="utf-8"))
+
+    assert provider_manifest["producer"] == {
+        "script": "build_qlib_v2.py",
+        "version": "2",
+    }
+
+    provider_manifest["producer"] = {"script": "tampered.py", "version": "1"}
+    module.atomic_write_json(provider_manifest_path, provider_manifest)
+    with pytest.raises(module.DataContractError, match="producer lineage disagree"):
+        module.validate_qlib_snapshot(snapshot, verify_hashes=False)
+
+
+@pytest.mark.parametrize("version", ["2", "3", "4", "5"])
+def test_known_legacy_canonical_without_duplicate_producer_remains_valid(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    module = load_module()
+    snapshot = finalize_qlib_snapshot(
+        module,
+        tmp_path / "quant_data",
+        f"qlib-{version}",
+        producer={"script": "build_qlib_v2.py", "version": version},
+    )
+    rewrite_as_legacy_qlib_snapshot(module, snapshot)
+
+    validated = module.validate_qlib_snapshot(snapshot, verify_hashes=True)
+
+    assert validated["producer"] == {
+        "script": "build_qlib_v2.py",
+        "version": version,
+    }
+
+
+@pytest.mark.parametrize(
+    ("version", "omit_dependencies"),
+    [("1", True), ("2", False)],
+)
+def test_known_legacy_cleaned_snapshots_remain_valid(
+    tmp_path: Path,
+    version: str,
+    omit_dependencies: bool,
+) -> None:
+    module = load_module()
+    dependency = {
+        "dataset_id": "qlib_ashare_v2",
+        "snapshot_id": "canonical-legacy",
+        "content_sha256": "b" * 64,
+        "price_basis": "qfq",
+    }
+    snapshot = finalize_qlib_snapshot(
+        module,
+        tmp_path / "quant_data",
+        f"cleaned-{version}",
+        dataset_id="qlib_ashare_cleaned_v2",
+        dependency_snapshots=[dependency],
+        producer={"script": "build_cleaned_qlib_v2.py", "version": version},
+    )
+    rewrite_as_legacy_qlib_snapshot(
+        module,
+        snapshot,
+        omit_dependencies=omit_dependencies,
+    )
+
+    validated = module.validate_qlib_snapshot(snapshot, verify_hashes=True)
+
+    assert validated["producer"]["version"] == version
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        {"script": "build_qlib_v2.py", "version": "1"},
+        {"script": "build_qlib_v2.py", "version": "6"},
+        {"script": "build_cleaned_qlib_v2.py", "version": "3"},
+    ],
+)
+def test_unknown_or_new_provider_versions_cannot_omit_producer(
+    tmp_path: Path,
+    producer: dict[str, str],
+) -> None:
+    module = load_module()
+    snapshot = finalize_qlib_snapshot(
+        module,
+        tmp_path / "quant_data",
+        "qlib-rejected",
+        producer=producer,
+    )
+    rewrite_as_legacy_qlib_snapshot(module, snapshot)
+
+    with pytest.raises(module.DataContractError, match="producer lineage disagree"):
+        module.validate_qlib_snapshot(snapshot, verify_hashes=True)
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "producer"),
+    [
+        (
+            "qlib_ashare_v2",
+            {"script": "build_cleaned_qlib_v2.py", "version": "1"},
+        ),
+        (
+            "qlib_ashare_cleaned_v2",
+            {"script": "build_qlib_v2.py", "version": "2"},
+        ),
+    ],
+)
+def test_legacy_producer_omission_cannot_cross_dataset_identity(
+    tmp_path: Path,
+    dataset_id: str,
+    producer: dict[str, str],
+) -> None:
+    module = load_module()
+    dependencies = None
+    if dataset_id == "qlib_ashare_cleaned_v2":
+        dependencies = [
+            {
+                "dataset_id": "qlib_ashare_v2",
+                "snapshot_id": "canonical-legacy",
+                "content_sha256": "b" * 64,
+                "price_basis": "qfq",
+            }
+        ]
+    snapshot = finalize_qlib_snapshot(
+        module,
+        tmp_path / "quant_data",
+        "cross-dataset-producer",
+        dataset_id=dataset_id,
+        dependency_snapshots=dependencies,
+        producer=producer,
+    )
+    rewrite_as_legacy_qlib_snapshot(module, snapshot)
+
+    with pytest.raises(module.DataContractError, match="producer lineage disagree"):
+        module.validate_qlib_snapshot(snapshot, verify_hashes=True)
 
 
 def test_finalize_snapshot_records_price_basis_adjustment_and_file_index(

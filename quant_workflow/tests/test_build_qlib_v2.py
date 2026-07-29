@@ -3,7 +3,9 @@ import importlib.util
 import json
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -156,13 +158,36 @@ def write_benchmark_provider(
 
 
 def benchmark_source_evidence(root: Path) -> dict[str, str]:
-    relative = Path(
-        "runtime/v2_compatibility/runs/v1-compat-test/candidate_summary.json"
-    )
+    run_root = root / "runtime/v2_compatibility/runs/v1-compat-test"
+    relative = run_root.relative_to(root) / "candidate_summary.json"
     evidence_path = root / relative
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    provider = root / "qlib" / "cn_data_baostock_jqdata"
+    provider_manifest = json.loads(
+        (provider / "PROVIDER_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    source_snapshot = provider_manifest["source_snapshot"]
     evidence_path.write_text(
-        json.dumps({"status": "candidate_ready", "run_id": "v1-compat-test"}),
+        json.dumps(
+            {
+                "status": "candidate_ready",
+                "run_id": "v1-compat-test",
+                "source_snapshot": source_snapshot,
+                "benchmark": {"status": "completed", "source": "tencent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_root / "publish_summary.json").write_text(
+        json.dumps(
+            {
+                "status": "published",
+                "run_id": "v1-compat-test",
+                "published_at": "2026-07-25T23:30:00+08:00",
+                "source_snapshot": source_snapshot,
+                "targets": {"merged_qlib": str(provider)},
+            }
+        ),
         encoding="utf-8",
     )
     return {
@@ -231,6 +256,10 @@ def test_build_and_publish_qlib_v2_tracks_exact_qfq_snapshot(tmp_path: Path) -> 
     assert published == resolved.snapshot_path
     assert resolved.manifest["latest_trade_date"] == "2026-07-24"
     assert provider["source_snapshot"]["snapshot_id"] == "qfq-source-001"
+    assert provider["producer"] == {
+        "script": "build_qlib_v2.py",
+        "version": "8",
+    }
     assert (published / "features" / "sh600000" / "close.day.bin").is_file()
     assert resolved.manifest["benchmark_complete"] is True
     assert provider["benchmark_complete"] is True
@@ -347,11 +376,12 @@ def test_default_rebuild_reuses_current_native_benchmarks_without_compatibility(
         root,
         source_snapshot=_qfq_source_contract(contract, root),
     )
+    compatibility_source = benchmark_source_evidence(root)
     first = module.build_qlib_v2(
         quant_data_root=root,
         publish=True,
         benchmark_provider=compatibility,
-        benchmark_source=benchmark_source_evidence(root),
+        benchmark_source=compatibility_source,
     )
     shutil.rmtree(compatibility)
 
@@ -373,9 +403,161 @@ def test_default_rebuild_reuses_current_native_benchmarks_without_compatibility(
     assert source["origin_source_dataset_id"] == (
         "qlib_ashare_merged_compatibility"
     )
-    assert source["origin_evidence_sha256"] == benchmark_source_evidence(root)[
-        "evidence_sha256"
-    ]
+    assert source["origin_evidence_sha256"] == compatibility_source["evidence_sha256"]
+
+
+def test_explicit_native_benchmark_provider_discovers_its_own_provenance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    first = module.build_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+        benchmark_provider=compatibility,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    shutil.rmtree(compatibility)
+
+    second = module.build_qlib_v2(
+        quant_data_root=root,
+        benchmark_provider=first,
+    )
+    manifest = json.loads(
+        (second / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+
+    source = manifest["benchmarks"]["source"]
+    assert source["source_dataset_id"] == "qlib_ashare_v2"
+    assert source["source_path"] == first.relative_to(root).as_posix()
+    assert source["source_run_id"] == first.name
+    assert source["origin_provider"] == "tencent"
+
+
+def test_explicit_native_benchmark_provider_rejects_tampered_manifests(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    compatibility_source = benchmark_source_evidence(root)
+    published = module.build_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+        benchmark_provider=compatibility,
+        benchmark_source=compatibility_source,
+    )
+    shutil.rmtree(compatibility)
+    supplied_source = dict(compatibility_source)
+    supplied_source.update(
+        {
+            "source_dataset_id": "forged_native_source",
+            "source_path": published.relative_to(root).as_posix(),
+            "source_run_id": published.name,
+        }
+    )
+    for filename in ("DATASET_MANIFEST.json", "PROVIDER_MANIFEST.json"):
+        path = published / filename
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["benchmarks"]["source"]["origin_provider"] = "forged"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(module.DataContractError, match="size mismatch|hash mismatch"):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            benchmark_provider=published,
+            benchmark_source=supplied_source,
+        )
+
+
+def test_explicit_native_benchmark_provider_must_be_published(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    staging = module.build_qlib_v2(
+        quant_data_root=root,
+        benchmark_provider=compatibility,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    supplied_source = benchmark_source_evidence(root)
+    supplied_source.update(
+        {
+            "source_dataset_id": "forged_staging_source",
+            "source_path": staging.relative_to(root).as_posix(),
+            "source_run_id": staging.name,
+        }
+    )
+
+    with pytest.raises(
+        module.DataContractError,
+        match="published canonical snapshot",
+    ):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            benchmark_provider=staging,
+            benchmark_source=supplied_source,
+        )
+
+
+def test_native_provider_without_dataset_manifest_cannot_pose_as_compatibility(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    staging = module.build_qlib_v2(
+        quant_data_root=root,
+        benchmark_provider=compatibility,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    (staging / "DATASET_MANIFEST.json").unlink()
+    forged_evidence_path = root / "runtime/forged-native-evidence.json"
+    forged_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    forged_evidence_path.write_text('{"status":"forged"}', encoding="utf-8")
+    forged_source = {
+        "provider": "forged",
+        "interface": "forged compatibility benchmark",
+        "source_dataset_id": "qlib_ashare_merged_compatibility",
+        "source_path": staging.relative_to(root).as_posix(),
+        "source_run_id": "forged-run",
+        "evidence_path": forged_evidence_path.relative_to(root).as_posix(),
+        "evidence_sha256": hashlib.sha256(
+            forged_evidence_path.read_bytes()
+        ).hexdigest(),
+    }
+
+    with pytest.raises(
+        module.DataContractError,
+        match="no published benchmark provenance",
+    ):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            benchmark_provider=staging,
+            benchmark_source=forged_source,
+        )
 
 
 def test_build_rejects_missing_required_benchmark_date(tmp_path: Path) -> None:
@@ -453,7 +635,10 @@ def test_build_rejects_unverifiable_benchmark_source_evidence(
 
     with pytest.raises(
         module.DataContractError,
-        match="evidence is unavailable|evidence hash mismatch",
+        match=(
+            "evidence is unavailable|evidence hash mismatch|"
+            "no published benchmark provenance"
+        ),
     ):
         module.build_qlib_v2(
             quant_data_root=root,
@@ -540,7 +725,11 @@ def test_cleaned_v2_builds_without_compatibility_provider_and_records_cleaning(
     provider_manifest = json.loads(
         (published / "PROVIDER_MANIFEST.json").read_text(encoding="utf-8")
     )
-    assert resolved.manifest["producer"]["version"] == "2"
+    assert resolved.manifest["producer"]["version"] == "5"
+    assert provider_manifest["producer"] == {
+        "script": "build_cleaned_qlib_v2.py",
+        "version": "5",
+    }
     assert provider_manifest["transformation"] == transformation
     assert provider_manifest["dependency_snapshots"] == [canonical_identity]
     assert (
@@ -560,3 +749,88 @@ def test_cleaned_v2_builds_without_compatibility_provider_and_records_cleaning(
     artifact.write_text("tampered", encoding="utf-8")
     with pytest.raises(contract.DataContractError, match="transformation artifact"):
         contract.validate_qlib_snapshot(published, verify_hashes=True)
+
+
+@pytest.mark.parametrize(
+    ("changed_dataset", "expected_error"),
+    [
+        ("ashare_daily_qfq", "qfq snapshot changed during cleaned build"),
+        ("qlib_ashare_v2", "canonical Qlib changed during cleaned build"),
+    ],
+)
+def test_cleaned_publish_rejects_input_change_inside_publication_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_dataset: str,
+    expected_error: str,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    canonical_module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    source_contract = _qfq_source_contract(contract, root)
+    compatibility = write_benchmark_provider(
+        root,
+        source_snapshot=source_contract,
+    )
+    canonical_module.build_qlib_v2(
+        quant_data_root=root,
+        publish=True,
+        benchmark_provider=compatibility,
+        benchmark_source=benchmark_source_evidence(root),
+    )
+    shutil.rmtree(compatibility)
+
+    cleaned_module = load_script("build_cleaned_qlib_v2")
+    real_resolve = cleaned_module.resolve_dataset
+    resolutions: dict[str, int] = {}
+    lock_state = {"held": False}
+
+    @contextmanager
+    def tracked_publication_lock(_root: Path):
+        assert lock_state["held"] is False
+        lock_state["held"] = True
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
+
+    def resolve_with_concurrent_input(dataset_id: str, **kwargs):
+        resolved = real_resolve(dataset_id, **kwargs)
+        resolutions[dataset_id] = resolutions.get(dataset_id, 0) + 1
+        if resolutions[dataset_id] == 1:
+            return resolved
+        assert lock_state["held"] is True
+        if dataset_id != changed_dataset:
+            return resolved
+        changed_manifest = dict(resolved.manifest)
+        changed_manifest["snapshot_id"] = f"{dataset_id}-concurrently-published"
+        changed_manifest["content_sha256"] = "f" * 64
+        return SimpleNamespace(
+            dataset_id=resolved.dataset_id,
+            manifest=changed_manifest,
+            snapshot_path=resolved.snapshot_path,
+        )
+
+    monkeypatch.setattr(
+        cleaned_module,
+        "resolve_dataset",
+        resolve_with_concurrent_input,
+    )
+    monkeypatch.setattr(
+        cleaned_module,
+        "dataset_publication_lock",
+        tracked_publication_lock,
+    )
+
+    with pytest.raises(
+        contract.DataContractError,
+        match=expected_error,
+    ):
+        cleaned_module.build_cleaned_qlib_v2(
+            quant_data_root=root,
+            publish=True,
+        )
+    assert resolutions[changed_dataset] >= 2
+    assert lock_state["held"] is False
+    assert not (root / "qlib" / "cn_data_ashare_cleaned_v2" / "LATEST.json").exists()

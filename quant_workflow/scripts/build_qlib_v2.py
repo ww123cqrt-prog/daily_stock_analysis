@@ -37,6 +37,7 @@ from quant_data_contract import (  # noqa: E402
     publish_qlib_snapshot,
     resolve_dataset,
     sha256_file,
+    validate_qlib_snapshot,
 )
 
 
@@ -145,15 +146,21 @@ def _validate_source_metadata(
     return normalized
 
 
-def native_benchmark_source(
-    resolved_provider: Any,
+def _native_benchmark_source_from_manifest(
     *,
+    snapshot_path: Path,
+    manifest: Mapping[str, Any],
     root: Path,
 ) -> dict[str, str]:
-    manifest_path = resolved_provider.snapshot_path / "DATASET_MANIFEST.json"
+    snapshot_path = Path(snapshot_path).expanduser().resolve()
+    dataset_id = str(manifest.get("dataset_id") or "").strip()
+    snapshot_id = str(manifest.get("snapshot_id") or "").strip()
+    if not dataset_id or not snapshot_id:
+        raise DataContractError("native benchmark provider identity is incomplete")
+    manifest_path = snapshot_path / "DATASET_MANIFEST.json"
     source = (
-        resolved_provider.manifest.get("benchmarks", {}).get("source", {})
-        if isinstance(resolved_provider.manifest.get("benchmarks"), Mapping)
+        manifest.get("benchmarks", {}).get("source", {})
+        if isinstance(manifest.get("benchmarks"), Mapping)
         else {}
     )
     origin: dict[str, str] = {}
@@ -180,13 +187,13 @@ def native_benchmark_source(
     return {
         "provider": "quant_workflow",
         "interface": "native_v2_benchmark_copy",
-        "source_dataset_id": str(resolved_provider.dataset_id),
+        "source_dataset_id": dataset_id,
         "source_path": _safe_relative(
-            resolved_provider.snapshot_path,
+            snapshot_path,
             root,
             label="native benchmark provider",
         ),
-        "source_run_id": str(resolved_provider.manifest["snapshot_id"]),
+        "source_run_id": snapshot_id,
         "evidence_path": _safe_relative(
             manifest_path,
             root,
@@ -197,11 +204,70 @@ def native_benchmark_source(
     }
 
 
+def native_benchmark_source(
+    resolved_provider: Any,
+    *,
+    root: Path,
+) -> dict[str, str]:
+    return _native_benchmark_source_from_manifest(
+        snapshot_path=resolved_provider.snapshot_path,
+        manifest=resolved_provider.manifest,
+        root=root,
+    )
+
+
 def _discover_benchmark_source(
     root: Path,
     benchmark_provider: Path,
     upstream: Mapping[str, str],
 ) -> dict[str, str]:
+    native_manifest_path = benchmark_provider / "DATASET_MANIFEST.json"
+    if native_manifest_path.is_file() and not native_manifest_path.is_symlink():
+        native_manifest = validate_qlib_snapshot(
+            benchmark_provider,
+            verify_hashes=True,
+            evidence_root=root,
+        )
+        snapshot_id = str(native_manifest.get("snapshot_id") or "")
+        expected_provider = (
+            root
+            / "qlib"
+            / "cn_data_ashare_v2"
+            / "snapshots"
+            / snapshot_id
+        )
+        if (
+            native_manifest.get("dataset_id") != "qlib_ashare_v2"
+            or not snapshot_id
+            or expected_provider.is_symlink()
+            or benchmark_provider != expected_provider.resolve()
+        ):
+            raise DataContractError(
+                "native benchmark provider must be a published canonical snapshot"
+            )
+        provider_manifest = _read_json(
+            benchmark_provider / "PROVIDER_MANIFEST.json",
+            label="native benchmark provider manifest",
+        )
+        benchmarks = native_manifest.get("benchmarks")
+        if (
+            native_manifest.get("data_kind") != "qlib_provider"
+            or native_manifest.get("status") != "ready"
+            or native_manifest.get("price_basis") != "qfq"
+            or native_manifest.get("upstream_snapshots") != [dict(upstream)]
+            or native_manifest.get("benchmark_complete") is not True
+            or not isinstance(benchmarks, Mapping)
+            or provider_manifest.get("source_snapshot") != dict(upstream)
+            or provider_manifest.get("benchmark_complete") is not True
+            or provider_manifest.get("benchmarks") != benchmarks
+        ):
+            raise DataContractError("native benchmark provider evidence is invalid")
+        return _native_benchmark_source_from_manifest(
+            snapshot_path=benchmark_provider,
+            manifest=native_manifest,
+            root=root,
+        )
+
     runs_root = root / "runtime" / "v2_compatibility" / "runs"
     candidates: list[tuple[datetime, Path, dict[str, Any], dict[str, Any]]] = []
     for publish_path in runs_root.glob("*/publish_summary.json"):
@@ -278,12 +344,22 @@ def _import_benchmarks(
     )
     if source_calendar_bytes != target_calendar_bytes or source_calendar != target_calendar:
         raise DataContractError("benchmark calendar differs from native Qlib calendar")
-    source = _validate_source_metadata(
-        source_metadata
-        or _discover_benchmark_source(root, source_provider, upstream),
+    discovered_source = _validate_source_metadata(
+        _discover_benchmark_source(root, source_provider, upstream),
         benchmark_provider=source_provider,
         root=root,
     )
+    if source_metadata is not None:
+        supplied_source = _validate_source_metadata(
+            source_metadata,
+            benchmark_provider=source_provider,
+            root=root,
+        )
+        if supplied_source != discovered_source:
+            raise DataContractError(
+                "benchmark source metadata does not match published provenance"
+            )
+    source = discovered_source
     source["provider_manifest_sha256"] = sha256_file(
         source_provider / "PROVIDER_MANIFEST.json"
     )
@@ -706,7 +782,7 @@ def build_qlib_v2(
             "interface": "v2_snapshot_to_qlib",
         },
         source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-        producer={"script": "build_qlib_v2.py", "version": "5"},
+        producer={"script": "build_qlib_v2.py", "version": "8"},
         upstream_snapshot=upstream,
         benchmark_evidence=benchmark_evidence,
         instrument_pool_evidence=instrument_pool_evidence,

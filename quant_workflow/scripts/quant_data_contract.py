@@ -40,6 +40,13 @@ REQUIRED_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume")
 ADJUSTED_PRICE_BASES = {"qfq", "hfq"}
 QLIB_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
 QLIB_BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
+QLIB_PROVIDER_PRODUCER_LEGACY_OMISSION_VERSIONS = {
+    ("qlib_ashare_v2", "build_qlib_v2.py"): frozenset({"2", "3", "4", "5"}),
+    (
+        "qlib_ashare_cleaned_v2",
+        "build_cleaned_qlib_v2.py",
+    ): frozenset({"1", "2"}),
+}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -55,6 +62,26 @@ class ResolvedDataset(NamedTuple):
 
 
 ValidatedResolutionCache = MutableMapping[str, ResolvedDataset]
+
+
+def _legacy_provider_manifest_may_omit_producer(
+    dataset_id: Any,
+    producer: Mapping[str, Any],
+) -> bool:
+    script = str(producer.get("script") or "")
+    version = str(producer.get("version") or "")
+    return version in QLIB_PROVIDER_PRODUCER_LEGACY_OMISSION_VERSIONS.get(
+        (str(dataset_id or ""), script), frozenset()
+    )
+
+
+def _legacy_cleaned_provider_may_omit_dependency(
+    producer: Mapping[str, Any],
+) -> bool:
+    return (
+        producer.get("script") == "build_cleaned_qlib_v2.py"
+        and str(producer.get("version") or "") == "1"
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -614,8 +641,13 @@ def finalize_qlib_snapshot(
         raise DataContractError("dataset_id is invalid")
     if not snapshot_id or "/" in snapshot_id or snapshot_id in {".", ".."}:
         raise DataContractError("snapshot_id is invalid")
-    if not source.get("provider") or not producer.get("script"):
+    if (
+        not source.get("provider")
+        or not producer.get("script")
+        or not producer.get("version")
+    ):
         raise DataContractError("Qlib source and producer are required")
+    normalized_producer = json.loads(json.dumps(dict(producer)))
     _iso_timestamp(source_retrieved_at, "source_retrieved_at")
     required_upstream = {
         "dataset_id",
@@ -670,6 +702,7 @@ def finalize_qlib_snapshot(
     provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != dict(upstream_snapshot):
         raise DataContractError("Qlib provider points to the wrong upstream snapshot")
+    provider_manifest["producer"] = normalized_producer
     if normalized_dependencies:
         provider_manifest["dependency_snapshots"] = normalized_dependencies
     if benchmark_evidence is not None:
@@ -693,13 +726,7 @@ def finalize_qlib_snapshot(
             )
         _validate_qlib_transformation_evidence(snapshot, normalized_transformation)
         provider_manifest["transformation"] = normalized_transformation
-    if (
-        benchmark_evidence is not None
-        or instrument_pool_evidence is not None
-        or transformation_evidence is not None
-        or normalized_dependencies
-    ):
-        atomic_write_json(provider_manifest_path, provider_manifest)
+    atomic_write_json(provider_manifest_path, provider_manifest)
     index = _build_qlib_file_index(snapshot)
     index.to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
     feature_files = index["relative_path"].str.startswith("features/")
@@ -717,7 +744,7 @@ def finalize_qlib_snapshot(
             "method": "upstream_qfq_snapshot",
             "upstream_snapshot_id": upstream_snapshot["snapshot_id"],
         },
-        "producer": dict(producer),
+        "producer": normalized_producer,
         "upstream_snapshots": [dict(upstream_snapshot)],
         "dependency_snapshots": normalized_dependencies,
         "date_range": {"start": calendar[0], "end": calendar[-1]},
@@ -1053,6 +1080,24 @@ def validate_qlib_snapshot(
     provider_manifest = _read_json(provider_manifest_path)
     if provider_manifest.get("source_snapshot") != upstream[0]:
         raise DataContractError("Qlib provider and dataset lineage disagree")
+    producer = manifest.get("producer")
+    if (
+        not isinstance(producer, Mapping)
+        or not str(producer.get("script") or "").strip()
+        or not str(producer.get("version") or "").strip()
+    ):
+        raise DataContractError("Qlib producer contract is invalid")
+    provider_producer = provider_manifest.get("producer")
+    if not (
+        provider_producer == producer
+        or (
+            provider_producer is None
+            and _legacy_provider_manifest_may_omit_producer(
+                manifest.get("dataset_id"), producer
+            )
+        )
+    ):
+        raise DataContractError("Qlib provider and dataset producer lineage disagree")
     dependencies = manifest.get("dependency_snapshots", [])
     if not isinstance(dependencies, list):
         raise DataContractError("Qlib dependency snapshot contract is invalid")
@@ -1077,13 +1122,18 @@ def validate_qlib_snapshot(
         ):
             raise DataContractError("Qlib dependency snapshot contract is invalid")
         dependency_ids.add(str(dependency["dataset_id"]))
-    if manifest.get("dataset_id") == "qlib_ashare_cleaned_v2" and (
-        len(dependencies) != 1
-        or dependencies[0].get("dataset_id") != "qlib_ashare_v2"
-    ):
-        raise DataContractError(
-            "cleaned Qlib must declare its exact canonical Qlib dependency"
+    if manifest.get("dataset_id") == "qlib_ashare_cleaned_v2":
+        dependency_is_exact = (
+            len(dependencies) == 1
+            and dependencies[0].get("dataset_id") == "qlib_ashare_v2"
         )
+        if not dependency_is_exact and not (
+            not dependencies
+            and _legacy_cleaned_provider_may_omit_dependency(producer)
+        ):
+            raise DataContractError(
+                "cleaned Qlib must declare its exact canonical Qlib dependency"
+            )
     benchmark_complete = manifest.get("benchmark_complete")
     provider_benchmark_complete = provider_manifest.get("benchmark_complete")
     if benchmark_complete is not None or provider_benchmark_complete is not None:

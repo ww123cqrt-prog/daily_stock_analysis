@@ -31,6 +31,7 @@ from quant_data_contract import (  # noqa: E402
     DataContractError,
     ValidatedResolutionCache,
     atomic_write_json,
+    dataset_publication_lock,
     finalize_qlib_snapshot,
     publish_qlib_snapshot,
     resolve_dataset,
@@ -56,6 +57,28 @@ def _upstream_contract(resolved: Any) -> dict[str, str]:
         "content_sha256": str(resolved.manifest["content_sha256"]),
         "price_basis": str(resolved.manifest["price_basis"]),
     }
+
+
+def _assert_build_inputs_still_current(
+    root: Path,
+    *,
+    upstream: Mapping[str, str],
+    canonical_dependency: Mapping[str, str],
+) -> None:
+    current_qfq = resolve_dataset(
+        "ashare_daily_qfq",
+        quant_data_root=root,
+        require_basis="qfq",
+    )
+    if _upstream_contract(current_qfq) != dict(upstream):
+        raise DataContractError("qfq snapshot changed during cleaned build")
+    current_canonical = resolve_dataset(
+        "qlib_ashare_v2",
+        quant_data_root=root,
+        require_basis="qfq",
+    )
+    if _upstream_contract(current_canonical) != dict(canonical_dependency):
+        raise DataContractError("canonical Qlib changed during cleaned build")
 
 
 def _write_anomaly_evidence(
@@ -238,7 +261,7 @@ def build_cleaned_qlib_v2(
                 "interface": "v2_anomaly_cleaning_to_qlib",
             },
             source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-            producer={"script": "build_cleaned_qlib_v2.py", "version": "2"},
+            producer={"script": "build_cleaned_qlib_v2.py", "version": "5"},
             upstream_snapshot=upstream,
             benchmark_evidence=benchmark_evidence,
             instrument_pool_evidence=instrument_pool_evidence,
@@ -247,14 +270,27 @@ def build_cleaned_qlib_v2(
         )
         if not publish:
             return staging
-        published = publish_qlib_snapshot(
-            staging,
-            dataset_root=root / DATASET_ROOT,
-            quant_data_root=root,
-            update_root_catalog=True,
-            publication_lock_held=publication_lock_held,
-            validated_cache=validated_cache,
-        )
+
+        def publish_current_build() -> Path:
+            _assert_build_inputs_still_current(
+                root,
+                upstream=upstream,
+                canonical_dependency=canonical_dependency,
+            )
+            return publish_qlib_snapshot(
+                staging,
+                dataset_root=root / DATASET_ROOT,
+                quant_data_root=root,
+                update_root_catalog=True,
+                publication_lock_held=True,
+                validated_cache=validated_cache,
+            )
+
+        if publication_lock_held:
+            published = publish_current_build()
+        else:
+            with dataset_publication_lock(root):
+                published = publish_current_build()
     except Exception as exc:
         run_root.mkdir(parents=True, exist_ok=True)
         atomic_write_json(
