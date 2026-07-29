@@ -323,17 +323,18 @@ def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _Ar
 async def get_quant_status() -> QuantStatusResponse:
     """Return quant workflow status used by the web workflow page."""
     service = get_quant_job_service()
-    latest_jobs = {
-        job_type: _job_response(job)
-        for job_type, job in service.get_latest_jobs_by_type().items()
-    }
     research_status = build_research_status_payload()
     mlflow_payload = await asyncio.to_thread(_mlflow_status_payload)
+    latest_job_snapshot, active_count, recent_jobs = service.get_status_snapshot()
+    latest_jobs = {
+        job_type: _job_response(job)
+        for job_type, job in latest_job_snapshot.items()
+    }
     return QuantStatusResponse(
         available_job_types=service.available_job_types(),
-        active_count=service.active_count(),
+        active_count=active_count,
         latest_jobs=latest_jobs,
-        recent_jobs=[_job_response(job) for job in service.list_jobs(limit=10)],
+        recent_jobs=[_job_response(job) for job in recent_jobs],
         generated_at=research_status.get("generated_at"),
         trainable=bool(research_status.get("trainable")),
         training_readiness=research_status.get("training_readiness") or {},

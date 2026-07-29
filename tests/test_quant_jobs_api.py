@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import asyncio
@@ -210,6 +211,69 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("cwd", status_body["latest_jobs"]["report_data_quality"])
         self.assertNotIn("log_path", status_body["latest_jobs"]["report_data_quality"])
         self.assertEqual(status_body["active_count"], 0)
+
+    def test_status_snapshot_stays_consistent_while_job_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            job = QuantJob(
+                job_id="qj_snapshot_consistency",
+                job_type="report_data_quality",
+                label="数据质量报告",
+                status="running",
+                params={},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-07-30T06:00:00+08:00",
+                started_at="2026-07-30T06:00:00+08:00",
+                updated_at="2026-07-30T06:00:00+08:00",
+                log_path=str(Path(temp_dir) / "jobs" / "job.log"),
+            )
+            service._insert_job(job)
+            real_latest = service.get_latest_jobs_by_type
+            update_started = threading.Event()
+            update_finished = threading.Event()
+            workers: list[threading.Thread] = []
+
+            def latest_then_complete() -> dict[str, QuantJob]:
+                latest = real_latest()
+
+                def complete_job() -> None:
+                    update_started.set()
+                    service._update_job(
+                        job.job_id,
+                        status="completed",
+                        return_code=0,
+                        completed_at="2026-07-30T06:00:01+08:00",
+                        updated_at="2026-07-30T06:00:01+08:00",
+                    )
+                    update_finished.set()
+
+                worker = threading.Thread(target=complete_job, daemon=True)
+                workers.append(worker)
+                worker.start()
+                self.assertTrue(update_started.wait(timeout=1))
+                time.sleep(0.05)
+                self.assertFalse(update_finished.is_set())
+                return latest
+
+            with patch.object(
+                service,
+                "get_latest_jobs_by_type",
+                side_effect=latest_then_complete,
+            ):
+                latest_jobs, active_count, recent_jobs = service.get_status_snapshot()
+
+            workers[0].join(timeout=1)
+            final_status = service.get_job(job.job_id).status
+
+        self.assertTrue(update_finished.is_set())
+        self.assertEqual(latest_jobs[job.job_type].status, "running")
+        self.assertEqual(active_count, 1)
+        self.assertEqual(recent_jobs[0].status, "running")
+        self.assertEqual(final_status, "completed")
 
     def test_job_response_exposes_artifact_names_without_absolute_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

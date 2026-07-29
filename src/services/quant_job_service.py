@@ -1630,6 +1630,15 @@ class QuantJobService:
         )
         return int(row["count"]) if row is not None else 0
 
+    def get_status_snapshot(
+        self, recent_limit: int = 10
+    ) -> tuple[Dict[str, QuantJob], int, List[QuantJob]]:
+        with self._lock:
+            latest_jobs = self.get_latest_jobs_by_type()
+            active_count = self.active_count()
+            recent_jobs = self.list_jobs(limit=recent_limit)
+        return latest_jobs, active_count, recent_jobs
+
     def _active_quant_data_network_job(self) -> Optional[QuantJob]:
         placeholders = ", ".join("?" for _item in QUANT_DATA_NETWORK_JOB_TYPES)
         row = self._fetch_one(
