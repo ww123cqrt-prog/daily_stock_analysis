@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
@@ -7,21 +7,26 @@ import ResearchPage from '../ResearchPage';
 
 const {
   getResearchStatus,
+  getExperimentNotebook,
   archiveExperimentRun,
   permanentlyDeleteExperimentRun,
   submitQuantJob,
   getQuantJob,
+  listQuantJobs,
 } = vi.hoisted(() => ({
   getResearchStatus: vi.fn(),
+  getExperimentNotebook: vi.fn(),
   archiveExperimentRun: vi.fn(),
   permanentlyDeleteExperimentRun: vi.fn(),
   submitQuantJob: vi.fn(),
   getQuantJob: vi.fn(),
+  listQuantJobs: vi.fn(),
 }));
 
 vi.mock('../../api/research', () => ({
   researchApi: {
     getStatus: () => getResearchStatus(),
+    getExperimentNotebook: () => getExperimentNotebook(),
     archiveExperimentRun: (runId: string) => archiveExperimentRun(runId),
     permanentlyDeleteExperimentRun: (runId: string) => permanentlyDeleteExperimentRun(runId),
   },
@@ -31,6 +36,7 @@ vi.mock('../../api/quant', () => ({
   quantApi: {
     submitJob: (jobType: string, params: Record<string, unknown>) => submitQuantJob(jobType, params),
     getJob: (jobId: string) => getQuantJob(jobId),
+    listJobs: (params: Record<string, unknown>) => listQuantJobs(params),
   },
 }));
 
@@ -50,10 +56,14 @@ describe('ResearchPage', () => {
   beforeEach(() => {
     localStorage.clear();
     getResearchStatus.mockReset();
+    getExperimentNotebook.mockReset();
+    getExperimentNotebook.mockRejectedValue(new Error('fast notebook unavailable'));
     archiveExperimentRun.mockReset();
     permanentlyDeleteExperimentRun.mockReset();
     submitQuantJob.mockReset();
     getQuantJob.mockReset();
+    listQuantJobs.mockReset();
+    listQuantJobs.mockResolvedValue({ total: 0, items: [] });
     getResearchStatus.mockResolvedValue({
       generatedAt: '2026-07-02T10:00:00+08:00',
       trainable: true,
@@ -68,6 +78,7 @@ describe('ResearchPage', () => {
           rows: 1000,
           dateRange: '2005-01-04 ~ 2026-06-10',
           status: 'partial',
+          role: 'audit',
         },
         {
           name: 'jqdata',
@@ -75,6 +86,7 @@ describe('ResearchPage', () => {
           rows: 343237,
           dateRange: '2025-03-03 ~ 2025-06-10',
           status: 'available',
+          role: 'audit',
         },
       ],
       qlibProvider: {
@@ -191,7 +203,7 @@ describe('ResearchPage', () => {
         },
         qualityReport: {
           status: 'available',
-          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_quality_report_latest.md',
+          path: '/Users/cq/WorkingProjects/daily_stock_analysis/quant_workflow/reports/data_quality_report_latest.json',
           summary: {
             stockUniverse: '5509',
             usableInstruments: '5340',
@@ -464,8 +476,10 @@ describe('ResearchPage', () => {
 
     expect(await screen.findByText('数据状态')).toBeInTheDocument();
     expect(screen.getByText('可训练')).toBeInTheDocument();
+    expect(screen.getByText('quant_data 原生 V2')).toBeInTheDocument();
     expect(screen.getByText('akshare')).toBeInTheDocument();
     expect(screen.getByText('jqdata')).toBeInTheDocument();
+    expect(screen.getAllByText('审计来源')).toHaveLength(2);
     expect(screen.getAllByText('部分可用').length).toBeGreaterThan(0);
     expect(screen.getAllByText('可用').length).toBeGreaterThan(0);
     expect(screen.queryByText('available')).not.toBeInTheDocument();
@@ -491,6 +505,9 @@ describe('ResearchPage', () => {
     expect(screen.getByText(/数据 Manifest/)).toBeInTheDocument();
     expect(screen.getByText(/治理说明/)).toBeInTheDocument();
     expect(screen.getByText('数据盘点')).toBeInTheDocument();
+    expect(screen.getByText(/以下数量由上次扫描确认/)).toHaveTextContent(
+      '2026-07-06T08:00:00+08:00',
+    );
     expect(screen.getByText('清理计划')).toBeInTheDocument();
     expect(screen.getByText('清理动作预览')).toBeInTheDocument();
     expect(screen.getByText('archive')).toBeInTheDocument();
@@ -545,6 +562,29 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText(/不读取账号密码/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/不连接券商交易接口/).length).toBeGreaterThan(0);
   }, 10_000);
+
+  it('hides cleanup actions unless the cleanup plan is available', async () => {
+    const status = structuredClone(await getResearchStatus());
+    status.dataHygiene.cleanupPlan = {
+      ...status.dataHygiene.cleanupPlan,
+      status: 'stale',
+      actions: [
+        {
+          action: 'archive-stale-evidence',
+          source: '/tmp/stale-cleanup-source',
+          reason: 'This action must not be rendered from stale evidence.',
+          requiresConfirmation: true,
+        },
+      ],
+    };
+    getResearchStatus.mockResolvedValue(status);
+
+    renderResearchPage();
+
+    expect(await screen.findByText('数据治理')).toBeInTheDocument();
+    expect(screen.queryByText('archive-stale-evidence')).not.toBeInTheDocument();
+    expect(screen.queryByText('/tmp/stale-cleanup-source')).not.toBeInTheDocument();
+  });
 
   it('renders English copy without missing i18n keys', async () => {
     renderResearchPage('en');
@@ -604,6 +644,23 @@ describe('ResearchPage', () => {
       screen.getAllByText('原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。').length,
     ).toBeGreaterThan(0);
     expect(screen.queryByText('当前正式入口：原生 V2')).not.toBeInTheDocument();
+  });
+
+  it('treats a non-boolean trainable value as not trainable', async () => {
+    const initialStatus = await getResearchStatus();
+    getResearchStatus.mockReset();
+    getResearchStatus.mockResolvedValueOnce({
+      ...initialStatus,
+      trainable: 'false' as unknown as boolean,
+    });
+
+    renderResearchPage('en');
+
+    const label = await screen.findByText('Not trainable yet');
+    expect(label).toBeInTheDocument();
+    expect(label.closest('span')).toHaveClass('bg-warning/10');
+    expect(label.closest('span')).not.toHaveClass('bg-success/10');
+    expect(screen.queryByText('Trainable')).not.toBeInTheDocument();
   });
 
   it('describes a stale immutable V2 run as historical instead of legacy compatibility data', async () => {
@@ -679,6 +736,37 @@ describe('ResearchPage', () => {
     expect(screen.getByText('9')).toBeInTheDocument();
   });
 
+  it('hides official counts when the data inventory is stale', async () => {
+    const initialStatus = await getResearchStatus();
+    getResearchStatus.mockReset();
+    getResearchStatus.mockResolvedValue({
+      ...initialStatus,
+      dataHygiene: {
+        ...initialStatus.dataHygiene,
+        inventory: {
+          ...initialStatus.dataHygiene.inventory,
+          status: 'stale',
+          validationStatus: 'stale',
+          officialEntries: 9,
+        },
+        manifest: {
+          ...initialStatus.dataHygiene.manifest,
+          status: 'stale',
+          validationStatus: 'stale',
+          officialEntries: 0,
+        },
+      },
+    });
+
+    renderResearchPage('zh');
+
+    const title = await screen.findByText('数据盘点');
+    const card = title.parentElement?.parentElement;
+    expect(card).toHaveTextContent('已过期');
+    expect(card).toHaveTextContent('盘点与当前数据清单不一致，请重新扫描。');
+    expect(card).not.toHaveTextContent('正式9');
+  });
+
   it('disables duplicate data hygiene submissions while the report is running', async () => {
     submitQuantJob.mockResolvedValue({
       jobId: 'hygiene-running',
@@ -699,6 +787,34 @@ describe('ResearchPage', () => {
     expect(runningButton).toBeDisabled();
     fireEvent.click(runningButton);
     expect(submitQuantJob).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes polling an active data hygiene job after the page is remounted', async () => {
+    const activeJob = {
+      jobId: 'hygiene-resume',
+      jobType: 'report_data_hygiene',
+      label: 'Data hygiene report',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-11T11:29:59+08:00',
+      updatedAt: '2026-07-11T11:29:59+08:00',
+      artifactPaths: [],
+    };
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [activeJob] });
+    getQuantJob.mockResolvedValueOnce({
+      ...activeJob,
+      status: 'completed',
+      completedAt: '2026-07-11T11:30:00+08:00',
+      updatedAt: '2026-07-11T11:30:00+08:00',
+    });
+
+    renderResearchPage('zh');
+
+    await waitFor(() => {
+      expect(listQuantJobs).toHaveBeenCalledWith({ limit: 20, jobType: 'report_data_hygiene' });
+      expect(getQuantJob).toHaveBeenCalledWith('hygiene-resume');
+    });
+    expect(await screen.findByText('已更新')).toBeInTheDocument();
   });
 
   it('keeps the previous report visible when the data hygiene job fails', async () => {
@@ -814,6 +930,101 @@ describe('ResearchPage', () => {
     });
     expect(screen.queryByText('TopkDropoutStrategy')).not.toBeInTheDocument();
     expect(screen.getByText('还没有结构化实验条目。')).toBeInTheDocument();
+  });
+
+  it('serializes experiment mutations across different runs', async () => {
+    let resolveArchive: (value: unknown) => void = () => undefined;
+    archiveExperimentRun.mockReturnValueOnce(new Promise((resolve) => {
+      resolveArchive = resolve;
+    }));
+    renderResearchPage('zh');
+
+    fireEvent.click(await screen.findByRole('button', { name: '归档实验 abc123' }));
+    await waitFor(() => {
+      expect(archiveExperimentRun).toHaveBeenCalledTimes(1);
+    });
+
+    const otherArchive = screen.getByRole('button', { name: '归档实验 cleaned123' });
+    expect(otherArchive).toBeDisabled();
+    fireEvent.click(otherArchive);
+    expect(archiveExperimentRun).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveArchive({
+        removedRun: { runId: 'abc123' },
+        experimentNotebook: {
+          status: 'available',
+          totalRuns: 0,
+          latestNote: '',
+          runs: [],
+        },
+      });
+      await Promise.resolve();
+    });
+  });
+
+  it('does not restore an archived run from an older notebook request', async () => {
+    let resolveNotebook: ((value: {
+      status: string;
+      totalRuns: number;
+      latestNote: string;
+      runs: Array<Record<string, unknown>>;
+    }) => void) | undefined;
+    getExperimentNotebook.mockReturnValueOnce(new Promise((resolve) => {
+      resolveNotebook = resolve;
+    }));
+    renderResearchPage('zh');
+
+    fireEvent.click(await screen.findByRole('button', { name: '归档实验 abc123' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '归档实验 abc123' })).not.toBeInTheDocument();
+    });
+
+    await act(async () => {
+      resolveNotebook?.({
+        status: 'available',
+        totalRuns: 1,
+        latestNote: '',
+        runs: [
+          {
+            runId: 'abc123',
+            experimentName: 'baseline_lgb_alpha158',
+            status: 'completed',
+            model: 'LGBModel',
+            strategy: 'TopkDropoutStrategy',
+            metrics: {},
+          },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole('button', { name: '归档实验 abc123' })).not.toBeInTheDocument();
+  });
+
+  it('loads experiment records without waiting for the full research status', async () => {
+    getResearchStatus.mockImplementationOnce(() => new Promise(() => undefined));
+    getExperimentNotebook.mockResolvedValueOnce({
+      status: 'available',
+      totalRuns: 1,
+      latestNote: '',
+      runs: [
+        {
+          runId: 'fast-notebook-run',
+          experimentName: 'fast_notebook',
+          status: 'completed',
+          model: 'Ridge',
+          strategy: 'Top50',
+          metrics: {},
+        },
+      ],
+    });
+
+    renderResearchPage('zh');
+
+    expect(
+      await screen.findByRole('button', { name: '归档实验 fast-notebook-run' }),
+    ).toBeInTheDocument();
   });
 
   it('permanently deletes a selected experiment run after confirmation', async () => {

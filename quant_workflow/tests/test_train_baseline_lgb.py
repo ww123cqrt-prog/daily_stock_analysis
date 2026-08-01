@@ -1,4 +1,5 @@
 import importlib.util
+import errno
 import json
 import os
 import subprocess
@@ -21,6 +22,41 @@ def load_module():
 
 
 class TrainBaselineLgbTest(unittest.TestCase):
+    def test_approved_identity_resolves_exact_snapshot_without_reading_latest(self):
+        module = load_module()
+        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+
+        with (
+            patch.object(
+                module,
+                "resolve_approved_provider_identity",
+                return_value=pinned,
+                create=True,
+            ) as approved_resolver,
+            patch.object(
+                module,
+                "qlib_provider_uri",
+                side_effect=AssertionError("LATEST was resolved"),
+            ),
+        ):
+            resolved = module.resolve_provider_uri(
+                "canonical", expected_provider_identity=identity
+            )
+
+        self.assertEqual(resolved, pinned)
+        approved_resolver.assert_called_once_with(
+            "canonical",
+            identity,
+            quant_data_root=module.QUANT_DATA,
+        )
+
     def test_explicit_provider_uri_is_validated_and_used_without_reresolving_latest(self):
         module = load_module()
         pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
@@ -294,6 +330,42 @@ class TrainBaselineLgbTest(unittest.TestCase):
             mlruns_dir=Path("/tmp/mlruns"),
         )
 
+    def test_publication_revalidates_provider_before_tagging_or_writing_latest(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+        client = object()
+
+        with (
+            patch.object(
+                module,
+                "revalidate_provider_identity",
+                side_effect=RuntimeError("provider changed during training"),
+                create=True,
+            ) as revalidate,
+            patch.object(module, "tag_run_with_provider") as tag_provider,
+            patch.object(module, "record_training_result") as record_result,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed during training"):
+                module.publish_training_result(
+                    {"run_id": "run-1", "status": "completed"},
+                    provider="canonical",
+                    provider_uri=Path("/tmp/native-v2"),
+                    expected_provider_identity=identity,
+                    source_config=Path("/tmp/source.yaml"),
+                    runtime_config=Path("/tmp/runtime.yaml"),
+                    client=client,
+                )
+
+        revalidate.assert_called_once()
+        tag_provider.assert_not_called()
+        record_result.assert_not_called()
+
     def test_builds_csi300_lines_from_provider_instrument_ranges(self):
         module = load_module()
         ranges = {
@@ -344,6 +416,85 @@ class TrainBaselineLgbTest(unittest.TestCase):
 
             self.assertFalse((instruments_dir / "csi300.txt").exists())
 
+    def test_experiment_file_lock_uses_cross_platform_adapter_and_unlocks_on_error(
+        self,
+    ):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(module, "lock_file", create=True) as lock_file,
+                patch.object(module, "unlock_file", create=True) as unlock_file,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "write failed"):
+                    with module.experiment_file_lock(Path(temp_dir)):
+                        raise RuntimeError("write failed")
+
+        lock_file.assert_called_once()
+        lock_handle = lock_file.call_args.args[0]
+        self.assertEqual(lock_file.call_args.kwargs, {"exclusive": True})
+        self.assertIn("b", lock_handle.mode)
+        unlock_file.assert_called_once_with(lock_handle)
+
+    def test_windows_file_lock_retries_until_the_lock_is_available(self):
+        import _file_lock as file_lock
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+            LK_UNLCK = 2
+
+            def __init__(self):
+                self.calls = []
+                self.attempts = 0
+
+            def locking(self, _fileno, mode, size):
+                self.calls.append((mode, size))
+                if mode == self.LK_NBLCK and self.attempts == 0:
+                    self.attempts += 1
+                    raise OSError(errno.EACCES, "lock is busy")
+
+        fake_msvcrt = FakeMsvcrt()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "lock"
+            with lock_path.open("a+b") as handle:
+                with (
+                    patch.object(file_lock, "IS_WINDOWS", True),
+                    patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+                    patch.object(file_lock.time, "sleep") as fake_sleep,
+                ):
+                    file_lock.lock_file(handle, exclusive=True)
+                    file_lock.unlock_file(handle)
+
+        self.assertEqual(
+            fake_msvcrt.calls,
+            [
+                (FakeMsvcrt.LK_NBLCK, 1),
+                (FakeMsvcrt.LK_NBLCK, 1),
+                (FakeMsvcrt.LK_UNLCK, 1),
+            ],
+        )
+        fake_sleep.assert_called_once_with(0.1)
+
+    def test_windows_file_lock_does_not_retry_unrelated_os_errors(self):
+        import _file_lock as file_lock
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+
+            def locking(self, _fileno, _mode, _size):
+                raise OSError(errno.EBADF, "bad handle")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (Path(temp_dir) / "lock").open("a+b") as handle:
+                with (
+                    patch.object(file_lock, "IS_WINDOWS", True),
+                    patch.dict(sys.modules, {"msvcrt": FakeMsvcrt()}),
+                    patch.object(file_lock.time, "sleep") as fake_sleep,
+                ):
+                    with self.assertRaisesRegex(OSError, "bad handle"):
+                        file_lock.lock_file(handle, exclusive=True)
+
+        fake_sleep.assert_not_called()
+
     def test_append_experiment_record_writes_jsonl_and_marked_markdown(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -386,6 +537,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
             latest = report_dir / "latest_training_result.json"
+            result_output = report_dir / "runs" / "smoke-run.json"
             latest.write_text('{"run_id":"formal-run"}\n', encoding="utf-8")
 
             module.record_training_result(
@@ -396,9 +548,11 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 },
                 publish_latest=False,
                 report_dir=report_dir,
+                result_output=result_output,
             )
 
             latest_payload = json.loads(latest.read_text(encoding="utf-8"))
+            isolated_payload = json.loads(result_output.read_text(encoding="utf-8"))
             history = [
                 json.loads(line)
                 for line in (report_dir / "experiment_runs.jsonl")
@@ -407,7 +561,48 @@ class TrainBaselineLgbTest(unittest.TestCase):
             ]
 
         self.assertEqual(latest_payload["run_id"], "formal-run")
+        self.assertEqual(isolated_payload["run_id"], "smoke-run")
         self.assertEqual(history[0]["run_id"], "smoke-run")
+
+    def test_publication_forwards_isolated_result_output(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+        result_output = Path("/tmp/candidate-result.json")
+
+        with (
+            patch.object(
+                module,
+                "revalidate_provider_identity",
+                return_value=identity,
+                create=True,
+            ),
+            patch.object(module, "tag_run_with_provider"),
+            patch.object(module, "record_training_result") as record_result,
+        ):
+            module.publish_training_result(
+                {"run_id": "candidate-run", "status": "completed"},
+                provider="canonical",
+                provider_uri=Path("/tmp/native-v2"),
+                expected_provider_identity=identity,
+                source_config=Path("/tmp/source.yaml"),
+                runtime_config=Path("/tmp/runtime.yaml"),
+                publish_latest=False,
+                result_output=result_output,
+                client=object(),
+            )
+
+        record_result.assert_called_once()
+        self.assertFalse(record_result.call_args.kwargs["publish_latest"])
+        self.assertEqual(
+            record_result.call_args.kwargs["result_output"],
+            result_output,
+        )
 
 
 if __name__ == "__main__":

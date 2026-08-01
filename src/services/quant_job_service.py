@@ -8,6 +8,8 @@ arbitrary shell strings from the web UI.
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import json
 import logging
 import math
@@ -20,7 +22,6 @@ import sys
 import threading
 import time
 import uuid
-import glob
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -95,6 +96,7 @@ RECOVERED_RUNNER_POLL_INTERVAL_SECONDS = 1.0
 RECOVERED_RUNNER_MAX_POLL_SECONDS = 48 * 60 * 60
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EXIT_STATUS_FILENAME = "exit_status.json"
+ARTIFACT_BASELINE_FILENAME = "artifact_baseline.json"
 JQDATA_WEB_DRY_RUN_DEFAULT_LIMIT = 3
 JQDATA_WEB_DRY_RUN_MAX_LIMIT = 20
 GENERIC_WEB_LIMIT_MAX = 10000
@@ -133,6 +135,18 @@ DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS = 3650
 MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS = 5000
 MARKET_REPORT_WEB_MAX_MIN_SYMBOLS = 10000
 OPTIMIZE_STRATEGY_WEB_MAX_PHASE = 4
+FORMAL_TRAINING_JOB_TYPES = {"train_baseline_lgb", "run_candidate_pipeline"}
+TRAINING_PROVIDER_DATASET_IDS = {
+    "canonical": "qlib_ashare_v2",
+    "cleaned": "qlib_ashare_cleaned_v2",
+}
+PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+)
 CONFIG_FILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _DURABLE_RUNNER_CODE = r"""
 import json
@@ -267,7 +281,7 @@ class QuantJob:
 
 
 def _now() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
 def _json_dumps(value: Any) -> str:
@@ -582,6 +596,30 @@ def _safe_provider(value: Any) -> str:
     return raw
 
 
+def _approved_provider_identity_json(
+    provider: str,
+    identity: Mapping[str, Any],
+) -> str:
+    expected_dataset_id = TRAINING_PROVIDER_DATASET_IDS[provider]
+    payload = {field: identity.get(field) for field in PROVIDER_IDENTITY_FIELDS}
+    snapshot_id = payload.get("snapshot_id")
+    if (
+        payload.get("provider_contract") != "immutable_snapshot_v2"
+        or payload.get("dataset_id") != expected_dataset_id
+        or not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or snapshot_id in {".", ".."}
+        or any(
+            not isinstance(payload.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
+            for field in ("manifest_sha256", "content_sha256")
+        )
+    ):
+        raise ValueError("Approved provider identity is invalid or mismatched.")
+    return _json_dumps(payload)
+
+
 def _python_bin() -> str:
     _warn_if_legacy_qlib_python_is_ignored()
     if QUANT_WORKFLOW_PYTHON.exists():
@@ -646,6 +684,53 @@ def _return_code_indicates_cancel(return_code: Optional[int]) -> bool:
     }
 
 
+def _artifact_patterns_may_overlap(left: str, right: str) -> bool:
+    left_path = Path(os.path.abspath(os.path.expanduser(str(left))))
+    right_path = Path(os.path.abspath(os.path.expanduser(str(right))))
+    if left_path.parent != right_path.parent:
+        return False
+
+    left_name = left_path.name
+    right_name = right_path.name
+    left_magic = glob.has_magic(left_name)
+    right_magic = glob.has_magic(right_name)
+    if not left_magic and not right_magic:
+        return left_name == right_name
+    if left_magic and not right_magic:
+        return fnmatch.fnmatchcase(right_name, left_name)
+    if right_magic and not left_magic:
+        return fnmatch.fnmatchcase(left_name, right_name)
+
+    def literal_edges(pattern: str) -> tuple[str, str]:
+        wildcard_positions = [
+            index for index, character in enumerate(pattern) if character in "*?["
+        ]
+        first = min(wildcard_positions)
+        last = max(wildcard_positions)
+        return pattern[:first], pattern[last + 1 :]
+
+    left_prefix, left_suffix = literal_edges(left_name)
+    right_prefix, right_suffix = literal_edges(right_name)
+    prefixes_overlap = left_prefix.startswith(right_prefix) or right_prefix.startswith(
+        left_prefix
+    )
+    suffixes_overlap = left_suffix.endswith(right_suffix) or right_suffix.endswith(
+        left_suffix
+    )
+    return prefixes_overlap and suffixes_overlap
+
+
+def _artifact_pattern_sets_overlap(
+    left_patterns: Iterable[str],
+    right_patterns: Iterable[str],
+) -> bool:
+    return any(
+        _artifact_patterns_may_overlap(str(left), str(right))
+        for left in left_patterns
+        for right in right_patterns
+    )
+
+
 def _script_command(script_name: str) -> List[str]:
     return [_python_bin(), str(QUANT_WORKFLOW_ROOT / "scripts" / script_name)]
 
@@ -655,6 +740,27 @@ def _append_reports_out_dir(command: List[str]) -> None:
 
 
 def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
+    data_quality_artifact_patterns = [
+        str(REPORTS_ROOT / "data_quality_report_latest.json"),
+        str(REPORTS_ROOT / "data_quality_report_latest.md"),
+        str(REPORTS_ROOT / "data_quality_report_*.json"),
+        str(REPORTS_ROOT / "data_quality_report_*.md"),
+        str(REPORTS_ROOT / "data_quality_sources_*.csv"),
+        str(REPORTS_ROOT / "data_quality_issues_*.csv"),
+        str(REPORTS_ROOT / "data_quality_overlap_*.csv"),
+        str(REPORTS_ROOT / "data_quality_ashare_qfq_summary_*.csv"),
+        str(REPORTS_ROOT / "research_status_latest.json"),
+    ]
+    shared_training_artifact_patterns = [
+        str(REPORTS_ROOT / "latest_training_result.json"),
+        str(REPORTS_ROOT / "train_baseline_lgb_status_latest.json"),
+        str(REPORTS_ROOT / "train_baseline_lgb_*.log"),
+        str(REPORTS_ROOT / "experiment_runs.jsonl"),
+        str(REPORTS_ROOT / "experiment_log.md"),
+        str(REPORTS_ROOT / "full_experiment_report.md"),
+        str(REPORTS_ROOT / "ic_ir_analysis.md"),
+    ]
+
     def prepare_baostock_refresh(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("prepare_baostock_refresh.py")
         _append_reports_out_dir(command)
@@ -1088,6 +1194,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": [
                 str(REPORTS_ROOT / "daily_update_summary_latest.json"),
                 str(REPORTS_ROOT / "daily_update_summary_*.json"),
+                *data_quality_artifact_patterns,
             ],
         },
         "download_eastmoney": {
@@ -1260,15 +1367,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "label": "生成数据质量报告",
             "command": report_data_quality,
             "allowed_params": {"overlap_sample", "merged_sample"},
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "data_quality_report_latest.md"),
-                str(REPORTS_ROOT / "data_quality_report_*.md"),
-                str(REPORTS_ROOT / "data_quality_sources_*.csv"),
-                str(REPORTS_ROOT / "data_quality_issues_*.csv"),
-                str(REPORTS_ROOT / "data_quality_overlap_*.csv"),
-                str(REPORTS_ROOT / "data_quality_merged_summary_*.csv"),
-                str(REPORTS_ROOT / "research_status_latest.json"),
-            ],
+            "artifact_patterns": list(data_quality_artifact_patterns),
         },
         "report_data_anomalies": {
             "label": "生成异常股票和清洗策略",
@@ -1288,10 +1387,15 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "command": report_data_hygiene,
             "allowed_params": set(),
             "artifact_patterns": [
+                str(REPORTS_ROOT / "data_hygiene_reports_latest.json"),
                 str(REPORTS_ROOT / "data_hygiene_inventory_latest.md"),
                 str(REPORTS_ROOT / "data_hygiene_inventory_latest.json"),
                 str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.md"),
                 str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.json"),
+                str(REPORTS_ROOT / "data_hygiene_inventory_*.md"),
+                str(REPORTS_ROOT / "data_hygiene_inventory_*.json"),
+                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_*.md"),
+                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_*.json"),
             ],
         },
         "report_workbench_capabilities": {
@@ -1417,21 +1521,14 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "label": "训练 Qlib LightGBM 选股模型基线",
             "command": train_baseline_lgb,
             "allowed_params": {"config", "experiment_name", "provider"},
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "latest_training_result.json"),
-                str(REPORTS_ROOT / "train_baseline_lgb_status_latest.json"),
-                str(REPORTS_ROOT / "train_baseline_lgb_*.log"),
-                str(REPORTS_ROOT / "experiment_runs.jsonl"),
-                str(REPORTS_ROOT / "experiment_log.md"),
-                str(REPORTS_ROOT / "full_experiment_report.md"),
-                str(REPORTS_ROOT / "ic_ir_analysis.md"),
-            ],
+            "artifact_patterns": list(shared_training_artifact_patterns),
         },
         "run_candidate_pipeline": {
             "label": "运行五个选股模型候选流程",
             "command": run_candidate_pipeline,
             "allowed_params": {"dry_run", "provider"},
             "artifact_patterns": [
+                *shared_training_artifact_patterns,
                 str(REPORTS_ROOT / "candidate_pipeline_latest.json"),
                 str(REPORTS_ROOT / "candidate_pipeline_latest.md"),
                 str(REPORTS_ROOT / "candidate_pipeline_progress_latest.json"),
@@ -1549,38 +1646,77 @@ class QuantJobService:
         }
 
     def submit_job(
-        self, job_type: str, params: Optional[Mapping[str, Any]] = None
+        self,
+        job_type: str,
+        params: Optional[Mapping[str, Any]] = None,
+        *,
+        approved_provider_identity: Optional[Mapping[str, Any]] = None,
     ) -> QuantJob:
         params_dict = dict(params or {})
         spec = self._get_spec(job_type)
+        formal_training = job_type in FORMAL_TRAINING_JOB_TYPES and not (
+            job_type == "run_candidate_pipeline"
+            and _as_bool(params_dict.get("dry_run"))
+        )
+        if formal_training and approved_provider_identity is None:
+            raise ValueError(
+                "Formal training requires an approved provider identity."
+            )
         command = self._build_command(job_type, params_dict)
+        if approved_provider_identity is not None:
+            if job_type not in FORMAL_TRAINING_JOB_TYPES:
+                raise ValueError(
+                    "Approved provider identity is only valid for formal training jobs."
+                )
+            provider = _safe_provider(params_dict.get("provider"))
+            command.extend(
+                [
+                    "--provider-identity-json",
+                    _approved_provider_identity_json(
+                        provider, approved_provider_identity
+                    ),
+                ]
+            )
         with self._lock:
-            if job_type in QUANT_DATA_NETWORK_JOB_TYPES:
-                active = self._active_quant_data_network_job()
-                if active is not None:
+            with self._connect() as conn:
+                # Serialize the conflict check and pending-row claim across all
+                # DSA processes sharing this SQLite job index.
+                conn.execute("BEGIN IMMEDIATE")
+                if job_type in QUANT_DATA_NETWORK_JOB_TYPES:
+                    active = self._active_quant_data_network_job(conn=conn)
+                    if active is not None:
+                        raise ValueError(
+                            "A quant_data network job is already active: "
+                            f"{active.job_type} ({active.job_id}). Wait for it to finish or cancel it first."
+                        )
+                artifact_conflict = self._active_artifact_output_conflict(
+                    job_type, conn=conn
+                )
+                if artifact_conflict is not None:
                     raise ValueError(
-                        "A quant_data network job is already active: "
-                        f"{active.job_type} ({active.job_id}). Wait for it to finish or cancel it first."
+                        "Artifact output conflicts with an active quant job: "
+                        f"{artifact_conflict.job_type} ({artifact_conflict.job_id}). "
+                        "Wait for it to finish or cancel it first."
                     )
 
-            job_id = f"qj_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-            job_dir = self.jobs_root / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-            log_path = job_dir / "job.log"
-            timestamp = _now()
-            job = QuantJob(
-                job_id=job_id,
-                job_type=job_type,
-                label=str(spec.get("label") or job_type),
-                status="pending",
-                params=params_dict,
-                command=command,
-                cwd=str(spec.get("cwd") or self.default_cwd),
-                created_at=timestamp,
-                updated_at=timestamp,
-                log_path=str(log_path),
-            )
-            self._insert_job(job)
+                job_id = f"qj_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                job_dir = self.jobs_root / job_id
+                job_dir.mkdir(parents=True, exist_ok=True)
+                log_path = job_dir / "job.log"
+                timestamp = _now()
+                job = QuantJob(
+                    job_id=job_id,
+                    job_type=job_type,
+                    label=str(spec.get("label") or job_type),
+                    status="pending",
+                    params=params_dict,
+                    command=command,
+                    cwd=str(spec.get("cwd") or self.default_cwd),
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    log_path=str(log_path),
+                )
+                self._insert_job(job, conn=conn)
             self._start_job(job)
             return self.get_job(job_id)
 
@@ -1596,15 +1732,55 @@ class QuantJobService:
         bounded_limit = max(1, min(int(limit), 200))
         if job_type:
             rows = self._fetch_all(
-                "SELECT * FROM jobs WHERE job_type = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                "SELECT * FROM jobs WHERE job_type = ? "
+                "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
                 (job_type, bounded_limit),
             )
         else:
             rows = self._fetch_all(
-                "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                "SELECT * FROM jobs "
+                "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
                 (bounded_limit,),
             )
         return [self._row_to_job(row) for row in rows]
+
+    def list_jobs_for_monitoring(self, history_limit: int = 20) -> List[QuantJob]:
+        """Return every active job plus a bounded amount of recent history."""
+        bounded_limit = max(1, min(int(history_limit), 200))
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN")
+                rows = self._monitoring_job_rows(conn, bounded_limit)
+        return [self._row_to_job(row) for row in rows]
+
+    def _monitoring_job_rows(
+        self, conn: sqlite3.Connection, history_limit: int
+    ) -> List[sqlite3.Row]:
+        active_rows = list(
+            conn.execute(
+                "SELECT rowid AS _rowid, * FROM jobs "
+                "WHERE status IN ('pending', 'running') "
+                "ORDER BY updated_at DESC, created_at DESC, rowid DESC",
+                (),
+            ).fetchall()
+        )
+        history_rows = list(
+            conn.execute(
+                "SELECT rowid AS _rowid, * FROM jobs "
+                "WHERE status NOT IN ('pending', 'running') "
+                "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
+                (history_limit,),
+            ).fetchall()
+        )
+        return sorted(
+            [*active_rows, *history_rows],
+            key=lambda row: (
+                str(row["updated_at"]),
+                str(row["created_at"]),
+                int(row["_rowid"]),
+            ),
+            reverse=True,
+        )
 
     def get_latest_jobs_by_type(self) -> Dict[str, QuantJob]:
         rows = self._fetch_all(
@@ -1633,25 +1809,86 @@ class QuantJobService:
     def get_status_snapshot(
         self, recent_limit: int = 10
     ) -> tuple[Dict[str, QuantJob], int, List[QuantJob]]:
+        bounded_limit = max(1, min(int(recent_limit), 200))
         with self._lock:
-            latest_jobs = self.get_latest_jobs_by_type()
-            active_count = self.active_count()
-            recent_jobs = self.list_jobs(limit=recent_limit)
+            with self._connect() as conn:
+                conn.execute("BEGIN")
+                latest_rows = list(
+                    conn.execute(
+                        """
+                        SELECT j.*
+                        FROM jobs j
+                        INNER JOIN (
+                            SELECT job_type, MAX(rowid) AS max_rowid
+                            FROM jobs
+                            GROUP BY job_type
+                        ) latest
+                        ON latest.max_rowid = j.rowid
+                        ORDER BY j.created_at DESC, j.rowid DESC
+                        """,
+                        (),
+                    ).fetchall()
+                )
+                active_row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM jobs "
+                    "WHERE status IN ('pending', 'running')",
+                    (),
+                ).fetchone()
+                recent_rows = self._monitoring_job_rows(conn, bounded_limit)
+        latest_jobs = {
+            row["job_type"]: self._row_to_job(row) for row in latest_rows
+        }
+        active_count = int(active_row["count"]) if active_row is not None else 0
+        recent_jobs = [self._row_to_job(row) for row in recent_rows]
         return latest_jobs, active_count, recent_jobs
 
-    def _active_quant_data_network_job(self) -> Optional[QuantJob]:
+    def _active_quant_data_network_job(
+        self, *, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[QuantJob]:
         placeholders = ", ".join("?" for _item in QUANT_DATA_NETWORK_JOB_TYPES)
-        row = self._fetch_one(
-            f"""
+        query = f"""
             SELECT * FROM jobs
             WHERE status IN ('pending', 'running')
               AND job_type IN ({placeholders})
             ORDER BY rowid DESC
             LIMIT 1
-            """,
-            tuple(sorted(QUANT_DATA_NETWORK_JOB_TYPES)),
+            """
+        params = tuple(sorted(QUANT_DATA_NETWORK_JOB_TYPES))
+        row = (
+            conn.execute(query, params).fetchone()
+            if conn is not None
+            else self._fetch_one(query, params)
         )
         return self._row_to_job(row) if row is not None else None
+
+    def _active_artifact_output_conflict(
+        self,
+        job_type: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Optional[QuantJob]:
+        requested_patterns = self._get_spec(job_type).get("artifact_patterns", [])
+        if not requested_patterns:
+            return None
+        query = (
+            "SELECT * FROM jobs WHERE status IN ('pending', 'running') "
+            "ORDER BY rowid DESC"
+        )
+        rows = (
+            list(conn.execute(query, ()).fetchall())
+            if conn is not None
+            else self._fetch_all(query, ())
+        )
+        for row in rows:
+            active = self._row_to_job(row)
+            active_spec = self.command_specs.get(active.job_type, {})
+            active_patterns = active_spec.get("artifact_patterns", [])
+            if active_patterns and _artifact_pattern_sets_overlap(
+                requested_patterns,
+                active_patterns,
+            ):
+                return active
+        return None
 
     def get_log(self, job_id: str, max_bytes: int = 20000) -> Dict[str, Any]:
         job = self.get_job(job_id)
@@ -1772,6 +2009,7 @@ class QuantJobService:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handle: Any = None
         try:
+            self._write_artifact_baseline(job)
             handle = log_path.open("ab")
             header = (
                 f"[job] {job.job_id} {job.job_type}\n"
@@ -1873,7 +2111,7 @@ class QuantJobService:
         with self._lock:
             current = self.get_job(job.job_id)
             artifact_paths = (
-                self._collect_artifact_paths(current.job_type)
+                self._collect_artifact_paths(current)
                 if return_code == 0
                 else current.artifact_paths
             )
@@ -1927,14 +2165,89 @@ class QuantJobService:
                 with self._lock:
                     self._processes.pop(job_id, None)
 
-    def _collect_artifact_paths(self, job_type: str) -> List[str]:
+    def _artifact_baseline_path(self, job: QuantJob) -> Path:
+        return Path(job.log_path).parent / ARTIFACT_BASELINE_FILENAME
+
+    def _matching_artifact_states(self, job_type: str) -> Dict[str, List[int]]:
         patterns = self._get_spec(job_type).get("artifact_patterns", [])
-        paths: List[Path] = []
+        states: Dict[str, List[int]] = {}
         for pattern in patterns:
             for match in glob.glob(str(pattern)):
                 path = Path(match)
+                try:
+                    metadata = path.stat()
+                except OSError:
+                    continue
                 if path.is_file():
-                    paths.append(path)
+                    states[str(path)] = [
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                        int(metadata.st_size),
+                        int(metadata.st_mtime_ns),
+                        int(metadata.st_ctime_ns),
+                    ]
+        return states
+
+    def _write_artifact_baseline(self, job: QuantJob) -> None:
+        path = self._artifact_baseline_path(job)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        payload = {
+            "schema_version": 1,
+            "job_id": job.job_id,
+            "artifacts": self._matching_artifact_states(job.job_type),
+        }
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _read_artifact_baseline(self, job: QuantJob) -> Optional[Dict[str, List[int]]]:
+        try:
+            payload = json.loads(
+                self._artifact_baseline_path(job).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        artifacts = payload.get("artifacts")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("job_id") != job.job_id
+            or not isinstance(artifacts, dict)
+        ):
+            return None
+        normalized: Dict[str, List[int]] = {}
+        for raw_path, raw_state in artifacts.items():
+            if (
+                isinstance(raw_path, str)
+                and isinstance(raw_state, list)
+                and len(raw_state) == 5
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in raw_state
+                )
+            ):
+                normalized[raw_path] = raw_state
+            else:
+                return None
+        return normalized
+
+    def _collect_artifact_paths(self, job: QuantJob) -> List[str]:
+        baseline = self._read_artifact_baseline(job)
+        if baseline is None:
+            return []
+        current = self._matching_artifact_states(job.job_type)
+        paths = [
+            Path(path)
+            for path, state in current.items()
+            if baseline.get(path) != state
+        ]
 
         def sort_key(path: Path) -> float:
             try:
@@ -2095,38 +2408,42 @@ class QuantJobService:
             error="Job was marked failed because the API service restarted before it finished and no durable runner was found.",
         )
 
-    def _insert_job(self, job: QuantJob) -> None:
-        with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    """
+    def _insert_job(
+        self, job: QuantJob, *, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        query = """
                     INSERT INTO jobs (
                         job_id, job_type, label, status, params_json, command_json, cwd,
                         pid, return_code, created_at, started_at, completed_at, updated_at,
                         error, log_path, artifact_paths_json
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        job.job_id,
-                        job.job_type,
-                        job.label,
-                        job.status,
-                        _json_dumps(job.params),
-                        _json_dumps(job.command),
-                        job.cwd,
-                        job.pid,
-                        job.return_code,
-                        job.created_at,
-                        job.started_at,
-                        job.completed_at,
-                        job.updated_at,
-                        job.error,
-                        job.log_path,
-                        _json_dumps(job.artifact_paths),
-                    ),
-                )
-                conn.commit()
+                    """
+        values = (
+            job.job_id,
+            job.job_type,
+            job.label,
+            job.status,
+            _json_dumps(job.params),
+            _json_dumps(job.command),
+            job.cwd,
+            job.pid,
+            job.return_code,
+            job.created_at,
+            job.started_at,
+            job.completed_at,
+            job.updated_at,
+            job.error,
+            job.log_path,
+            _json_dumps(job.artifact_paths),
+        )
+        if conn is not None:
+            conn.execute(query, values)
+            return
+        with self._lock:
+            with self._connect() as local_conn:
+                local_conn.execute(query, values)
+                local_conn.commit()
 
     def _update_job(self, job_id: str, **updates: Any) -> None:
         if not updates:

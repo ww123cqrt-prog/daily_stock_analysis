@@ -5,6 +5,9 @@ export type ResearchSourceStatus = 'available' | 'partial' | 'missing' | string;
 
 export type ResearchDataSource = {
   name: string;
+  datasetId?: string;
+  role?: 'canonical' | 'audit' | 'legacy' | string;
+  lifecycle?: string;
   files: number;
   rows: number;
   dateRange: string;
@@ -15,6 +18,14 @@ export type ResearchDataSource = {
 export type ResearchTrainingReadiness = {
   status: string;
   summary: string;
+};
+
+export type ResearchQualityScan = {
+  mode: 'full' | 'sampled' | string;
+  coverage: 'full' | 'partial' | string;
+  verificationStatus: 'verified' | 'unverified' | string;
+  requestedSample?: number;
+  scannedInstruments?: number | null;
 };
 
 export type ResearchQlibProvider = {
@@ -440,6 +451,7 @@ export type ResearchExternalTools = {
 
 export type ResearchDataHygieneInventory = {
   status: string;
+  validationStatus?: string;
   path?: string | null;
   generatedAt?: string | null;
   officialEntries?: number;
@@ -483,6 +495,7 @@ export type ResearchDataHygieneReport = {
 
 export type ResearchDataHygieneManifest = {
   status: string;
+  validationStatus?: string;
   path?: string | null;
   generatedAt?: string | null;
   sourceReport?: string | null;
@@ -563,6 +576,7 @@ export type ResearchStatus = {
   generatedAt?: string;
   trainable: boolean;
   trainingReadiness: ResearchTrainingReadiness;
+  qualityScan?: ResearchQualityScan;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
   latestTrainingProvider?: ResearchQlibProvider | null;
@@ -617,6 +631,11 @@ export const researchApi = {
   async getStatus(): Promise<ResearchStatus> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/research/status');
     return convertResearchStatus(response.data);
+  },
+
+  async getExperimentNotebook(): Promise<ResearchExperimentNotebook> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/research/experiments');
+    return toCamelCase<ResearchExperimentNotebook>(response.data);
   },
 
   async archiveExperimentRun(runId: string): Promise<ResearchExperimentMutationResult> {

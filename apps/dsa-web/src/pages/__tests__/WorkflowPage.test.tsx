@@ -58,8 +58,9 @@ class FakeEventSource {
   }
 }
 
-const { getQuantStatus, getResearchStatus, listQuantJobs, submitQuantJob, getQuantJobLog, getQuantJobArtifactText, cancelQuantJob } = vi.hoisted(() => ({
+const { getQuantStatus, getQuantJobTypes, getResearchStatus, listQuantJobs, submitQuantJob, getQuantJobLog, getQuantJobArtifactText, cancelQuantJob } = vi.hoisted(() => ({
   getQuantStatus: vi.fn(),
+  getQuantJobTypes: vi.fn(),
   getResearchStatus: vi.fn(),
   listQuantJobs: vi.fn(),
   submitQuantJob: vi.fn(),
@@ -71,6 +72,7 @@ const { getQuantStatus, getResearchStatus, listQuantJobs, submitQuantJob, getQua
 vi.mock('../../api/quant', () => ({
   quantApi: {
     getStatus: () => getQuantStatus(),
+    getJobTypes: () => getQuantJobTypes(),
     listJobs: () => listQuantJobs(),
     submitJob: (jobType: string, params?: Record<string, unknown>) => submitQuantJob(jobType, params),
     getJobLog: (jobId: string) => getQuantJobLog(jobId),
@@ -117,7 +119,7 @@ function readyResearchStatus() {
     };
 }
 
-function renderWorkflowPage(surface: 'all' | 'training' = 'all') {
+function renderWorkflowPage(surface: 'all' | 'training' | 'other' = 'all') {
   localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
   return render(
     <UiLanguageProvider>
@@ -137,6 +139,7 @@ describe('WorkflowPage', () => {
   beforeEach(() => {
     localStorage.clear();
     getQuantStatus.mockReset();
+    getQuantJobTypes.mockReset();
     getResearchStatus.mockReset();
     listQuantJobs.mockReset();
     submitQuantJob.mockReset();
@@ -151,8 +154,7 @@ describe('WorkflowPage', () => {
 
     getResearchStatus.mockResolvedValue(readyResearchStatus());
 
-    getQuantStatus.mockResolvedValue({
-      availableJobTypes: {
+    const availableJobTypes = {
         prepare_baostock_refresh: { label: '准备 Baostock 增量清单', allowedParams: ['target_end', 'limit'] },
         download_baostock: { label: '下载 Baostock 长历史', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'overlap_days', 'retry_failed', 'retry_empty', 'retry_timeout', 'incremental'] },
         download_eastmoney: { label: '下载东方财富日线', allowedParams: ['start', 'end', 'sleep', 'limit', 'retries', 'timeout', 'max_consecutive_failures', 'max_requests', 'retry_failed', 'incremental', 'overlap_days', 'use_system_proxy'] },
@@ -185,8 +187,12 @@ describe('WorkflowPage', () => {
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
         report_china_astock_indicators: { label: '生成 china-astock 技术指标报告', allowedParams: ['symbols', 'lookback_days', 'limit'] },
         optimize_strategy: { label: '交易策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
-        run_dsa_backtest: { label: '运行 DSA 分析准确性回测', allowedParams: ['code', 'eval_window_days', 'force'] },
-      },
+      run_dsa_backtest: { label: '运行 DSA 分析准确性回测', allowedParams: ['code', 'eval_window_days', 'force'] },
+    };
+    getQuantJobTypes.mockResolvedValue(availableJobTypes);
+
+    getQuantStatus.mockResolvedValue({
+      availableJobTypes,
       activeCount: 0,
       latestJobs: {
         train_baseline_lgb: {
@@ -638,6 +644,9 @@ describe('WorkflowPage', () => {
   });
 
   it('disables workflow jobs that are not advertised by the backend whitelist', async () => {
+    getQuantJobTypes.mockResolvedValueOnce({
+      check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+    });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
@@ -660,8 +669,11 @@ describe('WorkflowPage', () => {
 
   it('waits for the backend whitelist before reporting a job as disabled', async () => {
     let resolveStatus: (value: unknown) => void = () => undefined;
-    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+    getQuantJobTypes.mockReturnValueOnce(new Promise((resolve) => {
       resolveStatus = resolve;
+    }));
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      void resolve;
     }));
 
     renderWorkflowPage();
@@ -674,12 +686,7 @@ describe('WorkflowPage', () => {
 
     await act(async () => {
       resolveStatus({
-        availableJobTypes: {
-          report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
-        },
-        activeCount: 0,
-        latestJobs: {},
-        recentJobs: [],
+        report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
       });
     });
 
@@ -691,8 +698,11 @@ describe('WorkflowPage', () => {
 
   it('keeps daily guide job shortcuts disabled until the backend whitelist loads', async () => {
     let resolveStatus: (value: unknown) => void = () => undefined;
-    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+    getQuantJobTypes.mockReturnValueOnce(new Promise((resolve) => {
       resolveStatus = resolve;
+    }));
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      void resolve;
     }));
 
     renderWorkflowPage();
@@ -706,12 +716,7 @@ describe('WorkflowPage', () => {
 
     await act(async () => {
       resolveStatus({
-        availableJobTypes: {
-          apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
-        },
-        activeCount: 0,
-        latestJobs: {},
-        recentJobs: [],
+        apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
       });
     });
 
@@ -721,6 +726,9 @@ describe('WorkflowPage', () => {
   });
 
   it('disables daily guide job shortcuts that are missing from the backend whitelist', async () => {
+    getQuantJobTypes.mockResolvedValueOnce({
+      check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+    });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
@@ -762,6 +770,17 @@ describe('WorkflowPage', () => {
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('report_workbench_capabilities', {});
     });
+  });
+
+  it('enables jobs from the fast whitelist while the full quant status is still loading', async () => {
+    getQuantStatus.mockReturnValueOnce(new Promise(() => undefined));
+    getResearchStatus.mockReturnValueOnce(new Promise(() => undefined));
+    listQuantJobs.mockReturnValueOnce(new Promise(() => undefined));
+
+    renderWorkflowPage('other');
+
+    const button = await screen.findByRole('button', { name: '运行 生成工作台能力盘点' });
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 
   it('submits Qlib research enhancement jobs with fixed whitelist params', async () => {
@@ -886,6 +905,9 @@ describe('WorkflowPage', () => {
   });
 
   it('renders and submits only parameters advertised by the backend whitelist', async () => {
+    getQuantJobTypes.mockResolvedValueOnce({
+      train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config'] },
+    });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
         train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config'] },
@@ -1131,6 +1153,443 @@ describe('WorkflowPage', () => {
     expect(screen.getByText(/IC: 0.01/)).toBeInTheDocument();
   });
 
+  it('shows a streamed artifact while the slower status snapshot is still loading', async () => {
+    const completedJob = {
+      jobId: 'qj_cash_control',
+      jobType: 'report_cash_control_backtest',
+      label: '生成现金仓位叠加回测',
+      status: 'completed',
+      params: {},
+      createdAt: '2026-07-03T22:00:00+08:00',
+      completedAt: '2026-07-03T22:00:01+08:00',
+      updatedAt: '2026-07-03T22:00:01+08:00',
+      artifactPaths: ['/tmp/cash_control_backtest_latest.md'],
+    };
+    getQuantStatus.mockReturnValueOnce(new Promise(() => undefined));
+    listQuantJobs.mockReturnValueOnce(new Promise(() => undefined));
+
+    renderWorkflowPage('other');
+
+    await waitFor(() => {
+      expect(FakeEventSource.instances).toHaveLength(1);
+    });
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [completedJob] });
+    });
+
+    expect(
+      await screen.findByRole('button', { name: '预览 cash_control_backtest_latest.md' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('qj_cash_control')).toBeInTheDocument();
+  });
+
+  it('does not let a delayed GET snapshot overwrite a newer streamed job', async () => {
+    const staleRunningJob = {
+      jobId: 'qj_refresh_race',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:00:00+08:00',
+      updatedAt: '2026-07-03T22:00:01+08:00',
+      artifactPaths: ['/tmp/stale.log'],
+    };
+    const streamedCompletedJob = {
+      ...staleRunningJob,
+      status: 'completed',
+      completedAt: '2026-07-03T22:01:00+08:00',
+      updatedAt: '2026-07-03T22:01:00+08:00',
+      artifactPaths: ['/tmp/final.log'],
+    };
+    let resolveStatus: (value: unknown) => void = () => undefined;
+    let resolveList: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+    listQuantJobs.mockReturnValueOnce(new Promise((resolve) => {
+      resolveList = resolve;
+    }));
+
+    renderWorkflowPage();
+    await waitFor(() => {
+      expect(FakeEventSource.instances).toHaveLength(1);
+    });
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [streamedCompletedJob] });
+    });
+    expect(await screen.findByText('final.log')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveStatus({
+        availableJobTypes: {},
+        activeCount: 1,
+        latestJobs: { check_qlib_data: staleRunningJob },
+        recentJobs: [staleRunningJob],
+      });
+      resolveList({ total: 1, items: [staleRunningJob] });
+    });
+
+    expect(screen.getByText('final.log')).toBeInTheDocument();
+    expect(screen.queryByText('stale.log')).not.toBeInTheDocument();
+    expect(screen.getByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('1 个运行中')).not.toBeInTheDocument();
+  });
+
+  it('does not let a delayed status snapshot remove a newer streamed active job', async () => {
+    const streamedRunningJob = {
+      jobId: 'qj_created_after_status_request',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:05:00+08:00',
+      updatedAt: '2026-07-03T22:05:00+08:00',
+      artifactPaths: [],
+    };
+
+    renderWorkflowPage();
+    await screen.findByText('当前数据可训练');
+    expect(getQuantStatus).toHaveBeenCalledTimes(1);
+
+    let resolveStatus: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+    await waitFor(() => {
+      expect(getQuantStatus).toHaveBeenCalledTimes(2);
+    });
+
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [streamedRunningJob] });
+    });
+    expect(await screen.findByText('qj_created_after_status_request')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveStatus({
+        availableJobTypes: {},
+        activeCount: 0,
+        latestJobs: {},
+        recentJobs: [],
+      });
+    });
+
+    expect(screen.getByText('qj_created_after_status_request')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: '取消 检查 Qlib 数据' }),
+    ).toBeInTheDocument();
+  });
+
+  it('does not let a delayed status snapshot resurrect a job removed by the stream', async () => {
+    const staleRunningJob = {
+      jobId: 'qj_completed_after_status_request',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:00:00+08:00',
+      updatedAt: '2026-07-03T22:00:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { check_qlib_data: staleRunningJob },
+      recentJobs: [staleRunningJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [staleRunningJob] });
+
+    renderWorkflowPage();
+    expect(await screen.findByText('qj_completed_after_status_request')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+
+    let resolveStatus: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise((resolve) => {
+      resolveStatus = resolve;
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+    await waitFor(() => {
+      expect(getQuantStatus).toHaveBeenCalledTimes(2);
+    });
+
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [] });
+    });
+    expect(await screen.findByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('qj_completed_after_status_request')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveStatus({
+        availableJobTypes: {},
+        activeCount: 1,
+        latestJobs: { check_qlib_data: staleRunningJob },
+        recentJobs: [staleRunningJob],
+      });
+    });
+
+    expect(screen.getByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('qj_completed_after_status_request')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '取消 检查 Qlib 数据' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps the active count idempotent when SSE arrives before submit resolves', async () => {
+    const submittedJob = {
+      jobId: 'qj_submit_race',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:00:00+08:00',
+      updatedAt: '2026-07-03T22:00:00+08:00',
+      artifactPaths: [],
+    };
+    let resolveSubmit: (value: unknown) => void = () => undefined;
+    submitQuantJob.mockReturnValueOnce(new Promise((resolve) => {
+      resolveSubmit = resolve;
+    }));
+
+    renderWorkflowPage();
+    fireEvent.click(await screen.findByRole('button', { name: '运行 检查 Qlib 数据' }));
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('check_qlib_data', {});
+    });
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [submittedJob] });
+    });
+    expect(await screen.findByText('1 个运行中')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSubmit(submittedJob);
+    });
+
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('2 个运行中')).not.toBeInTheDocument();
+  });
+
+  it('does not decrement another active job when SSE precedes cancel response', async () => {
+    const cancelledTarget = {
+      jobId: 'qj_cancel_target',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:00:00+08:00',
+      updatedAt: '2026-07-03T22:00:00+08:00',
+      artifactPaths: [],
+    };
+    const otherRunningJob = {
+      jobId: 'qj_other_running',
+      jobType: 'report_data_quality',
+      label: '生成数据质量报告',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-03T22:00:10+08:00',
+      updatedAt: '2026-07-03T22:00:10+08:00',
+      artifactPaths: [],
+    };
+    const cancelledResponse = {
+      ...cancelledTarget,
+      status: 'cancelled',
+      completedAt: '2026-07-03T22:01:00+08:00',
+      updatedAt: '2026-07-03T22:01:00+08:00',
+    };
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 2,
+      latestJobs: {
+        check_qlib_data: cancelledTarget,
+        report_data_quality: otherRunningJob,
+      },
+      recentJobs: [otherRunningJob, cancelledTarget],
+    });
+    listQuantJobs.mockResolvedValueOnce({
+      total: 2,
+      items: [otherRunningJob, cancelledTarget],
+    });
+    let resolveCancel: (value: unknown) => void = () => undefined;
+    cancelQuantJob.mockReturnValueOnce(new Promise((resolve) => {
+      resolveCancel = resolve;
+    }));
+
+    renderWorkflowPage();
+    expect(await screen.findByText('2 个运行中')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '取消 检查 Qlib 数据' }));
+    await waitFor(() => {
+      expect(cancelQuantJob).toHaveBeenCalledWith('qj_cancel_target');
+    });
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', {
+        jobs: [otherRunningJob, cancelledResponse],
+      });
+    });
+    expect(await screen.findByText('1 个运行中')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveCancel(cancelledResponse);
+    });
+
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('0 个运行中')).not.toBeInTheDocument();
+  });
+
+  it('retains every active job in addition to the bounded completed history', async () => {
+    const longRunningJob = {
+      jobId: 'qj_long_running',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-01T09:00:00+08:00',
+      updatedAt: '2026-07-01T09:00:00+08:00',
+      artifactPaths: [],
+    };
+    const completedHistory = Array.from({ length: 30 }, (_, index) => ({
+      jobId: `qj_history_${index}`,
+      jobType: 'report_data_quality',
+      label: '生成数据质量报告',
+      status: 'completed',
+      params: {},
+      createdAt: `2026-07-${String(index + 2).padStart(2, '0')}T10:00:00+08:00`,
+      updatedAt: `2026-07-${String(index + 2).padStart(2, '0')}T10:01:00+08:00`,
+      artifactPaths: [],
+    }));
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { check_qlib_data: longRunningJob },
+      recentJobs: [longRunningJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({
+      total: completedHistory.length,
+      items: completedHistory,
+    });
+
+    renderWorkflowPage();
+
+    expect(await screen.findByText('qj_history_29')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+    expect(screen.getByText('qj_long_running')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: '取消 检查 Qlib 数据' }),
+    ).toBeInTheDocument();
+  });
+
+  it('removes a stale active job when the authoritative status snapshot no longer lists it', async () => {
+    const staleRunningJob = {
+      jobId: 'qj_status_stale_running',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-01T09:00:00+08:00',
+      updatedAt: '2026-07-01T09:00:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus
+      .mockResolvedValueOnce({
+        availableJobTypes: {},
+        activeCount: 1,
+        latestJobs: { check_qlib_data: staleRunningJob },
+        recentJobs: [staleRunningJob],
+      })
+      .mockResolvedValueOnce({
+        availableJobTypes: {},
+        activeCount: 0,
+        latestJobs: {},
+        recentJobs: [],
+      });
+    listQuantJobs
+      .mockResolvedValueOnce({ total: 1, items: [staleRunningJob] })
+      .mockResolvedValueOnce({ total: 0, items: [] });
+
+    renderWorkflowPage();
+    expect(await screen.findByText('qj_status_stale_running')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+    await waitFor(() => {
+      expect(getQuantStatus).toHaveBeenCalledTimes(2);
+    });
+
+    expect(await screen.findByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('qj_status_stale_running')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '取消 检查 Qlib 数据' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not resurrect a stale active job from a delayed history response', async () => {
+    const staleRunningJob = {
+      jobId: 'qj_delayed_history_stale',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-01T09:00:00+08:00',
+      updatedAt: '2026-07-01T09:00:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: {},
+      recentJobs: [],
+    });
+    let resolveList: (value: unknown) => void = () => undefined;
+    listQuantJobs.mockReturnValueOnce(new Promise((resolve) => {
+      resolveList = resolve;
+    }));
+
+    renderWorkflowPage();
+    await waitFor(() => {
+      expect(getQuantStatus).toHaveBeenCalledTimes(1);
+    });
+    await act(async () => {
+      resolveList({ total: 1, items: [staleRunningJob] });
+    });
+
+    expect(await screen.findByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('qj_delayed_history_stale')).not.toBeInTheDocument();
+  });
+
+  it('removes a stale active job when the authoritative stream snapshot no longer lists it', async () => {
+    const staleRunningJob = {
+      jobId: 'qj_stream_stale_running',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-01T09:00:00+08:00',
+      updatedAt: '2026-07-01T09:00:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { check_qlib_data: staleRunningJob },
+      recentJobs: [staleRunningJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [staleRunningJob] });
+
+    renderWorkflowPage();
+    expect(await screen.findByText('qj_stream_stale_running')).toBeInTheDocument();
+    expect(screen.getByText('1 个运行中')).toBeInTheDocument();
+
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [] });
+    });
+
+    expect(await screen.findByText('0 个运行中')).toBeInTheDocument();
+    expect(screen.queryByText('qj_stream_stale_running')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '取消 检查 Qlib 数据' }),
+    ).not.toBeInTheDocument();
+  });
+
   it('updates the active job count immediately after cancelling a running job', async () => {
     const runningJob = {
       jobId: 'qj_running',
@@ -1185,22 +1644,24 @@ describe('WorkflowPage', () => {
     expect(FakeEventSource.instances[0].url).toBe('/api/v1/quant/jobs/stream');
     expect(FakeEventSource.instances[0].init).toEqual({ withCredentials: true });
 
-    FakeEventSource.instances[0].emit('jobs', {
-      jobs: [
-        {
-          jobId: 'qj_stream',
-          jobType: 'check_qlib_data',
-          label: '检查 Qlib 数据',
-          status: 'completed',
-          params: {},
-          command: [],
-          cwd: '/Users/cq/WorkingProjects',
-          createdAt: '2026-07-04T01:00:00+08:00',
-          updatedAt: '2026-07-04T01:00:01+08:00',
-          logPath: '/tmp/job.log',
-          artifactPaths: ['/tmp/qlib_check.log'],
-        },
-      ],
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', {
+        jobs: [
+          {
+            jobId: 'qj_stream',
+            jobType: 'check_qlib_data',
+            label: '检查 Qlib 数据',
+            status: 'completed',
+            params: {},
+            command: [],
+            cwd: '/Users/cq/WorkingProjects',
+            createdAt: '2026-07-04T01:00:00+08:00',
+            updatedAt: '2026-07-04T01:00:01+08:00',
+            logPath: '/tmp/job.log',
+            artifactPaths: ['/tmp/qlib_check.log'],
+          },
+        ],
+      });
     });
 
     expect(await screen.findByText('qj_stream')).toBeInTheDocument();
@@ -1212,39 +1673,84 @@ describe('WorkflowPage', () => {
 
     await screen.findByText('当前数据可训练');
 
-    FakeEventSource.instances[0].emit('jobs', {
-      jobs: [
-        {
-          jobId: 'qj_old_quality',
-          jobType: 'report_data_quality',
-          label: '生成数据质量报告',
-          status: 'completed',
-          params: {},
-          command: [],
-          cwd: '/Users/cq/WorkingProjects',
-          createdAt: '2026-07-04T01:00:00+08:00',
-          updatedAt: '2026-07-04T01:00:01+08:00',
-          logPath: '/tmp/job.log',
-          artifactPaths: ['/tmp/old_report.md'],
-        },
-        {
-          jobId: 'qj_new_quality',
-          jobType: 'report_data_quality',
-          label: '生成数据质量报告',
-          status: 'completed',
-          params: {},
-          command: [],
-          cwd: '/Users/cq/WorkingProjects',
-          createdAt: '2026-07-04T02:00:00+08:00',
-          updatedAt: '2026-07-04T02:00:01+08:00',
-          logPath: '/tmp/job.log',
-          artifactPaths: ['/tmp/new_report.md'],
-        },
-      ],
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', {
+        jobs: [
+          {
+            jobId: 'qj_old_quality',
+            jobType: 'report_data_quality',
+            label: '生成数据质量报告',
+            status: 'completed',
+            params: {},
+            command: [],
+            cwd: '/Users/cq/WorkingProjects',
+            createdAt: '2026-07-04T01:00:00+08:00',
+            updatedAt: '2026-07-04T01:00:01+08:00',
+            logPath: '/tmp/job.log',
+            artifactPaths: ['/tmp/old_report.md'],
+          },
+          {
+            jobId: 'qj_new_quality',
+            jobType: 'report_data_quality',
+            label: '生成数据质量报告',
+            status: 'completed',
+            params: {},
+            command: [],
+            cwd: '/Users/cq/WorkingProjects',
+            createdAt: '2026-07-04T02:00:00+08:00',
+            updatedAt: '2026-07-04T02:00:01+08:00',
+            logPath: '/tmp/job.log',
+            artifactPaths: ['/tmp/new_report.md'],
+          },
+        ],
+      });
     });
 
     expect(await screen.findByRole('link', { name: 'new_report.md' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'old_report.md' })).not.toBeInTheDocument();
+  });
+
+  it('does not let a stale list response replace a newer status job', async () => {
+    const newer = {
+      jobId: 'qj_newer',
+      jobType: 'report_data_quality',
+      label: '生成数据质量报告',
+      status: 'running',
+      params: {},
+      createdAt: '2026-07-04T02:00:00.200000+08:00',
+      updatedAt: '2026-07-04T02:00:00.300000+08:00',
+      artifactPaths: ['/tmp/newer.md'],
+    };
+    let resolveList: (value: unknown) => void = () => undefined;
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { report_data_quality: newer },
+      recentJobs: [newer],
+    });
+    listQuantJobs.mockReturnValueOnce(new Promise((resolve) => {
+      resolveList = resolve;
+    }));
+
+    renderWorkflowPage();
+    expect(await screen.findByRole('link', { name: 'newer.md' })).toBeInTheDocument();
+
+    await act(async () => {
+      resolveList({
+        total: 1,
+        items: [{
+          ...newer,
+          jobId: 'qj_older',
+          status: 'completed',
+          createdAt: '2026-07-04T01:00:00.100000+08:00',
+          updatedAt: '2026-07-04T03:00:00.100000+08:00',
+          artifactPaths: ['/tmp/older.md'],
+        }],
+      });
+    });
+
+    expect(screen.getByRole('link', { name: 'newer.md' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'older.md' })).not.toBeInTheDocument();
   });
 
   it('reconnects the quant job stream and localizes the transient error', async () => {
@@ -1303,6 +1809,25 @@ describe('WorkflowPage', () => {
       vi.advanceTimersByTime(0);
     });
 
+    expect(FakeEventSource.instances).toHaveLength(2);
+  });
+
+  it('does not schedule a second reconnect when stream end is followed by an error', async () => {
+    renderWorkflowPage();
+
+    await screen.findByText('当前数据可训练');
+    vi.useFakeTimers();
+
+    act(() => {
+      FakeEventSource.instances[0].emit('stream_end', { type: 'stream_end' });
+      FakeEventSource.instances[0].fail();
+      vi.advanceTimersByTime(0);
+    });
+    expect(FakeEventSource.instances).toHaveLength(2);
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
     expect(FakeEventSource.instances).toHaveLength(2);
   });
 

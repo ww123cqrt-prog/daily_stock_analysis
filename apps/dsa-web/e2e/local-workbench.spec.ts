@@ -238,13 +238,13 @@ async function expectNoHorizontalOverflow(page: Page) {
   ))).toBe(true);
 }
 
-async function waitForJobToFinish(page: Page, jobId: string) {
+async function waitForJobToFinish(page: Page, jobId: string, timeout = 60_000) {
   await expect.poll(async () => {
     return getTaskStatusForPoll(page.request, `/api/v1/quant/jobs/${encodeURIComponent(jobId)}`);
   }, {
     intervals: [1000, 1500, 2000],
-    timeout: 60_000,
-  }).toMatch(/^(completed|failed|cancelled)$/);
+    timeout,
+  }).toBe('completed');
 }
 
 async function launchCapabilityArtifactJob(page: Page) {
@@ -575,7 +575,11 @@ function cleanupQuantJobDatabase(jobIds: string[]) {
   const databasePath = path.join(jobsRoot, 'index.sqlite');
   if (fs.existsSync(databasePath)) {
     const quotedIds = safeJobIds.map((jobId) => `'${jobId}'`).join(',');
-    execFileSync('sqlite3', [databasePath, `DELETE FROM jobs WHERE job_id IN (${quotedIds});`], { stdio: 'pipe' });
+    execFileSync(
+      'sqlite3',
+      ['-cmd', '.timeout 10000', databasePath, `DELETE FROM jobs WHERE job_id IN (${quotedIds});`],
+      { stdio: 'pipe' },
+    );
   }
 
   for (const jobId of safeJobIds) {
@@ -686,22 +690,40 @@ test.beforeAll(async ({ request }) => {
 
 test('main workbench routes render in Chinese without runtime errors or horizontal overflow', async ({ page }) => {
   const consoleWatch = watchConsole(page);
-  const routes = [
-    { path: '/', text: '个股栏' },
-    { path: '/research', text: '研究工作台' },
-    { path: '/workflow', text: '量化任务中心' },
-    { path: '/backtest', text: 'Qlib选股模型与交易策略回测' },
-    { path: '/chat', text: '问股' },
-    { path: '/portfolio', text: '持仓管理' },
-    { path: '/alerts', text: '告警中心' },
-    { path: '/settings', text: '系统设置' },
-    { path: '/screening', text: 'AlphaSift 选股' },
+  const mainRoutes = [
+    { link: '研究', path: '/research', heading: '研究工作台' },
+    { link: '工作流', path: '/workflow', heading: '选股模型训练' },
+    { link: '回测', path: '/backtest', heading: '交易策略回测工作台' },
+    { link: '问股', path: '/chat', heading: '问股' },
+    { link: '持仓', path: '/portfolio', heading: '持仓管理' },
+    { link: '告警', path: '/alerts', heading: '告警中心' },
+    { link: '设置', path: '/settings', heading: '系统设置' },
+    { link: '选股', path: '/screening', heading: 'AlphaSift 选股' },
   ];
 
   try {
-    for (const route of routes) {
-      await openWorkbench(page, route.path);
-      await expect(page.locator('body')).toContainText(route.text, { timeout: 15_000 });
+    await openWorkbench(page, '/');
+    await expect(page.locator('body')).toContainText('个股栏', { timeout: 15_000 });
+    await expectNoHorizontalOverflow(page);
+
+    const mainNav = page.getByRole('navigation', { name: '主导航' });
+    for (const route of mainRoutes) {
+      await mainNav.getByRole('link', { name: route.link, exact: true }).click();
+      await expect.poll(() => new URL(page.url()).pathname).toBe(route.path);
+      await expect(page.locator('h1').filter({ hasText: route.heading }).first()).toBeVisible({ timeout: 15_000 });
+      await expectNoHorizontalOverflow(page);
+    }
+
+    await mainNav.getByRole('link', { name: '工作流', exact: true }).click();
+    const taskNav = page.getByRole('navigation', { name: '量化任务分类' });
+    for (const route of [
+      { link: '数据更新与检查', path: '/data', heading: '数据更新与检查' },
+      { link: '选股模型训练', path: '/workflow', heading: '选股模型训练' },
+      { link: '其他量化任务', path: '/other', heading: '其他量化任务' },
+    ]) {
+      await taskNav.getByRole('link', { name: route.link, exact: true }).click();
+      await expect.poll(() => new URL(page.url()).pathname).toBe(route.path);
+      await expect(page.locator('h1').filter({ hasText: route.heading }).first()).toBeVisible({ timeout: 15_000 });
       await expectNoHorizontalOverflow(page);
     }
     expect(consoleWatch.errors).toEqual([]);
@@ -715,6 +737,12 @@ test('research page shows capability acceptance matrix and deferred external-too
   try {
     await openWorkbench(page, '/research');
     await expect(page.getByRole('heading', { name: '研究工作台' })).toBeVisible({ timeout: 15_000 });
+    const researchStatusResponse = await page.request.get('/api/v1/research/status');
+    expect(researchStatusResponse.ok()).toBeTruthy();
+    const researchStatus = await researchStatusResponse.json() as {
+      data_hygiene?: { quality_report?: { status?: string } };
+    };
+    expect(researchStatus.data_hygiene?.quality_report?.status).toBe('available');
     await expect(page.getByRole('heading', { name: '能力验收矩阵' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '功能入口盘点' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '后续开发队列' })).toBeVisible();
@@ -726,10 +754,10 @@ test('research page shows capability acceptance matrix and deferred external-too
     await expect(page.getByText('china-astock-quant').last()).toBeVisible();
     await expect(page.getByText('同花顺桌面端').last()).toBeVisible();
     await expect(page.getByText('交易执行').last()).toBeVisible();
-    await expect(page.getByText(/已检测到本机同花顺|未在默认路径检测到同花顺/).last()).toBeVisible();
-    await expect(page.getByText(/不读取账号密码/).last()).toBeVisible();
-    await expect(page.getByText(/不读取券商密码/).last()).toBeVisible();
-    await expect(page.getByText(/不自动下单/).last()).toBeVisible();
+    await expect(page.getByText(/接入前先做只读方案评审|已检测到本机同花顺|未在默认路径检测到同花顺/).last()).toBeVisible();
+    await expect(page.getByText(/不读取密码、不自动下单/).last()).toBeVisible();
+    await expect(page.getByText(/不做登录凭据读取和交易执行/).last()).toBeVisible();
+    await expect(page.getByText(/只读观察，暂不接入交易/).last()).toBeVisible();
     await expect(page.getByText('测试脚本').last()).toBeVisible();
     await expect(page.getByText('浏览器执行').last()).toBeVisible();
     await expect(page.getByText('opencode复审').last()).toBeVisible();
@@ -740,11 +768,11 @@ test('research page shows capability acceptance matrix and deferred external-too
   }
 });
 
-test('workflow page can launch the safe Qlib data check and show its log', async ({ page }) => {
+test('data page can launch the safe Qlib data check and show its log', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
@@ -768,34 +796,31 @@ test('workflow page can launch the safe Qlib data check and show its log', async
   }
 });
 
-test('workflow page can launch the daily guide cleaning preflight and preview the plan', async ({ page }) => {
+test('data page can launch the cleaning preflight and preview the plan', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
-    await expect(page.getByText('按顺序完成检查、报告、预演、训练和记录。')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('button', { name: '今日流程 清洗预演 预演' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: '应用清洗策略' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('根据异常清单生成 cleaned Qlib provider，不覆盖原始 canonical provider。')).toBeVisible();
-    await expect(page.getByLabel('应用清洗策略 只预演不写入')).toBeVisible();
-    await expect(page.getByLabel('应用清洗策略 不覆盖已有文件')).toBeVisible();
-    await expect(page.getByLabel('应用清洗策略 仅生成 cleaned Parquet')).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '构建原生 cleaned Qlib V2 快照' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('正式运行从当前 canonical V2 构建并发布不可变 cleaned V2；勾选预演时只检查清洗计划，不发布数据。')).toBeVisible();
+    await page.getByLabel('构建原生 cleaned Qlib V2 快照 只预演不写入').check();
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '今日流程 清洗预演 预演' }).click();
+    await page.getByRole('button', { name: '运行 构建原生 cleaned Qlib V2 快照' }).click();
     const submitResponse = await responsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
       job_type: 'apply_data_cleaning',
-      params: { dry_run: true, no_overwrite: true },
+      params: { dry_run: true },
     });
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
 
-    await waitForJobToFinish(page, job.job_id);
+    await waitForJobToFinish(page, job.job_id, 120_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
     const previewButton = page.getByRole('button', { name: /预览 data_cleaning_applied_latest\.md/ });
@@ -809,22 +834,18 @@ test('workflow page can launch the daily guide cleaning preflight and preview th
     const status = await statusResponse.json() as {
       available_job_types?: Record<string, { allowed_params?: string[] }>;
     };
-    expect(status.available_job_types?.apply_data_cleaning?.allowed_params).toEqual([
-      'dry_run',
-      'no_overwrite',
-      'skip_qlib_convert',
-    ]);
+    expect(status.available_job_types?.apply_data_cleaning?.allowed_params).toEqual(['dry_run']);
     expect(consoleWatch.errors).toEqual([]);
   } finally {
     consoleWatch.stop();
   }
 });
 
-test('workflow page can launch the Baostock refresh plan from the browser', async ({ page }) => {
+test('data page can launch the Baostock refresh plan from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '准备 Baostock 增量清单' })).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel('准备 Baostock 增量清单 股票数量上限').fill('3');
@@ -858,11 +879,11 @@ test('workflow page can launch the Baostock refresh plan from the browser', asyn
   }
 });
 
-test('workflow page can launch a JQData connection dry run from the browser without writing parquet', async ({ page }) => {
+test('data page can launch a JQData connection dry run from the browser without writing parquet', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '验证 JQData 连接' })).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel('验证 JQData 连接 股票池').fill('csi300');
@@ -896,19 +917,19 @@ test('workflow page can launch a JQData connection dry run from the browser with
   }
 });
 
-test('workflow page can launch a Qlib provider repair dry run from the browser', async ({ page }) => {
+test('data page can launch a Qlib provider repair dry run from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: '预演修复 Qlib Provider' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByLabel('修复 Qlib Provider 只检查不写入')).toHaveCount(0);
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '预演旧兼容 Qlib 修复' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('只检查保留的旧兼容目录；网页端固定 dry-run，不影响原生 V2。')).toBeVisible();
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 预演修复 Qlib Provider' }).click();
+    await page.getByRole('button', { name: '运行 预演旧兼容 Qlib 修复' }).click();
     const submitResponse = await responsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
@@ -931,17 +952,17 @@ test('workflow page can launch a Qlib provider repair dry run from the browser',
   }
 });
 
-test('workflow page can launch provider maintenance dry-runs from the browser', async ({ page }) => {
+test('data page can launch provider maintenance dry-runs from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
 
     const csiResponsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 预演生成 CSI300 股票池' }).click();
+    await page.getByRole('button', { name: '运行 预演旧兼容 CSI300 股票池' }).click();
     const csiResponse = await csiResponsePromise;
     expect(csiResponse.ok()).toBeTruthy();
     expect(csiResponse.request().postDataJSON()).toMatchObject({
@@ -963,7 +984,7 @@ test('workflow page can launch provider maintenance dry-runs from the browser', 
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 预演添加沪深300 benchmark' }).click();
+    await page.getByRole('button', { name: '运行 预演旧兼容 benchmark' }).click();
     const benchmarkResponse = await benchmarkResponsePromise;
     expect(benchmarkResponse.ok()).toBeTruthy();
     expect(benchmarkResponse.request().postDataJSON()).toMatchObject({
@@ -986,26 +1007,25 @@ test('workflow page can launch provider maintenance dry-runs from the browser', 
   }
 });
 
-test('workflow page can launch an isolated Qlib merge smoke fixture from the browser', async ({ page }) => {
+test('data page can launch an isolated Qlib merge smoke fixture from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: '合并并转换为 Qlib' })).toBeVisible({ timeout: 15_000 });
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '构建并发布原生 Qlib V2' })).toBeVisible({ timeout: 15_000 });
 
-    await page.getByLabel('合并并转换为 Qlib 使用隔离小样本演练').check();
-    await page.getByLabel('合并并转换为 Qlib 跳过已有输出文件').check();
+    await page.getByLabel('构建并发布原生 Qlib V2 使用隔离小样本演练').check();
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 合并并转换为 Qlib' }).click();
+    await page.getByRole('button', { name: '运行 构建并发布原生 Qlib V2' }).click();
     const submitResponse = await responsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
       job_type: 'merge_to_qlib',
-      params: { smoke: true, no_overwrite: true },
+      params: { smoke: true },
     });
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
@@ -1015,7 +1035,7 @@ test('workflow page can launch an isolated Qlib merge smoke fixture from the bro
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
     await page.getByText(job.job_id).click();
     await expect(page.locator('pre')).toContainText('Merge fixture root', { timeout: 15_000 });
-    await expect(page.locator('pre')).toContainText('Qlib bin: 1 stocks, 3 days', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('Qlib bin: 1 stocks, 2 days', { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
   } finally {
@@ -1023,12 +1043,12 @@ test('workflow page can launch an isolated Qlib merge smoke fixture from the bro
   }
 });
 
-test('workflow page can launch a sampled data quality report from the browser', async ({ page }) => {
+test('data page can launch a sampled data quality report from the browser', async ({ page }) => {
   test.slow();
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成数据质量报告' })).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel('生成数据质量报告 重叠样本数').fill('5');
@@ -1048,7 +1068,7 @@ test('workflow page can launch a sampled data quality report from the browser', 
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
 
-    await waitForJobToFinish(page, job.job_id);
+    await waitForJobToFinish(page, job.job_id, 120_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
     const previewButton = page.getByRole('button', { name: /预览 data_quality_report_latest\.md/ });
@@ -1063,11 +1083,12 @@ test('workflow page can launch a sampled data quality report from the browser', 
   }
 });
 
-test('workflow page can launch the anomaly stock report from the browser', async ({ page }) => {
+test('data page can launch the anomaly stock report from the browser', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成异常股票和清洗策略' })).toBeVisible({ timeout: 15_000 });
 
     const responsePromise = page.waitForResponse(
@@ -1084,7 +1105,7 @@ test('workflow page can launch the anomaly stock report from the browser', async
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
 
-    await waitForJobToFinish(page, job.job_id);
+    await waitForJobToFinish(page, job.job_id, 120_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
     const previewButton = page.getByRole('button', { name: /预览 data_cleaning_strategy_latest\.md/ });
@@ -1099,11 +1120,12 @@ test('workflow page can launch the anomaly stock report from the browser', async
   }
 });
 
-test('workflow page can launch data governance and capability inventory reports from the browser', async ({ page }) => {
+test('data and other pages can launch governance and capability inventory reports', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
 
     const hygieneResponsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
@@ -1119,7 +1141,7 @@ test('workflow page can launch data governance and capability inventory reports 
     const hygieneJob = await hygieneResponse.json() as { job_id: string };
     createdQuantJobIds.add(hygieneJob.job_id);
 
-    await waitForJobToFinish(page, hygieneJob.job_id);
+    await waitForJobToFinish(page, hygieneJob.job_id, 180_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(hygieneJob.job_id)).toBeVisible({ timeout: 15_000 });
     const hygienePreview = page.getByRole('button', { name: /预览 data_hygiene_inventory_latest\.md/ });
@@ -1127,7 +1149,8 @@ test('workflow page can launch data governance and capability inventory reports 
     await hygienePreview.click();
     await expect(page.locator('pre')).toContainText('A 股量化数据治理 Inventory', { timeout: 15_000 });
 
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     const capabilityResponsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
@@ -1156,11 +1179,11 @@ test('workflow page can launch data governance and capability inventory reports 
   }
 });
 
-test('workflow page can launch a sampled market regime report and preview the cash signal', async ({ page }) => {
+test('other quant tasks page can launch a sampled market regime report and preview the cash signal', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成市场状态和现金仓位信号' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/只读研究报告，不连接券商/)).toBeVisible();
 
@@ -1198,11 +1221,11 @@ test('workflow page can launch a sampled market regime report and preview the ca
   }
 });
 
-test('workflow page can launch a sampled cash-control backtest and preview the report', async ({ page }) => {
+test('other quant tasks page can launch a sampled cash-control backtest and preview the report', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成现金仓位叠加回测' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/baseline vs cash-control/)).toBeVisible();
 
@@ -1240,11 +1263,11 @@ test('workflow page can launch a sampled cash-control backtest and preview the r
   }
 });
 
-test('workflow page can launch a strategy optimization dry-run and preview the report', async ({ page }) => {
+test('other quant tasks page can launch a strategy optimization dry-run and preview the report', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '交易策略优化预演' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/不训练、不连接券商、不自动下单/)).toBeVisible();
 
@@ -1281,11 +1304,11 @@ test('workflow page can launch a strategy optimization dry-run and preview the r
   }
 });
 
-test('workflow page can launch the Qlib prediction summary and preview the report', async ({ page }) => {
+test('other quant tasks page can launch the Qlib prediction summary and preview the report', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成 Qlib 预测摘要' })).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel('生成 Qlib 预测摘要 TopK').fill('3');
@@ -1319,11 +1342,11 @@ test('workflow page can launch the Qlib prediction summary and preview the repor
   }
 });
 
-test('workflow page exposes the china-astock report-only comparison task without launching it', async ({ page }) => {
+test('other quant tasks page exposes the china-astock report-only comparison task without launching it', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成 china-astock 策略对比' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeVisible();
     await expect(page.getByRole('button', { name: '运行 生成 china-astock 策略对比' })).toBeVisible();
@@ -1340,11 +1363,12 @@ test('workflow page exposes the china-astock report-only comparison task without
   }
 });
 
-test('workflow page can launch the china-astock technical indicator report from the browser', async ({ page }) => {
+test('other quant tasks page can launch the china-astock technical indicator report from the browser', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/other');
+    await expect(page.getByRole('heading', { name: '其他量化任务' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '生成 china-astock 技术指标报告' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/复用 china-astock-quant 的 SMA\/EMA\/RSI\/ATR\/Bollinger/)).toBeVisible();
 
@@ -1366,7 +1390,7 @@ test('workflow page can launch the china-astock technical indicator report from 
     const job = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(job.job_id);
 
-    await waitForJobToFinish(page, job.job_id);
+    await waitForJobToFinish(page, job.job_id, 120_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
     const previewButton = page.getByRole('button', { name: /预览 china_astock_indicator_report_latest\.md/ });
@@ -1387,7 +1411,7 @@ test('workflow page can select the cleaned provider for training without launchi
   const consoleWatch = watchConsole(page);
   try {
     await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '选股模型训练' })).toBeVisible();
 
     const providerSelect = page.getByLabel('训练 Qlib LightGBM 选股模型基线 数据版本');
     await expect(providerSelect).toBeVisible({ timeout: 15_000 });
@@ -1406,11 +1430,11 @@ test('workflow page can select the cleaned provider for training without launchi
   }
 });
 
-test('workflow page rejects invalid job parameters before creating a quant job', async ({ page }) => {
+test('data page rejects invalid job parameters before creating a quant job', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
-    await openWorkbench(page, '/workflow');
-    await expect(page.getByRole('heading', { name: '量化任务中心' })).toBeVisible();
+    await openWorkbench(page, '/data');
+    await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
 
     await page.getByLabel('准备 Baostock 增量清单 股票数量上限').fill('0');
     const responsePromise = page.waitForResponse(
@@ -1432,11 +1456,11 @@ test('workflow page rejects invalid job parameters before creating a quant job',
   }
 });
 
-test('workflow page opens completed quant job artifact links in a browser tab', async ({ page }) => {
+test('other quant tasks page opens completed job artifact links in a browser tab', async ({ page }) => {
   const consoleWatch = watchConsole(page);
 
   try {
-    await openWorkbench(page, '/workflow');
+    await openWorkbench(page, '/other');
     const { jobId, artifactName } = await launchCapabilityArtifactJob(page);
 
     const artifactLink = page.getByRole('link', { name: artifactName });
@@ -1461,11 +1485,11 @@ test('workflow page opens completed quant job artifact links in a browser tab', 
   }
 });
 
-test('workflow page previews a completed quant text artifact inline', async ({ page }) => {
+test('other quant tasks page previews a completed quant text artifact inline', async ({ page }) => {
   const consoleWatch = watchConsole(page);
 
   try {
-    await openWorkbench(page, '/workflow');
+    await openWorkbench(page, '/other');
     const { artifactName } = await launchCapabilityArtifactJob(page);
 
     await page.getByRole('button', { name: `预览 ${artifactName}` }).click();
@@ -1478,36 +1502,35 @@ test('workflow page previews a completed quant text artifact inline', async ({ p
   }
 });
 
-test('workflow page can cancel a running quant job from the browser', async ({ page }) => {
+test('data page can cancel a running quant job from the browser', async ({ page }) => {
   const consoleWatch = watchConsole(page);
 
   try {
-    await openWorkbench(page, '/workflow');
-    await page.getByLabel('应用清洗策略 只预演不写入').check();
-    await page.getByLabel('应用清洗策略 不覆盖已有文件').check();
+    await openWorkbench(page, '/data');
+    await page.getByLabel('构建原生 cleaned Qlib V2 快照 只预演不写入').check();
     const submitResponsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '运行 应用清洗策略' }).click();
+    await page.getByRole('button', { name: '运行 构建原生 cleaned Qlib V2 快照' }).click();
     const submitResponse = await submitResponsePromise;
     expect(submitResponse.ok()).toBeTruthy();
     expect(submitResponse.request().postDataJSON()).toMatchObject({
       job_type: 'apply_data_cleaning',
-      params: { dry_run: true, no_overwrite: true },
+      params: { dry_run: true },
     });
     const runningJob = await submitResponse.json() as { job_id: string };
     createdQuantJobIds.add(runningJob.job_id);
 
     await expect(page.getByText(runningJob.job_id)).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('button', { name: '取消 应用清洗策略' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '取消 构建原生 cleaned Qlib V2 快照' })).toBeVisible({ timeout: 15_000 });
 
     const cancelResponsePromise = page.waitForResponse(
       (response) => response.url().includes(`/api/v1/quant/jobs/${runningJob.job_id}/cancel`)
         && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '取消 应用清洗策略' }).click();
+    await page.getByRole('button', { name: '取消 构建原生 cleaned Qlib V2 快照' }).click();
     const cancelResponse = await cancelResponsePromise;
     expect(cancelResponse.ok()).toBeTruthy();
     const cancelled = await cancelResponse.json() as { status?: string; error?: string };
@@ -1534,12 +1557,12 @@ test('research page can archive and permanently delete temporary experiment reco
   try {
     await openWorkbench(page, '/research');
     await expect.poll(async () => {
-      const response = await page.request.get('/api/v1/research/status');
+      const response = await page.request.get('/api/v1/research/experiments');
       if (!response.ok()) return false;
       const payload = await response.json() as {
-        experiment_notebook?: { runs?: Array<{ run_id?: string }> };
+        runs?: Array<{ run_id?: string }>;
       };
-      const runIds = new Set((payload.experiment_notebook?.runs || []).map((run) => run.run_id));
+      const runIds = new Set((payload.runs || []).map((run) => run.run_id));
       return runIds.has(archiveRunId) && runIds.has(permanentRunId);
     }, { timeout: 15_000 }).toBe(true);
     await page.reload({ waitUntil: 'domcontentloaded' });
@@ -1564,31 +1587,33 @@ test('research page can archive and permanently delete temporary experiment reco
   }
 });
 
-test('backtest page can run a narrow DSA validation and switch to the Qlib backtest tab', async ({ page }) => {
+test('backtest page can run a script strategy and switch among current strategy modes', async ({ page }) => {
+  test.slow();
   const consoleWatch = watchConsole(page);
   try {
     await openWorkbench(page, '/backtest');
-    await expect(page.getByRole('button', { name: 'DSA分析准确性回测' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '交易策略回测工作台' })).toBeVisible();
+    await expect(page.getByRole('tab', { name: '脚本交易策略' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByLabel('Python交易策略脚本')).toHaveValue(/def on_bar\(context, data\):/);
 
-    await page.getByPlaceholder('按股票代码筛选（留空表示全部）').fill('000000');
-    await page.getByPlaceholder('10').fill('1');
-    await page.getByRole('button', { name: '1 日验证' }).click();
     const runResponsePromise = page.waitForResponse(
-      (response) => response.url().includes('/api/v1/backtest/run') && response.request().method() === 'POST',
-      { timeout: 30_000 },
+      (response) => response.url().includes('/api/v1/backtest/strategy/script') && response.request().method() === 'POST',
+      { timeout: 120_000 },
     );
     await page.getByRole('button', { name: '运行回测' }).click();
     const runResponse = await runResponsePromise;
     expect(runResponse.ok()).toBeTruthy();
-    await expect(page.getByText('已处理:')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('已保存:')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '回测结果' })).toBeVisible({ timeout: 120_000 });
+    await expect(page.getByText('Alpha（年化）')).toBeVisible();
 
-    await page.getByRole('button', { name: 'Qlib选股模型与交易策略回测' }).click();
-    await expect(page.getByRole('heading', { name: 'Qlib 选股模型与交易策略回测' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('选股模型结果 ≠ 交易建议')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('heading', { name: '实验复现与产物' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('pred.pkl')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('heading', { name: '现金仓位叠加回测' })).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('tab', { name: '条件交易策略' }).click();
+    await expect(page.getByRole('heading', { name: '创业板ETF-纳指ETF 20日动量轮动交易策略' })).toBeVisible();
+    await expect(page.getByText(/两者都不符合时空仓/)).toBeVisible();
+
+    await page.getByRole('tab', { name: '选股模型与交易策略' }).click();
+    await expect(page.getByRole('heading', { name: '选股模型与交易策略' })).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByLabel('选股模型')).toBeVisible();
+    await expect(page.getByLabel('交易策略')).toBeVisible();
     expect(consoleWatch.errors).toEqual([]);
   } finally {
     consoleWatch.stop();

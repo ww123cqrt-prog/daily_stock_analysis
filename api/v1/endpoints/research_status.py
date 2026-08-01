@@ -6,8 +6,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -17,22 +19,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
-    fcntl = None
-
-try:
-    import msvcrt
-except ImportError:  # pragma: no cover - msvcrt is only available on Windows.
-    msvcrt = None
-
 from fastapi import APIRouter, HTTPException, Query
 
 from quant_workflow.scripts.quant_data_contract import (
+    AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS,
+    AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
     DataContractError,
+    filesystem_state_fingerprint,
     validate_qlib_snapshot,
 )
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
 from src.safe_errors import sanitize_public_error
 from src.safe_urls import public_http_url
 from src.services.quant_workflow_paths import (
@@ -72,6 +68,11 @@ NATIVE_QLIB_DATASET_ROOTS = {
     NATIVE_QLIB_DATASET_ID: NATIVE_QLIB_DATASET_ROOT,
     "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
 }
+NATIVE_QLIB_DATA_CONTRACT_KEYS = {
+    "qlib_ashare_v2": "canonical",
+    "qlib_ashare_cleaned_v2": "cleaned",
+}
+NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE = 0.50
 ROBUST_STRATEGY_DIRNAME = "robust_strategy"
 ROBUST_SIGNAL_DIRNAME = "robust_signal"
 QLIB_RESEARCH_REPORTS = {
@@ -89,6 +90,14 @@ EXPERIMENT_FILE_LOCK = threading.RLock()
 DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
 DIRECTORY_SIZE_CACHE_TTL_SECONDS = 60.0
 NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS = 60.0
+NATIVE_QLIB_VALIDATION_CACHE_MAX_ENTRIES = 8
+DATA_HYGIENE_STATE_SCAN_MAX_ENTRIES = 200_000
+DATA_HYGIENE_STATE_SCAN_MAX_SECONDS = 5.0
+DATA_HYGIENE_POINTER_MAX_BYTES = 64 * 1024
+DATA_HYGIENE_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
+DATA_QUALITY_POINTER_MAX_BYTES = 64 * 1024
+DATA_QUALITY_EVIDENCE_MAX_BYTES = 4 * 1024 * 1024
+DATA_QUALITY_MARKDOWN_MAX_BYTES = 4 * 1024 * 1024
 DIRECTORY_SIZE_SCAN_MAX_ENTRIES = 50000
 DIRECTORY_SIZE_SCAN_MAX_SECONDS = 0.5
 CLEANUP_ACTION_PREVIEW_LIMIT = 50
@@ -121,6 +130,15 @@ class _NativeQlibProviderResolution:
     content_sha256: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _DataQualityPublication:
+    payload: Dict[str, Any]
+    markdown_bytes: bytes
+    report_id: str
+    evidence_sha256: Optional[str]
+    training_authoritative: bool
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -130,11 +148,52 @@ _NATIVE_QLIB_VALIDATION_CACHE_LOCK = threading.Lock()
 _NATIVE_QLIB_VALIDATION_CACHE: Dict[
     Tuple[str, str, str], Tuple[float, Dict[str, Any]]
 ] = {}
+_DATA_HYGIENE_STATE_SCAN_LOCK = threading.Lock()
 
 
 def _clear_native_qlib_validation_cache() -> None:
     with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
         _NATIVE_QLIB_VALIDATION_CACHE.clear()
+
+
+def _filesystem_state_fingerprint_live(path: Path) -> Dict[str, Any]:
+    with _DATA_HYGIENE_STATE_SCAN_LOCK:
+        return filesystem_state_fingerprint(
+            path,
+            max_entries=DATA_HYGIENE_STATE_SCAN_MAX_ENTRIES,
+            max_seconds=DATA_HYGIENE_STATE_SCAN_MAX_SECONDS,
+        )
+
+
+def _valid_filesystem_state_fingerprint(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("algorithm")
+        == "relative-path-size-mtime-ctime-device-inode-v2"
+        and isinstance(value.get("file_count"), int)
+        and not isinstance(value.get("file_count"), bool)
+        and value["file_count"] >= 0
+        and isinstance(value.get("total_bytes"), int)
+        and not isinstance(value.get("total_bytes"), bool)
+        and value["total_bytes"] >= 0
+        and isinstance(value.get("scanned_entries"), int)
+        and not isinstance(value.get("scanned_entries"), bool)
+        and value["scanned_entries"] >= value["file_count"]
+        and isinstance(value.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
+    )
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _validate_native_qlib_snapshot_cached(
@@ -152,43 +211,37 @@ def _validate_native_qlib_snapshot_cached(
     )
     now = time.monotonic()
     with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
+        expired_keys = [
+            cached_key
+            for cached_key, (cached_at, _) in _NATIVE_QLIB_VALIDATION_CACHE.items()
+            if now - cached_at >= NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS
+        ]
+        for expired_key in expired_keys:
+            _NATIVE_QLIB_VALIDATION_CACHE.pop(expired_key, None)
         cached = _NATIVE_QLIB_VALIDATION_CACHE.get(key)
-        if cached is not None and now - cached[0] < NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS:
+        if cached is not None:
             return dict(cached[1])
         validated = validate_qlib_snapshot(
             provider_path,
             verify_hashes=True,
             evidence_root=evidence_root,
         )
-        _NATIVE_QLIB_VALIDATION_CACHE.clear()
+        if len(_NATIVE_QLIB_VALIDATION_CACHE) >= NATIVE_QLIB_VALIDATION_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _NATIVE_QLIB_VALIDATION_CACHE,
+                key=lambda cached_key: _NATIVE_QLIB_VALIDATION_CACHE[cached_key][0],
+            )
+            _NATIVE_QLIB_VALIDATION_CACHE.pop(oldest_key, None)
         _NATIVE_QLIB_VALIDATION_CACHE[key] = (time.monotonic(), dict(validated))
         return dict(validated)
 
 
 def _lock_experiment_handle(lock_handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        return
-    if (
-        msvcrt is not None
-    ):  # pragma: no cover - covered through patched fallback tests on non-Windows.
-        lock_handle.seek(0, os.SEEK_END)
-        if lock_handle.tell() == 0:
-            lock_handle.write("0")
-            lock_handle.flush()
-        lock_handle.seek(0)
-        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_LOCK, 1)
+    lock_file(lock_handle, exclusive=True)
 
 
 def _unlock_experiment_handle(lock_handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        return
-    if (
-        msvcrt is not None
-    ):  # pragma: no cover - covered through patched fallback tests on non-Windows.
-        lock_handle.seek(0)
-        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+    unlock_file(lock_handle)
 
 
 @contextmanager
@@ -200,7 +253,7 @@ def _experiment_file_guard(reports_dir: Path) -> Iterator[None]:
         # Keep this small advisory lock file around deliberately. It only
         # coordinates writers that also take this lock; quant_workflow writers
         # must use the same path before mutating experiment notebook files.
-        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        with lock_path.open("a+b") as lock_handle:
             _lock_experiment_handle(lock_handle)
             try:
                 yield
@@ -224,6 +277,213 @@ def _read_json_object_bytes(path: Path) -> tuple[Optional[Dict[str, Any]], Optio
 def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
     payload, _raw = _read_json_object_bytes(path)
     return payload
+
+
+def _trusted_root_relative_path(root: Path, raw_path: Any) -> Optional[Path]:
+    """Keep descendant components lexical while allowing a trusted root alias."""
+
+    if not isinstance(raw_path, (str, os.PathLike)) or not str(raw_path).strip():
+        return None
+    root_input = Path(os.path.abspath(str(Path(root).expanduser())))
+    root_resolved = _resolve_for_boundary(root_input)
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        candidate = Path(os.path.abspath(str(candidate)))
+        relative = None
+        for boundary in (root_input, root_resolved):
+            try:
+                relative = candidate.relative_to(boundary)
+                break
+            except ValueError:
+                continue
+        if relative is None:
+            return None
+    else:
+        relative = candidate
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    return relative
+
+
+def _read_bounded_regular_file_at(
+    root: Path,
+    relative_path: Path,
+    *,
+    max_bytes: int,
+) -> Optional[bytes]:
+    """Read one regular file without following descendant symlinks."""
+
+    relative = Path(relative_path)
+    if (
+        max_bytes < 0
+        or relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        return None
+
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+    ):
+        return _read_bounded_regular_file_fallback(
+            root,
+            relative,
+            max_bytes=max_bytes,
+        )
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        file_flags |= os.O_NONBLOCK
+
+    descriptors: list[int] = []
+    file_fd: Optional[int] = None
+    try:
+        root_fd = os.open(str(_resolve_for_boundary(root)), directory_flags)
+        descriptors.append(root_fd)
+        current_fd = root_fd
+        for part in relative.parts[:-1]:
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            descriptors.append(current_fd)
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            return None
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(file_fd, min(1024 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+        after = os.fstat(file_fd)
+        before_state = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_state = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_state != after_state or total != after.st_size:
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_bounded_regular_file_fallback(
+    root: Path,
+    relative: Path,
+    *,
+    max_bytes: int,
+) -> Optional[bytes]:
+    """Read a bounded file where directory-fd flags are unavailable.
+
+    Each path component is checked with ``lstat`` and the opened file is
+    compared with the pre-open and post-read metadata. This is less race-proof
+    than the descriptor-walk above, but it rejects symlinks and keeps reads
+    inside the resolved root on Windows and similar platforms.
+    """
+
+    root = Path(root).expanduser().absolute()
+    try:
+        root_before = root.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+        return None
+    current = root
+    component_states: list[tuple[Path, os.stat_result]] = []
+    try:
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                return None
+            if index < len(relative.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                return None
+            component_states.append((current, metadata))
+        resolved_root = root.resolve(strict=True)
+        resolved_file = current.resolve(strict=True)
+        resolved_file.relative_to(resolved_root)
+        with current.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+                return None
+            content = handle.read(max_bytes + 1)
+            after = os.fstat(handle.fileno())
+        if (
+            len(content) > max_bytes
+            or not stat.S_ISREG(after.st_mode)
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or len(content) != after.st_size
+        ):
+            return None
+        for component, expected in component_states:
+            current_state = component.lstat()
+            if (
+                stat.S_ISLNK(current_state.st_mode)
+                or current_state.st_dev != expected.st_dev
+                or current_state.st_ino != expected.st_ino
+                or current_state.st_mtime_ns != expected.st_mtime_ns
+                or current_state.st_ctime_ns != expected.st_ctime_ns
+            ):
+                return None
+        root_after = root.lstat()
+        if (
+            stat.S_ISLNK(root_after.st_mode)
+            or root_after.st_dev != root_before.st_dev
+            or root_after.st_ino != root_before.st_ino
+        ):
+            return None
+        return content
+    except (OSError, ValueError):
+        return None
+
+
+def _read_json_object_bytes_at(
+    root: Path,
+    relative_path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[Optional[Dict[str, Any]], Optional[bytes]]:
+    raw = _read_bounded_regular_file_at(
+        root,
+        relative_path,
+        max_bytes=max_bytes,
+    )
+    if raw is None:
+        return None, None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None, raw
+    return (payload if isinstance(payload, dict) else None), raw
 
 
 def _public_path_label(value: Any) -> str:
@@ -1004,42 +1264,583 @@ def _mlflow_payload() -> Dict[str, Any]:
     return payload
 
 
-def _data_quality_summary_from_json(path: Path) -> Optional[Dict[str, Any]]:
-    payload = _read_json_object(path)
+def _data_quality_publication_from_json(
+    path: Path,
+) -> Optional[_DataQualityPublication]:
+    payload, _pointer_bytes = _read_json_object_bytes_at(
+        path.parent,
+        Path(path.name),
+        max_bytes=DATA_QUALITY_POINTER_MAX_BYTES,
+    )
     if not payload:
         return None
-    raw_summary = (
-        payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
-    )
-    summary: Dict[str, Any] = {}
-    for source_key, target_key in (
-        ("stock_universe", "stock_universe"),
-        ("usable_instruments", "usable_instruments"),
-        ("merged_usable_instruments", "usable_instruments"),
-        ("total_rows", "total_rows"),
-        ("merged_rows", "total_rows"),
-        ("date_range", "date_range"),
-        ("calendar_range", "date_range"),
+    if (
+        payload.get("schema_version") == 3
+        and payload.get("publication_contract")
+        == "atomic_json_pointer_to_immutable_quality_evidence_v2"
     ):
-        value = raw_summary.get(source_key)
-        if value not in (None, ""):
-            summary[target_key] = str(value)
-    return summary or None
+        report_id = payload.get("report_id")
+        evidence_sha256 = payload.get("evidence_sha256")
+        evidence_artifact = payload.get("evidence_artifact")
+        if (
+            not isinstance(report_id, str)
+            or not re.fullmatch(r"data-quality-[0-9a-f]{16}", report_id)
+            or not isinstance(evidence_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256)
+            or report_id != f"data-quality-{evidence_sha256[:16]}"
+            or not isinstance(evidence_artifact, str)
+            or not re.fullmatch(
+                r"data_quality_report_\d{8}_\d{6}_[0-9a-f]{16}\.json",
+                evidence_artifact,
+            )
+            or not evidence_artifact.endswith(f"_{evidence_sha256[:16]}.json")
+        ):
+            return None
+        evidence_bytes = _read_bounded_regular_file_at(
+            path.parent,
+            Path(evidence_artifact),
+            max_bytes=DATA_QUALITY_EVIDENCE_MAX_BYTES,
+        )
+        if (
+            evidence_bytes is None
+            or hashlib.sha256(evidence_bytes).hexdigest() != evidence_sha256
+        ):
+            return None
+        try:
+            evidence = json.loads(evidence_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("schema_version") != 3
+            or evidence.get("evidence_contract")
+            != "immutable_data_quality_evidence_v2"
+        ):
+            return None
+        publication = _validated_quality_markdown(
+            path.parent,
+            evidence,
+            report_id=report_id,
+            evidence_sha256=evidence_sha256,
+            training_authoritative=True,
+        )
+        return publication
+
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("publication_contract")
+        != "atomic_json_pointer_to_immutable_markdown_v1"
+    ):
+        return None
+    report_id = payload.get("report_id")
+    markdown_sha256 = payload.get("markdown_sha256")
+    markdown_artifact = payload.get("markdown_artifact")
+    if (
+        not isinstance(report_id, str)
+        or not re.fullmatch(r"data-quality-[0-9a-f]{16}", report_id)
+        or not isinstance(markdown_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", markdown_sha256)
+        or report_id != f"data-quality-{markdown_sha256[:16]}"
+        or not isinstance(markdown_artifact, str)
+        or not re.fullmatch(
+            r"data_quality_report_\d{8}_\d{6}_[0-9a-f]{16}\.md",
+            markdown_artifact,
+        )
+    ):
+        return None
+    return _validated_quality_markdown(
+        path.parent,
+        payload,
+        report_id=report_id,
+        evidence_sha256=None,
+        training_authoritative=False,
+    )
+
+
+def _validated_quality_markdown(
+    reports_dir: Path,
+    payload: Dict[str, Any],
+    *,
+    report_id: str,
+    evidence_sha256: Optional[str],
+    training_authoritative: bool,
+) -> Optional[_DataQualityPublication]:
+    markdown_sha256 = payload.get("markdown_sha256")
+    markdown_artifact = payload.get("markdown_artifact")
+    if (
+        not isinstance(markdown_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", markdown_sha256)
+        or not isinstance(markdown_artifact, str)
+        or not re.fullmatch(
+            r"data_quality_report_\d{8}_\d{6}_[0-9a-f]{16}\.md",
+            markdown_artifact,
+        )
+        or not markdown_artifact.endswith(f"_{markdown_sha256[:16]}.md")
+    ):
+        return None
+    markdown_bytes = _read_bounded_regular_file_at(
+        reports_dir,
+        Path(markdown_artifact),
+        max_bytes=DATA_QUALITY_MARKDOWN_MAX_BYTES,
+    )
+    if (
+        markdown_bytes is None
+        or hashlib.sha256(markdown_bytes).hexdigest() != markdown_sha256
+    ):
+        return None
+    return _DataQualityPublication(
+        payload=dict(payload),
+        markdown_bytes=markdown_bytes,
+        report_id=report_id,
+        evidence_sha256=evidence_sha256,
+        training_authoritative=training_authoritative,
+    )
+
+
+def _data_quality_summary_from_json(
+    path: Path,
+) -> Optional[Dict[str, Any]]:
+    publication = _data_quality_publication_from_json(path)
+    if publication is None:
+        return None
+    return _data_quality_summary_from_markdown_bytes(publication.markdown_bytes)
+
+
+def _apply_data_quality_training_gate(
+    payload: Dict[str, Any],
+    reports_dir: Path,
+    native_resolution: _NativeQlibProviderResolution,
+) -> None:
+    raw_trainable = payload.get("trainable")
+    if not isinstance(raw_trainable, bool):
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Research status has an invalid trainable flag; rerun the full "
+                "data quality report before training."
+            ),
+        }
+        return
+    provider_specific_gate = (
+        native_resolution.authoritative and native_resolution.path is not None
+    )
+    if raw_trainable is False and not provider_specific_gate:
+        payload["trainable"] = False
+        return
+
+    pointer_path = reports_dir / "data_quality_report_latest.json"
+    status_report_id = payload.get("quality_report_id")
+    publication = _data_quality_publication_from_json(pointer_path)
+    if publication is None:
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Latest data quality publication is missing or invalid; "
+                "rerun the full data quality report before training."
+            ),
+        }
+        return
+
+    quality_payload = publication.payload
+    current_report_id = publication.report_id
+    payload["quality_scan"] = {
+        "mode": quality_payload.get("scan_mode"),
+        "coverage": quality_payload.get("coverage_status"),
+        "verification_status": quality_payload.get("verification_status"),
+        "requested_sample": quality_payload.get("requested_sample", 0),
+        "scanned_instruments": quality_payload.get("scanned_instruments"),
+    }
+    if status_report_id != current_report_id:
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Research status does not match the latest data quality report; "
+                "rerun the full data quality report before training."
+            ),
+        }
+        return
+
+    status_evidence_sha256 = payload.get("quality_evidence_sha256")
+    if (
+        not publication.training_authoritative
+        or not isinstance(status_evidence_sha256, str)
+        or status_evidence_sha256 != publication.evidence_sha256
+    ):
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Latest data quality report is not fully verified and trainable; "
+                "rerun the full data quality report before training."
+            ),
+        }
+        return
+
+    thresholds = quality_payload.get("training_thresholds")
+    thresholds_verified = (
+        isinstance(thresholds, dict)
+        and thresholds.get("authoritative") is True
+        and all(
+            isinstance(thresholds.get(field), int)
+            and not isinstance(thresholds.get(field), bool)
+            and thresholds[field] >= minimum
+            for field, minimum in (
+                (
+                    "min_calendar_days",
+                    AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS,
+                ),
+                ("min_instruments", AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS),
+                (
+                    "min_merged_instruments",
+                    AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
+                ),
+            )
+        )
+    )
+    fully_verified = (
+        quality_payload.get("scan_mode") == "full"
+        and quality_payload.get("coverage_status") == "full"
+        and quality_payload.get("verification_status") == "verified"
+        and thresholds_verified
+        and (
+            provider_specific_gate
+            or quality_payload.get("trainable") is True
+        )
+    )
+    if not fully_verified:
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Latest data quality report is not fully verified and trainable; "
+                "rerun the full data quality report before training."
+            ),
+        }
+        return
+
+    if native_resolution.authoritative and native_resolution.path is not None:
+        data_contract = quality_payload.get("data_contract")
+        provider_key = NATIVE_QLIB_DATA_CONTRACT_KEYS.get(
+            str(native_resolution.dataset_id or "")
+        )
+        provider_identities = (
+            data_contract.get("qlib_providers")
+            if isinstance(data_contract, dict)
+            else None
+        )
+        qlib_identity = (
+            provider_identities.get(provider_key)
+            if isinstance(provider_identities, dict) and provider_key is not None
+            else None
+        )
+        if qlib_identity is None and provider_key == "canonical":
+            qlib_identity = (
+                data_contract.get("qlib_provider")
+                if isinstance(data_contract, dict)
+                else None
+            )
+        expected_identity = {
+            "dataset_id": native_resolution.dataset_id,
+            "snapshot_id": native_resolution.snapshot_id,
+            "manifest_sha256": native_resolution.manifest_sha256,
+            "content_sha256": native_resolution.content_sha256,
+        }
+        identity_matches = (
+            isinstance(data_contract, dict)
+            and data_contract.get("status") == "verified"
+            and isinstance(qlib_identity, dict)
+            and all(
+                isinstance(expected, str)
+                and expected
+                and qlib_identity.get(field) == expected
+                for field, expected in expected_identity.items()
+            )
+        )
+        if not identity_matches:
+            payload["trainable"] = False
+            payload["training_readiness"] = {
+                "status": "blocked",
+                "summary": (
+                    "Latest data quality evidence does not match the current "
+                    "native V2 snapshot; rerun the full data quality report before training."
+                ),
+            }
+            return
+
+        provider_quality = quality_payload.get("provider_quality")
+        quality_record = (
+            provider_quality.get(provider_key)
+            if isinstance(provider_quality, dict) and provider_key is not None
+            else None
+        )
+        payload["provider_quality"] = (
+            provider_quality if isinstance(provider_quality, dict) else {}
+        )
+        record_identity_matches = isinstance(quality_record, dict) and all(
+            quality_record.get(field) == expected
+            for field, expected in expected_identity.items()
+        )
+        record_metrics_valid = (
+            isinstance(quality_record, dict)
+            and isinstance(quality_record.get("calendar_valid"), bool)
+            and _is_nonnegative_int(
+                quality_record.get("invalid_calendar_entries")
+            )
+            and isinstance(quality_record.get("instrument_records_valid"), bool)
+            and _is_nonnegative_int(
+                quality_record.get("invalid_instrument_records")
+            )
+            and isinstance(quality_record.get("calendar_days"), int)
+            and not isinstance(quality_record.get("calendar_days"), bool)
+            and isinstance(quality_record.get("instruments"), int)
+            and not isinstance(quality_record.get("instruments"), bool)
+            and isinstance(quality_record.get("instrument_feature_dirs"), int)
+            and not isinstance(
+                quality_record.get("instrument_feature_dirs"), bool
+            )
+            and isinstance(
+                quality_record.get("missing_instrument_feature_dirs"), int
+            )
+            and not isinstance(
+                quality_record.get("missing_instrument_feature_dirs"), bool
+            )
+            and isinstance(
+                quality_record.get("complete_instrument_feature_dirs"), int
+            )
+            and not isinstance(
+                quality_record.get("complete_instrument_feature_dirs"), bool
+            )
+            and quality_record.get("complete_instrument_feature_dirs") >= 0
+            and isinstance(
+                quality_record.get("incomplete_instrument_feature_dirs"), int
+            )
+            and not isinstance(
+                quality_record.get("incomplete_instrument_feature_dirs"), bool
+            )
+            and quality_record.get("incomplete_instrument_feature_dirs") >= 0
+            and isinstance(
+                quality_record.get("missing_instrument_feature_files"), int
+            )
+            and not isinstance(
+                quality_record.get("missing_instrument_feature_files"), bool
+            )
+            and quality_record.get("missing_instrument_feature_files") >= 0
+            and isinstance(
+                quality_record.get("invalid_instrument_feature_files"), int
+            )
+            and not isinstance(
+                quality_record.get("invalid_instrument_feature_files"), bool
+            )
+            and quality_record.get("invalid_instrument_feature_files") >= 0
+            and _is_finite_number(
+                quality_record.get("required_feature_min_coverage")
+            )
+            and float(quality_record.get("required_feature_min_coverage"))
+            == NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
+            and _is_finite_number(
+                quality_record.get("minimum_valid_instrument_feature_coverage")
+            )
+            and 0.0
+            <= float(
+                quality_record.get("minimum_valid_instrument_feature_coverage")
+            )
+            <= 1.0
+            and _is_nonnegative_int(
+                quality_record.get("misaligned_instrument_feature_dirs")
+            )
+            and quality_record.get("complete_instrument_feature_dirs")
+            + quality_record.get("incomplete_instrument_feature_dirs")
+            == quality_record.get("instruments")
+            and isinstance(quality_record.get("benchmark_complete"), bool)
+            and isinstance(quality_record.get("failure_reasons"), list)
+            and all(
+                isinstance(reason, str)
+                for reason in quality_record.get("failure_reasons", [])
+            )
+            and isinstance(quality_record.get("trainable"), bool)
+            and (
+                quality_record.get("trainable") is not True
+                or (
+                    quality_record.get("complete_instrument_feature_dirs")
+                    >= thresholds["min_instruments"]
+                    and quality_record.get("incomplete_instrument_feature_dirs")
+                    == 0
+                    and quality_record.get("missing_instrument_feature_files")
+                    == 0
+                    and quality_record.get("invalid_instrument_feature_files")
+                    == 0
+                    and quality_record.get("calendar_valid") is True
+                    and quality_record.get("invalid_calendar_entries") == 0
+                    and quality_record.get("instrument_records_valid") is True
+                    and quality_record.get("invalid_instrument_records") == 0
+                    and float(
+                        quality_record.get(
+                            "minimum_valid_instrument_feature_coverage"
+                        )
+                    )
+                    >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
+                    and quality_record.get("misaligned_instrument_feature_dirs")
+                    == 0
+                )
+            )
+        )
+        if not record_identity_matches or not record_metrics_valid:
+            payload["trainable"] = False
+            payload["training_readiness"] = {
+                "status": "blocked",
+                "summary": (
+                    "Latest data quality evidence does not contain valid "
+                    "provider-specific quality for the requested native V2 snapshot; "
+                    "rerun the full data quality report before training."
+                ),
+            }
+            return
+
+        if quality_record.get("trainable") is not True:
+            readiness = quality_record.get("training_readiness")
+            payload["trainable"] = False
+            if (
+                isinstance(readiness, dict)
+                and isinstance(readiness.get("status"), str)
+                and readiness.get("status") != "trainable"
+                and isinstance(readiness.get("summary"), str)
+            ):
+                payload["training_readiness"] = dict(readiness)
+            else:
+                payload["training_readiness"] = {
+                    "status": "blocked",
+                    "summary": (
+                        "The requested native V2 provider did not pass its own "
+                        "quality checks; rerun the full data quality report after repair."
+                    ),
+                }
+            return
+
+        snapshot_state = data_contract.get("snapshot_state")
+        snapshot_stages = (
+            "before",
+            "after_scan",
+            "after_revalidation",
+            "after",
+        )
+        provider_states = []
+        for stage in snapshot_stages:
+            stage_states = (
+                snapshot_state.get(stage)
+                if isinstance(snapshot_state, dict)
+                else None
+            )
+            provider_states.append(
+                stage_states.get(native_resolution.dataset_id)
+                if isinstance(stage_states, dict)
+                else None
+            )
+        expected_before = provider_states[0]
+        expected_after = provider_states[-1]
+        stable_state_is_valid = (
+            isinstance(snapshot_state, dict)
+            and snapshot_state.get("stable") is True
+            and snapshot_state.get("content_revalidated") is True
+            and all(
+                _valid_filesystem_state_fingerprint(state)
+                for state in provider_states
+            )
+            and all(state == expected_before for state in provider_states[1:])
+        )
+        if not stable_state_is_valid:
+            payload["trainable"] = False
+            payload["training_readiness"] = {
+                "status": "blocked",
+                "summary": (
+                    "Latest data quality evidence does not contain a stable provider "
+                    "snapshot state; rerun the full data quality report before training."
+                ),
+            }
+            return
+        try:
+            current_state = _filesystem_state_fingerprint_live(
+                native_resolution.path
+            )
+        except (DataContractError, OSError):
+            current_state = None
+        if current_state != expected_after:
+            payload["trainable"] = False
+            payload["training_readiness"] = {
+                "status": "blocked",
+                "summary": (
+                    "The native V2 provider changed after the latest data quality "
+                    "report; rerun the full report before training."
+                ),
+            }
+            return
+
+        provider_thresholds_pass = (
+            quality_record["calendar_days"] >= thresholds["min_calendar_days"]
+            and quality_record["instruments"] >= thresholds["min_instruments"]
+            and quality_record["instrument_feature_dirs"]
+            >= thresholds["min_instruments"]
+            and quality_record["missing_instrument_feature_dirs"] == 0
+            and quality_record["benchmark_complete"] is True
+            and quality_record["invalid_instrument_feature_files"] == 0
+            and quality_record["calendar_valid"] is True
+            and quality_record["invalid_calendar_entries"] == 0
+            and quality_record["instrument_records_valid"] is True
+            and quality_record["invalid_instrument_records"] == 0
+            and quality_record["minimum_valid_instrument_feature_coverage"]
+            >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
+            and quality_record["misaligned_instrument_feature_dirs"] == 0
+            and not quality_record["failure_reasons"]
+        )
+        readiness = quality_record.get("training_readiness")
+        if (
+            not provider_thresholds_pass
+            or not isinstance(readiness, dict)
+            or readiness.get("status") != "trainable"
+        ):
+            payload["trainable"] = False
+            payload["training_readiness"] = {
+                "status": "blocked",
+                "summary": (
+                    "The requested native V2 provider has inconsistent quality "
+                    "evidence; rerun the full data quality report before training."
+                ),
+            }
+            return
+
+        payload["trainable"] = True
+        payload["training_readiness"] = dict(readiness)
 
 
 def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
-    if not path.exists():
+    markdown_bytes = _read_bounded_regular_file_at(
+        path.parent,
+        Path(path.name),
+        max_bytes=DATA_QUALITY_MARKDOWN_MAX_BYTES,
+    )
+    if markdown_bytes is None:
         return None
+    return _data_quality_summary_from_markdown_bytes(markdown_bytes)
+
+
+def _data_quality_summary_from_markdown_bytes(
+    markdown_bytes: bytes,
+) -> Optional[Dict[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        lines = markdown_bytes.decode("utf-8").splitlines()
+    except UnicodeError:
         return None
 
     summary: Dict[str, Any] = {}
     prefixes = {
         "Stock universe": "stock_universe",
+        "Canonical qfq usable instruments": "usable_instruments",
         "Merged usable instruments": "usable_instruments",
+        "Canonical qfq rows": "total_rows",
         "Merged rows": "total_rows",
+        "Canonical qfq date range": "date_range",
         "Calendar range": "date_range",
     }
     for line in lines[:30]:
@@ -1056,9 +1857,7 @@ def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
 
 def _data_quality_summary_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
     return _data_quality_summary_from_json(
-        reports_dir / "data_quality_report_latest.json"
-    ) or _data_quality_summary_from_markdown(
-        reports_dir / "data_quality_report_latest.md"
+        reports_dir / "data_quality_report_latest.json",
     )
 
 
@@ -1767,7 +2566,7 @@ def _sync_qlib_provider_with_latest_training(
     payload["qlib_provider"] = provider
 
 
-def _experiment_notebook_payload(reports_dir: Path) -> Dict[str, Any]:
+def _experiment_notebook_payload_unlocked(reports_dir: Path) -> Dict[str, Any]:
     log_path = reports_dir / EXPERIMENT_LOG_FILENAME
     runs_path = reports_dir / EXPERIMENT_RUNS_FILENAME
     latest_note = ""
@@ -1810,6 +2609,11 @@ def _experiment_notebook_payload(reports_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _experiment_notebook_payload(reports_dir: Path) -> Dict[str, Any]:
+    with _experiment_file_guard(reports_dir):
+        return _experiment_notebook_payload_unlocked(reports_dir)
+
+
 def _tonghuashun_candidate_paths() -> list[Path]:
     paths: list[Path] = []
     configured = os.environ.get("TONGHUASHUN_APP_PATH")
@@ -1847,20 +2651,142 @@ def _tonghuashun_status_payload() -> Dict[str, Any]:
     }
 
 
+def _read_data_hygiene_bundle(
+    reports_dir: Path,
+) -> Tuple[
+    Optional[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    Path,
+    Path,
+    str,
+]:
+    pointer_path = reports_dir / "data_hygiene_reports_latest.json"
+    legacy_inventory_path = reports_dir / "data_hygiene_inventory_latest.json"
+    legacy_cleanup_path = reports_dir / "data_hygiene_cleanup_plan_latest.json"
+    if not pointer_path.exists():
+        inventory, _inventory_bytes = _read_json_object_bytes_at(
+            reports_dir,
+            Path(legacy_inventory_path.name),
+            max_bytes=DATA_HYGIENE_ARTIFACT_MAX_BYTES,
+        )
+        cleanup_plan, _cleanup_bytes = _read_json_object_bytes_at(
+            reports_dir,
+            Path(legacy_cleanup_path.name),
+            max_bytes=DATA_HYGIENE_ARTIFACT_MAX_BYTES,
+        )
+        catalog = inventory.get("catalog") if isinstance(inventory, dict) else None
+        if (
+            isinstance(catalog, dict)
+            and catalog.get("validation_contract_version") == 2
+        ):
+            return None, None, pointer_path, pointer_path, "stale"
+        return (
+            inventory,
+            cleanup_plan,
+            legacy_inventory_path,
+            legacy_cleanup_path,
+            "legacy" if inventory or cleanup_plan else "missing",
+        )
+
+    pointer, _pointer_bytes = _read_json_object_bytes_at(
+        reports_dir,
+        Path(pointer_path.name),
+        max_bytes=DATA_HYGIENE_POINTER_MAX_BYTES,
+    )
+    if not pointer or (
+        pointer.get("schema_version") != 1
+        or pointer.get("publication_contract")
+        != "atomic_json_pointer_to_immutable_hygiene_bundle_v1"
+    ):
+        return None, None, pointer_path, pointer_path, "invalid"
+
+    bundle_id = pointer.get("bundle_id")
+    inventory_name = pointer.get("inventory_artifact")
+    cleanup_name = pointer.get("cleanup_plan_artifact")
+    inventory_sha256 = pointer.get("inventory_sha256")
+    cleanup_sha256 = pointer.get("cleanup_plan_sha256")
+    inventory_match = (
+        re.fullmatch(
+            r"data_hygiene_inventory_(\d{8}_\d{6}_[0-9a-f]{16})\.json",
+            inventory_name,
+        )
+        if isinstance(inventory_name, str)
+        else None
+    )
+    cleanup_match = (
+        re.fullmatch(
+            r"data_hygiene_cleanup_plan_(\d{8}_\d{6}_[0-9a-f]{16})\.json",
+            cleanup_name,
+        )
+        if isinstance(cleanup_name, str)
+        else None
+    )
+    if (
+        not isinstance(bundle_id, str)
+        or not re.fullmatch(r"data-hygiene-[0-9a-f]{16}", bundle_id)
+        or inventory_match is None
+        or cleanup_match is None
+        or inventory_match.group(1) != cleanup_match.group(1)
+        or not isinstance(inventory_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", inventory_sha256)
+        or not isinstance(cleanup_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", cleanup_sha256)
+    ):
+        return None, None, pointer_path, pointer_path, "invalid"
+
+    inventory_path = reports_dir / str(inventory_name)
+    cleanup_path = reports_dir / str(cleanup_name)
+    inventory, inventory_bytes = _read_json_object_bytes_at(
+        reports_dir,
+        Path(str(inventory_name)),
+        max_bytes=DATA_HYGIENE_ARTIFACT_MAX_BYTES,
+    )
+    cleanup_plan, cleanup_bytes = _read_json_object_bytes_at(
+        reports_dir,
+        Path(str(cleanup_name)),
+        max_bytes=DATA_HYGIENE_ARTIFACT_MAX_BYTES,
+    )
+    if (
+        inventory is None
+        or inventory_bytes is None
+        or cleanup_plan is None
+        or cleanup_bytes is None
+        or hashlib.sha256(inventory_bytes).hexdigest() != inventory_sha256
+        or hashlib.sha256(cleanup_bytes).hexdigest() != cleanup_sha256
+    ):
+        return None, None, pointer_path, pointer_path, "invalid"
+    bundle_digest = hashlib.sha256(
+        inventory_bytes + b"\0" + cleanup_bytes
+    ).hexdigest()
+    if bundle_id != f"data-hygiene-{bundle_digest[:16]}":
+        return None, None, pointer_path, pointer_path, "invalid"
+    return inventory, cleanup_plan, inventory_path, cleanup_path, "available"
+
+
 def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
-    inventory_path = reports_dir / "data_hygiene_inventory_latest.json"
-    cleanup_plan_path = reports_dir / "data_hygiene_cleanup_plan_latest.json"
-    quality_report_path = reports_dir / "data_quality_report_latest.md"
+    (
+        inventory,
+        cleanup_plan,
+        inventory_path,
+        cleanup_plan_path,
+        hygiene_publication_status,
+    ) = _read_data_hygiene_bundle(reports_dir)
+    quality_report_path = reports_dir / "data_quality_report_latest.json"
     cleaning_strategy_path = reports_dir / "data_cleaning_strategy_latest.md"
     manifest_path = QUANT_DATA_ROOT / "DATA_MANIFEST.json"
     readme_path = QUANT_DATA_ROOT / "README.md"
     maintenance_lock_path = QUANT_DATA_ROOT / ".maintenance.lock"
 
-    inventory = _read_json_object(inventory_path)
-    cleanup_plan = _read_json_object(cleanup_plan_path)
-    manifest = _read_json_object(manifest_path)
-    official_entries = manifest.get("official_entries") if manifest else None
-
+    manifest, manifest_bytes = _read_json_object_bytes_at(
+        QUANT_DATA_ROOT,
+        Path(DATA_MANIFEST_FILENAME),
+        max_bytes=DATA_HYGIENE_ARTIFACT_MAX_BYTES,
+    )
+    manifest_sha256 = (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        if manifest is not None and manifest_bytes is not None
+        else None
+    )
     maintenance_locked = maintenance_lock_path.exists()
 
     # Extract cleanup plan actions
@@ -1887,22 +2813,81 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
             )
 
     quality_summary = _data_quality_summary_payload(reports_dir)
+    quality_report_status = (
+        "available"
+        if quality_summary is not None
+        else "invalid"
+        if quality_report_path.exists()
+        else "missing"
+    )
     inventory_counts = _data_hygiene_inventory_counts(inventory)
+    manifest_evidence = _manifest_official_entry_evidence(
+        manifest,
+        inventory=inventory,
+        current_manifest_sha256=manifest_sha256,
+    )
+    manifest_is_v2 = bool(manifest and manifest.get("schema_version") == 2)
+    validation_status = str(manifest_evidence["validation_status"])
+    inventory_catalog = inventory.get("catalog") if isinstance(inventory, dict) else None
+    inventory_requires_manifest = bool(
+        isinstance(inventory_catalog, dict)
+        and inventory_catalog.get("validation_contract_version") == 2
+    )
+    validation_required = (
+        inventory_requires_manifest
+        or manifest_is_v2
+        or (manifest_path.exists() and manifest is None)
+    )
+    if validation_required and validation_status == "missing":
+        validation_status = "stale" if inventory_requires_manifest else "unverified"
+    inventory_status = "missing"
+    if inventory:
+        inventory_status = (
+            "available"
+            if not validation_required or validation_status == "verified"
+            else validation_status
+        )
+    elif hygiene_publication_status in {"invalid", "stale"}:
+        inventory_status = hygiene_publication_status
+    manifest_status = "invalid" if manifest_path.exists() and manifest is None else "missing"
+    if manifest is not None:
+        manifest_status = (
+            "available"
+            if not manifest_is_v2 or validation_status == "verified"
+            else validation_status
+        )
+    cleanup_plan_status = "missing"
+    if cleanup_plan:
+        cleanup_plan_status = (
+            "available"
+            if not validation_required or validation_status == "verified"
+            else validation_status
+        )
+    elif hygiene_publication_status in {"invalid", "stale"}:
+        cleanup_plan_status = hygiene_publication_status
+    visible_cleanup_actions = (
+        cleanup_actions if cleanup_plan_status == "available" else []
+    )
 
     return {
         "inventory": {
-            "status": "available" if inventory else "missing",
+            "status": inventory_status,
+            "validation_status": validation_status,
             "path": _public_path_label(inventory_path)
             if inventory_path.exists()
             else None,
             "generated_at": inventory.get("generated_at") if inventory else None,
-            "official_entries": inventory_counts["official_entries"],
+            "official_entries": (
+                manifest_evidence["official_entries"]
+                if validation_required
+                else inventory_counts["official_entries"]
+            ),
             "candidate_entries": inventory_counts["candidate_entries"],
             "legacy_entries": inventory_counts["legacy_entries"],
             "archive_candidates": inventory_counts["archive_candidates"],
         },
         "cleanup_plan": {
-            "status": "available" if cleanup_plan else "missing",
+            "status": cleanup_plan_status,
             "path": _public_path_label(cleanup_plan_path)
             if cleanup_plan_path.exists()
             else None,
@@ -1910,13 +2895,21 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
             "dry_run_only": cleanup_plan.get("dry_run_only", True)
             if cleanup_plan
             else True,
-            "total_actions": len(cleanup_plan_actions),
+            "total_actions": (
+                len(cleanup_plan_actions)
+                if cleanup_plan_status == "available"
+                else 0
+            ),
             "preview_limit": CLEANUP_ACTION_PREVIEW_LIMIT,
-            "truncated": len(cleanup_plan_actions) > len(cleanup_actions),
-            "actions": cleanup_actions,
+            "truncated": (
+                len(cleanup_plan_actions) > len(visible_cleanup_actions)
+                if cleanup_plan_status == "available"
+                else False
+            ),
+            "actions": visible_cleanup_actions,
         },
         "quality_report": {
-            "status": "available" if quality_report_path.exists() else "missing",
+            "status": quality_report_status,
             "path": _public_path_label(quality_report_path)
             if quality_report_path.exists()
             else None,
@@ -1929,7 +2922,7 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
             else None,
         },
         "manifest": {
-            "status": "available" if manifest else "missing",
+            "status": manifest_status,
             "path": _public_path_label(manifest_path)
             if manifest_path.exists()
             else None,
@@ -1937,7 +2930,8 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
             "source_report": _public_path_label(manifest.get("source_report"))
             if manifest
             else None,
-            "official_entries": _collection_count(official_entries),
+            "official_entries": manifest_evidence["official_entries"],
+            "validation_status": validation_status,
         },
         "readme": {
             "status": "available" if readme_path.exists() else "missing",
@@ -1957,6 +2951,165 @@ def _collection_count(value: Any) -> int:
     if isinstance(value, (dict, list, tuple)):
         return len(value)
     return 0
+
+
+def _manifest_official_entry_evidence(
+    manifest: Optional[Dict[str, Any]],
+    *,
+    inventory: Optional[Dict[str, Any]],
+    current_manifest_sha256: Optional[str],
+) -> Dict[str, Any]:
+    if not manifest:
+        return {"official_entries": 0, "validation_status": "missing"}
+    datasets = manifest.get("datasets")
+    if manifest.get("schema_version") == 2 and isinstance(datasets, dict):
+        catalog = inventory.get("catalog") if isinstance(inventory, dict) else None
+        if not isinstance(catalog, dict):
+            return {"official_entries": 0, "validation_status": "unverified"}
+        audited_sha256 = catalog.get("manifest_sha256")
+        if (
+            not isinstance(current_manifest_sha256, str)
+            or not isinstance(audited_sha256, str)
+            or audited_sha256 != current_manifest_sha256
+        ):
+            return {"official_entries": 0, "validation_status": "stale"}
+        catalog_errors = catalog.get("errors")
+        if (
+            catalog.get("status") != "available"
+            or not isinstance(catalog_errors, list)
+            or catalog_errors
+        ):
+            return {"official_entries": 0, "validation_status": "unverified"}
+        records = catalog.get("datasets")
+        recorded_ids = catalog.get("validated_dataset_ids")
+        if not isinstance(records, list) or not isinstance(recorded_ids, list):
+            return {"official_entries": 0, "validation_status": "unverified"}
+        dataset_count = catalog.get("dataset_count")
+        if (
+            isinstance(dataset_count, bool)
+            or not isinstance(dataset_count, int)
+            or dataset_count != len(records)
+            or dataset_count != len(datasets)
+        ):
+            return {"official_entries": 0, "validation_status": "unverified"}
+        verified_ids = {
+            str(item.get("dataset_id"))
+            for item in records
+            if isinstance(item, dict)
+            and item.get("canonical_valid") is True
+            and isinstance(item.get("dataset_id"), str)
+            and item.get("dataset_id")
+        }
+        declared_ids = {
+            value for value in recorded_ids if isinstance(value, str) and value
+        }
+        if verified_ids != declared_ids or len(declared_ids) != len(recorded_ids):
+            return {"official_entries": 0, "validation_status": "unverified"}
+        if catalog.get("validation_contract_version") != 2:
+            return {"official_entries": 0, "validation_status": "unverified"}
+        for record in records:
+            if not isinstance(record, dict) or record.get("canonical_valid") is not True:
+                continue
+            pointer_status = _inventory_latest_pointer_status(record)
+            if pointer_status != "verified":
+                return {"official_entries": 0, "validation_status": pointer_status}
+            state_status = _inventory_snapshot_state_status(record)
+            if state_status != "verified":
+                return {"official_entries": 0, "validation_status": state_status}
+        current_ids = {
+            key
+            for key, entry in datasets.items()
+            if isinstance(key, str)
+            and isinstance(entry, dict)
+            and entry.get("dataset_id") == key
+            and entry.get("role") == "canonical"
+            and entry.get("status") == "ready"
+        }
+        if current_ids != verified_ids:
+            return {"official_entries": 0, "validation_status": "unverified"}
+        return {
+            "official_entries": len(current_ids),
+            "validation_status": "verified",
+        }
+    return {
+        "official_entries": _collection_count(manifest.get("official_entries")),
+        "validation_status": "legacy_unverified",
+    }
+
+
+def _inventory_snapshot_state_status(record: Dict[str, Any]) -> str:
+    raw_path = record.get("snapshot_path")
+    expected = record.get("state_fingerprint")
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(expected, dict):
+        return "unverified"
+    normalized_expected = {
+        "algorithm": expected.get("algorithm"),
+        "file_count": expected.get("file_count"),
+        "total_bytes": expected.get("total_bytes"),
+        "scanned_entries": expected.get("scanned_entries"),
+        "sha256": expected.get("sha256"),
+    }
+    if (
+        normalized_expected["algorithm"]
+        != "relative-path-size-mtime-ctime-device-inode-v2"
+        or isinstance(normalized_expected["file_count"], bool)
+        or not isinstance(normalized_expected["file_count"], int)
+        or normalized_expected["file_count"] < 0
+        or isinstance(normalized_expected["total_bytes"], bool)
+        or not isinstance(normalized_expected["total_bytes"], int)
+        or normalized_expected["total_bytes"] < 0
+        or isinstance(normalized_expected["scanned_entries"], bool)
+        or not isinstance(normalized_expected["scanned_entries"], int)
+        or normalized_expected["scanned_entries"] < normalized_expected["file_count"]
+        or not isinstance(normalized_expected["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", normalized_expected["sha256"])
+    ):
+        return "unverified"
+
+    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+    relative = _trusted_root_relative_path(QUANT_DATA_ROOT, raw_path)
+    if relative is None:
+        return "unverified"
+    if _manifest_path_contains_symlink(root, relative):
+        return "stale"
+    snapshot = root / relative
+    try:
+        current = _filesystem_state_fingerprint_live(snapshot)
+    except (DataContractError, OSError):
+        return "stale"
+    return "verified" if current == normalized_expected else "stale"
+
+
+def _inventory_latest_pointer_status(record: Dict[str, Any]) -> str:
+    if record.get("storage_contract") != "immutable_snapshot_v2":
+        return "verified"
+    raw_path = record.get("latest_pointer_path")
+    expected_sha256 = record.get("latest_pointer_sha256")
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+    ):
+        return "unverified"
+    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+    relative = _trusted_root_relative_path(QUANT_DATA_ROOT, raw_path)
+    if relative is None:
+        return "unverified"
+    if _manifest_path_contains_symlink(root, relative):
+        return "stale"
+    pointer_bytes = _read_bounded_regular_file_at(
+        root,
+        relative,
+        max_bytes=DATA_HYGIENE_POINTER_MAX_BYTES,
+    )
+    if pointer_bytes is None:
+        return "stale"
+    return (
+        "verified"
+        if hashlib.sha256(pointer_bytes).hexdigest() == expected_sha256
+        else "stale"
+    )
 
 
 def _data_hygiene_inventory_counts(
@@ -2664,7 +3817,9 @@ def _restore_text_file(path: Path, existed: bool, content: str) -> None:
         logger.warning("Experiment rollback restore failed for %s: %s", path, exc)
 
 
-def build_research_status_payload() -> Dict[str, Any]:
+def build_research_status_payload(
+    provider_dataset_id: str = NATIVE_QLIB_DATASET_ID,
+) -> Dict[str, Any]:
     """Build the latest quant workflow status used by web pages."""
     if not RESEARCH_STATUS_PATH.exists():
         return _missing_status_payload()
@@ -2687,12 +3842,14 @@ def build_research_status_payload() -> Dict[str, Any]:
         }
         return fallback
 
+    native_resolution = _resolve_native_qlib_provider(provider_dataset_id)
     reports_dir = RESEARCH_STATUS_PATH.parent
-    native_resolution = _resolve_native_qlib_provider()
+    _apply_data_quality_training_gate(payload, reports_dir, native_resolution)
     if native_resolution.path is not None:
         payload["qlib_provider"] = {
             **_qlib_provider_from_path(native_resolution.path),
-            "dataset_id": NATIVE_QLIB_DATASET_ID,
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": native_resolution.dataset_id or provider_dataset_id,
             "role": "canonical",
             "status": "ready",
             "price_basis": "qfq",
@@ -2703,7 +3860,7 @@ def build_research_status_payload() -> Dict[str, Any]:
         }
     elif native_resolution.authoritative:
         payload["qlib_provider"] = {
-            "dataset_id": NATIVE_QLIB_DATASET_ID,
+            "dataset_id": provider_dataset_id,
             "role": "canonical",
             "status": "blocked",
             "price_basis": "qfq",
@@ -2747,9 +3904,15 @@ def build_research_status_payload() -> Dict[str, Any]:
 
 
 @router.get("/status")
-async def get_research_status() -> Dict[str, Any]:
+def get_research_status() -> Dict[str, Any]:
     """Return the latest quant workflow status used by the research page."""
     return build_research_status_payload()
+
+
+@router.get("/experiments")
+def get_experiment_notebook() -> Dict[str, Any]:
+    """Return experiment records without scanning the Qlib provider."""
+    return _experiment_notebook_payload(RESEARCH_STATUS_PATH.parent)
 
 
 @router.post("/experiments/{run_id}/archive")
@@ -2759,7 +3922,7 @@ async def archive_experiment_run(run_id: str) -> Dict[str, Any]:
         removed = _archive_experiment_run(RESEARCH_STATUS_PATH.parent, run_id)
         return {
             "removed_run": removed,
-            "experiment_notebook": _experiment_notebook_payload(
+            "experiment_notebook": _experiment_notebook_payload_unlocked(
                 RESEARCH_STATUS_PATH.parent
             ),
         }
@@ -2802,5 +3965,5 @@ async def permanently_delete_experiment_run(
         return {
             "removed_run": removed,
             "note_removed": note_removed,
-            "experiment_notebook": _experiment_notebook_payload(reports_dir),
+            "experiment_notebook": _experiment_notebook_payload_unlocked(reports_dir),
         }

@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,11 +18,130 @@ def load_module():
 
 
 class ReportDataAnomaliesTest(unittest.TestCase):
+    def test_scan_uses_native_snapshot_file_index(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "snapshot"
+            directory = snapshot / "bars"
+            directory.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1200.0],
+                }
+            ).to_parquet(directory / "SH600000.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "first_date": ["2026-07-23"],
+                    "last_date": ["2026-07-24"],
+                }
+            ).to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
+            (snapshot / "DATASET_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "dataset_id": "ashare_daily_qfq",
+                        "snapshot_id": snapshot.name,
+                        "data_kind": "daily_bars",
+                        "role": "canonical",
+                        "status": "ready",
+                        "file_index_path": "FILE_INDEX.parquet",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                module,
+                "dataset_date_range",
+                side_effect=AssertionError("must not rescan date columns"),
+            ):
+                _summary, _events, coverage = module.scan_merged_files(
+                    directory,
+                    native_snapshot_validated=True,
+                )
+
+        self.assertEqual(coverage["start"], "2026-07-23")
+        self.assertEqual(coverage["end"], "2026-07-24")
+
+    def test_explicit_merged_dir_does_not_resolve_native_v2_default(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            explicit = root / "legacy"
+            explicit.mkdir()
+            out_dir = root / "reports"
+            with (
+                patch.object(
+                    module,
+                    "ashare_qfq_bars_dir",
+                    side_effect=AssertionError("native resolver must not run"),
+                ),
+                patch.object(
+                    module,
+                    "scan_merged_files",
+                    return_value=(
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        {"files": 0, "rows": 0, "start": "", "end": ""},
+                    ),
+                ) as scan,
+            ):
+                result = module.main(
+                    ["--merged-dir", str(explicit), "--out-dir", str(out_dir)]
+                )
+
+        self.assertEqual(result, 0)
+        scan.assert_called_once_with(explicit, native_snapshot_validated=False)
+
+    def test_scan_ignores_unvalidated_snapshot_file_index(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "snapshot"
+            directory = snapshot / "bars"
+            directory.mkdir(parents=True)
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-07-23", "2026-07-24"]),
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.9, 10.0],
+                    "close": [10.1, 10.2],
+                    "volume": [1000.0, 1200.0],
+                }
+            ).to_parquet(directory / "SH600000.parquet", index=False)
+            pd.DataFrame(
+                {
+                    "first_date": ["1990-01-01"],
+                    "last_date": ["2099-12-31"],
+                }
+            ).to_parquet(snapshot / "FILE_INDEX.parquet", index=False)
+            (snapshot / "DATASET_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "data_kind": "daily_bars",
+                        "file_index_path": "FILE_INDEX.parquet",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            _summary, _events, coverage = module.scan_merged_files(
+                directory,
+                native_snapshot_validated=True,
+            )
+
+        self.assertEqual(coverage["start"], "2026-07-23")
+        self.assertEqual(coverage["end"], "2026-07-24")
+
     def test_scan_uses_compatibility_index_instead_of_loading_dates_twice(self):
         module = load_module()
         with self.subTest("compatibility metadata"):
-            import tempfile
-
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 pd.DataFrame(
@@ -65,6 +186,8 @@ class ReportDataAnomaliesTest(unittest.TestCase):
         )
 
         self.assertIn(str(candidate), report)
+        self.assertIn("A-share qfq parquet directory", report)
+        self.assertNotIn("Merged parquet directory", report)
 
     def test_classifies_structural_price_issue_as_blocker(self):
         module = load_module()

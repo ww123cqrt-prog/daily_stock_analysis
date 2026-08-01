@@ -86,6 +86,7 @@ type DailyGuideAction =
 
 const STREAM_RECONNECT_INITIAL_DELAY_MS = 1000;
 const STREAM_RECONNECT_MAX_DELAY_MS = 15000;
+const RECENT_JOB_LIMIT = 30;
 const WORKFLOW_INPUT_CLASS =
   'input-surface input-focus-glow h-9 w-full rounded-lg border bg-transparent px-2.5 text-xs transition-all focus:outline-none';
 
@@ -735,20 +736,81 @@ function artifactFileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
 
-function jobTimestamp(job: QuantJob): number {
-  const timestamp = new Date(job.updatedAt || job.createdAt || '').getTime();
+function parseJobTimestamp(value: string | null | undefined): number {
+  const timestamp = new Date(value || '').getTime();
   return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function jobTimestamp(job: QuantJob): number {
+  return parseJobTimestamp(job.updatedAt || job.createdAt);
+}
+
+function isNewerJob(candidate: QuantJob, current: QuantJob): boolean {
+  const candidateCreated = parseJobTimestamp(candidate.createdAt);
+  const currentCreated = parseJobTimestamp(current.createdAt);
+  if (candidateCreated !== currentCreated) return candidateCreated > currentCreated;
+  if (candidate.jobId !== current.jobId) return false;
+  return parseJobTimestamp(candidate.updatedAt) > parseJobTimestamp(current.updatedAt);
 }
 
 function latestJobsByType(jobs: QuantJob[]): Record<string, QuantJob> {
   const latest: Record<string, QuantJob> = {};
   for (const job of jobs) {
     const current = latest[job.jobType];
-    if (!current || jobTimestamp(job) >= jobTimestamp(current)) {
+    if (!current || isNewerJob(job, current)) {
       latest[job.jobType] = job;
     }
   }
   return latest;
+}
+
+function mergeLatestJobsByType(
+  ...groups: Array<Record<string, QuantJob> | undefined>
+): Record<string, QuantJob> {
+  return latestJobsByType(groups.flatMap((group) => Object.values(group ?? {})));
+}
+
+function jobStatusRank(status: string): number {
+  if (status === 'completed' || status === 'failed' || status === 'cancelled') return 2;
+  if (status === 'running') return 1;
+  return 0;
+}
+
+function isNewerJobVersion(candidate: QuantJob, current: QuantJob): boolean {
+  const candidateTimestamp = jobTimestamp(candidate);
+  const currentTimestamp = jobTimestamp(current);
+  if (candidateTimestamp !== currentTimestamp) return candidateTimestamp > currentTimestamp;
+  return jobStatusRank(candidate.status) >= jobStatusRank(current.status);
+}
+
+function mergeJobsById(...groups: QuantJob[][]): QuantJob[] {
+  const merged = new Map<string, QuantJob>();
+  for (const job of groups.flat()) {
+    const current = merged.get(job.jobId);
+    if (!current || isNewerJobVersion(job, current)) {
+      merged.set(job.jobId, job);
+    }
+  }
+  const sorted = [...merged.values()]
+    .sort((left, right) => jobTimestamp(right) - jobTimestamp(left));
+  const activeJobs = sorted.filter(isActiveJob);
+  const recentHistory = sorted
+    .filter((job) => !isActiveJob(job))
+    .slice(0, RECENT_JOB_LIMIT);
+  return [...activeJobs, ...recentHistory];
+}
+
+function mergeAuthoritativeMonitoringSnapshot(
+  currentJobs: QuantJob[],
+  incomingJobs: QuantJob[],
+): QuantJob[] {
+  const activeJobIds = new Set(
+    incomingJobs.filter(isActiveJob).map((job) => job.jobId),
+  );
+  const retainedJobs = currentJobs.filter(
+    (job) => !isActiveJob(job) || activeJobIds.has(job.jobId),
+  );
+  return mergeJobsById(retainedJobs, incomingJobs);
 }
 
 function activeJobCount(jobs: QuantJob[]): number {
@@ -757,6 +819,33 @@ function activeJobCount(jobs: QuantJob[]): number {
 
 function isActiveJob(job?: QuantJob): boolean {
   return job?.status === 'pending' || job?.status === 'running';
+}
+
+function quantStatusWithJobs(
+  status: QuantStatus,
+  jobs: QuantJob[],
+  previous?: QuantStatus | null,
+  authoritativeActive = false,
+): QuantStatus {
+  const mergedLatestJobs = mergeLatestJobsByType(
+    status.latestJobs,
+    previous?.latestJobs,
+    latestJobsByType(jobs),
+  );
+  const activeJobIds = new Set(jobs.filter(isActiveJob).map((job) => job.jobId));
+  const reconciledLatestJobs = authoritativeActive
+    ? Object.fromEntries(
+        Object.entries(mergedLatestJobs).filter(
+          ([, job]) => !isActiveJob(job) || activeJobIds.has(job.jobId),
+        ),
+      )
+    : mergedLatestJobs;
+  return {
+    ...status,
+    activeCount: activeJobCount(jobs),
+    latestJobs: reconciledLatestJobs,
+    recentJobs: jobs,
+  };
 }
 
 function isDoneJob(job?: QuantJob): boolean {
@@ -943,15 +1032,15 @@ function workflowErrorMessage(err: unknown): string {
   return parsed.message || parsed.rawMessage || '请求未成功完成，请稍后重试。';
 }
 
-function getBackendJobInfo(quantStatus: QuantStatus | null, jobType: string): {
+function getBackendJobInfo(jobTypes: Record<string, QuantJobTypeInfo> | null, jobType: string): {
   catalogLoaded: boolean;
   info?: QuantJobTypeInfo;
   isEnabled: boolean;
   isDisabled: boolean;
   allowedParamKeys: Set<string> | null;
 } {
-  const info = quantStatus?.availableJobTypes?.[jobType];
-  const catalogLoaded = quantStatus !== null;
+  const info = jobTypes?.[jobType];
+  const catalogLoaded = jobTypes !== null;
   const isEnabled = Boolean(info);
   return {
     catalogLoaded,
@@ -1087,6 +1176,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
   const { language, t } = useUiLanguage();
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [quantStatus, setQuantStatus] = useState<QuantStatus | null>(null);
+  const [jobTypes, setJobTypes] = useState<Record<string, QuantJobTypeInfo> | null>(null);
   const [jobs, setJobs] = useState<QuantJob[]>([]);
   const [jobParams, setJobParams] = useState<JobParamState>({});
   const [selectedLogJob, setSelectedLogJob] = useState<QuantJob | null>(null);
@@ -1096,8 +1186,74 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
   const [error, setError] = useState<string | null>(null);
   const [submittingTypes, setSubmittingTypes] = useState<Record<string, boolean>>({});
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
+  const jobsRef = useRef<QuantJob[]>([]);
+  const jobStateRevisionRef = useRef(0);
 
-  const latestJobs = useMemo(() => quantStatus?.latestJobs ?? {}, [quantStatus]);
+  const applyJobSnapshot = useCallback((
+    incomingJobs: QuantJob[],
+    options: {
+      authoritativeActive?: boolean;
+      advancesRevision?: boolean;
+    } = {},
+  ) => {
+    if (options.advancesRevision !== false) {
+      jobStateRevisionRef.current += 1;
+    }
+    const nextJobs = options.authoritativeActive
+      ? mergeAuthoritativeMonitoringSnapshot(jobsRef.current, incomingJobs)
+      : mergeJobsById(jobsRef.current, incomingJobs);
+    jobsRef.current = nextJobs;
+    setJobs(nextJobs);
+    setQuantStatus((current) => (
+      current
+        ? quantStatusWithJobs(
+            current,
+            nextJobs,
+            undefined,
+            options.authoritativeActive === true,
+          )
+        : current
+    ));
+  }, []);
+
+  const applyQuantStatusSnapshot = useCallback((
+    incomingStatus: QuantStatus,
+    requestRevision: number,
+  ) => {
+    const incomingJobs = [
+      ...Object.values(incomingStatus.latestJobs ?? {}),
+      ...(incomingStatus.recentJobs ?? []),
+    ];
+    const authoritativeActive = requestRevision === jobStateRevisionRef.current;
+    const nextJobs = authoritativeActive
+      ? mergeAuthoritativeMonitoringSnapshot(jobsRef.current, incomingJobs)
+      : jobsRef.current;
+    const statusForJobs = authoritativeActive
+      ? incomingStatus
+      : {
+          ...incomingStatus,
+          activeCount: activeJobCount(nextJobs),
+          latestJobs: {},
+          recentJobs: [],
+        };
+    if (authoritativeActive) {
+      jobStateRevisionRef.current += 1;
+    }
+    jobsRef.current = nextJobs;
+    setJobs(nextJobs);
+    setQuantStatus((current) => quantStatusWithJobs(
+      statusForJobs,
+      nextJobs,
+      current,
+      authoritativeActive,
+    ));
+  }, []);
+
+  const listedLatestJobs = useMemo(() => latestJobsByType(jobs), [jobs]);
+  const latestJobs = useMemo(
+    () => mergeLatestJobsByType(quantStatus?.latestJobs, listedLatestJobs),
+    [listedLatestJobs, quantStatus],
+  );
   const visibleWorkflowSteps = useMemo(() => stepsForSurface(surface), [surface]);
   const visibleJobs = useMemo(
     () => surface === 'all' ? jobs : jobs.filter((job) => surfaceForJob(job.jobType) === surface),
@@ -1164,37 +1320,44 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
   const refresh = useCallback(async () => {
     setError(null);
+    const statusRequestRevision = jobStateRevisionRef.current;
     try {
-      const [nextResearchStatus, nextQuantStatus, nextJobs] = await Promise.all([
-        researchApi.getStatus(),
-        quantApi.getStatus(),
-        quantApi.listJobs({ limit: 30 }),
+      await Promise.all([
+        quantApi.getJobTypes().then(setJobTypes),
+        researchApi.getStatus().then(setResearchStatus),
+        quantApi.getStatus().then((nextStatus) => {
+          applyQuantStatusSnapshot(nextStatus, statusRequestRevision);
+        }),
+        quantApi.listJobs({ limit: RECENT_JOB_LIMIT }).then((nextJobs) => {
+          applyJobSnapshot(
+            nextJobs.items.filter((job) => !isActiveJob(job)),
+            { advancesRevision: false },
+          );
+        }),
       ]);
-      setResearchStatus(nextResearchStatus);
-      setQuantStatus(nextQuantStatus);
-      setJobs(nextJobs.items);
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyJobSnapshot, applyQuantStatusSnapshot]);
 
   const refreshSummary = useCallback(async () => {
     setError(null);
+    const statusRequestRevision = jobStateRevisionRef.current;
     try {
       const [nextResearchStatus, nextQuantStatus] = await Promise.all([
         researchApi.getStatus(),
         quantApi.getStatus(),
       ]);
       setResearchStatus(nextResearchStatus);
-      setQuantStatus(nextQuantStatus);
+      applyQuantStatusSnapshot(nextQuantStatus, statusRequestRevision);
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyQuantStatusSnapshot]);
 
   useEffect(() => {
     document.title = `${copy.title} - DSA`;
@@ -1221,15 +1384,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
     const handleJobs = (event: MessageEvent) => {
       const nextJobs = parseQuantJobStreamEvent(event.data);
-      setJobs(nextJobs);
-      setQuantStatus((current) => current
-        ? {
-            ...current,
-            activeCount: activeJobCount(nextJobs),
-            latestJobs: { ...current.latestJobs, ...latestJobsByType(nextJobs) },
-            recentJobs: nextJobs,
-          }
-        : current);
+      applyJobSnapshot(nextJobs, { authoritativeActive: true });
     };
 
     const handleStreamEnd = () => {
@@ -1255,6 +1410,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       };
       source.onerror = () => {
         if (closed) return;
+        if (reconnectTimer !== undefined) return;
         setError(t('workflow.streamDisconnected'));
         source?.removeEventListener('jobs', handleJobs as EventListener);
         source?.removeEventListener('stream_end', handleStreamEnd as EventListener);
@@ -1277,7 +1433,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       source?.removeEventListener('stream_end', handleStreamEnd as EventListener);
       source?.close();
     };
-  }, [t]);
+  }, [applyJobSnapshot, t]);
 
   const updateJobParam = useCallback((jobType: string, key: string, value: JobParamValue) => {
     setJobParams((current) => ({
@@ -1291,7 +1447,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
   const submitJob = async (workflowJob: WorkflowJob, explicitParams?: Record<string, unknown>) => {
     const jobType = workflowJob.type;
-    const backendJobInfo = getBackendJobInfo(quantStatus, jobType);
+    const backendJobInfo = getBackendJobInfo(jobTypes, jobType);
     if (!backendJobInfo.catalogLoaded) {
       setError('任务白名单仍在加载，请稍后再试。');
       return;
@@ -1315,14 +1471,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     setError(null);
     try {
       const job = await quantApi.submitJob(jobType, params);
-      setJobs((current) => [job, ...current.filter((item) => item.jobId !== job.jobId)]);
-      setQuantStatus((current) => current
-        ? {
-            ...current,
-            activeCount: isActiveJob(job) ? current.activeCount + 1 : current.activeCount,
-            latestJobs: { ...current.latestJobs, [job.jobType]: job },
-          }
-        : current);
+      applyJobSnapshot([job]);
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     } finally {
@@ -1344,14 +1493,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     setError(null);
     try {
       const cancelled = await quantApi.cancelJob(job.jobId);
-      setJobs((current) => current.map((item) => (item.jobId === cancelled.jobId ? cancelled : item)));
-      setQuantStatus((current) => current
-        ? {
-            ...current,
-            activeCount: isActiveJob(job) ? Math.max(0, current.activeCount - 1) : current.activeCount,
-            latestJobs: { ...current.latestJobs, [cancelled.jobType]: cancelled },
-          }
-        : current);
+      applyJobSnapshot([cancelled]);
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     }
@@ -1479,8 +1621,8 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
             <span className="label-uppercase">Jobs</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
               {language === 'zh'
-                ? `${surface === 'all' ? quantStatus?.activeCount ?? 0 : activeJobCount(visibleJobs)} 个运行中`
-                : `${surface === 'all' ? quantStatus?.activeCount ?? 0 : activeJobCount(visibleJobs)} running`}
+                ? `${activeJobCount(visibleJobs)} 个运行中`
+                : `${activeJobCount(visibleJobs)} running`}
             </p>
             <p className="mt-2 text-sm text-secondary-text">
               {language === 'zh'
@@ -1598,7 +1740,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                       const isSubmitting = submittingTypes[job.type] === true;
                       const paramValues = jobParams[job.type] || {};
                       const isKnownJobType = Boolean(WORKFLOW_JOBS_BY_TYPE[job.type]);
-                      const backendJobInfo = getBackendJobInfo(quantStatus, job.type);
+                      const backendJobInfo = getBackendJobInfo(jobTypes, job.type);
                       const effectiveParams = buildJobParams(job, paramValues, backendJobInfo.allowedParamKeys);
                       const formalTrainingBlocked = isFormalTrainingBlocked(job.type, effectiveParams, trainable);
                       return (
@@ -1754,7 +1896,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                           {step.actions.map((action) => {
                             if (action.kind === 'job') {
                               const isSubmitting = submittingTypes[action.jobType] === true;
-                              const backendJobInfo = getBackendJobInfo(quantStatus, action.jobType);
+                              const backendJobInfo = getBackendJobInfo(jobTypes, action.jobType);
                               return (
                                 <span key={`${step.id}-${action.jobType}-${action.label}`} className="inline-flex items-center gap-1.5">
                                   <button

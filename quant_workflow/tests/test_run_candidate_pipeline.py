@@ -33,18 +33,171 @@ def prediction_frame(start: str, periods: int = 5, instruments: int = 6) -> tupl
 
 
 class CandidatePipelineTest(unittest.TestCase):
+    def test_atomic_write_fsyncs_file_and_parent_directory(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "candidate.json"
+            with (
+                patch.object(module.os, "fsync") as fsync,
+                patch.object(module, "_fsync_directory", create=True) as fsync_directory,
+            ):
+                module._atomic_write(target, "{\"status\": \"ok\"}\n")
+                written = target.read_text(encoding="utf-8")
+
+        self.assertTrue(written)
+        fsync.assert_called_once()
+        fsync_directory.assert_called_once_with(target.parent)
+
+    def test_approved_identity_resolves_pipeline_snapshot_without_reading_latest(self):
+        module = load_module()
+        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+
+        with (
+            patch.object(
+                module,
+                "resolve_approved_provider_identity",
+                return_value=pinned,
+                create=True,
+            ) as approved_resolver,
+            patch.object(
+                module,
+                "qlib_provider_uri",
+                side_effect=AssertionError("LATEST was resolved"),
+            ),
+        ):
+            resolved = module.resolve_pipeline_provider(
+                "canonical", expected_provider_identity=identity
+            )
+
+        self.assertEqual(resolved, pinned)
+        approved_resolver.assert_called_once_with(
+            "canonical",
+            identity,
+            quant_data_root=module.QUANT_DATA,
+        )
+
     def test_model_training_command_pins_the_parent_snapshot(self):
         module = load_module()
-        provider = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+        result_output = Path("/tmp/candidate-result.json")
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
 
         command = module._training_command(
             config_path=Path("/tmp/candidate.yaml"),
             experiment_name="candidate-test",
             provider="canonical",
-            provider_uri=provider,
+            expected_provider_identity=identity,
+            result_output=result_output,
         )
 
-        self.assertEqual(command[command.index("--provider-uri") + 1], str(provider))
+        self.assertNotIn("--provider-uri", command)
+        self.assertIn("--no-publish-latest", command)
+        self.assertEqual(
+            Path(command[command.index("--result-output") + 1]),
+            result_output,
+        )
+        self.assertEqual(
+            json.loads(command[command.index("--provider-identity-json") + 1]),
+            identity,
+        )
+
+    def test_model_training_reads_its_batch_result_instead_of_operational_latest(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "native-v2",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_config = root / "base.yaml"
+            base_config.write_text("{}\n", encoding="utf-8")
+            operational_latest = root / "latest_training_result.json"
+            operational_latest.write_text("not candidate JSON", encoding="utf-8")
+
+            def fake_training(command, *, cwd, check):
+                self.assertEqual(cwd, str(module.WORKFLOW_ROOT))
+                self.assertFalse(check)
+                self.assertIn("--no-publish-latest", command)
+                result_path = Path(command[command.index("--result-output") + 1])
+                source_config = Path(command[command.index("--config") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "run_id": "candidate-run",
+                            "experiment_id": "candidate-experiment-id",
+                            "experiment_name": "candidate-experiment",
+                            "source_config": str(source_config),
+                            "provider_identity": identity,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch.object(
+                    module,
+                    "LATEST_TRAINING_RESULT",
+                    operational_latest,
+                    create=True,
+                ),
+                patch.object(module, "_resolve_base_config", return_value=base_config),
+                patch.object(
+                    module,
+                    "build_candidate_config",
+                    return_value={"qlib_init": {}},
+                ),
+                patch.object(module, "apply_common_periods"),
+                patch.object(module.subprocess, "run", side_effect=fake_training),
+                patch.object(module, "_tag_candidate_run") as tag_candidate,
+                patch.object(
+                    module,
+                    "_load_artifacts",
+                    return_value=("prediction", "label"),
+                ),
+            ):
+                info, prediction, label = module._run_model_training(
+                    {"id": "linear_ridge"},
+                    {},
+                    provider="canonical",
+                    provider_uri=root / "provider",
+                    provider_latest_day="2026-07-31",
+                    latest_prediction_day="2026-07-30",
+                    batch_id="candidate-alpha158-20260801_120000",
+                    config_dir=root / "runtime_configs",
+                    experiment_name="candidate-experiment",
+                    expected_provider_identity=identity,
+                )
+
+            self.assertEqual(
+                operational_latest.read_text(encoding="utf-8"),
+                "not candidate JSON",
+            )
+
+        self.assertEqual(info["run_id"], "candidate-run")
+        self.assertEqual(prediction, "prediction")
+        self.assertEqual(label, "label")
+        tag_candidate.assert_called_once_with(
+            info,
+            "candidate-alpha158-20260801_120000",
+            "linear_ridge",
+        )
 
     def test_model_result_must_match_the_parent_snapshot_identity(self):
         module = load_module()

@@ -15,17 +15,13 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
-    fcntl = None
+from typing import Any, Iterable, Iterator, Mapping
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
     china_astock_root,
     mlruns_root,
@@ -37,6 +33,8 @@ from _paths import (  # noqa: E402
 from _mlflow_run_provenance import (  # noqa: E402
     experiment_run_ids,
     provider_identity,
+    revalidate_provider_identity,
+    resolve_approved_provider_identity,
     select_new_prediction_run,
     tag_run_artifact_hashes,
     tag_run_with_provider,
@@ -70,24 +68,33 @@ def experiment_file_lock(report_dir: Path = REPORT_DIR) -> Iterator[None]:
     """Guard experiment notebook writes shared with the DSA web API."""
     report_dir.mkdir(parents=True, exist_ok=True)
     lock_path = report_dir / ".experiment.lock"
-    with lock_path.open("a", encoding="utf-8") as lock_handle:
-        if fcntl is not None:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    with lock_path.open("a+b") as lock_handle:
+        lock_file(lock_handle, exclusive=True)
         try:
             yield
         finally:
-            if fcntl is not None:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(lock_handle)
 
 
 def resolve_provider_uri(
     provider: str | None,
     snapshot_override: str | Path | None = None,
+    expected_provider_identity: Mapping[str, Any] | None = None,
 ) -> Path:
     name = (provider or "canonical").strip().lower()
     if name not in PROVIDER_NAMES:
         choices = ", ".join(PROVIDER_NAMES)
         raise ValueError(f"Provider must be one of: {choices}.")
+    if expected_provider_identity is not None:
+        if snapshot_override is not None:
+            raise ValueError(
+                "snapshot_override and expected_provider_identity are mutually exclusive"
+            )
+        return resolve_approved_provider_identity(
+            name,
+            expected_provider_identity,
+            quant_data_root=QUANT_DATA,
+        )
     return qlib_provider_uri(name, snapshot_override=snapshot_override)
 
 
@@ -250,8 +257,6 @@ def _experiment_by_name(client, experiment_name: str):
 def run_qrun(
     config_path: str,
     experiment_name: str = "baseline_lgb_alpha158",
-    *,
-    provider_uri: Path,
 ) -> str:
     """Run qrun and return the one prediction Run created by this invocation."""
     import mlflow
@@ -274,7 +279,6 @@ def run_qrun(
         before_run_ids,
     )
     run_id = str(run.info.run_id)
-    tag_run_with_provider(client, run_id, provider_identity(provider_uri))
     return run_id
 
 
@@ -590,19 +594,75 @@ def record_training_result(
     *,
     publish_latest: bool = True,
     report_dir: Path = REPORT_DIR,
+    result_output: Path | None = None,
 ) -> None:
     recorded = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         **info,
     }
+    latest_path = (report_dir / LATEST_TRAINING_RESULT.name).resolve()
+    isolated_path = (
+        Path(result_output).expanduser().resolve()
+        if result_output is not None
+        else None
+    )
+    if not publish_latest and isolated_path == latest_path:
+        raise ValueError("result_output must not target latest_training_result.json")
     if publish_latest:
         write_latest_training_result(
             recorded,
-            output_path=report_dir / LATEST_TRAINING_RESULT.name,
+            output_path=latest_path,
         )
     else:
         print("\n[artifact] Latest training summary unchanged (--no-publish-latest)")
+    if isolated_path is not None and isolated_path != latest_path:
+        write_latest_training_result(recorded, output_path=isolated_path)
     append_experiment_record(recorded, report_dir=report_dir)
+
+
+def publish_training_result(
+    info: dict[str, Any],
+    *,
+    provider: str,
+    provider_uri: Path,
+    expected_provider_identity: Mapping[str, Any],
+    source_config: Path,
+    runtime_config: Path,
+    publish_latest: bool = True,
+    result_output: Path | None = None,
+    report_dir: Path = REPORT_DIR,
+    quant_data_root: Path = QUANT_DATA,
+    client: Any | None = None,
+) -> dict[str, str]:
+    """Revalidate data lineage, then publish MLflow tags and the DSA result."""
+
+    final_identity = revalidate_provider_identity(
+        provider_uri,
+        expected_provider_identity,
+        quant_data_root=quant_data_root,
+    )
+    if client is None:
+        import mlflow
+
+        client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    run_id = str(info.get("run_id") or "")
+    tag_run_with_provider(client, run_id, final_identity)
+    info.update(
+        {
+            "provider": provider,
+            "provider_uri": str(provider_uri),
+            "provider_identity": final_identity,
+            "source_config": str(source_config),
+            "runtime_config": str(runtime_config),
+        }
+    )
+    record_training_result(
+        info,
+        publish_latest=publish_latest,
+        report_dir=report_dir,
+        result_output=result_output,
+    )
+    return final_identity
 
 
 def main():
@@ -630,20 +690,50 @@ def main():
         help="Pin one already selected immutable native V2 snapshot for this run",
     )
     parser.add_argument(
+        "--provider-identity-json",
+        default=None,
+        help="Trusted immutable provider identity injected by the DSA job API",
+    )
+    parser.add_argument(
         "--no-publish-latest",
         action="store_true",
         help="Keep the MLflow/experiment record without replacing the DSA latest result",
     )
+    parser.add_argument(
+        "--result-output",
+        type=Path,
+        default=None,
+        help="Write this run's structured result to an independent JSON file",
+    )
     args = parser.parse_args()
+
+    expected_provider_identity = None
+    if args.provider_identity_json is not None:
+        try:
+            parsed_identity = json.loads(args.provider_identity_json)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--provider-identity-json must be valid JSON: {exc}")
+        if not isinstance(parsed_identity, dict):
+            parser.error("--provider-identity-json must contain a JSON object")
+        expected_provider_identity = parsed_identity
 
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"[error] Config not found: {config_path}")
         sys.exit(1)
     try:
-        provider_uri = resolve_provider_uri(args.provider, args.provider_uri)
+        provider_uri = resolve_provider_uri(
+            args.provider,
+            args.provider_uri,
+            expected_provider_identity,
+        )
         if not provider_uri.exists():
             raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
+        training_provider_identity = (
+            dict(expected_provider_identity)
+            if expected_provider_identity is not None
+            else provider_identity(provider_uri)
+        )
     except Exception as exc:
         print(f"[error] {exc}")
         sys.exit(1)
@@ -669,7 +759,6 @@ def main():
     run_id = run_qrun(
         str(runtime_config_path),
         experiment_name=args.experiment_name,
-        provider_uri=provider_uri,
     )
 
     # ── Step 3: Print summary ──
@@ -689,18 +778,15 @@ def main():
             str(info.get("run_id") or ""),
             mlruns_dir=MLRUNS_DIR,
         )
-        info.update(
-            {
-                "provider": args.provider,
-                "provider_uri": str(provider_uri),
-                "provider_identity": provider_identity(provider_uri),
-                "source_config": str(config_path),
-                "runtime_config": str(runtime_config_path),
-            }
-        )
-        record_training_result(
+        publish_training_result(
             info,
+            provider=args.provider,
+            provider_uri=provider_uri,
+            expected_provider_identity=training_provider_identity,
+            source_config=config_path,
+            runtime_config=runtime_config_path,
             publish_latest=not args.no_publish_latest,
+            result_output=args.result_output,
         )
         print(f"\nRun ID: {info['run_id']}")
         print("\nMetrics:")

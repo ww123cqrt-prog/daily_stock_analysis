@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +18,95 @@ function copyIfExists(source: string, destination: string) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.copyFileSync(source, destination);
+}
+
+function isSafeArtifactName(value: unknown): value is string {
+  return typeof value === 'string' && path.basename(value) === value;
+}
+
+function writeManagedQualitySourceFixture(sourceRoot: string) {
+  fs.mkdirSync(sourceRoot, { recursive: true });
+  const markdown = [
+    '# A-Share Data Quality Report',
+    '',
+    '- Stock universe: 5509',
+    '- Canonical qfq usable instruments: 5340',
+    '- Canonical qfq rows: 7,580,087',
+    '- Canonical qfq date range: 2020-01-02 ~ 2026-07-03',
+    '',
+  ].join('\n');
+  const markdownSha256 = createHash('sha256').update(markdown).digest('hex');
+  const markdownArtifact = `data_quality_report_20260731_120000_${markdownSha256.slice(0, 16)}.md`;
+  fs.writeFileSync(path.join(sourceRoot, markdownArtifact), markdown, 'utf-8');
+  fs.writeFileSync(path.join(sourceRoot, 'data_quality_report_latest.md'), markdown, 'utf-8');
+
+  const evidence = {
+    schema_version: 3,
+    evidence_contract: 'immutable_data_quality_evidence_v2',
+    scan_mode: 'full',
+    coverage_status: 'full',
+    verification_status: 'verified',
+    trainable: true,
+    training_thresholds: {
+      min_calendar_days: 252,
+      min_instruments: 100,
+      min_merged_instruments: 100,
+      authoritative_min_calendar_days: 252,
+      authoritative_min_instruments: 100,
+      authoritative: true,
+    },
+    markdown_artifact: markdownArtifact,
+    markdown_sha256: markdownSha256,
+  };
+  const evidenceBytes = `${JSON.stringify(evidence, null, 2)}\n`;
+  const evidenceSha256 = createHash('sha256').update(evidenceBytes).digest('hex');
+  const evidenceArtifact = `data_quality_report_20260731_120000_${evidenceSha256.slice(0, 16)}.json`;
+  fs.writeFileSync(path.join(sourceRoot, evidenceArtifact), evidenceBytes, 'utf-8');
+  fs.writeFileSync(
+    path.join(sourceRoot, 'data_quality_report_latest.json'),
+    `${JSON.stringify({
+      schema_version: 3,
+      publication_contract: 'atomic_json_pointer_to_immutable_quality_evidence_v2',
+      report_id: `data-quality-${evidenceSha256.slice(0, 16)}`,
+      evidence_artifact: evidenceArtifact,
+      evidence_sha256: evidenceSha256,
+    }, null, 2)}\n`,
+    'utf-8',
+  );
+}
+
+function copyDataQualityPublication(sourceRoot: string, destinationRoot: string) {
+  const pointerName = 'data_quality_report_latest.json';
+  const pointerPath = path.join(sourceRoot, pointerName);
+  if (!fs.existsSync(pointerPath)) return;
+  copyIfExists(pointerPath, path.join(destinationRoot, pointerName));
+  copyIfExists(
+    path.join(sourceRoot, 'data_quality_report_latest.md'),
+    path.join(destinationRoot, 'data_quality_report_latest.md'),
+  );
+  try {
+    const pointer = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')) as Record<string, unknown>;
+    if (isSafeArtifactName(pointer.evidence_artifact)) {
+      const evidencePath = path.join(sourceRoot, pointer.evidence_artifact);
+      copyIfExists(evidencePath, path.join(destinationRoot, pointer.evidence_artifact));
+      const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf-8')) as Record<string, unknown>;
+      if (isSafeArtifactName(evidence.markdown_artifact)) {
+        copyIfExists(
+          path.join(sourceRoot, evidence.markdown_artifact),
+          path.join(destinationRoot, evidence.markdown_artifact),
+        );
+      }
+      return;
+    }
+    if (isSafeArtifactName(pointer.markdown_artifact)) {
+      copyIfExists(
+        path.join(sourceRoot, pointer.markdown_artifact),
+        path.join(destinationRoot, pointer.markdown_artifact),
+      );
+    }
+  } catch {
+    // The backend must surface an invalid pointer; smoke setup does not repair it.
+  }
 }
 
 function seedManagedSmokeReports() {
@@ -38,10 +128,12 @@ function seedManagedSmokeReports() {
     'cash_control_backtest_latest.md',
     'market_regime_latest.json',
     'market_regime_latest.md',
+    'data_quality_report_latest.json',
     'data_quality_report_latest.md',
     'data_quality_sources_latest.csv',
     'data_quality_issues_latest.csv',
     'data_quality_overlap_latest.csv',
+    'data_quality_ashare_qfq_summary_latest.csv',
     'data_quality_merged_summary_latest.csv',
     'data_anomaly_stocks_latest.csv',
     'data_anomaly_events_latest.csv',
@@ -50,6 +142,7 @@ function seedManagedSmokeReports() {
     'data_hygiene_inventory_latest.json',
     'data_hygiene_cleanup_plan_latest.md',
     'data_hygiene_cleanup_plan_latest.json',
+    'data_hygiene_reports_latest.json',
     'workbench_capability_inventory_latest.md',
     'workbench_capability_inventory_latest.json',
     'optimization_results_latest.json',
@@ -59,6 +152,33 @@ function seedManagedSmokeReports() {
     'china_astock_strategy_comparison_latest.json',
   ]) {
     copyIfExists(path.join(realReportsRoot, fileName), path.join(managedReportsRoot, fileName));
+  }
+
+  let qualitySourceRoot = realReportsRoot;
+  if (!fs.existsSync(path.join(qualitySourceRoot, 'data_quality_report_latest.json'))) {
+    qualitySourceRoot = path.join(managedSmokeRoot, 'quality-source');
+    writeManagedQualitySourceFixture(qualitySourceRoot);
+  }
+  copyDataQualityPublication(qualitySourceRoot, managedReportsRoot);
+
+  for (const [pointerName, artifactFields] of [
+    ['data_hygiene_reports_latest.json', ['inventory_artifact', 'cleanup_plan_artifact']],
+  ] as const) {
+    const pointerPath = path.join(managedReportsRoot, pointerName);
+    if (!fs.existsSync(pointerPath)) continue;
+    try {
+      const pointer = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')) as Record<string, unknown>;
+      for (const field of artifactFields) {
+        const artifactName = pointer[field];
+        if (typeof artifactName !== 'string' || path.basename(artifactName) !== artifactName) continue;
+        copyIfExists(
+          path.join(realReportsRoot, artifactName),
+          path.join(managedReportsRoot, artifactName),
+        );
+      }
+    } catch {
+      // The backend must surface an invalid pointer; smoke setup does not repair it.
+    }
   }
 
   for (const fileName of ['experiment_runs.jsonl', 'experiment_runs_deleted.jsonl', 'experiment_log.md']) {

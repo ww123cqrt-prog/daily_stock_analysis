@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,8 +23,95 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from quant_workflow.scripts.quant_data_contract import (
     atomic_write_json,
+    filesystem_state_fingerprint,
     finalize_qlib_snapshot,
 )
+
+
+def write_quality_evidence(
+    reports_dir: Path,
+    evidence_fields: dict,
+    *,
+    markdown: str = "# Quality\n\n- Stock universe: 5509\n",
+    timestamp: str = "20260731_110000",
+) -> tuple[str, str]:
+    markdown_sha256 = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    markdown_artifact = reports_dir / (
+        f"data_quality_report_{timestamp}_{markdown_sha256[:16]}.md"
+    )
+    markdown_artifact.write_text(markdown, encoding="utf-8")
+    evidence = {
+        "schema_version": 3,
+        "evidence_contract": "immutable_data_quality_evidence_v2",
+        "training_thresholds": {
+            "min_calendar_days": 252,
+            "min_instruments": 100,
+            "min_merged_instruments": 100,
+            "authoritative_min_calendar_days": 252,
+            "authoritative_min_instruments": 100,
+            "authoritative": True,
+        },
+        **evidence_fields,
+        "markdown_artifact": markdown_artifact.name,
+        "markdown_sha256": markdown_sha256,
+    }
+    evidence_bytes = (
+        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+    evidence_artifact = reports_dir / (
+        f"data_quality_report_{timestamp}_{evidence_sha256[:16]}.json"
+    )
+    evidence_artifact.write_bytes(evidence_bytes)
+    report_id = f"data-quality-{evidence_sha256[:16]}"
+    (reports_dir / "data_quality_report_latest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "publication_contract": (
+                    "atomic_json_pointer_to_immutable_quality_evidence_v2"
+                ),
+                "report_id": report_id,
+                "evidence_artifact": evidence_artifact.name,
+                "evidence_sha256": evidence_sha256,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return report_id, evidence_sha256
+
+
+def stable_state_fingerprint(marker: str = "0") -> dict:
+    return {
+        "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
+        "file_count": 1,
+        "total_bytes": 8,
+        "scanned_entries": 1,
+        "sha256": marker * 64,
+    }
+
+
+def valid_provider_semantic_metrics() -> dict:
+    return {
+        "calendar_valid": True,
+        "invalid_calendar_entries": 0,
+        "instrument_records_valid": True,
+        "invalid_instrument_records": 0,
+        "required_feature_min_coverage": 0.50,
+        "minimum_valid_instrument_feature_coverage": 0.75,
+        "misaligned_instrument_feature_dirs": 0,
+    }
+
+
+def stable_snapshot_state(dataset_id: str, state: dict) -> dict:
+    return {
+        "stable": True,
+        "content_revalidated": True,
+        "before": {dataset_id: state},
+        "after_scan": {dataset_id: state},
+        "after_revalidation": {dataset_id: state},
+        "after": {dataset_id: state},
+    }
 
 
 class ResearchStatusApiTestCase(unittest.TestCase):
@@ -96,7 +185,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             "ashare_daily_qfq",
             {
                 "dataset_id": "ashare_daily_qfq",
-                "role": "canonical",
+                "role": "audit",
                 "status": "ready",
                 "price_basis": upstream_snapshot["price_basis"],
                 "snapshot_id": upstream_snapshot["snapshot_id"],
@@ -131,6 +220,158 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         return provider
+
+    def _write_native_hygiene_inventory(
+        self,
+        root: Path,
+    ) -> tuple[Path, Path, Path]:
+        from quant_workflow.scripts.report_data_hygiene import collect_v2_catalog
+
+        reports_dir = root / "quant_workflow" / "reports"
+        reports_dir.mkdir(parents=True)
+        quant_data_root = root / "quant_data"
+        provider = self._write_native_qlib_fixture(quant_data_root)
+        catalog_path = quant_data_root / "DATA_MANIFEST.json"
+        root_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        root_catalog["datasets"]["qlib_ashare_v2"]["data_kind"] = "qlib_provider"
+        catalog_path.write_text(json.dumps(root_catalog), encoding="utf-8")
+        catalog = collect_v2_catalog(quant_data_root)
+        self._write_hygiene_bundle(
+            reports_dir,
+            {
+                "generated_at": "2026-07-30T12:00:00+08:00",
+                "catalog": catalog,
+                "items": [
+                    {
+                        "category": "official",
+                        "dataset_id": item["dataset_id"],
+                    }
+                    for item in catalog["datasets"]
+                    if item.get("canonical_valid") is True
+                ],
+            },
+        )
+        return reports_dir, quant_data_root, provider
+
+    def test_v2_manifest_evidence_rejects_partial_catalog_with_malformed_entry(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _manifest_official_entry_evidence,
+        )
+
+        manifest = {
+            "schema_version": 2,
+            "datasets": {
+                "qlib_ashare_v2": {
+                    "dataset_id": "qlib_ashare_v2",
+                    "role": "canonical",
+                    "status": "ready",
+                },
+                "malformed": "not-an-object",
+            },
+        }
+        manifest_sha256 = "a" * 64
+        inventory = {
+            "catalog": {
+                "status": "partial",
+                "errors": ["malformed: dataset entry must be an object"],
+                "manifest_sha256": manifest_sha256,
+                "validation_contract_version": 2,
+                "dataset_count": 1,
+                "validated_dataset_ids": ["qlib_ashare_v2"],
+                "datasets": [
+                    {
+                        "dataset_id": "qlib_ashare_v2",
+                        "canonical_valid": True,
+                        "snapshot_path": "/tmp/native-v2",
+                        "state_fingerprint": {},
+                    }
+                ],
+            }
+        }
+
+        with (
+            patch(
+                "api.v1.endpoints.research_status._inventory_latest_pointer_status",
+                return_value="verified",
+            ),
+            patch(
+                "api.v1.endpoints.research_status._inventory_snapshot_state_status",
+                return_value="verified",
+            ),
+        ):
+            evidence = _manifest_official_entry_evidence(
+                manifest,
+                inventory=inventory,
+                current_manifest_sha256=manifest_sha256,
+            )
+
+        self.assertEqual(evidence["official_entries"], 0)
+        self.assertEqual(evidence["validation_status"], "unverified")
+
+    def _write_hygiene_bundle(
+        self,
+        reports_dir: Path,
+        inventory: dict,
+        cleanup_plan: dict | None = None,
+    ) -> Path:
+        cleanup_plan = cleanup_plan or {
+            "generated_at": "2026-07-30T12:00:00+08:00",
+            "dry_run_only": True,
+            "actions": [],
+        }
+        inventory_bytes = (
+            json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        cleanup_bytes = (
+            json.dumps(cleanup_plan, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        bundle_digest = hashlib.sha256(
+            inventory_bytes + b"\0" + cleanup_bytes
+        ).hexdigest()
+        suffix = f"20260730_120000_{bundle_digest[:16]}"
+        inventory_artifact = reports_dir / f"data_hygiene_inventory_{suffix}.json"
+        cleanup_artifact = reports_dir / f"data_hygiene_cleanup_plan_{suffix}.json"
+        inventory_artifact.write_bytes(inventory_bytes)
+        cleanup_artifact.write_bytes(cleanup_bytes)
+        (reports_dir / "data_hygiene_inventory_latest.json").write_bytes(
+            inventory_bytes
+        )
+        (reports_dir / "data_hygiene_cleanup_plan_latest.json").write_bytes(
+            cleanup_bytes
+        )
+        pointer = reports_dir / "data_hygiene_reports_latest.json"
+        pointer.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "publication_contract": (
+                        "atomic_json_pointer_to_immutable_hygiene_bundle_v1"
+                    ),
+                    "bundle_id": f"data-hygiene-{bundle_digest[:16]}",
+                    "inventory_artifact": inventory_artifact.name,
+                    "inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
+                    "cleanup_plan_artifact": cleanup_artifact.name,
+                    "cleanup_plan_sha256": hashlib.sha256(cleanup_bytes).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return pointer
+
+    def _read_hygiene_inventory(self, reports_dir: Path) -> dict:
+        pointer = json.loads(
+            (reports_dir / "data_hygiene_reports_latest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return json.loads(
+            (reports_dir / pointer["inventory_artifact"]).read_text(
+                encoding="utf-8"
+            )
+        )
 
     def test_status_rejects_root_catalog_without_v2_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1076,9 +1317,6 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 Path(temp_dir) / "qlib_research_model_explainability_latest.json"
             )
             quality_report_path = Path(temp_dir) / "data_quality_report_latest.md"
-            quality_report_json_path = (
-                Path(temp_dir) / "data_quality_report_latest.json"
-            )
             cleaning_strategy_path = Path(temp_dir) / "data_cleaning_strategy_latest.md"
             quant_data_root = Path(temp_dir) / "quant_data"
             quant_data_root.mkdir()
@@ -1230,27 +1468,38 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            quality_report_path.write_text(
+            quality_markdown = (
                 "# A-Share Data Quality Report\n\n"
-                "- Stock universe: 5509\n"
-                "- Merged usable instruments: 5340\n"
-                "- Merged rows: 7,580,087\n"
-                "- Calendar range: 2020-01-02T00:00:00+08:00 ~ 2026-07-03T15:00:00+08:00\n",
+                "- Stock universe: 5510\n"
+                "- Canonical qfq usable instruments: 5341\n"
+                "- Canonical qfq rows: 7,580,088\n"
+                "- Canonical qfq date range: 2020-01-03 ~ 2026-07-06\n"
+            )
+            quality_report_path.write_text(
+                quality_markdown,
                 encoding="utf-8",
             )
-            quality_report_json_path.write_text(
-                json.dumps(
-                    {
-                        "summary": {
-                            "stock_universe": 5510,
-                            "usable_instruments": 5341,
-                            "total_rows": "7,580,088",
-                            "date_range": "2020-01-03 ~ 2026-07-06",
-                        }
-                    }
-                ),
-                encoding="utf-8",
+            quality_report_id, quality_evidence_sha256 = write_quality_evidence(
+                Path(temp_dir),
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "trainable": True,
+                    "summary": {
+                        "stock_universe": 5510,
+                        "usable_instruments": 5341,
+                        "total_rows": "7,580,088",
+                        "date_range": "2020-01-03 ~ 2026-07-06",
+                    },
+                },
+                markdown=quality_markdown,
+                timestamp="20260706_090000",
             )
+            status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+            status_payload["quality_report_id"] = quality_report_id
+            status_payload["quality_evidence_sha256"] = quality_evidence_sha256
+            status_path.write_text(json.dumps(status_payload), encoding="utf-8")
             cleaning_strategy_path.write_text("# Cleaning Strategy\n", encoding="utf-8")
             manifest_path.write_text(
                 json.dumps(
@@ -1457,34 +1706,76 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(acceptance_by_id["opencode_review"]["status"], "verified")
         self.assertIn("opencode", acceptance_by_id["opencode_review"]["evidence"])
 
-    def test_experiment_file_guard_uses_msvcrt_fallback_when_fcntl_is_unavailable(
+    def test_experiment_file_guard_uses_shared_cross_platform_lock_adapter(
         self,
     ) -> None:
         from api.v1.endpoints.research_status import _experiment_file_guard
 
-        class FakeMsvcrt:
-            LK_LOCK = 1
-            LK_UNLCK = 2
-
-            def __init__(self) -> None:
-                self.calls: list[tuple[int, int]] = []
-
-            def locking(self, _fileno: int, mode: int, size: int) -> None:
-                self.calls.append((mode, size))
-
-        fake_msvcrt = FakeMsvcrt()
         with tempfile.TemporaryDirectory() as temp_dir:
             reports_dir = Path(temp_dir)
             with (
-                patch("api.v1.endpoints.research_status.fcntl", None),
-                patch("api.v1.endpoints.research_status.msvcrt", fake_msvcrt),
+                patch(
+                    "api.v1.endpoints.research_status.lock_file",
+                    create=True,
+                ) as lock_file,
+                patch(
+                    "api.v1.endpoints.research_status.unlock_file",
+                    create=True,
+                ) as unlock_file,
             ):
                 with _experiment_file_guard(reports_dir):
                     self.assertTrue((reports_dir / ".experiment.lock").exists())
 
-        self.assertEqual(
-            fake_msvcrt.calls, [(FakeMsvcrt.LK_LOCK, 1), (FakeMsvcrt.LK_UNLCK, 1)]
-        )
+        lock_file.assert_called_once()
+        lock_handle = lock_file.call_args.args[0]
+        self.assertEqual(lock_file.call_args.kwargs, {"exclusive": True})
+        self.assertIn("b", lock_handle.mode)
+        unlock_file.assert_called_once_with(lock_handle)
+
+    def test_bounded_file_read_supports_platforms_without_fd_capabilities(self) -> None:
+        from api.v1.endpoints import research_status
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nested = root / "nested"
+            nested.mkdir()
+            target = nested / "status.json"
+            target.write_bytes(b'{"status":"ok"}')
+            with (
+                patch.object(research_status.os, "supports_dir_fd", set()),
+                patch.object(research_status.os, "supports_fd", set()),
+            ):
+                content = research_status._read_bounded_regular_file_at(
+                    root,
+                    Path("nested/status.json"),
+                    max_bytes=1024,
+                )
+
+        self.assertEqual(content, b'{"status":"ok"}')
+
+    def test_bounded_file_read_rejects_symlink_on_fallback_platform_path(self) -> None:
+        from api.v1.endpoints import research_status
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            outside = root / "outside.json"
+            outside.write_bytes(b"secret")
+            link = root / "status.json"
+            try:
+                link.symlink_to(outside)
+            except OSError as exc:  # pragma: no cover - platform privilege fallback.
+                self.skipTest(f"symlink unavailable: {exc}")
+            with (
+                patch.object(research_status.os, "supports_dir_fd", set()),
+                patch.object(research_status.os, "supports_fd", set()),
+            ):
+                content = research_status._read_bounded_regular_file_at(
+                    root,
+                    Path("status.json"),
+                    max_bytes=1024,
+                )
+
+        self.assertIsNone(content)
 
     def test_status_keeps_data_entry_separate_from_latest_training_provider(
         self,
@@ -1993,6 +2284,51 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         finally:
             research_status._clear_native_qlib_validation_cache()
 
+    def test_native_snapshot_validation_cache_retains_distinct_snapshots(self) -> None:
+        from api.v1.endpoints import research_status
+
+        research_status._clear_native_qlib_validation_cache()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                first_provider = root / "first"
+                second_provider = root / "second"
+                first_provider.mkdir()
+                second_provider.mkdir()
+                first_manifest = {"snapshot_id": "first"}
+                second_manifest = {"snapshot_id": "second"}
+
+                with patch.object(
+                    research_status,
+                    "validate_qlib_snapshot",
+                    side_effect=[first_manifest, second_manifest],
+                ) as validator:
+                    with patch.object(research_status.time, "monotonic", return_value=0.0):
+                        first = research_status._validate_native_qlib_snapshot_cached(
+                            first_provider,
+                            manifest_sha256="a" * 64,
+                            evidence_root=root,
+                        )
+                    with patch.object(research_status.time, "monotonic", return_value=1.0):
+                        second = research_status._validate_native_qlib_snapshot_cached(
+                            second_provider,
+                            manifest_sha256="b" * 64,
+                            evidence_root=root,
+                        )
+                    with patch.object(research_status.time, "monotonic", return_value=2.0):
+                        first_again = research_status._validate_native_qlib_snapshot_cached(
+                            first_provider,
+                            manifest_sha256="a" * 64,
+                            evidence_root=root,
+                        )
+
+            self.assertEqual(first, first_manifest)
+            self.assertEqual(second, second_manifest)
+            self.assertEqual(first_again, first_manifest)
+            self.assertEqual(validator.call_count, 2)
+        finally:
+            research_status._clear_native_qlib_validation_cache()
+
     def test_directory_size_cache_avoids_repeated_provider_scans_until_ttl(
         self,
     ) -> None:
@@ -2077,7 +2413,11 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         from api.v1.endpoints.research_status import _data_hygiene_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir)
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            quant_data_root = root / "quant_data"
+            quant_data_root.mkdir()
             (reports_dir / "data_hygiene_inventory_latest.json").write_text(
                 json.dumps({"generated_at": "2026-07-07T00:00:00+08:00", "items": []}),
                 encoding="utf-8",
@@ -2096,7 +2436,11 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            payload = _data_hygiene_payload(reports_dir)
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
 
         self.assertEqual(payload["cleanup_plan"]["total_actions"], 55)
         self.assertEqual(len(payload["cleanup_plan"]["actions"]), 50)
@@ -2134,6 +2478,1730 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["manifest"]["status"], "available")
         self.assertEqual(payload["manifest"]["official_entries"], 2)
+
+    def test_data_hygiene_manifest_rejects_unverified_canonical_ready_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            quant_data_root = Path(temp_dir) / "quant_data"
+            quant_data_root.mkdir()
+            manifest_path = quant_data_root / "DATA_MANIFEST.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "path_format": "relative_to_quant_data_root",
+                        "official_entries": {"legacy_pointer": {}},
+                        "datasets": {
+                            dataset_id: {
+                                "dataset_id": dataset_id,
+                                "role": role,
+                                "status": status,
+                            }
+                            for dataset_id, role, status in (
+                                ("ashare_daily_qfq", "canonical", "ready"),
+                                ("qlib_ashare_v2", "canonical", "ready"),
+                                ("unverified_canonical", "canonical", "ready"),
+                                ("pending_canonical", "canonical", "building"),
+                                ("legacy_compatibility", "legacy", "ready"),
+                            )
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            ashare_snapshot = quant_data_root / "snapshots" / "ashare"
+            qlib_snapshot = quant_data_root / "snapshots" / "qlib"
+            for snapshot, content in (
+                (ashare_snapshot, b"ashare"),
+                (qlib_snapshot, b"qlib"),
+            ):
+                snapshot.mkdir(parents=True)
+                (snapshot / "data.bin").write_bytes(content)
+            inventory = {
+                "catalog": {
+                    "manifest_sha256": manifest_sha256,
+                    "validation_contract_version": 2,
+                    "validated_dataset_ids": [
+                        "ashare_daily_qfq",
+                        "qlib_ashare_v2",
+                    ],
+                    "datasets": [
+                        {
+                            "dataset_id": "ashare_daily_qfq",
+                            "canonical_valid": True,
+                            "snapshot_path": str(ashare_snapshot),
+                            "state_fingerprint": filesystem_state_fingerprint(
+                                ashare_snapshot
+                            ),
+                        },
+                        {
+                            "dataset_id": "qlib_ashare_v2",
+                            "canonical_valid": True,
+                            "snapshot_path": str(qlib_snapshot),
+                            "state_fingerprint": filesystem_state_fingerprint(
+                                qlib_snapshot
+                            ),
+                        },
+                        {
+                            "dataset_id": "unverified_canonical",
+                            "canonical_valid": False,
+                        },
+                    ],
+                },
+                "items": [
+                    {"category": "official", "dataset_id": "ashare_daily_qfq"},
+                    {"category": "official", "dataset_id": "qlib_ashare_v2"},
+                    {"category": "legacy", "dataset_id": "legacy_compatibility"},
+                ],
+            }
+            self._write_hygiene_bundle(reports_dir, inventory)
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT", quant_data_root
+            ):
+                from api.v1.endpoints.research_status import _data_hygiene_payload
+
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["manifest"]["status"], "unverified")
+        self.assertEqual(payload["manifest"]["official_entries"], 0)
+        self.assertEqual(payload["manifest"]["validation_status"], "unverified")
+        self.assertEqual(payload["inventory"]["status"], "unverified")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_manifest_rejects_stale_inventory_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            quant_data_root = Path(temp_dir) / "quant_data"
+            quant_data_root.mkdir()
+            manifest_path = quant_data_root / "DATA_MANIFEST.json"
+            original_manifest = {
+                "schema_version": 2,
+                "path_format": "relative_to_quant_data_root",
+                "datasets": {
+                    "ashare_daily_qfq": {
+                        "dataset_id": "ashare_daily_qfq",
+                        "role": "canonical",
+                        "status": "ready",
+                    }
+                },
+            }
+            manifest_path.write_text(json.dumps(original_manifest), encoding="utf-8")
+            original_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            (reports_dir / "data_hygiene_inventory_latest.json").write_text(
+                json.dumps(
+                    {
+                        "catalog": {
+                            "manifest_sha256": original_hash,
+                            "validated_dataset_ids": ["ashare_daily_qfq"],
+                            "datasets": [
+                                {
+                                    "dataset_id": "ashare_daily_qfq",
+                                    "canonical_valid": True,
+                                }
+                            ],
+                        },
+                        "items": [
+                            {"category": "official", "dataset_id": "ashare_daily_qfq"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        **original_manifest,
+                        "datasets": {
+                            "replacement": {
+                                "dataset_id": "replacement",
+                                "role": "canonical",
+                                "status": "ready",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT", quant_data_root
+            ):
+                from api.v1.endpoints.research_status import _data_hygiene_payload
+
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["manifest"]["official_entries"], 0)
+        self.assertEqual(payload["manifest"]["validation_status"], "stale")
+        self.assertEqual(payload["manifest"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["validation_status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_inventory_after_snapshot_file_is_deleted(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            (provider / "features" / "sh600000" / "close.day.bin").unlink()
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["manifest"]["validation_status"], "stale")
+        self.assertEqual(payload["manifest"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_inventory_after_root_manifest_is_deleted(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            (quant_data_root / "DATA_MANIFEST.json").unlink()
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_inventory_after_latest_pointer_changes(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            latest = provider.parents[1] / "LATEST.json"
+            pointer = json.loads(latest.read_text(encoding="utf-8"))
+            pointer["snapshot_id"] = "missing-snapshot"
+            pointer["snapshot_path"] = (
+                "qlib/cn_data_ashare_v2/snapshots/missing-snapshot"
+            )
+            latest.write_text(json.dumps(pointer), encoding="utf-8")
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_detects_equal_size_content_change_with_restored_mtime(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            feature = provider / "features" / "sh600000" / "close.day.bin"
+            before = feature.stat()
+            content = feature.read_bytes()
+            feature.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+            os.utime(
+                feature,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rechecks_snapshot_on_every_status_read(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                initial = _data_hygiene_payload(reports_dir)
+                feature = provider / "features" / "sh600000" / "close.day.bin"
+                feature.write_bytes(feature.read_bytes() + b"changed")
+                changed = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(initial["inventory"]["status"], "available")
+        self.assertEqual(changed["inventory"]["status"], "stale")
+        self.assertEqual(changed["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_snapshot_path_with_symlink_component(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            inventory = self._read_hygiene_inventory(reports_dir)
+            linked_snapshot = quant_data_root / "linked_snapshot"
+            try:
+                linked_snapshot.symlink_to(provider, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink not supported on this filesystem: {exc}")
+            record = next(
+                item
+                for item in inventory["catalog"]["datasets"]
+                if item.get("dataset_id") == "qlib_ashare_v2"
+            )
+            record["snapshot_path"] = str(linked_snapshot)
+            self._write_hygiene_bundle(reports_dir, inventory)
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_latest_pointer_with_symlink_component(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            inventory = self._read_hygiene_inventory(reports_dir)
+            record = next(
+                item
+                for item in inventory["catalog"]["datasets"]
+                if item.get("dataset_id") == "qlib_ashare_v2"
+            )
+            real_pointer = Path(record["latest_pointer_path"])
+            linked_pointer = quant_data_root / "linked_latest.json"
+            try:
+                linked_pointer.symlink_to(real_pointer)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink not supported on this filesystem: {exc}")
+            record["latest_pointer_path"] = str(linked_pointer)
+            self._write_hygiene_bundle(reports_dir, inventory)
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_rejects_symlinked_root_manifest(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            manifest_path = quant_data_root / "DATA_MANIFEST.json"
+            real_manifest = quant_data_root / "DATA_MANIFEST.real.json"
+            manifest_path.replace(real_manifest)
+            try:
+                manifest_path.symlink_to(real_manifest)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink not supported on this filesystem: {exc}")
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertNotEqual(payload["manifest"]["status"], "available")
+        self.assertNotEqual(payload["manifest"]["validation_status"], "verified")
+        self.assertEqual(payload["manifest"]["official_entries"], 0)
+
+    def test_data_hygiene_hides_cleanup_actions_when_manifest_is_stale(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            inventory = self._read_hygiene_inventory(reports_dir)
+            self._write_hygiene_bundle(
+                reports_dir,
+                inventory,
+                cleanup_plan={
+                    "generated_at": "2026-07-30T12:00:00+08:00",
+                    "dry_run_only": True,
+                    "actions": [
+                        {
+                            "action": "archive",
+                            "source": str(provider),
+                            "requires_user_confirmation": True,
+                        }
+                    ],
+                },
+            )
+            feature = provider / "features" / "sh600000" / "close.day.bin"
+            feature.write_bytes(feature.read_bytes() + b"changed")
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["cleanup_plan"]["status"], "stale")
+        self.assertEqual(payload["cleanup_plan"]["total_actions"], 0)
+        self.assertEqual(payload["cleanup_plan"]["actions"], [])
+
+    def test_data_hygiene_reads_immutable_bundle_not_compatibility_latest(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            (reports_dir / "data_hygiene_inventory_latest.json").write_text(
+                '{"items":[]}',
+                encoding="utf-8",
+            )
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "available")
+        self.assertGreater(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_fails_closed_when_v2_bundle_pointer_is_deleted(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            (reports_dir / "data_hygiene_reports_latest.json").unlink()
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_state_scan_fails_closed_at_entry_limit(self) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir, quant_data_root, _provider = (
+                self._write_native_hygiene_inventory(root)
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    quant_data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.DATA_HYGIENE_STATE_SCAN_MAX_ENTRIES",
+                    0,
+                ),
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["inventory"]["status"], "stale")
+        self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_data_hygiene_state_scan_waits_for_concurrent_reader(self) -> None:
+        import api.v1.endpoints.research_status as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = Path(temp_dir) / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "data.bin").write_bytes(b"stable")
+            first_scan_started = threading.Event()
+            release_first_scan = threading.Event()
+            second_scan_started = threading.Event()
+            second_scan_finished = threading.Event()
+            results: list[dict] = []
+            errors: list[BaseException] = []
+            original_fingerprint = module.filesystem_state_fingerprint
+            call_count = 0
+            call_count_lock = threading.Lock()
+
+            def controlled_fingerprint(path: Path, **kwargs):
+                nonlocal call_count
+                with call_count_lock:
+                    call_count += 1
+                    is_first = call_count == 1
+                if is_first:
+                    first_scan_started.set()
+                    self.assertTrue(release_first_scan.wait(timeout=2))
+                return original_fingerprint(path, **kwargs)
+
+            def scan(*, second: bool = False) -> None:
+                if second:
+                    second_scan_started.set()
+                try:
+                    results.append(module._filesystem_state_fingerprint_live(snapshot))
+                except BaseException as exc:  # noqa: BLE001 - captured for assertion.
+                    errors.append(exc)
+                finally:
+                    if second:
+                        second_scan_finished.set()
+
+            with patch.object(
+                module,
+                "filesystem_state_fingerprint",
+                side_effect=controlled_fingerprint,
+            ):
+                first = threading.Thread(target=scan)
+                second = threading.Thread(target=scan, kwargs={"second": True})
+                first.start()
+                self.assertTrue(first_scan_started.wait(timeout=2))
+                second.start()
+                self.assertTrue(second_scan_started.wait(timeout=2))
+                finished_while_locked = second_scan_finished.wait(timeout=0.1)
+                release_first_scan.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+
+        self.assertFalse(finished_while_locked)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+
+    def test_data_quality_summary_fails_closed_when_latest_pointer_is_invalid(self) -> None:
+        from api.v1.endpoints.research_status import _data_quality_summary_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            current_markdown = (
+                "# A-Share Data Quality Report\n\n"
+                "- Stock universe: 5509\n"
+                "- Canonical qfq usable instruments: 5340\n"
+                "- Canonical qfq rows: 7,580,087\n"
+                "- Canonical qfq date range: 2020-01-02 ~ 2026-07-03\n"
+            )
+            old_markdown = current_markdown.replace("5509", "1").replace("5340", "1")
+            (reports_dir / "data_quality_report_latest.md").write_text(
+                current_markdown,
+                encoding="utf-8",
+            )
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "report_id": "old-report",
+                        "markdown_sha256": hashlib.sha256(
+                            old_markdown.encode("utf-8")
+                        ).hexdigest(),
+                        "summary": {
+                            "stock_universe": 1,
+                            "usable_instruments": 1,
+                            "total_rows": 1,
+                            "date_range": "1990-01-01 ~ 1990-01-02",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = _data_quality_summary_payload(reports_dir)
+
+        self.assertIsNone(summary)
+
+    def test_data_hygiene_marks_quality_report_invalid_when_pointer_is_invalid(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _data_hygiene_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            quant_data_root = root / "quant_data"
+            quant_data_root.mkdir()
+            (reports_dir / "data_quality_report_latest.md").write_text(
+                "# stale compatibility report\n\n- Stock universe: 5509\n",
+                encoding="utf-8",
+            )
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                '{"schema_version":1}',
+                encoding="utf-8",
+            )
+
+            with patch(
+                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                quant_data_root,
+            ):
+                payload = _data_hygiene_payload(reports_dir)
+
+        self.assertEqual(payload["quality_report"]["status"], "invalid")
+        self.assertIsNone(payload["quality_report"]["summary"])
+
+    def test_data_quality_summary_is_derived_from_markdown_not_json_claims(self) -> None:
+        from api.v1.endpoints.research_status import _data_quality_summary_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            markdown = (
+                "# A-Share Data Quality Report\n\n"
+                "- Stock universe: 5509\n"
+                "- Canonical qfq usable instruments: 5340\n"
+                "- Canonical qfq rows: 7,580,087\n"
+                "- Canonical qfq date range: 2020-01-02 ~ 2026-07-03\n"
+            )
+            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
+            artifact.write_text(markdown, encoding="utf-8")
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "report_id": f"data-quality-{digest[:16]}",
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_markdown_v1"
+                        ),
+                        "markdown_artifact": artifact.name,
+                        "markdown_sha256": digest,
+                        "summary": {
+                            "stock_universe": 1,
+                            "usable_instruments": 1,
+                            "total_rows": 1,
+                            "date_range": "1990-01-01 ~ 1990-01-02",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = _data_quality_summary_payload(reports_dir)
+
+        self.assertEqual(summary["stock_universe"], "5509")
+        self.assertEqual(summary["total_rows"], "7,580,087")
+
+    def test_data_quality_summary_hashes_and_parses_the_same_markdown_bytes(
+        self,
+    ) -> None:
+        import api.v1.endpoints.research_status as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            original = "# Report\n\n- Stock universe: 5509\n"
+            replacement = "# Report\n\n- Stock universe: 1\n"
+            digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
+            artifact.write_text(original, encoding="utf-8")
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "report_id": f"data-quality-{digest[:16]}",
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_markdown_v1"
+                        ),
+                        "markdown_artifact": artifact.name,
+                        "markdown_sha256": digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            real_sha256 = hashlib.sha256
+            swapped = False
+
+            def swapping_sha256(data: bytes = b""):
+                nonlocal swapped
+                if data == original.encode("utf-8") and not swapped:
+                    artifact.write_text(replacement, encoding="utf-8")
+                    swapped = True
+                return real_sha256(data)
+
+            with patch.object(module.hashlib, "sha256", side_effect=swapping_sha256):
+                summary = module._data_quality_summary_payload(reports_dir)
+
+        self.assertTrue(swapped)
+        self.assertEqual(summary, {"stock_universe": "5509"})
+
+    def test_data_quality_summary_open_does_not_follow_markdown_symlink(self) -> None:
+        import api.v1.endpoints.research_status as module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            markdown = "# Report\n\n- Stock universe: 5509\n"
+            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            outside = root / "outside.md"
+            outside.write_text(markdown, encoding="utf-8")
+            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
+            try:
+                artifact.symlink_to(outside)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink not supported on this filesystem: {exc}")
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "report_id": f"data-quality-{digest[:16]}",
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_markdown_v1"
+                        ),
+                        "markdown_artifact": artifact.name,
+                        "markdown_sha256": digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            real_is_symlink = Path.is_symlink
+
+            def stale_symlink_check(path: Path) -> bool:
+                if path == artifact:
+                    return False
+                return real_is_symlink(path)
+
+            with patch.object(
+                Path,
+                "is_symlink",
+                autospec=True,
+                side_effect=stale_symlink_check,
+            ):
+                summary = module._data_quality_summary_payload(reports_dir)
+
+        self.assertIsNone(summary)
+
+    def test_research_status_route_is_sync_for_fastapi_threadpool(self) -> None:
+        from api.v1.endpoints.research_status import get_research_status
+
+        self.assertFalse(inspect.iscoroutinefunction(get_research_status))
+
+    def test_status_blocks_training_when_quality_publication_id_is_newer(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": "data-quality-0000000000000000",
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Previous full scan passed.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            markdown = "# Quality\n\n- Stock universe: 5509\n"
+            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            artifact = reports_dir / (
+                f"data_quality_report_20260731_110000_{digest[:16]}.md"
+            )
+            artifact.write_text(markdown, encoding="utf-8")
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "report_id": f"data-quality-{digest[:16]}",
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_markdown_v1"
+                        ),
+                        "markdown_artifact": artifact.name,
+                        "markdown_sha256": digest,
+                        "scan_mode": "full",
+                        "verification_status": "verified",
+                        "trainable": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertIn("does not match", payload["training_readiness"]["summary"])
+
+    def test_status_blocks_training_for_matching_sampled_quality_report(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            markdown = "# Quality\n\n- Stock universe: 1\n"
+            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+            report_id = f"data-quality-{digest[:16]}"
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": report_id,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Stale optimistic state.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            artifact = reports_dir / (
+                f"data_quality_report_20260731_110000_{digest[:16]}.md"
+            )
+            artifact.write_text(markdown, encoding="utf-8")
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "report_id": report_id,
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_markdown_v1"
+                        ),
+                        "markdown_artifact": artifact.name,
+                        "markdown_sha256": digest,
+                        "scan_mode": "sampled",
+                        "verification_status": "unverified",
+                        "trainable": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertIn("not fully verified", payload["training_readiness"]["summary"])
+
+    def test_status_blocks_verified_evidence_with_lowered_thresholds(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            report_id, evidence_sha256 = write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "trainable": True,
+                    "training_thresholds": {
+                        "min_calendar_days": 0,
+                        "min_instruments": 0,
+                        "min_merged_instruments": 0,
+                        "authoritative_min_calendar_days": 252,
+                        "authoritative_min_instruments": 100,
+                        "authoritative": False,
+                    },
+                },
+            )
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": report_id,
+                        "quality_evidence_sha256": evidence_sha256,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Lowered thresholds passed.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertIn("not fully verified", payload["training_readiness"]["summary"])
+
+    def test_status_blocks_training_without_quality_publication(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Legacy optimistic state.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertIn("missing or invalid", payload["training_readiness"]["summary"])
+
+    def test_status_normalizes_non_boolean_trainable_values_to_false(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            for raw_trainable in ("false", "true", 1, None):
+                with self.subTest(raw_trainable=raw_trainable):
+                    status_path.write_text(
+                        json.dumps(
+                            {
+                                "generated_at": "2026-07-31T10:00:00+08:00",
+                                "trainable": raw_trainable,
+                                "training_readiness": {
+                                    "status": "trainable",
+                                    "summary": "Malformed optimistic state.",
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with (
+                        patch(
+                            "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                            status_path,
+                        ),
+                        patch(
+                            "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                            return_value=_NativeQlibProviderResolution(
+                                authoritative=False
+                            ),
+                        ),
+                    ):
+                        payload = build_research_status_payload()
+
+                    self.assertIs(payload["trainable"], False)
+                    self.assertEqual(
+                        payload["training_readiness"]["status"], "blocked"
+                    )
+                    self.assertIn(
+                        "invalid trainable flag",
+                        payload["training_readiness"]["summary"],
+                    )
+
+    def test_status_blocks_quality_evidence_from_another_native_snapshot(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            old_hash = "1" * 64
+            report_id, evidence_sha256 = write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "trainable": True,
+                    "data_contract": {
+                        "status": "verified",
+                        "qlib_providers": {
+                            "canonical": {
+                                "dataset_id": "qlib_ashare_v2",
+                                "snapshot_id": "old-snapshot",
+                                "manifest_sha256": old_hash,
+                                "content_sha256": old_hash,
+                            }
+                        },
+                    },
+                },
+            )
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": report_id,
+                        "quality_evidence_sha256": evidence_sha256,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Full scan passed.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            current_hash = "2" * 64
+            pointer_path = reports_dir / "data_quality_report_latest.json"
+            forged_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            forged_pointer["data_contract"] = {
+                "status": "verified",
+                "qlib_providers": {
+                    "canonical": {
+                        "dataset_id": "qlib_ashare_v2",
+                        "snapshot_id": "current-snapshot",
+                        "manifest_sha256": current_hash,
+                        "content_sha256": current_hash,
+                    }
+                },
+            }
+            pointer_path.write_text(json.dumps(forged_pointer), encoding="utf-8")
+            native = _NativeQlibProviderResolution(
+                authoritative=True,
+                path=reports_dir / "provider",
+                dataset_id="qlib_ashare_v2",
+                snapshot_id="current-snapshot",
+                manifest_sha256=current_hash,
+                content_sha256=current_hash,
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=native,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "blocked")
+        self.assertIn("native V2 snapshot", payload["training_readiness"]["summary"])
+
+    def test_status_blocks_native_snapshot_without_provider_quality_record(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _DataQualityPublication,
+            _NativeQlibProviderResolution,
+            _apply_data_quality_training_gate,
+        )
+
+        snapshot_hash = "4" * 64
+        report_id = "data-quality-1234567890abcdef"
+        evidence_sha256 = "5" * 64
+        status = {
+            "trainable": True,
+            "quality_report_id": report_id,
+            "quality_evidence_sha256": evidence_sha256,
+            "training_readiness": {
+                "status": "trainable",
+                "summary": "Legacy provider-agnostic result.",
+            },
+        }
+        evidence = {
+            "scan_mode": "full",
+            "coverage_status": "full",
+            "verification_status": "verified",
+            "trainable": True,
+            "training_thresholds": {
+                "min_calendar_days": 252,
+                "min_instruments": 100,
+                "min_merged_instruments": 100,
+                "authoritative": True,
+            },
+            "data_contract": {
+                "status": "verified",
+                "qlib_providers": {
+                    "cleaned": {
+                        "dataset_id": "qlib_ashare_cleaned_v2",
+                        "snapshot_id": "cleaned-snapshot",
+                        "manifest_sha256": snapshot_hash,
+                        "content_sha256": snapshot_hash,
+                    }
+                },
+            },
+        }
+        publication = _DataQualityPublication(
+            payload=evidence,
+            markdown_bytes=b"# Quality\n",
+            report_id=report_id,
+            evidence_sha256=evidence_sha256,
+            training_authoritative=True,
+        )
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/cleaned-provider"),
+            dataset_id="qlib_ashare_cleaned_v2",
+            snapshot_id="cleaned-snapshot",
+            manifest_sha256=snapshot_hash,
+            content_sha256=snapshot_hash,
+        )
+
+        with patch(
+            "api.v1.endpoints.research_status._data_quality_publication_from_json",
+            return_value=publication,
+        ):
+            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_readiness"]["status"], "blocked")
+        self.assertIn(
+            "provider-specific quality", status["training_readiness"]["summary"]
+        )
+
+    def test_status_blocks_provider_quality_without_semantic_contract_metrics(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _DataQualityPublication,
+            _NativeQlibProviderResolution,
+            _apply_data_quality_training_gate,
+        )
+
+        snapshot_hash = "4" * 64
+        report_id = "data-quality-1234567890abcdef"
+        evidence_sha256 = "5" * 64
+        provider_identity = {
+            "dataset_id": "qlib_ashare_cleaned_v2",
+            "snapshot_id": "cleaned-snapshot",
+            "manifest_sha256": snapshot_hash,
+            "content_sha256": snapshot_hash,
+        }
+        status = {
+            "trainable": True,
+            "quality_report_id": report_id,
+            "quality_evidence_sha256": evidence_sha256,
+            "training_readiness": {
+                "status": "trainable",
+                "summary": "Legacy provider metrics passed.",
+            },
+        }
+        evidence = {
+            "scan_mode": "full",
+            "coverage_status": "full",
+            "verification_status": "verified",
+            "trainable": True,
+            "training_thresholds": {
+                "min_calendar_days": 252,
+                "min_instruments": 100,
+                "min_merged_instruments": 100,
+                "authoritative": True,
+            },
+            "provider_quality": {
+                "cleaned": {
+                    **provider_identity,
+                    "calendar_days": 252,
+                    "instruments": 100,
+                    "instrument_feature_dirs": 100,
+                    "missing_instrument_feature_dirs": 0,
+                    "complete_instrument_feature_dirs": 100,
+                    "incomplete_instrument_feature_dirs": 0,
+                    "missing_instrument_feature_files": 0,
+                    "invalid_instrument_feature_files": 0,
+                    "benchmark_complete": True,
+                    "trainable": True,
+                    "failure_reasons": [],
+                    "training_readiness": {
+                        "status": "trainable",
+                        "summary": "Legacy provider metrics passed.",
+                    },
+                }
+            },
+            "data_contract": {
+                "status": "verified",
+                "qlib_providers": {"cleaned": provider_identity},
+            },
+        }
+        publication = _DataQualityPublication(
+            payload=evidence,
+            markdown_bytes=b"# Quality\n",
+            report_id=report_id,
+            evidence_sha256=evidence_sha256,
+            training_authoritative=True,
+        )
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/cleaned-provider"),
+            dataset_id="qlib_ashare_cleaned_v2",
+            snapshot_id="cleaned-snapshot",
+            manifest_sha256=snapshot_hash,
+            content_sha256=snapshot_hash,
+        )
+
+        with patch(
+            "api.v1.endpoints.research_status._data_quality_publication_from_json",
+            return_value=publication,
+        ):
+            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_readiness"]["status"], "blocked")
+        self.assertIn(
+            "provider-specific quality", status["training_readiness"]["summary"]
+        )
+
+    def test_status_blocks_when_provider_changes_after_quality_publication(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _DataQualityPublication,
+            _NativeQlibProviderResolution,
+            _apply_data_quality_training_gate,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "provider"
+            provider.mkdir()
+            feature = provider / "feature.bin"
+            feature.write_bytes(b"before")
+            published_state = filesystem_state_fingerprint(provider)
+            snapshot_hash = "4" * 64
+            report_id = "data-quality-1234567890abcdef"
+            evidence_sha256 = "5" * 64
+            provider_identity = {
+                "dataset_id": "qlib_ashare_cleaned_v2",
+                "snapshot_id": "cleaned-snapshot",
+                "manifest_sha256": snapshot_hash,
+                "content_sha256": snapshot_hash,
+            }
+            evidence = {
+                "scan_mode": "full",
+                "coverage_status": "full",
+                "verification_status": "verified",
+                "trainable": True,
+                "training_thresholds": {
+                    "min_calendar_days": 252,
+                    "min_instruments": 100,
+                    "min_merged_instruments": 100,
+                    "authoritative": True,
+                },
+                "provider_quality": {
+                    "cleaned": {
+                        **provider_identity,
+                        **valid_provider_semantic_metrics(),
+                        "calendar_days": 252,
+                        "instruments": 100,
+                        "instrument_feature_dirs": 100,
+                        "missing_instrument_feature_dirs": 0,
+                        "complete_instrument_feature_dirs": 100,
+                        "incomplete_instrument_feature_dirs": 0,
+                        "missing_instrument_feature_files": 0,
+                        "invalid_instrument_feature_files": 0,
+                        "benchmark_complete": True,
+                        "trainable": True,
+                        "failure_reasons": [],
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Provider passed.",
+                        },
+                    }
+                },
+                "data_contract": {
+                    "status": "verified",
+                    "qlib_providers": {"cleaned": provider_identity},
+                    "snapshot_state": stable_snapshot_state(
+                        "qlib_ashare_cleaned_v2", published_state
+                    ),
+                },
+            }
+            publication = _DataQualityPublication(
+                payload=evidence,
+                markdown_bytes=b"# Quality\n",
+                report_id=report_id,
+                evidence_sha256=evidence_sha256,
+                training_authoritative=True,
+            )
+            native = _NativeQlibProviderResolution(
+                authoritative=True,
+                path=provider,
+                dataset_id="qlib_ashare_cleaned_v2",
+                snapshot_id="cleaned-snapshot",
+                manifest_sha256=snapshot_hash,
+                content_sha256=snapshot_hash,
+            )
+            status = {
+                "trainable": True,
+                "quality_report_id": report_id,
+                "quality_evidence_sha256": evidence_sha256,
+                "training_readiness": {
+                    "status": "trainable",
+                    "summary": "Provider passed.",
+                },
+            }
+            feature.write_bytes(b"after")
+
+            with patch(
+                "api.v1.endpoints.research_status._data_quality_publication_from_json",
+                return_value=publication,
+            ):
+                _apply_data_quality_training_gate(status, Path(temp_dir), native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_readiness"]["status"], "blocked")
+        self.assertIn("changed", status["training_readiness"]["summary"].lower())
+
+    def test_status_authorizes_quality_approved_cleaned_snapshot(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            cleaned_hash = "3" * 64
+            cleaned_state = stable_state_fingerprint("6")
+            report_id, evidence_sha256 = write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "trainable": True,
+                    "provider_quality": {
+                        "cleaned": {
+                            "dataset_id": "qlib_ashare_cleaned_v2",
+                            "snapshot_id": "cleaned-snapshot",
+                            "manifest_sha256": cleaned_hash,
+                            "content_sha256": cleaned_hash,
+                            **valid_provider_semantic_metrics(),
+                            "calendar_days": 252,
+                            "instruments": 100,
+                            "instrument_feature_dirs": 100,
+                            "missing_instrument_feature_dirs": 0,
+                            "complete_instrument_feature_dirs": 100,
+                            "incomplete_instrument_feature_dirs": 0,
+                            "missing_instrument_feature_files": 0,
+                            "invalid_instrument_feature_files": 0,
+                            "benchmark_complete": True,
+                            "trainable": True,
+                            "failure_reasons": [],
+                            "training_readiness": {
+                                "status": "trainable",
+                                "summary": "Cleaned provider passed.",
+                            },
+                        }
+                    },
+                    "data_contract": {
+                        "status": "verified",
+                        "qlib_providers": {
+                            "cleaned": {
+                                "dataset_id": "qlib_ashare_cleaned_v2",
+                                "snapshot_id": "cleaned-snapshot",
+                                "manifest_sha256": cleaned_hash,
+                                "content_sha256": cleaned_hash,
+                            }
+                        },
+                        "snapshot_state": stable_snapshot_state(
+                            "qlib_ashare_cleaned_v2", cleaned_state
+                        ),
+                    },
+                },
+            )
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": report_id,
+                        "quality_evidence_sha256": evidence_sha256,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Full scan passed.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            native = _NativeQlibProviderResolution(
+                authoritative=True,
+                path=reports_dir / "cleaned-provider",
+                dataset_id="qlib_ashare_cleaned_v2",
+                snapshot_id="cleaned-snapshot",
+                manifest_sha256=cleaned_hash,
+                content_sha256=cleaned_hash,
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=native,
+                ) as resolve_native,
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._filesystem_state_fingerprint_live",
+                    return_value=cleaned_state,
+                ),
+            ):
+                payload = build_research_status_payload(
+                    provider_dataset_id="qlib_ashare_cleaned_v2"
+                )
+
+        resolve_native.assert_called_once_with("qlib_ashare_cleaned_v2")
+        self.assertTrue(payload["trainable"])
+        self.assertEqual(
+            payload["qlib_provider"]["dataset_id"], "qlib_ashare_cleaned_v2"
+        )
+
+    def test_status_can_authorize_cleaned_when_canonical_quality_failed(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _DataQualityPublication,
+            _NativeQlibProviderResolution,
+            _apply_data_quality_training_gate,
+        )
+
+        canonical_hash = "2" * 64
+        cleaned_hash = "3" * 64
+        cleaned_state = stable_state_fingerprint("7")
+        report_id = "data-quality-1234567890abcdef"
+        evidence_sha256 = "5" * 64
+        status = {
+            "trainable": False,
+            "quality_report_id": report_id,
+            "quality_evidence_sha256": evidence_sha256,
+            "training_readiness": {
+                "status": "limited",
+                "summary": "Canonical provider failed.",
+            },
+        }
+        evidence = {
+            "scan_mode": "full",
+            "coverage_status": "full",
+            "verification_status": "verified",
+            "trainable": False,
+            "training_thresholds": {
+                "min_calendar_days": 252,
+                "min_instruments": 100,
+                "min_merged_instruments": 100,
+                "authoritative": True,
+            },
+            "provider_quality": {
+                "canonical": {
+                    "dataset_id": "qlib_ashare_v2",
+                    "snapshot_id": "canonical-snapshot",
+                    "manifest_sha256": canonical_hash,
+                    "content_sha256": canonical_hash,
+                    **valid_provider_semantic_metrics(),
+                    "calendar_days": 251,
+                    "instruments": 100,
+                    "instrument_feature_dirs": 100,
+                    "missing_instrument_feature_dirs": 0,
+                    "complete_instrument_feature_dirs": 100,
+                    "incomplete_instrument_feature_dirs": 0,
+                    "missing_instrument_feature_files": 0,
+                    "invalid_instrument_feature_files": 0,
+                    "benchmark_complete": True,
+                    "trainable": False,
+                    "failure_reasons": ["Canonical history is incomplete."],
+                    "training_readiness": {
+                        "status": "limited",
+                        "summary": "Canonical provider failed.",
+                    },
+                },
+                "cleaned": {
+                    "dataset_id": "qlib_ashare_cleaned_v2",
+                    "snapshot_id": "cleaned-snapshot",
+                    "manifest_sha256": cleaned_hash,
+                    "content_sha256": cleaned_hash,
+                    **valid_provider_semantic_metrics(),
+                    "calendar_days": 252,
+                    "instruments": 100,
+                    "instrument_feature_dirs": 100,
+                    "missing_instrument_feature_dirs": 0,
+                    "complete_instrument_feature_dirs": 100,
+                    "incomplete_instrument_feature_dirs": 0,
+                    "missing_instrument_feature_files": 0,
+                    "invalid_instrument_feature_files": 0,
+                    "benchmark_complete": True,
+                    "trainable": True,
+                    "failure_reasons": [],
+                    "training_readiness": {
+                        "status": "trainable",
+                        "summary": "Cleaned provider passed.",
+                    },
+                },
+            },
+            "data_contract": {
+                "status": "verified",
+                "qlib_providers": {
+                    "canonical": {
+                        "dataset_id": "qlib_ashare_v2",
+                        "snapshot_id": "canonical-snapshot",
+                        "manifest_sha256": canonical_hash,
+                        "content_sha256": canonical_hash,
+                    },
+                    "cleaned": {
+                        "dataset_id": "qlib_ashare_cleaned_v2",
+                        "snapshot_id": "cleaned-snapshot",
+                        "manifest_sha256": cleaned_hash,
+                        "content_sha256": cleaned_hash,
+                    },
+                },
+                "snapshot_state": stable_snapshot_state(
+                    "qlib_ashare_cleaned_v2", cleaned_state
+                ),
+            },
+        }
+        publication = _DataQualityPublication(
+            payload=evidence,
+            markdown_bytes=b"# Quality\n",
+            report_id=report_id,
+            evidence_sha256=evidence_sha256,
+            training_authoritative=True,
+        )
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/cleaned-provider"),
+            dataset_id="qlib_ashare_cleaned_v2",
+            snapshot_id="cleaned-snapshot",
+            manifest_sha256=cleaned_hash,
+            content_sha256=cleaned_hash,
+        )
+
+        with (
+            patch(
+                "api.v1.endpoints.research_status._data_quality_publication_from_json",
+                return_value=publication,
+            ),
+            patch(
+                "api.v1.endpoints.research_status._filesystem_state_fingerprint_live",
+                return_value=cleaned_state,
+            ),
+        ):
+            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
+
+        self.assertTrue(status["trainable"])
+        self.assertEqual(status["training_readiness"]["status"], "trainable")
+
+    def test_status_blocks_cleaned_snapshot_when_only_canonical_quality_passes(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            canonical_hash = "2" * 64
+            cleaned_hash = "3" * 64
+            report_id, evidence_sha256 = write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "trainable": True,
+                    "provider_quality": {
+                        "canonical": {
+                            "dataset_id": "qlib_ashare_v2",
+                            "snapshot_id": "canonical-snapshot",
+                            "manifest_sha256": canonical_hash,
+                            "content_sha256": canonical_hash,
+                            **valid_provider_semantic_metrics(),
+                            "calendar_days": 252,
+                            "instruments": 100,
+                            "benchmark_complete": True,
+                            "trainable": True,
+                            "failure_reasons": [],
+                            "training_readiness": {
+                                "status": "trainable",
+                                "summary": "Canonical provider passed.",
+                            },
+                        },
+                        "cleaned": {
+                            "dataset_id": "qlib_ashare_cleaned_v2",
+                            "snapshot_id": "cleaned-snapshot",
+                            "manifest_sha256": cleaned_hash,
+                            "content_sha256": cleaned_hash,
+                            **valid_provider_semantic_metrics(),
+                            "calendar_days": 251,
+                            "instruments": 100,
+                            "instrument_feature_dirs": 100,
+                            "missing_instrument_feature_dirs": 0,
+                            "complete_instrument_feature_dirs": 100,
+                            "incomplete_instrument_feature_dirs": 0,
+                            "missing_instrument_feature_files": 0,
+                            "invalid_instrument_feature_files": 0,
+                            "benchmark_complete": True,
+                            "trainable": False,
+                            "failure_reasons": [
+                                "Qlib calendar has fewer than 252 trading days"
+                            ],
+                            "training_readiness": {
+                                "status": "limited",
+                                "summary": "Cleaned provider has insufficient history.",
+                            },
+                        },
+                    },
+                    "data_contract": {
+                        "status": "verified",
+                        "qlib_providers": {
+                            "canonical": {
+                                "dataset_id": "qlib_ashare_v2",
+                                "snapshot_id": "canonical-snapshot",
+                                "manifest_sha256": canonical_hash,
+                                "content_sha256": canonical_hash,
+                            },
+                            "cleaned": {
+                                "dataset_id": "qlib_ashare_cleaned_v2",
+                                "snapshot_id": "cleaned-snapshot",
+                                "manifest_sha256": cleaned_hash,
+                                "content_sha256": cleaned_hash,
+                            },
+                        },
+                    },
+                },
+            )
+            status_path = reports_dir / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-07-31T10:00:00+08:00",
+                        "trainable": True,
+                        "quality_report_id": report_id,
+                        "quality_evidence_sha256": evidence_sha256,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Canonical provider passed.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            native = _NativeQlibProviderResolution(
+                authoritative=True,
+                path=reports_dir / "cleaned-provider",
+                dataset_id="qlib_ashare_cleaned_v2",
+                snapshot_id="cleaned-snapshot",
+                manifest_sha256=cleaned_hash,
+                content_sha256=cleaned_hash,
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=native,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
+            ):
+                payload = build_research_status_payload(
+                    provider_dataset_id="qlib_ashare_cleaned_v2"
+                )
+
+        self.assertFalse(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "limited")
+        self.assertIn(
+            "insufficient history", payload["training_readiness"]["summary"]
+        )
 
     def test_status_redacts_mlflow_url_credentials_query_and_fragment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2677,6 +4745,174 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         ]
         self.assertEqual(tonghuashun["browser"], "detected 能力：本机应用存在检测")
         self.assertEqual(tonghuashun["restrictions"], ["不自动下单"])
+
+    def test_experiment_notebook_route_does_not_build_full_research_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            static_dir = root / "static"
+            static_dir.mkdir()
+            status_path = root / "research_status_latest.json"
+            status_path.write_text("{}", encoding="utf-8")
+            (root / "experiment_runs.jsonl").write_text(
+                json.dumps(
+                    {
+                        "run_id": "fast-notebook-run",
+                        "experiment_name": "fast_notebook",
+                        "status": "completed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                status_path,
+            ), patch(
+                "api.v1.endpoints.research_status.build_research_status_payload",
+                side_effect=AssertionError("full status must not be built"),
+            ):
+                client = TestClient(
+                    create_app(static_dir=static_dir),
+                    headers={"Origin": "http://127.0.0.1:8010"},
+                )
+                response = client.get("/api/v1/research/experiments")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "available")
+        self.assertEqual(body["total_runs"], 1)
+        self.assertEqual(body["runs"][0]["run_id"], "fast-notebook-run")
+
+    def test_experiment_notebook_reader_acquires_the_shared_file_guard(self) -> None:
+        from api.v1.endpoints import research_status
+
+        events: list[str] = []
+
+        class RecordingGuard:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            with patch.object(
+                research_status,
+                "_experiment_file_guard",
+                side_effect=lambda _reports_dir: RecordingGuard(),
+            ):
+                payload = research_status._experiment_notebook_payload(reports_dir)
+
+        self.assertEqual(payload["status"], "missing")
+        self.assertEqual(events, ["enter", "exit"])
+
+    def test_archive_route_uses_unlocked_reader_while_holding_shared_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            static_dir = root / "static"
+            static_dir.mkdir()
+            status_path = root / "research_status_latest.json"
+            status_path.write_text("{}", encoding="utf-8")
+            (root / "experiment_runs.jsonl").write_text(
+                json.dumps({"run_id": "archive-me"}) + "\n",
+                encoding="utf-8",
+            )
+            notebook = {
+                "status": "missing",
+                "latest_note": "",
+                "runs": [],
+                "total_runs": 0,
+                "invalid_lines": 0,
+                "log_path": "experiment_log.md",
+                "runs_path": "experiment_runs.jsonl",
+            }
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._experiment_notebook_payload",
+                    side_effect=AssertionError("nested experiment guard"),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._experiment_notebook_payload_unlocked",
+                    return_value=notebook,
+                    create=True,
+                ) as read_unlocked,
+            ):
+                client = TestClient(
+                    create_app(static_dir=static_dir),
+                    headers={"Origin": "http://127.0.0.1:8010"},
+                    raise_server_exceptions=False,
+                )
+                response = client.post(
+                    "/api/v1/research/experiments/archive-me/archive"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        read_unlocked.assert_called_once_with(root)
+
+    def test_permanent_delete_route_uses_unlocked_reader_while_holding_guard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            static_dir = root / "static"
+            static_dir.mkdir()
+            status_path = root / "research_status_latest.json"
+            status_path.write_text("{}", encoding="utf-8")
+            (root / "experiment_runs.jsonl").write_text(
+                json.dumps({"run_id": "delete-me"}) + "\n",
+                encoding="utf-8",
+            )
+            (root / "experiment_log.md").write_text(
+                "<!-- experiment-run:delete-me -->\n"
+                "delete me\n"
+                "<!-- /experiment-run:delete-me -->\n",
+                encoding="utf-8",
+            )
+            notebook = {
+                "status": "missing",
+                "latest_note": "",
+                "runs": [],
+                "total_runs": 0,
+                "invalid_lines": 0,
+                "log_path": "experiment_log.md",
+                "runs_path": "experiment_runs.jsonl",
+            }
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._experiment_notebook_payload",
+                    side_effect=AssertionError("nested experiment guard"),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._experiment_notebook_payload_unlocked",
+                    return_value=notebook,
+                    create=True,
+                ) as read_unlocked,
+            ):
+                client = TestClient(
+                    create_app(static_dir=static_dir),
+                    headers={"Origin": "http://127.0.0.1:8010"},
+                    raise_server_exceptions=False,
+                )
+                response = client.delete(
+                    "/api/v1/research/experiments/delete-me/permanent?confirm=permanent"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        read_unlocked.assert_called_once_with(root)
 
     def test_archive_experiment_run_rewrites_active_log_and_archives_record(
         self,

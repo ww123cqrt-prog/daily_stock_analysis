@@ -63,6 +63,7 @@ _CSRF_STRICT_ORIGIN_PREFIXES = (
 )
 _LOCAL_ORIGIN_PROTECTED_GET_PATHS = frozenset({
     "/api/v1/research/status",
+    "/api/v1/research/experiments",
 })
 _LOCAL_ORIGIN_PROTECTED_GET_PREFIXES = (
     "/experiments/",

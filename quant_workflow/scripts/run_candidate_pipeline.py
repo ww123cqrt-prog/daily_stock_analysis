@@ -14,7 +14,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -34,24 +34,40 @@ from _paths import (  # noqa: E402
 from _mlflow_run_provenance import (  # noqa: E402
     RunProvenanceError,
     provider_identity,
+    resolve_approved_provider_identity,
     validate_file_store_run_artifact,
 )
 from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
+QUANT_DATA = quant_data_root()
 CONFIGS_DIR = WORKFLOW_ROOT / "configs"
 REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
 DEFAULT_SPEC_PATH = CONFIGS_DIR / "candidate_pipeline.yaml"
 TRAIN_SCRIPT = SCRIPT_DIR / "train_baseline_lgb.py"
-LATEST_TRAINING_RESULT = REPORT_DIR / "latest_training_result.json"
 ALLOWED_MODEL_MODULES = {
     "qlib.contrib.model.linear",
     "qlib.contrib.model.gbdt",
     "qlib.contrib.model.xgboost",
     "qlib.contrib.model.catboost_model",
 }
+
+
+def resolve_pipeline_provider(
+    provider: str,
+    expected_provider_identity: Mapping[str, Any] | None = None,
+) -> Path:
+    if expected_provider_identity is not None:
+        return resolve_approved_provider_identity(
+            provider,
+            expected_provider_identity,
+            quant_data_root=QUANT_DATA,
+        )
+    return qlib_provider_uri(provider)
+
+
 REQUIRED_MODEL_IDS = ["linear_ols", "linear_ridge", "lightgbm", "xgboost", "catboost"]
 MODEL_DEPENDENCIES = {
     "linear_ols": "sklearn",
@@ -82,8 +98,25 @@ def _json_default(value: Any) -> Any:
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _date_pair(value: Any, name: str) -> list[str]:
@@ -487,7 +520,8 @@ def _training_command(
     config_path: Path,
     experiment_name: str,
     provider: str,
-    provider_uri: Path,
+    expected_provider_identity: dict[str, Any],
+    result_output: Path,
 ) -> list[str]:
     return [
         sys.executable,
@@ -498,8 +532,16 @@ def _training_command(
         experiment_name,
         "--provider",
         provider,
-        "--provider-uri",
-        str(provider_uri),
+        "--no-publish-latest",
+        "--result-output",
+        str(result_output),
+        "--provider-identity-json",
+        json.dumps(
+            expected_provider_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     ]
 
 
@@ -546,18 +588,28 @@ def _run_model_training(
     )
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"{model['id']}.yaml"
+    result_path = config_dir / f"{model['id']}.training_result.json"
     _atomic_write(config_path, yaml.safe_dump(candidate_config, allow_unicode=True, sort_keys=False))
+    result_path.unlink(missing_ok=True)
     command = _training_command(
         config_path=config_path,
         experiment_name=experiment_name,
         provider=provider,
-        provider_uri=provider_uri,
+        expected_provider_identity=expected_provider_identity,
+        result_output=result_path,
     )
     print(f"[candidate] command model={model['id']} config={config_path}", flush=True)
     result = subprocess.run(command, cwd=str(WORKFLOW_ROOT), check=False)
     if result.returncode != 0:
         raise RuntimeError(f"Training command exited with code {result.returncode}")
-    info = json.loads(LATEST_TRAINING_RESULT.read_text(encoding="utf-8"))
+    try:
+        info = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Candidate training result is missing or invalid: {result_path.name}"
+        ) from exc
+    if not isinstance(info, dict):
+        raise RuntimeError("Candidate training result must be a JSON object")
     if info.get("experiment_name") != experiment_name or not info.get("run_id"):
         raise RuntimeError("Training summary does not belong to the current candidate experiment")
     if Path(str(info.get("source_config") or "")).resolve() != config_path.resolve():
@@ -804,6 +856,7 @@ def run_pipeline(
     output_dir: Path = REPORT_DIR,
     timestamp: str | None = None,
     dry_run: bool = False,
+    expected_provider_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     if not TIMESTAMP_RE.fullmatch(timestamp):
@@ -811,169 +864,213 @@ def run_pipeline(
     output_dir = Path(output_dir)
     spec = load_pipeline_spec(Path(spec_path))
     batch_id = f"candidate-alpha158-{timestamp}"
-    original_latest = LATEST_TRAINING_RESULT.read_bytes() if LATEST_TRAINING_RESULT.exists() else None
     candidates: list[dict[str, Any]] = []
     artifacts: dict[str, tuple[pd.DataFrame | pd.Series, pd.DataFrame | pd.Series]] = {}
 
-    try:
-        if dry_run:
-            artifacts, market, provider_state = _dry_run_artifacts(spec["models"])
-            provider_uri = Path("dry-run-provider")
-            locked_provider_identity = provider_identity(provider_uri)
-        else:
-            _preflight_dependencies(spec["models"])
-            provider_uri = qlib_provider_uri(provider)
-            if not provider_uri.exists():
-                raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
-            provider_latest_day, latest_prediction_day, latest_label_day = provider_days(provider_uri)
-            locked_provider_identity = provider_identity(provider_uri)
-            provider_state = {
-                "provider_latest_day": provider_latest_day,
-                "latest_prediction_day": latest_prediction_day,
-                "latest_label_day": latest_label_day,
-            }
-            market = load_market_data(provider_uri, spec["selection_period"][0], provider_latest_day)
-        selection_period, holdout_period = _periods(spec, provider_state["latest_label_day"])
-        experiment_name = f"candidate_models_alpha158_{timestamp}"
-        config_dir = output_dir / "runtime_configs" / batch_id
-        _progress(output_dir, batch_id, "models", 0, len(spec["models"]))
+    if dry_run:
+        artifacts, market, provider_state = _dry_run_artifacts(spec["models"])
+        provider_uri = Path("dry-run-provider")
+        locked_provider_identity = provider_identity(provider_uri)
+    else:
+        _preflight_dependencies(spec["models"])
+        provider_uri = resolve_pipeline_provider(
+            provider,
+            expected_provider_identity=expected_provider_identity,
+        )
+        if not provider_uri.exists():
+            raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
+        provider_latest_day, latest_prediction_day, latest_label_day = provider_days(
+            provider_uri
+        )
+        locked_provider_identity = provider_identity(provider_uri)
+        provider_state = {
+            "provider_latest_day": provider_latest_day,
+            "latest_prediction_day": latest_prediction_day,
+            "latest_label_day": latest_label_day,
+        }
+        market = load_market_data(
+            provider_uri, spec["selection_period"][0], provider_latest_day
+        )
+    selection_period, holdout_period = _periods(
+        spec, provider_state["latest_label_day"]
+    )
+    experiment_name = f"candidate_models_alpha158_{timestamp}"
+    config_dir = output_dir / "runtime_configs" / batch_id
+    _progress(output_dir, batch_id, "models", 0, len(spec["models"]))
 
-        for index, model in enumerate(spec["models"], start=1):
-            model_id = str(model["id"])
-            print(f"\n[{index}/{len(spec['models'])}] 训练候选模型 {model_id}", flush=True)
-            _progress(output_dir, batch_id, "models", index - 1, len(spec["models"]), model_id)
-            try:
-                if dry_run:
-                    info = {"run_id": None, "experiment_id": None, "experiment_name": experiment_name, "metrics": {}}
-                    pred, label = artifacts[model_id]
-                else:
-                    info, pred, label = _run_model_training(
-                        model,
-                        spec,
-                        provider=provider,
-                        provider_uri=provider_uri,
-                        provider_latest_day=provider_state["provider_latest_day"],
-                        latest_prediction_day=provider_state["latest_prediction_day"],
-                        batch_id=batch_id,
-                        config_dir=config_dir,
-                        experiment_name=experiment_name,
-                        expected_provider_identity=locked_provider_identity,
-                    )
-                    artifacts[model_id] = (pred, label)
-                selection = evaluate_period(
-                    pred,
-                    label,
-                    market,
-                    selection_period,
-                    _baseline_strategy_kwargs(),
-                    topk=spec["topk"],
-                    cost_bps=spec["cost_bps"],
+    for index, model in enumerate(spec["models"], start=1):
+        model_id = str(model["id"])
+        print(
+            f"\n[{index}/{len(spec['models'])}] 训练候选模型 {model_id}",
+            flush=True,
+        )
+        _progress(
+            output_dir,
+            batch_id,
+            "models",
+            index - 1,
+            len(spec["models"]),
+            model_id,
+        )
+        try:
+            if dry_run:
+                info = {
+                    "run_id": None,
+                    "experiment_id": None,
+                    "experiment_name": experiment_name,
+                    "metrics": {},
+                }
+                pred, label = artifacts[model_id]
+            else:
+                info, pred, label = _run_model_training(
+                    model,
+                    spec,
+                    provider=provider,
+                    provider_uri=provider_uri,
+                    provider_latest_day=provider_state["provider_latest_day"],
+                    latest_prediction_day=provider_state["latest_prediction_day"],
+                    batch_id=batch_id,
+                    config_dir=config_dir,
+                    experiment_name=experiment_name,
+                    expected_provider_identity=locked_provider_identity,
                 )
-                holdout = evaluate_period(
-                    pred,
-                    label,
-                    market,
-                    holdout_period,
-                    _baseline_strategy_kwargs(),
-                    topk=spec["topk"],
-                    cost_bps=spec["cost_bps"],
-                )
-                if not dry_run:
-                    _log_candidate_metrics(info, selection, holdout)
-                candidates.append(
-                    {
-                        "id": model_id,
-                        "label": model.get("label") or model_id,
-                        "class": model["class"],
-                        "status": "completed",
-                        "run_id": info.get("run_id"),
-                        "experiment_id": info.get("experiment_id"),
-                        "experiment_name": info.get("experiment_name"),
-                        "artifact_sha256": info.get("artifact_sha256") or {},
-                        "qlib_metrics": info.get("metrics") or {},
-                        "selection": selection,
-                        "holdout": holdout,
-                    }
-                )
-            except Exception as exc:
-                candidates.append(
-                    {
-                        "id": model_id,
-                        "label": model.get("label") or model_id,
-                        "class": model["class"],
-                        "status": "failed",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                print(f"[candidate:error] {model_id}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-            _progress(output_dir, batch_id, "models", index, len(spec["models"]), model_id)
+                artifacts[model_id] = (pred, label)
+            selection = evaluate_period(
+                pred,
+                label,
+                market,
+                selection_period,
+                _baseline_strategy_kwargs(),
+                topk=spec["topk"],
+                cost_bps=spec["cost_bps"],
+            )
+            holdout = evaluate_period(
+                pred,
+                label,
+                market,
+                holdout_period,
+                _baseline_strategy_kwargs(),
+                topk=spec["topk"],
+                cost_bps=spec["cost_bps"],
+            )
+            if not dry_run:
+                _log_candidate_metrics(info, selection, holdout)
+            candidates.append(
+                {
+                    "id": model_id,
+                    "label": model.get("label") or model_id,
+                    "class": model["class"],
+                    "status": "completed",
+                    "run_id": info.get("run_id"),
+                    "experiment_id": info.get("experiment_id"),
+                    "experiment_name": info.get("experiment_name"),
+                    "artifact_sha256": info.get("artifact_sha256") or {},
+                    "qlib_metrics": info.get("metrics") or {},
+                    "selection": selection,
+                    "holdout": holdout,
+                }
+            )
+        except Exception as exc:
+            candidates.append(
+                {
+                    "id": model_id,
+                    "label": model.get("label") or model_id,
+                    "class": model["class"],
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            print(
+                f"[candidate:error] {model_id}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        _progress(
+            output_dir,
+            batch_id,
+            "models",
+            index,
+            len(spec["models"]),
+            model_id,
+        )
 
-        selected_models = rank_models(candidates, spec["top_models"])
-        strategy_rows = _strategy_rows(
+    selected_models = rank_models(candidates, spec["top_models"])
+    strategy_rows = (
+        _strategy_rows(
             selected_models,
             artifacts,
             spec,
             market,
             selection_period,
             holdout_period,
-        ) if len(selected_models) == spec["top_models"] else []
-        ranked_strategies = rank_strategies(strategy_rows)
-        status = pipeline_status(candidates)
-        champion = ranked_strategies[0] if ranked_strategies else None
-        selected_combination = champion if status == "completed" else None
-        verdict = holdout_verdict(champion, pipeline_complete=status == "completed")
-        if not dry_run:
-            _tag_pipeline_outcome(candidates, selected_models, selected_combination, verdict)
-        payload = {
-            "status": status,
-            "dry_run": dry_run,
-            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "batch_id": batch_id,
-            "experiment_name": experiment_name,
-            "provider": provider if not dry_run else "dry_run",
-            "provider_uri": str(provider_uri),
-            "provider_identity": locked_provider_identity,
-            "provider_latest_day": provider_state["provider_latest_day"],
-            "latest_prediction_day": provider_state["latest_prediction_day"],
-            "latest_label_day": provider_state["latest_label_day"],
-            "periods": {
-                "training": list(spec["training_period"]),
-                "validation": list(spec["validation_period"]),
-                "selection": selection_period,
-                "holdout": holdout_period,
-            },
-            "selection_basis": "selection_period_only",
-            "ranking_order": ["information_ratio", "annual_excess_return", "rank_ic"],
-            "metric_basis": {
-                "portfolio_return": "absolute_net_return_after_configured_cost",
-                "benchmark": "SH000300",
-                "annual_excess_return": "portfolio_annual_return_minus_benchmark_annual_return",
-                "directly_comparable": True,
-            },
-            "models": candidates,
-            "selected_models": [item["id"] for item in selected_models],
-            "strategy_evaluations": strategy_rows,
-            "selected_combination": selected_combination,
-            "partial_development_leader": champion if status != "completed" else None,
-            "holdout_verdict": verdict,
-            "operational_latest_training_changed": False,
-            "experiment_notebook_appended": not dry_run,
-            "experiment_notebook_policy": (
-                "candidate MLflow runs are appended to the experiment notebook; "
-                "the operational latest training pointer is restored"
+        )
+        if len(selected_models) == spec["top_models"]
+        else []
+    )
+    ranked_strategies = rank_strategies(strategy_rows)
+    status = pipeline_status(candidates)
+    champion = ranked_strategies[0] if ranked_strategies else None
+    selected_combination = champion if status == "completed" else None
+    verdict = holdout_verdict(champion, pipeline_complete=status == "completed")
+    if not dry_run:
+        _tag_pipeline_outcome(
+            candidates, selected_models, selected_combination, verdict
+        )
+    payload = {
+        "status": status,
+        "dry_run": dry_run,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "batch_id": batch_id,
+        "experiment_name": experiment_name,
+        "provider": provider if not dry_run else "dry_run",
+        "provider_uri": str(provider_uri),
+        "provider_identity": locked_provider_identity,
+        "provider_latest_day": provider_state["provider_latest_day"],
+        "latest_prediction_day": provider_state["latest_prediction_day"],
+        "latest_label_day": provider_state["latest_label_day"],
+        "periods": {
+            "training": list(spec["training_period"]),
+            "validation": list(spec["validation_period"]),
+            "selection": selection_period,
+            "holdout": holdout_period,
+        },
+        "selection_basis": "selection_period_only",
+        "ranking_order": ["information_ratio", "annual_excess_return", "rank_ic"],
+        "metric_basis": {
+            "portfolio_return": "absolute_net_return_after_configured_cost",
+            "benchmark": "SH000300",
+            "annual_excess_return": (
+                "portfolio_annual_return_minus_benchmark_annual_return"
             ),
-            "safety": {"broker_connected": False, "credentials_read": False, "auto_order": False},
-        }
-        payload["artifacts"] = write_reports(payload, output_dir, timestamp)
-        _progress(output_dir, batch_id, "completed" if status == "completed" else "failed", 5, 5)
-        return payload
-    finally:
-        if not dry_run:
-            if original_latest is None:
-                LATEST_TRAINING_RESULT.unlink(missing_ok=True)
-            else:
-                LATEST_TRAINING_RESULT.parent.mkdir(parents=True, exist_ok=True)
-                LATEST_TRAINING_RESULT.write_bytes(original_latest)
+            "directly_comparable": True,
+        },
+        "models": candidates,
+        "selected_models": [item["id"] for item in selected_models],
+        "strategy_evaluations": strategy_rows,
+        "selected_combination": selected_combination,
+        "partial_development_leader": champion if status != "completed" else None,
+        "holdout_verdict": verdict,
+        "operational_latest_training_changed": False,
+        "experiment_notebook_appended": not dry_run,
+        "experiment_notebook_policy": (
+            "candidate MLflow runs are appended to the experiment notebook; "
+            "candidate runs never publish the operational latest training pointer"
+        ),
+        "safety": {
+            "broker_connected": False,
+            "credentials_read": False,
+            "auto_order": False,
+        },
+    }
+    payload["artifacts"] = write_reports(payload, output_dir, timestamp)
+    _progress(
+        output_dir,
+        batch_id,
+        "completed" if status == "completed" else "failed",
+        5,
+        5,
+    )
+    return payload
 
 
 def main() -> int:
@@ -983,13 +1080,28 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--timestamp", default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--provider-identity-json",
+        default=None,
+        help="Trusted immutable provider identity injected by the DSA job API",
+    )
     args = parser.parse_args()
+    expected_provider_identity = None
+    if args.provider_identity_json is not None:
+        try:
+            parsed_identity = json.loads(args.provider_identity_json)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--provider-identity-json must be valid JSON: {exc}")
+        if not isinstance(parsed_identity, dict):
+            parser.error("--provider-identity-json must contain a JSON object")
+        expected_provider_identity = parsed_identity
     payload = run_pipeline(
         spec_path=args.spec,
         provider=args.provider,
         output_dir=args.output_dir,
         timestamp=args.timestamp,
         dry_run=args.dry_run,
+        expected_provider_identity=expected_provider_identity,
     )
     print(f"\n[完成] 五个选股模型候选流程状态: {payload['status']}")
     print(f"[报告] {payload['artifacts']['json']}")

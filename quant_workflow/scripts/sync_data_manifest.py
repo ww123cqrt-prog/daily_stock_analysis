@@ -1477,7 +1477,7 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
             "no_action_taken": True,
         },
         "related_reports": {
-            "quality_report": "data_quality_report_latest.md",
+            "quality_report": "data_quality_report_latest.json",
             "cleaning_strategy": "data_cleaning_strategy_latest.md",
             "latest_training_result": "latest_training_result.json",
             "daily_update_summary": "daily_update_summary_latest.json",

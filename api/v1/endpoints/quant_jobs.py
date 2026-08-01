@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -27,6 +28,7 @@ from api.v1.schemas.quant_jobs import (
     QuantJobLogResponse,
     QuantJobResponse,
     QuantJobSubmitRequest,
+    QuantJobTypesResponse,
     QuantStatusResponse,
 )
 from api.v1.endpoints.research_status import build_research_status_payload
@@ -47,6 +49,18 @@ MLFLOW_HEALTH_CACHE_MAX_ENTRIES = 8
 LOCAL_MLFLOW_HOSTS = {"127.0.0.1", "localhost", "::1"}
 LOCAL_MLFLOW_HEALTH_PORTS = {None, 6006, 6606}
 LOCAL_CATDESK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+FORMAL_TRAINING_JOB_TYPES = {"train_baseline_lgb", "run_candidate_pipeline"}
+TRAINING_PROVIDER_DATASET_IDS = {
+    "canonical": "qlib_ashare_v2",
+    "cleaned": "qlib_ashare_cleaned_v2",
+}
+PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+)
 LOCAL_CATDESK_HEALTH_PORTS = {8765}
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -304,6 +318,59 @@ def _job_response(job: QuantJob) -> QuantJobResponse:
     return QuantJobResponse(**payload)
 
 
+def _is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _requires_training_readiness_gate(
+    job_type: str, params: Dict[str, Any]
+) -> bool:
+    if job_type not in FORMAL_TRAINING_JOB_TYPES:
+        return False
+    return not (
+        job_type == "run_candidate_pipeline" and _is_true(params.get("dry_run"))
+    )
+
+
+def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
+    provider = str(params.get("provider") or "canonical").strip().lower()
+    dataset_id = TRAINING_PROVIDER_DATASET_IDS.get(provider)
+    if dataset_id is None:
+        raise ValueError("Provider must be one of: canonical, cleaned.")
+    return dataset_id
+
+
+def _approved_provider_identity_from_status(
+    research_status: Dict[str, Any],
+    *,
+    expected_dataset_id: str,
+) -> Dict[str, str]:
+    provider = research_status.get("qlib_provider")
+    if not isinstance(provider, dict):
+        raise ValueError("Training status does not expose an approved Qlib snapshot.")
+    identity = {field: provider.get(field) for field in PROVIDER_IDENTITY_FIELDS}
+    snapshot_id = identity.get("snapshot_id")
+    if (
+        identity.get("provider_contract") != "immutable_snapshot_v2"
+        or identity.get("dataset_id") != expected_dataset_id
+        or not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or snapshot_id in {".", ".."}
+        or any(
+            not isinstance(identity.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(identity.get(field))) is None
+            for field in ("manifest_sha256", "content_sha256")
+        )
+    ):
+        raise ValueError("Training status has an invalid approved Qlib snapshot identity.")
+    return {field: str(identity[field]) for field in PROVIDER_IDENTITY_FIELDS}
+
+
 def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _ArtifactPathResolution:
     try:
         resolved = path.expanduser().resolve(strict=False)
@@ -323,9 +390,13 @@ def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _Ar
 async def get_quant_status() -> QuantStatusResponse:
     """Return quant workflow status used by the web workflow page."""
     service = get_quant_job_service()
-    research_status = build_research_status_payload()
-    mlflow_payload = await asyncio.to_thread(_mlflow_status_payload)
-    latest_job_snapshot, active_count, recent_jobs = service.get_status_snapshot()
+    research_status, mlflow_payload = await asyncio.gather(
+        asyncio.to_thread(build_research_status_payload),
+        asyncio.to_thread(_mlflow_status_payload),
+    )
+    latest_job_snapshot, active_count, recent_jobs = await asyncio.to_thread(
+        service.get_status_snapshot
+    )
     latest_jobs = {
         job_type: _job_response(job)
         for job_type, job in latest_job_snapshot.items()
@@ -352,12 +423,64 @@ async def get_quant_status() -> QuantStatusResponse:
     )
 
 
+@router.get("/job-types", response_model=QuantJobTypesResponse)
+async def get_quant_job_types() -> QuantJobTypesResponse:
+    """Return the static task whitelist without loading research artifacts."""
+
+    service = get_quant_job_service()
+    available = await asyncio.to_thread(service.available_job_types)
+    return QuantJobTypesResponse(available_job_types=available)
+
+
 @router.post("/jobs", response_model=QuantJobResponse)
 async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
     """Submit one whitelisted quant workflow job."""
     service = get_quant_job_service()
+    approved_provider_identity = None
     try:
-        job = service.submit_job(request.job_type, request.params)
+        if _requires_training_readiness_gate(request.job_type, request.params):
+            provider_dataset_id = _training_provider_dataset_id(request.params)
+            research_status = await asyncio.to_thread(
+                build_research_status_payload,
+                provider_dataset_id=provider_dataset_id,
+            )
+            if research_status.get("trainable") is not True:
+                readiness = research_status.get("training_readiness")
+                summary = (
+                    readiness.get("summary")
+                    if isinstance(readiness, dict)
+                    else None
+                )
+                raise api_error(
+                    409,
+                    "training_blocked",
+                    str(
+                        summary
+                        or "Current data quality evidence does not allow formal training."
+                    ),
+                )
+            try:
+                approved_provider_identity = _approved_provider_identity_from_status(
+                    research_status,
+                    expected_dataset_id=provider_dataset_id,
+                )
+            except ValueError as exc:
+                raise api_error(
+                    409,
+                    "training_blocked",
+                    "Current data quality evidence cannot pin an approved Qlib snapshot.",
+                ) from exc
+        submit_kwargs = (
+            {"approved_provider_identity": approved_provider_identity}
+            if approved_provider_identity is not None
+            else {}
+        )
+        job = await asyncio.to_thread(
+            service.submit_job,
+            request.job_type,
+            request.params,
+            **submit_kwargs,
+        )
     except ValueError as exc:
         raise api_error(400, "invalid_params", str(exc)) from exc
     return _job_response(job)
@@ -369,7 +492,9 @@ async def list_quant_jobs(
     job_type: Optional[str] = Query(None),
 ) -> QuantJobListResponse:
     service = get_quant_job_service()
-    jobs = service.list_jobs(limit=limit, job_type=job_type)
+    jobs = await asyncio.to_thread(
+        service.list_jobs, limit=limit, job_type=job_type
+    )
     return QuantJobListResponse(total=len(jobs), items=[_job_response(job) for job in jobs])
 
 
@@ -379,7 +504,9 @@ def _sse_event(event: str, payload: Dict[str, Any]) -> str:
 
 async def _list_jobs_for_stream(service: QuantJobService) -> list[QuantJob]:
     """Fetch stream snapshots without blocking the event loop on SQLite I/O."""
-    return await asyncio.to_thread(service.list_jobs, limit=20)
+    return await asyncio.to_thread(
+        service.list_jobs_for_monitoring, history_limit=20
+    )
 
 
 async def _quant_job_event_generator(
@@ -454,7 +581,7 @@ async def stream_quant_jobs() -> StreamingResponse:
 async def get_quant_job(job_id: str) -> QuantJobResponse:
     service = get_quant_job_service()
     try:
-        job = service.get_job(job_id)
+        job = await asyncio.to_thread(service.get_job, job_id)
     except KeyError as exc:
         raise api_error(404, "not_found", f"Quant job {job_id} was not found.") from exc
     return _job_response(job)
@@ -467,7 +594,9 @@ async def get_quant_job_log(
 ) -> QuantJobLogResponse:
     service = get_quant_job_service()
     try:
-        payload = service.get_log(job_id, max_bytes=max_bytes)
+        payload = await asyncio.to_thread(
+            service.get_log, job_id, max_bytes=max_bytes
+        )
     except KeyError as exc:
         raise api_error(404, "not_found", f"Quant job {job_id} was not found.") from exc
     payload.pop("log_path", None)
@@ -478,7 +607,7 @@ async def get_quant_job_log(
 async def get_quant_job_artifact(job_id: str, artifact_index: int) -> FileResponse:
     service = get_quant_job_service()
     try:
-        job = service.get_job(job_id)
+        job = await asyncio.to_thread(service.get_job, job_id)
     except KeyError as exc:
         raise api_error(404, "not_found", f"Quant job {job_id} was not found.") from exc
 
@@ -486,7 +615,9 @@ async def get_quant_job_artifact(job_id: str, artifact_index: int) -> FileRespon
         raise api_error(404, "not_found", f"Quant job artifact {artifact_index} was not found.")
 
     artifact_path = Path(job.artifact_paths[artifact_index])
-    artifact_resolution = _resolved_allowed_artifact_path(artifact_path, service)
+    artifact_resolution = await asyncio.to_thread(
+        _resolved_allowed_artifact_path, artifact_path, service
+    )
     if artifact_resolution.is_forbidden:
         raise api_error(403, "forbidden", f"Quant job artifact {artifact_index} is outside the allowed reports directory.")
     if artifact_resolution.path is None:
@@ -508,7 +639,7 @@ async def get_quant_job_artifact(job_id: str, artifact_index: int) -> FileRespon
 async def cancel_quant_job(job_id: str) -> QuantJobResponse:
     service = get_quant_job_service()
     try:
-        job = service.cancel_job(job_id)
+        job = await asyncio.to_thread(service.cancel_job, job_id)
     except KeyError as exc:
         raise api_error(404, "not_found", f"Quant job {job_id} was not found.") from exc
     return _job_response(job)

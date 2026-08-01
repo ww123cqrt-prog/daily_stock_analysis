@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -37,9 +39,13 @@ ADJUSTMENT_METHODS = {
     "unknown",
 }
 REQUIRED_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume")
+BAR_OHLC_RELATIVE_TOLERANCE = 2e-6
+BAR_OHLC_ABSOLUTE_TOLERANCE = 1e-4
 ADJUSTED_PRICE_BASES = {"qfq", "hfq"}
 QLIB_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
 QLIB_BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
+AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS = 252
+AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS = 100
 QLIB_PROVIDER_PRODUCER_LEGACY_OMISSION_VERSIONS = {
     ("qlib_ashare_v2", "build_qlib_v2.py"): frozenset({"2", "3", "4", "5"}),
     (
@@ -90,6 +96,469 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def filesystem_state_fingerprint(
+    root: Path,
+    *,
+    max_entries: int | None = None,
+    max_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Return a cheap mutation fingerprint after full snapshot validation.
+
+    This intentionally hashes filesystem metadata rather than file contents. A
+    producer or audit scan must still perform the authoritative content-hash
+    validation first; consumers can then use this proof to detect deletion,
+    replacement, or modification without rereading the full dataset. ``ctime``
+    and inode/device identity prevent an equal-size rewrite from being hidden by
+    restoring the original ``mtime``.
+    """
+
+    root = Path(root).expanduser().absolute()
+    try:
+        root_metadata = root.lstat()
+    except OSError as exc:
+        raise DataContractError("fingerprint root is unavailable") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise DataContractError("fingerprint root is unavailable")
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_metadata = root.lstat()
+    except OSError as exc:
+        raise DataContractError("fingerprint root changed during scan") from exc
+    if (
+        stat.S_ISLNK(resolved_metadata.st_mode)
+        or not stat.S_ISDIR(resolved_metadata.st_mode)
+        or (resolved_metadata.st_dev, resolved_metadata.st_ino)
+        != (root_metadata.st_dev, root_metadata.st_ino)
+    ):
+        raise DataContractError("fingerprint root changed during scan")
+
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.scandir not in os.supports_fd
+    ):
+        return _filesystem_state_fingerprint_fallback(
+            root,
+            max_entries=max_entries,
+            max_seconds=max_seconds,
+        )
+
+    directory_flags = os.O_RDONLY
+    directory_flags |= os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        file_flags |= os.O_NONBLOCK
+    digest = hashlib.sha256()
+    file_count = 0
+    total_bytes = 0
+    scanned_entries = 0
+    started_at = time.monotonic()
+    directory_states: list[tuple[str, tuple[int, int, int, int]]] = []
+    file_states: list[tuple[str, tuple[int, int, int, int, int]]] = []
+
+    def check_limits() -> None:
+        if max_entries is not None and scanned_entries > max_entries:
+            raise DataContractError("filesystem state scan exceeded entry limit")
+        if max_seconds is not None and time.monotonic() - started_at > max_seconds:
+            raise DataContractError("filesystem state scan exceeded time limit")
+
+    def visit(directory_fd: int, relative_parts: tuple[str, ...]) -> None:
+        nonlocal file_count, scanned_entries, total_bytes
+        directory_before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise DataContractError("fingerprint directory changed during scan")
+        directory_states.append(
+            (
+                "/".join(relative_parts),
+                (
+                    directory_before.st_dev,
+                    directory_before.st_ino,
+                    directory_before.st_mtime_ns,
+                    directory_before.st_ctime_ns,
+                ),
+            )
+        )
+        names: list[str] = []
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                scanned_entries += 1
+                check_limits()
+                names.append(entry.name)
+        names.sort()
+        check_limits()
+
+        # A depth-first walk over sorted path components preserves the v2
+        # digest order; compact metadata records support the final stability check.
+        for name in names:
+            check_limits()
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise DataContractError(
+                    "fingerprint entry changed during scan"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise DataContractError("fingerprint root cannot contain symlinks")
+            if stat.S_ISDIR(metadata.st_mode):
+                try:
+                    child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise DataContractError(
+                        "fingerprint directory changed or became a symlink"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                    ):
+                        raise DataContractError(
+                            "fingerprint directory changed during scan"
+                        )
+                    visit(child_fd, (*relative_parts, name))
+                finally:
+                    os.close(child_fd)
+                continue
+            if name.endswith(".lock"):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            file_fd: int | None = None
+            try:
+                file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+                opened = os.fstat(file_fd)
+                after_open = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                opened_identity = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or not stat.S_ISREG(after_open.st_mode)
+                    or opened_identity
+                    != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                    )
+                    or opened_identity
+                    != (
+                        after_open.st_dev,
+                        after_open.st_ino,
+                        after_open.st_size,
+                        after_open.st_mtime_ns,
+                        after_open.st_ctime_ns,
+                    )
+                ):
+                    raise DataContractError(
+                        "fingerprint file changed during scan"
+                    )
+                metadata = opened
+            except OSError as exc:
+                raise DataContractError(
+                    "fingerprint file changed or became a symlink"
+                ) from exc
+            finally:
+                if file_fd is not None:
+                    os.close(file_fd)
+            relative = "/".join((*relative_parts, name))
+            file_states.append((relative, opened_identity))
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_ctime_ns).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_dev).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_ino).encode("ascii"))
+            digest.update(b"\n")
+            file_count += 1
+            total_bytes += metadata.st_size
+
+        directory_after = os.fstat(directory_fd)
+        directory_state_before = (
+            directory_before.st_dev,
+            directory_before.st_ino,
+            directory_before.st_mtime_ns,
+            directory_before.st_ctime_ns,
+        )
+        directory_state_after = (
+            directory_after.st_dev,
+            directory_after.st_ino,
+            directory_after.st_mtime_ns,
+            directory_after.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISDIR(directory_after.st_mode)
+            or directory_state_before != directory_state_after
+        ):
+            raise DataContractError("fingerprint directory changed during scan")
+
+    def verify_final_states(root_fd: int) -> None:
+        for relative, expected in directory_states:
+            check_limits()
+            try:
+                current = (
+                    os.stat(relative, dir_fd=root_fd, follow_symlinks=False)
+                    if relative
+                    else os.fstat(root_fd)
+                )
+            except OSError as exc:
+                raise DataContractError(
+                    "fingerprint directory changed during final verification"
+                ) from exc
+            current_state = (
+                current.st_dev,
+                current.st_ino,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            if not stat.S_ISDIR(current.st_mode) or current_state != expected:
+                raise DataContractError(
+                    "fingerprint directory changed during final verification"
+                )
+
+        for relative, expected in file_states:
+            check_limits()
+            try:
+                current = os.stat(
+                    relative,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise DataContractError(
+                    "fingerprint file changed during final verification"
+                ) from exc
+            current_state = (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            if not stat.S_ISREG(current.st_mode) or current_state != expected:
+                raise DataContractError(
+                    "fingerprint file changed during final verification"
+                )
+
+    try:
+        root_fd = os.open(resolved_root, directory_flags)
+    except OSError as exc:
+        raise DataContractError("fingerprint root changed during scan") from exc
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (root_metadata.st_dev, root_metadata.st_ino)
+        ):
+            raise DataContractError("fingerprint root changed during scan")
+        visit(root_fd, ())
+        verify_final_states(root_fd)
+    finally:
+        os.close(root_fd)
+    return {
+        "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "scanned_entries": scanned_entries,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _filesystem_state_fingerprint_fallback(
+    root: Path,
+    *,
+    max_entries: int | None,
+    max_seconds: float | None,
+) -> dict[str, Any]:
+    """Fingerprint on platforms without POSIX directory-fd primitives.
+
+    The fallback checks every component with ``lstat`` and validates the opened
+    file identity before and after reading. It cannot provide the same
+    race-free path traversal guarantee as ``openat`` plus ``O_NOFOLLOW``, but it
+    remains bounded and rejects symlinks instead of silently following them.
+    """
+
+    root = Path(root).expanduser().absolute()
+    try:
+        root_before = root.lstat()
+    except OSError as exc:
+        raise DataContractError("fingerprint root is unavailable") from exc
+    if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+        raise DataContractError("fingerprint root is unavailable")
+
+    digest = hashlib.sha256()
+    file_count = 0
+    total_bytes = 0
+    scanned_entries = 0
+    started_at = time.monotonic()
+    directory_states: list[tuple[Path, tuple[int, int, int, int]]] = []
+    file_states: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+
+    def state(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def directory_state(metadata: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def check_limits() -> None:
+        if max_entries is not None and scanned_entries > max_entries:
+            raise DataContractError("filesystem state scan exceeded entry limit")
+        if max_seconds is not None and time.monotonic() - started_at > max_seconds:
+            raise DataContractError("filesystem state scan exceeded time limit")
+
+    def visit(directory: Path, relative_parts: tuple[str, ...]) -> None:
+        nonlocal file_count, scanned_entries, total_bytes
+        try:
+            before = directory.lstat()
+        except OSError as exc:
+            raise DataContractError("fingerprint directory changed during scan") from exc
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise DataContractError("fingerprint directory changed during scan")
+        directory_states.append((directory, directory_state(before)))
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise DataContractError("fingerprint directory changed during scan") from exc
+        for entry in entries:
+            scanned_entries += 1
+            check_limits()
+            try:
+                metadata = entry.lstat()
+            except OSError as exc:
+                raise DataContractError("fingerprint entry changed during scan") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise DataContractError("fingerprint root cannot contain symlinks")
+            if stat.S_ISDIR(metadata.st_mode):
+                visit(entry, (*relative_parts, entry.name))
+                continue
+            if entry.name.endswith(".lock"):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            try:
+                with entry.open("rb") as handle:
+                    opened = os.fstat(handle.fileno())
+                after_open = entry.lstat()
+            except OSError as exc:
+                raise DataContractError(
+                    "fingerprint file changed or became a symlink"
+                ) from exc
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(after_open.st_mode)
+                or state(opened) != state(metadata)
+                or state(opened) != state(after_open)
+            ):
+                raise DataContractError("fingerprint file changed during scan")
+            relative = "/".join((*relative_parts, entry.name))
+            file_states.append((entry, state(opened)))
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_ctime_ns).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_dev).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(metadata.st_ino).encode("ascii"))
+            digest.update(b"\n")
+            file_count += 1
+            total_bytes += metadata.st_size
+        try:
+            after = directory.lstat()
+        except OSError as exc:
+            raise DataContractError("fingerprint directory changed during scan") from exc
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or directory_state(after) != directory_state(before)
+        ):
+            raise DataContractError("fingerprint directory changed during scan")
+
+    visit(root, ())
+    for directory, expected in directory_states:
+        try:
+            current = directory.lstat()
+        except OSError as exc:
+            raise DataContractError(
+                "fingerprint directory changed during final verification"
+            ) from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or directory_state(current) != expected
+        ):
+            raise DataContractError(
+                "fingerprint directory changed during final verification"
+            )
+    for file_path, expected in file_states:
+        try:
+            current = file_path.lstat()
+        except OSError as exc:
+            raise DataContractError(
+                "fingerprint file changed during final verification"
+            ) from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or state(current) != expected
+        ):
+            raise DataContractError(
+                "fingerprint file changed during final verification"
+            )
+    try:
+        root_after = root.lstat()
+    except OSError as exc:
+        raise DataContractError("fingerprint root changed during scan") from exc
+    if stat.S_ISLNK(root_after.st_mode) or directory_state(root_after) != directory_state(root_before):
+        raise DataContractError("fingerprint root changed during scan")
+    return {
+        "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "scanned_entries": scanned_entries,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -224,12 +693,45 @@ def _validate_bar_frame(frame: pd.DataFrame, path: Path) -> pd.Series:
     dates = pd.to_datetime(frame["date"], errors="coerce")
     if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
         raise DataContractError(f"bar dates are invalid: {path.name}")
+    numeric_columns: dict[str, np.ndarray] = {}
     for column in ("open", "high", "low", "close", "volume"):
         values = pd.to_numeric(frame[column], errors="coerce")
-        if values.isna().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
+        numeric = values.to_numpy(dtype=float)
+        if values.isna().any() or not np.isfinite(numeric).all():
             raise DataContractError(f"bar column {column} is invalid: {path.name}")
-    if (pd.to_numeric(frame["volume"], errors="coerce") < 0).any():
+        numeric_columns[column] = numeric
+    if any(
+        bool((numeric_columns[column] <= 0).any())
+        for column in ("open", "high", "low", "close")
+    ):
+        raise DataContractError(f"bar price is not positive: {path.name}")
+    if bool((numeric_columns["volume"] < 0).any()):
         raise DataContractError(f"bar volume is negative: {path.name}")
+    open_ = numeric_columns["open"]
+    high = numeric_columns["high"]
+    low = numeric_columns["low"]
+    close = numeric_columns["close"]
+    upper_reference = np.maximum.reduce([open_, low, close])
+    lower_reference = np.minimum.reduce([open_, high, close])
+    invalid = (
+        (high < upper_reference)
+        & ~np.isclose(
+            high,
+            upper_reference,
+            rtol=BAR_OHLC_RELATIVE_TOLERANCE,
+            atol=BAR_OHLC_ABSOLUTE_TOLERANCE,
+        )
+    ) | (
+        (low > lower_reference)
+        & ~np.isclose(
+            low,
+            lower_reference,
+            rtol=BAR_OHLC_RELATIVE_TOLERANCE,
+            atol=BAR_OHLC_ABSOLUTE_TOLERANCE,
+        )
+    )
+    if bool(invalid.any()):
+        raise DataContractError(f"bar OHLC relationships are invalid: {path.name}")
     return dates
 
 

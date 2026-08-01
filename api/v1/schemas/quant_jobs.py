@@ -40,6 +40,10 @@ class QuantJobLogResponse(BaseModel):
     truncated: bool
 
 
+class QuantJobTypesResponse(BaseModel):
+    available_job_types: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
 class QuantStatusResponse(BaseModel):
     available_job_types: Dict[str, Dict[str, Any]]
     active_count: int

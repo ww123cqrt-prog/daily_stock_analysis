@@ -76,6 +76,90 @@ def test_provider_identity_records_native_snapshot(tmp_path: Path) -> None:
     }
 
 
+def test_approved_provider_identity_is_rechecked_before_training(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    snapshot = tmp_path / "canonical-snapshot"
+    expected = {
+        "provider_contract": "immutable_snapshot_v2",
+        "dataset_id": "qlib_ashare_v2",
+        "snapshot_id": snapshot.name,
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+    }
+
+    with (
+        patch.object(
+            module,
+            "resolve_immutable_provider_identity",
+            return_value=snapshot,
+        ) as resolve_identity,
+        patch.object(module, "provider_identity", return_value=expected),
+    ):
+        resolved = module.resolve_approved_provider_identity(
+            "canonical",
+            expected,
+            quant_data_root=tmp_path,
+        )
+
+    assert resolved == snapshot
+    resolve_identity.assert_called_once_with(expected, quant_data_root=tmp_path)
+
+    with pytest.raises(module.RunProvenanceError, match="selected provider"):
+        module.resolve_approved_provider_identity(
+            "cleaned",
+            expected,
+            quant_data_root=tmp_path,
+        )
+
+    changed = {**expected, "content_sha256": "c" * 64}
+    with (
+        patch.object(
+            module,
+            "resolve_immutable_provider_identity",
+            return_value=snapshot,
+        ),
+        patch.object(module, "provider_identity", return_value=changed),
+        pytest.raises(module.RunProvenanceError, match="changed before training"),
+    ):
+        module.resolve_approved_provider_identity(
+            "canonical",
+            expected,
+            quant_data_root=tmp_path,
+        )
+
+
+def test_revalidate_provider_identity_rejects_content_changed_during_training(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    provider = tmp_path / "qlib" / "cn_data_ashare_v2" / "snapshots" / "native-v2"
+    provider.mkdir(parents=True)
+    expected = {
+        "provider_uri": str(provider),
+        "provider_contract": "immutable_snapshot_v2",
+        "dataset_id": "qlib_ashare_v2",
+        "snapshot_id": "native-v2",
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+    }
+
+    with patch.object(
+        module,
+        "resolve_immutable_provider_identity",
+        side_effect=module.RunProvenanceError(
+            "selected native Qlib snapshot failed its integrity check"
+        ),
+    ):
+        with pytest.raises(module.RunProvenanceError, match="integrity check"):
+            module.revalidate_provider_identity(
+                provider,
+                expected,
+                quant_data_root=tmp_path,
+            )
+
+
 def test_resolve_identity_uses_native_snapshot_and_ignores_saved_absolute_path(
     tmp_path: Path,
 ) -> None:

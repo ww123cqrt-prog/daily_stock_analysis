@@ -904,7 +904,10 @@ class SyncDataManifestTest(unittest.TestCase):
                 encoding="utf-8",
             )
             reports.mkdir(parents=True)
-            (reports / "data_quality_report_latest.md").write_text("# quality", encoding="utf-8")
+            (reports / "data_quality_report_latest.json").write_text(
+                '{"publication_contract":"atomic_json_pointer_to_immutable_markdown_v1"}',
+                encoding="utf-8",
+            )
 
             manifest_path = module.sync_data_manifest(quant_data_root=quant_data, reports_root=reports)
 
@@ -919,6 +922,10 @@ class SyncDataManifestTest(unittest.TestCase):
             )
 
         self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(
+            manifest["related_reports"]["quality_report"],
+            "data_quality_report_latest.json",
+        )
         self.assertEqual(manifest["path_format"], "relative_to_quant_data_root")
         cleaned = manifest["datasets"]["ashare_cleaned_qfq_legacy"]
         self.assertEqual(

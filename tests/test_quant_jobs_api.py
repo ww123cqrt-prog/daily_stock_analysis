@@ -13,8 +13,9 @@ import threading
 import time
 import unittest
 import asyncio
+import hashlib
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from fastapi import HTTPException
@@ -212,10 +213,50 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("log_path", status_body["latest_jobs"]["report_data_quality"])
         self.assertEqual(status_body["active_count"], 0)
 
-    def test_status_snapshot_stays_consistent_while_job_completes(self) -> None:
+    def test_job_types_endpoint_returns_whitelist_without_building_research_status(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
                 jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "report_workbench_capabilities": {
+                        "label": "生成工作台能力盘点",
+                        "command": [sys.executable, "-c", "print('ok')"],
+                        "allowed_params": set(),
+                    },
+                },
+            )
+            client = self._make_client(service)
+
+            with patch(
+                "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                side_effect=AssertionError("slow research status was loaded"),
+            ):
+                response = client.get("/api/v1/quant/job-types")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "available_job_types": {
+                    "report_workbench_capabilities": {
+                        "label": "生成工作台能力盘点",
+                        "allowed_params": [],
+                    }
+                }
+            },
+        )
+
+    def test_status_snapshot_stays_consistent_while_job_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            reader_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs={},
+            )
+            writer_service = QuantJobService(
+                jobs_root=jobs_root,
                 command_specs={},
             )
             job = QuantJob(
@@ -229,51 +270,237 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 created_at="2026-07-30T06:00:00+08:00",
                 started_at="2026-07-30T06:00:00+08:00",
                 updated_at="2026-07-30T06:00:00+08:00",
-                log_path=str(Path(temp_dir) / "jobs" / "job.log"),
+                log_path=str(jobs_root / "job.log"),
             )
-            service._insert_job(job)
-            real_latest = service.get_latest_jobs_by_type
-            update_started = threading.Event()
-            update_finished = threading.Event()
-            workers: list[threading.Thread] = []
+            reader_service._insert_job(job)
+            real_connect = reader_service._connect
+            select_count = 0
 
-            def latest_then_complete() -> dict[str, QuantJob]:
-                latest = real_latest()
+            def connect_with_interleaved_writer():
+                connection = real_connect()
 
-                def complete_job() -> None:
-                    update_started.set()
-                    service._update_job(
-                        job.job_id,
-                        status="completed",
-                        return_code=0,
-                        completed_at="2026-07-30T06:00:01+08:00",
-                        updated_at="2026-07-30T06:00:01+08:00",
-                    )
-                    update_finished.set()
+                def trace(statement: str) -> None:
+                    nonlocal select_count
+                    if not statement.lstrip().upper().startswith("SELECT"):
+                        return
+                    select_count += 1
+                    if select_count == 2:
+                        writer_service._update_job(
+                            job.job_id,
+                            status="completed",
+                            return_code=0,
+                            completed_at="2026-07-30T06:00:01+08:00",
+                            updated_at="2026-07-30T06:00:01+08:00",
+                        )
 
-                worker = threading.Thread(target=complete_job, daemon=True)
-                workers.append(worker)
-                worker.start()
-                self.assertTrue(update_started.wait(timeout=1))
-                time.sleep(0.05)
-                self.assertFalse(update_finished.is_set())
-                return latest
+                connection.set_trace_callback(trace)
+                return connection
 
             with patch.object(
-                service,
-                "get_latest_jobs_by_type",
-                side_effect=latest_then_complete,
+                reader_service,
+                "_connect",
+                side_effect=connect_with_interleaved_writer,
             ):
-                latest_jobs, active_count, recent_jobs = service.get_status_snapshot()
+                latest_jobs, active_count, recent_jobs = (
+                    reader_service.get_status_snapshot()
+                )
 
-            workers[0].join(timeout=1)
-            final_status = service.get_job(job.job_id).status
+            final_status = writer_service.get_job(job.job_id).status
 
-        self.assertTrue(update_finished.is_set())
+        self.assertGreaterEqual(select_count, 3)
         self.assertEqual(latest_jobs[job.job_type].status, "running")
         self.assertEqual(active_count, 1)
         self.assertEqual(recent_jobs[0].status, "running")
         self.assertEqual(final_status, "completed")
+
+    def test_status_snapshot_keeps_active_jobs_beyond_recent_history_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            jobs = [
+                QuantJob(
+                    job_id="qj_old_running",
+                    job_type="run_robust_development",
+                    label="长期训练",
+                    status="running",
+                    params={},
+                    command=[sys.executable],
+                    cwd=temp_dir,
+                    created_at="2026-07-30T01:00:00+08:00",
+                    started_at="2026-07-30T01:00:01+08:00",
+                    updated_at="2026-07-30T01:00:01+08:00",
+                    log_path=str(jobs_root / "qj_old_running" / "job.log"),
+                ),
+                QuantJob(
+                    job_id="qj_old_pending",
+                    job_type="run_robust_signal_research",
+                    label="信号研究",
+                    status="pending",
+                    params={},
+                    command=[sys.executable],
+                    cwd=temp_dir,
+                    created_at="2026-07-30T02:00:00+08:00",
+                    updated_at="2026-07-30T02:00:00+08:00",
+                    log_path=str(jobs_root / "qj_old_pending" / "job.log"),
+                ),
+            ]
+            for index in range(3):
+                timestamp = f"2026-07-30T0{index + 3}:00:00+08:00"
+                jobs.append(
+                    QuantJob(
+                        job_id=f"qj_recent_completed_{index}",
+                        job_type=f"completed_{index}",
+                        label=f"已完成任务 {index}",
+                        status="completed",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        return_code=0,
+                        created_at=timestamp,
+                        started_at=timestamp,
+                        completed_at=timestamp,
+                        updated_at=timestamp,
+                        log_path=str(
+                            jobs_root / f"qj_recent_completed_{index}" / "job.log"
+                        ),
+                    )
+                )
+            for job in jobs:
+                service._insert_job(job)
+
+            _latest_jobs, active_count, visible_jobs = service.get_status_snapshot(
+                recent_limit=2
+            )
+
+        visible_ids = {job.job_id for job in visible_jobs}
+        completed_ids = [
+            job.job_id for job in visible_jobs if job.status == "completed"
+        ]
+        self.assertEqual(active_count, 2)
+        self.assertIn("qj_old_running", visible_ids)
+        self.assertIn("qj_old_pending", visible_ids)
+        self.assertEqual(
+            completed_ids,
+            ["qj_recent_completed_2", "qj_recent_completed_1"],
+        )
+
+    def test_status_snapshot_prioritizes_recently_completed_long_running_job(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            long_running_job = QuantJob(
+                job_id="qj_long_running_completed",
+                job_type="run_robust_development",
+                label="长期训练",
+                status="running",
+                params={},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-07-01T01:00:00+08:00",
+                started_at="2026-07-01T01:00:01+08:00",
+                updated_at="2026-07-01T01:00:01+08:00",
+                log_path=str(
+                    jobs_root / "qj_long_running_completed" / "job.log"
+                ),
+            )
+            service._insert_job(long_running_job)
+            for index in range(3):
+                timestamp = f"2026-07-0{index + 2}T01:00:00+08:00"
+                service._insert_job(
+                    QuantJob(
+                        job_id=f"qj_newer_completed_{index}",
+                        job_type=f"newer_completed_{index}",
+                        label=f"较新任务 {index}",
+                        status="completed",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        return_code=0,
+                        created_at=timestamp,
+                        started_at=timestamp,
+                        completed_at=timestamp,
+                        updated_at=timestamp,
+                        log_path=str(
+                            jobs_root / f"qj_newer_completed_{index}" / "job.log"
+                        ),
+                    )
+                )
+            service._update_job(
+                long_running_job.job_id,
+                status="completed",
+                return_code=0,
+                completed_at="2026-07-30T01:00:00+08:00",
+                updated_at="2026-07-30T01:00:00+08:00",
+            )
+
+            _latest_jobs, active_count, visible_jobs = service.get_status_snapshot(
+                recent_limit=2
+            )
+
+        self.assertEqual(active_count, 0)
+        self.assertEqual(len(visible_jobs), 2)
+        self.assertEqual(visible_jobs[0].job_id, "qj_long_running_completed")
+        self.assertIn(
+            "qj_long_running_completed", {job.job_id for job in visible_jobs}
+        )
+
+    def test_list_jobs_limit_prioritizes_recently_updated_long_running_job(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            service._insert_job(
+                QuantJob(
+                    job_id="qj_old_just_completed",
+                    job_type="report_data_quality",
+                    label="长期数据任务",
+                    status="completed",
+                    params={},
+                    command=[sys.executable],
+                    cwd=temp_dir,
+                    return_code=0,
+                    created_at="2026-07-01T01:00:00+08:00",
+                    started_at="2026-07-01T01:00:01+08:00",
+                    completed_at="2026-07-30T01:00:00+08:00",
+                    updated_at="2026-07-30T01:00:00+08:00",
+                    log_path=str(
+                        jobs_root / "qj_old_just_completed" / "job.log"
+                    ),
+                )
+            )
+            for index in range(2):
+                timestamp = f"2026-07-0{index + 2}T01:00:00+08:00"
+                service._insert_job(
+                    QuantJob(
+                        job_id=f"qj_newer_created_{index}",
+                        job_type="report_data_quality",
+                        label=f"较晚创建任务 {index}",
+                        status="completed",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        return_code=0,
+                        created_at=timestamp,
+                        started_at=timestamp,
+                        completed_at=timestamp,
+                        updated_at=timestamp,
+                        log_path=str(
+                            jobs_root / f"qj_newer_created_{index}" / "job.log"
+                        ),
+                    )
+                )
+
+            listed = service.list_jobs(limit=2)
+            filtered = service.list_jobs(
+                limit=2,
+                job_type="report_data_quality",
+            )
+
+        self.assertEqual(listed[0].job_id, "qj_old_just_completed")
+        self.assertEqual(filtered[0].job_id, "qj_old_just_completed")
 
     def test_job_response_exposes_artifact_names_without_absolute_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -394,10 +621,15 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(
             [Path(pattern).name for pattern in artifact_patterns],
             [
+                "data_hygiene_reports_latest.json",
                 "data_hygiene_inventory_latest.md",
                 "data_hygiene_inventory_latest.json",
                 "data_hygiene_cleanup_plan_latest.md",
                 "data_hygiene_cleanup_plan_latest.json",
+                "data_hygiene_inventory_*.md",
+                "data_hygiene_inventory_*.json",
+                "data_hygiene_cleanup_plan_*.md",
+                "data_hygiene_cleanup_plan_*.json",
             ],
         )
         self.assertTrue(
@@ -406,7 +638,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 for pattern in artifact_patterns
             )
         )
-        self.assertFalse(any("*" in pattern for pattern in artifact_patterns))
+        self.assertEqual(sum("*" in pattern for pattern in artifact_patterns), 4)
 
     def test_workbench_capability_report_job_is_read_only_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -579,12 +811,72 @@ class QuantJobsApiTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             reports_dir = Path(temp_dir) / "reports"
             reports_dir.mkdir()
+            quality_markdown = "# Quality\n\n- Stock universe: 5340\n"
+            quality_digest = hashlib.sha256(
+                quality_markdown.encode("utf-8")
+            ).hexdigest()
+            quality_artifact = reports_dir / (
+                f"data_quality_report_20260705_153000_{quality_digest[:16]}.md"
+            )
+            quality_artifact.write_text(quality_markdown, encoding="utf-8")
+            quality_evidence = {
+                "schema_version": 3,
+                "evidence_contract": "immutable_data_quality_evidence_v2",
+                "scan_mode": "full",
+                "coverage_status": "full",
+                "verification_status": "verified",
+                "trainable": True,
+                "training_thresholds": {
+                    "min_calendar_days": 252,
+                    "min_instruments": 100,
+                    "min_merged_instruments": 100,
+                    "authoritative_min_calendar_days": 252,
+                    "authoritative_min_instruments": 100,
+                    "authoritative": True,
+                },
+                "markdown_artifact": quality_artifact.name,
+                "markdown_sha256": quality_digest,
+            }
+            quality_evidence_bytes = (
+                json.dumps(
+                    quality_evidence,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            quality_evidence_sha256 = hashlib.sha256(
+                quality_evidence_bytes
+            ).hexdigest()
+            quality_report_id = f"data-quality-{quality_evidence_sha256[:16]}"
+            quality_evidence_artifact = reports_dir / (
+                "data_quality_report_20260705_153000_"
+                f"{quality_evidence_sha256[:16]}.json"
+            )
+            quality_evidence_artifact.write_bytes(quality_evidence_bytes)
+            (reports_dir / "data_quality_report_latest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 3,
+                        "report_id": quality_report_id,
+                        "publication_contract": (
+                            "atomic_json_pointer_to_immutable_quality_evidence_v2"
+                        ),
+                        "evidence_artifact": quality_evidence_artifact.name,
+                        "evidence_sha256": quality_evidence_sha256,
+                    }
+                ),
+                encoding="utf-8",
+            )
             status_path = reports_dir / "research_status_latest.json"
             status_path.write_text(
                 json.dumps(
                     {
                         "generated_at": "2026-07-05T15:30:00+08:00",
                         "trainable": True,
+                        "quality_report_id": quality_report_id,
+                        "quality_evidence_sha256": quality_evidence_sha256,
                         "training_readiness": {
                             "status": "trainable",
                             "summary": "Qlib provider is ready.",
@@ -663,6 +955,304 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(
             body["external_services"]["catdesk"]["url"], "http://127.0.0.1:8765/"
         )
+
+    def test_status_offloads_research_snapshot_build_from_event_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+            offloaded = []
+            real_to_thread = asyncio.to_thread
+
+            async def tracking_to_thread(fn, *args, **kwargs):
+                offloaded.append(fn)
+                return await real_to_thread(fn, *args, **kwargs)
+
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                    return_value={
+                        "generated_at": "2026-07-31T12:00:00+08:00",
+                        "trainable": False,
+                        "training_readiness": {},
+                    },
+                ) as build_status,
+                patch(
+                    "api.v1.endpoints.quant_jobs.asyncio.to_thread",
+                    side_effect=tracking_to_thread,
+                ),
+                patch.object(
+                    service,
+                    "get_status_snapshot",
+                    wraps=service.get_status_snapshot,
+                ) as get_snapshot,
+            ):
+                resp = client.get("/api/v1/quant/status")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(build_status, offloaded)
+        self.assertIn(get_snapshot, offloaded)
+
+    def test_submit_job_offloads_service_work_from_event_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+            submitted = QuantJob(
+                job_id="qj_20260731120000_1234abcd",
+                job_type="check_qlib_data",
+                label="检查 Qlib 数据",
+                status="pending",
+                params={},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-07-31T12:00:00+08:00",
+                updated_at="2026-07-31T12:00:00+08:00",
+                log_path=str(Path(temp_dir) / "job.log"),
+            )
+            offloaded = []
+            real_to_thread = asyncio.to_thread
+
+            async def tracking_to_thread(fn, *args, **kwargs):
+                offloaded.append(fn)
+                return await real_to_thread(fn, *args, **kwargs)
+
+            with (
+                patch.object(service, "submit_job", return_value=submitted) as submit,
+                patch(
+                    "api.v1.endpoints.quant_jobs.asyncio.to_thread",
+                    side_effect=tracking_to_thread,
+                ),
+            ):
+                resp = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "check_qlib_data", "params": {}},
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(submit, offloaded)
+
+    def test_submit_blocks_formal_training_when_data_is_not_trainable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "train_baseline_lgb": {
+                        "label": "训练基线",
+                        "command": [sys.executable, "-c", "print('train')"],
+                    },
+                    "run_candidate_pipeline": {
+                        "label": "候选流程",
+                        "command": [sys.executable, "-c", "print('candidate')"],
+                        "allowed_params": {"dry_run"},
+                    },
+                },
+            )
+            client = self._make_client(service)
+            blocked_status = {
+                "trainable": False,
+                "training_readiness": {
+                    "status": "blocked",
+                    "summary": "Latest quality report is unverified.",
+                },
+            }
+
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                    return_value=blocked_status,
+                ),
+                patch.object(service, "_start_job"),
+            ):
+                baseline = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "train_baseline_lgb", "params": {}},
+                )
+                candidate = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "run_candidate_pipeline", "params": {}},
+                )
+                dry_run = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "run_candidate_pipeline",
+                        "params": {"dry_run": True},
+                    },
+                )
+
+            jobs = service.list_jobs()
+
+        self.assertEqual(baseline.status_code, 409)
+        self.assertEqual(candidate.status_code, 409)
+        self.assertEqual(baseline.json()["error"], "training_blocked")
+        self.assertEqual(candidate.json()["error"], "training_blocked")
+        self.assertEqual(dry_run.status_code, 200)
+        self.assertEqual([job.job_type for job in jobs], ["run_candidate_pipeline"])
+
+    def test_submit_pins_the_quality_approved_cleaned_snapshot_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "train_baseline_lgb": {
+                        "label": "训练基线",
+                        "command": [sys.executable, "-c", "print('train')"],
+                    }
+                },
+            )
+            client = self._make_client(service)
+            approved_identity = {
+                "provider_contract": "immutable_snapshot_v2",
+                "dataset_id": "qlib_ashare_cleaned_v2",
+                "snapshot_id": "cleaned-snapshot",
+                "manifest_sha256": "a" * 64,
+                "content_sha256": "b" * 64,
+            }
+            ready_status = {
+                "trainable": True,
+                "training_readiness": {"status": "trainable", "summary": "ready"},
+                "qlib_provider": {
+                    **approved_identity,
+                    "path": str(Path(temp_dir) / "cleaned-snapshot"),
+                },
+            }
+            submitted = QuantJob(
+                job_id="qj_20260731130000_1234abcd",
+                job_type="train_baseline_lgb",
+                label="训练基线",
+                status="pending",
+                params={"provider": "cleaned"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-07-31T13:00:00+08:00",
+                updated_at="2026-07-31T13:00:00+08:00",
+                log_path=str(Path(temp_dir) / "job.log"),
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                    return_value=ready_status,
+                ) as build_status,
+                patch.object(service, "submit_job", return_value=submitted) as submit,
+            ):
+                response = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "train_baseline_lgb",
+                        "params": {"provider": "cleaned"},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        build_status.assert_called_once_with(
+            provider_dataset_id="qlib_ashare_cleaned_v2"
+        )
+        submit.assert_called_once_with(
+            "train_baseline_lgb",
+            {"provider": "cleaned"},
+            approved_provider_identity=approved_identity,
+        )
+
+    def test_submit_blocks_trainable_status_without_approved_snapshot_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "train_baseline_lgb": {
+                        "label": "训练基线",
+                        "command": [sys.executable, "-c", "print('train')"],
+                    }
+                },
+            )
+            client = self._make_client(service)
+            with patch(
+                "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                return_value={
+                    "trainable": True,
+                    "training_readiness": {
+                        "status": "trainable",
+                        "summary": "Legacy optimistic state.",
+                    },
+                },
+            ):
+                response = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "train_baseline_lgb", "params": {}},
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "training_blocked")
+
+    def test_formal_training_commands_receive_approved_provider_identity(self) -> None:
+        approved_identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "canonical-snapshot",
+            "manifest_sha256": "c" * 64,
+            "content_sha256": "d" * 64,
+        }
+        commands = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, job_type in enumerate(
+                ("train_baseline_lgb", "run_candidate_pipeline")
+            ):
+                service = QuantJobService(
+                    jobs_root=Path(temp_dir) / f"jobs-{index}",
+                    command_specs=None,
+                )
+                with patch.object(service, "_start_job"):
+                    job = service.submit_job(
+                        job_type,
+                        {"provider": "canonical"},
+                        approved_provider_identity=approved_identity,
+                    )
+                commands.append(job.command)
+
+        for command in commands:
+            identity_json = command[command.index("--provider-identity-json") + 1]
+            self.assertEqual(json.loads(identity_json), approved_identity)
+
+    def test_service_rejects_formal_training_without_approved_provider_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, job_type in enumerate(
+                ("train_baseline_lgb", "run_candidate_pipeline")
+            ):
+                service = QuantJobService(
+                    jobs_root=Path(temp_dir) / f"jobs-{index}",
+                    command_specs=None,
+                )
+                with patch.object(service, "_start_job"):
+                    with self.subTest(job_type=job_type):
+                        with self.assertRaises(ValueError) as raised:
+                            service.submit_job(
+                                job_type, {"provider": "canonical"}
+                            )
+                        self.assertIn(
+                            "approved provider identity",
+                            str(raised.exception).lower(),
+                        )
+
+            dry_run_service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs-dry-run",
+                command_specs=None,
+            )
+            with patch.object(dry_run_service, "_start_job"):
+                dry_run = dry_run_service.submit_job(
+                    "run_candidate_pipeline",
+                    {"provider": "canonical", "dry_run": True},
+                )
+
+        self.assertEqual(dry_run.status, "pending")
+        self.assertNotIn("--provider-identity-json", dry_run.command)
 
     def test_status_mlflow_url_can_be_overridden_by_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -999,27 +1589,43 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 jobs_root=Path(temp_dir) / "jobs", command_specs={}
             )
             client = self._make_client(service)
-            to_thread = AsyncMock(
-                return_value={
+            offloaded = []
+
+            async def fake_to_thread(fn, *args, **kwargs):
+                offloaded.append(fn.__name__)
+                if fn.__name__ == "build_research_status_payload":
+                    return {
+                        "generated_at": "2026-07-05T15:30:00+08:00",
+                        "trainable": True,
+                    }
+                if fn.__name__ == "get_status_snapshot":
+                    return {}, 0, []
+                return {
                     "url": "http://127.0.0.1:6006/",
                     "status": "available",
                     "role": "experiment_raw_records",
                     "checked_at": "2026-07-06T10:00:00+00:00",
                 }
-            )
 
             with (
                 patch(
                     "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path
                 ),
-                patch("api.v1.endpoints.quant_jobs.asyncio.to_thread", to_thread),
+                patch(
+                    "api.v1.endpoints.quant_jobs.asyncio.to_thread",
+                    side_effect=fake_to_thread,
+                ),
             ):
                 resp = client.get("/api/v1/quant/status")
 
         self.assertEqual(resp.status_code, 200)
-        to_thread.assert_awaited_once()
         self.assertEqual(
-            to_thread.await_args.args[0].__name__, "_mlflow_status_payload"
+            offloaded,
+            [
+                "build_research_status_payload",
+                "_mlflow_status_payload",
+                "get_status_snapshot",
+            ],
         )
         self.assertEqual(resp.json()["mlflow"]["status"], "available")
 
@@ -1382,8 +1988,60 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 jobs = asyncio.run(_list_jobs_for_stream(service))
 
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][2], {"limit": 20})
+        self.assertIs(calls[0][0].__self__, service)
+        self.assertIs(
+            calls[0][0].__func__, QuantJobService.list_jobs_for_monitoring
+        )
+        self.assertEqual(calls[0][2], {"history_limit": 20})
         self.assertEqual(jobs[0].job_id, "qj_stream_thread")
+
+    def test_stream_snapshot_keeps_active_jobs_beyond_history_limit(self) -> None:
+        from api.v1.endpoints.quant_jobs import _list_jobs_for_stream
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            active_job = QuantJob(
+                job_id="qj_stream_old_running",
+                job_type="run_robust_development",
+                label="长期训练",
+                status="running",
+                params={},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-07-01T01:00:00+08:00",
+                started_at="2026-07-01T01:00:01+08:00",
+                updated_at="2026-07-01T01:00:01+08:00",
+                log_path=str(jobs_root / "qj_stream_old_running" / "job.log"),
+            )
+            service._insert_job(active_job)
+            for index in range(21):
+                timestamp = f"2026-07-{index + 2:02d}T01:00:00+08:00"
+                service._insert_job(
+                    QuantJob(
+                        job_id=f"qj_stream_completed_{index:02d}",
+                        job_type=f"completed_{index:02d}",
+                        label=f"已完成任务 {index}",
+                        status="completed",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        return_code=0,
+                        created_at=timestamp,
+                        started_at=timestamp,
+                        completed_at=timestamp,
+                        updated_at=timestamp,
+                        log_path=str(
+                            jobs_root / f"qj_stream_completed_{index:02d}" / "job.log"
+                        ),
+                    )
+                )
+
+            jobs = asyncio.run(_list_jobs_for_stream(service))
+
+        self.assertEqual(len(jobs), 21)
+        self.assertIn("qj_stream_old_running", {job.job_id for job in jobs})
+        self.assertEqual(sum(job.status == "completed" for job in jobs), 20)
 
     def test_stream_event_generator_stops_after_max_events(self) -> None:
         from api.v1.endpoints.quant_jobs import _quant_job_event_generator
@@ -2181,9 +2839,19 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 },
             )
             handle = FakeHandle()
+            real_path_open = Path.open
+
+            def open_job_log(path: Path, *args, **kwargs):
+                if path.name == "job.log" and path.parent.parent == service.jobs_root:
+                    return handle
+                return real_path_open(path, *args, **kwargs)
 
             with (
-                patch("src.services.quant_job_service.Path.open", return_value=handle),
+                patch(
+                    "src.services.quant_job_service.Path.open",
+                    autospec=True,
+                    side_effect=open_job_log,
+                ),
                 patch(
                     "src.services.quant_job_service.subprocess.Popen",
                     side_effect=RuntimeError("boom"),
@@ -2234,6 +2902,256 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         self.assertEqual(recovered.status, "completed")
         self.assertEqual(recovered.artifact_paths, [str(artifact_path)])
+
+    def test_completed_job_excludes_preexisting_matching_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            reports_dir.mkdir()
+            old_artifact = reports_dir / "data_quality_report_old.md"
+            old_artifact.write_text("old run", encoding="utf-8")
+            new_artifact = reports_dir / "data_quality_report_new.md"
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "report_data_quality": {
+                        "label": "数据质量报告",
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "from pathlib import Path; "
+                                f"p = Path({str(new_artifact)!r}); "
+                                "p.write_text('new run', encoding='utf-8')"
+                            ),
+                        ],
+                        "artifact_patterns": [
+                            str(reports_dir / "data_quality_report_*.md")
+                        ],
+                    },
+                },
+            )
+            job = service.submit_job("report_data_quality")
+
+            deadline = time.time() + 5
+            recovered = service.get_job(job.job_id)
+            while time.time() < deadline:
+                recovered = service.get_job(job.job_id)
+                if recovered.status == "completed":
+                    break
+                time.sleep(0.05)
+
+        self.assertEqual(recovered.status, "completed")
+        self.assertEqual(recovered.artifact_paths, [str(new_artifact)])
+
+    def test_submit_rejects_concurrent_jobs_with_overlapping_artifact_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "first_report": {
+                        "label": "第一份报告",
+                        "command": [sys.executable, "-c", "print('first')"],
+                        "artifact_patterns": [
+                            str(reports_dir / "shared_report_*.json")
+                        ],
+                    },
+                    "second_report": {
+                        "label": "第二份报告",
+                        "command": [sys.executable, "-c", "print('second')"],
+                        "artifact_patterns": [
+                            str(reports_dir / "shared_report_latest.json")
+                        ],
+                    },
+                },
+            )
+
+            with patch.object(service, "_start_job"):
+                first = service.submit_job("first_report")
+                with self.assertRaises(ValueError) as raised:
+                    service.submit_job("second_report")
+
+            jobs = service.list_jobs()
+
+        self.assertEqual(first.status, "pending")
+        self.assertIn("artifact output", str(raised.exception).lower())
+        self.assertEqual([job.job_type for job in jobs], ["first_report"])
+
+    def test_shared_job_index_atomically_claims_overlapping_artifact_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir) / "reports"
+            jobs_root = Path(temp_dir) / "jobs"
+            command_specs = {
+                "first_report": {
+                    "label": "第一份报告",
+                    "command": [sys.executable, "-c", "print('first')"],
+                    "artifact_patterns": [
+                        str(reports_dir / "shared_report_*.json")
+                    ],
+                },
+                "second_report": {
+                    "label": "第二份报告",
+                    "command": [sys.executable, "-c", "print('second')"],
+                    "artifact_patterns": [
+                        str(reports_dir / "shared_report_latest.json")
+                    ],
+                },
+            }
+            first_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            second_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            start_barrier = threading.Barrier(3)
+            result_lock = threading.Lock()
+            submitted = []
+            errors = []
+
+            def submit(service: QuantJobService, job_type: str) -> None:
+                start_barrier.wait()
+                try:
+                    job = service.submit_job(job_type)
+                except ValueError as exc:
+                    with result_lock:
+                        errors.append(str(exc))
+                else:
+                    with result_lock:
+                        submitted.append(job)
+
+            with (
+                patch.object(first_service, "_start_job"),
+                patch.object(second_service, "_start_job"),
+            ):
+                threads = [
+                    threading.Thread(
+                        target=submit,
+                        args=(first_service, "first_report"),
+                    ),
+                    threading.Thread(
+                        target=submit,
+                        args=(second_service, "second_report"),
+                    ),
+                ]
+                for thread in threads:
+                    thread.start()
+                start_barrier.wait()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            jobs = first_service.list_jobs()
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("artifact output", errors[0].lower())
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].status, "pending")
+
+    def test_baseline_and_candidate_atomically_claim_shared_training_outputs(
+        self,
+    ) -> None:
+        from src.services.quant_job_service import _build_default_command_specs
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            defaults = _build_default_command_specs()
+            command_specs = {
+                job_type: {
+                    **defaults[job_type],
+                    "command": [sys.executable, "-c", "print('training')"],
+                    "allowed_params": set(),
+                }
+                for job_type in ("train_baseline_lgb", "run_candidate_pipeline")
+            }
+            first_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            second_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            start_barrier = threading.Barrier(3)
+            result_lock = threading.Lock()
+            submitted = []
+            errors = []
+            approved_identity = {
+                "provider_contract": "immutable_snapshot_v2",
+                "dataset_id": "qlib_ashare_v2",
+                "snapshot_id": "canonical-snapshot",
+                "manifest_sha256": "a" * 64,
+                "content_sha256": "b" * 64,
+            }
+
+            def submit(service: QuantJobService, job_type: str) -> None:
+                start_barrier.wait()
+                try:
+                    job = service.submit_job(
+                        job_type,
+                        approved_provider_identity=approved_identity,
+                    )
+                except ValueError as exc:
+                    with result_lock:
+                        errors.append(str(exc))
+                else:
+                    with result_lock:
+                        submitted.append(job)
+
+            with (
+                patch.object(first_service, "_start_job"),
+                patch.object(second_service, "_start_job"),
+            ):
+                threads = [
+                    threading.Thread(
+                        target=submit,
+                        args=(first_service, "train_baseline_lgb"),
+                    ),
+                    threading.Thread(
+                        target=submit,
+                        args=(second_service, "run_candidate_pipeline"),
+                    ),
+                ]
+                for thread in threads:
+                    thread.start()
+                start_barrier.wait()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            jobs = first_service.list_jobs()
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("artifact output", errors[0].lower())
+        self.assertEqual(len(jobs), 1)
+
+    def test_daily_update_claims_data_quality_outputs_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs=None,
+            )
+
+            with patch.object(service, "_start_job"):
+                daily = service.submit_job(
+                    "run_daily_update",
+                    {"dry_run": True, "skip_download": True},
+                )
+                with self.assertRaises(ValueError) as raised:
+                    service.submit_job("report_data_quality")
+
+            jobs = service.list_jobs()
+
+        self.assertEqual(daily.status, "pending")
+        self.assertIn("artifact output", str(raised.exception).lower())
+        self.assertEqual([job.job_type for job in jobs], ["run_daily_update"])
 
     def test_artifact_download_rejects_symlink_that_resolves_outside_reports_root(
         self,
@@ -3340,6 +4258,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 {"overlap_sample": 5, "merged_sample": 5},
             )
             status = service.available_job_types()
+            spec = service.command_specs["report_data_quality"]
 
         self.assertIn("report_data_quality.py", command[1])
         self._assert_reports_dir_arg(command)
@@ -3350,6 +4269,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
             status["report_data_quality"]["allowed_params"],
             ["merged_sample", "overlap_sample"],
         )
+        artifact_names = [Path(pattern).name for pattern in spec["artifact_patterns"]]
+        self.assertIn("data_quality_report_latest.json", artifact_names)
+        self.assertIn("data_quality_report_*.json", artifact_names)
+        self.assertIn("data_quality_ashare_qfq_summary_*.csv", artifact_names)
+        self.assertNotIn("data_quality_merged_summary_*.csv", artifact_names)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")

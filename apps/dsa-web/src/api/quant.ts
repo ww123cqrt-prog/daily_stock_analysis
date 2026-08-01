@@ -135,6 +135,11 @@ export function parseQuantJobStreamEvent(data: string): QuantJob[] {
 }
 
 export const quantApi = {
+  async getJobTypes(): Promise<Record<string, QuantJobTypeInfo>> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/quant/job-types');
+    return convertRecordValues(response.data.available_job_types, convertJobTypeInfo);
+  },
+
   async getStatus(): Promise<QuantStatus> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/quant/status');
     return convertStatus(response.data);

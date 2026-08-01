@@ -8,11 +8,15 @@ never overlaps a writer.
 
 from __future__ import annotations
 
+import errno
 import os
+import time
 from typing import BinaryIO
 
 
 IS_WINDOWS = os.name == "nt"
+WINDOWS_LOCK_RETRY_INTERVAL_SECONDS = 0.1
+WINDOWS_LOCK_MAX_WAIT_SECONDS = 3600.0
 
 
 def _prepare_windows_lock_file(handle: BinaryIO) -> None:
@@ -28,13 +32,22 @@ def _lock_windows(handle: BinaryIO, *, blocking: bool) -> None:
     import msvcrt
 
     _prepare_windows_lock_file(handle)
-    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-    try:
-        msvcrt.locking(handle.fileno(), mode, 1)
-    except OSError as exc:
-        if not blocking:
-            raise BlockingIOError("file lock is already held") from exc
-        raise
+    started_at = time.monotonic()
+    while True:
+        handle.seek(0)
+        try:
+            # LK_LOCK has a short, implementation-defined retry limit.  Use
+            # non-blocking attempts so a long training run can hold the lock.
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if not blocking:
+                raise BlockingIOError("file lock is already held") from exc
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise
+            if time.monotonic() - started_at >= WINDOWS_LOCK_MAX_WAIT_SECONDS:
+                raise TimeoutError("timed out waiting for the Windows file lock") from exc
+            time.sleep(WINDOWS_LOCK_RETRY_INTERVAL_SECONDS)
 
 
 def _unlock_windows(handle: BinaryIO) -> None:

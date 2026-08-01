@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from datetime import datetime
@@ -324,8 +325,57 @@ def dataset_date_range(paths: list[Path]) -> tuple[pd.Timestamp | None, pd.Times
     return min(starts), max(ends)
 
 
-def indexed_date_range(directory: Path) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    index_path = Path(directory) / ".metadata" / "FILE_INDEX.parquet"
+def _native_file_index_path(directory: Path) -> Path | None:
+    directory = Path(directory)
+    snapshot = directory.parent
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    if directory.name != "bars" or manifest_path.is_symlink() or not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 2
+        or not isinstance(manifest.get("dataset_id"), str)
+        or not manifest.get("dataset_id")
+        or manifest.get("snapshot_id") != snapshot.name
+        or manifest.get("data_kind") != "daily_bars"
+        or manifest.get("role") != "canonical"
+        or manifest.get("status") != "ready"
+    ):
+        return None
+    raw_path = manifest.get("file_index_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    relative = Path(raw_path)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    snapshot = snapshot.resolve()
+    candidate = (snapshot / relative).resolve()
+    try:
+        candidate.relative_to(snapshot)
+    except ValueError:
+        return None
+    current = snapshot
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+    return candidate if candidate.is_file() else None
+
+
+def indexed_date_range(
+    directory: Path,
+    *,
+    native_snapshot_validated: bool = False,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    index_path = (
+        _native_file_index_path(directory) if native_snapshot_validated else None
+    )
+    if index_path is None:
+        index_path = Path(directory) / ".metadata" / "FILE_INDEX.parquet"
     if not index_path.is_file():
         return None, None
     try:
@@ -339,9 +389,16 @@ def indexed_date_range(directory: Path) -> tuple[pd.Timestamp | None, pd.Timesta
     return starts.min(), ends.max()
 
 
-def scan_merged_files(directory: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def scan_merged_files(
+    directory: Path,
+    *,
+    native_snapshot_validated: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     paths = sorted(directory.glob("*.parquet"))
-    dataset_start, dataset_end = indexed_date_range(directory)
+    dataset_start, dataset_end = indexed_date_range(
+        directory,
+        native_snapshot_validated=native_snapshot_validated,
+    )
     if dataset_end is None:
         dataset_start, dataset_end = dataset_date_range(paths)
     if dataset_end is None:
@@ -377,7 +434,7 @@ def scan_merged_files(directory: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict
         summary_rows.append(summary)
         event_rows.extend(events)
         if index % 1000 == 0:
-            print(f"  scanned {index}/{len(paths)} merged files")
+            print(f"  scanned {index}/{len(paths)} A-share qfq files")
 
     summary_df = pd.DataFrame(summary_rows)
     events_df = pd.DataFrame(event_rows)
@@ -435,7 +492,7 @@ def build_report(
         conclusion = "当前数据存在结构性 blocker，正式训练前应先排除或修复这些股票。"
     else:
         conclusion = (
-            "当前合并数据没有发现结构性 blocker，可以先跑基线训练；"
+            "当前正式 qfq 数据没有发现结构性 blocker，可以先跑基线训练；"
             "review 级事件建议在干净训练集里做极端收益截尾或事件日 mask。"
         )
 
@@ -445,7 +502,7 @@ Generated: {generated}
 
 ## Coverage
 
-- Merged parquet directory: `{merged_dir}`
+- A-share qfq parquet directory: `{merged_dir}`
 - Files scanned: {coverage["files"]}
 - Rows scanned: {coverage["rows"]:,}
 - Dataset date range: {coverage["start"]} ~ {coverage["end"]}
@@ -485,19 +542,23 @@ Generated: {generated}
 """
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--merged-dir", type=Path, default=MERGED_DIR or ashare_qfq_bars_dir()
-    )
+    parser.add_argument("--merged-dir", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    configured_directory = args.merged_dir or MERGED_DIR
+    native_snapshot_validated = configured_directory is None
+    args.merged_dir = Path(configured_directory or ashare_qfq_bars_dir())
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("Scanning merged parquet files for anomaly events...")
-    summary_df, events_df, coverage = scan_merged_files(args.merged_dir)
+    print("Scanning A-share qfq parquet files for anomaly events...")
+    summary_df, events_df, coverage = scan_merged_files(
+        args.merged_dir,
+        native_snapshot_validated=native_snapshot_validated,
+    )
 
     if not summary_df.empty:
         summary_df = summary_df.sort_values(

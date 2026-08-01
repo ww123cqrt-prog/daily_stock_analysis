@@ -39,6 +39,10 @@ NATIVE_QLIB_DATASET_ROOTS = {
     "qlib_ashare_v2": Path("qlib/cn_data_ashare_v2"),
     "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
 }
+PROVIDER_DATASET_IDS = {
+    "canonical": "qlib_ashare_v2",
+    "cleaned": "qlib_ashare_cleaned_v2",
+}
 
 
 class RunProvenanceError(RuntimeError):
@@ -112,6 +116,34 @@ def resolve_immutable_provider_identity(
     ):
         raise RunProvenanceError(
             "selected native Qlib snapshot does not match the MLflow provider identity"
+        )
+    return snapshot
+
+
+def resolve_approved_provider_identity(
+    provider: str,
+    identity: Mapping[str, Any],
+    *,
+    quant_data_root: Path,
+) -> Path:
+    """Resolve one API-approved provider identity without consulting LATEST."""
+
+    provider_name = str(provider or "canonical").strip().lower()
+    expected_dataset_id = PROVIDER_DATASET_IDS.get(provider_name)
+    if expected_dataset_id is None:
+        raise RunProvenanceError("approved provider name is unsupported")
+    if identity.get("dataset_id") != expected_dataset_id:
+        raise RunProvenanceError(
+            "approved provider identity does not match the selected provider"
+        )
+    snapshot = resolve_immutable_provider_identity(
+        identity,
+        quant_data_root=quant_data_root,
+    )
+    actual = provider_identity(snapshot)
+    if any(actual.get(field) != identity.get(field) for field in PROVIDER_IDENTITY_FIELDS):
+        raise RunProvenanceError(
+            "approved provider identity changed before training started"
         )
     return snapshot
 
@@ -304,6 +336,34 @@ def provider_identity(provider_uri: Path) -> dict[str, str]:
         }
     )
     return identity
+
+
+def revalidate_provider_identity(
+    provider_uri: Path,
+    expected_identity: Mapping[str, Any],
+    *,
+    quant_data_root: Path,
+) -> dict[str, str]:
+    """Fully revalidate a pinned provider and require its identity to be unchanged."""
+
+    provider = Path(provider_uri).expanduser().resolve()
+    validated_provider = resolve_immutable_provider_identity(
+        expected_identity,
+        quant_data_root=quant_data_root,
+    )
+    if provider != validated_provider:
+        raise RunProvenanceError(
+            "selected provider path changed after training approval"
+        )
+    actual_identity = provider_identity(provider)
+    if any(
+        actual_identity.get(field) != expected_identity.get(field)
+        for field in PROVIDER_IDENTITY_FIELDS
+    ):
+        raise RunProvenanceError(
+            "selected provider identity changed during training"
+        )
+    return actual_identity
 
 
 def provider_tags(identity: Mapping[str, str]) -> dict[str, str]:

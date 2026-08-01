@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,260 @@ def write_factors(path: Path) -> None:
             "factor": [0.98, 1.0],
         }
     ).to_parquet(path, index=False)
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close"])
+def test_validate_bar_frame_rejects_non_positive_prices(column: str) -> None:
+    module = load_module()
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-07-23"]),
+            "open": [1.0],
+            "high": [1.2],
+            "low": [0.9],
+            "close": [1.1],
+            "volume": [100.0],
+        }
+    )
+    frame.loc[0, column] = 0.0
+
+    with pytest.raises(module.DataContractError, match="price is not positive"):
+        module._validate_bar_frame(frame, Path("SH600000.parquet"))
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("high", 0.8),
+        ("low", 1.3),
+    ],
+)
+def test_validate_bar_frame_rejects_inconsistent_ohlc(
+    column: str,
+    value: float,
+) -> None:
+    module = load_module()
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-07-23"]),
+            "open": [1.0],
+            "high": [1.2],
+            "low": [0.9],
+            "close": [1.1],
+            "volume": [100.0],
+        }
+    )
+    frame.loc[0, column] = value
+
+    with pytest.raises(module.DataContractError, match="OHLC relationships are invalid"):
+        module._validate_bar_frame(frame, Path("SH600000.parquet"))
+
+
+def reference_filesystem_state_fingerprint(root: Path) -> dict[str, object]:
+    digest = hashlib.sha256()
+    candidates = sorted(root.rglob("*"))
+    file_count = 0
+    total_bytes = 0
+    for path in candidates:
+        if path.is_symlink():
+            raise AssertionError("test fixture must not contain symlinks")
+        if not path.is_file() or path.name.endswith(".lock"):
+            continue
+        stat = path.stat()
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_ctime_ns).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_dev).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_ino).encode("ascii"))
+        digest.update(b"\n")
+        file_count += 1
+        total_bytes += stat.st_size
+    return {
+        "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "scanned_entries": len(candidates),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def test_filesystem_state_fingerprint_streams_without_rglob_buffer(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    (root / "a" / "nested").mkdir(parents=True)
+    (root / "a" / "nested" / "one.bin").write_bytes(b"one")
+    (root / "a.txt").write_text("two", encoding="utf-8")
+    (root / "z" / "deep").mkdir(parents=True)
+    (root / "z" / "deep" / "three.bin").write_bytes(b"three")
+    (root / "ignored.lock").write_text("lock", encoding="utf-8")
+    expected = reference_filesystem_state_fingerprint(root)
+
+    with patch.object(Path, "rglob", side_effect=AssertionError("must stream")):
+        actual = module.filesystem_state_fingerprint(root)
+
+    assert actual == expected
+
+
+def test_filesystem_state_fingerprint_supports_platforms_without_fd_capabilities(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    (root / "nested").mkdir(parents=True)
+    (root / "nested" / "one.bin").write_bytes(b"one")
+    (root / "two.bin").write_bytes(b"two")
+    expected = reference_filesystem_state_fingerprint(root)
+
+    with (
+        patch.object(module.os, "supports_dir_fd", set()),
+        patch.object(module.os, "supports_fd", set()),
+    ):
+        actual = module.filesystem_state_fingerprint(root)
+
+    assert actual == expected
+
+
+def test_filesystem_state_fingerprint_rejects_directory_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    nested = root / "nested"
+    outside = tmp_path / "outside"
+    nested.mkdir(parents=True)
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(b"outside")
+    original_is_dir = module.stat.S_ISDIR
+    replaced = False
+
+    def replace_after_directory_check(mode: int) -> bool:
+        nonlocal replaced
+        result = original_is_dir(mode)
+        if result and not replaced:
+            replaced = True
+            nested.rmdir()
+            nested.symlink_to(outside, target_is_directory=True)
+        return result
+
+    with patch.object(module.stat, "S_ISDIR", side_effect=replace_after_directory_check):
+        with pytest.raises(module.DataContractError, match="symlink|changed"):
+            module.filesystem_state_fingerprint(root)
+
+
+def test_filesystem_state_fingerprint_rejects_entry_added_after_enumeration(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    (root / "initial.bin").write_bytes(b"initial")
+    original_scandir = module.os.scandir
+    injected = False
+
+    class MutatingScandir:
+        def __init__(self, target) -> None:
+            self.delegate = original_scandir(target)
+            self.iterator = iter(self.delegate)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            self.delegate.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal injected
+            try:
+                return next(self.iterator)
+            except StopIteration:
+                if not injected:
+                    injected = True
+                    (root / "added-after-enumeration.bin").write_bytes(b"changed")
+                raise
+
+    with patch.object(
+        module.os, "scandir", side_effect=MutatingScandir
+    ) as patched_scandir:
+        supported_fd = set(module.os.supports_fd)
+        supported_fd.add(patched_scandir)
+        with patch.object(module.os, "supports_fd", supported_fd):
+            with pytest.raises(module.DataContractError, match="directory changed"):
+                module.filesystem_state_fingerprint(root)
+
+
+def test_filesystem_state_fingerprint_rejects_file_rewritten_after_scan(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    target = root / "a.bin"
+    target.write_bytes(b"first")
+    (root / "z.bin").write_bytes(b"later")
+    target_state = target.stat()
+    target_identity = (target_state.st_dev, target_state.st_ino)
+    original_close = module.os.close
+    rewritten = False
+
+    def close_and_rewrite(fd: int) -> None:
+        nonlocal rewritten
+        try:
+            state = module.os.fstat(fd)
+            identity = (state.st_dev, state.st_ino)
+        except OSError:
+            identity = None
+        original_close(fd)
+        if not rewritten and identity == target_identity:
+            rewritten = True
+            target.write_bytes(b"after")
+
+    with patch.object(module.os, "close", side_effect=close_and_rewrite):
+        with pytest.raises(module.DataContractError, match="file changed"):
+            module.filesystem_state_fingerprint(root)
+
+    assert rewritten
+
+
+def test_filesystem_state_fingerprint_rejects_file_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    target = root / "prices.bin"
+    outside = tmp_path / "outside.bin"
+    target.write_bytes(b"inside")
+    outside.write_bytes(b"outside")
+    original_is_regular = module.stat.S_ISREG
+    replaced = False
+
+    def replace_after_file_check(mode: int) -> bool:
+        nonlocal replaced
+        result = original_is_regular(mode)
+        if result and not replaced:
+            replaced = True
+            target.unlink()
+            target.symlink_to(outside)
+        return result
+
+    with patch.object(
+        module.stat,
+        "S_ISREG",
+        side_effect=replace_after_file_check,
+    ):
+        with pytest.raises(module.DataContractError, match="symlink|changed"):
+            module.filesystem_state_fingerprint(root)
 
 
 def finalize_qfq_snapshot(
@@ -572,7 +827,7 @@ def test_resolve_rejects_bar_content_changed_after_publication(tmp_path: Path) -
     )
     bars_path = published / "bars" / "SZ159915.parquet"
     bars = pd.read_parquet(bars_path)
-    bars.loc[0, "close"] = 99.0
+    bars.loc[0, "close"] = 1.05
     bars.to_parquet(bars_path, index=False)
 
     with pytest.raises(module.DataContractError, match="bar hash mismatch"):

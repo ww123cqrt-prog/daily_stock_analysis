@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
+import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -23,8 +25,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import projects_root as default_projects_root
-from _paths import reports_root as default_reports_root
+from _paths import projects_root as default_projects_root  # noqa: E402
+from _paths import quant_data_root as default_quant_data_root  # noqa: E402
+from _paths import reports_root as default_reports_root  # noqa: E402
+from _robust_membership_integrity import read_membership_snapshot  # noqa: E402
+from _robust_reference_integrity import (  # noqa: E402
+    reference_snapshot_fingerprint,
+    validate_reference_source,
+)
+from quant_data_contract import (  # noqa: E402
+    DataContractError,
+    atomic_write_json,
+    filesystem_state_fingerprint,
+    resolve_dataset,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +51,7 @@ class HygieneReportPaths:
     inventory_latest_json: Path
     cleanup_plan_latest_md: Path
     cleanup_plan_latest_json: Path
+    bundle_latest_json: Path
 
 
 RUNTIME_PATTERNS = ["*.log", "*.pid", "*_launch*.json", "*.out", "*.err"]
@@ -57,6 +72,321 @@ SENSITIVE_TEXT_PATTERNS = [
     re.compile(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|COOKIE|API[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*)=([^\s]+)"),
     re.compile(r"(?i)(--(?:password|passwd|token|secret|cookie|api-key|access-key)\s+)([^\s]+)"),
 ]
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PROTECTED_ROOT_FILES = {"DATA_MANIFEST.json", "README.md"}
+HYGIENE_STATE_SCAN_MAX_ENTRIES = 200_000
+HYGIENE_STATE_SCAN_MAX_SECONDS = 10.0
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON: {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON object required: {path.name}")
+    return payload
+
+
+def _read_catalog(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON: {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON object required: {path.name}")
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _safe_catalog_child(root: Path, value: object, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} is required")
+    relative = Path(value)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"{field} must be a safe relative path")
+    root = root.resolve()
+    candidate = (root / relative).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{field} escapes quant_data root") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{field} cannot use symlinks")
+    return candidate
+
+
+def _catalog_date_range(entry: dict[str, Any]) -> tuple[str, str]:
+    value = entry.get("date_range")
+    if not isinstance(value, dict):
+        raise ValueError("canonical fixed-path date range is invalid")
+    start = value.get("start_date") or value.get("start")
+    end = value.get("end_date") or value.get("end")
+    if not isinstance(start, str) or not start or not isinstance(end, str) or not end:
+        raise ValueError("canonical fixed-path date range is invalid")
+    try:
+        start_date = dt.date.fromisoformat(start)
+        end_date = dt.date.fromisoformat(end)
+    except ValueError as exc:
+        raise ValueError("canonical fixed-path date range is invalid") from exc
+    if start_date > end_date:
+        raise ValueError("canonical fixed-path date range is invalid")
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _validate_fixed_path_dataset(
+    dataset_id: str,
+    fixed_path: Path,
+    entry: dict[str, Any],
+) -> str:
+    expected_kind = {
+        "pit_csi800": "point_in_time_membership",
+        "robust_reference": "point_in_time_reference",
+    }.get(dataset_id)
+    if expected_kind is None or entry.get("data_kind") != expected_kind:
+        raise ValueError("canonical fixed-path data kind is invalid")
+    if entry.get("price_basis") != "not_applicable":
+        raise ValueError("canonical fixed-path price basis is invalid")
+    expected_hash = str(entry.get("snapshot_hash") or "")
+    if not SHA256_RE.fullmatch(expected_hash):
+        raise ValueError("canonical fixed-path snapshot hash is invalid")
+    start_date, end_date = _catalog_date_range(entry)
+    if dataset_id == "pit_csi800":
+        _metadata, actual_hash = read_membership_snapshot(
+            fixed_path,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    elif dataset_id == "robust_reference":
+        validate_reference_source(
+            fixed_path,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        actual_hash = reference_snapshot_fingerprint(fixed_path)
+    if actual_hash != expected_hash:
+        raise ValueError("canonical fixed-path snapshot hash mismatch")
+    return actual_hash
+
+
+def collect_v2_catalog(quant_data: Path) -> dict[str, Any]:
+    """Inventory V2 entries and prove each canonical-ready snapshot identity."""
+
+    catalog_path = quant_data / "DATA_MANIFEST.json"
+    base = {
+        "path": str(catalog_path),
+        "status": "missing",
+        "schema_version": None,
+        "validation_contract_version": 2,
+        "path_format": None,
+        "manifest_sha256": None,
+        "dataset_count": 0,
+        "canonical_ready_count": 0,
+        "validated_dataset_ids": [],
+        "datasets": [],
+        "errors": [],
+    }
+    if not catalog_path.is_file() or catalog_path.is_symlink():
+        return base
+    try:
+        payload, manifest_sha256 = _read_catalog(catalog_path)
+    except ValueError as exc:
+        return {**base, "status": "invalid", "errors": [str(exc)]}
+    base["manifest_sha256"] = manifest_sha256
+    base["schema_version"] = payload.get("schema_version")
+    base["path_format"] = payload.get("path_format")
+    datasets = payload.get("datasets")
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("path_format") != "relative_to_quant_data_root"
+        or not isinstance(datasets, dict)
+    ):
+        return {
+            **base,
+            "status": "invalid",
+            "errors": ["DATA_MANIFEST.json must use schema_version 2 and root-relative paths"],
+        }
+
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for key, raw_entry in sorted(datasets.items()):
+        if not isinstance(raw_entry, dict):
+            errors.append(f"{key}: dataset entry must be an object")
+            continue
+        dataset_id = str(raw_entry.get("dataset_id") or key)
+        record: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "data_kind": str(raw_entry.get("data_kind") or ""),
+            "role": str(raw_entry.get("role") or ""),
+            "status": str(raw_entry.get("status") or ""),
+            "lifecycle": str(raw_entry.get("lifecycle") or ""),
+            "price_basis": str(raw_entry.get("price_basis") or ""),
+            "dataset_path": "",
+            "snapshot_path": "",
+            "snapshot_id": str(raw_entry.get("snapshot_id") or ""),
+            "storage_contract": "",
+            "canonical_valid": False,
+            "error": "",
+        }
+        registered_path = raw_entry.get("dataset_root") or raw_entry.get("path")
+        try:
+            if registered_path:
+                record["dataset_path"] = str(
+                    _safe_catalog_child(quant_data, registered_path, "dataset path")
+                )
+        except ValueError as exc:
+            record["error"] = str(exc)
+
+        if raw_entry.get("dataset_id") != key:
+            record["error"] = "catalog key and dataset_id differ"
+
+        if (
+            not record["error"]
+            and record["role"] == "canonical"
+            and record["status"] == "ready"
+        ):
+            try:
+                if (
+                    raw_entry.get("snapshot_available") is False
+                    and raw_entry.get("path")
+                    and not raw_entry.get("dataset_root")
+                ):
+                    fixed_path = _safe_catalog_child(
+                        quant_data, raw_entry.get("path"), "canonical path"
+                    )
+                    if not fixed_path.exists() or fixed_path.is_symlink():
+                        raise ValueError("canonical fixed-path dataset is unavailable")
+                    state_before_validation = filesystem_state_fingerprint(
+                        fixed_path,
+                        max_entries=HYGIENE_STATE_SCAN_MAX_ENTRIES,
+                        max_seconds=HYGIENE_STATE_SCAN_MAX_SECONDS,
+                    )
+                    snapshot_hash = _validate_fixed_path_dataset(
+                        dataset_id,
+                        fixed_path,
+                        raw_entry,
+                    )
+                    state_after_validation = filesystem_state_fingerprint(
+                        fixed_path,
+                        max_entries=HYGIENE_STATE_SCAN_MAX_ENTRIES,
+                        max_seconds=HYGIENE_STATE_SCAN_MAX_SECONDS,
+                    )
+                    if state_before_validation != state_after_validation:
+                        raise ValueError("canonical snapshot changed during validation")
+                    record.update(
+                        {
+                            "dataset_path": str(fixed_path),
+                            "snapshot_path": str(fixed_path),
+                            "snapshot_id": snapshot_hash,
+                            "storage_contract": "catalog_registered_fixed_path",
+                            "state_fingerprint": state_after_validation,
+                            "canonical_valid": True,
+                            "error": "",
+                        }
+                    )
+                    records.append(record)
+                    continue
+                dataset_root = _safe_catalog_child(
+                    quant_data, raw_entry.get("dataset_root"), "dataset_root"
+                )
+                latest_path = _safe_catalog_child(
+                    quant_data, raw_entry.get("latest_pointer"), "latest_pointer"
+                )
+                if latest_path != dataset_root / "LATEST.json":
+                    raise ValueError("LATEST pointer is outside the dataset root")
+                latest_payload, latest_pointer_sha256 = _read_catalog(latest_path)
+                snapshot_before_validation = _safe_catalog_child(
+                    quant_data,
+                    latest_payload.get("snapshot_path"),
+                    "LATEST snapshot_path",
+                )
+                state_before_validation = filesystem_state_fingerprint(
+                    snapshot_before_validation,
+                    max_entries=HYGIENE_STATE_SCAN_MAX_ENTRIES,
+                    max_seconds=HYGIENE_STATE_SCAN_MAX_SECONDS,
+                )
+                resolved = resolve_dataset(
+                    key,
+                    quant_data_root=quant_data,
+                )
+                snapshot = resolved.snapshot_path.resolve()
+                manifest = resolved.manifest
+                snapshot_id = str(manifest.get("snapshot_id") or "")
+                if (
+                    snapshot.parent != (dataset_root / "snapshots").resolve()
+                    or snapshot.name != snapshot_id
+                    or snapshot.is_symlink()
+                    or not snapshot.is_dir()
+                ):
+                    raise ValueError("LATEST must select one immutable snapshot directory")
+                if raw_entry.get("snapshot_id") != snapshot_id:
+                    raise ValueError("catalog and LATEST snapshot IDs differ")
+                if raw_entry.get("data_kind") != manifest.get("data_kind"):
+                    raise ValueError("catalog and snapshot data kind differ")
+                for field, expected in (
+                    ("schema_version", 2),
+                    ("dataset_id", dataset_id),
+                    ("snapshot_id", snapshot_id),
+                    ("role", "canonical"),
+                    ("status", "ready"),
+                ):
+                    if manifest.get(field) != expected:
+                        raise ValueError(f"snapshot manifest {field} is invalid")
+                if manifest.get("price_basis") != raw_entry.get("price_basis"):
+                    raise ValueError("catalog and snapshot price basis differ")
+                state_after_validation = filesystem_state_fingerprint(
+                    snapshot,
+                    max_entries=HYGIENE_STATE_SCAN_MAX_ENTRIES,
+                    max_seconds=HYGIENE_STATE_SCAN_MAX_SECONDS,
+                )
+                if (
+                    snapshot_before_validation != snapshot
+                    or state_before_validation != state_after_validation
+                ):
+                    raise ValueError("canonical snapshot changed during validation")
+                _latest_after, latest_pointer_sha256_after = _read_catalog(latest_path)
+                if latest_pointer_sha256_after != latest_pointer_sha256:
+                    raise ValueError("LATEST pointer changed during validation")
+                record.update(
+                    {
+                        "dataset_path": str(dataset_root),
+                        "snapshot_path": str(snapshot),
+                        "snapshot_id": snapshot_id,
+                        "storage_contract": "immutable_snapshot_v2",
+                        "latest_pointer_path": str(latest_path),
+                        "latest_pointer_sha256": latest_pointer_sha256,
+                        "state_fingerprint": state_after_validation,
+                        "canonical_valid": True,
+                        "error": "",
+                    }
+                )
+            except (DataContractError, OSError, TypeError, ValueError) as exc:
+                record["error"] = str(exc)
+
+        if record["error"]:
+            errors.append(f"{dataset_id}: {record['error']}")
+        records.append(record)
+
+    canonical_ready_count = sum(
+        1 for record in records if record["canonical_valid"]
+    )
+    validated_dataset_ids = sorted(
+        record["dataset_id"] for record in records if record["canonical_valid"]
+    )
+    return {
+        **base,
+        "status": "available" if not errors else "partial",
+        "schema_version": 2,
+        "path_format": "relative_to_quant_data_root",
+        "dataset_count": len(records),
+        "canonical_ready_count": canonical_ready_count,
+        "validated_dataset_ids": validated_dataset_ids,
+        "datasets": records,
+        "errors": errors,
+    }
 
 
 def redact_sensitive_text(value: str) -> str:
@@ -278,7 +608,33 @@ def markdown_table(rows: list[dict[str, Any]], headers: list[str]) -> str:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, payload)
+
+
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_inventory_markdown(path: Path, inventory: dict[str, Any]) -> None:
@@ -338,7 +694,7 @@ def write_inventory_markdown(path: Path, inventory: dict[str, Any]) -> None:
     )
     for item in inventory["items"]:
         lines.append(f"- `{item['category']}` `{item['path']}` - {item['role']}；{item['reason']}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def write_cleanup_plan_markdown(path: Path, plan: dict[str, Any]) -> None:
@@ -356,37 +712,50 @@ def write_cleanup_plan_markdown(path: Path, plan: dict[str, Any]) -> None:
             ["action", "source", "destination", "reason", "risk", "requires_user_confirmation"],
         ),
     ]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def generate_data_hygiene_reports(
     *,
     projects_root: Path | None = None,
+    quant_data_root: Path | None = None,
     reports_root: Path | None = None,
     timestamp: str | None = None,
     process_lines: Iterable[str] | None = None,
 ) -> HygieneReportPaths:
+    explicit_projects_root = projects_root is not None
     root = Path(projects_root or default_projects_root()).expanduser()
+    if quant_data_root is not None:
+        quant_data = Path(quant_data_root).expanduser()
+    elif explicit_projects_root:
+        quant_data = root / "quant_data"
+    else:
+        quant_data = Path(default_quant_data_root()).expanduser().resolve()
     reports = Path(reports_root or default_reports_root()).expanduser()
     reports.mkdir(parents=True, exist_ok=True)
 
     ts = timestamp or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    quant_data = root / "quant_data"
+    if not re.fullmatch(r"\d{8}_\d{6}", ts):
+        raise ValueError("timestamp must use YYYYMMDD_HHMMSS format")
     quant_workflow = root / "quant_workflow"
     dsa = root / "daily_stock_analysis"
     qlib = root / "qlib"
     china = root / "china-astock-quant"
     parquet_root = quant_data / "parquet" / "ashare_1d"
     qlib_root = quant_data / "qlib"
-    official_cleaned_parquet = parquet_root / "merged_baostock_jqdata_cleaned"
-    official_cleaned_qlib = qlib_root / "cn_data_baostock_jqdata_cleaned"
-    latest_quality_report = reports / "data_quality_report_latest.md"
+    latest_quality_report_pointer = reports / "data_quality_report_latest.json"
     latest_cleaning_strategy = reports / "data_cleaning_strategy_latest.md"
     latest_training_result = reports / "latest_training_result.json"
+    catalog = collect_v2_catalog(quant_data)
+    canonical_datasets = [
+        entry for entry in catalog["datasets"] if entry["canonical_valid"]
+    ]
     official_paths = {
-        "official_cleaned_parquet": official_cleaned_parquet,
-        "official_cleaned_qlib_provider": official_cleaned_qlib,
-        "latest_quality_report": latest_quality_report,
+        **{
+            entry["dataset_id"]: Path(entry["snapshot_path"])
+            for entry in canonical_datasets
+        },
+        "latest_quality_report_pointer": latest_quality_report_pointer,
         "latest_cleaning_strategy_report": latest_cleaning_strategy,
         "latest_training_result": latest_training_result,
     }
@@ -396,17 +765,58 @@ def generate_data_hygiene_reports(
     root_files = classify_root_files(quant_data)
     items: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
+    registered_paths: dict[Path, dict[str, Any]] = {}
+    for entry in catalog["datasets"]:
+        for field in ("dataset_path", "snapshot_path"):
+            value = entry.get(field)
+            if value:
+                registered_paths[Path(value).resolve()] = entry
 
-    add_inventory_item(items, official_cleaned_parquet, "official", "正式清洗 parquet 入口", "当前 DSA/Qlib 工作流应优先使用的清洗后 A 股日线 parquet。", tags=["do_not_touch"])
-    add_inventory_item(items, official_cleaned_qlib, "official", "正式 Qlib provider", "当前训练和 Qlib 回测应使用的清洗后 provider。", tags=["do_not_touch"])
-    for path in (latest_quality_report, latest_cleaning_strategy, latest_training_result):
+    for entry in canonical_datasets:
+        snapshot = Path(entry["snapshot_path"])
+        immutable = entry["storage_contract"] == "immutable_snapshot_v2"
+        add_inventory_item(
+            items,
+            snapshot,
+            "official",
+            (
+                f"原生 V2 正式快照 {entry['dataset_id']}"
+                if immutable
+                else f"原生 V2 正式参考数据 {entry['dataset_id']}"
+            ),
+            (
+                "由 DATA_MANIFEST.json 和 LATEST.json 锁定的 canonical ready 不可变快照。"
+                if immutable
+                else "由 DATA_MANIFEST.json 登记的 canonical ready 固定路径参考数据。"
+            ),
+            extra={
+                "dataset_id": entry["dataset_id"],
+                "data_kind": entry["data_kind"],
+                "snapshot_id": entry["snapshot_id"],
+                "price_basis": entry["price_basis"],
+                "storage_contract": entry["storage_contract"],
+            },
+            tags=["do_not_touch"],
+        )
+    for path in (
+        latest_quality_report_pointer,
+        latest_cleaning_strategy,
+        latest_training_result,
+    ):
         add_inventory_item(items, path, "do_not_touch", "latest 指针/结果文件", "当前页面和交接状态会引用，不能在清理阶段移动。")
 
     for dataset in parquet_datasets:
         path = Path(dataset["path"])
-        if path == official_cleaned_parquet:
+        registered = registered_paths.get(path.resolve())
+        if registered and registered["canonical_valid"]:
             continue
-        if dataset["name"] in {"qfq", "qfq_full"}:
+        if registered and registered["role"] == "legacy":
+            category = "legacy"
+            reason = "原生 V2 清单登记的兼容输出，不是正式训练入口。"
+        elif registered and registered["role"] == "audit":
+            category = "candidate"
+            reason = "旧采集审计来源，只用于核对，不是正式训练入口。"
+        elif dataset["name"] in {"qfq", "qfq_full"}:
             category = "legacy"
             reason = "旧测试或旧口径数据，未作为当前正式入口。"
         else:
@@ -423,11 +833,15 @@ def generate_data_hygiene_reports(
 
     for provider in qlib_providers:
         path = Path(provider["path"])
-        if path == official_cleaned_qlib:
+        registered = registered_paths.get(path.resolve())
+        if registered and registered["canonical_valid"]:
             continue
-        if provider["name"] == "cn_data_baostock_jqdata":
+        if registered and registered["role"] == "legacy":
+            category = "legacy"
+            reason = "原生 V2 清单登记的兼容 provider，不是正式训练入口。"
+        elif registered and registered["role"] == "audit":
             category = "candidate"
-            reason = "原始合并版 provider，可用于与清洗版对照。"
+            reason = "旧审计 provider，只用于核对，不是正式训练入口。"
         else:
             category = "legacy"
             reason = "测试 provider 或短历史 provider，不是当前正式训练入口。"
@@ -443,6 +857,15 @@ def generate_data_hygiene_reports(
     for root_file in root_files:
         path = Path(root_file["path"])
         categories = root_file["categories"]
+        if path.name in PROTECTED_ROOT_FILES:
+            add_inventory_item(
+                items,
+                path,
+                "do_not_touch",
+                "原生 V2 数据目录说明/清单",
+                "解析正式快照和维护数据契约所需，不能归档或移动。",
+            )
+            continue
         role = "quant_data 根目录文件"
         if "runtime_log" in categories:
             role = "运行日志/pid/launch 输出"
@@ -469,9 +892,39 @@ def generate_data_hygiene_reports(
             }
         )
 
-    add_plan_action(actions, "keep", official_cleaned_parquet, None, "正式清洗 parquet 入口，保持原路径。", "移动会导致 DSA/quant_workflow/Qlib 转换链路找不到正式数据。", False)
-    add_plan_action(actions, "keep", official_cleaned_qlib, None, "正式 Qlib provider，保持原路径。", "移动会影响训练、回测和 latest_training_result 指向。", False)
-    for path in (latest_quality_report, latest_cleaning_strategy, latest_training_result):
+    add_plan_action(
+        actions,
+        "keep",
+        quant_data / "DATA_MANIFEST.json",
+        None,
+        "原生 V2 根清单，保持原路径。",
+        "移动会使所有按清单解析的消费者停止工作。",
+        False,
+    )
+    for entry in canonical_datasets:
+        immutable = entry["storage_contract"] == "immutable_snapshot_v2"
+        add_plan_action(
+            actions,
+            "keep",
+            entry["snapshot_path"],
+            None,
+            (
+                f"原生 V2 正式快照 {entry['dataset_id']}，保持不可变。"
+                if immutable
+                else f"原生 V2 正式参考数据 {entry['dataset_id']}，保持原路径。"
+            ),
+            (
+                "移动或修改会使 LATEST 指针和清单哈希失效。"
+                if immutable
+                else "移动会使历史时点股票池或鲁棒训练参考数据失效。"
+            ),
+            False,
+        )
+    for path in (
+        latest_quality_report_pointer,
+        latest_cleaning_strategy,
+        latest_training_result,
+    ):
         add_plan_action(actions, "keep", path, None, "latest 指针或最新结果文件，保持原路径。", "移动会影响网页状态、交接说明或实验查看。", False)
 
     for name in ("qfq", "qfq_full"):
@@ -482,14 +935,14 @@ def generate_data_hygiene_reports(
         path = qlib_root / name
         if path.exists():
             add_plan_action(actions, "archive", path, quant_data / "archive" / "qlib" / name, "测试 provider 或短历史 provider，不是当前正式入口；用户确认后可归档。", "可能影响旧实验复现；归档前需核对 MLflow artifact 和 jobs/index.sqlite 引用。", True)
-    for name in ("cn_data_baostock_jqdata",):
+    for name in ("cn_data_baostock_jqdata", "cn_data_baostock_jqdata_cleaned"):
         path = qlib_root / name
         if path.exists():
-            add_plan_action(actions, "document", path, None, "原始合并版 provider 保留作清洗版对照，先写入未来 manifest，不迁移。", "无路径变更风险；主要风险是长期未文档化导致误用。", False)
-    for name in ("baostock_qfq", "jqdata", "merged_baostock_jqdata"):
+            add_plan_action(actions, "document", path, None, "V1 兼容 provider 仅供旧消费者使用，不是正式训练入口。", "无路径变更风险；主要风险是误把兼容输出当作 canonical。", False)
+    for name in ("baostock_qfq", "jqdata", "merged_baostock_jqdata", "merged_baostock_jqdata_cleaned"):
         path = parquet_root / name
         if path.exists():
-            add_plan_action(actions, "document", path, None, "源数据/合并前后对照数据保留，用于复现官方清洗版；先文档化，不迁移。", "无路径变更风险；若后续迁移必须更新转换脚本引用。", False)
+            add_plan_action(actions, "document", path, None, "审计来源或 V1 兼容输出保留用于核对，不是正式训练入口。", "无路径变更风险；若后续迁移必须先核对旧消费者。", False)
 
     for root_file in root_files:
         path = Path(root_file["path"])
@@ -532,6 +985,7 @@ def generate_data_hygiene_reports(
         },
         "jobs": collect_jobs(reports / "jobs" / "index.sqlite"),
         "process_matches": collect_process_matches(process_lines),
+        "catalog": catalog,
         "official_status": {
             name: {"path": str(path), "exists": path.exists(), "size": directory_size(path) if path.exists() else "missing"}
             for name, path in official_paths.items()
@@ -550,30 +1004,61 @@ def generate_data_hygiene_reports(
         "actions": actions,
     }
 
+    bundle_digest = hashlib.sha256(
+        _json_bytes(inventory) + b"\0" + _json_bytes(plan)
+    ).hexdigest()
+    artifact_suffix = f"{ts}_{bundle_digest[:16]}"
     paths = HygieneReportPaths(
-        inventory_md=reports / f"data_hygiene_inventory_{ts}.md",
-        inventory_json=reports / f"data_hygiene_inventory_{ts}.json",
-        cleanup_plan_md=reports / f"data_hygiene_cleanup_plan_{ts}.md",
-        cleanup_plan_json=reports / f"data_hygiene_cleanup_plan_{ts}.json",
+        inventory_md=reports / f"data_hygiene_inventory_{artifact_suffix}.md",
+        inventory_json=reports / f"data_hygiene_inventory_{artifact_suffix}.json",
+        cleanup_plan_md=reports / f"data_hygiene_cleanup_plan_{artifact_suffix}.md",
+        cleanup_plan_json=reports / f"data_hygiene_cleanup_plan_{artifact_suffix}.json",
         inventory_latest_md=reports / "data_hygiene_inventory_latest.md",
         inventory_latest_json=reports / "data_hygiene_inventory_latest.json",
         cleanup_plan_latest_md=reports / "data_hygiene_cleanup_plan_latest.md",
         cleanup_plan_latest_json=reports / "data_hygiene_cleanup_plan_latest.json",
+        bundle_latest_json=reports / "data_hygiene_reports_latest.json",
     )
     write_json(paths.inventory_json, inventory)
     write_json(paths.cleanup_plan_json, plan)
     write_inventory_markdown(paths.inventory_md, inventory)
     write_cleanup_plan_markdown(paths.cleanup_plan_md, plan)
-    paths.inventory_latest_json.write_text(paths.inventory_json.read_text(encoding="utf-8"), encoding="utf-8")
-    paths.cleanup_plan_latest_json.write_text(paths.cleanup_plan_json.read_text(encoding="utf-8"), encoding="utf-8")
-    paths.inventory_latest_md.write_text(paths.inventory_md.read_text(encoding="utf-8"), encoding="utf-8")
-    paths.cleanup_plan_latest_md.write_text(paths.cleanup_plan_md.read_text(encoding="utf-8"), encoding="utf-8")
+    write_json(paths.inventory_latest_json, inventory)
+    write_json(paths.cleanup_plan_latest_json, plan)
+    atomic_write_text(
+        paths.inventory_latest_md,
+        paths.inventory_md.read_text(encoding="utf-8"),
+    )
+    atomic_write_text(
+        paths.cleanup_plan_latest_md,
+        paths.cleanup_plan_md.read_text(encoding="utf-8"),
+    )
+    write_json(
+        paths.bundle_latest_json,
+        {
+            "schema_version": 1,
+            "publication_contract": (
+                "atomic_json_pointer_to_immutable_hygiene_bundle_v1"
+            ),
+            "bundle_id": f"data-hygiene-{bundle_digest[:16]}",
+            "generated_at": generated_at,
+            "inventory_artifact": paths.inventory_json.name,
+            "inventory_sha256": hashlib.sha256(
+                paths.inventory_json.read_bytes()
+            ).hexdigest(),
+            "cleanup_plan_artifact": paths.cleanup_plan_json.name,
+            "cleanup_plan_sha256": hashlib.sha256(
+                paths.cleanup_plan_json.read_bytes()
+            ).hexdigest(),
+        },
+    )
     return paths
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate read-only data hygiene inventory and dry-run cleanup plan.")
     parser.add_argument("--projects-root", type=Path, default=None)
+    parser.add_argument("--quant-data-root", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=None, help="Report output directory. Defaults to quant_workflow/reports.")
     parser.add_argument("--timestamp", default=None)
     return parser.parse_args()
@@ -583,11 +1068,18 @@ def main() -> None:
     args = parse_args()
     paths = generate_data_hygiene_reports(
         projects_root=args.projects_root,
+        quant_data_root=args.quant_data_root,
         reports_root=args.out_dir,
         timestamp=args.timestamp,
     )
     print("Generated data hygiene inventory and dry-run cleanup plan:")
-    for path in (paths.inventory_md, paths.inventory_json, paths.cleanup_plan_md, paths.cleanup_plan_json):
+    for path in (
+        paths.inventory_md,
+        paths.inventory_json,
+        paths.cleanup_plan_md,
+        paths.cleanup_plan_json,
+        paths.bundle_latest_json,
+    ):
         print(path)
 
 
