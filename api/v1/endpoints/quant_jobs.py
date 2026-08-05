@@ -481,6 +481,10 @@ async def get_quant_status(
         data_sources=research_status.get("data_sources") or [],
         qlib_provider=research_status.get("qlib_provider"),
         provider_quality=research_status.get("provider_quality") or {},
+        current_provider_identities=research_status.get(
+            "current_provider_identities"
+        )
+        or {},
         latest_training=research_status.get("latest_training"),
         cash_control_backtest=research_status.get("cash_control_backtest"),
         qlib_predictions=research_status.get("qlib_predictions"),

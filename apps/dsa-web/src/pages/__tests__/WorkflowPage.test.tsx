@@ -125,9 +125,18 @@ function readyResearchStatus() {
         cleaned: {
           provider: 'cleaned',
           datasetId: 'qlib_ashare_cleaned_v2',
-          snapshotId: 'cleaned-snapshot-blocked',
-          trainable: false,
-          trainingReadiness: { status: 'blocked', summary: 'cleaned provider 缺少完整 benchmark' },
+          snapshotId: 'cleaned-snapshot-20260802',
+          trainable: true,
+          structuralStatus: 'accepted',
+          calendarEnd: '2026-07-24',
+          freshness: {
+            status: 'stale',
+            calendarEnd: '2026-07-24',
+            asOfDate: '2026-08-02',
+            calendarAgeDays: 9,
+            blocksTraining: false,
+          },
+          trainingReadiness: { status: 'trainable', summary: 'cleaned ready' },
         },
       },
       robustSignal: {
@@ -426,6 +435,15 @@ describe('WorkflowPage', () => {
             summary: 'SH000300 benchmark is missing or incomplete (8710 missing days)',
           },
         },
+        cleaned: {
+          ...readyResearchStatus().providerQuality.cleaned,
+          trainable: false,
+          structuralStatus: 'blocked',
+          trainingReadiness: {
+            status: 'blocked_data',
+            summary: 'SH000300 benchmark is missing or incomplete (8710 missing days)',
+          },
+        },
       },
     });
     localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
@@ -506,6 +524,12 @@ describe('WorkflowPage', () => {
         canonical: {
           ...status.providerQuality.canonical,
           trainable: false,
+          trainingReadiness: { status: 'blocked_data', summary: 'benchmark coverage is incomplete' },
+        },
+        cleaned: {
+          ...status.providerQuality.cleaned,
+          trainable: false,
+          structuralStatus: 'blocked',
           trainingReadiness: { status: 'blocked_data', summary: 'benchmark coverage is incomplete' },
         },
       },
@@ -1090,6 +1114,20 @@ describe('WorkflowPage', () => {
   });
 
   it('gates each training card with the selected provider snapshot', async () => {
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValue({
+      ...status,
+      providerQuality: {
+        ...status.providerQuality,
+        cleaned: {
+          ...status.providerQuality.cleaned,
+          snapshotId: 'cleaned-snapshot-blocked',
+          trainable: false,
+          structuralStatus: 'blocked',
+          trainingReadiness: { status: 'blocked', summary: 'cleaned provider 缺少完整 benchmark' },
+        },
+      },
+    });
     renderWorkflowPage('training');
 
     const baselineCard = await screen.findByTestId('workflow-job-train_baseline_lgb');
@@ -1437,6 +1475,163 @@ describe('WorkflowPage', () => {
     expect(within(baselineCard).getByText(/行情截止 2026-07-24/)).toBeInTheDocument();
     expect(within(baselineCard).getByText(/已落后 9 天，建议更新，不阻断训练/)).toBeInTheDocument();
     expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
+  });
+
+  it('separates a newly published provider from the previous quality evidence', async () => {
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValue({
+      ...status,
+      trainable: false,
+      trainingReadiness: {
+        status: 'blocked',
+        summary: 'Latest data quality evidence does not match the current native V2 snapshot; rerun the full data quality report before training.',
+      },
+      currentProviderIdentities: {
+        canonical: {
+          provider: 'canonical',
+          datasetId: 'qlib_ashare_v2',
+          snapshotId: 'qlib-ashare-v2-20260805-new',
+          calendarEnd: '2026-08-04',
+          status: 'ready',
+        },
+        cleaned: {
+          provider: 'cleaned',
+          datasetId: 'qlib_ashare_cleaned_v2',
+          snapshotId: 'qlib-ashare-cleaned-v2-20260805-new',
+          calendarEnd: '2026-08-04',
+          status: 'ready',
+        },
+      },
+      providerQuality: {
+        canonical: {
+          ...status.providerQuality.canonical,
+          evidenceCurrent: false,
+        },
+        cleaned: {
+          ...status.providerQuality.cleaned,
+          snapshotId: 'qlib-ashare-cleaned-v2-20260802-old',
+          trainable: true,
+          structuralStatus: 'accepted',
+          calendarEnd: '2026-07-24',
+          evidenceCurrent: false,
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('新快照待验收')).toBeInTheDocument();
+    expect(screen.getByText('数据验收：待重新验收')).toBeInTheDocument();
+    expect(screen.getAllByText(/当前完整质量报告仍绑定上一版快照/).length).toBeGreaterThan(0);
+    const canonical = screen.getByTestId('provider-quality-canonical');
+    expect(canonical).toHaveTextContent('当前快照 qlib-ashare-v2-20260805-new');
+    expect(canonical).toHaveTextContent('待完整质量验收');
+    expect(canonical).toHaveTextContent('行情截止 2026-08-04');
+    expect(canonical).toHaveTextContent('上次已验收快照 snapshot-20260802');
+    expect(canonical).not.toHaveTextContent('不阻断训练');
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
+  });
+
+  it('reports mixed provider acceptance without contradicting the provider rows', async () => {
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValue({
+      ...status,
+      trainable: true,
+      currentProviderIdentities: {
+        canonical: {
+          provider: 'canonical',
+          datasetId: 'qlib_ashare_v2',
+          snapshotId: 'snapshot-20260802',
+          calendarEnd: '2026-07-24',
+          status: 'ready',
+        },
+        cleaned: {
+          provider: 'cleaned',
+          datasetId: 'qlib_ashare_cleaned_v2',
+          snapshotId: 'cleaned-snapshot-20260805-new',
+          calendarEnd: '2026-08-04',
+          status: 'ready',
+        },
+      },
+      providerQuality: {
+        canonical: {
+          ...status.providerQuality.canonical,
+          evidenceCurrent: true,
+        },
+        cleaned: {
+          ...status.providerQuality.cleaned,
+          snapshotId: 'cleaned-snapshot-20260802-old',
+          evidenceCurrent: false,
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('部分数据可训练')).toBeInTheDocument();
+    expect(screen.getByText('数据验收：部分通过，部分待验收')).toBeInTheDocument();
+    expect(screen.getByText(/canonical 已通过；cleaned 的当前快照待完整质量验收/)).toBeInTheDocument();
+    expect(screen.queryByText('当前数据可训练')).not.toBeInTheDocument();
+    expect(screen.queryByText('数据验收：通过')).not.toBeInTheDocument();
+    expect(screen.getByTestId('provider-quality-canonical')).toHaveTextContent('结构验收：通过');
+    expect(screen.getByTestId('provider-quality-cleaned')).toHaveTextContent('待完整质量验收');
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
+
+    const baselineCard = screen.getByTestId('workflow-job-train_baseline_lgb');
+    fireEvent.change(
+      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
+      { target: { value: 'cleaned' } },
+    );
+
+    const selectedProviderStatus = within(baselineCard).getByText(/当前数据：cleaned/);
+    expect(selectedProviderStatus).toHaveTextContent('待完整质量验收');
+    expect(selectedProviderStatus).toHaveTextContent('当前 cleaned 快照尚未完成正式全量数据验收');
+    expect(selectedProviderStatus).not.toHaveTextContent('已可训练');
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
+  });
+
+  it('does not present the previous accepted snapshot as the current snapshot when native data is unavailable', async () => {
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValue({
+      ...status,
+      trainable: false,
+      trainingReadiness: {
+        status: 'blocked',
+        summary: 'The current native V2 provider is unavailable.',
+      },
+      currentProviderIdentities: {
+        canonical: {
+          provider: 'canonical',
+          datasetId: 'qlib_ashare_v2',
+          status: 'blocked',
+          error: 'Current provider is unavailable.',
+        },
+      },
+      providerQuality: {
+        ...status.providerQuality,
+        canonical: {
+          ...status.providerQuality.canonical,
+          evidenceCurrent: false,
+        },
+        cleaned: {
+          ...status.providerQuality.cleaned,
+          trainable: false,
+          structuralStatus: 'blocked',
+          trainingReadiness: { status: 'blocked', summary: 'The current provider is unavailable.' },
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('数据暂不可训练')).toBeInTheDocument();
+    expect(screen.getByText('数据验收：阻塞')).toBeInTheDocument();
+    const canonical = screen.getByTestId('provider-quality-canonical');
+    expect(canonical).toHaveTextContent('当前快照 -');
+    expect(canonical).toHaveTextContent('当前数据快照不可用');
+    expect(canonical).toHaveTextContent('上次已验收快照 snapshot-20260802');
+    expect(canonical).not.toHaveTextContent('当前快照 snapshot-20260802');
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
   });
 
   it('shows provider snapshots, structural acceptance, and freshness on the data page', async () => {

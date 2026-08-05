@@ -4028,6 +4028,17 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                             "status": "trainable",
                             "summary": "Full scan passed.",
                         },
+                        "provider_quality": {
+                            "canonical": {
+                                "dataset_id": "qlib_ashare_v2",
+                                "snapshot_id": "old-snapshot",
+                                "manifest_sha256": old_hash,
+                                "content_sha256": old_hash,
+                                "trainable": True,
+                                "structural_status": "accepted",
+                                "calendar_end": "2026-07-24",
+                            }
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -4074,6 +4085,13 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertFalse(payload["trainable"])
         self.assertEqual(payload["training_readiness"]["status"], "blocked")
         self.assertIn("native V2 snapshot", payload["training_readiness"]["summary"])
+        self.assertEqual(
+            payload["current_provider_identities"]["canonical"]["snapshot_id"],
+            "current-snapshot",
+        )
+        self.assertFalse(
+            payload["provider_quality"]["canonical"]["evidence_current"]
+        )
 
     def test_status_blocks_native_snapshot_without_provider_quality_record(
         self,
@@ -4442,7 +4460,10 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     provider_dataset_id="qlib_ashare_cleaned_v2"
                 )
 
-        resolve_native.assert_called_once_with("qlib_ashare_cleaned_v2")
+        self.assertEqual(
+            [item.args[0] for item in resolve_native.call_args_list],
+            ["qlib_ashare_cleaned_v2", "qlib_ashare_v2"],
+        )
         self.assertTrue(payload["trainable"])
         self.assertEqual(
             payload["qlib_provider"]["dataset_id"], "qlib_ashare_cleaned_v2"

@@ -61,6 +61,9 @@ class QuantStatusResponse(BaseModel):
     data_sources: List[Dict[str, Any]] = Field(default_factory=list)
     qlib_provider: Optional[Dict[str, Any]] = None
     provider_quality: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    current_provider_identities: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict
+    )
     latest_training: Optional[Dict[str, Any]] = None
     cash_control_backtest: Optional[Dict[str, Any]] = None
     qlib_predictions: Optional[Dict[str, Any]] = None

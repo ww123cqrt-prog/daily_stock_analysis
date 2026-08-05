@@ -29,6 +29,7 @@ export type ResearchProviderQuality = {
   contentSha256?: string;
   calendarEnd?: string;
   trainable?: boolean;
+  evidenceCurrent?: boolean;
   structuralStatus?: 'accepted' | 'blocked' | string;
   freshness?: {
     status: 'current' | 'stale' | 'future' | 'unknown' | string;
@@ -38,6 +39,17 @@ export type ResearchProviderQuality = {
     blocksTraining?: boolean;
   };
   trainingReadiness?: ResearchTrainingReadiness;
+};
+
+export type ResearchCurrentProviderIdentity = {
+  provider?: 'canonical' | 'cleaned' | string;
+  datasetId?: string;
+  snapshotId?: string;
+  manifestSha256?: string;
+  contentSha256?: string;
+  calendarEnd?: string;
+  status?: 'ready' | 'blocked' | string;
+  error?: string;
 };
 
 export type ResearchQualityScan = {
@@ -652,6 +664,7 @@ export type ResearchStatus = {
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
   providerQuality?: Record<string, ResearchProviderQuality>;
+  currentProviderIdentities?: Record<string, ResearchCurrentProviderIdentity>;
   latestTrainingProvider?: ResearchQlibProvider | null;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;

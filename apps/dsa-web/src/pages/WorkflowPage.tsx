@@ -666,6 +666,15 @@ function selectedProvider(params: Record<string, unknown>): 'canonical' | 'clean
   return params.provider === 'cleaned' ? 'cleaned' : 'canonical';
 }
 
+function providerEvidenceSummary(
+  provider: 'canonical' | 'cleaned',
+  currentSnapshotReady: boolean,
+): string {
+  return currentSnapshotReady
+    ? `The current ${provider} snapshot has not completed full data quality acceptance; the previous report cannot authorize formal training.`
+    : `The current ${provider} native V2 snapshot is unavailable; formal training is blocked.`;
+}
+
 function providerTrainingState(
   status: ResearchStatus | null,
   params: Record<string, unknown>,
@@ -677,11 +686,38 @@ function providerTrainingState(
   calendarEnd?: string;
   freshnessStatus?: string;
   calendarAgeDays?: number | null;
+  evidenceCurrent: boolean;
+  currentSnapshotReady: boolean;
+  qualitySnapshotId?: string;
   summary: string;
 } {
   const provider = selectedProvider(params);
   const quality = status?.providerQuality?.[provider];
+  const currentIdentity = status?.currentProviderIdentities?.[provider];
   if (quality) {
+    const identityMismatch = Boolean(
+      currentIdentity?.snapshotId
+      && quality.snapshotId
+      && currentIdentity.snapshotId !== quality.snapshotId,
+    );
+    const evidenceCurrent = quality.evidenceCurrent !== false && !identityMismatch;
+    if (!evidenceCurrent) {
+      const currentSnapshotReady = currentIdentity?.status === 'ready'
+        && Boolean(currentIdentity.snapshotId);
+      return {
+        provider,
+        trainable: false,
+        snapshotId: currentSnapshotReady ? currentIdentity?.snapshotId : undefined,
+        qualitySnapshotId: quality.snapshotId,
+        structuralStatus: currentSnapshotReady ? 'pending' : 'blocked',
+        calendarEnd: currentIdentity?.calendarEnd,
+        freshnessStatus: 'unknown',
+        calendarAgeDays: null,
+        evidenceCurrent: false,
+        currentSnapshotReady,
+        summary: providerEvidenceSummary(provider, currentSnapshotReady),
+      };
+    }
     return {
       provider,
       trainable: quality.trainable === true,
@@ -690,7 +726,25 @@ function providerTrainingState(
       calendarEnd: quality.freshness?.calendarEnd || quality.calendarEnd,
       freshnessStatus: quality.freshness?.status,
       calendarAgeDays: quality.freshness?.calendarAgeDays,
+      evidenceCurrent: true,
+      currentSnapshotReady: true,
       summary: quality.trainingReadiness?.summary || (quality.trainable ? 'ready' : 'blocked'),
+    };
+  }
+  if (currentIdentity) {
+    const currentSnapshotReady = currentIdentity.status === 'ready'
+      && Boolean(currentIdentity.snapshotId);
+    return {
+      provider,
+      trainable: false,
+      snapshotId: currentIdentity.snapshotId,
+      structuralStatus: currentSnapshotReady ? 'pending' : 'blocked',
+      calendarEnd: currentIdentity.calendarEnd,
+      freshnessStatus: 'unknown',
+      calendarAgeDays: null,
+      evidenceCurrent: false,
+      currentSnapshotReady,
+      summary: providerEvidenceSummary(provider, currentSnapshotReady),
     };
   }
   if (provider === 'canonical') {
@@ -699,6 +753,8 @@ function providerTrainingState(
       trainable: status?.trainable === true,
       snapshotId: status?.qlibProvider?.snapshotId,
       structuralStatus: status?.trainable === true ? 'accepted' : 'blocked',
+      evidenceCurrent: status?.trainable === true,
+      currentSnapshotReady: status?.trainable === true,
       summary: status?.trainingReadiness?.summary || '未找到 canonical 数据验收结果。',
     };
   }
@@ -706,6 +762,8 @@ function providerTrainingState(
     provider,
     trainable: false,
     structuralStatus: 'blocked',
+    evidenceCurrent: false,
+    currentSnapshotReady: false,
     summary: '未找到 cleaned 数据验收结果。请先运行正式全量数据质量报告。',
   };
 }
@@ -1223,6 +1281,16 @@ function providerFreshnessText(
   state: ReturnType<typeof providerTrainingState>,
   language: 'zh' | 'en',
 ): string {
+  if (!state.evidenceCurrent) {
+    if (!state.currentSnapshotReady) {
+      return language === 'zh'
+        ? '当前数据快照不可用'
+        : 'current data snapshot unavailable';
+    }
+    return language === 'zh'
+      ? `待完整质量验收${state.calendarEnd ? ` · 行情截止 ${state.calendarEnd}` : ''}`
+      : `full quality acceptance pending${state.calendarEnd ? ` · market calendar through ${state.calendarEnd}` : ''}`;
+  }
   const structural = state.structuralStatus === 'accepted'
     ? (language === 'zh' ? '通过' : 'accepted')
     : (language === 'zh' ? '阻塞' : 'blocked');
@@ -1250,6 +1318,24 @@ function localizedTrainingReadinessSummary(
   language: 'zh' | 'en',
 ): string {
   if (!summary || language === 'en') return summary || '';
+
+  if (summary.startsWith('Latest data quality evidence does not match the current native V2 snapshot')) {
+    return '已检测到新的原生 V2 数据快照，但当前完整质量报告仍绑定上一版快照。重新运行正式全量数据验收后才能启动正式训练；下方“上次验收”记录不代表当前快照。';
+  }
+
+  const pendingProviderMatch = summary.match(
+    /^The current (canonical|cleaned) snapshot has not completed full data quality acceptance; the previous report cannot authorize formal training\.$/,
+  );
+  if (pendingProviderMatch) {
+    return `当前 ${pendingProviderMatch[1]} 快照尚未完成正式全量数据验收；上一版报告不能授权当前快照启动正式训练。`;
+  }
+
+  const unavailableProviderMatch = summary.match(
+    /^The current (canonical|cleaned) native V2 snapshot is unavailable; formal training is blocked\.$/,
+  );
+  if (unavailableProviderMatch) {
+    return `当前 ${unavailableProviderMatch[1]} 原生 V2 快照不可用；正式训练已阻止。`;
+  }
 
   const readyPrefix = 'Qlib provider has enough calendar/instrument coverage for the baseline run.';
   if (!summary.startsWith(readyPrefix)) return summary;
@@ -1574,6 +1660,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       dataSources: quantStatus.dataSources,
       qlibProvider: quantStatus.qlibProvider,
       providerQuality: quantStatus.providerQuality,
+      currentProviderIdentities: quantStatus.currentProviderIdentities,
       latestTraining: quantStatus.latestTraining,
       cashControlBacktest: quantStatus.cashControlBacktest,
       qlibPredictions: quantStatus.qlibPredictions,
@@ -1789,7 +1876,9 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       : buildJobParams(workflowJob, jobParams[jobType], backendJobInfo.allowedParamKeys);
     if (isFormalTrainingBlocked(jobType, params, workflowStatus)) {
       const providerState = providerTrainingState(workflowStatus, params);
-      setError(`${providerState.provider} 数据没有通过训练检查：${providerState.summary}`);
+      setError(
+        `${providerState.provider} 数据没有通过训练检查：${localizedTrainingReadinessSummary(providerState.summary, language)}`,
+      );
       return;
     }
     if (submittingJobTypesRef.current.has(jobType)) {
@@ -2022,6 +2111,46 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     { label: language === 'zh' ? '协作暂停' : 'cooperative pause', info: robustPauseJobInfo },
     { label: language === 'zh' ? '恢复研究' : 'resume research', info: robustResumeJobInfo },
   ].filter(({ info }) => info.catalogLoaded && !info.isEnabled);
+  const providerQualityRows = (['canonical', 'cleaned'] as const)
+    .filter((provider) => Boolean(
+      workflowStatus?.providerQuality?.[provider]
+      || workflowStatus?.currentProviderIdentities?.[provider],
+    ))
+    .map((provider) => providerTrainingState(workflowStatus, { provider }));
+  const hasPendingProviderAcceptance = providerQualityRows.some(
+    (providerState) => !providerState.evidenceCurrent && providerState.currentSnapshotReady,
+  );
+  const hasOutdatedQualityEvidence = providerQualityRows.some(
+    (providerState) => !providerState.evidenceCurrent && Boolean(providerState.qualitySnapshotId),
+  );
+  const allProvidersTrainable = providerQualityRows.length
+    ? providerQualityRows.every((providerState) => providerState.trainable)
+    : trainable;
+  const hasTrainableProvider = providerQualityRows.length
+    ? providerQualityRows.some((providerState) => providerState.trainable)
+    : trainable;
+  const hasNonTrainableProvider = providerQualityRows.some(
+    (providerState) => !providerState.trainable,
+  );
+  const hasMixedProviderReadiness = hasTrainableProvider && hasNonTrainableProvider;
+  const acceptedProviderNames = providerQualityRows
+    .filter((providerState) => providerState.trainable)
+    .map((providerState) => providerState.provider);
+  const pendingProviderNames = providerQualityRows
+    .filter((providerState) => !providerState.evidenceCurrent && providerState.currentSnapshotReady)
+    .map((providerState) => providerState.provider);
+  const blockedProviderNames = providerQualityRows
+    .filter((providerState) => !providerState.trainable && !pendingProviderNames.includes(providerState.provider))
+    .map((providerState) => providerState.provider);
+  const mixedReadinessSummary = hasMixedProviderReadiness
+    ? language === 'zh'
+      ? pendingProviderNames.length
+        ? `${acceptedProviderNames.join('、')} 已通过；${pendingProviderNames.join('、')} 的当前快照待完整质量验收。已通过的数据版本仍可训练，待验收版本不能用于正式训练。`
+        : `${acceptedProviderNames.join('、')} 已通过；${blockedProviderNames.join('、')} 当前不能用于正式训练。请查看对应数据行的阻断原因。`
+      : pendingProviderNames.length
+        ? `${acceptedProviderNames.join(', ')} accepted; the current ${pendingProviderNames.join(', ')} snapshot awaits full quality acceptance. Accepted providers remain trainable; pending providers cannot run formal training.`
+        : `${acceptedProviderNames.join(', ')} accepted; ${blockedProviderNames.join(', ')} cannot currently run formal training. See the provider row for details.`
+    : null;
   const qualityJob = latestJobs.report_data_quality;
   const qualityJobInfo = getBackendJobInfo(compatibleJobTypes, 'report_data_quality');
   const qualityTaskLabel = isActiveJob(qualityJob)
@@ -2029,7 +2158,11 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
         ? (language === 'zh' ? '运行中' : 'running')
         : (language === 'zh' ? '后台仍运行' : 'runner active'))
     : qualityJob?.status === 'completed'
-    ? (language === 'zh' ? '已完成' : 'completed')
+    ? (hasOutdatedQualityEvidence
+        ? (providerQualityRows.some((providerState) => providerState.evidenceCurrent)
+            ? (language === 'zh' ? '已完成（部分为上一快照）' : 'completed (some evidence is for a previous snapshot)')
+            : (language === 'zh' ? '已完成（上一快照）' : 'completed (previous snapshot)'))
+        : (language === 'zh' ? '已完成' : 'completed'))
     : qualityJob?.status === 'failed'
         ? (language === 'zh' ? '失败' : 'failed')
         : qualityJob?.status === 'cancelled'
@@ -2037,17 +2170,19 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
           : (language === 'zh' ? '未运行' : 'not run');
   const acceptanceLabel = loading
     ? (language === 'zh' ? '读取中' : 'loading')
-    : trainable
+    : allProvidersTrainable
       ? (language === 'zh' ? '通过' : 'accepted')
-      : (language === 'zh' ? '阻塞' : 'blocked');
+      : hasMixedProviderReadiness
+        ? hasPendingProviderAcceptance
+          ? (language === 'zh' ? '部分通过，部分待验收' : 'partly accepted, partly pending')
+          : (language === 'zh' ? '部分通过，部分阻塞' : 'partly accepted, partly blocked')
+      : hasPendingProviderAcceptance
+        ? (language === 'zh' ? '待重新验收' : 're-acceptance pending')
+        : (language === 'zh' ? '阻塞' : 'blocked');
   const dailyGuideSteps = useMemo(
     () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
     [workflowStatus, latestJobs, mlflowUrl],
   );
-  const providerQualityRows = (['canonical', 'cleaned'] as const)
-    .filter((provider) => Boolean(workflowStatus?.providerQuality?.[provider]))
-    .map((provider) => providerTrainingState(workflowStatus, { provider }));
-
   return (
     <main className="min-h-screen bg-base px-4 py-6 sm:px-6 lg:px-8">
       <div className="mx-auto flex max-w-7xl flex-col gap-5">
@@ -2121,21 +2256,26 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
               <JobStatusBadge job={qualityJob} />
             </div>
             <p className="mt-3 text-lg font-semibold text-foreground">
-              {trainable
+              {allProvidersTrainable
                 ? (language === 'zh' ? '当前数据可训练' : 'Data ready for training')
                 : loading
                   ? (language === 'zh' ? '正在读取数据状态' : 'Loading data status')
-                  : (language === 'zh' ? '数据暂不可训练' : 'Data not ready for training')}
+                  : hasMixedProviderReadiness
+                    ? (language === 'zh' ? '部分数据可训练' : 'Some data providers are trainable')
+                  : hasPendingProviderAcceptance
+                    ? (language === 'zh' ? '新快照待验收' : 'New snapshot awaiting acceptance')
+                    : (language === 'zh' ? '数据暂不可训练' : 'Data not ready for training')}
             </p>
             <p className="mt-2 text-sm leading-5 text-secondary-text">
-              {localizedTrainingReadinessSummary(workflowStatus?.trainingReadiness?.summary, language)
+              {mixedReadinessSummary
+                || localizedTrainingReadinessSummary(workflowStatus?.trainingReadiness?.summary, language)
                 || (language === 'zh'
                   ? '运行质量报告后，这里会显示训练准备状态。'
                   : 'Run a data quality report to see training readiness here.')}
             </p>
             <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary-text">
               <span>{language === 'zh' ? '质量报告任务' : 'Quality-report job'}：{qualityTaskLabel}</span>
-              <span className={loading ? 'text-muted-text' : trainable ? 'text-success' : 'text-warning'}>
+              <span className={loading ? 'text-muted-text' : allProvidersTrainable ? 'text-success' : 'text-warning'}>
                 {language === 'zh' ? '数据验收' : 'Data acceptance'}：{acceptanceLabel}
               </span>
             </div>
@@ -2149,8 +2289,22 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   >
                     <span className="font-medium text-foreground">{providerState.provider}</span>
                     <span className={providerState.trainable && providerState.freshnessStatus !== 'stale' ? 'text-secondary-text' : 'text-warning'}>
-                      {language === 'zh' ? '快照' : 'snapshot'} {providerState.snapshotId || '-'}
-                      {' · '}{providerFreshnessText(providerState, language)}
+                      <span className="block">
+                        {providerState.evidenceCurrent
+                          ? (language === 'zh' ? '快照' : 'snapshot')
+                          : (language === 'zh' ? '当前快照' : 'current snapshot')}{' '}
+                        {providerState.snapshotId || '-'}
+                        {' · '}{providerFreshnessText(providerState, language)}
+                      </span>
+                      {!providerState.evidenceCurrent && providerState.qualitySnapshotId ? (
+                        <span className="mt-1 block text-muted-text">
+                          {language === 'zh' ? '上次已验收快照' : 'last accepted snapshot'}{' '}
+                          {providerState.qualitySnapshotId}
+                          {language === 'zh'
+                            ? '（不能作为当前训练授权）'
+                            : ' (does not authorize training on the current snapshot)'}
+                        </span>
+                      ) : null}
                     </span>
                   </div>
                 ))}

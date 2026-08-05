@@ -2,6 +2,7 @@ import apiClient from './index';
 import {
   convertQlibResearch,
   type ResearchCashControlBacktest,
+  type ResearchCurrentProviderIdentity,
   type ResearchDataSource,
   type ResearchExperimentNotebook,
   type ResearchQlibPredictions,
@@ -94,6 +95,7 @@ export interface QuantStatus {
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
   providerQuality?: Record<string, ResearchProviderQuality>;
+  currentProviderIdentities?: Record<string, ResearchCurrentProviderIdentity>;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
@@ -164,6 +166,7 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     dataSources: Array.isArray(camel.dataSources) ? camel.dataSources : [],
     qlibProvider: camel.qlibProvider ?? null,
     providerQuality: camel.providerQuality ?? {},
+    currentProviderIdentities: camel.currentProviderIdentities ?? {},
     latestTraining: camel.latestTraining ?? null,
     cashControlBacktest: camel.cashControlBacktest ?? null,
     qlibPredictions: camel.qlibPredictions ?? null,

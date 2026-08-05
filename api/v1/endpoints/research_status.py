@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, HTTPException, Query
@@ -139,6 +139,7 @@ class _NativeQlibProviderResolution:
     snapshot_id: Optional[str] = None
     manifest_sha256: Optional[str] = None
     content_sha256: Optional[str] = None
+    calendar_end: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2518,7 +2519,74 @@ def _resolve_native_qlib_provider(
         snapshot_id=snapshot_id,
         manifest_sha256=manifest_sha256,
         content_sha256=str(dataset_manifest.get("content_sha256") or ""),
+        calendar_end=(
+            str(dataset_manifest["latest_trade_date"])
+            if isinstance(dataset_manifest.get("latest_trade_date"), str)
+            else None
+        ),
     )
+
+
+def _current_native_provider_identities(
+    *,
+    requested_dataset_id: str,
+    requested_resolution: _NativeQlibProviderResolution,
+) -> Dict[str, Dict[str, Any]]:
+    identities: Dict[str, Dict[str, Any]] = {}
+    for dataset_id, provider_key in NATIVE_QLIB_DATA_CONTRACT_KEYS.items():
+        resolution = (
+            requested_resolution
+            if dataset_id == requested_dataset_id
+            else _resolve_native_qlib_provider(dataset_id)
+        )
+        if not resolution.authoritative:
+            continue
+        identity: Dict[str, Any] = {
+            "provider": provider_key,
+            "dataset_id": dataset_id,
+            "status": "ready" if resolution.path is not None else "blocked",
+        }
+        if resolution.dataset_id == dataset_id:
+            for field in (
+                "snapshot_id",
+                "manifest_sha256",
+                "content_sha256",
+                "calendar_end",
+            ):
+                value = getattr(resolution, field)
+                if isinstance(value, str) and value:
+                    identity[field] = value
+        if resolution.error:
+            identity["error"] = resolution.error
+        identities[provider_key] = identity
+    return identities
+
+
+def _annotate_provider_quality_evidence_current(
+    payload: Dict[str, Any],
+    current_identities: Mapping[str, Mapping[str, Any]],
+) -> None:
+    provider_quality = payload.get("provider_quality")
+    if not isinstance(provider_quality, dict):
+        return
+    for provider_key, quality_record in provider_quality.items():
+        if not isinstance(quality_record, dict):
+            continue
+        current_identity = current_identities.get(str(provider_key))
+        quality_record["evidence_current"] = bool(
+            isinstance(current_identity, Mapping)
+            and current_identity.get("status") == "ready"
+            and all(
+                isinstance(current_identity.get(field), str)
+                and current_identity.get(field) == quality_record.get(field)
+                for field in (
+                    "dataset_id",
+                    "snapshot_id",
+                    "manifest_sha256",
+                    "content_sha256",
+                )
+            )
+        )
 
 
 def _saved_provider_identity(
@@ -4243,6 +4311,15 @@ def build_research_status_payload(
     payload["function_inventory"] = _function_inventory_payload()
     payload["china_astock_reuse"] = _china_astock_reuse_payload()
     payload["acceptance_checklist"] = _acceptance_checklist_payload()
+    current_provider_identities = _current_native_provider_identities(
+        requested_dataset_id=provider_dataset_id,
+        requested_resolution=native_resolution,
+    )
+    payload["current_provider_identities"] = current_provider_identities
+    _annotate_provider_quality_evidence_current(
+        payload,
+        current_provider_identities,
+    )
     provider_quality = payload.get("provider_quality")
     if isinstance(provider_quality, dict):
         _annotate_provider_quality_freshness(provider_quality)
