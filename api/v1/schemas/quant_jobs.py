@@ -27,6 +27,10 @@ class QuantJobResponse(BaseModel):
     updated_at: str
     error: Optional[str] = None
     artifact_paths: List[str] = Field(default_factory=list)
+    progress: Dict[str, Any] = Field(default_factory=dict)
+    runner_alive: Optional[bool] = None
+    can_cancel: bool = False
+    log_updated_at: Optional[str] = None
 
 
 class QuantJobListResponse(BaseModel):
@@ -42,9 +46,11 @@ class QuantJobLogResponse(BaseModel):
 
 class QuantJobTypesResponse(BaseModel):
     available_job_types: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    api_contract: Dict[str, str] = Field(default_factory=dict)
 
 
 class QuantStatusResponse(BaseModel):
+    api_contract: Dict[str, str] = Field(default_factory=dict)
     available_job_types: Dict[str, Dict[str, Any]]
     active_count: int
     latest_jobs: Dict[str, QuantJobResponse]
@@ -54,6 +60,7 @@ class QuantStatusResponse(BaseModel):
     training_readiness: Dict[str, Any] = Field(default_factory=dict)
     data_sources: List[Dict[str, Any]] = Field(default_factory=list)
     qlib_provider: Optional[Dict[str, Any]] = None
+    provider_quality: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     latest_training: Optional[Dict[str, Any]] = None
     cash_control_backtest: Optional[Dict[str, Any]] = None
     qlib_predictions: Optional[Dict[str, Any]] = None

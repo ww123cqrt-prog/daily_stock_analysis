@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import socket
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,7 +32,11 @@ from api.v1.schemas.quant_jobs import (
     QuantJobTypesResponse,
     QuantStatusResponse,
 )
-from api.v1.endpoints.research_status import build_research_status_payload
+from api.v1.endpoints.research_status import (
+    approved_ashare_qfq_snapshot_identity,
+    build_research_status_payload,
+)
+from quant_workflow.scripts.quant_data_contract import DataContractError
 from src.safe_errors import sanitize_public_error
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
 from src.safe_urls import public_http_url
@@ -50,6 +55,18 @@ LOCAL_MLFLOW_HOSTS = {"127.0.0.1", "localhost", "::1"}
 LOCAL_MLFLOW_HEALTH_PORTS = {None, 6006, 6606}
 LOCAL_CATDESK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 FORMAL_TRAINING_JOB_TYPES = {"train_baseline_lgb", "run_candidate_pipeline"}
+PROVIDER_PINNED_TRAINING_JOB_TYPES = FORMAL_TRAINING_JOB_TYPES | {
+    "train_baseline_lgb_equivalence"
+}
+READINESS_GATED_JOB_TYPES = PROVIDER_PINNED_TRAINING_JOB_TYPES
+ROBUST_SIGNAL_READINESS_GATED_JOB_TYPES = {
+    "run_robust_signal_research",
+    "resume_robust_signal_research",
+}
+MARKET_DATA_PINNED_JOB_TYPES = {
+    "report_market_regime",
+    "report_cash_control_backtest",
+}
 TRAINING_PROVIDER_DATASET_IDS = {
     "canonical": "qlib_ashare_v2",
     "cleaned": "qlib_ashare_cleaned_v2",
@@ -66,6 +83,9 @@ _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _QUANT_JOB_STREAM_LOCK = threading.Lock()
 _QUANT_JOB_STREAM_ACTIVE = 0
+QUANT_API_CONTRACT_VERSION = "quant-workbench-v2"
+BACKEND_STARTED_AT = datetime.now(timezone.utc).isoformat()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class _ArtifactPathResolution(NamedTuple):
@@ -116,6 +136,35 @@ def _public_catdesk_url(url: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_backend_build_id() -> str:
+    configured = os.environ.get("DSA_BACKEND_BUILD_ID", "").strip()
+    if configured:
+        return configured[:128]
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "backend-local"
+    return completed.stdout.strip() or "backend-local"
+
+
+BACKEND_BUILD_ID = _resolve_backend_build_id()
+
+
+def _api_contract_payload() -> Dict[str, str]:
+    return {
+        "version": QUANT_API_CONTRACT_VERSION,
+        "backend_build_id": BACKEND_BUILD_ID,
+        "backend_started_at": BACKEND_STARTED_AT,
+    }
 
 
 def _sanitize_public_error(error: Optional[str]) -> Optional[str]:
@@ -329,11 +378,19 @@ def _is_true(value: Any) -> bool:
 def _requires_training_readiness_gate(
     job_type: str, params: Dict[str, Any]
 ) -> bool:
-    if job_type not in FORMAL_TRAINING_JOB_TYPES:
+    if job_type not in READINESS_GATED_JOB_TYPES:
         return False
-    return not (
-        job_type == "run_candidate_pipeline" and _is_true(params.get("dry_run"))
-    )
+    if job_type == "run_candidate_pipeline":
+        return not _is_true(params.get("dry_run"))
+    return True
+
+
+def _robust_signal_data_readiness(research_status: Dict[str, Any]) -> Dict[str, Any]:
+    robust_signal = research_status.get("robust_signal")
+    if not isinstance(robust_signal, dict):
+        return {}
+    readiness = robust_signal.get("data_readiness")
+    return readiness if isinstance(readiness, dict) else {}
 
 
 def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
@@ -387,21 +444,33 @@ def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _Ar
 
 
 @router.get("/status", response_model=QuantStatusResponse)
-async def get_quant_status() -> QuantStatusResponse:
+async def get_quant_status(
+    include_research: bool = Query(
+        True,
+        description="Include the full research/data readiness snapshot.",
+    ),
+) -> QuantStatusResponse:
     """Return quant workflow status used by the web workflow page."""
     service = get_quant_job_service()
-    research_status, mlflow_payload = await asyncio.gather(
-        asyncio.to_thread(build_research_status_payload),
-        asyncio.to_thread(_mlflow_status_payload),
-    )
-    latest_job_snapshot, active_count, recent_jobs = await asyncio.to_thread(
-        service.get_status_snapshot
-    )
+    if include_research:
+        research_status, mlflow_payload = await asyncio.gather(
+            asyncio.to_thread(build_research_status_payload),
+            asyncio.to_thread(_mlflow_status_payload),
+        )
+    else:
+        research_status = {}
+        mlflow_payload = await asyncio.to_thread(_mlflow_status_payload)
+    # Research and service probes can be slow. Read mutable job state last so
+    # the response does not report a task as active after it finished while
+    # the immutable enrichment data was loading.
+    status_snapshot = await asyncio.to_thread(service.get_status_snapshot)
+    latest_job_snapshot, active_count, recent_jobs = status_snapshot
     latest_jobs = {
         job_type: _job_response(job)
         for job_type, job in latest_job_snapshot.items()
     }
     return QuantStatusResponse(
+        api_contract=_api_contract_payload(),
         available_job_types=service.available_job_types(),
         active_count=active_count,
         latest_jobs=latest_jobs,
@@ -411,6 +480,7 @@ async def get_quant_status() -> QuantStatusResponse:
         training_readiness=research_status.get("training_readiness") or {},
         data_sources=research_status.get("data_sources") or [],
         qlib_provider=research_status.get("qlib_provider"),
+        provider_quality=research_status.get("provider_quality") or {},
         latest_training=research_status.get("latest_training"),
         cash_control_backtest=research_status.get("cash_control_backtest"),
         qlib_predictions=research_status.get("qlib_predictions"),
@@ -429,7 +499,10 @@ async def get_quant_job_types() -> QuantJobTypesResponse:
 
     service = get_quant_job_service()
     available = await asyncio.to_thread(service.available_job_types)
-    return QuantJobTypesResponse(available_job_types=available)
+    return QuantJobTypesResponse(
+        available_job_types=available,
+        api_contract=_api_contract_payload(),
+    )
 
 
 @router.post("/jobs", response_model=QuantJobResponse)
@@ -437,8 +510,33 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
     """Submit one whitelisted quant workflow job."""
     service = get_quant_job_service()
     approved_provider_identity = None
+    approved_market_data_identity = None
     try:
-        if _requires_training_readiness_gate(request.job_type, request.params):
+        if request.job_type in MARKET_DATA_PINNED_JOB_TYPES:
+            try:
+                approved_market_data_identity = await asyncio.to_thread(
+                    approved_ashare_qfq_snapshot_identity
+                )
+            except DataContractError as exc:
+                raise api_error(
+                    409,
+                    "market_data_blocked",
+                    "A股日线数据尚未通过完整验收，或验收后的快照已经变化。请先在数据页重新运行完整数据质量报告。",
+                ) from exc
+        if request.job_type in ROBUST_SIGNAL_READINESS_GATED_JOB_TYPES:
+            research_status = await asyncio.to_thread(build_research_status_payload)
+            readiness = _robust_signal_data_readiness(research_status)
+            if readiness.get("trainable") is not True or readiness.get("status") != "ready":
+                raise api_error(
+                    409,
+                    "robust_signal_data_blocked",
+                    str(
+                        readiness.get("summary_zh")
+                        or readiness.get("summary")
+                        or "Robust CSI800 data has not passed its dedicated readiness check."
+                    ),
+                )
+        elif _requires_training_readiness_gate(request.job_type, request.params):
             provider_dataset_id = _training_provider_dataset_id(request.params)
             research_status = await asyncio.to_thread(
                 build_research_status_payload,
@@ -459,22 +557,25 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                         or "Current data quality evidence does not allow formal training."
                     ),
                 )
-            try:
-                approved_provider_identity = _approved_provider_identity_from_status(
-                    research_status,
-                    expected_dataset_id=provider_dataset_id,
-                )
-            except ValueError as exc:
-                raise api_error(
-                    409,
-                    "training_blocked",
-                    "Current data quality evidence cannot pin an approved Qlib snapshot.",
-                ) from exc
-        submit_kwargs = (
-            {"approved_provider_identity": approved_provider_identity}
-            if approved_provider_identity is not None
-            else {}
-        )
+            if request.job_type in PROVIDER_PINNED_TRAINING_JOB_TYPES:
+                try:
+                    approved_provider_identity = _approved_provider_identity_from_status(
+                        research_status,
+                        expected_dataset_id=provider_dataset_id,
+                    )
+                except ValueError as exc:
+                    raise api_error(
+                        409,
+                        "training_blocked",
+                        "Current data quality evidence cannot pin an approved Qlib snapshot.",
+                    ) from exc
+        submit_kwargs = {}
+        if approved_provider_identity is not None:
+            submit_kwargs["approved_provider_identity"] = approved_provider_identity
+        if approved_market_data_identity is not None:
+            submit_kwargs["approved_market_data_identity"] = (
+                approved_market_data_identity
+            )
         job = await asyncio.to_thread(
             service.submit_job,
             request.job_type,

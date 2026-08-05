@@ -158,6 +158,353 @@ def test_launch_fails_when_launchd_rejects_job(tmp_path: Path) -> None:
     assert record["status"] == "failed_to_start"
 
 
+def test_main_returns_nonzero_when_child_fails_during_warmup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    monkeypatch.setattr(
+        module,
+        "launch",
+        lambda **_kwargs: {"status": "failed", "return_code": 23},
+    )
+
+    return_code = module.main(
+        [
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--quant-data-dir",
+            str(tmp_path / "quant_data"),
+            "--report-dir",
+            str(tmp_path / "reports"),
+            "--mlruns-dir",
+            str(tmp_path / "mlruns"),
+            "--run-id",
+            "failed-warmup",
+            "--warmup-seconds",
+            "0",
+        ]
+    )
+
+    assert return_code == 23
+
+
+def test_cancel_launchd_runner_boots_out_and_confirms_the_owned_child_stopped(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "cancel-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    label = module._launchd_label(run_id)
+    domain = "gui/501"
+    launch_path = runner_dir / "launch.json"
+    launch_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": domain,
+                "job_label": label,
+                "pid": 43210,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runner_dir / "pid").write_text("43210\n", encoding="utf-8")
+    active = {"value": True}
+    commands: list[list[str]] = []
+
+    def launchctl_runner(command, **kwargs):
+        commands.append(command)
+        if command[1] == "print":
+            if active["value"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="state = running\n\tpid = 43199\n",
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=113, stdout="", stderr="not found")
+        if command[1] == "bootout":
+            active["value"] = False
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    result = module.cancel_launchd_runner(
+        report_dir=report_dir,
+        run_id=run_id,
+        runner_namespace="runner",
+        launchctl_runner=launchctl_runner,
+        sleep_fn=lambda _seconds: None,
+        pid_alive=lambda pid: active["value"] and pid == 43210,
+        uid=501,
+    )
+
+    record = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert result["status"] == "cancelled"
+    assert record["status"] == "cancelled"
+    assert ["/bin/launchctl", "bootout", f"{domain}/{label}"] in commands
+
+
+def test_cancel_launchd_runner_preserves_natural_completion_before_cancellation(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "naturally-completed-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    launch_path = runner_dir / "launch.json"
+    launch_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": "gui/501",
+                "job_label": module._launchd_label(run_id),
+                "pid": 43210,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runner_dir / "pid").write_text("43210\n", encoding="utf-8")
+    status_path = report_dir / "runs" / run_id / "status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": "signal_candidate_ready",
+                "lifecycle_status": "completed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+
+    result = module.cancel_launchd_runner(
+        report_dir=report_dir,
+        run_id=run_id,
+        runner_namespace="runner",
+        terminal_state_path=status_path,
+        launchctl_runner=lambda command, **_kwargs: commands.append(command),
+        sleep_fn=lambda _seconds: None,
+        pid_alive=lambda _pid: False,
+        uid=501,
+    )
+
+    record = json.loads(launch_path.read_text(encoding="utf-8"))
+    assert result["status"] == "completed"
+    assert result["cancel_outcome"] == "already_terminal"
+    assert record["status"] == "completed"
+    assert commands == []
+
+
+def test_cancel_launchd_runner_keeps_user_cancel_after_successful_bootout(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "cancel-wins-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    label = module._launchd_label(run_id)
+    domain = "gui/501"
+    launch_path = runner_dir / "launch.json"
+    launch_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": domain,
+                "job_label": label,
+                "pid": 43210,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runner_dir / "pid").write_text("43210\n", encoding="utf-8")
+    status_path = report_dir / "runs" / run_id / "status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": None,
+                "lifecycle_status": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+    active = {"value": True}
+
+    def launchctl_runner(command, **_kwargs):
+        if command[1] == "print":
+            if active["value"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="state = running\n\tpid = 43199\n",
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=113, stdout="", stderr="not found")
+        if command[1] == "bootout":
+            active["value"] = False
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "status": None,
+                        "lifecycle_status": "failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    result = module.cancel_launchd_runner(
+        report_dir=report_dir,
+        run_id=run_id,
+        runner_namespace="runner",
+        terminal_state_path=status_path,
+        launchctl_runner=launchctl_runner,
+        sleep_fn=lambda _seconds: None,
+        pid_alive=lambda pid: active["value"] and pid == 43210,
+        uid=501,
+    )
+
+    assert result["status"] == "cancelled"
+    assert result["reason_code"] == "user_cancelled"
+
+
+def test_cancel_launchd_runner_refuses_an_orphan_pid_without_launchd_ownership(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "orphan-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    (runner_dir / "launch.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": "gui/501",
+                "job_label": module._launchd_label(run_id),
+                "pid": 98765,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="ownership"):
+        module.cancel_launchd_runner(
+            report_dir=report_dir,
+            run_id=run_id,
+            launchctl_runner=lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=113, stdout="", stderr="not found"
+            ),
+            sleep_fn=lambda _seconds: None,
+            pid_alive=lambda pid: pid == 98765,
+            uid=501,
+        )
+
+
+def test_cancel_launchd_runner_refuses_mismatched_pid_record(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "mismatched-pid-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    domain = "gui/501"
+    label = module._launchd_label(run_id)
+    (runner_dir / "launch.json").write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": domain,
+                "job_label": label,
+                "pid": 12345,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runner_dir / "pid").write_text("54321\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    with pytest.raises(RuntimeError, match="ownership PID no longer matches"):
+        module.cancel_launchd_runner(
+            report_dir=report_dir,
+            run_id=run_id,
+            launchctl_runner=lambda command, **_kwargs: commands.append(command),
+            uid=501,
+        )
+
+    assert commands == []
+
+
+def test_cancel_launchd_runner_never_reports_cancelled_while_child_is_alive(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    report_dir = tmp_path / "reports"
+    run_id = "child-alive-run"
+    runner_dir = report_dir / "runner" / run_id
+    runner_dir.mkdir(parents=True)
+    domain = "gui/501"
+    label = module._launchd_label(run_id)
+    launch_path = runner_dir / "launch.json"
+    launch_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "run_id": run_id,
+                "launch_backend": "launchd",
+                "launchd_domain": domain,
+                "job_label": label,
+                "pid": 12345,
+            }
+        ),
+        encoding="utf-8",
+    )
+    active = {"job": True}
+
+    def launchctl_runner(command, **_kwargs):
+        if command[1] == "print":
+            if active["job"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="state = running\n\tpid = 12340\n",
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=113, stdout="", stderr="not found")
+        if command[1] == "bootout":
+            active["job"] = False
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        module.cancel_launchd_runner(
+            report_dir=report_dir,
+            run_id=run_id,
+            launchctl_runner=launchctl_runner,
+            pid_alive=lambda pid: pid == 12345,
+            uid=501,
+            timeout_seconds=0,
+        )
+
+    assert json.loads(launch_path.read_text(encoding="utf-8"))["status"] == "running"
+
+
 def test_duplicate_active_launch_preserves_original_pid_and_record(tmp_path: Path) -> None:
     module = load_module()
     report_dir = tmp_path / "reports"

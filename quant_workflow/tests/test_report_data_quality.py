@@ -23,9 +23,12 @@ def load_module():
     return module
 
 
-def load_quality_publication(out_dir: Path) -> tuple[dict, dict, bytes]:
+def load_quality_publication(
+    out_dir: Path,
+    pointer_name: str = "data_quality_report_latest.json",
+) -> tuple[dict, dict, bytes]:
     pointer = json.loads(
-        (out_dir / "data_quality_report_latest.json").read_text(encoding="utf-8")
+        (out_dir / pointer_name).read_text(encoding="utf-8")
     )
     evidence_bytes = (out_dir / pointer["evidence_artifact"]).read_bytes()
     evidence = json.loads(evidence_bytes.decode("utf-8"))
@@ -1084,17 +1087,41 @@ class ReportDataQualityTest(unittest.TestCase):
                 "SZ000001\t2026-07-17\t2026-07-20\n", encoding="utf-8"
             )
             write_benchmark_features(provider)
-            np.array([0.0, 9.0, 10.0], dtype="<f4").tofile(
+            write_instrument_features(provider, "SZ000001")
+            np.array([0.0, 9.0, 11.0], dtype="<f4").tofile(
                 provider / "features" / "sh000300" / "high.day.bin"
             )
 
             stats = module.qlib_provider_stats(provider)
+            ready, readiness = module.build_training_readiness(
+                stats,
+                {"000001"},
+                {
+                    "duplicate_dates": 0,
+                    "null_dates": 0,
+                    "missing_columns": 0,
+                    "bad_ohlc_rows": 0,
+                },
+                min_calendar_days=1,
+                min_instruments=1,
+                min_merged_instruments=1,
+            )
 
         self.assertFalse(stats["benchmark_complete"])
         self.assertIn(
             "ohlc_relationship",
             stats["benchmark_details"]["SH000300"]["missing_fields"],
         )
+        self.assertEqual(
+            stats["benchmark_details"]["SH000300"]["invalid_ohlc_dates"],
+            ["2026-07-17"],
+        )
+        self.assertFalse(ready)
+        self.assertIn(
+            "SH000300 benchmark OHLC relationship is invalid on 2026-07-17",
+            readiness["failure_reasons"],
+        )
+        self.assertNotIn("0 missing days", readiness["summary"])
 
     def test_benchmark_factor_must_cover_every_calendar_day(self):
         module = load_module()
@@ -1316,7 +1343,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 "--overlap-sample",
                 "5",
                 "--merged-sample",
-                "5",
+                "0",
             ]
 
             with patch.object(sys, "argv", argv):
@@ -1386,6 +1413,17 @@ class ReportDataQualityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             out_dir = root / "reports"
+            out_dir.mkdir()
+            (out_dir / "data_quality_report_latest.json").write_text(
+                '{"report_id":"formal-report"}', encoding="utf-8"
+            )
+            (out_dir / "data_quality_report_latest.md").write_text(
+                "# Formal quality report\n", encoding="utf-8"
+            )
+            (out_dir / "research_status_latest.json").write_text(
+                '{"trainable":true,"quality_report_id":"formal-report"}',
+                encoding="utf-8",
+            )
             bars = root / "bars"
             bars.mkdir()
             write_prices(bars, "000001")
@@ -1423,17 +1461,31 @@ class ReportDataQualityTest(unittest.TestCase):
                     "0",
                 ]
             )
-            report = (out_dir / "data_quality_report_latest.md").read_text(
+            sampled_dir = out_dir / "test_runs" / "data_quality"
+            report = (sampled_dir / "data_quality_report_sampled_latest.md").read_text(
                 encoding="utf-8"
             )
-            pointer, quality, evidence_bytes = load_quality_publication(out_dir)
+            pointer, quality, evidence_bytes = load_quality_publication(
+                sampled_dir,
+                pointer_name="data_quality_report_sampled_latest.json",
+            )
             status = json.loads(
-                (out_dir / "research_status_latest.json").read_text(
+                (sampled_dir / "research_status_sampled_latest.json").read_text(
                     encoding="utf-8"
                 )
             )
+            formal_pointer = json.loads(
+                (out_dir / "data_quality_report_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            formal_status = json.loads(
+                (out_dir / "research_status_latest.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(result, 0)
+        self.assertEqual(formal_pointer["report_id"], "formal-report")
+        self.assertTrue(formal_status["trainable"])
         self.assertEqual(quality.get("scan_mode"), "sampled")
         self.assertEqual(quality.get("coverage_status"), "partial")
         self.assertEqual(quality.get("verification_status"), "unverified")
@@ -1448,6 +1500,7 @@ class ReportDataQualityTest(unittest.TestCase):
         )
         self.assertIn("Scan mode: sampled", report)
         self.assertIn("Verification status: unverified", report)
+        self.assertIn("Sampled report cannot authorize training", report)
         self.assertFalse(status["trainable"])
         self.assertEqual(status.get("quality_scan", {}).get("mode"), "sampled")
         self.assertEqual(status.get("quality_scan", {}).get("coverage"), "partial")

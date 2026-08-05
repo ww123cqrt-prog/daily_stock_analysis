@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -21,10 +22,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri, quant_data_root  # noqa: E402
+try:  # noqa: E402
+    from ._paths import qlib_provider_uri, quant_data_root
+except ImportError:  # Direct script execution.
+    from _paths import qlib_provider_uri, quant_data_root
 
 
-DEFAULT_CANONICAL_PROVIDER = qlib_provider_uri("cleaned")
+DEFAULT_CANONICAL_PROVIDER: Path | None = None
 DEFAULT_INTERVALS = (
     quant_data_root() / "reference" / "pit_csi800" / "membership_intervals.parquet"
 )
@@ -260,19 +264,44 @@ def _remove_tree(root: Path) -> None:
     shutil.rmtree(root)
 
 
-def _snapshot_is_reusable(provider: Path, key: str) -> bool:
+def _snapshot_is_reusable(
+    provider: Path,
+    key: str,
+    *,
+    file_hasher: Any = None,
+) -> bool:
+    def hash_file(path: Path, info: os.stat_result) -> str:
+        if file_hasher is None:
+            return file_sha256(path)
+        return file_hasher(path, info)
+
     metadata_path = provider / PROVIDER_METADATA_FILENAME
     content_path = provider / PROVIDER_CONTENT_FILENAME
-    instrument_path = provider / "instruments" / "csi800.txt"
-    if (
-        provider.is_symlink()
-        or not provider.is_dir()
-        or not metadata_path.is_file()
-        or not content_path.is_file()
-        or not instrument_path.is_file()
-    ):
+    write_mask = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    try:
+        provider_info = provider.lstat()
+        if (
+            stat.S_ISLNK(provider_info.st_mode)
+            or not stat.S_ISDIR(provider_info.st_mode)
+            or provider_info.st_mode & write_mask
+        ):
+            return False
+        file_inventory: dict[str, os.stat_result] = {}
+        for path in provider.rglob("*"):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_mode & write_mask:
+                return False
+            if stat.S_ISREG(info.st_mode):
+                file_inventory[path.relative_to(provider).as_posix()] = info
+            elif not stat.S_ISDIR(info.st_mode):
+                return False
+    except OSError:
         return False
-    if any(path.is_symlink() for path in provider.rglob("*")):
+    if not {
+        PROVIDER_METADATA_FILENAME,
+        PROVIDER_CONTENT_FILENAME,
+        "instruments/csi800.txt",
+    }.issubset(file_inventory):
         return False
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -282,7 +311,11 @@ def _snapshot_is_reusable(provider: Path, key: str) -> bool:
     if (
         metadata.get("format_version") != PROVIDER_FORMAT_VERSION
         or metadata.get("provider_key") != key
-        or metadata.get("content_manifest_sha256") != file_sha256(content_path)
+        or metadata.get("content_manifest_sha256")
+        != hash_file(
+            content_path,
+            file_inventory[PROVIDER_CONTENT_FILENAME],
+        )
         or not isinstance(content, dict)
         or content.get("version") != PROVIDER_CONTENT_VERSION
         or content.get("provider_key") != key
@@ -296,30 +329,78 @@ def _snapshot_is_reusable(provider: Path, key: str) -> bool:
         PROVIDER_METADATA_FILENAME,
         PROVIDER_CONTENT_FILENAME,
     }
-    actual_paths = {
-        path.relative_to(provider).as_posix()
-        for path in provider.rglob("*")
-        if path.is_file()
-    }
-    if actual_paths != expected_paths:
-        return False
-    write_mask = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-    if any(
-        path.stat().st_mode & write_mask for path in [provider, *provider.rglob("*")]
-    ):
+    if set(file_inventory) != expected_paths:
         return False
     try:
         for relative, expected in files.items():
             path = provider / relative
-            if path.is_symlink() or not path.is_file():
+            info = file_inventory.get(relative)
+            if info is None:
                 return False
-            if int(expected.get("size", -1)) != path.stat().st_size:
+            if int(expected.get("size", -1)) != info.st_size:
                 return False
-            if expected.get("sha256") != file_sha256(path):
+            if expected.get("sha256") != hash_file(path, info):
                 return False
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+class RuntimeProviderIdentityCache:
+    """Reuse content hashes only while each immutable file identity is unchanged."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._provider_identity: tuple[str, str] | None = None
+        self._digests: dict[str, tuple[tuple[int, ...], str]] = {}
+
+    @staticmethod
+    def _fingerprint(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+            int(stat.S_IMODE(info.st_mode)),
+        )
+
+    def _cached_sha256(self, path: Path, info: os.stat_result) -> str:
+        cache_key = os.path.abspath(os.fspath(path))
+        before = self._fingerprint(info)
+        cached = self._digests.get(cache_key)
+        if cached is not None and cached[0] == before:
+            return cached[1]
+        digest = file_sha256(path)
+        after = self._fingerprint(Path(path).lstat())
+        if after != before:
+            raise OSError("provider file changed during identity verification")
+        self._digests[cache_key] = (after, digest)
+        return digest
+
+    def __call__(self, provider: Path, key: str) -> dict[str, str] | None:
+        provider = Path(provider)
+        identity = (os.path.abspath(os.fspath(provider)), str(key))
+        with self._lock:
+            if self._provider_identity != identity:
+                self._provider_identity = identity
+                self._digests.clear()
+            if not _snapshot_is_reusable(
+                provider,
+                key,
+                file_hasher=self._cached_sha256,
+            ):
+                return None
+            try:
+                metadata = json.loads(
+                    (provider / PROVIDER_METADATA_FILENAME).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return None
+            tree_hash = metadata.get("provider_tree_sha256")
+            if not isinstance(tree_hash, str) or len(tree_hash) != 64:
+                return None
+            return {"provider_key": key, "provider_tree_sha256": tree_hash}
 
 
 def runtime_provider_identity(provider: Path, key: str) -> dict[str, str] | None:
@@ -477,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-out-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     result = prepare_runtime_provider(
-        canonical_provider=args.canonical_provider,
+        canonical_provider=args.canonical_provider or qlib_provider_uri("cleaned"),
         intervals_path=args.intervals,
         runtime_root=args.runtime_root,
         data_manifest_path=args.data_manifest,

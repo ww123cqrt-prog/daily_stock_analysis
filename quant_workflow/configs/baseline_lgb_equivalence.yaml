@@ -1,0 +1,69 @@
+qlib_init:
+  provider_uri: "RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME"
+  region: "cn"
+  kernels: 4
+  joblib_backend: "multiprocessing"
+
+task:
+  model:
+    class: "LGBModel"
+    module_path: "qlib.contrib.model.gbdt"
+    kwargs:
+      loss: "mse"
+      learning_rate: 0.05
+      colsample_bytree: 0.9
+      subsample: 0.9
+      lambda_l1: 1.0
+      lambda_l2: 1.0
+      max_depth: 6
+      num_leaves: 31
+      num_threads: 4
+      seed: 42
+      feature_fraction_seed: 42
+      bagging_seed: 42
+      data_random_seed: 42
+      deterministic: true
+      force_col_wise: true
+      verbosity: -1
+  dataset:
+    class: "DatasetH"
+    module_path: "qlib.data.dataset"
+    kwargs:
+      handler:
+        class: "Alpha158"
+        module_path: "qlib.contrib.data.handler"
+        kwargs:
+          start_time: "2024-01-02"
+          end_time: "2024-12-31"
+          fit_start_time: "2024-01-02"
+          fit_end_time: "2024-06-28"
+          instruments: "csi300"
+      segments:
+        train: ["2024-01-02", "2024-06-28"]
+        valid: ["2024-07-01", "2024-09-30"]
+        test: ["2024-10-08", "2024-12-31"]
+  record:
+    - class: "SignalRecord"
+      module_path: "qlib.workflow.record_temp"
+    - class: "PortAnaRecord"
+      module_path: "qlib.workflow.record_temp"
+      kwargs:
+        config:
+          strategy:
+            class: "TopkDropoutStrategy"
+            module_path: "qlib.contrib.strategy"
+            kwargs:
+              signal: "<PRED>"
+              topk: 50
+              n_drop: 5
+          backtest:
+            start_time: "2024-10-08"
+            end_time: "2024-12-31"
+            account: 10000000
+            benchmark: "SH000300"
+            exchange_kwargs:
+              limit_threshold: 0.095
+              deal_price: "close"
+              open_cost: 0.0005
+              close_cost: 0.0015
+              min_cost: 5

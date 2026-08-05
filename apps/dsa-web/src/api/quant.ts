@@ -7,6 +7,7 @@ import {
   type ResearchQlibPredictions,
   type ResearchQlibResearch,
   type ResearchQlibProvider,
+  type ResearchProviderQuality,
   type ResearchRobustSignal,
   type ResearchRobustStrategy,
   type ResearchTrainingReadiness,
@@ -30,11 +31,44 @@ export interface QuantJob {
   updatedAt: string;
   error?: string | null;
   artifactPaths: string[];
+  progress?: {
+    stage?: string;
+    completed?: number;
+    total?: number;
+    percent?: number;
+    current?: string;
+    currentArtifact?: string;
+    elapsedSeconds?: number;
+    etaSeconds?: number | null;
+    updatedAt?: string;
+    pauseState?: string;
+    lifecycleStatus?: string;
+    runId?: string;
+    batchId?: string;
+    reasonCode?: string;
+    nextGate?: string;
+  };
+  runnerAlive?: boolean | null;
+  canCancel?: boolean;
+  logUpdatedAt?: string | null;
 }
 
 export interface QuantJobTypeInfo {
   label: string;
   allowedParams: string[];
+}
+
+export const QUANT_API_CONTRACT_VERSION = 'quant-workbench-v2';
+
+export interface QuantApiContract {
+  version: string;
+  backendBuildId: string;
+  backendStartedAt: string;
+}
+
+export interface QuantJobTypesCatalog {
+  availableJobTypes: Record<string, QuantJobTypeInfo>;
+  apiContract: QuantApiContract;
 }
 
 export interface QuantMlflowStatus {
@@ -49,6 +83,7 @@ export interface QuantMlflowStatus {
 export type QuantExternalServiceStatus = QuantMlflowStatus;
 
 export interface QuantStatus {
+  apiContract?: QuantApiContract;
   availableJobTypes: Record<string, QuantJobTypeInfo>;
   activeCount: number;
   latestJobs: Record<string, QuantJob>;
@@ -58,6 +93,7 @@ export interface QuantStatus {
   trainingReadiness?: ResearchTrainingReadiness;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
+  providerQuality?: Record<string, ResearchProviderQuality>;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
   qlibPredictions?: ResearchQlibPredictions | null;
@@ -72,6 +108,10 @@ export interface QuantStatus {
 export interface QuantJobListResponse {
   total: number;
   items: QuantJob[];
+}
+
+export interface QuantStatusOptions {
+  includeResearch?: boolean;
 }
 
 export interface QuantJobLog {
@@ -92,6 +132,15 @@ function convertJobTypeInfo(data: unknown): QuantJobTypeInfo {
   return toCamelCase<QuantJobTypeInfo>(data);
 }
 
+function convertApiContract(data: unknown): QuantApiContract {
+  const contract = toCamelCase<Partial<QuantApiContract>>(data);
+  return {
+    version: typeof contract.version === 'string' ? contract.version : '',
+    backendBuildId: typeof contract.backendBuildId === 'string' ? contract.backendBuildId : '',
+    backendStartedAt: typeof contract.backendStartedAt === 'string' ? contract.backendStartedAt : '',
+  };
+}
+
 function convertRecordValues<T>(data: unknown, converter: (value: unknown) => T): Record<string, T> {
   if (!data || typeof data !== 'object') {
     return {};
@@ -104,6 +153,7 @@ function convertRecordValues<T>(data: unknown, converter: (value: unknown) => T)
 function convertStatus(data: Record<string, unknown>): QuantStatus {
   const camel = toCamelCase<Partial<QuantStatus>>(data);
   return {
+    apiContract: data.api_contract ? convertApiContract(data.api_contract) : undefined,
     availableJobTypes: convertRecordValues(data.available_job_types, convertJobTypeInfo),
     activeCount: Number(data.active_count || 0),
     latestJobs: convertRecordValues(data.latest_jobs, convertJob),
@@ -113,6 +163,7 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     trainingReadiness: camel.trainingReadiness,
     dataSources: Array.isArray(camel.dataSources) ? camel.dataSources : [],
     qlibProvider: camel.qlibProvider ?? null,
+    providerQuality: camel.providerQuality ?? {},
     latestTraining: camel.latestTraining ?? null,
     cashControlBacktest: camel.cashControlBacktest ?? null,
     qlibPredictions: camel.qlibPredictions ?? null,
@@ -135,13 +186,22 @@ export function parseQuantJobStreamEvent(data: string): QuantJob[] {
 }
 
 export const quantApi = {
-  async getJobTypes(): Promise<Record<string, QuantJobTypeInfo>> {
+  async getJobTypes(): Promise<QuantJobTypesCatalog> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/quant/job-types');
-    return convertRecordValues(response.data.available_job_types, convertJobTypeInfo);
+    return {
+      availableJobTypes: convertRecordValues(response.data.available_job_types, convertJobTypeInfo),
+      apiContract: convertApiContract(response.data.api_contract),
+    };
   },
 
-  async getStatus(): Promise<QuantStatus> {
-    const response = await apiClient.get<Record<string, unknown>>('/api/v1/quant/status');
+  async getStatus(options: QuantStatusOptions = {}): Promise<QuantStatus> {
+    const requestConfig = options.includeResearch === false
+      ? { params: { include_research: false } }
+      : undefined;
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/quant/status',
+      requestConfig,
+    );
     return convertStatus(response.data);
   },
 

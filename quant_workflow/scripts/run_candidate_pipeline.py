@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -47,6 +49,7 @@ REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
 DEFAULT_SPEC_PATH = CONFIGS_DIR / "candidate_pipeline.yaml"
 TRAIN_SCRIPT = SCRIPT_DIR / "train_baseline_lgb.py"
+MAX_PICKLE_BYTES = 512 * 1024 * 1024
 ALLOWED_MODEL_MODULES = {
     "qlib.contrib.model.linear",
     "qlib.contrib.model.gbdt",
@@ -77,6 +80,7 @@ MODEL_DEPENDENCIES = {
     "catboost": "catboost",
 }
 TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _finite_float(value: Any, default: float = float("nan")) -> float:
@@ -394,7 +398,8 @@ def load_market_data(provider_uri: Path, start: str, end: str) -> pd.DataFrame:
     for days in (20, 60, 120, 200):
         market[f"ma{days}"] = market["close"].rolling(days).mean()
         market[f"trend_{days}"] = (market["close"] > market[f"ma{days}"]).astype(float)
-    market["volatility_20"] = market["benchmark_return"].rolling(20).std() * math.sqrt(252)
+    historical_return = pd.to_numeric(market["close"], errors="coerce").pct_change(fill_method=None)
+    market["volatility_20"] = historical_return.rolling(20).std() * math.sqrt(252)
     market["vol_percentile"] = market["volatility_20"].rolling(120).rank(pct=True)
     return market
 
@@ -431,6 +436,16 @@ def _load_artifacts(
         name: _artifact_path(info, name, mlruns_dir=mlruns_dir)
         for name in ("pred.pkl", "label.pkl")
     }
+    artifact_bytes: dict[str, bytes] = {}
+    for name, path in paths.items():
+        try:
+            with path.open("rb") as handle:
+                payload = handle.read(MAX_PICKLE_BYTES + 1)
+        except OSError as exc:
+            raise RuntimeError(f"Candidate artifact cannot be read: {name}") from exc
+        if len(payload) > MAX_PICKLE_BYTES:
+            raise RuntimeError(f"Candidate artifact is too large: {name}")
+        artifact_bytes[name] = payload
     try:
         for name, path in paths.items():
             provenance = validate_file_store_run_artifact(
@@ -445,9 +460,17 @@ def _load_artifacts(
                     provenance.get("provider_identity"),
                     expected_provider_identity,
                 )
+            loaded_sha256 = hashlib.sha256(artifact_bytes[name]).hexdigest()
+            if loaded_sha256 != str(provenance.get("artifact_sha256") or ""):
+                raise RunProvenanceError(
+                    f"{name} changed while its provenance was being verified"
+                )
     except RunProvenanceError as exc:
         raise RuntimeError(f"Candidate artifact provenance is invalid: {exc}") from exc
-    return pd.read_pickle(paths["pred.pkl"]), pd.read_pickle(paths["label.pkl"])
+    return (
+        pd.read_pickle(io.BytesIO(artifact_bytes["pred.pkl"])),
+        pd.read_pickle(io.BytesIO(artifact_bytes["label.pkl"])),
+    )
 
 
 def _tag_candidate_run(info: dict[str, Any], batch_id: str, model_id: str) -> None:
@@ -533,6 +556,8 @@ def _training_command(
         "--provider",
         provider,
         "--no-publish-latest",
+        "--result-scope",
+        "candidate_child",
         "--result-output",
         str(result_output),
         "--provider-identity-json",
@@ -562,6 +587,38 @@ def _require_provider_identity(
         raise RuntimeError(
             "Candidate model used a different immutable provider than the batch snapshot"
         )
+
+
+def _backtest_eligibility(
+    info: Mapping[str, Any],
+    provider: Mapping[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    missing: list[str] = []
+    if dry_run:
+        missing.append("synthetic_dry_run")
+    if not info.get("run_id"):
+        missing.append("run_id")
+    if not info.get("experiment_id"):
+        missing.append("experiment_id")
+    artifact_hashes = info.get("artifact_sha256")
+    if not isinstance(artifact_hashes, Mapping) or any(
+        not SHA256_RE.fullmatch(str(artifact_hashes.get(name) or ""))
+        for name in ("pred.pkl", "label.pkl")
+    ):
+        missing.append("replayable_predictions")
+    if (
+        provider.get("provider_contract") != "immutable_snapshot_v2"
+        or not provider.get("dataset_id")
+        or not provider.get("snapshot_id")
+        or any(
+            not SHA256_RE.fullmatch(str(provider.get(field) or ""))
+            for field in ("manifest_sha256", "content_sha256")
+        )
+    ):
+        missing.append("provider_snapshot")
+    return {"eligible": not missing, "missing": missing}
 
 
 def _run_model_training(
@@ -649,6 +706,7 @@ def _strategy_rows(
                     "model_id": model["id"],
                     "strategy_id": strategy["id"],
                     "strategy_label": strategy.get("label") or strategy["id"],
+                    "strategy_config": kwargs,
                     "selection": evaluate_period(
                         pred,
                         label,
@@ -743,9 +801,26 @@ def _dry_run_artifacts(models: list[dict[str, Any]]) -> tuple[dict[str, Any], pd
     }
 
 
-def _progress(output_dir: Path, batch_id: str, stage: str, completed: int, total: int, current: str = "") -> None:
+def _report_namespace(output_dir: Path, *, dry_run: bool) -> tuple[Path, str]:
+    if dry_run:
+        return output_dir / "test_runs" / "candidate_pipeline", "candidate_pipeline_test"
+    return output_dir, "candidate_pipeline"
+
+
+def _progress(
+    output_dir: Path,
+    batch_id: str,
+    stage: str,
+    completed: int,
+    total: int,
+    current: str = "",
+    *,
+    dry_run: bool = False,
+) -> None:
+    target_dir, prefix = _report_namespace(output_dir, dry_run=dry_run)
     payload = {
         "batch_id": batch_id,
+        "dry_run": dry_run,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "stage": stage,
         "completed": completed,
@@ -753,7 +828,7 @@ def _progress(output_dir: Path, batch_id: str, stage: str, completed: int, total
         "current": current,
     }
     _atomic_write(
-        output_dir / "candidate_pipeline_progress_latest.json",
+        target_dir / f"{prefix}_progress_latest.json",
         json.dumps(payload, ensure_ascii=False, indent=2),
     )
 
@@ -762,6 +837,17 @@ def _report_markdown(payload: dict[str, Any]) -> str:
     lines = [
         "# 五个选股模型候选流程报告",
         "",
+    ]
+    if payload.get("dry_run"):
+        lines.extend(
+            [
+                "> **测试数据，不可用于研究或交易。** 本报告来自合成小样本预演，",
+                "> 没有真实 Run ID、预测产物或 MLflow 训练记录。",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         f"- 状态：`{payload['status']}`",
         f"- 批次：`{payload['batch_id']}`",
         f"- 数据：`{payload['provider']}`，最新可验证标签日 `{payload['latest_label_day']}`",
@@ -777,7 +863,8 @@ def _report_markdown(payload: dict[str, Any]) -> str:
         "",
         "| 模型 | 状态 | 开发期IR | 开发期超额年化 | 开发期RankIC | 留出期IR | 留出期超额年化 |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
+        ]
+    )
     for item in payload["models"]:
         selection = item.get("selection") or {}
         holdout = item.get("holdout") or {}
@@ -830,10 +917,13 @@ def _report_markdown(payload: dict[str, Any]) -> str:
 def write_reports(payload: dict[str, Any], output_dir: Path, timestamp: str) -> dict[str, str]:
     json_text = json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
     markdown = _report_markdown(payload)
-    timestamped_json = output_dir / f"candidate_pipeline_{timestamp}.json"
-    timestamped_md = output_dir / f"candidate_pipeline_{timestamp}.md"
-    latest_json = output_dir / "candidate_pipeline_latest.json"
-    latest_md = output_dir / "candidate_pipeline_latest.md"
+    target_dir, prefix = _report_namespace(
+        output_dir, dry_run=bool(payload.get("dry_run"))
+    )
+    timestamped_json = target_dir / f"{prefix}_{timestamp}.json"
+    timestamped_md = target_dir / f"{prefix}_{timestamp}.md"
+    latest_json = target_dir / f"{prefix}_latest.json"
+    latest_md = target_dir / f"{prefix}_latest.md"
     for path, content in (
         (timestamped_json, json_text),
         (timestamped_md, markdown),
@@ -896,7 +986,14 @@ def run_pipeline(
     )
     experiment_name = f"candidate_models_alpha158_{timestamp}"
     config_dir = output_dir / "runtime_configs" / batch_id
-    _progress(output_dir, batch_id, "models", 0, len(spec["models"]))
+    _progress(
+        output_dir,
+        batch_id,
+        "models",
+        0,
+        len(spec["models"]),
+        dry_run=dry_run,
+    )
 
     for index, model in enumerate(spec["models"], start=1):
         model_id = str(model["id"])
@@ -911,6 +1008,7 @@ def run_pipeline(
             index - 1,
             len(spec["models"]),
             model_id,
+            dry_run=dry_run,
         )
         try:
             if dry_run:
@@ -965,6 +1063,11 @@ def run_pipeline(
                     "experiment_id": info.get("experiment_id"),
                     "experiment_name": info.get("experiment_name"),
                     "artifact_sha256": info.get("artifact_sha256") or {},
+                    "backtest_eligibility": _backtest_eligibility(
+                        info,
+                        locked_provider_identity,
+                        dry_run=dry_run,
+                    ),
                     "qlib_metrics": info.get("metrics") or {},
                     "selection": selection,
                     "holdout": holdout,
@@ -992,6 +1095,7 @@ def run_pipeline(
             index,
             len(spec["models"]),
             model_id,
+            dry_run=dry_run,
         )
 
     selected_models = rank_models(candidates, spec["top_models"])
@@ -1062,6 +1166,39 @@ def run_pipeline(
             "auto_order": False,
         },
     }
+    replay_contract = {
+        "contract_version": 2,
+        "replay_engine": "dsa_optimized_strategy",
+        "replay_capability": "custom_only",
+        "exact_strategy_ids": [],
+        "source_config_sha256": hashlib.sha256(
+            Path(spec_path).read_bytes()
+        ).hexdigest(),
+        "periods": dict(payload["periods"]),
+        "original_parameters": {
+            "start_date": selection_period[0],
+            "end_date": selection_period[1],
+            "topk": int(spec["topk"]),
+            "cost_bps": float(spec["cost_bps"]),
+        },
+        "strategies": [
+            {
+                "id": str(item["id"]),
+                "label": str(item.get("label") or item["id"]),
+                "config": dict(item.get("kwargs") or {}),
+            }
+            for item in spec["strategies"]
+        ],
+    }
+    replay_contract["config_hash"] = hashlib.sha256(
+        json.dumps(
+            replay_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["backtest_contract"] = replay_contract
     payload["artifacts"] = write_reports(payload, output_dir, timestamp)
     _progress(
         output_dir,
@@ -1069,6 +1206,7 @@ def run_pipeline(
         "completed" if status == "completed" else "failed",
         5,
         5,
+        dry_run=dry_run,
     )
     return payload
 

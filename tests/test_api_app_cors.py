@@ -379,6 +379,19 @@ class AppCorsConfigTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"], "csrf_forbidden")
 
+    def test_missing_origin_and_referer_backtest_mutation_is_rejected_even_when_cors_is_open(self):
+        with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
+             patch("api.app.is_auth_enabled", return_value=False), \
+             patch("api.middlewares.auth.is_auth_enabled", return_value=False):
+            client = TestClient(self._build_app())
+            resp = client.post(
+                "/api/v1/backtest/strategy/trained",
+                json={},
+            )
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "csrf_forbidden")
+
     def test_local_client_header_does_not_allow_no_origin_mutation(self):
         for header_value in ("true", "1", "yes"):
             with self.subTest(header_value=header_value):

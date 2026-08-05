@@ -732,6 +732,18 @@ test('main workbench routes render in Chinese without runtime errors or horizont
   }
 });
 
+test('workflow page keeps wide training results contained at mobile width', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openWorkbench(page, '/workflow');
+  await expect(page.getByRole('heading', { name: '选股模型训练' })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId('workflow-job-train_baseline_lgb')).toBeVisible({ timeout: 15_000 });
+  const results = page.getByRole('region', { name: '可回测的选股模型与交易策略' });
+  await expect(results).toBeVisible({ timeout: 15_000 });
+  await expect(results.getByRole('table')).toBeVisible({ timeout: 15_000 });
+
+  await expectNoHorizontalOverflow(page);
+});
+
 test('research page shows capability acceptance matrix and deferred external-tool boundaries', async ({ page }) => {
   const consoleWatch = watchConsole(page);
   try {
@@ -1071,11 +1083,12 @@ test('data page can launch a sampled data quality report from the browser', asyn
     await waitForJobToFinish(page, job.job_id, 120_000);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText(job.job_id)).toBeVisible({ timeout: 15_000 });
-    const previewButton = page.getByRole('button', { name: /预览 data_quality_report_latest\.md/ });
+    const previewButton = page.getByRole('button', { name: /预览 data_quality_report_sampled_latest\.md/ });
     await expect(previewButton).toBeVisible({ timeout: 15_000 });
     await previewButton.click();
     await expect(page.locator('pre')).toContainText('A-Share Data Quality Report', { timeout: 15_000 });
     await expect(page.locator('pre')).toContainText('Qlib Provider', { timeout: 15_000 });
+    await expect(page.locator('pre')).toContainText('Sampled report cannot authorize training', { timeout: 15_000 });
 
     expect(consoleWatch.errors).toEqual([]);
   } finally {
@@ -1525,12 +1538,15 @@ test('data page can cancel a running quant job from the browser', async ({ page 
     await expect(page.getByText(runningJob.job_id)).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('button', { name: '取消 构建原生 cleaned Qlib V2 快照' })).toBeVisible({ timeout: 15_000 });
 
+    await page.getByRole('button', { name: '取消 构建原生 cleaned Qlib V2 快照' }).click();
+    await expect(page.getByRole('heading', { name: '确认取消任务' })).toBeVisible();
+
     const cancelResponsePromise = page.waitForResponse(
       (response) => response.url().includes(`/api/v1/quant/jobs/${runningJob.job_id}/cancel`)
         && response.request().method() === 'POST',
       { timeout: 15_000 },
     );
-    await page.getByRole('button', { name: '取消 构建原生 cleaned Qlib V2 快照' }).click();
+    await page.getByRole('button', { name: '确认取消', exact: true }).click();
     const cancelResponse = await cancelResponsePromise;
     expect(cancelResponse.ok()).toBeTruthy();
     const cancelled = await cancelResponse.json() as { status?: string; error?: string };
@@ -1614,6 +1630,106 @@ test('backtest page can run a script strategy and switch among current strategy 
     await expect(page.getByRole('heading', { name: '选股模型与交易策略' })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByLabel('选股模型')).toBeVisible();
     await expect(page.getByLabel('交易策略')).toBeVisible();
+    expect(consoleWatch.errors).toEqual([]);
+  } finally {
+    consoleWatch.stop();
+  }
+});
+
+test('mounted trained backtest panel follows same-route Run query changes without a reload', async ({ page }) => {
+  const firstRunId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const secondRunId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const catalogRun = (runId: string, modelId: string, modelLabel: string, strategyId: string, strategyLabel: string) => ({
+    run_id: runId,
+    model_id: modelId,
+    model_label: modelLabel,
+    source_type: 'baseline',
+    generated_at: '2026-08-04T12:00:00+08:00',
+    provider: 'canonical',
+    provider_identity: {
+      provider_contract: 'quant_data_native_v2',
+      dataset_id: 'qlib_ashare_v2',
+      snapshot_id: `snapshot-${modelId}`,
+      content_sha256: 'c'.repeat(64),
+      manifest_sha256: 'd'.repeat(64),
+    },
+    periods: { test: ['2024-01-01', '2025-12-31'] },
+    original_parameters: {
+      strategy_id: strategyId,
+      start_date: '2024-01-01',
+      end_date: '2025-12-31',
+      topk: 50,
+      cost_bps: 15,
+    },
+    strategies: [{
+      id: strategyId,
+      label: strategyLabel,
+      config: { rebalance_freq: 1 },
+      exact_replay_available: true,
+      replay_engine: 'qlib_portana',
+    }],
+    config_hash: 'e'.repeat(64),
+    contract_version: 2,
+    exact_replay_available: true,
+    custom_replay_available: true,
+    replay_capability: 'exact_and_custom',
+  });
+
+  await page.route('**/api/v1/backtest/strategy/trained/catalog', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'completed',
+        generated_at: '2026-08-04T12:00:00+08:00',
+        runs: [
+          catalogRun(firstRunId, 'lightgbm', 'LightGBM', 'baseline_daily', '每日 TopK 等权基线'),
+          catalogRun(secondRunId, 'ridge', 'Ridge', 'low_turnover_weekly', '每周低换手'),
+        ],
+      }),
+    });
+  });
+  await page.route('**/api/v1/research/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        generated_at: '2026-08-04T12:00:00+08:00',
+        trainable: false,
+        training_readiness: { status: 'blocked', summary: 'E2E route-query fixture' },
+        data_sources: [],
+      }),
+    });
+  });
+
+  const consoleWatch = watchConsole(page);
+  try {
+    await openWorkbench(
+      page,
+      `/backtest?tab=trained&runId=${firstRunId}&modelId=lightgbm&strategyId=baseline_daily`,
+    );
+    await expect(page.getByLabel('选股模型', { exact: true })).toHaveValue(`${firstRunId}:lightgbm`);
+    await expect(page.getByLabel('交易策略', { exact: true })).toHaveValue('baseline_daily');
+    const marker = await page.evaluate(() => {
+      const value = `mounted-${Date.now()}`;
+      (window as Window & { __trainedPanelMarker?: string }).__trainedPanelMarker = value;
+      return value;
+    });
+
+    await page.evaluate(({ runId }) => {
+      window.history.pushState(
+        {},
+        '',
+        `/backtest?tab=trained&runId=${runId}&modelId=ridge&strategyId=low_turnover_weekly`,
+      );
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }, { runId: secondRunId });
+
+    await expect(page.getByLabel('选股模型', { exact: true })).toHaveValue(`${secondRunId}:ridge`);
+    await expect(page.getByLabel('交易策略', { exact: true })).toHaveValue('low_turnover_weekly');
+    await expect.poll(() => page.evaluate(() => (
+      (window as Window & { __trainedPanelMarker?: string }).__trainedPanelMarker
+    ))).toBe(marker);
     expect(consoleWatch.errors).toEqual([]);
   } finally {
     consoleWatch.stop();

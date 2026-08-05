@@ -77,11 +77,28 @@ const TrainedStrategyBacktestResults: React.FC<Props> = ({ language, report }) =
           <p className="mt-1 text-xs text-secondary-text">
             {report.period.startDate} - {report.period.endDate} · {metrics.days} {zh ? '个交易日' : 'trading days'}
           </p>
+          <p className="mt-1 text-xs text-secondary-text">
+            {zh ? '回测引擎：' : 'Backtest engine: '}
+            {report.replayEngine === 'qlib_portana'
+              ? (zh ? 'Qlib 原始组合回测' : 'Original Qlib portfolio backtest')
+              : (zh ? 'DSA 冻结策略回测' : 'Frozen DSA strategy backtest')}
+          </p>
         </div>
         <span className="border border-border/70 bg-card/60 px-2 py-1 font-mono text-xs text-secondary-text">
           {report.status}
         </span>
       </div>
+
+      {report.exactMetricValidation?.status === 'pass' ? (
+        <div className="flex items-start gap-2 border border-emerald-500/25 bg-emerald-500/8 px-3 py-2 text-xs text-emerald-700">
+          <CheckCircle2 className="mt-0.5 h-4 w-4 flex-none" />
+          <span>
+            {zh
+              ? `重放的年化超额、信息比率和超额回撤与训练 Run 保存值一致（最大绝对误差 ${report.exactMetricValidation.maxAbsDifference.toExponential(2)}）。`
+              : `Annual excess return, information ratio, and excess drawdown match the saved training Run (maximum absolute difference ${report.exactMetricValidation.maxAbsDifference.toExponential(2)}).`}
+          </span>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-px border border-border/70 bg-border/70 sm:grid-cols-3 xl:grid-cols-5">
         {cards.map(([label, value, className]) => (

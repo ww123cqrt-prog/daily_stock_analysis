@@ -197,6 +197,7 @@ describe('backtestApi', () => {
       runId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       modelId: 'xgboost',
       strategyId: 'low_turnover_weekly',
+      replayMode: 'custom',
       startDate: '2024-01-01',
       endDate: '2025-12-31',
       topk: 50,
@@ -204,14 +205,72 @@ describe('backtestApi', () => {
     });
 
     expect(result.metrics.annualExcessReturn).toBe(0.12);
-    expect(post).toHaveBeenCalledWith('/api/v1/backtest/strategy/trained', {
-      run_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      model_id: 'xgboost',
-      strategy_id: 'low_turnover_weekly',
-      start_date: '2024-01-01',
-      end_date: '2025-12-31',
-      topk: 50,
-      cost_bps: 15,
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/backtest/strategy/trained',
+      {
+        run_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        model_id: 'xgboost',
+        strategy_id: 'low_turnover_weekly',
+        replay_mode: 'custom',
+        start_date: '2024-01-01',
+        end_date: '2025-12-31',
+        topk: 50,
+        cost_bps: 15,
+      },
+      { timeout: 120000 },
+    );
+  });
+
+  it('loads the immutable historical trained-run catalog', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        status: 'completed',
+        generated_at: '2026-08-02T12:00:00+08:00',
+        runs: [{
+          run_id: 'a'.repeat(32),
+          model_id: 'xgboost',
+          model_label: 'XGBoost',
+          source_type: 'candidate',
+          exact_replay_available: true,
+          custom_replay_available: true,
+          strategies: [],
+        }],
+      },
     });
+
+    const result = await backtestApi.getTrainedStrategyCatalog();
+
+    expect(result.runs[0].runId).toBe('a'.repeat(32));
+    expect(result.runs[0].exactReplayAvailable).toBe(true);
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/strategy/trained/catalog');
+  });
+
+  it('submits exact replay without browser-controlled backtest parameters', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        status: 'completed',
+        replay_mode: 'exact',
+        metrics: {},
+        equity_curve: [],
+      },
+    });
+
+    await backtestApi.runTrainedStrategy({
+      runId: 'a'.repeat(32),
+      modelId: 'xgboost',
+      strategyId: 'low_turnover_weekly',
+      replayMode: 'exact',
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/backtest/strategy/trained',
+      {
+        run_id: 'a'.repeat(32),
+        model_id: 'xgboost',
+        strategy_id: 'low_turnover_weekly',
+        replay_mode: 'exact',
+      },
+      { timeout: 120000 },
+    );
   });
 });

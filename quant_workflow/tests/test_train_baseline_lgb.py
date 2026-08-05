@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import yaml
 
@@ -22,6 +22,152 @@ def load_module():
 
 
 class TrainBaselineLgbTest(unittest.TestCase):
+    def test_immutable_training_registry_rejects_existing_content_mismatch(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            info = {
+                "run_id": "run-immutable-1",
+                "status": "completed",
+                "provider_identity": {"snapshot_id": "native-v2"},
+            }
+
+            path = module.write_immutable_training_run(info, report_dir=report_dir)
+            self.assertEqual(
+                module.write_immutable_training_run(info, report_dir=report_dir),
+                path,
+            )
+            tampered = json.loads(path.read_text(encoding="utf-8"))
+            tampered["status"] = "failed"
+            path.write_text(json.dumps(tampered), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "immutable_training_run_mismatch"
+            ):
+                module.write_immutable_training_run(info, report_dir=report_dir)
+
+    def test_immutable_training_registry_rejects_unsafe_existing_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            registry = report_dir / "training_runs"
+            registry.mkdir()
+            info = {"run_id": "unsafe-run", "status": "completed"}
+            path = registry / "unsafe-run.json"
+
+            target = report_dir / "target.json"
+            target.write_text(json.dumps(info), encoding="utf-8")
+            path.symlink_to(target)
+            with self.assertRaisesRegex(
+                ValueError, "immutable_training_run_mismatch"
+            ):
+                module.write_immutable_training_run(info, report_dir=report_dir)
+
+            path.unlink()
+            path.write_text("not-json", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "immutable_training_run_mismatch"
+            ):
+                module.write_immutable_training_run(info, report_dir=report_dir)
+
+            path.write_bytes(b"x" * (module.MAX_IMMUTABLE_TRAINING_RUN_BYTES + 1))
+            with self.assertRaisesRegex(
+                ValueError, "immutable_training_run_mismatch"
+            ):
+                module.write_immutable_training_run(info, report_dir=report_dir)
+
+    def test_build_training_replay_contract_freezes_original_parameters(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "baseline.yaml"
+            runtime = root / "runtime.yaml"
+            strategies = root / "candidate.yaml"
+            source.write_text("task: {}\n", encoding="utf-8")
+            runtime.write_text(
+                yaml.safe_dump(
+                    {
+                        "task": {
+                            "dataset": {
+                                "kwargs": {
+                                    "segments": {
+                                        "train": ["2020-01-02", "2022-12-31"],
+                                        "valid": ["2023-01-01", "2023-12-31"],
+                                        "test": ["2024-01-01", "2026-07-10"],
+                                    }
+                                }
+                            },
+                            "record": [
+                                {
+                                    "class": "PortAnaRecord",
+                                    "kwargs": {
+                                        "config": {
+                                            "strategy": {
+                                                "kwargs": {"topk": 50, "n_drop": 5}
+                                            },
+                                            "backtest": {
+                                                "start_time": "2024-01-02",
+                                                "end_time": "2026-07-10",
+                                                "benchmark": "SH000300",
+                                                "exchange_kwargs": {
+                                                    "open_cost": 0.0005,
+                                                    "close_cost": 0.0015,
+                                                },
+                                            },
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            strategies.write_text(
+                yaml.safe_dump(
+                    {
+                        "cost_bps": 15,
+                        "strategies": [
+                            {
+                                "id": "baseline_daily",
+                                "label": "每日 TopK 等权基线",
+                                "kwargs": {
+                                    "rebalance_freq": 1,
+                                    "turnover_cap": 1.0,
+                                    "max_drawdown_stop": 0.0,
+                                },
+                            }
+                        ],
+                    },
+                    allow_unicode=True,
+                ),
+                encoding="utf-8",
+            )
+
+            contract = module.build_training_replay_contract(
+                source_config=source,
+                runtime_config=runtime,
+                strategy_config=strategies,
+            )
+
+        self.assertEqual(contract["contract_version"], 2)
+        self.assertEqual(contract["replay_engine"], "qlib_portana")
+        self.assertEqual(contract["exact_strategy_ids"], ["baseline_daily"])
+        self.assertEqual(contract["original_parameters"], {
+            "strategy_id": "baseline_daily",
+            "start_date": "2024-01-02",
+            "end_date": "2026-07-10",
+            "topk": 50,
+            "cost_bps": 20.0,
+        })
+        self.assertEqual(contract["periods"]["training"], ["2020-01-02", "2022-12-31"])
+        self.assertEqual(contract["strategies"][0]["config"]["rebalance_freq"], 1)
+        self.assertEqual(contract["qlib_backtest_assumptions"]["n_drop"], 5)
+        self.assertEqual(contract["qlib_backtest_assumptions"]["open_cost"], 0.0005)
+        self.assertEqual(contract["qlib_backtest_assumptions"]["close_cost"], 0.0015)
+        self.assertRegex(contract["config_hash"], r"^[0-9a-f]{64}$")
+
     def test_approved_identity_resolves_exact_snapshot_without_reading_latest(self):
         module = load_module()
         pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
@@ -209,6 +355,65 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(task["record"][1]["kwargs"]["config"]["backtest"]["end_time"], "2026-07-08")
         self.assertEqual(source_payload["task"]["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"], "2026-07-03")
 
+    def test_equivalence_runtime_config_preserves_registered_fixed_dates(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            provider = base / "provider"
+            (provider / "calendars").mkdir(parents=True)
+            (provider / "calendars" / "day.txt").write_text(
+                "2026-07-23\n2026-07-24\n",
+                encoding="utf-8",
+            )
+            source = base / "equivalence.yaml"
+            source.write_text(
+                yaml.safe_dump(
+                    {
+                        "qlib_init": {"provider_uri": "placeholder"},
+                        "task": {
+                            "dataset": {
+                                "kwargs": {
+                                    "handler": {"kwargs": {"end_time": "2024-12-31"}},
+                                    "segments": {
+                                        "test": ["2024-10-08", "2024-12-31"]
+                                    },
+                                }
+                            },
+                            "record": [
+                                {
+                                    "class": "PortAnaRecord",
+                                    "kwargs": {
+                                        "config": {
+                                            "backtest": {
+                                                "start_time": "2024-10-08",
+                                                "end_time": "2024-12-31",
+                                            }
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            runtime = module.write_runtime_config_with_provider(
+                source,
+                provider,
+                "canonical",
+                base / "runtime",
+                extend_dates_to_provider_latest=False,
+            )
+            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
+
+        dataset = payload["task"]["dataset"]["kwargs"]
+        backtest = payload["task"]["record"][0]["kwargs"]["config"]["backtest"]
+        self.assertEqual(dataset["handler"]["kwargs"]["end_time"], "2024-12-31")
+        self.assertEqual(dataset["segments"]["test"], ["2024-10-08", "2024-12-31"])
+        self.assertEqual(backtest["end_time"], "2024-12-31")
+
     def test_runtime_config_keeps_portana_config_under_qlib_kwargs(self):
         module = load_module()
         payload = {
@@ -288,13 +493,21 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 )
 
             (artifacts / "label.pkl").write_bytes(b"label")
+            with self.assertRaisesRegex(RuntimeError, "task"):
+                module.require_local_training_artifacts(
+                    "run-1",
+                    "123",
+                    mlruns_dir=mlruns,
+                )
+
+            (artifacts / "task").write_bytes(b"task")
             local = module.require_local_training_artifacts(
                 "run-1",
                 "123",
                 mlruns_dir=mlruns,
             )
 
-        self.assertEqual(local, ["label.pkl", "pred.pkl"])
+        self.assertEqual(local, ["label.pkl", "pred.pkl", "task"])
 
     def test_local_run_artifacts_returns_empty_for_missing_run(self):
         module = load_module()
@@ -310,6 +523,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
         expected = {
             "pred.pkl": "a" * 64,
             "label.pkl": "b" * 64,
+            "task": "c" * 64,
         }
 
         with patch.object(
@@ -559,10 +773,152 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
+            immutable_run = json.loads(
+                (report_dir / "training_runs" / "smoke-run.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "immutable_training_run_mismatch"
+            ):
+                module.record_training_result(
+                    {
+                        "run_id": "smoke-run",
+                        "status": "completed",
+                        "experiment_name": "must-not-overwrite",
+                    },
+                    publish_latest=False,
+                    report_dir=report_dir,
+                )
+            immutable_after_duplicate = json.loads(
+                (report_dir / "training_runs" / "smoke-run.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         self.assertEqual(latest_payload["run_id"], "formal-run")
         self.assertEqual(isolated_payload["run_id"], "smoke-run")
         self.assertEqual(history[0]["run_id"], "smoke-run")
+        self.assertEqual(immutable_run["experiment_name"], "native_v2_smoke")
+        self.assertEqual(immutable_after_duplicate, immutable_run)
+
+    def test_training_equivalence_scope_never_enters_official_result_indexes(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            latest = report_dir / "latest_training_result.json"
+            latest.write_text('{"run_id":"formal-run"}\n', encoding="utf-8")
+
+            result_path = module.record_training_result(
+                {
+                    "run_id": "equivalence-web-run",
+                    "status": "completed",
+                    "experiment_name": "dsa_training_equivalence",
+                },
+                publish_latest=False,
+                report_dir=report_dir,
+                result_scope="training_equivalence",
+                equivalence_channel="web",
+            )
+
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            latest_web = json.loads(
+                (
+                    report_dir
+                    / "test_runs"
+                    / "training_equivalence"
+                    / "latest_web.json"
+                ).read_text(encoding="utf-8")
+            )
+            formal_latest = json.loads(latest.read_text(encoding="utf-8"))
+            official_registry_exists = (report_dir / "training_runs").exists()
+            experiment_runs_exists = (report_dir / "experiment_runs.jsonl").exists()
+            experiment_log_exists = (report_dir / "experiment_log.md").exists()
+
+        self.assertEqual(result_path.name, "training_result.json")
+        self.assertEqual(payload["result_scope"], "training_equivalence")
+        self.assertTrue(payload["test_only"])
+        self.assertEqual(payload["equivalence_channel"], "web")
+        self.assertIn("不可用于研究或交易", payload["warning"])
+        self.assertEqual(latest_web["run_id"], "equivalence-web-run")
+        self.assertEqual(formal_latest["run_id"], "formal-run")
+        self.assertFalse(official_registry_exists)
+        self.assertFalse(experiment_runs_exists)
+        self.assertFalse(experiment_log_exists)
+
+    def test_training_equivalence_scope_rejects_official_latest_publication(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "cannot publish official latest"):
+                module.record_training_result(
+                    {
+                        "run_id": "equivalence-web-run",
+                        "status": "completed",
+                        "experiment_name": "dsa_training_equivalence",
+                    },
+                    publish_latest=True,
+                    report_dir=Path(temp_dir),
+                    result_scope="training_equivalence",
+                    equivalence_channel="web",
+                )
+
+    def test_candidate_child_scope_is_persisted_without_replacing_latest(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            latest = report_dir / "latest_training_result.json"
+            result_output = report_dir / "candidate" / "child-result.json"
+            latest.write_text('{"run_id":"formal-run"}\n', encoding="utf-8")
+
+            result_path = module.record_training_result(
+                {
+                    "run_id": "candidate-child-run",
+                    "status": "completed",
+                    "experiment_name": "candidate-models",
+                },
+                publish_latest=False,
+                report_dir=report_dir,
+                result_output=result_output,
+                result_scope="candidate_child",
+            )
+
+            isolated = json.loads(result_path.read_text(encoding="utf-8"))
+            immutable = json.loads(
+                (
+                    report_dir
+                    / "training_runs"
+                    / "candidate-child-run.json"
+                ).read_text(encoding="utf-8")
+            )
+            formal_latest = json.loads(latest.read_text(encoding="utf-8"))
+
+        self.assertEqual(isolated["result_scope"], "candidate_child")
+        self.assertEqual(immutable["result_scope"], "candidate_child")
+        self.assertEqual(formal_latest["run_id"], "formal-run")
+
+    def test_training_equivalence_config_is_bounded_and_deterministic(self):
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "baseline_lgb_equivalence.yaml"
+        )
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        model = payload["task"]["model"]["kwargs"]
+        handler = payload["task"]["dataset"]["kwargs"]["handler"]["kwargs"]
+        segments = payload["task"]["dataset"]["kwargs"]["segments"]
+
+        self.assertLessEqual(model["num_threads"], 4)
+        self.assertTrue(model["deterministic"])
+        self.assertEqual(model["seed"], 42)
+        self.assertEqual(model["feature_fraction_seed"], 42)
+        self.assertEqual(model["bagging_seed"], 42)
+        self.assertEqual(model["data_random_seed"], 42)
+        self.assertEqual(handler["start_time"], "2024-01-02")
+        self.assertEqual(handler["end_time"], "2024-12-31")
+        self.assertEqual(segments["train"], ["2024-01-02", "2024-06-28"])
+        self.assertEqual(segments["valid"], ["2024-07-01", "2024-09-30"])
+        self.assertEqual(segments["test"], ["2024-10-08", "2024-12-31"])
 
     def test_publication_forwards_isolated_result_output(self):
         module = load_module()
@@ -575,33 +931,60 @@ class TrainBaselineLgbTest(unittest.TestCase):
         }
         result_output = Path("/tmp/candidate-result.json")
 
-        with (
-            patch.object(
-                module,
-                "revalidate_provider_identity",
-                return_value=identity,
-                create=True,
-            ),
-            patch.object(module, "tag_run_with_provider"),
-            patch.object(module, "record_training_result") as record_result,
-        ):
-            module.publish_training_result(
-                {"run_id": "candidate-run", "status": "completed"},
-                provider="canonical",
-                provider_uri=Path("/tmp/native-v2"),
-                expected_provider_identity=identity,
-                source_config=Path("/tmp/source.yaml"),
-                runtime_config=Path("/tmp/runtime.yaml"),
-                publish_latest=False,
-                result_output=result_output,
-                client=object(),
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.yaml"
+            runtime = root / "runtime.yaml"
+            strategy = root / "candidate.yaml"
+            source.write_text("task: {}\n", encoding="utf-8")
+            runtime.write_text(
+                yaml.safe_dump({"task": {"dataset": {"kwargs": {"segments": {}}}, "record": []}}),
+                encoding="utf-8",
             )
+            strategy.write_text("cost_bps: 15\nstrategies: []\n", encoding="utf-8")
+            client = Mock()
+            with (
+                patch.object(
+                    module,
+                    "revalidate_provider_identity",
+                    return_value=identity,
+                    create=True,
+                ),
+                patch.object(module, "tag_run_with_provider"),
+                patch.object(module, "record_training_result") as record_result,
+                patch.object(module, "CANDIDATE_STRATEGY_CONFIG", strategy),
+            ):
+                module.publish_training_result(
+                    {"run_id": "candidate-run", "status": "completed"},
+                    provider="canonical",
+                    provider_uri=Path("/tmp/native-v2"),
+                    expected_provider_identity=identity,
+                    source_config=source,
+                    runtime_config=runtime,
+                    publish_latest=False,
+                    result_output=result_output,
+                    client=client,
+                    result_scope="candidate_child",
+                )
 
         record_result.assert_called_once()
         self.assertFalse(record_result.call_args.kwargs["publish_latest"])
         self.assertEqual(
             record_result.call_args.kwargs["result_output"],
             result_output,
+        )
+        self.assertEqual(
+            record_result.call_args.kwargs["result_scope"],
+            "candidate_child",
+        )
+        client.set_tag.assert_any_call(
+            "candidate-run",
+            "dsa.result_scope",
+            "candidate_child",
+        )
+        self.assertIn(
+            "replay_contract",
+            record_result.call_args.args[0],
         )
 
 

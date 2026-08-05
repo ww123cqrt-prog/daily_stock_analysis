@@ -2,6 +2,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -31,6 +32,43 @@ def write_prices(directory: Path, symbol: str, prices: list[float]) -> None:
 
 
 class ReportMarketRegimeTest(unittest.TestCase):
+    def test_main_does_not_resolve_default_snapshot_when_data_dir_is_explicit(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "market"
+            out_dir = root / "reports"
+            data_dir.mkdir()
+            write_prices(data_dir, "000001", [50 + index for index in range(80)])
+            write_prices(data_dir, "000002", [55 + index for index in range(80)])
+
+            with (
+                patch.object(
+                    module.sys,
+                    "argv",
+                    [
+                        "report_market_regime.py",
+                        "--data-dir",
+                        str(data_dir),
+                        "--out-dir",
+                        str(out_dir),
+                        "--lookback-days",
+                        "60",
+                        "--min-symbols",
+                        "2",
+                    ],
+                ),
+                patch.object(
+                    module,
+                    "ashare_qfq_bars_dir",
+                    side_effect=AssertionError("explicit data directory resolved the default snapshot"),
+                ) as resolve_default,
+            ):
+                exit_code = module.main()
+
+        self.assertEqual(exit_code, 0)
+        resolve_default.assert_not_called()
+
     def test_classifies_broad_decline_as_risk_off_with_high_cash(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

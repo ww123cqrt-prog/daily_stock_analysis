@@ -53,6 +53,46 @@ class _FakeSocket:
         return None
 
 
+def write_native_ashare_fixture(
+    data_root: Path,
+    *,
+    snapshot_id: str = "ashare-qfq-snapshot",
+) -> tuple[Path, dict[str, object]]:
+    from quant_workflow.scripts.quant_data_contract import (
+        filesystem_state_fingerprint,
+    )
+
+    dataset_id = "ashare_daily_qfq"
+    dataset_root = Path("parquet/ashare_1d/ashare_daily_qfq")
+    snapshot = data_root / dataset_root / "snapshots" / snapshot_id
+    bars = snapshot / "bars"
+    bars.mkdir(parents=True)
+    (bars / "600000.parquet").write_bytes(b"parquet-fixture")
+    manifest = {
+        "schema_version": 2,
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "data_kind": "daily_bars",
+        "role": "canonical",
+        "status": "ready",
+        "price_basis": "qfq",
+        "content_sha256": "a" * 64,
+    }
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    identity = {
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "content_sha256": manifest["content_sha256"],
+        "state_fingerprint": filesystem_state_fingerprint(snapshot),
+    }
+    return snapshot, identity
+
+
 class QuantJobsApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         from api.v1.endpoints.quant_jobs import (
@@ -206,12 +246,70 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         self.assertIn("report_data_quality", status_body["available_job_types"])
         self.assertEqual(
+            status_body["api_contract"]["version"], "quant-workbench-v2"
+        )
+        self.assertTrue(status_body["api_contract"]["backend_build_id"])
+        self.assertEqual(
             status_body["latest_jobs"]["report_data_quality"]["status"], "completed"
         )
         self.assertNotIn("command", status_body["latest_jobs"]["report_data_quality"])
         self.assertNotIn("cwd", status_body["latest_jobs"]["report_data_quality"])
         self.assertNotIn("log_path", status_body["latest_jobs"]["report_data_quality"])
         self.assertEqual(status_body["active_count"], 0)
+
+    def test_status_reads_job_snapshot_after_slow_research_enrichment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            job = QuantJob(
+                job_id="qj_status_refresh",
+                job_type="report_data_quality",
+                label="数据质量报告",
+                status="running",
+                params={},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-08-04T08:00:00+08:00",
+                started_at="2026-08-04T08:00:00+08:00",
+                updated_at="2026-08-04T08:00:00+08:00",
+                log_path=str(jobs_root / "qj_status_refresh" / "job.log"),
+            )
+            service._insert_job(job)
+            client = self._make_client(service)
+
+            async def fake_to_thread(fn, *args, **kwargs):
+                if fn.__name__ == "build_research_status_payload":
+                    await asyncio.sleep(0.01)
+                    service._update_job(
+                        job.job_id,
+                        status="completed",
+                        return_code=0,
+                        completed_at="2026-08-04T08:00:01+08:00",
+                        updated_at="2026-08-04T08:00:01+08:00",
+                    )
+                    return {"trainable": False, "training_readiness": {}}
+                if fn.__name__ == "_mlflow_status_payload":
+                    return {
+                        "url": "http://127.0.0.1:6006/",
+                        "status": "available",
+                        "role": "experiment_raw_records",
+                    }
+                if fn.__name__ == "get_status_snapshot":
+                    return service.get_status_snapshot()
+                return fn(*args, **kwargs)
+
+            with patch(
+                "api.v1.endpoints.quant_jobs.asyncio.to_thread",
+                side_effect=fake_to_thread,
+            ):
+                response = client.get("/api/v1/quant/status")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["active_count"], 0)
+        self.assertEqual(
+            body["latest_jobs"]["report_data_quality"]["status"], "completed"
+        )
 
     def test_job_types_endpoint_returns_whitelist_without_building_research_status(
         self,
@@ -236,17 +334,19 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 response = client.get("/api/v1/quant/job-types")
 
         self.assertEqual(response.status_code, 200)
+        body = response.json()
         self.assertEqual(
-            response.json(),
+            body["available_job_types"],
             {
-                "available_job_types": {
-                    "report_workbench_capabilities": {
-                        "label": "生成工作台能力盘点",
-                        "allowed_params": [],
-                    }
+                "report_workbench_capabilities": {
+                    "label": "生成工作台能力盘点",
+                    "allowed_params": [],
                 }
             },
         )
+        self.assertEqual(body["api_contract"]["version"], "quant-workbench-v2")
+        self.assertTrue(body["api_contract"]["backend_build_id"])
+        self.assertTrue(body["api_contract"]["backend_started_at"])
 
     def test_status_snapshot_stays_consistent_while_job_completes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -995,6 +1095,26 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn(build_status, offloaded)
         self.assertIn(get_snapshot, offloaded)
 
+    def test_status_can_skip_research_snapshot_for_job_monitoring(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            client = self._make_client(service)
+
+            with patch(
+                "api.v1.endpoints.quant_jobs.build_research_status_payload"
+            ) as build_status:
+                resp = client.get("/api/v1/quant/status?include_research=false")
+
+        self.assertEqual(resp.status_code, 200)
+        build_status.assert_not_called()
+        body = resp.json()
+        self.assertEqual(body["active_count"], 0)
+        self.assertEqual(body["latest_jobs"], {})
+        self.assertFalse(body["trainable"])
+
     def test_submit_job_offloads_service_work_from_event_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
@@ -1050,6 +1170,16 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "command": [sys.executable, "-c", "print('candidate')"],
                         "allowed_params": {"dry_run"},
                     },
+                    "run_robust_signal_research": {
+                        "label": "鲁棒信号研究",
+                        "command": [sys.executable, "-c", "print('signal')"],
+                        "allowed_params": {"smoke"},
+                    },
+                    "resume_robust_signal_research": {
+                        "label": "恢复鲁棒信号研究",
+                        "command": [sys.executable, "-c", "print('resume')"],
+                        "allowed_params": set(),
+                    },
                 },
             )
             client = self._make_client(service)
@@ -1058,6 +1188,14 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 "training_readiness": {
                     "status": "blocked",
                     "summary": "Latest quality report is unverified.",
+                },
+                "robust_signal": {
+                    "data_readiness": {
+                        "status": "blocked_data",
+                        "trainable": False,
+                        "reason_code": "data_manifest_changed",
+                        "summary": "Robust CSI800 data is bound to an older manifest.",
+                    }
                 },
             }
 
@@ -1083,6 +1221,21 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "params": {"dry_run": True},
                     },
                 )
+                robust_formal = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "run_robust_signal_research", "params": {}},
+                )
+                robust_smoke = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "run_robust_signal_research",
+                        "params": {"smoke": True},
+                    },
+                )
+                robust_resume = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "resume_robust_signal_research", "params": {}},
+                )
 
             jobs = service.list_jobs()
 
@@ -1091,7 +1244,76 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(baseline.json()["error"], "training_blocked")
         self.assertEqual(candidate.json()["error"], "training_blocked")
         self.assertEqual(dry_run.status_code, 200)
-        self.assertEqual([job.job_type for job in jobs], ["run_candidate_pipeline"])
+        self.assertEqual(robust_formal.status_code, 409)
+        self.assertEqual(robust_resume.status_code, 409)
+        self.assertEqual(robust_smoke.status_code, 409)
+        self.assertEqual(robust_smoke.json()["error"], "robust_signal_data_blocked")
+        self.assertEqual(
+            [job.job_type for job in jobs],
+            ["run_candidate_pipeline"],
+        )
+
+    def test_robust_signal_jobs_use_csi800_readiness_instead_of_generic_training_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "run_robust_signal_research": {
+                        "label": "鲁棒信号研究",
+                        "command": [sys.executable, "-c", "print('signal')"],
+                        "allowed_params": {"smoke"},
+                    },
+                    "resume_robust_signal_research": {
+                        "label": "恢复鲁棒信号研究",
+                        "command": [sys.executable, "-c", "print('resume')"],
+                        "allowed_params": set(),
+                    },
+                },
+            )
+            client = self._make_client(service)
+            status = {
+                "trainable": False,
+                "training_readiness": {
+                    "status": "blocked",
+                    "summary": "Generic LightGBM quality is blocked.",
+                },
+                "robust_signal": {
+                    "data_readiness": {
+                        "status": "ready",
+                        "trainable": True,
+                        "summary": "Robust CSI800 data is ready.",
+                    }
+                },
+            }
+
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
+                    return_value=status,
+                ),
+                patch.object(service, "_start_job"),
+            ):
+                formal = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "run_robust_signal_research", "params": {}},
+                )
+                smoke = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "run_robust_signal_research",
+                        "params": {"smoke": True},
+                    },
+                )
+                resume = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "resume_robust_signal_research", "params": {}},
+                )
+
+        self.assertEqual(formal.status_code, 200)
+        self.assertEqual(smoke.status_code, 200)
+        self.assertEqual(resume.status_code, 200)
 
     def test_submit_pins_the_quality_approved_cleaned_snapshot_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2397,12 +2619,24 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(recovered.return_code, 0)
         self.assertGreaterEqual(read_count, 2)
 
-    def test_recovery_monitor_marks_alive_runner_failed_after_poll_window(self) -> None:
+    def test_recovery_monitor_keeps_alive_runner_active_after_poll_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "shared-output.json"
             jobs_root = Path(temp_dir) / "jobs"
             service = QuantJobService(
                 jobs_root=jobs_root,
-                command_specs={},
+                command_specs={
+                    "sleepy": {
+                        "label": "慢任务",
+                        "command": [sys.executable, "-c", "print('still alive')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                    "conflicting": {
+                        "label": "冲突任务",
+                        "command": [sys.executable, "-c", "print('conflict')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                },
             )
             job_dir = jobs_root / "qj_recovery_timeout"
             job_dir.mkdir(parents=True)
@@ -2422,16 +2656,364 @@ class QuantJobsApiTestCase(unittest.TestCase):
             )
             service._insert_job(job)
 
-            service._poll_recovered_process(
-                job.job_id,
-                os.getpid(),
-                max_poll_seconds=0,
-                poll_interval_seconds=0,
+            with (
+                patch.object(
+                    service, "_runner_identity_matches", return_value=True
+                ) as identity_check,
+                patch.object(service, "_start_recovery_monitor") as restart_monitor,
+            ):
+                service._poll_recovered_process(
+                    job.job_id,
+                    os.getpid(),
+                    max_poll_seconds=0,
+                    poll_interval_seconds=0,
+                )
+                recovered = service.get_job(job.job_id)
+                conflict = service._active_artifact_output_conflict("conflicting")
+
+        self.assertGreaterEqual(identity_check.call_count, 1)
+        self.assertEqual(recovered.status, "running")
+        self.assertIsNone(recovered.completed_at)
+        self.assertIn("recovery monitoring window", recovered.error or "")
+        restart_monitor.assert_called_once_with(job.job_id, job.pid)
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict.job_id, job.job_id)
+
+    def test_recovery_monitor_keeps_pending_identity_handshake_active_on_timeout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            job = QuantJob(
+                job_id="qj_handshake_timeout",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable, "-c", "print('starting')"],
+                cwd=temp_dir,
+                pid=os.getpid(),
+                created_at="2026-08-04T20:00:00+08:00",
+                started_at="2026-08-04T20:00:01+08:00",
+                updated_at="2026-08-04T20:00:01+08:00",
+                log_path=str(jobs_root / "qj_handshake_timeout" / "job.log"),
+                runner_identity={
+                    "schema_version": 1,
+                    "handshake_status": "starting",
+                    "launch_token": "c" * 32,
+                    "pid": os.getpid(),
+                },
             )
+            service._insert_job(job)
+
+            with (
+                patch.object(service, "_read_exit_status", return_value=None),
+                patch.object(
+                    service, "_confirm_starting_runner_identity", return_value=None
+                ),
+                patch.object(
+                    service, "_runner_identity_startup_pending", return_value=True
+                ),
+                patch.object(service, "_start_recovery_monitor") as restart_monitor,
+                patch(
+                    "src.services.quant_job_service.RUNNER_IDENTITY_HANDSHAKE_TIMEOUT_SECONDS",
+                    0,
+                ),
+            ):
+                service._poll_recovered_process(
+                    job.job_id,
+                    job.pid,
+                    max_poll_seconds=60,
+                    poll_interval_seconds=0,
+                )
+                recovered = service.get_job(job.job_id)
+
+        self.assertEqual(recovered.status, "running")
+        self.assertIsNone(recovered.completed_at)
+        self.assertIn("identity handshake", recovered.error or "")
+        restart_monitor.assert_called_once_with(job.job_id, job.pid)
+
+    def test_restart_fails_expired_ownerless_startup_and_releases_artifact_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jobs_root = root / "jobs"
+            output = root / "shared-output.json"
+            service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                    "conflicting": {
+                        "label": "冲突任务",
+                        "command": [sys.executable, "-c", "print('conflict')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                },
+            )
+            command = [sys.executable, "-c", "print('never started')"]
+            command_hash = hashlib.sha256(
+                json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            job = QuantJob(
+                job_id="qj_expired_ownerless_startup",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=command,
+                cwd=temp_dir,
+                pid=None,
+                created_at="2026-08-04T20:00:00+08:00",
+                started_at="2026-08-04T20:00:01+08:00",
+                updated_at="2026-08-04T20:00:01+08:00",
+                log_path=str(jobs_root / "qj_expired_ownerless_startup" / "job.log"),
+                runner_identity={
+                    "schema_version": 1,
+                    "handshake_status": "starting",
+                    "launch_token": "d" * 32,
+                    "pid": None,
+                    "job_command_sha256": command_hash,
+                    "startup_deadline_epoch": time.time() - 1,
+                },
+            )
+            service._insert_job(job)
+
+            with patch.object(service, "_start_recovery_monitor") as monitor:
+                service._recover_running_jobs()
+
             recovered = service.get_job(job.job_id)
+            conflict = service._active_artifact_output_conflict("conflicting")
 
         self.assertEqual(recovered.status, "failed")
-        self.assertIn("recovery monitoring window", recovered.error or "")
+        self.assertIsNotNone(recovered.completed_at)
+        self.assertIn("startup lease expired", recovered.error or "")
+        monitor.assert_not_called()
+        self.assertIsNone(conflict)
+
+    def test_restart_recovery_reuses_the_row_runtime_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs_root = Path(temp_dir) / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            job = QuantJob(
+                job_id="qj_recovery_identity_once",
+                job_type="sleepy",
+                label="slow",
+                status="running",
+                params={},
+                command=[sys.executable, "-c", "print('running')"],
+                cwd=temp_dir,
+                pid=os.getpid(),
+                created_at="2026-07-04T01:00:00+08:00",
+                started_at="2026-07-04T01:00:01+08:00",
+                updated_at="2026-07-04T01:00:01+08:00",
+                log_path=str(jobs_root / "qj_recovery_identity_once" / "job.log"),
+            )
+            service._insert_job(job)
+
+            with (
+                patch.object(
+                    service, "_runner_identity_matches", return_value=True
+                ) as identity_check,
+                patch.object(service, "_start_recovery_monitor") as monitor,
+            ):
+                service._recover_running_jobs()
+
+        identity_check.assert_called_once()
+        monitor.assert_called_once_with(job.job_id, job.pid)
+
+    def test_restart_keeps_starting_runner_locked_while_identity_file_is_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jobs_root = root / "jobs"
+            output = root / "shared-output.json"
+            service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                    "conflicting": {
+                        "label": "冲突任务",
+                        "command": [sys.executable, "-c", "print('conflict')"],
+                        "artifact_patterns": [str(output)],
+                    },
+                },
+            )
+            command = [sys.executable, "-c", "print('running')"]
+            runtime_identity = service._process_runtime_identity(os.getpid())
+            self.assertIsNotNone(runtime_identity)
+            job = QuantJob(
+                job_id="qj_identity_pending",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=command,
+                cwd=temp_dir,
+                pid=os.getpid(),
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                updated_at="2026-08-03T10:00:01+08:00",
+                log_path=str(jobs_root / "qj_identity_pending" / "job.log"),
+                runner_identity={
+                    "schema_version": 1,
+                    "handshake_status": "starting",
+                    "launch_token": "a" * 32,
+                    "pid": os.getpid(),
+                    "job_command_sha256": hashlib.sha256(
+                        json.dumps(
+                            command, ensure_ascii=False, sort_keys=True
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    **(runtime_identity or {}),
+                },
+            )
+            service._insert_job(job)
+
+            with patch.object(service, "_start_recovery_monitor") as monitor:
+                service._recover_running_jobs()
+
+            recovered = service.get_job(job.job_id)
+            conflict = service._active_artifact_output_conflict("conflicting")
+
+        self.assertEqual(recovered.status, "running")
+        self.assertIsNone(recovered.runner_alive)
+        monitor.assert_called_once_with(job.job_id, job.pid)
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict.job_id, job.job_id)
+
+    def test_restart_adopts_signed_runner_identity_after_pre_pid_crash_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jobs_root = root / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            command = [sys.executable, "-c", "print('running')"]
+            token = "b" * 32
+            command_hash = hashlib.sha256(
+                json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            job_dir = jobs_root / "qj_adopt_identity"
+            job_dir.mkdir(parents=True)
+            job = QuantJob(
+                job_id="qj_adopt_identity",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=command,
+                cwd=temp_dir,
+                pid=None,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                updated_at="2026-08-03T10:00:01+08:00",
+                log_path=str(job_dir / "job.log"),
+                runner_identity={
+                    "schema_version": 1,
+                    "handshake_status": "starting",
+                    "launch_token": token,
+                    "pid": None,
+                    "job_command_sha256": command_hash,
+                },
+            )
+            service._insert_job(job)
+            (job_dir / "runner_identity.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "launch_token": token,
+                        "pid": os.getpid(),
+                        "job_command_sha256": command_hash,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(service, "_start_recovery_monitor") as monitor:
+                service._recover_running_jobs()
+
+            recovered = service.get_job(job.job_id)
+
+        self.assertEqual(recovered.status, "running")
+        self.assertEqual(recovered.pid, os.getpid())
+        self.assertEqual(
+            recovered.runner_identity.get("handshake_status"), "confirmed"
+        )
+        self.assertTrue(recovered.runner_alive)
+        monitor.assert_called_once_with(job.job_id, os.getpid())
+
+    def test_restart_waits_when_signed_identity_exists_but_runtime_probe_is_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jobs_root = root / "jobs"
+            service = QuantJobService(jobs_root=jobs_root, command_specs={})
+            command = [sys.executable, "-c", "print('running')"]
+            token = "c" * 32
+            command_hash = hashlib.sha256(
+                json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            job_dir = jobs_root / "qj_runtime_probe_pending"
+            job_dir.mkdir(parents=True)
+            job = QuantJob(
+                job_id="qj_runtime_probe_pending",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=command,
+                cwd=temp_dir,
+                pid=os.getpid(),
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                updated_at="2026-08-03T10:00:01+08:00",
+                log_path=str(job_dir / "job.log"),
+                runner_identity={
+                    "schema_version": 1,
+                    "handshake_status": "starting",
+                    "launch_token": token,
+                    "pid": os.getpid(),
+                    "job_command_sha256": command_hash,
+                    "process_start": "expected-start",
+                    "process_command_sha256": "d" * 64,
+                },
+            )
+            service._insert_job(job)
+            (job_dir / "runner_identity.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "launch_token": token,
+                        "pid": os.getpid(),
+                        "job_command_sha256": command_hash,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(service, "_process_runtime_identity", return_value=None),
+                patch.object(service, "_pid_is_alive", return_value=True),
+                patch.object(service, "_start_recovery_monitor") as monitor,
+            ):
+                service._recover_running_jobs()
+                recovered = service.get_job(job.job_id)
+
+        self.assertEqual(recovered.status, "running")
+        self.assertIsNone(recovered.runner_alive)
+        monitor.assert_called_once_with(job.job_id, job.pid)
 
     def test_latest_jobs_by_type_uses_latest_inserted_row_for_same_second_ties(
         self,
@@ -2496,6 +3078,15 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "src.services.quant_job_service.subprocess.Popen",
                     side_effect=fake_popen,
                 ),
+                patch.object(
+                    service,
+                    "_await_runner_identity",
+                    side_effect=lambda job, _process: {
+                        **job.runner_identity,
+                        "handshake_status": "confirmed",
+                        "pid": job.pid,
+                    },
+                ),
                 patch.dict(
                     os.environ,
                     {
@@ -2523,9 +3114,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     break
                 time.sleep(0.05)
 
-        self.assertEqual(len(popen_calls), 1)
+        runner_calls = [call for call in popen_calls if call[1].get("start_new_session")]
+        self.assertEqual(len(runner_calls), 1)
         self.assertEqual(recovered.status, "completed")
-        args, kwargs = popen_calls[0]
+        args, kwargs = runner_calls[0]
         self.assertEqual(args[0][0], sys.executable)
         self.assertEqual(args[0][1], "-c")
         self.assertTrue(kwargs["start_new_session"])
@@ -2541,6 +3133,158 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
         self.assertNotIn("QUANT_API_KEY", kwargs["env"])
         self.assertNotIn("QUANT_SECRET_TOKEN", kwargs["env"])
+
+    def test_late_durable_wrapper_never_executes_the_real_command(self) -> None:
+        from src.services.quant_job_service import _DURABLE_RUNNER_CODE
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "real-command-ran"
+            exit_path = root / "exit_status.json"
+            identity_path = root / "runner_identity.json"
+            command = [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ]
+            env = os.environ.copy()
+            env.update(
+                {
+                    "QUANT_JOB_COMMAND_JSON": json.dumps(command),
+                    "QUANT_JOB_CWD": temp_dir,
+                    "QUANT_JOB_EXIT_STATUS_PATH": str(exit_path),
+                    "QUANT_JOB_RUNNER_IDENTITY_PATH": str(identity_path),
+                    "QUANT_JOB_LAUNCH_TOKEN": "e" * 32,
+                    "QUANT_JOB_STARTUP_DEADLINE_EPOCH": str(time.time() - 1),
+                }
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", _DURABLE_RUNNER_CODE],
+                cwd=temp_dir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            payload = json.loads(exit_path.read_text(encoding="utf-8"))
+            marker_created = marker.exists()
+            identity_created = identity_path.exists()
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(marker_created)
+        self.assertFalse(identity_created)
+        self.assertIn("startup lease expired", payload["error"])
+
+    def test_durable_wrapper_requires_start_permission_before_real_command(self) -> None:
+        from src.services.quant_job_service import _DURABLE_RUNNER_CODE
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "real-command-ran"
+            exit_path = root / "exit_status.json"
+            identity_path = root / "runner_identity.json"
+            permission_path = root / "start_permission.json"
+            command = [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ]
+            env = os.environ.copy()
+            env.update(
+                {
+                    "QUANT_JOB_COMMAND_JSON": json.dumps(command),
+                    "QUANT_JOB_CWD": temp_dir,
+                    "QUANT_JOB_EXIT_STATUS_PATH": str(exit_path),
+                    "QUANT_JOB_RUNNER_IDENTITY_PATH": str(identity_path),
+                    "QUANT_JOB_START_PERMISSION_PATH": str(permission_path),
+                    "QUANT_JOB_LAUNCH_TOKEN": "f" * 32,
+                    "QUANT_JOB_STARTUP_DEADLINE_EPOCH": str(time.time() + 2.0),
+                }
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", _DURABLE_RUNNER_CODE],
+                cwd=temp_dir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            payload = json.loads(exit_path.read_text(encoding="utf-8"))
+            identity_created = identity_path.exists()
+            marker_created = marker.exists()
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(identity_created)
+        self.assertFalse(marker_created)
+        self.assertIn("start permission", payload["error"])
+
+    def test_cancel_between_pending_insert_and_start_never_launches_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            jobs_root = root / "jobs"
+            marker = root / "real-command-ran"
+            command_specs = {
+                "race": {
+                    "label": "启动取消竞态",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                    ],
+                }
+            }
+            submitting_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            cancelling_service = QuantJobService(
+                jobs_root=jobs_root,
+                command_specs=command_specs,
+            )
+            original_start = submitting_service._start_job
+            pending_inserted = threading.Event()
+            continue_start = threading.Event()
+            submit_errors: list[BaseException] = []
+
+            def delayed_start(job: QuantJob) -> None:
+                pending_inserted.set()
+                if not continue_start.wait(timeout=5):
+                    raise TimeoutError("test did not release delayed start")
+                original_start(job)
+
+            def submit() -> None:
+                try:
+                    submitting_service.submit_job("race")
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    submit_errors.append(exc)
+
+            with patch.object(
+                submitting_service,
+                "_start_job",
+                side_effect=delayed_start,
+            ):
+                submit_thread = threading.Thread(target=submit, daemon=True)
+                submit_thread.start()
+                self.assertTrue(pending_inserted.wait(timeout=5))
+                pending_job = cancelling_service.list_jobs(limit=1)[0]
+                cancelled = cancelling_service.cancel_job(pending_job.job_id)
+                continue_start.set()
+                submit_thread.join(timeout=10)
+
+            final_job = cancelling_service.get_job(pending_job.job_id)
+            marker_created = marker.exists()
+
+        self.assertFalse(submit_thread.is_alive())
+        self.assertEqual(submit_errors, [])
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(final_job.status, "cancelled")
+        self.assertFalse(marker_created)
 
     def test_start_job_passes_jq_credentials_only_for_explicit_jqdata_job(self) -> None:
         class FakeProcess:
@@ -2574,6 +3318,15 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "src.services.quant_job_service.subprocess.Popen",
                     side_effect=fake_popen,
                 ),
+                patch.object(
+                    service,
+                    "_await_runner_identity",
+                    side_effect=lambda job, _process: {
+                        **job.runner_identity,
+                        "handshake_status": "confirmed",
+                        "pid": job.pid,
+                    },
+                ),
                 patch.dict(
                     os.environ,
                     {
@@ -2605,6 +3358,123 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("TUSHARE_TOKEN", env)
         self.assertNotIn("AKSHARE_TOKEN", env)
         self.assertNotIn("OPENAI_API_KEY", env)
+
+    def test_start_job_stops_exact_runner_when_identity_handshake_times_out(
+        self,
+    ) -> None:
+        class UnconfirmedProcess:
+            pid = 424244
+
+            def __init__(self) -> None:
+                self.terminated = False
+                self.killed = False
+                self.waited = False
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                self.waited = True
+                return -signal.SIGTERM
+
+            def kill(self) -> None:
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            process = UnconfirmedProcess()
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "check_qlib_data": {
+                        "label": "检查 Qlib 数据",
+                        "command": [sys.executable, "-c", "print('qlib ok')"],
+                    }
+                },
+            )
+            with (
+                patch(
+                    "src.services.quant_job_service.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch.object(service, "_await_runner_identity", return_value=None),
+                patch.object(service, "_terminate_process_group") as terminate_group,
+            ):
+                job = service.submit_job("check_qlib_data")
+
+            recovered = service.get_job(job.job_id)
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertFalse(process.killed)
+        terminate_group.assert_called_once_with(process.pid, signal.SIGTERM)
+        self.assertEqual(recovered.status, "failed")
+        self.assertNotIn(job.job_id, service._processes)
+        self.assertIn("identity handshake", recovered.error or "")
+
+    def test_start_job_stops_runner_when_start_authorization_fails(self) -> None:
+        class UnauthorizedProcess:
+            pid = 424245
+
+            def __init__(self) -> None:
+                self.terminated = False
+                self.waited = False
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                self.waited = True
+                return -signal.SIGTERM
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            process = UnauthorizedProcess()
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "check_qlib_data": {
+                        "label": "检查 Qlib 数据",
+                        "command": [sys.executable, "-c", "print('qlib ok')"],
+                    }
+                },
+            )
+            with (
+                patch(
+                    "src.services.quant_job_service.subprocess.Popen",
+                    return_value=process,
+                ),
+                patch.object(
+                    service,
+                    "_await_runner_identity",
+                    side_effect=lambda job, _process: {
+                        **job.runner_identity,
+                        "handshake_status": "confirmed",
+                        "pid": job.pid,
+                    },
+                ),
+                patch.object(
+                    service,
+                    "_authorize_runner_start",
+                    side_effect=OSError("permission disk failed"),
+                ),
+                patch.object(service, "_terminate_process_group"),
+            ):
+                job = service.submit_job("check_qlib_data")
+
+            recovered = service.get_job(job.job_id)
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertEqual(recovered.status, "failed")
+        self.assertIn("start authorization", recovered.error or "")
+        self.assertNotIn(job.job_id, service._processes)
 
     def test_quant_job_child_env_requires_explicit_data_credential_allowlist(
         self,
@@ -2748,6 +3618,40 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(recovered.status, "completed")
         self.assertEqual(recovered.return_code, 0)
 
+    def test_cancel_recovered_job_never_signals_pid_without_matching_runner_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={},
+            )
+            job = QuantJob(
+                job_id="qj_reused_pid",
+                job_type="sleepy",
+                label="慢任务",
+                status="running",
+                params={},
+                command=[sys.executable, "-c", "print('old runner')"],
+                cwd=temp_dir,
+                pid=os.getpid(),
+                created_at="2026-07-04T01:00:00+08:00",
+                started_at="2026-07-04T01:00:01+08:00",
+                updated_at="2026-07-04T01:00:01+08:00",
+                log_path=str(Path(temp_dir) / "jobs" / "qj_reused_pid" / "job.log"),
+            )
+            service._insert_job(job)
+
+            with (
+                patch.object(service, "_pid_is_alive", return_value=False),
+                patch.object(service, "_terminate_process_group") as terminate,
+            ):
+                recovered = service.cancel_job(job.job_id)
+
+        terminate.assert_not_called()
+        self.assertEqual(recovered.status, "failed")
+        self.assertIn("identity", recovered.error or "")
+
     def test_cancel_job_rewrites_signal_failure_from_waiter_to_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
@@ -2795,6 +3699,368 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(recovered.status, "cancelled")
         self.assertEqual(recovered.return_code, -signal.SIGTERM)
         self.assertEqual(recovered.error, "Cancelled by user from the web UI.")
+
+    def test_cancel_job_runs_the_whitelisted_durable_runner_cancel_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "durable-runner-stopped"
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "from pathlib import Path; "
+                                f"Path({str(marker)!r}).write_text('stopped')"
+                            ),
+                        ],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_cancel_durable",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                pid=12345,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                updated_at="2026-08-03T10:00:01+08:00",
+                log_path=str(root / "jobs" / "qj_cancel_durable" / "job.log"),
+            )
+            service._insert_job(job)
+
+            class CancelledWrapperProcess:
+                pid = 12345
+
+                def __init__(self) -> None:
+                    self.return_code: int | None = None
+
+                def terminate(self) -> None:
+                    self.return_code = -signal.SIGTERM
+
+                def poll(self) -> int | None:
+                    return self.return_code
+
+            service._processes[job.job_id] = CancelledWrapperProcess()  # type: ignore[assignment]
+
+            returned = service.cancel_job(job.job_id)
+            durable_runner_stopped = marker.is_file()
+
+        self.assertTrue(durable_runner_stopped)
+        self.assertEqual(returned.status, "cancelled")
+
+    def test_completed_launcher_can_cancel_its_still_running_durable_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "durable-cancel-count"
+            progress_path = root / "robust-status.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "robust-signal-run",
+                        "status": "signal_diagnosis_complete",
+                        "lifecycle_status": "running",
+                        "pause_state": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "from pathlib import Path; "
+                                f"path=Path({str(marker)!r}); "
+                                "path.write_text(path.read_text() + 'x' if path.exists() else 'x')"
+                            ),
+                        ],
+                        "progress_patterns": [str(progress_path)],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_completed_launcher",
+                job_type="robust",
+                label="鲁棒研究",
+                status="completed",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                return_code=0,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                completed_at="2026-08-03T10:00:02+08:00",
+                updated_at="2026-08-03T10:00:02+08:00",
+                log_path=str(root / "jobs" / "qj_completed_launcher" / "job.log"),
+            )
+            service._insert_job(job)
+
+            before_cancel = service.get_job(job.job_id)
+            first = service.cancel_job(job.job_id)
+            second = service.cancel_job(job.job_id)
+            marker_value = marker.read_text(encoding="utf-8")
+
+        self.assertTrue(before_cancel.can_cancel)
+        self.assertEqual(first.status, "cancelled")
+        self.assertFalse(first.can_cancel)
+        self.assertEqual(second.status, "cancelled")
+        self.assertEqual(marker_value, "x")
+
+    def test_durable_cancel_preserves_natural_completion_reported_by_contract(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            progress_path = root / "robust-status.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "robust-signal-run",
+                        "lifecycle_status": "running",
+                        "pause_state": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [
+                            sys.executable,
+                            "-c",
+                            "import json; print(json.dumps({'cancel_outcome': 'already_terminal'}))",
+                        ],
+                        "cancel_result_contract": {
+                            "format": "json",
+                            "allowed_outcomes": ["cancelled", "already_terminal"],
+                        },
+                        "progress_patterns": [str(progress_path)],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_cancel_natural_completion",
+                job_type="robust",
+                label="鲁棒研究",
+                status="completed",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                return_code=0,
+                created_at="2026-08-04T21:00:00+08:00",
+                started_at="2026-08-04T21:00:01+08:00",
+                completed_at="2026-08-04T21:00:02+08:00",
+                updated_at="2026-08-04T21:00:02+08:00",
+                log_path=str(root / "jobs" / "qj_cancel_natural_completion" / "job.log"),
+            )
+            service._insert_job(job)
+
+            returned = service.cancel_job(job.job_id)
+
+        self.assertEqual(returned.status, "completed")
+        self.assertEqual(returned.return_code, 0)
+        self.assertNotEqual(returned.error, "Cancelled by user from the web UI.")
+
+    def test_durable_cancel_rejects_missing_contract_output_without_changing_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [sys.executable, "-c", "print('{}')"],
+                        "cancel_result_contract": {
+                            "format": "json",
+                            "allowed_outcomes": ["cancelled", "already_terminal"],
+                        },
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_cancel_invalid_contract",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-08-04T21:00:00+08:00",
+                started_at="2026-08-04T21:00:01+08:00",
+                updated_at="2026-08-04T21:00:01+08:00",
+                log_path=str(root / "jobs" / "qj_cancel_invalid_contract" / "job.log"),
+            )
+            service._insert_job(job)
+
+            returned = service.cancel_job(job.job_id)
+
+        self.assertEqual(returned.status, "running")
+        self.assertIn("Cancellation was not confirmed", returned.error or "")
+
+    def test_naturally_completed_durable_run_does_not_offer_or_execute_cancel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "unexpected-cancel"
+            progress_path = root / "robust-status.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "robust-signal-run",
+                        "status": "signal_candidate_ready",
+                        "lifecycle_status": "completed",
+                        "pause_state": "completed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [
+                            sys.executable,
+                            "-c",
+                            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                        ],
+                        "progress_patterns": [str(progress_path)],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_naturally_completed",
+                job_type="robust",
+                label="鲁棒研究",
+                status="completed",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                return_code=0,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                completed_at="2026-08-03T10:00:02+08:00",
+                updated_at="2026-08-03T10:00:02+08:00",
+                log_path=str(root / "jobs" / "qj_naturally_completed" / "job.log"),
+            )
+            service._insert_job(job)
+
+            before_cancel = service.get_job(job.job_id)
+            returned = service.cancel_job(job.job_id)
+
+        self.assertFalse(before_cancel.can_cancel)
+        self.assertEqual(returned.status, "completed")
+        self.assertFalse(marker.exists())
+
+    def test_completed_launcher_keeps_cancel_available_when_shutdown_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            progress_path = root / "robust-status.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "robust-signal-run",
+                        "lifecycle_status": "running",
+                        "pause_state": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [sys.executable, "-c", "raise SystemExit(5)"],
+                        "progress_patterns": [str(progress_path)],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_completed_cancel_failure",
+                job_type="robust",
+                label="鲁棒研究",
+                status="completed",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                return_code=0,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                completed_at="2026-08-03T10:00:02+08:00",
+                updated_at="2026-08-03T10:00:02+08:00",
+                log_path=str(root / "jobs" / "qj_completed_cancel_failure" / "job.log"),
+            )
+            service._insert_job(job)
+
+            returned = service.cancel_job(job.job_id)
+
+        self.assertEqual(returned.status, "completed")
+        self.assertTrue(returned.can_cancel)
+        self.assertIn("Cancellation was not confirmed", returned.error or "")
+
+    def test_cancel_job_does_not_report_cancelled_when_durable_shutdown_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "鲁棒研究",
+                        "command": [sys.executable, "-c", "print('launch')"],
+                        "cancel_command": [sys.executable, "-c", "raise SystemExit(5)"],
+                    }
+                },
+            )
+            job = QuantJob(
+                job_id="qj_cancel_durable_failure",
+                job_type="robust",
+                label="鲁棒研究",
+                status="running",
+                params={"run_id": "robust-signal-run"},
+                command=[sys.executable],
+                cwd=temp_dir,
+                pid=None,
+                created_at="2026-08-03T10:00:00+08:00",
+                started_at="2026-08-03T10:00:01+08:00",
+                updated_at="2026-08-03T10:00:01+08:00",
+                log_path=str(root / "jobs" / "qj_cancel_durable_failure" / "job.log"),
+            )
+            service._insert_job(job)
+
+            returned = service.cancel_job(job.job_id)
+
+        self.assertEqual(returned.status, "running")
+        self.assertIn("Cancellation was not confirmed", returned.error or "")
 
     def test_return_code_cancel_mapping_covers_signal_conventions(self) -> None:
         from src.services.quant_job_service import _return_code_indicates_cancel
@@ -3351,14 +4617,28 @@ class QuantJobsApiTestCase(unittest.TestCase):
             ):
                 service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
 
+                prepare = service._build_command("prepare_robust_signal_data", {})
                 start = service._build_command(
                     "run_robust_signal_research", {"run_id": "signal_20260723"}
                 )
+                smoke = service._build_command(
+                    "run_robust_signal_research",
+                    {"run_id": "signal_smoke", "smoke": True},
+                )
+                plan = service._build_command("preview_robust_signal_plan", {})
                 pause = service._build_command(
                     "pause_robust_signal_research", {"run_id": "signal_20260723"}
                 )
                 resume = service._build_command(
                     "resume_robust_signal_research", {"run_id": "signal_20260723"}
+                )
+                smoke_resume = service._build_command(
+                    "resume_robust_signal_research",
+                    {"run_id": "signal_smoke", "smoke": True},
+                )
+                string_smoke_resume = service._build_command(
+                    "resume_robust_signal_research",
+                    {"run_id": "signal_smoke_string", "smoke": "true"},
                 )
                 available = service.available_job_types()
 
@@ -3368,6 +4648,19 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 service._build_command("resume_robust_signal_research", {})
 
         self.assertIn("launch_robust_signal_research.py", start[1])
+        self.assertIn("prepare_robust_signal_data.py", prepare[1])
+        self.assertEqual(
+            prepare[prepare.index("--status-path") + 1],
+            str(
+                REPORTS_ROOT
+                / "robust_signal"
+                / "robust_signal_data_readiness_latest.json"
+            ),
+        )
+        self.assertEqual(
+            prepare[prepare.index("--quant-data-dir") + 1],
+            str(configured_quant_data),
+        )
         self.assertEqual(
             start[start.index("--report-dir") + 1],
             str(REPORTS_ROOT / "robust_signal"),
@@ -3380,18 +4673,28 @@ class QuantJobsApiTestCase(unittest.TestCase):
         )
         self.assertNotIn("--request-pause", start)
         self.assertNotIn("--resume", start)
+        self.assertNotIn("--smoke", start)
+        self.assertIn("--smoke", smoke)
+        self.assertIn("--plan", plan)
         self.assertIn("--request-pause", pause)
         self.assertNotIn("--resume", pause)
         self.assertIn("--resume", resume)
         self.assertNotIn("--request-pause", resume)
+        self.assertIn("--resume", smoke_resume)
+        self.assertIn("--smoke", smoke_resume)
+        self.assertIn("--resume", string_smoke_resume)
+        self.assertIn("--smoke", string_smoke_resume)
         self.assertEqual(
-            available["run_robust_signal_research"]["allowed_params"], ["run_id"]
+            available["run_robust_signal_research"]["allowed_params"], ["run_id", "smoke"]
         )
+        self.assertEqual(available["prepare_robust_signal_data"]["allowed_params"], [])
+        self.assertEqual(available["preview_robust_signal_plan"]["allowed_params"], [])
         self.assertEqual(
             available["pause_robust_signal_research"]["allowed_params"], ["run_id"]
         )
         self.assertEqual(
-            available["resume_robust_signal_research"]["allowed_params"], ["run_id"]
+            available["resume_robust_signal_research"]["allowed_params"],
+            ["run_id", "smoke"],
         )
 
     def test_report_and_refresh_jobs_use_configured_reports_root(self) -> None:
@@ -3872,6 +5175,43 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("cleaned", command)
         self.assertIn("provider", status["train_baseline_lgb"]["allowed_params"])
 
+    def test_training_equivalence_job_uses_only_server_controlled_test_contract(self) -> None:
+        from api.v1.endpoints.quant_jobs import _requires_training_readiness_gate
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+            command = service._build_command(
+                "train_baseline_lgb_equivalence",
+                {"provider": "cleaned"},
+            )
+            catalog = service.available_job_types()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "approved provider identity",
+            ):
+                service.submit_job(
+                    "train_baseline_lgb_equivalence",
+                    {"provider": "cleaned"},
+                )
+
+        command_text = " ".join(command)
+        self.assertIn("baseline_lgb_equivalence.yaml", command_text)
+        self.assertIn("--experiment-name dsa_training_equivalence", command_text)
+        self.assertIn("--result-scope training_equivalence", command_text)
+        self.assertIn("--equivalence-channel web", command_text)
+        self.assertIn("--no-publish-latest", command)
+        self.assertEqual(
+            catalog["train_baseline_lgb_equivalence"]["allowed_params"],
+            ["provider"],
+        )
+        self.assertTrue(
+            _requires_training_readiness_gate(
+                "train_baseline_lgb_equivalence",
+                {"provider": "cleaned"},
+            )
+        )
+
     def test_train_provider_param_is_restricted_to_known_local_providers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -4249,6 +5589,94 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 service._build_command("report_market_regime", {"min_symbols": 0})
         self.assertIn("Param min_symbols must be >= 1", str(ctx.exception))
 
+    def test_market_report_submit_injects_only_quality_approved_snapshot_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "report_market_regime": {
+                        "label": "市场状态",
+                        "command": [sys.executable, "-c", "print('report')"],
+                    }
+                },
+            )
+            client = self._make_client(service)
+            approved_identity = {
+                "dataset_id": "ashare_daily_qfq",
+                "snapshot_id": "ashare-qfq-snapshot",
+                "manifest_sha256": "a" * 64,
+                "content_sha256": "b" * 64,
+            }
+            submitted = QuantJob(
+                job_id="qj_20260803130000_1234abcd",
+                job_type="report_market_regime",
+                label="市场状态",
+                status="pending",
+                params={"limit": 20},
+                command=[sys.executable],
+                cwd=temp_dir,
+                created_at="2026-08-03T13:00:00+08:00",
+                updated_at="2026-08-03T13:00:00+08:00",
+                log_path=str(Path(temp_dir) / "job.log"),
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.approved_ashare_qfq_snapshot_identity",
+                    return_value=approved_identity,
+                ) as approve_snapshot,
+                patch.object(service, "submit_job", return_value=submitted) as submit,
+            ):
+                response = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "report_market_regime",
+                        "params": {"limit": 20},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        approve_snapshot.assert_called_once_with()
+        submit.assert_called_once_with(
+            "report_market_regime",
+            {"limit": 20},
+            approved_market_data_identity=approved_identity,
+        )
+
+    def test_market_report_submit_fails_closed_when_snapshot_is_not_approved(
+        self,
+    ) -> None:
+        from quant_workflow.scripts.quant_data_contract import DataContractError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                command_specs={
+                    "report_market_regime": {
+                        "label": "市场状态",
+                        "command": [sys.executable, "-c", "print('must not run')"],
+                    }
+                },
+            )
+            client = self._make_client(service)
+            with (
+                patch(
+                    "api.v1.endpoints.quant_jobs.approved_ashare_qfq_snapshot_identity",
+                    side_effect=DataContractError("changed"),
+                ),
+                patch.object(service, "submit_job") as submit,
+            ):
+                response = client.post(
+                    "/api/v1/quant/jobs",
+                    json={"job_type": "report_market_regime", "params": {}},
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "market_data_blocked")
+        submit.assert_not_called()
+
     def test_data_quality_report_job_supports_browser_safe_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -4274,6 +5702,13 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("data_quality_report_*.json", artifact_names)
         self.assertIn("data_quality_ashare_qfq_summary_*.csv", artifact_names)
         self.assertNotIn("data_quality_merged_summary_*.csv", artifact_names)
+        self.assertTrue(
+            any(
+                "test_runs/data_quality/data_quality_report_sampled_latest.json"
+                in pattern
+                for pattern in spec["artifact_patterns"]
+            )
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -4396,6 +5831,83 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn(
             "Unsupported params for report_cash_control_backtest", str(ctx.exception)
         )
+
+    def test_market_report_commands_pin_the_internal_snapshot_bars_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            commands = []
+            with patch("src.services.quant_job_service.QUANT_DATA_ROOT", data_root):
+                for index, job_type in enumerate(
+                    ("report_market_regime", "report_cash_control_backtest")
+                ):
+                    service = QuantJobService(
+                        jobs_root=root / f"jobs-{index}",
+                    )
+                    with patch.object(service, "_start_job"):
+                        job = service.submit_job(
+                            job_type,
+                            {"limit": 20},
+                            approved_market_data_identity=identity,
+                        )
+                    commands.append(job.command)
+
+        expected_bars = str((snapshot / "bars").resolve())
+        self.assertEqual(
+            commands[0][commands[0].index("--data-dir") + 1], expected_bars
+        )
+        self.assertEqual(
+            commands[1][commands[1].index("--market-data-dir") + 1],
+            expected_bars,
+        )
+
+    def test_market_report_service_rejects_snapshot_changed_after_approval(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            (snapshot / "bars" / "600000.parquet").write_bytes(b"changed-after-approval")
+            service = QuantJobService(jobs_root=root / "jobs")
+
+            with (
+                patch("src.services.quant_job_service.QUANT_DATA_ROOT", data_root),
+                patch.object(service, "_start_job"),
+                self.assertRaisesRegex(ValueError, "changed after approval"),
+            ):
+                service.submit_job(
+                    "report_market_regime",
+                    {"limit": 20},
+                    approved_market_data_identity=identity,
+                )
+
+    def test_market_report_service_rejects_missing_or_forged_internal_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            _snapshot, identity = write_native_ashare_fixture(data_root)
+            service = QuantJobService(jobs_root=root / "jobs")
+            with (
+                patch("src.services.quant_job_service.QUANT_DATA_ROOT", data_root),
+                patch.object(service, "_start_job"),
+            ):
+                with self.assertRaisesRegex(ValueError, "approved market data identity"):
+                    service.submit_job("report_market_regime", {"limit": 20})
+                with self.assertRaisesRegex(ValueError, "invalid or mismatched"):
+                    service.submit_job(
+                        "report_market_regime",
+                        {"limit": 20},
+                        approved_market_data_identity={
+                            **identity,
+                            "snapshot_id": "../outside",
+                        },
+                    )
 
     def test_china_astock_comparison_job_is_whitelisted_as_report_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4657,6 +6169,13 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(status["run_candidate_pipeline"]["label"], "运行五个选股模型候选流程")
         self.assertEqual(status["run_candidate_pipeline"]["allowed_params"], ["dry_run", "provider"])
         self.assertTrue(any("candidate_pipeline_latest.json" in item for item in spec["artifact_patterns"]))
+        self.assertTrue(
+            any(
+                "test_runs/candidate_pipeline/candidate_pipeline_test_latest.json"
+                in item
+                for item in spec["artifact_patterns"]
+            )
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -4703,6 +6222,182 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("Param sleep must be <= 60", huge_sleep.json()["message"])
         self.assertEqual(huge_timeout.status_code, 400)
         self.assertIn("Param timeout must be <= 86400", huge_timeout.json()["message"])
+
+    def test_running_job_exposes_structured_progress_and_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            progress_path = root / "candidate_progress.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "candidate-alpha158-test",
+                        "stage": "models",
+                        "completed": 2,
+                        "total": 5,
+                        "current": "lightgbm",
+                        "current_artifact": "/private/reports/lightgbm/pred.pkl",
+                        "updated_at": "2026-08-02T10:00:02+08:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "candidate": {
+                        "label": "candidate",
+                        "command": [sys.executable, "-c", "print('ok')"],
+                        "allowed_params": set(),
+                        "progress_patterns": [str(progress_path)],
+                    },
+                },
+            )
+            log_path = root / "jobs" / "qj_progress" / "job.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("working\n", encoding="utf-8")
+            service._insert_job(
+                QuantJob(
+                    job_id="qj_progress",
+                    job_type="candidate",
+                    label="candidate",
+                    status="running",
+                    params={},
+                    pid=os.getpid(),
+                    created_at="2026-08-02T09:59:00+08:00",
+                    started_at="2026-08-02T10:00:00+08:00",
+                    updated_at="2026-08-02T10:00:00+08:00",
+                    log_path=str(log_path),
+                )
+            )
+            client = self._make_client(service)
+
+            response = client.get("/api/v1/quant/jobs/qj_progress")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["runner_alive"])
+        self.assertIsNotNone(payload["log_updated_at"])
+        self.assertEqual(payload["progress"]["stage"], "models")
+        self.assertEqual(payload["progress"]["completed"], 2)
+        self.assertEqual(payload["progress"]["total"], 5)
+        self.assertEqual(payload["progress"]["percent"], 40.0)
+        self.assertEqual(payload["progress"]["current"], "lightgbm")
+        self.assertEqual(payload["progress"]["current_artifact"], "pred.pkl")
+        self.assertGreaterEqual(payload["progress"]["elapsed_seconds"], 0)
+        self.assertGreaterEqual(payload["progress"]["eta_seconds"], 0)
+
+    def test_terminal_job_does_not_recheck_a_reusable_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={},
+            )
+            service._insert_job(
+                QuantJob(
+                    job_id="qj_completed_pid",
+                    job_type="candidate",
+                    label="candidate",
+                    status="completed",
+                    params={},
+                    command=[sys.executable, "-c", "print('done')"],
+                    pid=os.getpid(),
+                    return_code=0,
+                    created_at="2026-08-02T09:59:00+08:00",
+                    started_at="2026-08-02T10:00:00+08:00",
+                    completed_at="2026-08-02T10:00:01+08:00",
+                    updated_at="2026-08-02T10:00:01+08:00",
+                    log_path=str(root / "jobs" / "qj_completed_pid" / "job.log"),
+                )
+            )
+
+            with patch.object(service, "_runner_identity_matches") as identity_check:
+                job = service.get_job("qj_completed_pid")
+
+        identity_check.assert_not_called()
+        self.assertFalse(job.runner_alive)
+
+    def test_progress_ignores_newer_file_from_another_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            own_progress = root / "runs" / "wanted" / "status.json"
+            other_progress = root / "runs" / "other" / "status.json"
+            own_progress.parent.mkdir(parents=True)
+            other_progress.parent.mkdir(parents=True)
+            own_progress.write_text(
+                json.dumps(
+                    {
+                        "run_id": "wanted",
+                        "run_mode": "formal",
+                        "current_stage": "screening",
+                        "completed_count": 3,
+                        "expected_count": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            other_progress.write_text(
+                json.dumps(
+                    {
+                        "run_id": "other",
+                        "run_mode": "formal",
+                        "current_stage": "validation",
+                        "completed_count": 9,
+                        "expected_count": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            now = time.time()
+            os.utime(own_progress, (now - 1, now - 1))
+            os.utime(other_progress, (now, now))
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "robust": {
+                        "label": "robust",
+                        "command": [sys.executable, "-c", "print('ok')"],
+                        "progress_patterns": [str(root / "runs" / "*" / "status.json")],
+                    }
+                },
+            )
+            service._insert_job(
+                QuantJob(
+                    job_id="qj_progress_identity",
+                    job_type="robust",
+                    label="robust",
+                    status="completed",
+                    params={"run_id": "wanted", "smoke": False},
+                    created_at="2026-08-02T09:59:00+08:00",
+                    started_at="2026-08-02T10:00:00+08:00",
+                    completed_at="2026-08-02T10:01:00+08:00",
+                    updated_at="2026-08-02T10:01:00+08:00",
+                    log_path=str(root / "jobs" / "qj_progress_identity" / "job.log"),
+                )
+            )
+
+            progress = service.get_job("qj_progress_identity").progress
+
+        self.assertEqual(progress["run_id"], "wanted")
+        self.assertEqual(progress["stage"], "screening")
+
+    def test_submission_freezes_generated_progress_identity_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
+            with patch.object(service, "_start_job"):
+                robust = service.submit_job(
+                    "run_robust_signal_research", {"smoke": True}
+                )
+                candidate = service.submit_job(
+                    "run_candidate_pipeline",
+                    {"provider": "canonical", "dry_run": True},
+                )
+
+        self.assertRegex(robust.params["run_id"], r"^robust_signal_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}$")
+        self.assertIn(robust.params["run_id"], robust.command)
+        self.assertRegex(candidate.params["batch_id"], r"^candidate-alpha158-[0-9]{8}_[0-9]{6}$")
+        timestamp = candidate.params["batch_id"].removeprefix("candidate-alpha158-")
+        self.assertEqual(candidate.command[-2:], ["--timestamp", timestamp])
 
 
 if __name__ == "__main__":

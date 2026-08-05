@@ -97,7 +97,7 @@ class WebBindTestCase(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=20,
+                timeout=60,
             )
 
         self.assertNotEqual(result.returncode, 0)

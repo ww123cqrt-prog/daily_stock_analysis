@@ -1,11 +1,13 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
+import type { TrainedStrategyCatalogStrategy } from '../../types/backtest';
 import BacktestPage from '../BacktestPage';
 
-const { getResearchStatus, runFormStrategy, runScriptStrategy, runTrainedStrategy } = vi.hoisted(() => ({
+const { getResearchStatus, getTrainedStrategyCatalog, runFormStrategy, runScriptStrategy, runTrainedStrategy } = vi.hoisted(() => ({
   getResearchStatus: vi.fn(),
+  getTrainedStrategyCatalog: vi.fn(),
   runFormStrategy: vi.fn(),
   runScriptStrategy: vi.fn(),
   runTrainedStrategy: vi.fn(),
@@ -13,6 +15,7 @@ const { getResearchStatus, runFormStrategy, runScriptStrategy, runTrainedStrateg
 
 vi.mock('../../api/backtest', () => ({
   backtestApi: {
+    getTrainedStrategyCatalog,
     runFormStrategy,
     runScriptStrategy,
     runTrainedStrategy,
@@ -100,6 +103,21 @@ const trainedReport = {
   strategyId: 'combined_risk',
   strategyLabel: '完整组合风控',
   provider: 'canonical',
+  providerIdentity: { snapshotId: 'snapshot-candidate' },
+  artifactSha256: { 'pred.pkl': 'a'.repeat(64), 'label.pkl': 'b'.repeat(64) },
+  strategyConfig: { rebalanceFreq: 5 },
+  replayMode: 'exact',
+  replayEngine: 'dsa_optimized_strategy',
+  modifiedFromOriginal: false,
+  configHash: 'c'.repeat(64),
+  contractVersion: 1,
+  originalParameters: {
+    startDate: '2024-01-01',
+    endDate: '2026-07-10',
+    topk: 50,
+    costBps: 15,
+  },
+  executionAssumptions: {},
   period: { startDate: '2024-01-02', endDate: '2026-07-10' },
   parameters: {
     startDate: '2024-01-01',
@@ -146,6 +164,37 @@ function renderPage(initialEntry = '/backtest') {
   );
 }
 
+const BacktestQuerySwitcher = () => {
+  const navigate = useNavigate();
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => navigate('/backtest?tab=trained&runId=latest-run&modelId=latest&strategyId=baseline_daily')}
+      >
+        Switch trained Run
+      </button>
+      <button
+        type="button"
+        onClick={() => navigate('/backtest?tab=trained&runId=run-xgb&modelId=latest&strategyId=combined_risk')}
+      >
+        Switch mismatched Run
+      </button>
+    </>
+  );
+};
+
+function renderPageWithQuerySwitcher(initialEntry: string) {
+  render(
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <UiLanguageProvider>
+        <BacktestQuerySwitcher />
+        <BacktestPage />
+      </UiLanguageProvider>
+    </MemoryRouter>,
+  );
+}
+
 describe('BacktestPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -154,6 +203,84 @@ describe('BacktestPage', () => {
     runScriptStrategy.mockResolvedValue({ ...report, strategyName: 'python_script' });
     runFormStrategy.mockResolvedValue(report);
     runTrainedStrategy.mockResolvedValue(trainedReport);
+    getTrainedStrategyCatalog.mockResolvedValue({
+      status: 'completed',
+      generatedAt: '2026-08-02T12:00:00+08:00',
+      runs: [
+        {
+          runId: 'run-xgb',
+          modelId: 'xgboost',
+          modelLabel: 'XGBoost',
+          sourceType: 'candidate',
+          generatedAt: '2026-08-02T10:00:00+08:00',
+          provider: 'canonical',
+          providerIdentity: { snapshotId: 'snapshot-candidate' },
+          periods: {
+            training: ['2020-01-02', '2022-12-31'],
+            selection: ['2024-01-01', '2025-12-31'],
+            holdout: ['2026-01-01', '2026-07-10'],
+          },
+          originalParameters: {
+            startDate: '2024-01-01',
+            endDate: '2025-12-31',
+            topk: 50,
+            costBps: 15,
+          },
+          strategies: [
+            {
+              id: 'combined_risk',
+              label: '完整组合风控',
+              config: { rebalanceFreq: 5 },
+              exactReplayAvailable: true,
+              replayEngine: 'dsa_optimized_strategy',
+            },
+          ],
+          configHash: 'c'.repeat(64),
+          contractVersion: 2,
+          exactReplayAvailable: true,
+          customReplayAvailable: true,
+          replayCapability: 'exact_and_custom',
+        },
+        {
+          runId: 'latest-run',
+          modelId: 'latest',
+          modelLabel: 'baseline_lgb_alpha158',
+          sourceType: 'baseline',
+          generatedAt: '2026-08-02T09:00:00+08:00',
+          provider: 'canonical',
+          providerIdentity: { snapshotId: 'snapshot-baseline' },
+          periods: { test: ['2024-01-01', '2026-07-10'] },
+          originalParameters: {
+            strategyId: 'baseline_daily',
+            startDate: '2024-01-01',
+            endDate: '2026-07-10',
+            topk: 50,
+            costBps: 15,
+          },
+          strategies: [
+            {
+              id: 'baseline_daily',
+              label: '每日 TopK 等权基线',
+              config: { rebalanceFreq: 1 },
+              exactReplayAvailable: true,
+              replayEngine: 'qlib_portana',
+            },
+            {
+              id: 'low_turnover_weekly',
+              label: '每周低换手',
+              config: { rebalanceFreq: 5 },
+              exactReplayAvailable: false,
+              replayEngine: 'dsa_optimized_strategy',
+            },
+          ],
+          configHash: 'd'.repeat(64),
+          contractVersion: 2,
+          exactReplayAvailable: true,
+          customReplayAvailable: true,
+          replayCapability: 'exact_and_custom',
+        },
+      ],
+    });
     getResearchStatus.mockResolvedValue({
       generatedAt: '2026-07-15T18:00:00+08:00',
       trainable: true,
@@ -264,7 +391,7 @@ describe('BacktestPage', () => {
 
     expect(screen.getByRole('tab', { name: '选股模型与交易策略' })).toHaveAttribute('aria-selected', 'true');
     expect(await screen.findByRole('heading', { name: '选股模型与交易策略' })).toBeInTheDocument();
-    expect(screen.getByLabelText('选股模型')).toHaveValue('xgboost');
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('run-xgb:xgboost');
     expect(screen.getByLabelText('交易策略')).toHaveValue('combined_risk');
     expect(screen.getAllByText('XGBoost').length).toBeGreaterThan(0);
     expect(screen.getAllByText('完整组合风控').length).toBeGreaterThan(0);
@@ -274,25 +401,56 @@ describe('BacktestPage', () => {
     expect(screen.getByText('留出期年化超额')).toBeInTheDocument();
     expect(screen.getByText('6.00%')).toBeInTheDocument();
     expect(screen.getByLabelText('回测开始日期')).toHaveValue('2024-01-01');
-    expect(screen.getByLabelText('回测结束日期')).toHaveValue('2026-07-10');
+    expect(screen.getByLabelText('回测结束日期')).toHaveValue('2025-12-31');
     expect(screen.getByLabelText('每次持有股票数（TopK）')).toHaveValue(50);
     expect(screen.getByLabelText('回测成本（基点，1基点=0.01%）')).toHaveValue(15);
 
-    fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
+    fireEvent.click(screen.getByRole('button', { name: '按原条件重放' }));
     await waitFor(() => expect(runTrainedStrategy).toHaveBeenCalledWith({
       runId: 'run-xgb',
       modelId: 'xgboost',
       strategyId: 'combined_risk',
-      startDate: '2024-01-01',
-      endDate: '2026-07-10',
-      topk: 50,
-      costBps: 15,
+      replayMode: 'exact',
     }));
     expect(await screen.findByRole('heading', { name: '本次重新计算结果' })).toBeInTheDocument();
     expect(screen.getByText('10.00%')).toBeInTheDocument();
     expect(screen.getByTestId('trained-strategy-equity-chart')).toBeInTheDocument();
     expect(runScriptStrategy).not.toHaveBeenCalled();
     expect(runFormStrategy).not.toHaveBeenCalled();
+  });
+
+  it('loads a different trained Run when the query changes without remounting the page', async () => {
+    renderPageWithQuerySwitcher('/backtest?tab=trained&runId=run-xgb&modelId=xgboost&strategyId=combined_risk');
+
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('run-xgb:xgboost');
+    fireEvent.click(screen.getByRole('button', { name: '按原条件重放' }));
+    expect(await screen.findByRole('heading', { name: '本次重新计算结果' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch trained Run' }));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('选股模型')).toHaveValue('latest-run:latest');
+    });
+    expect(screen.getByLabelText('交易策略')).toHaveValue('baseline_daily');
+    expect(screen.queryByRole('heading', { name: '本次重新计算结果' })).not.toBeInTheDocument();
+  });
+
+  it('clears the loaded selection and result when a changed deep link mismatches Run and model identity', async () => {
+    renderPageWithQuerySwitcher('/backtest?tab=trained&runId=run-xgb&modelId=xgboost&strategyId=combined_risk');
+
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('run-xgb:xgboost');
+    fireEvent.click(screen.getByRole('button', { name: '按原条件重放' }));
+    expect(await screen.findByRole('heading', { name: '本次重新计算结果' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch mismatched Run' }));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('选股模型')).toHaveValue('');
+    });
+    expect(screen.getByLabelText('交易策略')).toHaveValue('');
+    expect(screen.getByText('无法加载链接中的回测对象')).toBeInTheDocument();
+    expect(screen.getByText(/链接指定的 Run、选股模型或交易策略不可用或彼此不匹配/)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '本次重新计算结果' })).not.toBeInTheDocument();
   });
 
   it('marks a candidate result from the compatibility provider as historical', async () => {
@@ -370,21 +528,92 @@ describe('BacktestPage', () => {
 
     expect(screen.getByRole('tab', { name: '选股模型与交易策略' })).toHaveAttribute('aria-selected', 'true');
     expect(await screen.findByRole('heading', { name: '选股模型与交易策略' })).toBeInTheDocument();
-    expect(screen.getByLabelText('选股模型')).toHaveValue('latest');
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('latest-run:latest');
     expect(screen.getByLabelText('交易策略')).toHaveValue('low_turnover_weekly');
     expect(screen.getByRole('option', { name: '每日 TopK 等权基线' })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: '每周低换手' })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: 'Qlib 默认组合回测' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
+    fireEvent.click(screen.getByRole('button', { name: '按当前设置新回测' }));
     await waitFor(() => expect(runTrainedStrategy).toHaveBeenCalledWith({
       runId: 'latest-run',
       modelId: 'latest',
       strategyId: 'low_turnover_weekly',
+      replayMode: 'custom',
       startDate: '2024-01-01',
       endDate: '2026-07-10',
       topk: 50,
       costBps: 15,
     }));
+  });
+
+  it('keeps two Runs of the same model separately selectable', async () => {
+    const current = await getTrainedStrategyCatalog();
+    getTrainedStrategyCatalog.mockResolvedValueOnce({
+      ...current,
+      runs: [
+        current.runs[0],
+        { ...current.runs[0], runId: 'run-xgb-old', generatedAt: '2026-07-01T10:00:00+08:00' },
+      ],
+    });
+
+    renderPage('/backtest?tab=trained&runId=run-xgb-old&modelId=xgboost&strategyId=combined_risk');
+
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('run-xgb-old:xgboost');
+    expect(screen.getByRole('option', { name: /run-xgb-old/ })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /Run run-xgb$/ })).toBeInTheDocument();
+  });
+
+  it('excludes unavailable historical Runs from the backtest selector and explains why', async () => {
+    const current = await getTrainedStrategyCatalog();
+    getTrainedStrategyCatalog.mockResolvedValueOnce({
+      ...current,
+      runs: [
+        {
+          ...current.runs[0],
+          runId: 'unavailable-run',
+          providerIdentity: {},
+          strategies: [],
+          exactReplayAvailable: false,
+          customReplayAvailable: false,
+          replayCapability: 'unavailable',
+          replayUnavailableReason: '该 Run 缺少不可变数据身份或冻结交易策略配置，不能回测。',
+        },
+        ...current.runs,
+      ],
+    });
+
+    renderPage('/backtest?tab=trained&runId=unavailable-run&modelId=xgboost&strategyId=combined_risk');
+
+    expect(await screen.findByLabelText('选股模型')).toHaveValue('');
+    expect(screen.getByLabelText('交易策略')).toHaveValue('');
+    expect(screen.getByText('无法加载链接中的回测对象')).toBeInTheDocument();
+    expect(screen.getByText(/链接指定的 Run、选股模型或交易策略不可用或彼此不匹配/)).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /unavailable-run/ })).not.toBeInTheDocument();
+    expect(screen.getByText('1 个历史 Run 缺少回测契约')).toBeInTheDocument();
+    expect(screen.getByText('该 Run 缺少不可变数据身份或冻结交易策略配置，不能回测。')).toBeInTheDocument();
+  });
+
+  it('labels a legacy Run as custom-only and disables exact replay', async () => {
+    const current = await getTrainedStrategyCatalog();
+    getTrainedStrategyCatalog.mockResolvedValueOnce({
+      ...current,
+      runs: [{
+        ...current.runs[1],
+        strategies: current.runs[1].strategies.map((strategy: TrainedStrategyCatalogStrategy) => ({
+          ...strategy,
+          exactReplayAvailable: false,
+        })),
+        exactReplayAvailable: false,
+        replayCapability: 'custom_only',
+        replayUnavailableReason: '旧版 Run 没有可验证的精确重放契约，只能明确标记后自定义回测。',
+      }],
+    });
+
+    renderPage('/backtest?tab=trained&runId=latest-run&modelId=latest&strategyId=baseline_daily');
+
+    expect(await screen.findByText(/旧版 Run 没有可验证的精确重放契约/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '按原条件重放' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '按当前设置新回测' })).toBeEnabled();
   });
 });

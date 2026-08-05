@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from src.services import mlflow_service
@@ -8,6 +9,18 @@ from src.services import mlflow_service
 
 class _FakeProcess:
     pid = 4321
+
+    @staticmethod
+    def poll() -> None:
+        return None
+
+
+class _ExitedProcess:
+    pid = 9876
+
+    @staticmethod
+    def poll() -> int:
+        return 1
 
 
 def test_start_local_mlflow_service_uses_fixed_detached_command(
@@ -74,3 +87,62 @@ def test_start_local_mlflow_service_does_not_launch_duplicate(monkeypatch, tmp_p
     result = mlflow_service.start_local_mlflow_service(repo_root=tmp_path, wait_seconds=0)
 
     assert result == {"status": "available", "port": 6006}
+
+
+def test_start_local_mlflow_service_preserves_virtualenv_python_symlink(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+    interpreter = tmp_path / "runtime" / "python3.11"
+    interpreter.parent.mkdir()
+    interpreter.touch()
+    virtualenv_python = tmp_path / ".venv" / "bin" / "python"
+    virtualenv_python.parent.mkdir(parents=True)
+    os.symlink(interpreter, virtualenv_python)
+
+    monkeypatch.setattr(mlflow_service, "_port_is_open", lambda: False)
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        return _FakeProcess()
+
+    monkeypatch.setattr(mlflow_service.subprocess, "Popen", fake_popen)
+
+    mlflow_service.start_local_mlflow_service(
+        repo_root=tmp_path,
+        python_executable=virtualenv_python,
+        wait_seconds=0,
+    )
+
+    assert observed["command"][0] == str(virtualenv_python)
+
+
+def test_start_local_mlflow_service_reports_immediate_process_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(mlflow_service, "_port_is_open", lambda: False)
+    monkeypatch.setattr(
+        mlflow_service.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _ExitedProcess(),
+    )
+
+    result = mlflow_service.start_local_mlflow_service(
+        repo_root=tmp_path,
+        python_executable=Path("/opt/dsa/.venv/bin/python"),
+        wait_seconds=0,
+    )
+
+    assert result == {
+        "status": "failed",
+        "message": "MLflow 进程启动后立即退出，请检查 logs/mlflow_6006.log。",
+        "pid": 9876,
+        "port": 6006,
+    }
+    launch_record = json.loads(
+        (tmp_path / ".local" / "services" / "mlflow-6006.json").read_text(encoding="utf-8")
+    )
+    assert launch_record["status"] == "failed"
+    assert launch_record["returnCode"] == 1

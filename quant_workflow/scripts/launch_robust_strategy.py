@@ -33,7 +33,8 @@ from run_robust_strategy import (  # noqa: E402
 
 LAUNCHCTL = "/bin/launchctl"
 ACTIVE_LAUNCH_STATUSES = {"starting", "running"}
-TERMINAL_LIFECYCLE_STATUSES = {"completed", "stopped"}
+TERMINAL_LIFECYCLE_STATUSES = {"cancelled", "completed", "failed", "stopped"}
+FAILED_LAUNCH_STATUSES = {"failed", "failed_to_start", "stale", "stopped"}
 WORKER_ENV_NAMES = (
     "HOME",
     "LANG",
@@ -156,6 +157,18 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def launch_result_exit_code(result: Mapping[str, Any]) -> int:
+    try:
+        return_code = int(result.get("return_code") or 0)
+    except (TypeError, ValueError):
+        return_code = 0
+    if return_code != 0:
+        return return_code if 0 < return_code <= 255 else 1
+    if str(result.get("status") or "") in FAILED_LAUNCH_STATUSES:
+        return 1
+    return 0
+
+
 @contextmanager
 def _claim_launch_record(
     report_dir: Path, run_id: str, *, runner_namespace: str = "runner"
@@ -209,6 +222,156 @@ def _write_pipeline_state(path: Path, state: dict[str, Any]) -> None:
         path,
         json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
+
+
+def cancel_launchd_runner(
+    *,
+    report_dir: Path,
+    run_id: str,
+    runner_namespace: str = "runner",
+    terminal_state_path: Path | None = None,
+    launchctl_runner: Callable[..., Any] = subprocess.run,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    pid_alive: Callable[[int], bool] = _pid_alive,
+    uid: int | None = None,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Stop an owned launchd job and verify that its recorded child is gone."""
+
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("run_id contains unsupported characters")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", runner_namespace) is None:
+        raise ValueError("runner_namespace contains unsupported characters")
+    if timeout_seconds < 0:
+        raise ValueError("timeout_seconds must be nonnegative")
+
+    report_dir = Path(report_dir).expanduser().resolve()
+    runner_dir = report_dir / runner_namespace / run_id
+    launch_path = runner_dir / "launch.json"
+    pid_path = runner_dir / "pid"
+    expected_domain = f"gui/{os.getuid() if uid is None else int(uid)}"
+    expected_label = _launchd_label(run_id)
+
+    def preserve_terminal_state(
+        launch_record: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if terminal_state_path is None:
+            return None
+        run_state = _read_json(Path(terminal_state_path))
+        lifecycle = str(run_state.get("lifecycle_status") or "")
+        if run_state.get("run_id") != run_id or lifecycle not in TERMINAL_LIFECYCLE_STATUSES:
+            return None
+        reconciled = {
+            **launch_record,
+            "status": lifecycle,
+            "cancel_outcome": "already_terminal",
+            "observed_run_status": run_state.get("status"),
+            "reconciled_at": datetime.now()
+            .astimezone()
+            .isoformat(timespec="seconds"),
+        }
+        _write_pipeline_state(launch_path, reconciled)
+        return reconciled
+
+    with _claim_launch_record(
+        report_dir, run_id, runner_namespace=runner_namespace
+    ):
+        if launch_path.is_symlink() or not launch_path.is_file():
+            raise RuntimeError("launchd runner ownership record is unavailable")
+        launch_record = _read_json(launch_path)
+        if (
+            launch_record.get("run_id") != run_id
+            or launch_record.get("launch_backend") != "launchd"
+            or launch_record.get("launchd_domain") != expected_domain
+            or launch_record.get("job_label") != expected_label
+        ):
+            raise RuntimeError("launchd runner ownership could not be verified")
+
+        already_terminal = preserve_terminal_state(launch_record)
+        if already_terminal is not None:
+            return already_terminal
+
+        try:
+            record_pid = int(launch_record.get("pid") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("launchd runner ownership has an invalid child PID") from exc
+        child_pid = record_pid
+        if pid_path.exists() or pid_path.is_symlink():
+            if pid_path.is_symlink() or not pid_path.is_file():
+                raise RuntimeError("launchd runner ownership PID record is invalid")
+            try:
+                child_pid = int(pid_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    "launchd runner ownership PID record is invalid"
+                ) from exc
+            if record_pid > 0 and child_pid != record_pid:
+                raise RuntimeError("launchd runner ownership PID no longer matches")
+        if child_pid <= 0:
+            raise RuntimeError("launchd runner ownership has no recorded child PID")
+
+        job = _launchd_job_info(
+            expected_domain,
+            expected_label,
+            launchctl_runner=launchctl_runner,
+        )
+        recorded_launchd_pid = int(launch_record.get("launchd_pid") or 0)
+        current_launchd_pid = int((job or {}).get("pid") or 0)
+        if (
+            job is not None
+            and recorded_launchd_pid > 0
+            and current_launchd_pid > 0
+            and current_launchd_pid != recorded_launchd_pid
+        ):
+            raise RuntimeError("launchd runner ownership PID no longer matches")
+        if job is None and pid_alive(child_pid):
+            raise RuntimeError(
+                "launchd runner ownership is missing; refusing to signal an orphan PID"
+            )
+
+        bootout_return_code: int | None = None
+        if job is not None:
+            completed = launchctl_runner(
+                [LAUNCHCTL, "bootout", f"{expected_domain}/{expected_label}"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            bootout_return_code = int(completed.returncode)
+
+        deadline = time.monotonic() + float(timeout_seconds)
+        while True:
+            remaining_job = _launchd_job_info(
+                expected_domain,
+                expected_label,
+                launchctl_runner=launchctl_runner,
+            )
+            child_still_alive = pid_alive(child_pid)
+            if remaining_job is None and not child_still_alive:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "launchd runner cancellation could not be confirmed"
+                )
+            sleep_fn(0.1)
+
+        if bootout_return_code is None or bootout_return_code != 0:
+            already_terminal = preserve_terminal_state(_read_json(launch_path))
+            if already_terminal is not None:
+                return already_terminal
+
+        cancelled_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        cancelled = {
+            **launch_record,
+            "status": "cancelled",
+            "reason_code": "user_cancelled",
+            "bootout_return_code": bootout_return_code,
+            "cancelled_at": cancelled_at,
+            "verified_stopped_at": cancelled_at,
+        }
+        _write_pipeline_state(launch_path, cancelled)
+        return cancelled
 
 
 def _reconcile_existing_runner(
@@ -705,7 +868,7 @@ def main(argv: list[str] | None = None) -> int:
         warmup_seconds=args.warmup_seconds,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
+    return launch_result_exit_code(result)
 
 
 if __name__ == "__main__":

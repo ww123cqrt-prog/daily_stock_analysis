@@ -195,6 +195,27 @@ def test_proxy_exposes_fixed_local_mlflow_start_endpoint(monkeypatch: pytest.Mon
     assert calls == [True]
 
 
+def test_proxy_returns_visible_error_when_mlflow_process_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        mlflow_proxy,
+        "start_local_mlflow_service",
+        lambda: {
+            "status": "failed",
+            "message": "MLflow 进程启动后立即退出，请检查 logs/mlflow_6006.log。",
+            "pid": 9876,
+            "port": 6006,
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"start request must not reach MLflow upstream: {request.url}")
+
+    response = _client(handler).post("/experiments/__dsa_control__/start")
+
+    assert response.status_code == 500
+    assert response.json()["message"] == "MLflow 进程启动后立即退出，请检查 logs/mlflow_6006.log。"
+
+
 def test_proxy_forwards_head_without_a_response_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "HEAD"

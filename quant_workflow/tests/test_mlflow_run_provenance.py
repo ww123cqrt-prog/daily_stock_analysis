@@ -338,6 +338,7 @@ def test_tag_run_artifact_hashes_records_every_supported_local_artifact(
     mlruns = tmp_path / "mlruns"
     run_dir = mlruns / "123" / "safe_run"
     pred = run_dir / "artifacts" / "pred.pkl"
+    task = run_dir / "artifacts" / "task"
     report = (
         run_dir
         / "artifacts"
@@ -347,6 +348,7 @@ def test_tag_run_artifact_hashes_records_every_supported_local_artifact(
     pred.parent.mkdir(parents=True)
     report.parent.mkdir(parents=True)
     pred.write_bytes(b"prediction")
+    task.write_bytes(b"task")
     report.write_bytes(b"portfolio")
     client = FakeClient([fake_run("safe_run")])
 
@@ -361,10 +363,14 @@ def test_tag_run_artifact_hashes_records_every_supported_local_artifact(
             report.read_bytes()
         ).hexdigest(),
         "pred.pkl": hashlib.sha256(pred.read_bytes()).hexdigest(),
+        "task": hashlib.sha256(task.read_bytes()).hexdigest(),
     }
     assert client.tags[
         ("safe_run", module.ARTIFACT_SHA256_TAGS["pred.pkl"])
     ] == hashes["pred.pkl"]
+    assert client.tags[
+        ("safe_run", module.ARTIFACT_SHA256_TAGS["task"])
+    ] == hashes["task"]
     assert client.tags[
         (
             "safe_run",

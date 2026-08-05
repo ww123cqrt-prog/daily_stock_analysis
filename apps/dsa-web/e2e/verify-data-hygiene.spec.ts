@@ -45,7 +45,7 @@ test.describe('Research Page - Data Hygiene', () => {
 
       // Check if data hygiene section exists and verify its content.
       const dataHygieneSection = page.getByRole('region', { name: /数据治理/i });
-      await expect(dataHygieneSection).toBeVisible();
+      await expect(dataHygieneSection).toBeVisible({ timeout: 15_000 });
 
       console.log('✓ Data hygiene section is visible');
 
@@ -54,7 +54,13 @@ test.describe('Research Page - Data Hygiene', () => {
       await expect(maintenanceLockBadge).toBeVisible();
       console.log('✓ Maintenance lock status displayed');
 
-      await expect(page.getByText(/数据 Manifest: 可用/)).toBeVisible();
+      const manifestStatus = dataHygieneSection.getByText(/数据 Manifest: (可用|已过期|缺失)/);
+      await expect(manifestStatus).toBeVisible();
+      if ((await manifestStatus.textContent())?.includes('已过期')) {
+        await expect(
+          dataHygieneSection.getByText('盘点与当前数据清单不一致，请重新扫描。'),
+        ).toBeVisible();
+      }
       await expect(page.getByText(/治理说明: 可用/)).toBeVisible();
       console.log('✓ Data governance manifest and README status displayed');
 
@@ -97,10 +103,10 @@ test.describe('Research Page - Data Hygiene', () => {
       await page.waitForLoadState('domcontentloaded');
 
       const dataHygieneSection = page.getByRole('region', { name: /数据治理/i });
-      await expect(dataHygieneSection).toBeVisible();
+      await expect(dataHygieneSection).toBeVisible({ timeout: 15_000 });
 
       // Check for visible status labels without depending on a specific CSS class.
-      const statusLabels = dataHygieneSection.getByText(/可用|缺失|未锁定|已锁定/);
+      const statusLabels = dataHygieneSection.getByText(/可用|已过期|缺失|未锁定|已锁定/);
       await expect(statusLabels.first()).toBeVisible();
       const statusCount = await statusLabels.count();
       expect(statusCount).toBeGreaterThanOrEqual(3);

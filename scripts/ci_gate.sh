@@ -23,7 +23,7 @@ deterministic_checks() {
 
 offline_test_suite() {
   echo "==> backend-gate: offline test suite"
-  python -m pytest -m "not network"
+  python -m pytest tests -m "not network"
 }
 
 run_all() {

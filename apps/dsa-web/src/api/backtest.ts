@@ -13,25 +13,40 @@ import type {
   ScriptStrategyBacktestRunRequest,
   TrainedStrategyBacktestResponse,
   TrainedStrategyBacktestRunRequest,
+  TrainedStrategyCatalogResponse,
 } from '../types/backtest';
 
 // ============ API ============
 
+const TRAINED_STRATEGY_REPLAY_TIMEOUT_MS = 120_000;
+
 export const backtestApi = {
+  getTrainedStrategyCatalog: async (): Promise<TrainedStrategyCatalogResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/trained/catalog',
+    );
+    return toCamelCase<TrainedStrategyCatalogResponse>(response.data);
+  },
+
   runTrainedStrategy: async (
     params: TrainedStrategyBacktestRunRequest,
   ): Promise<TrainedStrategyBacktestResponse> => {
+    const requestData: Record<string, unknown> = {
+      run_id: params.runId,
+      model_id: params.modelId,
+      strategy_id: params.strategyId,
+      replay_mode: params.replayMode,
+    };
+    if (params.replayMode === 'custom') {
+      requestData.start_date = params.startDate;
+      requestData.end_date = params.endDate;
+      requestData.topk = params.topk;
+      requestData.cost_bps = params.costBps;
+    }
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/backtest/strategy/trained',
-      {
-        run_id: params.runId,
-        model_id: params.modelId,
-        strategy_id: params.strategyId,
-        start_date: params.startDate,
-        end_date: params.endDate,
-        topk: params.topk,
-        cost_bps: params.costBps,
-      },
+      requestData,
+      { timeout: TRAINED_STRATEGY_REPLAY_TIMEOUT_MS },
     );
     return toCamelCase<TrainedStrategyBacktestResponse>(response.data);
   },

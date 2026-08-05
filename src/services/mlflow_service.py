@@ -72,7 +72,7 @@ def start_local_mlflow_service(
             return {"status": "available", "port": MLFLOW_PORT}
 
         root = (repo_root or _default_repo_root()).resolve()
-        python = (python_executable or Path(sys.executable)).resolve()
+        python = Path(python_executable or sys.executable).expanduser().absolute()
         configured_store = os.getenv("QUANT_WORKFLOW_MLRUNS_DIR", "").strip()
         store = Path(configured_store).expanduser().resolve() if configured_store else root / "quant_workflow" / "mlruns"
         log_path = root / "logs" / "mlflow_6006.log"
@@ -111,23 +111,36 @@ def start_local_mlflow_service(
             )
 
         deadline = time.monotonic() + max(0.0, wait_seconds)
+        return_code: int | None = None
         while time.monotonic() < deadline:
             if _port_is_open():
                 status = "available"
                 break
+            return_code = process.poll()
+            if return_code is not None:
+                status = "failed"
+                break
             time.sleep(0.1)
         else:
-            status = "starting"
+            return_code = process.poll()
+            status = "failed" if return_code is not None else "starting"
 
-        _write_launch_record(
-            record_path,
-            {
-                "command": command,
-                "log": str(log_path.relative_to(root)),
-                "pid": process.pid,
-                "port": MLFLOW_PORT,
-                "startedAt": datetime.now(timezone.utc).isoformat(),
-                "status": status,
-            },
-        )
-        return {"status": status, "pid": process.pid, "port": MLFLOW_PORT}
+        launch_record = {
+            "command": command,
+            "log": str(log_path.relative_to(root)),
+            "pid": process.pid,
+            "port": MLFLOW_PORT,
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        }
+        result: dict[str, Any] = {
+            "status": status,
+            "pid": process.pid,
+            "port": MLFLOW_PORT,
+        }
+        if status == "failed":
+            message = "MLflow 进程启动后立即退出，请检查 logs/mlflow_6006.log。"
+            launch_record["returnCode"] = return_code
+            result["message"] = message
+        _write_launch_record(record_path, launch_record)
+        return result

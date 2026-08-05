@@ -249,7 +249,7 @@ run_backend() {
 
   section "DSA full backend pytest"
   cd "${REPO_ROOT}"
-  "${PYTHON_BIN}" -m pytest -q
+  "${PYTHON_BIN}" -m pytest tests -q
 }
 
 run_frontend() {
@@ -272,7 +272,8 @@ run_quant_workflow() {
   fi
   check_quant_workflow_scripts
   cd "${QUANT_WORKFLOW_ROOT}"
-  "${PYTHON_BIN}" -m pytest tests -q
+  PYTHONPATH="${QUANT_WORKFLOW_ROOT}/scripts${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PYTHON_BIN}" -m pytest tests -q
 }
 
 run_browser_local() {

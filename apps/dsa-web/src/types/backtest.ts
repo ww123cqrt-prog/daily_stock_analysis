@@ -65,10 +65,50 @@ export interface TrainedStrategyBacktestRunRequest {
   runId: string;
   modelId: string;
   strategyId: string;
-  startDate: string;
-  endDate: string;
-  topk: number;
-  costBps: number;
+  replayMode: 'exact' | 'custom';
+  startDate?: string;
+  endDate?: string;
+  topk?: number;
+  costBps?: number;
+}
+
+export interface TrainedStrategyCatalogStrategy {
+  id: string;
+  label: string;
+  config: Record<string, unknown>;
+  exactReplayAvailable: boolean;
+  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
+}
+
+export interface TrainedStrategyCatalogRun {
+  runId: string;
+  modelId: string;
+  modelLabel: string;
+  sourceType: 'baseline' | 'candidate';
+  generatedAt: string;
+  provider: string;
+  providerIdentity: Record<string, string>;
+  periods: Record<string, string[]>;
+  originalParameters: {
+    strategyId?: string;
+    startDate?: string;
+    endDate?: string;
+    topk?: number;
+    costBps?: number;
+  };
+  strategies: TrainedStrategyCatalogStrategy[];
+  configHash?: string | null;
+  contractVersion?: number | null;
+  exactReplayAvailable: boolean;
+  customReplayAvailable: boolean;
+  replayCapability: 'exact_and_custom' | 'custom_only' | 'unavailable';
+  replayUnavailableReason?: string | null;
+}
+
+export interface TrainedStrategyCatalogResponse {
+  status: 'completed' | 'missing';
+  generatedAt: string;
+  runs: TrainedStrategyCatalogRun[];
 }
 
 export interface TrainedStrategyBacktestMetrics {
@@ -106,6 +146,24 @@ export interface TrainedStrategyBacktestResponse {
   strategyId: string;
   strategyLabel: string;
   provider: string;
+  providerIdentity: Record<string, string>;
+  artifactSha256: Record<string, string>;
+  strategyConfig: Record<string, unknown>;
+  replayMode: 'exact' | 'custom';
+  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
+  sourceReplayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
+  modifiedFromOriginal: boolean;
+  configHash?: string | null;
+  contractVersion?: number | null;
+  originalParameters: Record<string, unknown>;
+  executionAssumptions: Record<string, unknown>;
+  exactMetricValidation?: {
+    status: 'pass';
+    tolerance: number;
+    maxAbsDifference: number;
+    saved: Record<string, number>;
+    replayed: Record<string, number>;
+  } | null;
   period: { startDate: string; endDate: string };
   parameters: {
     startDate: string;

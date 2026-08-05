@@ -370,6 +370,13 @@ class ReportCashControlBacktestTest(unittest.TestCase):
                     "load_portfolio_returns",
                     side_effect=AssertionError("unvalidated pickle was read"),
                 ),
+                patch.object(
+                    module,
+                    "ashare_qfq_bars_dir",
+                    side_effect=AssertionError(
+                        "explicit market data directory resolved the default snapshot"
+                    ),
+                ) as resolve_default,
             ):
                 exit_code = module.main()
 
@@ -380,6 +387,7 @@ class ReportCashControlBacktestTest(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 1)
+        resolve_default.assert_not_called()
         validate.assert_called_once_with(
             portfolio_report_path=report,
             run_id="safe_run",

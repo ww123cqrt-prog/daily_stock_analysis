@@ -89,6 +89,22 @@ def source_retrieval_window(paths: Sequence[Path]) -> dict[str, str]:
     }
 
 
+def _replace_with_reader_retry(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 8,
+) -> None:
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(min(0.02 * (2**attempt), 0.25))
+
+
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +115,7 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _replace_with_reader_retry(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -110,7 +126,7 @@ def atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         frame.to_parquet(temporary, index=False)
-        os.replace(temporary, path)
+        _replace_with_reader_retry(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -336,12 +352,43 @@ def expand_daily_factors(
     events = events.sort_values("source_event_date").drop_duplicates(
         "source_event_date", keep="last"
     )
+    paired_factors: pd.DataFrame | None = None
+    provider_terminal_factor = np.nan
+    if provider_qfq is not None:
+        paired_factors = derive_paired_daily_factors(raw_bars, provider_qfq)
+        provider_terminal_factor = float(
+            paired_factors.sort_values("date")["factor"].iloc[-1]
+        )
+        if (
+            not np.isfinite(provider_terminal_factor)
+            or provider_terminal_factor <= 0
+        ):
+            raise BaostockV2Error("provider qfq terminal factor must be positive")
+        paired_factors = paired_factors.copy()
+        paired_factors["factor"] = (
+            paired_factors["factor"] / provider_terminal_factor
+        )
+    terminal_normalized = False
+    if not events.empty:
+        source_terminal_factor = float(events["factor"].iloc[-1])
+        if not np.isfinite(source_terminal_factor) or source_terminal_factor <= 0:
+            raise BaostockV2Error("terminal foreAdjustFactor must be positive")
+        if not np.isclose(source_terminal_factor, 1.0, atol=1e-6):
+            if paired_factors is None:
+                raise BaostockV2Error(
+                    "non-unit terminal foreAdjustFactor requires provider qfq verification"
+                )
+            events["factor"] = events["factor"] / source_terminal_factor
+            terminal_normalized = True
     first_raw_date = raw_dates["date"].iloc[0]
     if events.empty:
-        if provider_qfq is None:
+        if paired_factors is None:
             raise BaostockV2Error("factor events do not cover earliest raw bar")
-        paired = derive_paired_daily_factors(raw_bars, provider_qfq)
-        daily = raw_dates.merge(paired, on="date", validate="one_to_one")
+        daily = raw_dates.merge(
+            paired_factors,
+            on="date",
+            validate="one_to_one",
+        )
         daily["source_event_date"] = pd.NaT
         backfilled = pd.Series(False, index=daily.index)
         paired_fallback = pd.Series(True, index=daily.index)
@@ -362,39 +409,33 @@ def expand_daily_factors(
             daily.loc[missing, "factor"] = 1.0
             backfilled.loc[missing] = True
         elif missing.any():
-            if provider_qfq is None:
+            if paired_factors is None:
                 raise BaostockV2Error("factor events do not cover earliest raw bar")
-            paired = derive_paired_daily_factors(raw_bars, provider_qfq).set_index(
-                "date"
-            )
+            paired = paired_factors.set_index("date")
             missing_dates = daily.loc[missing, "date"]
             daily.loc[missing, "factor"] = missing_dates.map(paired["factor"])
             paired_fallback.loc[missing] = True
     if daily["factor"].isna().any() or (daily["factor"] <= 0).any():
         raise BaostockV2Error("factor events do not cover every raw bar")
-    latest_factor = (
-        float(events["factor"].iloc[-1])
-        if not events.empty
-        else float(daily["factor"].iloc[-1])
+    latest_factor = float(daily.sort_values("date")["factor"].iloc[-1])
+    if not np.isclose(latest_factor, 1.0, atol=1e-6, rtol=1e-6):
+        raise BaostockV2Error("provider qfq terminal factor must equal 1")
+    if terminal_normalized:
+        local_qfq = build_local_qfq(raw_bars, daily)
+        compare_provider_qfq(local_qfq, provider_qfq)
+    daily["factor_source"] = (
+        "baostock_foreAdjustFactor_terminal_normalized"
+        if terminal_normalized
+        else "baostock_foreAdjustFactor"
     )
-    if not np.isclose(latest_factor, 1.0, atol=1e-6):
-        if provider_qfq is None:
-            raise BaostockV2Error(
-                "non-unit terminal foreAdjustFactor requires provider qfq verification"
-            )
-        paired = derive_paired_daily_factors(raw_bars, provider_qfq)
-        paired_latest = float(paired.sort_values("date")["factor"].iloc[-1])
-        if not np.isclose(latest_factor, paired_latest, atol=1e-6, rtol=1e-6):
-            raise BaostockV2Error(
-                "terminal foreAdjustFactor does not match provider qfq"
-            )
-    daily["factor_source"] = "baostock_foreAdjustFactor"
     daily.loc[backfilled, "factor_source"] = "baostock_listing_gap_identity"
     daily.loc[paired_fallback, "factor_source"] = (
         "baostock_raw_qfq_pair_fallback"
     )
     daily["factor_backfilled_before_first_event"] = backfilled.astype(bool)
     daily["factor_paired_fallback"] = paired_fallback.astype(bool)
+    daily["factor_terminal_normalized"] = bool(terminal_normalized)
+    daily["provider_qfq_terminal_factor"] = provider_terminal_factor
     return daily.reset_index(drop=True)
 
 
@@ -429,6 +470,7 @@ def compare_provider_qfq(
     provider_qfq: pd.DataFrame,
     *,
     absolute_tolerance: float = 0.005,
+    terminal_ratio_tolerance: float = 1e-5,
 ) -> dict[str, Any]:
     left = local_qfq[["date", *PRICE_COLUMNS]].copy()
     right = provider_qfq[["date", *PRICE_COLUMNS]].copy()
@@ -437,18 +479,49 @@ def compare_provider_qfq(
     merged = left.merge(right, on="date", suffixes=("_local", "_provider"))
     if len(merged) != len(left) or len(merged) != len(right):
         raise BaostockV2Error("provider qfq dates do not match raw dates")
+    merged = merged.sort_values("date", kind="stable")
+    terminal_ratios: list[float] = []
+    for column in PRICE_COLUMNS:
+        local_value = float(
+            pd.to_numeric(merged[f"{column}_local"], errors="coerce").iloc[-1]
+        )
+        provider_value = float(
+            pd.to_numeric(
+                merged[f"{column}_provider"], errors="coerce"
+            ).iloc[-1]
+        )
+        if (
+            not np.isfinite(local_value)
+            or not np.isfinite(provider_value)
+            or local_value <= 0
+            or provider_value <= 0
+        ):
+            raise BaostockV2Error("provider qfq terminal OHLC must be positive")
+        terminal_ratios.append(local_value / provider_value)
+    provider_terminal_scale = float(np.median(terminal_ratios))
+    terminal_deviation = max(
+        abs(ratio / provider_terminal_scale - 1.0)
+        for ratio in terminal_ratios
+    )
+    if terminal_deviation > terminal_ratio_tolerance:
+        raise BaostockV2Error("provider qfq terminal OHLC scales disagree")
     maximum = 0.0
     for column in PRICE_COLUMNS:
         errors = (
             pd.to_numeric(merged[f"{column}_local"])
             - pd.to_numeric(merged[f"{column}_provider"])
+            * provider_terminal_scale
         ).abs()
         maximum = max(maximum, float(errors.max()))
         if (errors > absolute_tolerance).any():
             raise BaostockV2Error(
                 f"provider qfq mismatch for {column}: max error {float(errors.max()):.6f}"
             )
-    return {"rows": len(merged), "max_absolute_error": maximum}
+    return {
+        "rows": len(merged),
+        "max_absolute_error": maximum,
+        "provider_terminal_scale": provider_terminal_scale,
+    }
 
 
 def compare_legacy_qfq_directory(
@@ -1172,11 +1245,7 @@ def build_snapshots_from_bundle(
             daily_factors["factor_paired_fallback"].any()
         )
         non_unit_terminal_factor_symbols += int(
-            not np.isclose(
-                float(daily_factors.sort_values("date")["factor"].iloc[-1]),
-                1.0,
-                atol=1e-6,
-            )
+            daily_factors["factor_terminal_normalized"].any()
         )
         local_qfq = build_local_qfq(raw, daily_factors)
         if provider_qfq is not None:
@@ -1274,10 +1343,12 @@ def build_snapshots_from_bundle(
             "adjustment_as_of": through,
             "adjusted_fields": list(PRICE_COLUMNS),
             "normalization_rule": (
-                "provider_native_fore_adjust_factor; "
-                "non_unit_terminal_requires_same_provider_qfq_match"
+                "foreAdjustFactor_divided_by_terminal_when_non_unit; "
+                "latest_valid_trade_date_factor_equals_1; "
+                "provider_qfq_constant_scale_normalized_to_latest_valid_trade_date; "
+                "same_provider_qfq_full_history_verified"
             ),
-            "algorithm_version": "baostock-factor-evidence-v2",
+            "algorithm_version": "baostock-factor-evidence-v3",
             "provider_qfq_cross_check_max_absolute_error": maximum_error,
             "provider_qfq_cross_check_symbols": audited_symbols,
             "bounded_factor_start_backfill_symbols": bounded_factor_backfill_symbols,

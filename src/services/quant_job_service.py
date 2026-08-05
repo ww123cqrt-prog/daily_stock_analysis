@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -22,7 +23,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -92,11 +93,17 @@ CHILD_ENV_EXACT_NAMES = {
 CHILD_ENV_PREFIXES = ("BAOSTOCK_", "QLIB_")
 
 JOB_TERMINATE_TIMEOUT_SECONDS = 5
+RUNNER_IDENTITY_HANDSHAKE_TIMEOUT_SECONDS = 5.0
+RUNNER_IDENTITY_HANDSHAKE_POLL_SECONDS = 0.02
+RUNNER_IDENTITY_STARTUP_LEASE_SECONDS = 30.0
 RECOVERED_RUNNER_POLL_INTERVAL_SECONDS = 1.0
 RECOVERED_RUNNER_MAX_POLL_SECONDS = 48 * 60 * 60
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 EXIT_STATUS_FILENAME = "exit_status.json"
+RUNNER_IDENTITY_FILENAME = "runner_identity.json"
+START_PERMISSION_FILENAME = "start_permission.json"
 ARTIFACT_BASELINE_FILENAME = "artifact_baseline.json"
+PROGRESS_FILE_MAX_BYTES = 512_000
 JQDATA_WEB_DRY_RUN_DEFAULT_LIMIT = 3
 JQDATA_WEB_DRY_RUN_MAX_LIMIT = 20
 GENERIC_WEB_LIMIT_MAX = 10000
@@ -136,6 +143,9 @@ MARKET_REPORT_WEB_MAX_LOOKBACK_DAYS = 5000
 MARKET_REPORT_WEB_MAX_MIN_SYMBOLS = 10000
 OPTIMIZE_STRATEGY_WEB_MAX_PHASE = 4
 FORMAL_TRAINING_JOB_TYPES = {"train_baseline_lgb", "run_candidate_pipeline"}
+PROVIDER_PINNED_TRAINING_JOB_TYPES = FORMAL_TRAINING_JOB_TYPES | {
+    "train_baseline_lgb_equivalence"
+}
 TRAINING_PROVIDER_DATASET_IDS = {
     "canonical": "qlib_ashare_v2",
     "cleaned": "qlib_ashare_cleaned_v2",
@@ -147,20 +157,106 @@ PROVIDER_IDENTITY_FIELDS = (
     "manifest_sha256",
     "content_sha256",
 )
+MARKET_DATA_PINNED_JOB_TYPES = {
+    "report_market_regime",
+    "report_cash_control_backtest",
+}
+ASHARE_DAILY_QFQ_DATASET_ID = "ashare_daily_qfq"
+ASHARE_DAILY_QFQ_DATASET_ROOT = Path("parquet/ashare_1d/ashare_daily_qfq")
+MARKET_DATA_IDENTITY_FIELDS = (
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+    "state_fingerprint",
+)
 CONFIG_FILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _DURABLE_RUNNER_CODE = r"""
+import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
+import time
 import traceback
 
 command = json.loads(os.environ["QUANT_JOB_COMMAND_JSON"])
 cwd = os.environ.get("QUANT_JOB_CWD") or None
 exit_path = os.environ["QUANT_JOB_EXIT_STATUS_PATH"]
+identity_path = os.environ["QUANT_JOB_RUNNER_IDENTITY_PATH"]
+permission_path = os.environ.get("QUANT_JOB_START_PERMISSION_PATH") or ""
+launch_token = os.environ["QUANT_JOB_LAUNCH_TOKEN"]
+try:
+    startup_deadline_epoch = float(os.environ["QUANT_JOB_STARTUP_DEADLINE_EPOCH"])
+except (KeyError, TypeError, ValueError):
+    startup_deadline_epoch = float("nan")
+
+def write_exit_status(payload):
+    tmp_path = exit_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, exit_path)
+
+startup_expired_error = (
+    "Durable runner startup lease expired; the real command was not started."
+)
+if not math.isfinite(startup_deadline_epoch) or time.time() >= startup_deadline_epoch:
+    print(startup_expired_error, file=sys.stderr)
+    write_exit_status({"return_code": 75, "error": startup_expired_error})
+    sys.exit(75)
+
+command_sha256 = hashlib.sha256(
+    json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8")
+).hexdigest()
+identity_payload = {
+    "schema_version": 1,
+    "launch_token": launch_token,
+    "pid": os.getpid(),
+    "job_command_sha256": command_sha256,
+}
+identity_tmp_path = identity_path + ".tmp"
+with open(identity_tmp_path, "w", encoding="utf-8") as handle:
+    json.dump(identity_payload, handle, ensure_ascii=False, sort_keys=True)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(identity_tmp_path, identity_path)
+
+permission_error = (
+    "Durable runner start permission was not granted before the startup lease "
+    "expired; the real command was not started."
+)
+permission_granted = False
+while time.time() < startup_deadline_epoch:
+    try:
+        if permission_path and os.path.getsize(permission_path) <= 4096:
+            with open(permission_path, "r", encoding="utf-8") as handle:
+                permission = json.load(handle)
+            permission_granted = (
+                isinstance(permission, dict)
+                and permission.get("schema_version") == 1
+                and permission.get("launch_token") == launch_token
+                and permission.get("job_command_sha256") == command_sha256
+                and permission.get("pid") == os.getpid()
+            )
+            if permission_granted:
+                break
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    time.sleep(0.01)
+
+if not permission_granted:
+    print(permission_error, file=sys.stderr)
+    write_exit_status({"return_code": 75, "error": permission_error})
+    sys.exit(75)
+
 return_code = 1
 error = None
 try:
+    if time.time() >= startup_deadline_epoch:
+        raise RuntimeError(startup_expired_error)
     process = subprocess.Popen(command, cwd=cwd, stdout=sys.stdout, stderr=subprocess.STDOUT)
     return_code = process.wait()
 except BaseException as exc:
@@ -170,11 +266,8 @@ finally:
     payload = {"return_code": return_code}
     if error:
         payload["error"] = error
-    tmp_path = exit_path + ".tmp"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp_path, exit_path)
+        write_exit_status(payload)
     except BaseException:
         traceback.print_exc()
 sys.exit(return_code if isinstance(return_code, int) and return_code >= 0 else 1)
@@ -235,6 +328,7 @@ JOB_UPDATE_COLUMNS = {
     "updated_at": "updated_at",
     "error": "error",
     "artifact_paths_json": "artifact_paths_json",
+    "runner_identity_json": "runner_identity_json",
 }
 
 
@@ -258,6 +352,11 @@ class QuantJob:
     error: Optional[str] = None
     log_path: str = ""
     artifact_paths: List[str] = field(default_factory=list)
+    runner_identity: Dict[str, Any] = field(default_factory=dict)
+    progress: Dict[str, Any] = field(default_factory=dict)
+    runner_alive: Optional[bool] = None
+    can_cancel: bool = False
+    log_updated_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -277,6 +376,10 @@ class QuantJob:
             "error": self.error,
             "log_path": self.log_path,
             "artifact_paths": self.artifact_paths,
+            "progress": self.progress,
+            "runner_alive": self.runner_alive,
+            "can_cancel": self.can_cancel,
+            "log_updated_at": self.log_updated_at,
         }
 
 
@@ -286,6 +389,47 @@ def _now() -> str:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _command_sha256(command: Iterable[str]) -> str:
+    return hashlib.sha256(_json_dumps(list(command)).encode("utf-8")).hexdigest()
+
+
+def _cancel_command_outcome(
+    stdout: Any,
+    contract: Mapping[str, Any],
+) -> str:
+    if contract.get("format") != "json":
+        raise ValueError("cancel result contract format is not supported")
+    if isinstance(stdout, bytes):
+        if len(stdout) > 64_000:
+            raise ValueError("cancel command output exceeded the trusted JSON limit")
+        try:
+            output_text = stdout.decode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("cancel command did not return valid UTF-8 JSON") from exc
+    elif isinstance(stdout, str):
+        if len(stdout.encode("utf-8")) > 64_000:
+            raise ValueError("cancel command output exceeded the trusted JSON limit")
+        output_text = stdout
+    else:
+        raise ValueError("cancel command did not return captured output")
+    if not output_text.strip():
+        raise ValueError("cancel command returned empty output")
+    try:
+        payload = json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("cancel command did not return valid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("cancel command JSON must be an object")
+    allowed = contract.get("allowed_outcomes")
+    if not isinstance(allowed, Iterable) or isinstance(allowed, (str, bytes)):
+        raise ValueError("cancel result contract has no allowed outcomes")
+    allowed_outcomes = {str(value) for value in allowed}
+    outcome = payload.get("cancel_outcome")
+    if not isinstance(outcome, str) or outcome not in allowed_outcomes:
+        raise ValueError("cancel command did not return a trusted cancel_outcome")
+    return outcome
 
 
 def _as_bool(value: Any) -> bool:
@@ -620,6 +764,79 @@ def _approved_provider_identity_json(
     return _json_dumps(payload)
 
 
+def _approved_market_data_bars_path(identity: Mapping[str, Any]) -> Path:
+    payload = {field: identity.get(field) for field in MARKET_DATA_IDENTITY_FIELDS}
+    snapshot_id = payload.get("snapshot_id")
+    expected_state = payload.get("state_fingerprint")
+    if (
+        payload.get("dataset_id") != ASHARE_DAILY_QFQ_DATASET_ID
+        or not isinstance(snapshot_id, str)
+        or not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or snapshot_id in {".", ".."}
+        or any(
+            not isinstance(payload.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
+            for field in ("manifest_sha256", "content_sha256")
+        )
+        or not isinstance(expected_state, dict)
+    ):
+        raise ValueError("Approved market data identity is invalid or mismatched.")
+
+    root = QUANT_DATA_ROOT.expanduser().resolve()
+    snapshots_root = (root / ASHARE_DAILY_QFQ_DATASET_ROOT / "snapshots").resolve()
+    snapshot = (snapshots_root / snapshot_id).resolve()
+    if snapshot.parent != snapshots_root:
+        raise ValueError("Approved market data identity is invalid or mismatched.")
+    relative_snapshot = snapshot.relative_to(root)
+    current = root
+    for part in relative_snapshot.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("Approved market data identity is invalid or mismatched.")
+
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    try:
+        if manifest_path.is_symlink() or manifest_path.stat().st_size > 1_048_576:
+            raise ValueError("Approved market data identity is invalid or mismatched.")
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Approved market data identity is invalid or mismatched."
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or hashlib.sha256(manifest_bytes).hexdigest()
+        != payload.get("manifest_sha256")
+        or manifest.get("dataset_id") != ASHARE_DAILY_QFQ_DATASET_ID
+        or manifest.get("snapshot_id") != snapshot_id
+        or manifest.get("content_sha256") != payload.get("content_sha256")
+        or manifest.get("data_kind") != "daily_bars"
+        or manifest.get("role") != "canonical"
+        or manifest.get("status") != "ready"
+        or manifest.get("price_basis") != "qfq"
+    ):
+        raise ValueError("Approved market data identity is invalid or mismatched.")
+    bars_path = snapshot / "bars"
+    if bars_path.is_symlink() or not bars_path.is_dir():
+        raise ValueError("Approved market data identity is invalid or mismatched.")
+    try:
+        from quant_workflow.scripts.quant_data_contract import (
+            DataContractError,
+            filesystem_state_fingerprint,
+        )
+
+        current_state = filesystem_state_fingerprint(snapshot)
+    except (DataContractError, OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "Approved market data snapshot state could not be verified."
+        ) from exc
+    if current_state != expected_state:
+        raise ValueError("Approved market data snapshot changed after approval.")
+    return bars_path.resolve()
+
+
 def _python_bin() -> str:
     _warn_if_legacy_qlib_python_is_ignored()
     if QUANT_WORKFLOW_PYTHON.exists():
@@ -750,8 +967,30 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         str(REPORTS_ROOT / "data_quality_overlap_*.csv"),
         str(REPORTS_ROOT / "data_quality_ashare_qfq_summary_*.csv"),
         str(REPORTS_ROOT / "research_status_latest.json"),
+        str(
+            REPORTS_ROOT
+            / "test_runs"
+            / "data_quality"
+            / "data_quality_report_sampled_latest.json"
+        ),
+        str(
+            REPORTS_ROOT
+            / "test_runs"
+            / "data_quality"
+            / "data_quality_report_sampled_latest.md"
+        ),
+        str(
+            REPORTS_ROOT
+            / "test_runs"
+            / "data_quality"
+            / "research_status_sampled_latest.json"
+        ),
+        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_report_*.json"),
+        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_report_*.md"),
+        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_*.csv"),
     ]
     shared_training_artifact_patterns = [
+        str(REPORTS_ROOT / ".training-runner-resource"),
         str(REPORTS_ROOT / "latest_training_result.json"),
         str(REPORTS_ROOT / "train_baseline_lgb_status_latest.json"),
         str(REPORTS_ROOT / "train_baseline_lgb_*.log"),
@@ -987,6 +1226,25 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "experiment_name", "--experiment-name")
         return command
 
+    def train_baseline_lgb_equivalence(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("train_baseline_lgb.py")
+        command.extend(
+            [
+                "--config",
+                _safe_config_path("baseline_lgb_equivalence.yaml"),
+                "--provider",
+                _safe_provider(params.get("provider")),
+                "--experiment-name",
+                "dsa_training_equivalence",
+                "--no-publish-latest",
+                "--result-scope",
+                "training_equivalence",
+                "--equivalence-channel",
+                "web",
+            ]
+        )
+        return command
+
     def run_candidate_pipeline(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("run_candidate_pipeline.py")
         command.extend(["--output-dir", str(REPORTS_ROOT)])
@@ -1069,10 +1327,35 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         run_id = _safe_run_id(params.get("run_id"))
         if run_id:
             command.extend(["--run-id", run_id])
+        _append_flag(command, params, "smoke", "--smoke")
+        _append_flag(command, params, "plan", "--plan")
+        return command
+
+    def prepare_robust_signal_data(params: Mapping[str, Any]) -> List[str]:
+        del params
+        command = _script_command("prepare_robust_signal_data.py")
+        command.extend(
+            [
+                "--quant-data-dir",
+                str(quant_data_root(DSA_ROOT)),
+                "--status-path",
+                str(
+                    REPORTS_ROOT
+                    / "robust_signal"
+                    / "robust_signal_data_readiness_latest.json"
+                ),
+                "--quality-pointer-path",
+                str(REPORTS_ROOT / "data_quality_report_latest.json"),
+            ]
+        )
         return command
 
     def run_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
         return _robust_signal_command(params)
+
+    def preview_robust_signal_plan(params: Mapping[str, Any]) -> List[str]:
+        del params
+        return _robust_signal_command({"plan": True})
 
     def pause_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
         run_id = _safe_run_id(params.get("run_id"))
@@ -1086,8 +1369,18 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         run_id = _safe_run_id(params.get("run_id"))
         if not run_id:
             raise ValueError("run_id is required for robust signal resume")
-        command = _robust_signal_command({"run_id": run_id})
+        command = _robust_signal_command(
+            {"run_id": run_id, "smoke": _as_bool(params.get("smoke"))}
+        )
         command.append("--resume")
+        return command
+
+    def cancel_robust_signal_research(params: Mapping[str, Any]) -> List[str]:
+        run_id = _safe_run_id(params.get("run_id"))
+        if not run_id:
+            raise ValueError("run_id is required for robust signal cancellation")
+        command = _robust_signal_command({"run_id": run_id})
+        command.append("--cancel")
         return command
 
     def run_robust_confirmation(params: Mapping[str, Any]) -> List[str]:
@@ -1523,6 +1816,28 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "allowed_params": {"config", "experiment_name", "provider"},
             "artifact_patterns": list(shared_training_artifact_patterns),
         },
+        "train_baseline_lgb_equivalence": {
+            "label": "运行真实 LightGBM 网页等价验收",
+            "command": train_baseline_lgb_equivalence,
+            "allowed_params": {"provider"},
+            "artifact_patterns": [
+                str(REPORTS_ROOT / ".training-runner-resource"),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "training_equivalence"
+                    / "runs"
+                    / "*"
+                    / "training_result.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "training_equivalence"
+                    / "latest_web.json"
+                ),
+            ],
+        },
         "run_candidate_pipeline": {
             "label": "运行五个选股模型候选流程",
             "command": run_candidate_pipeline,
@@ -1534,6 +1849,45 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "candidate_pipeline_progress_latest.json"),
                 str(REPORTS_ROOT / "candidate_pipeline_*.json"),
                 str(REPORTS_ROOT / "candidate_pipeline_*.md"),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_latest.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_latest.md"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_progress_latest.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_*.json"
+                ),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_*.md"
+                ),
+            ],
+            "progress_patterns": [
+                str(REPORTS_ROOT / "candidate_pipeline_progress_latest.json"),
+                str(
+                    REPORTS_ROOT
+                    / "test_runs"
+                    / "candidate_pipeline"
+                    / "candidate_pipeline_test_progress_latest.json"
+                ),
             ],
         },
         "run_robust_strategy": {
@@ -1557,13 +1911,53 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(REPORTS_ROOT / "robust_strategy" / "frozen_strategy_latest.json"),
             ],
         },
+        "prepare_robust_signal_data": {
+            "label": "验收并准备鲁棒 CSI800 数据",
+            "command": prepare_robust_signal_data,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(
+                    REPORTS_ROOT
+                    / "robust_signal"
+                    / "robust_signal_data_readiness_latest.json"
+                ),
+            ],
+        },
         "run_robust_signal_research": {
             "label": "启动鲁棒选股信号研究",
             "command": run_robust_signal_research,
-            "allowed_params": {"run_id"},
+            "cancel_command": cancel_robust_signal_research,
+            "cancel_result_contract": {
+                "format": "json",
+                "allowed_outcomes": ["cancelled", "already_terminal"],
+            },
+            "allowed_params": {"run_id", "smoke"},
             "artifact_patterns": [
                 str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+                str(
+                    REPORTS_ROOT
+                    / "robust_signal"
+                    / "robust_signal_smoke_status_latest.json"
+                ),
                 str(REPORTS_ROOT / "robust_signal" / "runs" / "*" / "result.json"),
+            ],
+            "progress_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+                str(
+                    REPORTS_ROOT
+                    / "robust_signal"
+                    / "robust_signal_smoke_status_latest.json"
+                ),
+                str(REPORTS_ROOT / "robust_signal" / "runs" / "*" / "status.json"),
+            ],
+        },
+        "preview_robust_signal_plan": {
+            "label": "预览鲁棒选股信号研究计划",
+            "command": preview_robust_signal_plan,
+            "allowed_params": set(),
+            "artifact_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_plan_latest.json"),
+                str(REPORTS_ROOT / "robust_signal" / "plans" / "robust_signal_plan_*.json"),
             ],
         },
         "pause_robust_signal_research": {
@@ -1573,13 +1967,25 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": [
                 str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
             ],
+            "progress_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+            ],
         },
         "resume_robust_signal_research": {
             "label": "恢复鲁棒选股信号研究",
             "command": resume_robust_signal_research,
-            "allowed_params": {"run_id"},
+            "cancel_command": cancel_robust_signal_research,
+            "cancel_result_contract": {
+                "format": "json",
+                "allowed_outcomes": ["cancelled", "already_terminal"],
+            },
+            "allowed_params": {"run_id", "smoke"},
             "artifact_patterns": [
                 str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+            ],
+            "progress_patterns": [
+                str(REPORTS_ROOT / "robust_signal" / "robust_signal_status_latest.json"),
+                str(REPORTS_ROOT / "robust_signal" / "runs" / "*" / "status.json"),
             ],
         },
         "run_robust_confirmation": {
@@ -1651,22 +2057,43 @@ class QuantJobService:
         params: Optional[Mapping[str, Any]] = None,
         *,
         approved_provider_identity: Optional[Mapping[str, Any]] = None,
+        approved_market_data_identity: Optional[Mapping[str, Any]] = None,
     ) -> QuantJob:
         params_dict = dict(params or {})
+        generated_robust_run_id: Optional[str] = None
+        if job_type == "run_robust_signal_research" and not _safe_run_id(
+            params_dict.get("run_id")
+        ):
+            generated_robust_run_id = (
+                f"robust_signal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                f"{uuid.uuid4().hex[:6]}"
+            )
         spec = self._get_spec(job_type)
-        formal_training = job_type in FORMAL_TRAINING_JOB_TYPES and not (
+        provider_pinned_training = job_type in PROVIDER_PINNED_TRAINING_JOB_TYPES and not (
             job_type == "run_candidate_pipeline"
             and _as_bool(params_dict.get("dry_run"))
         )
-        if formal_training and approved_provider_identity is None:
+        if provider_pinned_training and approved_provider_identity is None:
             raise ValueError(
-                "Formal training requires an approved provider identity."
+                "Provider-pinned training requires an approved provider identity."
+            )
+        market_data_pinned = job_type in MARKET_DATA_PINNED_JOB_TYPES
+        if market_data_pinned and approved_market_data_identity is None:
+            raise ValueError(
+                "Market report jobs require an approved market data identity."
             )
         command = self._build_command(job_type, params_dict)
+        if generated_robust_run_id is not None:
+            params_dict["run_id"] = generated_robust_run_id
+            command.extend(["--run-id", generated_robust_run_id])
+        if job_type == "run_candidate_pipeline":
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            params_dict["batch_id"] = f"candidate-alpha158-{timestamp}"
+            command.extend(["--timestamp", timestamp])
         if approved_provider_identity is not None:
-            if job_type not in FORMAL_TRAINING_JOB_TYPES:
+            if job_type not in PROVIDER_PINNED_TRAINING_JOB_TYPES:
                 raise ValueError(
-                    "Approved provider identity is only valid for formal training jobs."
+                    "Approved provider identity is only valid for provider-pinned training jobs."
                 )
             provider = _safe_provider(params_dict.get("provider"))
             command.extend(
@@ -1677,6 +2104,20 @@ class QuantJobService:
                     ),
                 ]
             )
+        if approved_market_data_identity is not None:
+            if not market_data_pinned:
+                raise ValueError(
+                    "Approved market data identity is only valid for pinned market report jobs."
+                )
+            bars_path = _approved_market_data_bars_path(
+                approved_market_data_identity
+            )
+            data_flag = (
+                "--data-dir"
+                if job_type == "report_market_regime"
+                else "--market-data-dir"
+            )
+            command.extend([data_flag, str(bars_path)])
         with self._lock:
             with self._connect() as conn:
                 # Serialize the conflict check and pending-row claim across all
@@ -1915,11 +2356,69 @@ class QuantJobService:
         }
 
     def cancel_job(self, job_id: str) -> QuantJob:
+        job = self._claim_job_cancellation(job_id)
+        if job.status in TERMINAL_STATUSES and not job.can_cancel:
+            return job
         with self._lock:
-            job = self.get_job(job_id)
-            if job.status in TERMINAL_STATUSES:
-                return job
             process = self._processes.get(job_id)
+
+        durable_runner_stopped = False
+        job_spec = self.command_specs.get(job.job_type, {})
+        cancel_spec = job_spec.get("cancel_command")
+        if cancel_spec is not None:
+            try:
+                if callable(cancel_spec):
+                    cancel_command = [str(part) for part in cancel_spec(job.params)]
+                elif isinstance(cancel_spec, Iterable) and not isinstance(
+                    cancel_spec, (str, bytes)
+                ):
+                    cancel_command = [str(part) for part in cancel_spec]
+                else:
+                    raise ValueError("cancel_command is not a trusted command sequence")
+                if not cancel_command:
+                    raise ValueError("cancel_command produced an empty command")
+                completed = subprocess.run(
+                    cancel_command,
+                    cwd=job.cwd or None,
+                    env=_quant_job_child_env(
+                        {},
+                        allowed_names=job_spec.get("env_names", ()),
+                        allowed_prefixes=job_spec.get("env_prefixes", ()),
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=max(30, JOB_TERMINATE_TIMEOUT_SECONDS * 4),
+                )
+                if int(completed.returncode) != 0:
+                    raise RuntimeError(
+                        "durable runner cancellation command did not confirm shutdown"
+                    )
+                cancel_result_contract = job_spec.get("cancel_result_contract")
+                if cancel_result_contract is not None:
+                    if not isinstance(cancel_result_contract, Mapping):
+                        raise ValueError("cancel_result_contract is not a mapping")
+                    cancel_outcome = _cancel_command_outcome(
+                        completed.stdout,
+                        cancel_result_contract,
+                    )
+                    if cancel_outcome == "already_terminal":
+                        return self.get_job(job_id)
+                    if cancel_outcome != "cancelled":
+                        raise ValueError("cancel command outcome did not confirm cancellation")
+                durable_runner_stopped = True
+            except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+                timestamp = _now()
+                self._update_job(
+                    job_id,
+                    updated_at=timestamp,
+                    error=(
+                        "Cancellation was not confirmed; the durable runner may still "
+                        f"be active ({type(exc).__name__})."
+                    ),
+                )
+                return self.get_job(job_id)
 
         if process is not None and process.poll() is None:
             process_pid = getattr(process, "pid", job.pid)
@@ -1936,6 +2435,19 @@ class QuantJobService:
                 if hasattr(process, "kill"):
                     process.kill()
         elif job.pid:
+            if not self._runner_identity_matches(job):
+                timestamp = _now()
+                self._update_job(
+                    job_id,
+                    status="failed",
+                    completed_at=timestamp,
+                    updated_at=timestamp,
+                    error=(
+                        "Recovered runner identity no longer matches; no process was "
+                        "signaled during cancellation."
+                    ),
+                )
+                return self.get_job(job_id)
             self._terminate_process_group(job.pid, signal.SIGTERM)
             deadline = time.time() + JOB_TERMINATE_TIMEOUT_SECONDS
             while time.time() < deadline and self._pid_is_alive(job.pid):
@@ -1957,7 +2469,9 @@ class QuantJobService:
                     error="Cancelled by user from the web UI.",
                 )
                 return self.get_job(job_id)
-            if current.status in TERMINAL_STATUSES:
+            if current.status in TERMINAL_STATUSES and not (
+                durable_runner_stopped and current.status != "cancelled"
+            ):
                 return current
             timestamp = _now()
             self._update_job(
@@ -2000,13 +2514,263 @@ class QuantJobService:
             raise ValueError(f"Job type {job_type} produced an empty command.")
         return command
 
+    @staticmethod
+    def _row_runner_identity(row: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            payload = json.loads(str(row["runner_identity_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _claim_job_cancellation(self, job_id: str) -> QuantJob:
+        timestamp = _now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(job_id)
+                current = self._row_to_job(row)
+                if current.status == "pending":
+                    conn.execute(
+                        "UPDATE jobs SET status = ?, completed_at = ?, updated_at = ?, "
+                        "error = ? WHERE job_id = ? AND status = 'pending'",
+                        (
+                            "cancelled",
+                            timestamp,
+                            timestamp,
+                            "Cancelled by user from the web UI.",
+                            job_id,
+                        ),
+                    )
+                elif current.status == "running":
+                    runner_identity = self._row_runner_identity(row)
+                    runner_identity.update(
+                        {
+                            "cancel_requested": True,
+                            "cancel_requested_at": timestamp,
+                        }
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET runner_identity_json = ?, updated_at = ? "
+                        "WHERE job_id = ? AND status = 'running'",
+                        (_json_dumps(runner_identity), timestamp, job_id),
+                    )
+                conn.commit()
+                claimed_row = conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+        if claimed_row is None:  # pragma: no cover - protected by the transaction.
+            raise KeyError(job_id)
+        return self._row_to_job(claimed_row)
+
+    def _claim_pending_job_start(
+        self,
+        job_id: str,
+        *,
+        started_at: str,
+        starting_identity: Mapping[str, Any],
+    ) -> bool:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'running', started_at = ?, updated_at = ?, "
+                    "runner_identity_json = ? WHERE job_id = ? AND status = 'pending'",
+                    (
+                        started_at,
+                        started_at,
+                        _json_dumps(dict(starting_identity)),
+                        job_id,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+
+    def _record_starting_runner_pid(
+        self,
+        job_id: str,
+        *,
+        launch_token: str,
+        runner_identity: Mapping[str, Any],
+    ) -> bool:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT status, runner_identity_json FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                current_identity = (
+                    self._row_runner_identity(row) if row is not None else {}
+                )
+                if (
+                    row is None
+                    or row["status"] != "running"
+                    or current_identity.get("launch_token") != launch_token
+                    or current_identity.get("handshake_status") != "starting"
+                    or current_identity.get("cancel_requested") is True
+                ):
+                    conn.rollback()
+                    return False
+                cursor = conn.execute(
+                    "UPDATE jobs SET pid = ?, runner_identity_json = ?, updated_at = ? "
+                    "WHERE job_id = ? AND status = 'running'",
+                    (
+                        int(runner_identity["pid"]),
+                        _json_dumps(dict(runner_identity)),
+                        _now(),
+                        job_id,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+
+    def _authorize_runner_start(
+        self,
+        job: QuantJob,
+        *,
+        launch_token: str,
+        confirmed_identity: Mapping[str, Any],
+    ) -> bool:
+        permission_path = self._start_permission_path(job)
+        temporary = permission_path.with_name(
+            f".{permission_path.name}.{launch_token}.tmp"
+        )
+        permission_payload = {
+            "schema_version": 1,
+            "job_id": job.job_id,
+            "launch_token": launch_token,
+            "job_command_sha256": _command_sha256(job.command),
+            "pid": int(confirmed_identity["pid"]),
+        }
+        authorized = False
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT status, pid, runner_identity_json FROM jobs "
+                        "WHERE job_id = ?",
+                        (job.job_id,),
+                    ).fetchone()
+                    current_identity = (
+                        self._row_runner_identity(row) if row is not None else {}
+                    )
+                    if (
+                        row is None
+                        or row["status"] != "running"
+                        or row["pid"] != int(confirmed_identity["pid"])
+                        or current_identity.get("launch_token") != launch_token
+                        or current_identity.get("handshake_status") != "starting"
+                        or current_identity.get("cancel_requested") is True
+                    ):
+                        conn.rollback()
+                        return False
+                    final_identity = {
+                        **dict(confirmed_identity),
+                        "handshake_status": "confirmed",
+                        "start_authorized_at": _now(),
+                    }
+                    with temporary.open("w", encoding="utf-8") as handle:
+                        json.dump(
+                            permission_payload,
+                            handle,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        handle.write("\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    conn.execute(
+                        "UPDATE jobs SET pid = ?, runner_identity_json = ?, "
+                        "updated_at = ? WHERE job_id = ? AND status = 'running'",
+                        (
+                            int(confirmed_identity["pid"]),
+                            _json_dumps(final_identity),
+                            _now(),
+                            job.job_id,
+                        ),
+                    )
+                    os.replace(temporary, permission_path)
+                    conn.commit()
+                    authorized = True
+            return True
+        finally:
+            temporary.unlink(missing_ok=True)
+            if not authorized:
+                permission_path.unlink(missing_ok=True)
+
+    def _mark_start_failed_if_current(
+        self,
+        job_id: str,
+        launch_token: str,
+        error: str,
+    ) -> bool:
+        timestamp = _now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT status, runner_identity_json FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                current_identity = (
+                    self._row_runner_identity(row) if row is not None else {}
+                )
+                if (
+                    row is None
+                    or row["status"] != "running"
+                    or current_identity.get("launch_token") != launch_token
+                    or current_identity.get("cancel_requested") is True
+                ):
+                    conn.rollback()
+                    return False
+                failed_identity = {
+                    **current_identity,
+                    "handshake_status": "failed",
+                }
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'failed', completed_at = ?, "
+                    "updated_at = ?, error = ?, runner_identity_json = ? "
+                    "WHERE job_id = ? AND status = 'running'",
+                    (
+                        timestamp,
+                        timestamp,
+                        error,
+                        _json_dumps(failed_identity),
+                        job_id,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+
     def _start_job(self, job: QuantJob) -> None:
         started_at = _now()
-        self._update_job(
-            job.job_id, status="running", started_at=started_at, updated_at=started_at
-        )
+        launch_token = uuid.uuid4().hex
+        startup_deadline_epoch = time.time() + RUNNER_IDENTITY_STARTUP_LEASE_SECONDS
+        starting_identity = {
+            "schema_version": 1,
+            "handshake_status": "starting",
+            "launch_token": launch_token,
+            "pid": None,
+            "job_command_sha256": _command_sha256(job.command),
+            "startup_deadline_epoch": startup_deadline_epoch,
+        }
+        if not self._claim_pending_job_start(
+            job.job_id,
+            started_at=started_at,
+            starting_identity=starting_identity,
+        ):
+            return
         log_path = Path(job.log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        runner_identity_path = self._runner_identity_path(job)
+        start_permission_path = self._start_permission_path(job)
+        runner_identity_path.unlink(missing_ok=True)
+        start_permission_path.unlink(missing_ok=True)
         handle: Any = None
         try:
             self._write_artifact_baseline(job)
@@ -2026,6 +2790,10 @@ class QuantJobService:
                     "QUANT_JOB_COMMAND_JSON": _json_dumps(job.command),
                     "QUANT_JOB_CWD": job.cwd,
                     "QUANT_JOB_EXIT_STATUS_PATH": str(self._exit_status_path(job)),
+                    "QUANT_JOB_RUNNER_IDENTITY_PATH": str(runner_identity_path),
+                    "QUANT_JOB_START_PERMISSION_PATH": str(start_permission_path),
+                    "QUANT_JOB_LAUNCH_TOKEN": launch_token,
+                    "QUANT_JOB_STARTUP_DEADLINE_EPOCH": str(startup_deadline_epoch),
                 },
                 allowed_names=spec.get("env_names", ()),
                 allowed_prefixes=spec.get("env_prefixes", ()),
@@ -2044,18 +2812,109 @@ class QuantJobService:
                     handle.close()
                 except Exception:
                     pass
-            self._update_job(
+            self._mark_start_failed_if_current(
                 job.job_id,
-                status="failed",
-                completed_at=_now(),
-                updated_at=_now(),
-                error=f"Failed to start job: {exc}",
+                launch_token,
+                f"Failed to start job: {exc}",
             )
             return
 
+        process_identity = self._process_runtime_identity(process.pid) or {}
+        runner_identity = {
+            **starting_identity,
+            "pid": process.pid,
+            "process_start": process_identity.get("process_start"),
+            "process_command_sha256": process_identity.get(
+                "process_command_sha256"
+            ),
+        }
+        try:
+            pid_recorded = self._record_starting_runner_pid(
+                job.job_id,
+                launch_token=launch_token,
+                runner_identity=runner_identity,
+            )
+        except Exception as exc:  # noqa: BLE001 - convert startup faults to job state.
+            self._stop_unconfirmed_runner(process)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._mark_start_failed_if_current(
+                job.job_id,
+                launch_token,
+                f"Durable runner PID registration failed ({type(exc).__name__}).",
+            )
+            return
+        if not pid_recorded:
+            self._stop_unconfirmed_runner(process)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._mark_start_failed_if_current(
+                job.job_id,
+                launch_token,
+                "Durable runner PID registration no longer matched the active start.",
+            )
+            return
+        started_job = replace(
+            job,
+            status="running",
+            pid=process.pid,
+            started_at=started_at,
+            updated_at=_now(),
+            runner_identity=runner_identity,
+        )
+        confirmed_identity = self._await_runner_identity(started_job, process)
+        if confirmed_identity is None:
+            self._stop_unconfirmed_runner(process)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._mark_start_failed_if_current(
+                job.job_id,
+                launch_token,
+                (
+                    "Durable runner identity handshake was not confirmed; the exact "
+                    "newly started runner was stopped."
+                ),
+            )
+            return
+
+        try:
+            start_authorized = self._authorize_runner_start(
+                job,
+                launch_token=launch_token,
+                confirmed_identity=confirmed_identity,
+            )
+        except Exception as exc:  # noqa: BLE001 - convert startup faults to job state.
+            self._stop_unconfirmed_runner(process)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._mark_start_failed_if_current(
+                job.job_id,
+                launch_token,
+                f"Durable runner start authorization failed ({type(exc).__name__}).",
+            )
+            return
+        if not start_authorized:
+            self._stop_unconfirmed_runner(process)
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._mark_start_failed_if_current(
+                job.job_id,
+                launch_token,
+                "Durable runner start authorization no longer matched the active start.",
+            )
+            return
         with self._lock:
             self._processes[job.job_id] = process
-            self._update_job(job.job_id, pid=process.pid, updated_at=_now())
         thread = threading.Thread(
             target=self._wait_for_process,
             args=(job.job_id, process, handle),
@@ -2066,6 +2925,254 @@ class QuantJobService:
 
     def _exit_status_path(self, job: QuantJob) -> Path:
         return Path(job.log_path).parent / EXIT_STATUS_FILENAME
+
+    def _runner_identity_path(self, job: QuantJob) -> Path:
+        return Path(job.log_path).parent / RUNNER_IDENTITY_FILENAME
+
+    def _start_permission_path(self, job: QuantJob) -> Path:
+        return Path(job.log_path).parent / START_PERMISSION_FILENAME
+
+    @staticmethod
+    def _process_runtime_identity(pid: Optional[int]) -> Optional[Dict[str, str]]:
+        if not pid:
+            return None
+        try:
+            completed = subprocess.run(
+                ["ps", "-ww", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, TypeError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        parts = completed.stdout.strip().split(None, 5)
+        if len(parts) != 6:
+            return None
+        process_start = " ".join(parts[:5])
+        process_command = parts[5].strip()
+        if not process_command:
+            return None
+        return {
+            "process_start": process_start,
+            "process_command_sha256": hashlib.sha256(
+                process_command.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def _read_runner_identity(self, job: QuantJob) -> Optional[Dict[str, Any]]:
+        path = self._runner_identity_path(job)
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _confirmed_runner_identity(
+        self,
+        job: QuantJob,
+        *,
+        direct_process: Optional[subprocess.Popen[bytes]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        expected = job.runner_identity
+        if (
+            not isinstance(expected, dict)
+            or expected.get("schema_version") != 1
+            or not re.fullmatch(r"[0-9a-f]{32}", str(expected.get("launch_token") or ""))
+            or expected.get("job_command_sha256") != _command_sha256(job.command)
+        ):
+            return None
+        started = self._read_runner_identity(job)
+        started_pid = started.get("pid") if isinstance(started, dict) else None
+        if (
+            not isinstance(started, dict)
+            or started.get("schema_version") != 1
+            or started.get("launch_token") != expected.get("launch_token")
+            or started.get("job_command_sha256") != expected.get("job_command_sha256")
+            or isinstance(started_pid, bool)
+            or not isinstance(started_pid, int)
+            or started_pid <= 0
+            or (job.pid is not None and started_pid != job.pid)
+            or (
+                expected.get("pid") is not None
+                and started_pid != expected.get("pid")
+            )
+            or (
+                direct_process is not None
+                and started_pid != getattr(direct_process, "pid", None)
+            )
+        ):
+            return None
+
+        current = self._process_runtime_identity(started_pid)
+        if current is None:
+            if direct_process is None or direct_process.poll() is None:
+                return None
+            current = {
+                "process_start": expected.get("process_start"),
+                "process_command_sha256": expected.get("process_command_sha256"),
+            }
+        for key in ("process_start", "process_command_sha256"):
+            expected_value = expected.get(key)
+            if expected_value and current.get(key) != expected_value:
+                return None
+        return {
+            **expected,
+            "handshake_status": "confirmed",
+            "pid": started_pid,
+            "process_start": current.get("process_start"),
+            "process_command_sha256": current.get("process_command_sha256"),
+        }
+
+    def _await_runner_identity(
+        self,
+        job: QuantJob,
+        process: subprocess.Popen[bytes],
+        *,
+        timeout_seconds: float = RUNNER_IDENTITY_HANDSHAKE_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = RUNNER_IDENTITY_HANDSHAKE_POLL_SECONDS,
+    ) -> Optional[Dict[str, Any]]:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            confirmed = self._confirmed_runner_identity(
+                job, direct_process=process
+            )
+            if confirmed is not None:
+                return confirmed
+            if process.poll() is not None:
+                # The runner writes identity atomically before it exits. A fast
+                # command can finish between the first read and poll(), so do
+                # one final strict read before declaring the handshake failed.
+                return self._confirmed_runner_identity(
+                    job, direct_process=process
+                )
+            if time.monotonic() >= deadline:
+                return None
+            if poll_interval_seconds > 0:
+                time.sleep(poll_interval_seconds)
+
+    def _stop_unconfirmed_runner(self, process: subprocess.Popen[bytes]) -> None:
+        process_pid = getattr(process, "pid", None)
+        try:
+            process.terminate()
+        except (AttributeError, OSError):
+            pass
+        self._terminate_process_group(process_pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=JOB_TERMINATE_TIMEOUT_SECONDS)
+            return
+        except (AttributeError, OSError, subprocess.TimeoutExpired, TypeError):
+            pass
+        self._terminate_process_group(process_pid, signal.SIGKILL)
+        try:
+            process.kill()
+        except (AttributeError, OSError):
+            pass
+
+    def _ownerless_startup_lease_expired(self, job: QuantJob) -> bool:
+        expected = job.runner_identity
+        if (
+            job.status not in {"pending", "running"}
+            or job.pid is not None
+            or not isinstance(expected, dict)
+            or expected.get("handshake_status") != "starting"
+            or self._read_runner_identity(job) is not None
+        ):
+            return False
+        raw_deadline = expected.get("startup_deadline_epoch")
+        if isinstance(raw_deadline, bool):
+            return True
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError):
+            return True
+        return not math.isfinite(deadline) or time.time() >= deadline
+
+    def _mark_ownerless_startup_lease_failed(self, job: QuantJob) -> None:
+        timestamp = _now()
+        self._update_job(
+            job.job_id,
+            status="failed",
+            completed_at=timestamp,
+            updated_at=timestamp,
+            error=(
+                "Durable runner startup lease expired before a PID or signed identity "
+                "was recorded; the real command was not started and output ownership "
+                "was released."
+            ),
+        )
+
+    def _runner_identity_startup_pending(self, job: QuantJob) -> bool:
+        expected = job.runner_identity
+        if (
+            job.status not in {"pending", "running"}
+            or not isinstance(expected, dict)
+            or expected.get("schema_version") != 1
+            or expected.get("handshake_status") != "starting"
+            or not re.fullmatch(r"[0-9a-f]{32}", str(expected.get("launch_token") or ""))
+            or expected.get("job_command_sha256") != _command_sha256(job.command)
+        ):
+            return False
+        identity_path = self._runner_identity_path(job)
+        expected_pid = expected.get("pid")
+        if expected_pid is not None and expected_pid != job.pid:
+            return False
+        if not identity_path.exists() and not identity_path.is_symlink():
+            if job.pid is None:
+                return not self._ownerless_startup_lease_expired(job)
+            return self._pid_is_alive(job.pid)
+
+        started = self._read_runner_identity(job)
+        started_pid = started.get("pid") if isinstance(started, dict) else None
+        if (
+            not isinstance(started, dict)
+            or started.get("schema_version") != 1
+            or started.get("launch_token") != expected.get("launch_token")
+            or started.get("job_command_sha256") != expected.get("job_command_sha256")
+            or isinstance(started_pid, bool)
+            or not isinstance(started_pid, int)
+            or started_pid <= 0
+            or (job.pid is not None and started_pid != job.pid)
+            or (expected_pid is not None and started_pid != expected_pid)
+            or not self._pid_is_alive(started_pid)
+        ):
+            return False
+        current = self._process_runtime_identity(started_pid)
+        if current is None:
+            return True
+        for key in ("process_start", "process_command_sha256"):
+            expected_value = expected.get(key)
+            if expected_value and current.get(key) != expected_value:
+                return False
+        return False
+
+    def _confirm_starting_runner_identity(self, job: QuantJob) -> Optional[QuantJob]:
+        if job.runner_identity.get("handshake_status") != "starting":
+            return None
+        confirmed = self._confirmed_runner_identity(job)
+        if confirmed is None:
+            return None
+        self._update_job(
+            job.job_id,
+            pid=int(confirmed["pid"]),
+            runner_identity_json=_json_dumps(confirmed),
+            updated_at=_now(),
+        )
+        return self.get_job(job.job_id)
+
+    def _runner_identity_matches(self, job: QuantJob) -> bool:
+        confirmed = self._confirmed_runner_identity(job)
+        return bool(
+            confirmed
+            and job.pid is not None
+            and confirmed.get("pid") == job.pid
+            and confirmed.get("process_start")
+            and confirmed.get("process_command_sha256")
+        )
 
     def _read_exit_status(self, job: QuantJob) -> Optional[Dict[str, Any]]:
         path = self._exit_status_path(job)
@@ -2280,10 +3387,18 @@ class QuantJobService:
                     updated_at TEXT NOT NULL,
                     error TEXT,
                     log_path TEXT NOT NULL,
-                    artifact_paths_json TEXT NOT NULL
+                    artifact_paths_json TEXT NOT NULL,
+                    runner_identity_json TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "runner_identity_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN runner_identity_json TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.commit()
 
     def _recover_running_jobs(self) -> None:
@@ -2304,13 +3419,32 @@ class QuantJobService:
                     job, int(payload["return_code"]), _now(), runner_error
                 )
                 continue
-            if self._pid_is_alive(job.pid):
+            confirmed_job = self._confirm_starting_runner_identity(job)
+            if confirmed_job is not None:
+                job = confirmed_job
+            if self._ownerless_startup_lease_expired(job):
+                self._mark_ownerless_startup_lease_failed(job)
+                continue
+            if job.runner_alive is True:
                 timestamp = _now()
                 self._update_job(
                     job.job_id,
                     status="running",
                     updated_at=timestamp,
                     error="API service restarted while this durable runner was still running; monitoring exit status.",
+                )
+                self._start_recovery_monitor(job.job_id, job.pid)
+                continue
+            if self._runner_identity_startup_pending(job):
+                timestamp = _now()
+                self._update_job(
+                    job.job_id,
+                    status="running",
+                    updated_at=timestamp,
+                    error=(
+                        "API service restarted while the durable runner identity "
+                        "handshake was still starting; waiting for signed identity."
+                    ),
                 )
                 self._start_recovery_monitor(job.job_id, job.pid)
                 continue
@@ -2334,6 +3468,7 @@ class QuantJobService:
         poll_interval_seconds: float = RECOVERED_RUNNER_POLL_INTERVAL_SECONDS,
     ) -> None:
         started_at = time.monotonic()
+        handshake_started_at = started_at
         while True:
             try:
                 job = self.get_job(job_id)
@@ -2352,7 +3487,49 @@ class QuantJobService:
                     job, int(payload["return_code"]), _now(), runner_error
                 )
                 return
-            if not self._pid_is_alive(pid):
+            if job.runner_identity.get("handshake_status") == "starting":
+                confirmed_job = self._confirm_starting_runner_identity(job)
+                if confirmed_job is not None:
+                    job = confirmed_job
+                elif self._ownerless_startup_lease_expired(job):
+                    self._mark_ownerless_startup_lease_failed(job)
+                    return
+                elif self._runner_identity_startup_pending(job):
+                    if (
+                        time.monotonic() - handshake_started_at
+                        >= RUNNER_IDENTITY_HANDSHAKE_TIMEOUT_SECONDS
+                    ):
+                        timestamp = _now()
+                        self._update_job(
+                            job_id,
+                            status="running",
+                            completed_at=None,
+                            updated_at=timestamp,
+                            error=(
+                                "Recovered durable runner did not complete its signed "
+                                "identity handshake within the startup window; output "
+                                "ownership remains locked and monitoring will continue."
+                            ),
+                        )
+                        self._start_recovery_monitor(job_id, pid)
+                        return
+                    if poll_interval_seconds > 0:
+                        time.sleep(poll_interval_seconds)
+                    continue
+                else:
+                    timestamp = _now()
+                    self._update_job(
+                        job_id,
+                        status="failed",
+                        completed_at=timestamp,
+                        updated_at=timestamp,
+                        error=(
+                            "Recovered durable runner identity handshake did not match; "
+                            "no process was signaled."
+                        ),
+                    )
+                    return
+            if job.runner_alive is not True:
                 payload = self._read_exit_status(job)
                 if payload is not None:
                     runner_error = (
@@ -2377,14 +3554,16 @@ class QuantJobService:
                 timestamp = _now()
                 self._update_job(
                     job_id,
-                    status="failed",
-                    completed_at=timestamp,
+                    status="running",
+                    completed_at=None,
                     updated_at=timestamp,
                     error=(
                         "Recovered durable runner exceeded the recovery monitoring "
-                        "window without writing an exit status."
+                        "window without writing an exit status; output ownership "
+                        "remains locked and monitoring will continue."
                     ),
                 )
+                self._start_recovery_monitor(job_id, pid)
                 return
             if poll_interval_seconds > 0:
                 time.sleep(poll_interval_seconds)
@@ -2415,9 +3594,9 @@ class QuantJobService:
                     INSERT INTO jobs (
                         job_id, job_type, label, status, params_json, command_json, cwd,
                         pid, return_code, created_at, started_at, completed_at, updated_at,
-                        error, log_path, artifact_paths_json
+                        error, log_path, artifact_paths_json, runner_identity_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
         values = (
             job.job_id,
@@ -2436,6 +3615,7 @@ class QuantJobService:
             job.error,
             job.log_path,
             _json_dumps(job.artifact_paths),
+            _json_dumps(job.runner_identity),
         )
         if conn is not None:
             conn.execute(query, values)
@@ -2474,8 +3654,168 @@ class QuantJobService:
         with self._connect() as conn:
             return list(conn.execute(query, params).fetchall())
 
+    @staticmethod
+    def _timestamp(value: Optional[str]) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.timestamp()
+
+    def _progress_payload(self, job: QuantJob) -> Dict[str, Any]:
+        patterns = self.command_specs.get(job.job_type, {}).get("progress_patterns", [])
+        if not patterns:
+            return {}
+        started_timestamp = self._timestamp(job.started_at or job.created_at)
+        candidates: List[Path] = []
+        for pattern in patterns:
+            candidates.extend(Path(match) for match in glob.glob(str(pattern)))
+        valid_paths: List[Path] = []
+        for path in candidates:
+            try:
+                metadata = path.stat()
+            except OSError:
+                continue
+            if not path.is_file() or metadata.st_size > PROGRESS_FILE_MAX_BYTES:
+                continue
+            if started_timestamp is not None and metadata.st_mtime + 1 < started_timestamp:
+                continue
+            valid_paths.append(path)
+        if not valid_paths:
+            return {}
+        raw: Optional[Dict[str, Any]] = None
+        for progress_path in sorted(
+            valid_paths,
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        ):
+            try:
+                candidate = json.loads(progress_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, dict) and self._progress_matches_job(
+                job, candidate
+            ):
+                raw = candidate
+                break
+        if raw is None:
+            return {}
+
+        completed_raw = raw.get("completed", raw.get("completed_count", 0))
+        total_raw = raw.get("total", raw.get("expected_count", 0))
+        try:
+            completed = max(0, int(completed_raw or 0))
+            total = max(0, int(total_raw or 0))
+        except (TypeError, ValueError):
+            completed, total = 0, 0
+        if total:
+            completed = min(completed, total)
+        percent = round((completed / total) * 100, 2) if total else 0.0
+
+        started = self._timestamp(job.started_at)
+        finished = self._timestamp(job.completed_at) if job.completed_at else time.time()
+        elapsed_seconds = (
+            max(0, int((finished or time.time()) - started))
+            if started is not None
+            else 0
+        )
+        eta_seconds: Optional[int] = None
+        if job.status in {"pending", "running"} and completed > 0 and total > completed:
+            eta_seconds = max(0, int((elapsed_seconds / completed) * (total - completed)))
+
+        progress: Dict[str, Any] = {
+            "stage": str(raw.get("stage") or raw.get("current_stage") or ""),
+            "completed": completed,
+            "total": total,
+            "percent": percent,
+            "current": str(
+                raw.get("current")
+                or raw.get("current_model")
+                or raw.get("signal_id")
+                or ""
+            ),
+            "elapsed_seconds": elapsed_seconds,
+            "eta_seconds": eta_seconds,
+        }
+        for source, target in (
+            ("updated_at", "updated_at"),
+            ("pause_state", "pause_state"),
+            ("lifecycle_status", "lifecycle_status"),
+            ("status", "status"),
+            ("run_id", "run_id"),
+            ("batch_id", "batch_id"),
+            ("reason_code", "reason_code"),
+            ("next_gate", "next_gate"),
+        ):
+            value = raw.get(source)
+            if isinstance(value, (str, int, float, bool)) and str(value):
+                progress[target] = value
+        artifact = raw.get("current_artifact")
+        if isinstance(artifact, str) and artifact.strip():
+            progress["current_artifact"] = Path(artifact).name
+        return progress
+
+    @staticmethod
+    def _progress_matches_job(job: QuantJob, raw: Mapping[str, Any]) -> bool:
+        for key in ("run_id", "batch_id"):
+            expected = job.params.get(key)
+            if expected not in (None, "") and str(raw.get(key) or "") != str(expected):
+                return False
+
+        if "smoke" in job.params:
+            expected_mode = "smoke" if _as_bool(job.params.get("smoke")) else "formal"
+            actual_mode = raw.get("run_mode")
+            if actual_mode is None and isinstance(raw.get("smoke"), bool):
+                actual_mode = "smoke" if raw["smoke"] else "formal"
+            if str(actual_mode or "") != expected_mode:
+                return False
+
+        if job.job_type == "run_candidate_pipeline" or "dry_run" in job.params:
+            if not isinstance(raw.get("dry_run"), bool):
+                return False
+            if bool(raw["dry_run"]) != _as_bool(job.params.get("dry_run")):
+                return False
+
+        for key, expected in job.params.items():
+            if key in {"run_id", "batch_id", "smoke", "dry_run"} or key not in raw:
+                continue
+            actual = raw.get(key)
+            if isinstance(expected, (str, int, float, bool)) and actual != expected:
+                return False
+        return True
+
+    def _job_can_cancel(
+        self, job: QuantJob, progress: Mapping[str, Any]
+    ) -> bool:
+        if job.status in {"pending", "running"}:
+            return True
+        if job.status != "completed":
+            return False
+        spec = self.command_specs.get(job.job_type, {})
+        if spec.get("cancel_command") is None:
+            return False
+        lifecycle = str(progress.get("lifecycle_status") or "").strip().lower()
+        pause_state = str(progress.get("pause_state") or "").strip().lower()
+        return lifecycle in {"starting", "running", "pause_requested"} or pause_state in {
+            "starting",
+            "running",
+            "pause_requested",
+        }
+
+    @staticmethod
+    def _log_updated_at(job: QuantJob) -> Optional[str]:
+        try:
+            modified = Path(job.log_path).stat().st_mtime
+        except OSError:
+            return None
+        return datetime.fromtimestamp(modified).astimezone().isoformat(timespec="microseconds")
+
     def _row_to_job(self, row: sqlite3.Row) -> QuantJob:
-        return QuantJob(
+        job = QuantJob(
             job_id=row["job_id"],
             job_type=row["job_type"],
             label=row["label"],
@@ -2492,4 +3832,21 @@ class QuantJobService:
             error=row["error"],
             log_path=row["log_path"],
             artifact_paths=json.loads(row["artifact_paths_json"] or "[]"),
+            runner_identity=json.loads(row["runner_identity_json"] or "{}"),
+        )
+        progress = self._progress_payload(job)
+        runner_alive = None
+        if job.pid:
+            if job.status in TERMINAL_STATUSES:
+                runner_alive = False
+            elif self._runner_identity_startup_pending(job):
+                runner_alive = None
+            else:
+                runner_alive = self._runner_identity_matches(job)
+        return replace(
+            job,
+            progress=progress,
+            runner_alive=runner_alive,
+            can_cancel=self._job_can_cancel(job, progress),
+            log_updated_at=self._log_updated_at(job),
         )

@@ -6,6 +6,26 @@ import numpy as np
 import pandas as pd
 
 
+def _equal_weights(holdings: set[object], position_pct: float) -> dict[object, float]:
+    if not holdings or position_pct <= 0:
+        return {}
+    weight = float(position_pct) / len(holdings)
+    return {symbol: weight for symbol in holdings}
+
+
+def _weight_turnover(
+    previous: dict[object, float], target: dict[object, float]
+) -> float:
+    symbols = previous.keys() | target.keys()
+    return (
+        sum(
+            abs(target.get(symbol, 0.0) - previous.get(symbol, 0.0))
+            for symbol in symbols
+        )
+        / 2
+    )
+
+
 class OptimizedStrategy:
     """TopK strategy with turnover, market-state and drawdown controls."""
 
@@ -55,6 +75,7 @@ class OptimizedStrategy:
 
         daily_results = []
         prev_holdings = set()
+        prev_weights: dict[object, float] = {}
         cum_return = 1.0
         peak_return = 1.0
         in_cooldown = False
@@ -73,7 +94,9 @@ class OptimizedStrategy:
             if market_indicators is not None and dt in market_indicators.index:
                 mi = market_indicators.loc[dt]
                 if self.trend_filter and not pd.isna(mi.get(self.trend_ma, np.nan)):
-                    trend_signal = mi.get(f"trend_{self.trend_ma.replace('ma', '')}", 1.0)
+                    trend_signal = mi.get(
+                        f"trend_{self.trend_ma.replace('ma', '')}", 1.0
+                    )
                     if trend_signal < 0.5:
                         position_pct *= 1.0 - self.trend_reduce_pct
 
@@ -105,55 +128,77 @@ class OptimizedStrategy:
                         position_pct = 0.0
 
             rebalance_day += 1
-            if self.rebalance_freq > 1 and rebalance_day % self.rebalance_freq != 0 and prev_holdings:
-                port_data = day_data.loc[day_data.index.isin(prev_holdings)]
-                if len(port_data) > 0:
-                    port_ret = port_data["label"].mean() * position_pct
-                    cum_return *= 1 + port_ret
-                    peak_return = max(peak_return, cum_return)
-                    daily_results.append(
-                        {
-                            "date": dt,
-                            "return": port_ret,
-                            "gross_return": port_data["label"].mean(),
-                            "turnover": 0.0,
-                            "position_pct": position_pct,
-                            "n_stocks": len(prev_holdings),
-                        }
-                    )
-                continue
-
             if position_pct < 0.01:
+                turnover = _weight_turnover(prev_weights, {})
+                net_ret = -(turnover * (self.cost_bps / 10000))
+                cum_return *= 1 + net_ret
+                peak_return = max(peak_return, cum_return)
                 daily_results.append(
                     {
                         "date": dt,
-                        "return": 0.0,
+                        "return": net_ret,
                         "gross_return": 0.0,
-                        "turnover": len(prev_holdings) / max(self.topk, 1) if prev_holdings else 0.0,
+                        "turnover": turnover,
                         "position_pct": 0.0,
                         "n_stocks": 0,
                     }
                 )
                 prev_holdings = set()
+                prev_weights = {}
+                continue
+
+            if (
+                self.rebalance_freq > 1
+                and rebalance_day % self.rebalance_freq != 0
+                and prev_holdings
+            ):
+                port_data = day_data.loc[day_data.index.isin(prev_holdings)]
+                if len(port_data) > 0:
+                    target_weights = _equal_weights(prev_holdings, position_pct)
+                    turnover = _weight_turnover(prev_weights, target_weights)
+                    port_ret = port_data["label"].mean() * position_pct
+                    net_ret = port_ret - turnover * (self.cost_bps / 10000)
+                    cum_return *= 1 + net_ret
+                    peak_return = max(peak_return, cum_return)
+                    daily_results.append(
+                        {
+                            "date": dt,
+                            "return": net_ret,
+                            "gross_return": port_data["label"].mean(),
+                            "turnover": turnover,
+                            "position_pct": position_pct,
+                            "n_stocks": len(prev_holdings),
+                        }
+                    )
+                    prev_weights = target_weights
                 continue
 
             top_stocks = set(day_data.nlargest(self.topk, "score").index)
             new_stocks = top_stocks - prev_holdings
             removed_stocks = prev_holdings - top_stocks
-            turnover = (len(new_stocks) + len(removed_stocks)) / (2 * max(self.topk, 1))
+            composition_turnover = (len(new_stocks) + len(removed_stocks)) / (
+                2 * max(self.topk, 1)
+            )
 
-            if self.turnover_cap and turnover > self.turnover_cap and prev_holdings:
+            if (
+                self.turnover_cap
+                and composition_turnover > self.turnover_cap
+                and prev_holdings
+            ):
                 n_keep = int(self.topk * (1 - self.turnover_cap))
                 keep = {symbol for symbol in prev_holdings if symbol in day_data.index}
                 if len(keep) > n_keep:
                     keep_scores = day_data.loc[list(keep), "score"].nlargest(n_keep)
                     keep = set(keep_scores.index)
                 n_new = self.topk - len(keep)
-                candidates = day_data.drop(index=list(keep), errors="ignore").nlargest(n_new, "score")
+                candidates = day_data.drop(index=list(keep), errors="ignore").nlargest(
+                    n_new, "score"
+                )
                 top_stocks = keep | set(candidates.index)
-                turnover = min(turnover, self.turnover_cap)
 
             port_data = day_data.loc[day_data.index.isin(top_stocks)]
+            target_weights = _equal_weights(top_stocks, position_pct)
+            turnover = _weight_turnover(prev_weights, target_weights)
             port_ret = port_data["label"].mean() * position_pct
             cost = turnover * (self.cost_bps / 10000)
             net_ret = port_ret - cost
@@ -171,9 +216,16 @@ class OptimizedStrategy:
                 }
             )
             prev_holdings = top_stocks
+            prev_weights = target_weights
 
         if not daily_results:
             return pd.DataFrame(
-                columns=["return", "gross_return", "turnover", "position_pct", "n_stocks"]
+                columns=[
+                    "return",
+                    "gross_return",
+                    "turnover",
+                    "position_pct",
+                    "n_stocks",
+                ]
             ).rename_axis("date")
         return pd.DataFrame(daily_results).set_index("date")

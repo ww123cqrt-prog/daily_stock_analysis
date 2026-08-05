@@ -18,6 +18,26 @@ export type ResearchDataSource = {
 export type ResearchTrainingReadiness = {
   status: string;
   summary: string;
+  failureReasons?: string[];
+};
+
+export type ResearchProviderQuality = {
+  provider?: string;
+  datasetId?: string;
+  snapshotId?: string;
+  manifestSha256?: string;
+  contentSha256?: string;
+  calendarEnd?: string;
+  trainable?: boolean;
+  structuralStatus?: 'accepted' | 'blocked' | string;
+  freshness?: {
+    status: 'current' | 'stale' | 'future' | 'unknown' | string;
+    calendarEnd?: string | null;
+    asOfDate?: string;
+    calendarAgeDays?: number | null;
+    blocksTraining?: boolean;
+  };
+  trainingReadiness?: ResearchTrainingReadiness;
 };
 
 export type ResearchQualityScan = {
@@ -60,6 +80,7 @@ export type ResearchProviderIdentity = {
 export type ResearchTrainingResult = {
   status: string;
   experimentName?: string;
+  experimentId?: string;
   runId?: string;
   provider?: string;
   providerUri?: string;
@@ -70,6 +91,7 @@ export type ResearchTrainingResult = {
   providerIdentity?: ResearchProviderIdentity;
   sourceConfig?: string;
   runtimeConfig?: string;
+  artifactSha256?: Record<string, string>;
   metrics?: Record<string, number>;
   artifacts?: string[];
   generatedAt?: string;
@@ -152,7 +174,9 @@ export type ResearchCandidateModel = {
   id: string;
   label?: string;
   status: string;
+  experimentId?: string | null;
   runId?: string | null;
+  artifactSha256?: Record<string, string>;
   selection?: ResearchCandidateMetrics;
   holdout?: ResearchCandidateMetrics;
   error?: string;
@@ -162,12 +186,14 @@ export type ResearchCandidateStrategy = {
   modelId: string;
   strategyId: string;
   strategyLabel?: string;
+  strategyConfig?: Record<string, unknown>;
   selection?: ResearchCandidateMetrics;
   holdout?: ResearchCandidateMetrics;
 };
 
 export type ResearchCandidatePipeline = {
   status: string;
+  dryRun?: boolean;
   batchId?: string;
   experimentName?: string;
   provider?: string;
@@ -336,11 +362,57 @@ export type ResearchRobustSignal = {
   completedCount?: number;
   expectedCount?: number;
   updatedAt?: string;
+  configHash?: string;
+  gitCommit?: string;
+  dataManifestHash?: string;
+  contextHash?: string;
+  dataReadiness?: {
+    contractVersion?: string;
+    status: string;
+    trainable: boolean;
+    reasonCode?: string;
+    summary?: string;
+    summaryZh?: string;
+    generatedAt?: string;
+    providerName?: string;
+    providerKey?: string;
+    providerTreeSha256?: string;
+    dataManifestSha256?: string;
+    membershipIntervalsSha256?: string;
+    canonicalSnapshotId?: string;
+    symbols?: number;
+    intervals?: number;
+  };
   progress?: {
     currentStage?: string;
     pauseState?: string;
     completedCount?: number;
     expectedCount?: number;
+    currentJob?: string;
+  };
+  smokeRun?: {
+    status: string;
+    lifecycleStatus?: string;
+    reasonCode?: string;
+    runId?: string;
+    currentStage?: string;
+    pauseState?: string;
+    nextGate?: string;
+    completedCount?: number;
+    expectedCount?: number;
+    updatedAt?: string;
+    configHash?: string;
+    gitCommit?: string;
+    dataManifestHash?: string;
+    contextHash?: string;
+    testOnly?: boolean;
+    progress?: {
+      currentStage?: string;
+      pauseState?: string;
+      completedCount?: number;
+      expectedCount?: number;
+      currentJob?: string;
+    };
   };
   result?: {
     status?: string;
@@ -579,6 +651,7 @@ export type ResearchStatus = {
   qualityScan?: ResearchQualityScan;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
+  providerQuality?: Record<string, ResearchProviderQuality>;
   latestTrainingProvider?: ResearchQlibProvider | null;
   latestTraining?: ResearchTrainingResult | null;
   cashControlBacktest?: ResearchCashControlBacktest | null;
@@ -624,7 +697,46 @@ export function convertQlibResearch(data: unknown): ResearchQlibResearch | null 
 function convertResearchStatus(data: Record<string, unknown>): ResearchStatus {
   const status = toCamelCase<ResearchStatus>(data);
   status.qlibResearch = convertQlibResearch(data.qlib_research);
+  const rawLatestTraining = data.latest_training;
+  if (
+    status.latestTraining
+    && rawLatestTraining
+    && typeof rawLatestTraining === 'object'
+    && !Array.isArray(rawLatestTraining)
+  ) {
+    const artifactSha256 = preserveArtifactSha256(
+      (rawLatestTraining as Record<string, unknown>).artifact_sha256,
+    );
+    if (artifactSha256) status.latestTraining.artifactSha256 = artifactSha256;
+  }
+
+  const rawCandidatePipeline = data.candidate_pipeline;
+  if (
+    status.candidatePipeline?.models
+    && rawCandidatePipeline
+    && typeof rawCandidatePipeline === 'object'
+    && !Array.isArray(rawCandidatePipeline)
+  ) {
+    const rawModels = (rawCandidatePipeline as Record<string, unknown>).models;
+    if (Array.isArray(rawModels)) {
+      for (const rawModel of rawModels) {
+        if (!rawModel || typeof rawModel !== 'object' || Array.isArray(rawModel)) continue;
+        const raw = rawModel as Record<string, unknown>;
+        const model = status.candidatePipeline.models.find((item) => item.id === raw.id);
+        const artifactSha256 = preserveArtifactSha256(raw.artifact_sha256);
+        if (model && artifactSha256) model.artifactSha256 = artifactSha256;
+      }
+    }
+  }
   return status;
+}
+
+function preserveArtifactSha256(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string',
+  );
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 export const researchApi = {

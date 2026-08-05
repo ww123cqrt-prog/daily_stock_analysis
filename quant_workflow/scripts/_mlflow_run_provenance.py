@@ -31,6 +31,7 @@ PREDICTION_ARTIFACTS = {"pred.pkl", "label.pkl"}
 ARTIFACT_SHA256_TAGS = {
     "pred.pkl": "dsa.artifact.pred_sha256",
     "label.pkl": "dsa.artifact.label_sha256",
+    "task": "dsa.artifact.task_sha256",
     "portfolio_analysis/report_normal_1day.pkl": (
         "dsa.artifact.portfolio_report_sha256"
     ),

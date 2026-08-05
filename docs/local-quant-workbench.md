@@ -22,7 +22,7 @@
 
 本地研究默认只绑定 `127.0.0.1`。只要 `DSA_BIND_HOST`/`UVICORN_HOST` 指向非 localhost，或 `DSA_ENV=production`，后端就要求 `ADMIN_AUTH_ENABLED=true`；否则启动会直接拒绝。设置页也不能在这些暴露运行时关闭认证。需要局域网或公网访问时，先启用管理员认证，再配置明确的来源列表或反向代理。若绕过项目入口、手写 `uvicorn.Config(host=...)` 启动服务，必须先设置 `DSA_BIND_HOST` 或调用 `src.web_bind.publish_bind_host()`，否则应用工厂无法可靠感知真实绑定地址。
 
-`/api/v1/quant/*` 的任务创建/取消/SSE、`/api/v1/research/experiments/*` 的实验记录变更和 `/experiments/*` 的 MLflow 写请求，都要求请求带有本机 `Origin` 或本机 `Referer`。`/api/v1/quant/*` 的任务列表、日志、产物和状态读取、`/api/v1/research/status` 以及 `/experiments/*` 读取也会拒绝跨站浏览器访问；无 `Origin` 的本机 CLI 健康检查仍可读取。浏览器里的 DSA 页面会自动满足这个条件；裸 `curl`/脚本调试 mutation API 时，应显式带上本机 `Referer: http://127.0.0.1:8010/workflow` 或 `Origin: http://127.0.0.1:8010`。`X-DSA-Local-Client` 不作为来源保护旁路；一旦绑定到 `0.0.0.0` 或生产环境，应启用管理员认证后按受控客户端方式接入。
+`/api/v1/quant/*` 的任务创建/取消/SSE、`/api/v1/backtest/*` 的回测写请求、`/api/v1/research/experiments/*` 的实验记录变更和 `/experiments/*` 的 MLflow 写请求，都要求请求带有本机 `Origin` 或本机 `Referer`。`/api/v1/quant/*` 的任务列表、日志、产物和状态读取、`/api/v1/research/status` 以及 `/experiments/*` 读取也会拒绝跨站浏览器访问；无 `Origin` 的本机 CLI 健康检查仍可读取。浏览器里的 DSA 页面会自动满足这个条件；裸 `curl`/脚本调试 mutation API 时，应显式带上本机 `Referer: http://127.0.0.1:8010/workflow` 或 `Origin: http://127.0.0.1:8010`。`X-DSA-Local-Client` 不作为来源保护旁路；一旦绑定到 `0.0.0.0` 或生产环境，应启用管理员认证后按受控客户端方式接入。
 
 量化任务接口在本地模式下可以不启用登录认证，但安全边界是“只绑定 localhost + 来源校验 + 白名单脚本”。如果要给局域网或公网使用，必须启用 `ADMIN_AUTH_ENABLED=true`，并额外评估访问控制、反向代理和提交频率限制。
 
@@ -141,6 +141,8 @@ JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baosto
 
 东方财富、AkShare 和新浪快照任务默认绕过 macOS/系统代理，避免本机代理端口残留时把公开行情下载误判为源站失败；确实需要代理访问时，在网页任务里勾选“使用系统代理”，或在脚本端传 `--use-system-proxy`。Baostock 阶段使用其 SDK 的匿名连接路径，不走这组 requests 代理开关。
 
+外部端口被封、上游数据源拒绝连接或本机网络暂时不可达属于运行环境状态，本身不作为 DSA 软件缺陷或代码审查阻塞项。DSA 必须把这类失败明确显示为外部连接失败，并允许重试或切换已批准来源；误报成功、写入半套数据、破坏现有快照、无限等待或无法恢复才属于产品缺陷。测试和审查不得为了让外部连接变绿而降低数据验收门槛。
+
 自动调度用本机 launchd（不写入 Git，属机器本地配置）。安装脚本从仓内模板生成含绝对路径的 plist：
 
 ```bash
@@ -171,17 +173,44 @@ scripts/launchd/install-robust-shadow.sh --uninstall
 
 `report_workbench_capabilities.py` 在 `/workflow` 中作为“生成工作台能力盘点”任务出现。它只读扫描 DSA 前端页面、DSA API router、后端量化任务白名单、网页任务卡、`quant_workflow/scripts` 稳定脚本、测试覆盖和 `china-astock-quant` 可复用边界，输出 `workbench_capability_inventory_latest.{json,md}`。这个任务用于回答“哪些能力已经有网页入口，哪些还缺测试、缺前端入口或只保留在脚本层”，不启动下载、转换、清洗、训练任务，也不接券商、不自动下单。
 
-### 2.4 鲁棒策略长训练待开发功能
+### 2.4 鲁棒选股信号长训练控制
 
-鲁棒策略 runner 当前已经支持命令行 `--resume` 断点续训：恢复时会校验 Git 提交、工作树、数据清单、历史股票池、参考数据和已完成模型产物，只跳过身份一致且文件完整的任务。当前仍缺少以下产品化能力，不能把人工停止进程和手工执行恢复命令描述成已经完成的网页功能：
+`/workflow` 已经为 Goal 1 的鲁棒选股信号研究提供受控网页入口：预览固定研究矩阵、运行隔离的单季度测试、正式启动、完成当前原子任务后暂停、按同一 Run 恢复和立即取消。网页显示 Run ID、阶段、完成数、总数、百分比、暂停状态、检查点以及配置、代码和数据身份；浏览器不能提交任意命令、输出路径或 launchd label。
 
-- **一键暂停**：在 `/workflow` 增加“暂停训练”操作，由后端安全停止对应 launchd 作业及其训练子进程，等待进程退出后原子写入暂停快照、当前阶段、进度、代码与数据身份和可执行的恢复参数。
-- **网页恢复**：暂停后的同一个 Run 显示“从断点恢复”操作；恢复前重新执行身份与产物校验，校验失败时明确说明变更项，不得悄悄新建 Run 或从头训练。
-- **状态展示**：网页明确区分 `running`、`pausing`、`paused`、`resuming`、`completed` 和 `failed`，并显示已完成、待运行和需要重跑的任务数量。
-- **MPS 恢复身份修正**：当前 MPS 长训练会把每次启动探测的时间也计入冻结身份，导致硬件和软件完全相同时仍可能误报 `resume_context_mismatch`。正式实现应冻结 Python、Torch、设备和可用性等稳定字段，并把本次恢复探测时间作为新的审计证据单独保存，不能通过删除校验或伪造当前探测结果绕过。
-- **相应测试**：补齐 runner 暂停/恢复、重复点击、进程树退出、写快照失败、数据清单变化、Git 提交变化、产物损坏、API 来源保护和前端状态切换测试，再通过真实短任务验证暂停后不会残留训练进程、恢复后不会重跑有效断点。
+- **协作暂停**只写入暂停请求，runner 完成当前原子任务并保存检查点后进入 `paused`。这和立即终止进程不同。
+- **网页恢复**只接受原 Run ID；恢复前重新校验配置哈希、Git 提交、数据清单、provider 树和已有产物。身份变化时失败关闭，不会悄悄新建 Run 或从头训练。
+- **检查点完整性**不再以“文件存在”作为完成依据。每个已完成子任务保存固定的 Run 内相对路径、SHA-256、字节数、任务身份、阶段、信号、选股模型、季度、训练窗口、时间切分、行数和 artifact schema；恢复时重新读取同一份预测 Parquet 字节校验字段与锁定日期范围，并校验 diagnostics JSON。模型 pickle 只核对受控路径、哈希和模型契约，不为检查点验证而反序列化。
+- **立即取消**调用服务端白名单中的专用取消命令，并核对 launch token、PID、进程启动身份和命令哈希。只有后台 runner 确认停止后才标记 `cancelled`；取消失败会保留可见错误，不能伪装成已停止。
+- **启动授权**采用两阶段协议。任务必须先在共享 SQLite 中原子完成 `pending -> running` 认领；耐久 wrapper 只登记签名身份并等待一次性许可，服务端再次核对任务状态、launch token 和 PID 后才允许执行真实命令。另一个 DSA 进程先取消时，任务不会被复活，真实训练命令也不会启动；授权先完成时，已登记的进程组可被准确终止。
+- **启动器与 runner 分离**：launchd 接管训练后，网页启动任务本身可以先显示 `completed`。只要同一个 Run 的持久化状态仍是 `starting`、`running` 或 `pause_requested`，API 仍返回 `can_cancel=true`，页面继续提供“立即取消”；自然完成或重复取消不会再次执行取消命令。
+- **重启恢复**：API 重启时会等待严格的 runner identity 握手，并验证 token、PID、命令哈希、进程启动时间和实际进程命令。身份文件仍在生成时保留输出冲突锁；握手超时只终止本次新建且身份精确匹配的进程，不会误杀其他训练。
+- **恢复监控超时**：已验证仍存活的 runner 不会仅因监控窗口到期被标记为失败。页面显示告警，任务继续占用冲突产物并重新挂接监控，直到取得真实退出状态或完成经过身份核对的取消。
 
-在这些能力完成并通过测试前，鲁棒训练只能由维护者使用持久化 runner 和受审计的命令行流程暂停或恢复；MPS Run 还需要分别保留首次启动证明和本次恢复证明。
+以上能力只覆盖 `run_robust_signal_research` 和 `resume_robust_signal_research`。旧鲁棒策略开发 runner、确认期、60 日纸面跟踪和 MPS 专用训练没有因此自动获得同一套网页暂停/恢复功能；这些流程仍按各自持久化 runner 和维护文档执行。立即取消也不是可恢复暂停，页面会二次确认并明确提示这个区别。
+
+### 2.5 网页选股模型训练闭环
+
+`/workflow` 的训练主体是“选股模型训练”，不是把选股模型和交易策略混成一个概念。人类用户可以先在 `/data` 查看或生成数据质量报告，再返回训练页选择 canonical 或 cleaned provider；页面会显示实际不可变 snapshot ID、结构验收、`trainable` 状态、阻塞原因和数据新鲜度。数据质量不通过时正式训练不会启动，按钮旁必须说明缺少哪份报告或哪项数据契约，不能只显示无解释的灰色按钮。
+
+Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canonical `trainable`。不可变质量证据必须同时包含 `provider_quality.cleaned`，其 `trainable=true`、`training_readiness.status=trainable`、两层阻塞原因均为空，而且 dataset、snapshot、manifest 和 content 四项身份必须与 `data_contract.qlib_providers.cleaned` 完全一致；否则固定阻断正式信号研究。
+
+页面请求数据状态期间必须显示中性的“读取中”，不能在结果尚未返回时提前显示“阻塞”。训练结果宽表在移动视口中只允许自身容器滚动，不能撑宽整个页面或裁掉训练、暂停、恢复和回测按钮。
+
+测试式训练与正式训练使用不同的产物和实验边界：
+
+- 候选流程 dry-run 只写 `candidate_pipeline_test_*` 和测试进度，页面统一标记“测试数据，不可用于研究或交易”。它不覆盖 `candidate_pipeline_latest`，不进入正式候选列表，也不创建正式 MLflow Run。
+- 真实网页/脚本等价验收使用专用配置、报告目录和 MLflow 实验 `dsa_training_equivalence`，不替换日常 `latest_training_result`。验收必须固定同一配置、provider snapshot、随机条件和时间区间，并比较两个真实 Run 的预测哈希、关键指标、MLflow 归属及回测结果；dry-run 不能证明等价。
+- 正式训练只能由网页提交到后端白名单任务和持久化 runner。网页不接受任意命令、脚本、输出路径、MLflow 实验名或 provider 绝对路径；终端只用于诊断、测试和只读核对。
+
+训练结果是否能进入 `/backtest` 由回测契约决定，不能只看模型名称或是否有 Run ID。可回测结果必须同时具备真实 Run ID、可重放预测、完整不可变 provider 身份以及冻结的交易策略配置。训练结果按钮会把 Run ID、选股模型、交易策略、snapshot、日期、TopK 和成本写入回测 URL；回测页在同一个已挂载页面内切换这些查询参数时也会重新同步选择并清除旧结果。URL 没有 Run/模型身份时才允许默认选择第一项；URL 明确指定的 Run、模型或组合不存在、不匹配时，页面必须清空旧选择和旧结果并显示错误，不能静默改成另一条 Run。测试结果或缺少契约的历史结果只提供“查看测试结果”或缺失原因，不显示“运行回测”。回测目录 API 可以保留旧记录用于审计，但前端会把 `replay_capability=unavailable` 的 Run 排除在可操作下拉框之外，并汇总显示排除数量和原因；`custom_only` 且仍有完整数据身份和冻结策略的旧 Run 继续允许明确标记的自定义回测。
+
+候选流程的子训练记录使用 `candidate_child` scope。baseline 目录跳过这些子记录，由候选报告按真实模型 ID 只生成一条目录项，避免同一 MLflow Run 以 `latest` 和候选模型两个身份重复出现。候选 DSA 交易策略依赖当前 `OptimizedStrategy` 引擎，因此统一标为“重建回测 / custom_only”，不再宣称“按原条件重放”。baseline 和 candidate 的所有可运行重放都必须使用选中模型条目中冻结的 `pred.pkl`、`label.pkl`（Qlib exact 另含 `task`）哈希；服务只读取 artifact 一次，比较同一份字节的 SHA-256 后再从该字节反序列化，不能先验证路径再重新打开文件。
+
+任务状态同时区分短生命周期启动器和实际 durable runner。launchd 已接管但启动器任务先显示 `completed` 时，只要 `can_cancel=true`，页面仍将其计入运行中任务、阻止重复启动并显示“后台仍运行”。顶部计数、任务分组、日志、进度和启动按钮统一使用这一判断。页面展示前端构建、后端构建、API 契约、runner PID/存活状态、当前阶段、完成数、总数、百分比、已用时间、可计算时的预计剩余时间、当前产物和失败阶段；日志截断会明确标记。
+
+市场状态与现金仓位报告只接收最近一次正式全量质量报告批准的 A 股 qfq 快照。质量报告已经完成内容哈希验证；网页提交任务时再比较该快照的文件系统状态指纹，防止验收后、进程启动前数据被替换，同时避免每次报告都重新读取整套行情文件。
+
+当前已知边界必须如实保留：旧候选 Run 如果没有不可变数据身份或冻结策略，只能查看缺失原因；旧版但具备数据身份和策略的 Run 可能只支持自定义回测，不能称为原条件重放。Goal 1 的预览、测试、正式启动、暂停和恢复按钮都必须等待并遵从后端任务目录；后端未加载、版本不兼容或未启用时显示具体不可用状态，不发送请求。通用 LightGBM 正式训练与严格鲁棒 CSI800 研究是两套不同的数据准备契约；通用 provider 可训练不代表鲁棒 PIT 数据已就绪。旧鲁棒策略 runner、确认期和纸面跟踪仍没有 Goal 1 同等级的网页协作暂停/恢复。系统不连接券商、不自动下单。
 
 `/research` 右侧栏提供 CatDesk 9（`a-share-us-catalyst` / 九点猫研）的本地跳转入口 `http://127.0.0.1:8765/`。当前只是网页级跳转，不共享 DSA/Qlib 数据，也不把 CatDesk 的“候选信号历史验证”归类为 Qlib 策略回测。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。后续若要合并模块，先单独审查重复数据源、术语和报告边界。
 
@@ -221,6 +250,8 @@ scripts/launchd/install-robust-shadow.sh --uninstall
 - `Qlib 研究增强`：读取最新或指定 MLflow run 的 `pred.pkl`、`label.pkl`、`params.pkl` 和 `portfolio_analysis`，生成模型解释、回测明细、多实验对比、因子 IC、滚动训练计划和风险诊断报告。
 - `实验复现与产物`：在 `/experiments/` 核对本次训练使用的数据版本、provider、source config、runtime config、MLflow run id、参数、指标和关键 artifact，例如 `pred.pkl`、`portfolio_analysis`、`task`。
 - `交易策略优化预演`：在 `/workflow` 用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；它只读生成报告，不训练选股模型、不连接券商、不自动下单。
+- “按原条件重放”会在本机重新运行冻结的组合回测，冷启动可能超过 30 秒。前端只对该本地计算使用 120 秒等待上限；若仍超时，页面会说明“本地回测等待超时”，不能把它误报成外部行情、代理或网络故障。
+- `/workflow` 的任务轮询使用 `/api/v1/quant/status?include_research=false`，避免和独立研究状态接口重复组装大数据快照。需要完整状态时，后端先完成研究数据和本地服务探测，再读取可变的任务状态；因此任务在慢查询期间完成时，响应不会继续显示请求开始时的旧“运行中”状态。
 
 打开 `http://127.0.0.1:8010/research` 查看实验记录本：
 
@@ -300,10 +331,10 @@ npm run test:smoke:local
 `quant_workflow/reports/*_latest` 指针。`test:smoke:local` 面向当前正在运行的
 本机 8010 服务，适合最终验收前手动确认。
 
-在 `quant_workflow` 中：
+从 DSA 仓库根目录运行：
 
 ```bash
-python -m pytest tests -q
+PYTHONPATH=quant_workflow/scripts .venv/bin/python -m pytest quant_workflow/tests -q
 ```
 
 浏览器验收必须至少打开：
@@ -320,10 +351,16 @@ python -m pytest tests -q
 | --- | --- |
 | 页面打不开 | DSA 服务是否在 `8010`，端口是否被占用 |
 | 工作流按钮失败 | `/workflow` 任务日志抽屉、`quant_workflow/reports/jobs/<job_id>/job.log` |
+| 原条件重放等待超时 | 先看 DSA 日志是否已进入 Qlib 回测；这是本地计算，不等于外部网络失败，避免连续重复点击 |
 | Qlib 不可训练 | `/research` 的数据状态和 `check_qlib_data` 任务日志 |
 | 数据质量差 | 最新数据质量报告、异常股票清单、清洗策略报告 |
 | 训练效果差 | `/backtest` 的 Qlib 指标、MLflow、cash-control 对比 |
 | 实验删不掉 | 确认 run id 存在，Markdown 实验块是否带完整标记 |
+
+重启 8010 后必须同时用 `lsof -nP -iTCP:8010 -sTCP:LISTEN` 和进程树确认旧
+服务已经退出。关闭 screen 容器不保证其 login/Python 子进程一定随之退出；发现
+孤立服务时，只能终止已经核对过身份和进程组的旧 DSA，不能按模糊进程名批量
+结束，更不能影响 6006 的 MLflow。
 
 ## 阶段验收清单
 

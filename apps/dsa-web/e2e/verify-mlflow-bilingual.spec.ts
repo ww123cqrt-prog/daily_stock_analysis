@@ -120,18 +120,55 @@ test('preserves run filters, parameter names, and artifacts on the local MLflow 
   expect(experimentCandidates.length).toBeGreaterThan(0);
 
   let experimentName = '';
+  let experimentUrl = '';
+  let runName = '';
+  let runUrl = '';
   for (const candidate of experimentCandidates) {
-    await page.goto(new URL(candidate.href, page.url()).toString());
-    const hasRun = await page.locator('a[href*="/runs/"]').first().waitFor({
+    const candidateUrl = new URL(candidate.href, page.url()).toString();
+    await page.goto(candidateUrl);
+    const runLinks = page.locator('a[href*="/runs/"]');
+    const hasRun = await runLinks.first().waitFor({
       state: 'visible',
       timeout: 5_000,
     }).then(() => true).catch(() => false);
-    if (hasRun) {
+    if (!hasRun) continue;
+
+    const runCandidates = await runLinks.evaluateAll((links) => (
+      links.slice(0, 5).map((link) => ({
+        href: link.getAttribute('href') || '',
+        name: (link.textContent || '').trim(),
+      })).filter((run) => run.href && run.name)
+    ));
+    for (const run of runCandidates) {
+      const candidateRunUrl = new URL(run.href, page.url()).toString();
+      await page.goto(candidateRunUrl);
+      const hasModelClass = await page.getByText('model.class', { exact: true }).waitFor({
+        state: 'visible',
+        timeout: 2_000,
+      }).then(() => true).catch(() => false);
+      if (!hasModelClass) continue;
+
+      await page.getByText('Artifacts', { exact: true }).click();
+      const hasArtifact = await page.locator('[data-testid="artifact-tree-node"]').first().waitFor({
+        state: 'visible',
+        timeout: 2_000,
+      }).then(() => true).catch(() => false);
+      if (!hasArtifact) continue;
+
       experimentName = candidate.name;
+      experimentUrl = candidateUrl;
+      runName = run.name;
+      runUrl = candidateRunUrl;
       break;
     }
+    if (runUrl) break;
   }
-  expect(experimentName, 'Expected at least one local MLflow experiment containing a run.').not.toBe('');
+  expect(
+    runUrl,
+    'Expected a local MLflow model-training run containing model.class and at least one artifact.',
+  ).not.toBe('');
+
+  await page.goto(experimentUrl);
   await expect(page).toHaveURL(/#\/experiments\/[^/]+\/runs/);
 
   const search = page.locator('[data-testid="search-box"]');
@@ -143,10 +180,7 @@ test('preserves run filters, parameter names, and artifacts on the local MLflow 
   await search.fill('');
   await search.press('Enter');
 
-  const firstRun = page.locator('a[href*="/runs/"]').first();
-  await expect(firstRun).toBeVisible();
-  const runName = (await firstRun.innerText()).trim();
-  await firstRun.click();
+  await page.goto(runUrl);
 
   const parameterKey = page.getByText('model.class', { exact: true });
   await expect(parameterKey).toBeVisible();

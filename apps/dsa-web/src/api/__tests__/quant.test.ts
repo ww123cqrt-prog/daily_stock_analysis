@@ -29,6 +29,11 @@ describe('quantApi', () => {
             allowed_params: [],
           },
         },
+        api_contract: {
+          version: 'quant-workbench-v2',
+          backend_build_id: 'backend-test-123',
+          backend_started_at: '2026-08-02T02:00:00Z',
+        },
         active_count: 0,
         generated_at: '2026-07-05T15:30:00+08:00',
         trainable: true,
@@ -109,6 +114,7 @@ describe('quantApi', () => {
             cwd: '/Users/cq/WorkingProjects',
             created_at: '2026-07-04T01:00:00+08:00',
             updated_at: '2026-07-04T01:00:01+08:00',
+            can_cancel: true,
             log_path: '/tmp/job.log',
             artifact_paths: [],
           },
@@ -120,7 +126,10 @@ describe('quantApi', () => {
     const status = await quantApi.getStatus();
 
     expect(status.availableJobTypes.check_qlib_data.label).toBe('检查 Qlib 数据');
+    expect(status.apiContract?.version).toBe('quant-workbench-v2');
+    expect(status.apiContract?.backendBuildId).toBe('backend-test-123');
     expect(status.latestJobs.check_qlib_data.jobId).toBe('qj_1');
+    expect(status.latestJobs.check_qlib_data.canCancel).toBe(true);
     expect((status.latestJobs.check_qlib_data as unknown as { command?: unknown }).command).toBeUndefined();
     expect((status.latestJobs.check_qlib_data as unknown as { cwd?: unknown }).cwd).toBeUndefined();
     expect((status.latestJobs.check_qlib_data as unknown as { logPath?: unknown }).logPath).toBeUndefined();
@@ -138,6 +147,43 @@ describe('quantApi', () => {
     expect(status.externalServices?.dsa.status).toBe('available');
     expect(status.externalServices?.catdesk.url).toBe('http://127.0.0.1:8765/');
     expect(status.externalServices?.catdesk.healthChecked).toBe(true);
+  });
+
+  it('loads the static job catalog together with its backend contract', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        available_job_types: {
+          check_qlib_data: { label: '检查 Qlib 数据', allowed_params: [] },
+        },
+        api_contract: {
+          version: 'quant-workbench-v2',
+          backend_build_id: 'backend-test-456',
+          backend_started_at: '2026-08-02T03:00:00Z',
+        },
+      },
+    });
+
+    const catalog = await quantApi.getJobTypes();
+
+    expect(catalog.availableJobTypes.check_qlib_data.label).toBe('检查 Qlib 数据');
+    expect(catalog.apiContract.backendBuildId).toBe('backend-test-456');
+  });
+
+  it('requests lightweight quant status without duplicating research-state loading', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        available_job_types: {},
+        active_count: 0,
+        latest_jobs: {},
+        recent_jobs: [],
+      },
+    });
+
+    await quantApi.getStatus({ includeResearch: false });
+
+    expect(get).toHaveBeenCalledWith('/api/v1/quant/status', {
+      params: { include_research: false },
+    });
   });
 
   it('parses streamed job snapshots into frontend job objects', () => {

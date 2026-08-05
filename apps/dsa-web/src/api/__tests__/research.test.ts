@@ -112,6 +112,51 @@ describe('researchApi', () => {
     expect(status.chinaAstockReuse?.[0].restrictions).toEqual(['不自动下单', '不读取券商密码']);
   });
 
+  it('preserves artifact file names while camel-casing training metadata', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        generated_at: '2026-08-02T17:46:17+08:00',
+        trainable: true,
+        training_readiness: { status: 'trainable', summary: 'ready' },
+        data_sources: [],
+        latest_training: {
+          status: 'completed',
+          run_id: 'run-with-replay-artifacts',
+          artifact_sha256: {
+            'pred.pkl': 'a'.repeat(64),
+            'label.pkl': 'b'.repeat(64),
+            'portfolio_analysis/report_normal_1day.pkl': 'c'.repeat(64),
+          },
+        },
+        candidate_pipeline: {
+          status: 'completed',
+          models: [
+            {
+              id: 'lightgbm',
+              status: 'completed',
+              artifact_sha256: {
+                'pred.pkl': 'd'.repeat(64),
+                'label.pkl': 'e'.repeat(64),
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    const status = await researchApi.getStatus();
+
+    expect(status.latestTraining?.artifactSha256).toEqual({
+      'pred.pkl': 'a'.repeat(64),
+      'label.pkl': 'b'.repeat(64),
+      'portfolio_analysis/report_normal_1day.pkl': 'c'.repeat(64),
+    });
+    expect(status.candidatePipeline?.models?.[0].artifactSha256).toEqual({
+      'pred.pkl': 'd'.repeat(64),
+      'label.pkl': 'e'.repeat(64),
+    });
+  });
+
   it('passes an explicit backend confirmation token for permanent experiment deletion', async () => {
     del.mockResolvedValueOnce({
       data: {

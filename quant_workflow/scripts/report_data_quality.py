@@ -656,19 +656,21 @@ def _valid_qlib_field_mask(field: str, values: np.ndarray) -> np.ndarray | None:
     return finite
 
 
-def _valid_qlib_ohlc_relationships(values_by_field: dict[str, np.ndarray]) -> bool:
+def _invalid_qlib_ohlc_positions(
+    values_by_field: dict[str, np.ndarray],
+) -> np.ndarray:
     try:
         open_ = values_by_field["open"]
         high = values_by_field["high"]
         low = values_by_field["low"]
         close = values_by_field["close"]
     except KeyError:
-        return False
+        return np.array([], dtype=np.int64)
     if not (open_.shape == high.shape == low.shape == close.shape):
-        return False
+        return np.array([], dtype=np.int64)
     finite = np.isfinite(open_) & np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
     if not bool(finite.any()):
-        return False
+        return np.array([], dtype=np.int64)
     upper_reference = np.maximum.reduce([open_, low, close])
     lower_reference = np.minimum.reduce([open_, high, close])
     invalid = (
@@ -688,7 +690,18 @@ def _valid_qlib_ohlc_relationships(values_by_field: dict[str, np.ndarray]) -> bo
             atol=QLIB_OHLC_ABSOLUTE_TOLERANCE,
         )
     )
-    return not bool(invalid[finite].any())
+    return np.flatnonzero(finite & invalid)
+
+
+def _valid_qlib_ohlc_relationships(values_by_field: dict[str, np.ndarray]) -> bool:
+    try:
+        required = [values_by_field[field] for field in ("open", "high", "low", "close")]
+    except KeyError:
+        return False
+    if not (required[0].shape == required[1].shape == required[2].shape == required[3].shape):
+        return False
+    finite = np.isfinite(required[0]) & np.isfinite(required[1]) & np.isfinite(required[2]) & np.isfinite(required[3])
+    return bool(finite.any()) and not len(_invalid_qlib_ohlc_positions(values_by_field))
 
 
 def _aligned_benchmark_feature(
@@ -718,6 +731,7 @@ def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
         masks: list[np.ndarray] = []
         first_positions: list[int] = []
         aligned_fields: dict[str, np.ndarray] = {}
+        invalid_ohlc_dates: list[str] = []
         price_missing_days = len(calendar)
         factor_missing_days = len(calendar)
         for field in BENCHMARK_FIELDS:
@@ -751,7 +765,9 @@ def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
             price_missing_days = int((~masks[0][first:]).sum())
             first_observation = calendar[first]
             first_observations.append(first_observation)
-            ohlc_valid = _valid_qlib_ohlc_relationships(aligned_fields)
+            invalid_positions = _invalid_qlib_ohlc_positions(aligned_fields)
+            invalid_ohlc_dates = [calendar[int(index)] for index in invalid_positions]
+            ohlc_valid = not invalid_ohlc_dates
             if not ohlc_valid:
                 missing_fields.append("ohlc_relationship")
         else:
@@ -770,6 +786,7 @@ def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
             "first_observation": first_observation,
             "missing_days": missing_days,
             "missing_fields": missing_fields,
+            "invalid_ohlc_dates": invalid_ohlc_dates,
         }
         total_missing_days += missing_days
     return {
@@ -1017,9 +1034,44 @@ def build_training_readiness(
     if qlib_stats["instruments"] < min_instruments:
         blockers.append(f"Qlib provider has fewer than {min_instruments} instruments")
     if not qlib_stats.get("benchmark_complete", False):
-        blockers.append(
-            "SH000300/SH000905/SH000906 benchmarks are missing or incomplete "
-            f"({qlib_stats.get('benchmark_missing_days', 'unknown')} missing days)"
+        details = qlib_stats.get("benchmark_details") or {}
+        benchmark_blockers: list[str] = []
+        for symbol in BENCHMARK_SYMBOLS:
+            detail = details.get(symbol) or {}
+            invalid_dates = list(detail.get("invalid_ohlc_dates") or [])
+            if invalid_dates:
+                if len(invalid_dates) == 1:
+                    benchmark_blockers.append(
+                        f"{symbol} benchmark OHLC relationship is invalid on {invalid_dates[0]}"
+                    )
+                else:
+                    benchmark_blockers.append(
+                        f"{symbol} benchmark OHLC relationship is invalid on "
+                        f"{len(invalid_dates)} days (first: {invalid_dates[0]})"
+                    )
+                continue
+            missing_fields = [
+                field
+                for field in detail.get("missing_fields") or []
+                if field != "ohlc_relationship"
+            ]
+            if missing_fields:
+                benchmark_blockers.append(
+                    f"{symbol} benchmark fields are missing or invalid: "
+                    + ", ".join(missing_fields)
+                )
+                continue
+            missing_days = int(detail.get("missing_days") or 0)
+            if missing_days:
+                benchmark_blockers.append(
+                    f"{symbol} benchmark is missing {missing_days} trading days after inception"
+                )
+                continue
+            if detail.get("complete") is not True:
+                benchmark_blockers.append(f"{symbol} benchmark validation is incomplete")
+        blockers.extend(
+            benchmark_blockers
+            or ["SH000300/SH000905/SH000906 benchmark validation is incomplete"]
         )
     instrument_feature_dirs = qlib_stats.get("instrument_feature_dirs")
     if not isinstance(instrument_feature_dirs, int) or isinstance(
@@ -1261,6 +1313,7 @@ def build_provider_quality_record(
         "benchmark_missing_days": int(
             qlib_stats.get("benchmark_missing_days", 0)
         ),
+        "benchmark_details": qlib_stats.get("benchmark_details") or {},
         "trainable": trainable,
         "failure_reasons": list(
             training_readiness.get("failure_reasons") or []
@@ -1287,6 +1340,7 @@ def write_research_status(
     verification_status: str | None = None,
     data_contract: dict | None = None,
     provider_quality: dict | None = None,
+    status_filename: str = "research_status_latest.json",
 ) -> Path:
     provider_dir = Path(provider_dir or qlib_provider_uri())
     trainable, training_readiness = build_training_readiness(
@@ -1384,7 +1438,7 @@ def write_research_status(
     if provider_quality is not None:
         payload["provider_quality"] = provider_quality
 
-    status_path = out_dir / "research_status_latest.json"
+    status_path = out_dir / status_filename
     atomic_write_json(status_path, payload)
     return status_path
 
@@ -1503,6 +1557,8 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_fingerprint_failed = True
 
     out_dir = args.out_dir
+    if scan_mode != "full":
+        out_dir = out_dir / "test_runs" / "data_quality"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1707,11 +1763,17 @@ def main(argv: list[str] | None = None) -> int:
         (data_contract.get("qlib_providers") or {}).get("cleaned") or {}
     )
 
+    sampled_notice = (
+        "> **Sampled report cannot authorize training.** This diagnostic output "
+        "does not replace the formal full-scan quality publication.\n\n"
+        if scan_mode != "full"
+        else ""
+    )
     report = f"""# A-Share Data Quality Report
 
 Generated: {generated_at.strftime("%Y-%m-%d %H:%M:%S")}
 
-## Executive Summary
+{sampled_notice}## Executive Summary
 
 - Stock universe: {len(stock_set)}
 - Canonical qfq usable instruments: {len(merged_success)}
@@ -1822,9 +1884,14 @@ expected in adjusted-volume space after corporate actions.
     evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
     report_id = f"data-quality-{evidence_sha256[:16]}"
     evidence_artifact_stem = f"data_quality_report_{ts}_{evidence_sha256[:16]}"
-    latest_path = out_dir / "data_quality_report_latest.md"
+    latest_stem = (
+        "data_quality_report_sampled_latest"
+        if scan_mode != "full"
+        else "data_quality_report_latest"
+    )
+    latest_path = out_dir / f"{latest_stem}.md"
     report_json_path = out_dir / f"{evidence_artifact_stem}.json"
-    latest_json_path = out_dir / "data_quality_report_latest.json"
+    latest_json_path = out_dir / f"{latest_stem}.json"
     atomic_write_json(report_json_path, quality_payload)
     atomic_write_text(latest_path, report)
     atomic_write_json(
@@ -1857,6 +1924,11 @@ expected in adjusted-volume space after corporate actions.
         verification_status=verification_status,
         data_contract=data_contract,
         provider_quality=provider_quality,
+        status_filename=(
+            "research_status_sampled_latest.json"
+            if scan_mode != "full"
+            else "research_status_latest.json"
+        ),
     )
 
     print(f"Report: {report_path}")

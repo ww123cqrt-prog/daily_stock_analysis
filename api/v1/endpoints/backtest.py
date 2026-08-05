@@ -21,6 +21,7 @@ from api.v1.schemas.backtest import (
     ScriptStrategyBacktestRunRequest,
     StrategyBacktestResponse,
     StrategyBacktestRunRequest,
+    TrainedStrategyCatalogResponse,
     TrainedStrategyBacktestResponse,
     TrainedStrategyBacktestRunRequest,
 )
@@ -47,6 +48,29 @@ def _validate_analysis_date_range(
                 "error": "invalid_params",
                 "message": "analysis_date_from cannot be after analysis_date_to",
             },
+        )
+
+
+@router.get(
+    "/strategy/trained/catalog",
+    response_model=TrainedStrategyCatalogResponse,
+    responses={
+        200: {"description": "可加载的历史选股模型 Run 与冻结交易策略目录"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="读取历史选股模型与冻结交易策略目录",
+    description="只返回可公开的 Run、配置哈希和数据快照身份，不返回本机绝对路径。",
+)
+def get_trained_strategy_catalog() -> TrainedStrategyCatalogResponse:
+    try:
+        return TrainedStrategyCatalogResponse(
+            **TrainedStrategyBacktestService().catalog()
+        )
+    except Exception as exc:
+        logger.error("读取历史选股模型回测目录失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "历史选股模型目录读取失败"},
         )
 
 
@@ -231,15 +255,26 @@ def run_trained_strategy_backtest(
     request: TrainedStrategyBacktestRunRequest,
 ) -> TrainedStrategyBacktestResponse:
     try:
-        _validate_analysis_date_range(request.start_date, request.end_date)
+        if request.replay_mode == "custom":
+            if (
+                request.start_date is None
+                or request.end_date is None
+                or request.topk is None
+                or request.cost_bps is None
+            ):
+                raise ValueError(
+                    "自定义回测必须提供开始日期、结束日期、TopK 和成本"
+                )
+            _validate_analysis_date_range(request.start_date, request.end_date)
         report = TrainedStrategyBacktestService().run(
             run_id=request.run_id,
             model_id=request.model_id,
             strategy_id=request.strategy_id,
-            start_date=request.start_date.isoformat(),
-            end_date=request.end_date.isoformat(),
+            replay_mode=request.replay_mode,
+            start_date=(request.start_date.isoformat() if request.start_date else None),
+            end_date=(request.end_date.isoformat() if request.end_date else None),
             topk=request.topk,
-            cost_bps=float(request.cost_bps),
+            cost_bps=(float(request.cost_bps) if request.cost_bps is not None else None),
         )
         return TrainedStrategyBacktestResponse(**report)
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:

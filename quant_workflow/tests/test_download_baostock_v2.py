@@ -110,6 +110,33 @@ def test_collect_result_accepts_normal_final_short_page() -> None:
     assert frame["date"].tolist() == ["2026-07-22", "2026-07-23", "2026-07-24"]
 
 
+def test_atomic_json_retries_temporary_reader_permission_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_module()
+    destination = tmp_path / "progress.json"
+    real_replace = module.os.replace
+    attempts = 0
+
+    def flaky_replace(source: Path, target: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(13, "file is temporarily held by a reader")
+        real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", flaky_replace)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    module.atomic_json(destination, {"status": "running"})
+
+    assert attempts == 3
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "status": "running"
+    }
+
+
 def test_collect_result_rejects_repeated_provider_page() -> None:
     module = load_module()
     result = FakePagedResult(
@@ -185,13 +212,15 @@ def test_expand_daily_factors_uses_same_provider_pair_for_long_gap() -> None:
     ).all()
 
 
-def test_expand_daily_factors_accepts_provider_verified_non_unit_terminal_factor() -> None:
+def test_expand_daily_factors_normalizes_provider_verified_non_unit_terminal_factor() -> None:
     module = load_module()
     raw = raw_frame()
     events = factor_events()
     events.loc[events.index[-1], "foreAdjustFactor"] = 1.034063
     provider_qfq = raw.copy()
-    expected_factors = pd.Series([0.95, 0.95, 0.95, 1.034063])
+    expected_factors = pd.Series(
+        [0.95 / 1.034063, 0.95 / 1.034063, 0.95 / 1.034063, 1.0]
+    )
     for column in module.PRICE_COLUMNS:
         provider_qfq[column] = provider_qfq[column] * expected_factors
 
@@ -202,7 +231,31 @@ def test_expand_daily_factors_accepts_provider_verified_non_unit_terminal_factor
     )
 
     assert factors["factor"].tolist() == pytest.approx(expected_factors.tolist())
-    assert factors["factor_source"].eq("baostock_foreAdjustFactor").all()
+    assert factors["factor_source"].eq(
+        "baostock_foreAdjustFactor_terminal_normalized"
+    ).all()
+    assert factors["factor_terminal_normalized"].all()
+
+
+def test_expand_daily_factors_normalizes_non_unit_provider_qfq_terminal_factor() -> None:
+    module = load_module()
+    raw = raw_frame()
+    events = factor_events()
+    events.loc[events.index[-1], "foreAdjustFactor"] = 1.034063
+    provider_qfq = raw.copy()
+    provider_native_factors = pd.Series([0.95, 0.95, 0.95, 1.034063])
+    for column in module.PRICE_COLUMNS:
+        provider_qfq[column] = provider_qfq[column] * provider_native_factors
+
+    factors = module.expand_daily_factors(
+        raw,
+        events,
+        provider_qfq=provider_qfq,
+    )
+
+    expected = provider_native_factors / provider_native_factors.iloc[-1]
+    assert factors["factor"].tolist() == pytest.approx(expected.tolist())
+    assert factors["factor_terminal_normalized"].all()
 
 
 def test_expand_daily_factors_rejects_unverified_non_unit_terminal_factor() -> None:
@@ -248,6 +301,15 @@ def test_compare_provider_qfq_accepts_rounding_and_rejects_scale_drift() -> None
 
     result = module.compare_provider_qfq(local, provider)
     assert result["max_absolute_error"] < 0.001
+
+    constant_scaled = local.copy()
+    for column in module.PRICE_COLUMNS:
+        constant_scaled[column] = constant_scaled[column] * 1.034063
+    scaled_result = module.compare_provider_qfq(local, constant_scaled)
+    assert scaled_result["provider_terminal_scale"] == pytest.approx(
+        1 / 1.034063
+    )
+    assert scaled_result["max_absolute_error"] < 1e-10
 
     provider.loc[0, "close"] = provider.loc[0, "close"] + 0.1
     with pytest.raises(module.BaostockV2Error, match="provider qfq mismatch"):
@@ -420,7 +482,9 @@ def test_build_snapshot_records_provider_verified_non_unit_terminal_factor(
     events = factor_events()
     events.loc[events.index[-1], "foreAdjustFactor"] = 1.034063
     provider_qfq = raw.copy()
-    expected_factors = pd.Series([0.95, 0.95, 0.95, 1.034063])
+    expected_factors = pd.Series(
+        [0.95 / 1.034063, 0.95 / 1.034063, 0.95 / 1.034063, 1.0]
+    )
     for column in module.PRICE_COLUMNS:
         provider_qfq[column] = provider_qfq[column] * expected_factors
     raw_path = bundle / "raw" / "SH600786.parquet"
@@ -464,7 +528,14 @@ def test_build_snapshot_records_provider_verified_non_unit_terminal_factor(
 
     adjustment = manifest["adjustment"]
     assert adjustment["normalization_rule"] == (
-        "provider_native_fore_adjust_factor; "
-        "non_unit_terminal_requires_same_provider_qfq_match"
+        "foreAdjustFactor_divided_by_terminal_when_non_unit; "
+        "latest_valid_trade_date_factor_equals_1; "
+        "provider_qfq_constant_scale_normalized_to_latest_valid_trade_date; "
+        "same_provider_qfq_full_history_verified"
     )
     assert adjustment["non_unit_terminal_factor_symbols"] == 1
+    assert adjustment["algorithm_version"] == "baostock-factor-evidence-v3"
+    qfq_bars = pd.read_parquet(qfq_stage / "bars" / "SH600786.parquet")
+    assert qfq_bars.sort_values("date")["close"].iloc[-1] == pytest.approx(
+        raw.sort_values("date")["close"].iloc[-1]
+    )

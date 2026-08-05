@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,6 +43,7 @@ def write_quality_evidence(
     evidence = {
         "schema_version": 3,
         "evidence_contract": "immutable_data_quality_evidence_v2",
+        "trainable": True,
         "training_thresholds": {
             "min_calendar_days": 252,
             "min_instruments": 100,
@@ -114,7 +115,291 @@ def stable_snapshot_state(dataset_id: str, state: dict) -> dict:
     }
 
 
+def write_native_ashare_fixture(
+    data_root: Path,
+    *,
+    snapshot_id: str = "ashare-qfq-snapshot",
+) -> tuple[Path, dict[str, str]]:
+    dataset_id = "ashare_daily_qfq"
+    dataset_root = Path("parquet/ashare_1d/ashare_daily_qfq")
+    snapshot = data_root / dataset_root / "snapshots" / snapshot_id
+    bars = snapshot / "bars"
+    bars.mkdir(parents=True)
+    (bars / "600000.parquet").write_bytes(b"parquet-fixture")
+    manifest = {
+        "schema_version": 2,
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "data_kind": "daily_bars",
+        "role": "canonical",
+        "status": "ready",
+        "price_basis": "qfq",
+        "content_sha256": "a" * 64,
+    }
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    atomic_write_json(manifest_path, manifest)
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    identity = {
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_sha256,
+        "content_sha256": manifest["content_sha256"],
+    }
+    data_root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        data_root / "DATA_MANIFEST.json",
+        {
+            "schema_version": 2,
+            "path_format": "relative_to_quant_data_root",
+            "datasets": {
+                dataset_id: {
+                    **identity,
+                    "dataset_root": dataset_root.as_posix(),
+                    "role": "canonical",
+                    "status": "ready",
+                    "price_basis": "qfq",
+                    "snapshot_manifest_sha256": manifest_sha256,
+                    "latest_pointer": (dataset_root / "LATEST.json").as_posix(),
+                }
+            },
+        },
+    )
+    atomic_write_json(
+        data_root / dataset_root / "LATEST.json",
+        {
+            "schema_version": 2,
+            "dataset_id": dataset_id,
+            "snapshot_id": snapshot_id,
+            "manifest_sha256": manifest_sha256,
+            "snapshot_path": (
+                dataset_root / "snapshots" / snapshot_id
+            ).as_posix(),
+        },
+    )
+    return snapshot, identity
+
+
 class ResearchStatusApiTestCase(unittest.TestCase):
+    def test_approved_ashare_snapshot_requires_matching_full_quality_evidence(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            approved_ashare_qfq_snapshot_identity,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            snapshot_state = filesystem_state_fingerprint(snapshot)
+            write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "requested_sample": 0,
+                    "scanned_instruments": 100,
+                    "data_contract": {
+                        "status": "verified",
+                        "ashare_daily_qfq": identity,
+                        "snapshot_state": stable_snapshot_state(
+                            "ashare_daily_qfq", snapshot_state
+                        ),
+                    },
+                },
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+            ):
+                approved = approved_ashare_qfq_snapshot_identity()
+
+        self.assertEqual(
+            {field: approved[field] for field in identity},
+            identity,
+        )
+        self.assertEqual(approved["state_fingerprint"], snapshot_state)
+
+    def test_approved_ashare_snapshot_rejects_non_trainable_full_quality_evidence(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            approved_ashare_qfq_snapshot_identity,
+        )
+        from quant_workflow.scripts.quant_data_contract import DataContractError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            snapshot_state = filesystem_state_fingerprint(snapshot)
+            write_quality_evidence(
+                reports_dir,
+                {
+                    "trainable": False,
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "requested_sample": 0,
+                    "scanned_instruments": 100,
+                    "data_contract": {
+                        "status": "verified",
+                        "ashare_daily_qfq": identity,
+                        "snapshot_state": stable_snapshot_state(
+                            "ashare_daily_qfq", snapshot_state
+                        ),
+                    },
+                },
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                self.assertRaises(DataContractError),
+            ):
+                approved_ashare_qfq_snapshot_identity()
+
+    def test_approved_ashare_snapshot_rejects_data_changed_after_quality_scan(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            approved_ashare_qfq_snapshot_identity,
+        )
+        from quant_workflow.scripts.quant_data_contract import DataContractError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            snapshot_state = filesystem_state_fingerprint(snapshot)
+            write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "requested_sample": 0,
+                    "scanned_instruments": 100,
+                    "data_contract": {
+                        "status": "verified",
+                        "ashare_daily_qfq": identity,
+                        "snapshot_state": stable_snapshot_state(
+                            "ashare_daily_qfq", snapshot_state
+                        ),
+                    },
+                },
+            )
+            (snapshot / "bars" / "600000.parquet").write_bytes(b"changed")
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                self.assertRaises(DataContractError),
+            ):
+                approved_ashare_qfq_snapshot_identity()
+
+    def test_approved_ashare_snapshot_rejects_sampled_quality_evidence(self) -> None:
+        from api.v1.endpoints.research_status import (
+            approved_ashare_qfq_snapshot_identity,
+        )
+        from quant_workflow.scripts.quant_data_contract import DataContractError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            reports_dir = root / "reports"
+            reports_dir.mkdir()
+            snapshot, identity = write_native_ashare_fixture(data_root)
+            snapshot_state = filesystem_state_fingerprint(snapshot)
+            write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "sampled",
+                    "coverage_status": "sampled",
+                    "verification_status": "sampled",
+                    "requested_sample": 20,
+                    "scanned_instruments": 20,
+                    "data_contract": {
+                        "status": "verified",
+                        "ashare_daily_qfq": identity,
+                        "snapshot_state": stable_snapshot_state(
+                            "ashare_daily_qfq", snapshot_state
+                        ),
+                    },
+                },
+            )
+
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
+                    data_root,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QUANT_WORKFLOW_REPORTS_ROOT",
+                    reports_dir,
+                ),
+                self.assertRaises(DataContractError),
+            ):
+                approved_ashare_qfq_snapshot_identity()
+
+    def test_provider_freshness_is_reported_separately_from_structural_acceptance(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _annotate_provider_quality_freshness,
+        )
+
+        quality = {
+            "canonical": {
+                "trainable": True,
+                "calendar_end": "2026-07-24",
+            },
+            "cleaned": {
+                "trainable": False,
+                "calendar_end": "2026-07-31",
+            },
+        }
+
+        _annotate_provider_quality_freshness(
+            quality,
+            as_of_date=date(2026, 8, 2),
+        )
+
+        self.assertTrue(quality["canonical"]["trainable"])
+        self.assertEqual(quality["canonical"]["structural_status"], "accepted")
+        self.assertEqual(quality["canonical"]["freshness"]["status"], "stale")
+        self.assertEqual(quality["canonical"]["freshness"]["calendar_age_days"], 9)
+        self.assertFalse(quality["canonical"]["freshness"]["blocks_training"])
+        self.assertFalse(quality["cleaned"]["trainable"])
+        self.assertEqual(quality["cleaned"]["structural_status"], "blocked")
+        self.assertEqual(quality["cleaned"]["freshness"]["status"], "current")
+
     def _write_native_qlib_fixture(
         self,
         data_root: Path,
@@ -640,6 +925,225 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             {"risk_on", "neutral", "defensive", "risk_off"},
         )
         self.assertNotIn("/Users/", json.dumps(payload))
+
+    def test_robust_signal_status_exposes_dedicated_current_manifest_readiness(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _robust_signal_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reports_dir = root / "reports"
+            data_root = root / "quant_data"
+            signal_dir = reports_dir / "robust_signal"
+            signal_dir.mkdir(parents=True)
+            manifest = data_root / "DATA_MANIFEST.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"version": 2}\n', encoding="utf-8")
+            manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            provider_key = "a" * 64
+            provider = (
+                data_root
+                / "runtime"
+                / "robust_strategy"
+                / "providers"
+                / provider_key[:16]
+            )
+            (provider / "instruments").mkdir(parents=True)
+            (provider / "instruments" / "csi800.txt").write_text(
+                "SH600000\t2020-01-02\t2025-12-31\n", encoding="utf-8"
+            )
+            (provider / "ROBUST_PROVIDER.json").write_text(
+                json.dumps(
+                    {
+                        "format_version": 3,
+                        "provider_key": provider_key,
+                        "provider_tree_sha256": "b" * 64,
+                        "data_manifest_sha256": manifest_hash,
+                        "membership_intervals_sha256": "c" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cleaned_identity = {
+                "dataset_id": "qlib_ashare_cleaned_v2",
+                "snapshot_id": "cleaned-snapshot-v2",
+                "manifest_sha256": "d" * 64,
+                "content_sha256": "e" * 64,
+            }
+            quality_report_id, quality_evidence_sha256 = write_quality_evidence(
+                reports_dir,
+                {
+                    "scan_mode": "full",
+                    "coverage_status": "full",
+                    "verification_status": "verified",
+                    "requested_sample": 0,
+                    "scanned_instruments": 100,
+                    "data_contract": {
+                        "status": "verified",
+                        "qlib_providers": {"cleaned": cleaned_identity},
+                        "snapshot_state": stable_snapshot_state(
+                            "qlib_ashare_cleaned_v2",
+                            stable_state_fingerprint("9"),
+                        ),
+                    },
+                    "provider_quality": {
+                        "cleaned": {
+                            **cleaned_identity,
+                            "provider": "cleaned",
+                            "trainable": True,
+                            "failure_reasons": [],
+                            "training_readiness": {
+                                "status": "trainable",
+                                "failure_reasons": [],
+                            },
+                        }
+                    },
+                },
+            )
+            (signal_dir / "robust_signal_data_readiness_latest.json").write_text(
+                json.dumps(
+                    {
+                        "contract_version": "robust_signal_data_v1",
+                        "status": "ready",
+                        "trainable": True,
+                        "generated_at": "2026-08-02T16:00:00+08:00",
+                        "provider_uri": str(provider),
+                        "provider_key": provider_key,
+                        "provider_tree_sha256": "b" * 64,
+                        "data_manifest_sha256": manifest_hash,
+                        "quality_report_id": quality_report_id,
+                        "quality_evidence_sha256": quality_evidence_sha256,
+                        "cleaned_provider_identity": cleaned_identity,
+                        "canonical_snapshot_id": "cleaned-snapshot-v2",
+                        "symbols": 1633,
+                        "intervals": 2058,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("api.v1.endpoints.research_status.QUANT_DATA_ROOT", data_root),
+                patch(
+                    "api.v1.endpoints.research_status._ROBUST_PROVIDER_IDENTITY",
+                    return_value={
+                        "provider_key": provider_key,
+                        "provider_tree_sha256": "b" * 64,
+                    },
+                ),
+            ):
+                payload = _robust_signal_payload(reports_dir)
+
+        readiness = payload["data_readiness"]
+        self.assertEqual(readiness["status"], "ready")
+        self.assertTrue(readiness["trainable"])
+        self.assertEqual(readiness["provider_name"], provider_key[:16])
+        self.assertEqual(readiness["canonical_snapshot_id"], "cleaned-snapshot-v2")
+        self.assertNotIn(str(root), json.dumps(payload))
+
+    def test_robust_signal_status_keeps_smoke_run_separate_and_reads_live_progress(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import _robust_signal_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            signal_dir = reports_dir / "robust_signal"
+            formal_run_id = "robust_signal_20260802_120000"
+            smoke_run_id = "robust_signal_20260802_130000"
+            formal_run_dir = signal_dir / "runs" / formal_run_id
+            smoke_run_dir = signal_dir / "runs" / smoke_run_id
+            formal_run_dir.mkdir(parents=True)
+            (smoke_run_dir / "screening").mkdir(parents=True)
+
+            (signal_dir / "robust_signal_status_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "signal_diagnosis_complete",
+                        "lifecycle_status": "completed",
+                        "run_id": formal_run_id,
+                        "current_stage": "completed",
+                        "pause_state": "completed",
+                        "completed_count": 320,
+                        "expected_count": 320,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            smoke_alias = {
+                "status": "signal_diagnosis_complete",
+                "lifecycle_status": "running",
+                "run_id": smoke_run_id,
+                "current_stage": "screening",
+                "pause_state": "running",
+                "completed_count": 0,
+                "expected_count": 1,
+            }
+            (signal_dir / "robust_signal_smoke_status_latest.json").write_text(
+                json.dumps(smoke_alias), encoding="utf-8"
+            )
+            (smoke_run_dir / "status.json").write_text(
+                json.dumps({**smoke_alias, "pause_state": "pause_requested"}),
+                encoding="utf-8",
+            )
+            (smoke_run_dir / "screening" / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "current_job": (
+                            "screening__trend_momentum_excess_5d__"
+                            "equal_weight_rank__2023Q1__w756"
+                        ),
+                        "completed_count": 0,
+                        "expected_count": 1,
+                        "pause_state": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = _robust_signal_payload(reports_dir)
+
+        self.assertEqual(payload["run_id"], formal_run_id)
+        self.assertEqual(payload["completed_count"], 320)
+        smoke = payload["smoke_run"]
+        self.assertTrue(smoke["test_only"])
+        self.assertEqual(smoke["run_id"], smoke_run_id)
+        self.assertEqual(smoke["pause_state"], "pause_requested")
+        self.assertEqual(smoke["progress"]["expected_count"], 1)
+        self.assertIn("2023Q1", smoke["progress"]["current_job"])
+        self.assertNotIn("/Users/", json.dumps(payload))
+
+    def test_robust_signal_progress_ignores_corrupt_count_fields(self) -> None:
+        from api.v1.endpoints.research_status import _robust_signal_progress_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            screening_dir = run_dir / "screening"
+            screening_dir.mkdir()
+            (screening_dir / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "current_job": "screening__2023Q1",
+                        "completed_count": {"invalid": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            progress = _robust_signal_progress_payload(
+                {
+                    "lifecycle_status": "running",
+                    "current_stage": "screening",
+                    "completed_count": ["invalid"],
+                    "expected_count": "invalid",
+                },
+                run_dir,
+            )
+
+        self.assertEqual(progress["completed_count"], 0)
+        self.assertEqual(progress["expected_count"], 0)
+        self.assertEqual(progress["current_job"], "screening__2023Q1")
 
     def test_robust_status_exposes_run_scoped_membership_progress(self) -> None:
         from api.v1.endpoints.research_status import _robust_strategy_payload
@@ -4614,6 +5118,32 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertNotIn("/private/", str(body))
         self.assertNotIn("/Users/", str(body))
         self.assertNotIn("C:\\Users\\", str(body))
+
+    def test_candidate_pipeline_ignores_legacy_dry_run_latest_pointer(self) -> None:
+        from api.v1.endpoints.research_status import _candidate_pipeline_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir = Path(temp_dir)
+            (reports_dir / "candidate_pipeline_latest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "dry_run": True,
+                        "models": [{"id": "lightgbm", "status": "completed"}],
+                        "strategy_evaluations": [
+                            {
+                                "model_id": "lightgbm",
+                                "strategy_id": "baseline_daily",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = _candidate_pipeline_payload(reports_dir)
+
+        self.assertIsNone(payload)
 
     def test_status_returns_missing_payload_when_artifact_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

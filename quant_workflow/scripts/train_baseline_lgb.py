@@ -8,6 +8,7 @@ Usage:
     python scripts/train_baseline_lgb.py --train-only        # skip backtest
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,7 +57,12 @@ QUANT_DATA = quant_data_root()
 STOCK_LIST_PATH = QUANT_DATA / "stock_lists.json"
 PROVIDER_NAMES = ("canonical", "cleaned")
 ASTOCK_PROJECT = china_astock_root()
-REQUIRED_TRAINING_ARTIFACTS = ("pred.pkl", "label.pkl")
+REQUIRED_TRAINING_ARTIFACTS = ("pred.pkl", "label.pkl", "task")
+CANDIDATE_STRATEGY_CONFIG = CONFIGS_DIR / "candidate_pipeline.yaml"
+RESULT_SCOPES = ("official", "candidate_child", "training_equivalence")
+EQUIVALENCE_CHANNELS = ("web", "script")
+EQUIVALENCE_EXPERIMENT_NAME = "dsa_training_equivalence"
+MAX_IMMUTABLE_TRAINING_RUN_BYTES = 4 * 1024 * 1024
 
 # ── Environment fixes (must run before qlib import) ──────────────────
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
@@ -153,6 +159,8 @@ def write_runtime_config_with_provider(
     provider_uri: Path,
     provider_name: str,
     out_dir: Path = RUNTIME_CONFIG_DIR,
+    *,
+    extend_dates_to_provider_latest: bool = True,
 ) -> Path:
     import yaml
 
@@ -160,10 +168,15 @@ def write_runtime_config_with_provider(
     qlib_init = dict(payload.get("qlib_init") or {})
     qlib_init["provider_uri"] = str(provider_uri)
     payload["qlib_init"] = qlib_init
-    calendar_tail = provider_calendar_tail(provider_uri)
-    latest_day = calendar_tail[-1] if calendar_tail else ""
-    backtest_end_day = calendar_tail[-2] if len(calendar_tail) >= 2 else latest_day
-    update_runtime_config_dates(payload, latest_day, backtest_end_day=backtest_end_day)
+    if extend_dates_to_provider_latest:
+        calendar_tail = provider_calendar_tail(provider_uri)
+        latest_day = calendar_tail[-1] if calendar_tail else ""
+        backtest_end_day = calendar_tail[-2] if len(calendar_tail) >= 2 else latest_day
+        update_runtime_config_dates(
+            payload,
+            latest_day,
+            backtest_end_day=backtest_end_day,
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -473,6 +486,212 @@ def write_latest_training_result(
     print(f"\n[artifact] Latest training summary: {output_path}")
 
 
+def write_immutable_training_run(info: dict, report_dir: Path = REPORT_DIR) -> Path:
+    run_id = str(info.get("run_id") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id) is None:
+        raise ValueError("run_id is not safe for the immutable training registry")
+    registry_dir = Path(report_dir) / "training_runs"
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    if registry_dir.is_symlink() or not registry_dir.is_dir():
+        raise ValueError("immutable_training_run_mismatch")
+    output_path = registry_dir / f"{run_id}.json"
+
+    def canonical_payload(value: Mapping[str, Any]) -> str:
+        normalized = dict(value)
+        normalized.pop("generated_at", None)
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def validate_existing() -> None:
+        try:
+            if (
+                output_path.is_symlink()
+                or not output_path.is_file()
+                or output_path.stat().st_size > MAX_IMMUTABLE_TRAINING_RUN_BYTES
+            ):
+                raise ValueError("immutable_training_run_mismatch")
+            existing = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("immutable_training_run_mismatch") from exc
+        if not isinstance(existing, dict):
+            raise ValueError("immutable_training_run_mismatch")
+        try:
+            matches = canonical_payload(existing) == canonical_payload(info)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("immutable_training_run_mismatch") from exc
+        if not matches:
+            raise ValueError("immutable_training_run_mismatch")
+
+    if output_path.exists() or output_path.is_symlink():
+        validate_existing()
+        return output_path
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        **info,
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    try:
+        with output_path.open("x", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        validate_existing()
+        return output_path
+    print(f"\n[artifact] Immutable training summary: {output_path}")
+    return output_path
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_training_replay_contract(
+    *,
+    source_config: Path,
+    runtime_config: Path,
+    strategy_config: Path = CANDIDATE_STRATEGY_CONFIG,
+) -> dict[str, Any]:
+    """Freeze the human-visible replay defaults used by this training Run."""
+
+    import yaml
+
+    source_config = Path(source_config).resolve()
+    runtime_config = Path(runtime_config).resolve()
+    strategy_config = Path(strategy_config).resolve()
+    runtime_payload = yaml.safe_load(runtime_config.read_text(encoding="utf-8")) or {}
+    strategy_payload = yaml.safe_load(strategy_config.read_text(encoding="utf-8")) or {}
+    task = runtime_payload.get("task") if isinstance(runtime_payload, dict) else {}
+    task = task if isinstance(task, dict) else {}
+    dataset = task.get("dataset") if isinstance(task.get("dataset"), dict) else {}
+    dataset_kwargs = dataset.get("kwargs") if isinstance(dataset.get("kwargs"), dict) else {}
+    segments = dataset_kwargs.get("segments") if isinstance(dataset_kwargs.get("segments"), dict) else {}
+    records = task.get("record") if isinstance(task.get("record"), list) else []
+    portana = next(
+        (
+            item
+            for item in records
+            if isinstance(item, dict) and item.get("class") == "PortAnaRecord"
+        ),
+        {},
+    )
+    portana_kwargs = portana.get("kwargs") if isinstance(portana.get("kwargs"), dict) else {}
+    portana_config = (
+        portana_kwargs.get("config")
+        if isinstance(portana_kwargs.get("config"), dict)
+        else portana.get("config")
+        if isinstance(portana.get("config"), dict)
+        else {}
+    )
+    qlib_strategy = (
+        portana_config.get("strategy")
+        if isinstance(portana_config.get("strategy"), dict)
+        else {}
+    )
+    qlib_strategy_kwargs = (
+        qlib_strategy.get("kwargs")
+        if isinstance(qlib_strategy.get("kwargs"), dict)
+        else {}
+    )
+    qlib_backtest = (
+        portana_config.get("backtest")
+        if isinstance(portana_config.get("backtest"), dict)
+        else {}
+    )
+    strategy_rows = (
+        strategy_payload.get("strategies")
+        if isinstance(strategy_payload, dict)
+        and isinstance(strategy_payload.get("strategies"), list)
+        else []
+    )
+    strategies = [
+        {
+            "id": str(item["id"]),
+            "label": str(item.get("label") or item["id"]),
+            "config": dict(item.get("kwargs") or {}),
+        }
+        for item in strategy_rows
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("kwargs") or {}, dict)
+    ]
+    periods = {
+        target: list(segments.get(source) or [])
+        for source, target in (
+            ("train", "training"),
+            ("valid", "validation"),
+            ("test", "test"),
+        )
+    }
+    exchange_kwargs = (
+        qlib_backtest.get("exchange_kwargs")
+        if isinstance(qlib_backtest.get("exchange_kwargs"), dict)
+        else {}
+    )
+    open_cost = float(exchange_kwargs.get("open_cost") or 0.0)
+    close_cost = float(exchange_kwargs.get("close_cost") or 0.0)
+    original_parameters = {
+        "strategy_id": "baseline_daily",
+        "start_date": str(qlib_backtest.get("start_time") or ""),
+        "end_date": str(qlib_backtest.get("end_time") or ""),
+        "topk": int(qlib_strategy_kwargs.get("topk") or 50),
+        "cost_bps": (open_cost + close_cost) * 10_000,
+    }
+    executor = (
+        portana_config.get("executor")
+        if isinstance(portana_config.get("executor"), dict)
+        else {
+            "class": "SimulatorExecutor",
+            "module_path": "qlib.backtest.executor",
+            "kwargs": {
+                "time_per_step": "day",
+                "generate_portfolio_metrics": True,
+            },
+        }
+    )
+    contract: dict[str, Any] = {
+        "contract_version": 2,
+        "replay_engine": "qlib_portana",
+        "exact_strategy_ids": ["baseline_daily"],
+        "source_config_sha256": _file_sha256(source_config),
+        "runtime_config_sha256": _file_sha256(runtime_config),
+        "strategy_catalog_sha256": _file_sha256(strategy_config),
+        "periods": periods,
+        "original_parameters": original_parameters,
+        "strategies": strategies,
+        "qlib_backtest_assumptions": {
+            "account": float(qlib_backtest.get("account") or 100_000_000),
+            "benchmark": str(qlib_backtest.get("benchmark") or ""),
+            "topk": original_parameters["topk"],
+            "n_drop": int(qlib_strategy_kwargs.get("n_drop") or 0),
+            "deal_price": str(exchange_kwargs.get("deal_price") or ""),
+            "limit_threshold": float(exchange_kwargs.get("limit_threshold") or 0.0),
+            "open_cost": open_cost,
+            "close_cost": close_cost,
+            "min_cost": float(exchange_kwargs.get("min_cost") or 0.0),
+            "executor": executor,
+        },
+    }
+    contract["config_hash"] = hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return contract
+
+
 def _metric_subset(metrics: dict) -> dict:
     keys = [
         "1day.excess_return_with_cost.annualized_return",
@@ -595,11 +814,63 @@ def record_training_result(
     publish_latest: bool = True,
     report_dir: Path = REPORT_DIR,
     result_output: Path | None = None,
-) -> None:
+    result_scope: str = "official",
+    equivalence_channel: str | None = None,
+) -> Path:
+    if result_scope not in RESULT_SCOPES:
+        raise ValueError(f"Unsupported result scope: {result_scope}")
+    if result_scope == "training_equivalence":
+        if publish_latest:
+            raise ValueError(
+                "training_equivalence cannot publish official latest results"
+            )
+        if result_output is not None:
+            raise ValueError(
+                "training_equivalence output is server-controlled; result_output is not allowed"
+            )
+        if equivalence_channel not in EQUIVALENCE_CHANNELS:
+            raise ValueError(
+                "training_equivalence requires equivalence_channel=web or script"
+            )
+    elif result_scope == "candidate_child":
+        if publish_latest:
+            raise ValueError("candidate_child cannot publish official latest results")
+        if result_output is None:
+            raise ValueError("candidate_child requires an isolated result_output")
+        if equivalence_channel is not None:
+            raise ValueError("equivalence_channel is only valid for training_equivalence")
+    elif equivalence_channel is not None:
+        raise ValueError("equivalence_channel is only valid for training_equivalence")
+
     recorded = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         **info,
     }
+    if result_scope == "candidate_child":
+        recorded["result_scope"] = "candidate_child"
+    if result_scope == "training_equivalence":
+        run_id = str(recorded.get("run_id") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id) is None:
+            raise ValueError("run_id is not safe for the equivalence registry")
+        recorded.update(
+            {
+                "result_scope": result_scope,
+                "test_only": True,
+                "equivalence_channel": equivalence_channel,
+                "warning": "测试数据，不可用于研究或交易。",
+            }
+        )
+        base_dir = Path(report_dir) / "test_runs" / "training_equivalence"
+        run_path = base_dir / "runs" / run_id / "training_result.json"
+        latest_channel_path = base_dir / f"latest_{equivalence_channel}.json"
+        write_latest_training_result(recorded, output_path=run_path)
+        write_latest_training_result(recorded, output_path=latest_channel_path)
+        print(
+            "\n[artifact] Equivalence result isolated from official latest, "
+            "training registry, and experiment notebook"
+        )
+        return run_path
+
     latest_path = (report_dir / LATEST_TRAINING_RESULT.name).resolve()
     isolated_path = (
         Path(result_output).expanduser().resolve()
@@ -608,6 +879,7 @@ def record_training_result(
     )
     if not publish_latest and isolated_path == latest_path:
         raise ValueError("result_output must not target latest_training_result.json")
+    immutable_path = write_immutable_training_run(recorded, report_dir=report_dir)
     if publish_latest:
         write_latest_training_result(
             recorded,
@@ -618,6 +890,7 @@ def record_training_result(
     if isolated_path is not None and isolated_path != latest_path:
         write_latest_training_result(recorded, output_path=isolated_path)
     append_experiment_record(recorded, report_dir=report_dir)
+    return isolated_path or (latest_path if publish_latest else immutable_path)
 
 
 def publish_training_result(
@@ -633,6 +906,8 @@ def publish_training_result(
     report_dir: Path = REPORT_DIR,
     quant_data_root: Path = QUANT_DATA,
     client: Any | None = None,
+    result_scope: str = "official",
+    equivalence_channel: str | None = None,
 ) -> dict[str, str]:
     """Revalidate data lineage, then publish MLflow tags and the DSA result."""
 
@@ -647,6 +922,12 @@ def publish_training_result(
         client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
     run_id = str(info.get("run_id") or "")
     tag_run_with_provider(client, run_id, final_identity)
+    if result_scope == "training_equivalence":
+        client.set_tag(run_id, "dsa.result_scope", "training_equivalence")
+        client.set_tag(run_id, "dsa.test_only", "true")
+        client.set_tag(run_id, "dsa.equivalence_channel", equivalence_channel or "")
+    elif result_scope == "candidate_child":
+        client.set_tag(run_id, "dsa.result_scope", "candidate_child")
     info.update(
         {
             "provider": provider,
@@ -654,6 +935,11 @@ def publish_training_result(
             "provider_identity": final_identity,
             "source_config": str(source_config),
             "runtime_config": str(runtime_config),
+            "replay_contract": build_training_replay_contract(
+                source_config=source_config,
+                runtime_config=runtime_config,
+                strategy_config=CANDIDATE_STRATEGY_CONFIG,
+            ),
         }
     )
     record_training_result(
@@ -661,6 +947,8 @@ def publish_training_result(
         publish_latest=publish_latest,
         report_dir=report_dir,
         result_output=result_output,
+        result_scope=result_scope,
+        equivalence_channel=equivalence_channel,
     )
     return final_identity
 
@@ -705,7 +993,44 @@ def main():
         default=None,
         help="Write this run's structured result to an independent JSON file",
     )
+    parser.add_argument(
+        "--result-scope",
+        default="official",
+        choices=RESULT_SCOPES,
+        help=(
+            "Internal result namespace; candidate_child belongs to a candidate report "
+            "and training_equivalence is isolated test evidence"
+        ),
+    )
+    parser.add_argument(
+        "--equivalence-channel",
+        choices=EQUIVALENCE_CHANNELS,
+        default=None,
+        help="Identify the web or direct-script side of an equivalence check",
+    )
     args = parser.parse_args()
+
+    if args.result_scope == "training_equivalence":
+        if not args.no_publish_latest:
+            parser.error("training_equivalence requires --no-publish-latest")
+        if args.result_output is not None:
+            parser.error("training_equivalence does not accept --result-output")
+        if args.equivalence_channel is None:
+            parser.error("training_equivalence requires --equivalence-channel")
+        if args.experiment_name != EQUIVALENCE_EXPERIMENT_NAME:
+            parser.error(
+                "training_equivalence requires the dedicated "
+                f"{EQUIVALENCE_EXPERIMENT_NAME} experiment"
+            )
+    elif args.result_scope == "candidate_child":
+        if not args.no_publish_latest:
+            parser.error("candidate_child requires --no-publish-latest")
+        if args.result_output is None:
+            parser.error("candidate_child requires --result-output")
+        if args.equivalence_channel is not None:
+            parser.error("--equivalence-channel requires training_equivalence scope")
+    elif args.equivalence_channel is not None:
+        parser.error("--equivalence-channel requires training_equivalence scope")
 
     expected_provider_identity = None
     if args.provider_identity_json is not None:
@@ -744,7 +1069,14 @@ def main():
     except Exception as exc:
         print(f"[error] Failed to prepare CSI300 instruments: {exc}")
         sys.exit(1)
-    runtime_config_path = write_runtime_config_with_provider(config_path, provider_uri, args.provider)
+    runtime_config_path = write_runtime_config_with_provider(
+        config_path,
+        provider_uri,
+        args.provider,
+        extend_dates_to_provider_latest=(
+            args.result_scope != "training_equivalence"
+        ),
+    )
 
     # ── Step 2: Run training + backtest ──
     ensure_mlruns_artifact_locations(MLRUNS_DIR)
@@ -787,6 +1119,8 @@ def main():
             runtime_config=runtime_config_path,
             publish_latest=not args.no_publish_latest,
             result_output=args.result_output,
+            result_scope=args.result_scope,
+            equivalence_channel=args.equivalence_channel,
         )
         print(f"\nRun ID: {info['run_id']}")
         print("\nMetrics:")

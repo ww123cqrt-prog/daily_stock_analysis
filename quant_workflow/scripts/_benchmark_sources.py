@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import time
 from datetime import datetime, timedelta
 from typing import Callable
@@ -14,6 +16,145 @@ TENCENT_BENCHMARKS = {
     "SH000905": "sh000905",
     "SH000906": "sh000906",
 }
+EASTMONEY_BENCHMARKS = {
+    "SH000300": "1.000300",
+    "SH000905": "1.000905",
+    "SH000906": "1.000906",
+}
+
+
+def download_eastmoney_benchmarks(
+    start_date: str,
+    end_date: str,
+    *,
+    use_system_proxy: bool = False,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    request_interval_seconds: float = 0.5,
+    retry_backoff_seconds: float = 1.0,
+    max_attempts: int = 3,
+) -> dict[str, pd.DataFrame]:
+    """Download three index OHLCV series from Eastmoney with bounded retries."""
+
+    import requests
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if request_interval_seconds < 0 or retry_backoff_seconds < 0:
+        raise ValueError("Eastmoney request timing values must be non-negative")
+
+    session = requests.Session()
+    session.trust_env = use_system_proxy
+    endpoint = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    user_agent = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    )
+
+    def fetch(params: dict[str, str]):
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            sleep_fn(request_interval_seconds)
+            try:
+                response = session.get(
+                    endpoint,
+                    params=params,
+                    headers={
+                        "User-Agent": user_agent,
+                        "Referer": "https://quote.eastmoney.com/",
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = status is None or status == 429 or status >= 500
+                if not retryable:
+                    break
+                if attempt + 1 >= max_attempts:
+                    break
+                sleep_fn(retry_backoff_seconds * (2**attempt))
+
+        command = [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "--doh-url",
+            "https://cloudflare-dns.com/dns-query",
+            "--user-agent",
+            user_agent,
+            "--referer",
+            "https://quote.eastmoney.com/",
+            "--get",
+        ]
+        if not use_system_proxy:
+            command.extend(["--noproxy", "*"])
+        for key, value in params.items():
+            command.extend(["--data-urlencode", f"{key}={value}"])
+        command.append(endpoint)
+        try:
+            completed = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=35,
+            )
+            return json.loads(completed.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Eastmoney request exhausted all transports") from (
+                last_error or exc
+            )
+
+    result: dict[str, pd.DataFrame] = {}
+    try:
+        for symbol, secid in EASTMONEY_BENCHMARKS.items():
+            payload = fetch(
+                {
+                    "secid": secid,
+                    "klt": "101",
+                    "fqt": "0",
+                    "beg": start_date.replace("-", ""),
+                    "end": end_date.replace("-", ""),
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                }
+            )
+            rows = (((payload or {}).get("data") or {}).get("klines") or [])
+            values: dict[str, dict[str, float]] = {}
+            for raw_row in rows:
+                row = raw_row.split(",") if isinstance(raw_row, str) else raw_row
+                if len(row) < 6:
+                    continue
+                day = str(row[0])[:10]
+                if not (start_date <= day <= end_date):
+                    continue
+                try:
+                    values[day] = {
+                        "open": float(row[1]),
+                        "close": float(row[2]),
+                        "high": float(row[3]),
+                        "low": float(row[4]),
+                        "volume": float(row[5]),
+                    }
+                except (TypeError, ValueError):
+                    continue
+            frame = pd.DataFrame.from_dict(values, orient="index")
+            if not frame.empty:
+                frame = frame[["open", "high", "low", "close", "volume"]]
+                frame.index = frame.index.astype(str)
+                frame = frame.sort_index()
+            result[symbol] = frame
+    finally:
+        session.close()
+    return result
 
 
 def download_tencent_benchmarks(

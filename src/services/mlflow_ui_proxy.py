@@ -483,7 +483,13 @@ def create_mlflow_ui_router(
                 {"status": "error", "message": "MLflow 启动失败，请检查本机日志。"},
                 status_code=500,
             )
-        status_code = 200 if result.get("status") == "available" else 202
+        result_status = result.get("status")
+        if result_status == "available":
+            status_code = 200
+        elif result_status == "starting":
+            status_code = 202
+        else:
+            status_code = 500
         return JSONResponse(result, status_code=status_code)
 
     async def proxy_request(request: Request, path: str = "") -> Response:

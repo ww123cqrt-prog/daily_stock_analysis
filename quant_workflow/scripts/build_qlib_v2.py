@@ -24,7 +24,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import quant_data_root as default_quant_data_root  # noqa: E402
 from _benchmark_sources import (  # noqa: E402
+    EASTMONEY_BENCHMARKS,
     TENCENT_BENCHMARKS,
+    download_eastmoney_benchmarks,
     download_tencent_benchmarks,
 )
 from _symbols import to_qlib_name  # noqa: E402
@@ -49,6 +51,53 @@ BENCHMARK_START_DATES = {
 }
 INSTRUMENT_POOLS = ("csi300", "csi500", "csi800")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+OHLC_RELATIVE_TOLERANCE = 2e-6
+OHLC_ABSOLUTE_TOLERANCE = 1e-4
+
+
+def _invalid_ohlc_positions(values_by_field: Mapping[str, np.ndarray]) -> np.ndarray:
+    open_ = values_by_field["open"]
+    high = values_by_field["high"]
+    low = values_by_field["low"]
+    close = values_by_field["close"]
+    finite = np.isfinite(open_) & np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
+    upper = np.maximum.reduce([open_, low, close])
+    lower = np.minimum.reduce([open_, high, close])
+    invalid = finite & (
+        (
+            (high < upper)
+            & ~np.isclose(
+                high,
+                upper,
+                rtol=OHLC_RELATIVE_TOLERANCE,
+                atol=OHLC_ABSOLUTE_TOLERANCE,
+            )
+        )
+        | (
+            (low > lower)
+            & ~np.isclose(
+                low,
+                lower,
+                rtol=OHLC_RELATIVE_TOLERANCE,
+                atol=OHLC_ABSOLUTE_TOLERANCE,
+            )
+        )
+    )
+    return np.flatnonzero(invalid)
+
+
+def _require_valid_ohlc(
+    values_by_field: Mapping[str, np.ndarray],
+    dates: Sequence[str],
+    *,
+    symbol: str,
+) -> None:
+    invalid = _invalid_ohlc_positions(values_by_field)
+    if len(invalid):
+        first_date = str(dates[int(invalid[0])])
+        raise DataContractError(
+            f"{symbol} benchmark OHLC relationship is invalid on {first_date}"
+        )
 
 
 def _read_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -382,10 +431,12 @@ def _import_benchmarks(
         target_dir.mkdir(parents=True, exist_ok=False)
         features: dict[str, Any] = {}
         validity_masks: dict[str, np.ndarray] = {}
+        aligned_fields: dict[str, np.ndarray] = {}
         try:
             for field in BENCHMARK_FIELDS:
                 source_path = source_dir / f"{field}.day.bin"
                 aligned = _read_feature(source_path, len(source_calendar))
+                aligned_fields[field] = aligned
                 required = aligned if field == "factor" else aligned[required_start:]
                 valid = np.isfinite(required)
                 if field == "volume":
@@ -419,6 +470,11 @@ def _import_benchmarks(
                 raise DataContractError(
                     f"benchmark {symbol} OHLCV fields have inconsistent dates"
                 )
+            _require_valid_ohlc(
+                aligned_fields,
+                source_calendar,
+                symbol=symbol,
+            )
         except Exception:
             shutil.rmtree(target_dir, ignore_errors=True)
             raise
@@ -455,22 +511,23 @@ def _normalize_downloaded_frame(
     frame: pd.DataFrame,
     *,
     symbol: str,
+    provider: str,
 ) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame) or frame.empty:
-        raise DataContractError(f"Tencent returned no benchmark data for {symbol}")
+        raise DataContractError(f"{provider} returned no benchmark data for {symbol}")
     missing_fields = set(BENCHMARK_FIELDS[:-1]).difference(frame.columns)
     if missing_fields:
         raise DataContractError(
-            f"Tencent benchmark schema is incomplete for {symbol}: "
+            f"{provider} benchmark schema is incomplete for {symbol}: "
             + ", ".join(sorted(missing_fields))
         )
     parsed = pd.to_datetime(frame.index, errors="coerce")
     if parsed.isna().any():
-        raise DataContractError(f"Tencent benchmark dates are invalid for {symbol}")
+        raise DataContractError(f"{provider} benchmark dates are invalid for {symbol}")
     normalized = frame.loc[:, list(BENCHMARK_FIELDS[:-1])].copy()
     normalized.index = pd.Index(parsed.strftime("%Y-%m-%d"), name="date")
     if normalized.index.has_duplicates:
-        raise DataContractError(f"Tencent benchmark dates are duplicated for {symbol}")
+        raise DataContractError(f"{provider} benchmark dates are duplicated for {symbol}")
     normalized = normalized.sort_index()
     for field in BENCHMARK_FIELDS[:-1]:
         normalized[field] = pd.to_numeric(normalized[field], errors="coerce")
@@ -488,24 +545,66 @@ def _download_benchmark_evidence(
     calendar, _ = _read_calendar(target_provider / "calendars" / "day.txt")
     calendar_index = pd.Index(calendar)
     parsed_calendar = pd.to_datetime(calendar_index, errors="raise")
-    downloaded = download_tencent_benchmarks(
-        calendar[0],
-        calendar[-1],
-        use_system_proxy=use_system_proxy,
-    )
-    if set(downloaded) != set(BENCHMARK_START_DATES):
-        raise DataContractError("Tencent benchmark response is missing required indexes")
+    tencent_spec = {
+        "provider": "tencent",
+        "interface": "web.ifzq.gtimg.cn appstock fqkline daily",
+        "source_dataset_id": "tencent_index_daily",
+        "provider_codes": TENCENT_BENCHMARKS,
+        "download": download_tencent_benchmarks,
+    }
+    eastmoney_spec = {
+        "provider": "eastmoney",
+        "interface": "push2his.eastmoney.com index kline daily with bounded DoH fallback",
+        "source_dataset_id": "eastmoney_index_daily",
+        "provider_codes": EASTMONEY_BENCHMARKS,
+        "download": download_eastmoney_benchmarks,
+    }
+    reconciled_spec = {
+        "provider": "tencent+eastmoney",
+        "interface": "Tencent daily series with row-level Eastmoney OHLCV corrections",
+        "source_dataset_id": "tencent_eastmoney_reconciled_index_daily",
+        "provider_codes": TENCENT_BENCHMARKS,
+    }
+    source_attempts: list[dict[str, str]] = []
+    selected_spec: dict[str, Any] | None = None
+    normalized_by_symbol: dict[str, pd.DataFrame] = {}
+    required_calendar_by_symbol: dict[str, pd.Index] = {}
+    start_index_by_symbol: dict[str, int] = {}
+    evidence_frames_by_provider: dict[str, dict[str, pd.DataFrame]] = {}
+    corrections: list[dict[str, Any]] = []
 
-    evidence_root = root / "runtime" / "qlib_v2_upgrade" / "runs" / run_id
-    raw_root = evidence_root / "benchmarks"
-    raw_root.mkdir(parents=True, exist_ok=False)
-    calendar_sha256 = sha256_file(target_provider / "calendars" / "day.txt")
-    symbols: dict[str, Any] = {}
-    source_symbols: dict[str, Any] = {}
-    created_targets: list[Path] = []
-    try:
+    def normalize_source(
+        source_spec: Mapping[str, Any],
+        downloaded: Mapping[str, pd.DataFrame],
+    ) -> dict[str, pd.DataFrame]:
+        provider = str(source_spec["provider"])
+        if set(downloaded) != set(BENCHMARK_START_DATES):
+            raise DataContractError(
+                f"{provider} benchmark response is missing required indexes"
+            )
+        return {
+            symbol: _normalize_downloaded_frame(
+                downloaded[symbol], symbol=symbol, provider=provider
+            )
+            for symbol in BENCHMARK_START_DATES
+        }
+
+    def prepare_complete_source(
+        source_spec: Mapping[str, Any],
+        frames: Mapping[str, pd.DataFrame],
+    ) -> tuple[
+        dict[str, pd.DataFrame],
+        dict[str, pd.Index],
+        dict[str, int],
+        dict[str, list[str]],
+    ]:
+        provider = str(source_spec["provider"])
+        candidate_frames: dict[str, pd.DataFrame] = {}
+        candidate_calendars: dict[str, pd.Index] = {}
+        candidate_starts: dict[str, int] = {}
+        invalid_ohlc: dict[str, list[str]] = {}
         for symbol, inception in BENCHMARK_START_DATES.items():
-            normalized = _normalize_downloaded_frame(downloaded[symbol], symbol=symbol)
+            normalized = frames[symbol]
             required_positions = np.flatnonzero(
                 parsed_calendar >= pd.Timestamp(inception)
             )
@@ -519,7 +618,7 @@ def _download_benchmark_evidence(
             if aligned.isna().any(axis=None):
                 missing = aligned.index[aligned.isna().any(axis=1)].tolist()
                 raise DataContractError(
-                    f"Tencent benchmark {symbol} is missing required trading dates: "
+                    f"{provider} benchmark {symbol} is missing required trading dates: "
                     + ", ".join(missing[:10])
                 )
             prices = aligned[["open", "high", "low", "close"]].to_numpy(
@@ -532,7 +631,197 @@ def _download_benchmark_evidence(
                 or (prices <= 0).any()
                 or (volumes < 0).any()
             ):
-                raise DataContractError(f"Tencent benchmark values are invalid for {symbol}")
+                raise DataContractError(
+                    f"{provider} benchmark values are invalid for {symbol}"
+                )
+            invalid_positions = _invalid_ohlc_positions(
+                {
+                    field: aligned[field].to_numpy(dtype=float)
+                    for field in ("open", "high", "low", "close")
+                }
+            )
+            invalid_ohlc[symbol] = [
+                str(required_calendar[int(position)])
+                for position in invalid_positions
+            ]
+            candidate_frames[symbol] = normalized.copy()
+            candidate_calendars[symbol] = required_calendar
+            candidate_starts[symbol] = start_index
+        return (
+            candidate_frames,
+            candidate_calendars,
+            candidate_starts,
+            invalid_ohlc,
+        )
+
+    tencent_ready = False
+    try:
+        tencent_downloaded = tencent_spec["download"](
+            calendar[0], calendar[-1], use_system_proxy=use_system_proxy
+        )
+        tencent_frames = normalize_source(tencent_spec, tencent_downloaded)
+        evidence_frames_by_provider["tencent"] = tencent_frames
+        (
+            normalized_by_symbol,
+            required_calendar_by_symbol,
+            start_index_by_symbol,
+            invalid_by_symbol,
+        ) = prepare_complete_source(tencent_spec, tencent_frames)
+        invalid_pairs = [
+            (symbol, day)
+            for symbol in BENCHMARK_START_DATES
+            for day in invalid_by_symbol[symbol]
+        ]
+        tencent_ready = True
+    except Exception as exc:
+        invalid_pairs = []
+        source_attempts.append(
+            {
+                "provider": "tencent",
+                "status": "rejected",
+                "reason": str(exc)[:300],
+            }
+        )
+
+    if tencent_ready and not invalid_pairs:
+        selected_spec = tencent_spec
+        source_attempts.append({"provider": "tencent", "status": "selected"})
+    elif tencent_ready:
+        first_symbol, first_day = invalid_pairs[0]
+        source_attempts.append(
+            {
+                "provider": "tencent",
+                "status": "requires_correction",
+                "reason": (
+                    f"{first_symbol} benchmark OHLC relationship is invalid on "
+                    f"{first_day}"
+                ),
+            }
+        )
+        try:
+            eastmoney_downloaded = eastmoney_spec["download"](
+                calendar[0], calendar[-1], use_system_proxy=use_system_proxy
+            )
+            eastmoney_frames = normalize_source(eastmoney_spec, eastmoney_downloaded)
+            evidence_frames_by_provider["eastmoney"] = eastmoney_frames
+            for symbol, day in invalid_pairs:
+                source_frame = eastmoney_frames[symbol]
+                if day not in source_frame.index:
+                    raise DataContractError(
+                        f"eastmoney correction is unavailable for {symbol} on {day}"
+                    )
+                replacement = source_frame.loc[[day], list(BENCHMARK_FIELDS[:-1])]
+                if replacement.isna().any(axis=None):
+                    raise DataContractError(
+                        f"eastmoney correction is incomplete for {symbol} on {day}"
+                    )
+                _require_valid_ohlc(
+                    {
+                        field: replacement[field].to_numpy(dtype=float)
+                        for field in ("open", "high", "low", "close")
+                    },
+                    [day],
+                    symbol=symbol,
+                )
+                normalized_by_symbol[symbol].loc[
+                    day, list(BENCHMARK_FIELDS[:-1])
+                ] = replacement.iloc[0].to_numpy(dtype=float)
+                corrections.append(
+                    {
+                        "date": day,
+                        "fields": list(BENCHMARK_FIELDS[:-1]),
+                        "source": "eastmoney",
+                        "symbol": symbol,
+                    }
+                )
+            for symbol, required_calendar in required_calendar_by_symbol.items():
+                reconciled = normalized_by_symbol[symbol].reindex(required_calendar)
+                _require_valid_ohlc(
+                    {
+                        field: reconciled[field].to_numpy(dtype=float)
+                        for field in ("open", "high", "low", "close")
+                    },
+                    required_calendar.tolist(),
+                    symbol=symbol,
+                )
+            selected_spec = reconciled_spec
+            source_attempts.append(
+                {"provider": "eastmoney", "status": "correction_source"}
+            )
+        except Exception as exc:
+            source_attempts.append(
+                {
+                    "provider": "eastmoney",
+                    "status": "rejected",
+                    "reason": str(exc)[:300],
+                }
+            )
+
+    if selected_spec is None and not tencent_ready:
+        try:
+            eastmoney_downloaded = eastmoney_spec["download"](
+                calendar[0], calendar[-1], use_system_proxy=use_system_proxy
+            )
+            eastmoney_frames = normalize_source(eastmoney_spec, eastmoney_downloaded)
+            evidence_frames_by_provider["eastmoney"] = eastmoney_frames
+            (
+                normalized_by_symbol,
+                required_calendar_by_symbol,
+                start_index_by_symbol,
+                invalid_by_symbol,
+            ) = prepare_complete_source(eastmoney_spec, eastmoney_frames)
+            first_invalid = next(
+                (
+                    (symbol, day)
+                    for symbol in BENCHMARK_START_DATES
+                    for day in invalid_by_symbol[symbol]
+                ),
+                None,
+            )
+            if first_invalid is not None:
+                _require_valid_ohlc(
+                    {
+                        field: normalized_by_symbol[first_invalid[0]][field]
+                        .reindex(required_calendar_by_symbol[first_invalid[0]])
+                        .to_numpy(dtype=float)
+                        for field in ("open", "high", "low", "close")
+                    },
+                    required_calendar_by_symbol[first_invalid[0]].tolist(),
+                    symbol=first_invalid[0],
+                )
+            selected_spec = eastmoney_spec
+            source_attempts.append(
+                {"provider": "eastmoney", "status": "selected"}
+            )
+        except Exception as exc:
+            source_attempts.append(
+                {
+                    "provider": "eastmoney",
+                    "status": "rejected",
+                    "reason": str(exc)[:300],
+                }
+            )
+
+    if selected_spec is None:
+        reasons = "; ".join(
+            f"{item['provider']}: {item.get('reason', 'rejected')}"
+            for item in source_attempts
+        )
+        raise DataContractError(f"no benchmark source passed validation: {reasons}")
+
+    evidence_root = root / "runtime" / "qlib_v2_upgrade" / "runs" / run_id
+    raw_root = evidence_root / "benchmarks"
+    raw_root.mkdir(parents=True, exist_ok=False)
+    calendar_sha256 = sha256_file(target_provider / "calendars" / "day.txt")
+    symbols: dict[str, Any] = {}
+    source_symbols: dict[str, Any] = {}
+    created_targets: list[Path] = []
+    try:
+        for symbol in BENCHMARK_START_DATES:
+            normalized = normalized_by_symbol[symbol]
+            start_index = start_index_by_symbol[symbol]
+            required_calendar = required_calendar_by_symbol[symbol]
+            aligned = normalized.reindex(required_calendar)
 
             target_dir = target_provider / "features" / symbol.lower()
             target_dir.mkdir(parents=True, exist_ok=False)
@@ -564,6 +853,26 @@ def _download_benchmark_evidence(
 
             raw_path = raw_root / f"{symbol}.parquet"
             normalized.reset_index().to_parquet(raw_path, index=False)
+            input_artifacts: dict[str, dict[str, Any]] = {}
+            for provider, source_frames in evidence_frames_by_provider.items():
+                input_path = raw_root / provider / f"{symbol}.parquet"
+                input_path.parent.mkdir(parents=True, exist_ok=True)
+                source_frames[symbol].reset_index().to_parquet(
+                    input_path, index=False
+                )
+                provider_codes = (
+                    TENCENT_BENCHMARKS
+                    if provider == "tencent"
+                    else EASTMONEY_BENCHMARKS
+                )
+                input_artifacts[provider] = {
+                    "provider_code": provider_codes[symbol],
+                    "raw_path": _safe_relative(
+                        input_path, root, label="benchmark input evidence"
+                    ),
+                    "raw_sha256": sha256_file(input_path),
+                    "row_count": len(source_frames[symbol]),
+                }
             coverage = {
                 "start": str(required_calendar[0]),
                 "end": str(required_calendar[-1]),
@@ -571,11 +880,12 @@ def _download_benchmark_evidence(
             }
             symbols[symbol] = {"coverage": coverage, "features": features}
             source_symbols[symbol] = {
-                "provider_code": TENCENT_BENCHMARKS[symbol],
+                "provider_code": selected_spec["provider_codes"][symbol],
                 "coverage": coverage,
                 "row_count": len(normalized),
                 "raw_path": _safe_relative(raw_path, root, label="benchmark raw file"),
                 "raw_sha256": sha256_file(raw_path),
+                "input_artifacts": input_artifacts,
             }
     except Exception:
         for target in created_targets:
@@ -587,13 +897,13 @@ def _download_benchmark_evidence(
     atomic_write_json(
         evidence_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "complete",
             "run_id": run_id,
             "retrieved_at": retrieved_at,
             "source": {
-                "provider": "tencent",
-                "interface": "web.ifzq.gtimg.cn appstock fqkline daily",
+                "provider": selected_spec["provider"],
+                "interface": selected_spec["interface"],
                 "price_basis": "provider_index_series",
             },
             "request_range": {"start": calendar[0], "end": calendar[-1]},
@@ -602,14 +912,16 @@ def _download_benchmark_evidence(
                 "error_type": type(fallback_error).__name__,
                 "message": str(fallback_error)[:300],
             },
+            "source_attempts": source_attempts,
+            "corrections": corrections,
             "symbols": source_symbols,
         },
     )
     evidence_sha256 = sha256_file(evidence_path)
     source = {
-        "provider": "tencent",
-        "interface": "web.ifzq.gtimg.cn appstock fqkline daily",
-        "source_dataset_id": "tencent_index_daily",
+        "provider": selected_spec["provider"],
+        "interface": selected_spec["interface"],
+        "source_dataset_id": selected_spec["source_dataset_id"],
         "source_path": _safe_relative(
             evidence_root, root, label="benchmark source evidence"
         ),
@@ -694,9 +1006,10 @@ def _install_instrument_pools(target_provider: Path, *, root: Path) -> dict[str,
     }
 
 
-def build_qlib_v2(
+def _build_qlib_v2_unchecked(
     *,
     quant_data_root: Path,
+    run_id: str,
     publish: bool = False,
     benchmark_provider: Path | None = None,
     benchmark_source: Mapping[str, str] | None = None,
@@ -710,11 +1023,6 @@ def build_qlib_v2(
         quant_data_root=root,
         require_basis="qfq",
         validated_cache=validated_cache,
-    )
-    run_id = (
-        datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
-        + "-"
-        + uuid.uuid4().hex[:8]
     )
     snapshot_id = f"qlib-ashare-v2-{run_id}"
     staging = root / "staging" / f"qlib-v2-{run_id}" / snapshot_id
@@ -782,7 +1090,7 @@ def build_qlib_v2(
             "interface": "v2_snapshot_to_qlib",
         },
         source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-        producer={"script": "build_qlib_v2.py", "version": "8"},
+        producer={"script": "build_qlib_v2.py", "version": "9"},
         upstream_snapshot=upstream,
         benchmark_evidence=benchmark_evidence,
         instrument_pool_evidence=instrument_pool_evidence,
@@ -799,6 +1107,45 @@ def build_qlib_v2(
         validated_cache=validated_cache,
     )
     return published
+
+
+def build_qlib_v2(
+    *,
+    quant_data_root: Path,
+    publish: bool = False,
+    benchmark_provider: Path | None = None,
+    benchmark_source: Mapping[str, str] | None = None,
+    benchmark_use_system_proxy: bool = False,
+    publication_lock_held: bool = False,
+    validated_cache: ValidatedResolutionCache | None = None,
+) -> Path:
+    root = Path(quant_data_root).expanduser().resolve()
+    run_id = (
+        datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    staging_run = root / "staging" / f"qlib-v2-{run_id}"
+    try:
+        result = _build_qlib_v2_unchecked(
+            quant_data_root=root,
+            run_id=run_id,
+            publish=publish,
+            benchmark_provider=benchmark_provider,
+            benchmark_source=benchmark_source,
+            benchmark_use_system_proxy=benchmark_use_system_proxy,
+            publication_lock_held=publication_lock_held,
+            validated_cache=validated_cache,
+        )
+    except BaseException:
+        shutil.rmtree(staging_run, ignore_errors=True)
+        raise
+    if publish:
+        try:
+            staging_run.rmdir()
+        except OSError:
+            pass
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:

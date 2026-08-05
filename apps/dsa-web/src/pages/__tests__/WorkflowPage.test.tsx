@@ -70,8 +70,9 @@ const { getQuantStatus, getQuantJobTypes, getResearchStatus, listQuantJobs, subm
 }));
 
 vi.mock('../../api/quant', () => ({
+  QUANT_API_CONTRACT_VERSION: 'quant-workbench-v2',
   quantApi: {
-    getStatus: () => getQuantStatus(),
+    getStatus: (options?: { includeResearch?: boolean }) => getQuantStatus(options),
     getJobTypes: () => getQuantJobTypes(),
     listJobs: () => listQuantJobs(),
     submitJob: (jobType: string, params?: Record<string, unknown>) => submitQuantJob(jobType, params),
@@ -104,10 +105,59 @@ function readyResearchStatus() {
         calendarRange: '2020-01-02 ~ 2026-07-03',
         instruments: 5300,
       },
+      providerQuality: {
+        canonical: {
+          provider: 'canonical',
+          datasetId: 'qlib_ashare_v2',
+          snapshotId: 'snapshot-20260802',
+          trainable: true,
+          structuralStatus: 'accepted',
+          calendarEnd: '2026-07-24',
+          freshness: {
+            status: 'stale',
+            calendarEnd: '2026-07-24',
+            asOfDate: '2026-08-02',
+            calendarAgeDays: 9,
+            blocksTraining: false,
+          },
+          trainingReadiness: { status: 'trainable', summary: 'canonical ready' },
+        },
+        cleaned: {
+          provider: 'cleaned',
+          datasetId: 'qlib_ashare_cleaned_v2',
+          snapshotId: 'cleaned-snapshot-blocked',
+          trainable: false,
+          trainingReadiness: { status: 'blocked', summary: 'cleaned provider 缺少完整 benchmark' },
+        },
+      },
+      robustSignal: {
+        status: 'missing',
+        lifecycleStatus: 'not_started',
+        dataReadiness: {
+          status: 'ready',
+          trainable: true,
+          summary: 'Robust CSI800 data is ready.',
+          summaryZh: '鲁棒 CSI800 数据已验收并绑定当前数据清单。',
+          providerKey: 'robust-provider-key',
+          dataManifestSha256: 'e'.repeat(64),
+        },
+      },
       latestTraining: {
         status: 'completed',
         experimentName: 'baseline_lgb_alpha158',
+        experimentId: '1',
         runId: 'abc123',
+        artifactSha256: {
+          'pred.pkl': 'a'.repeat(64),
+          'label.pkl': 'b'.repeat(64),
+        },
+        providerIdentity: {
+          providerContract: 'immutable_snapshot_v2',
+          datasetId: 'qlib_ashare_v2',
+          snapshotId: 'snapshot-20260802',
+          manifestSha256: 'c'.repeat(64),
+          contentSha256: 'd'.repeat(64),
+        },
         metrics: { IC: 0.01 },
       },
       experimentNotebook: {
@@ -181,7 +231,13 @@ describe('WorkflowPage', () => {
         report_qlib_rolling_training: { label: '生成 Qlib 滚动训练计划', allowedParams: ['config', 'windows', 'train_years', 'valid_months', 'test_months', 'step_months'] },
         report_qlib_risk_model: { label: '生成 Qlib 组合风险诊断', allowedParams: ['run_id'] },
         train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config', 'experiment_name', 'provider'] },
+        train_baseline_lgb_equivalence: { label: '运行真实 LightGBM 网页等价验收', allowedParams: ['provider'] },
         run_candidate_pipeline: { label: '运行五个选股模型候选流程', allowedParams: ['dry_run', 'provider'] },
+        prepare_robust_signal_data: { label: '验收并准备鲁棒 CSI800 数据', allowedParams: [] },
+        preview_robust_signal_plan: { label: '预览鲁棒选股信号研究计划', allowedParams: [] },
+        run_robust_signal_research: { label: '启动鲁棒选股信号研究', allowedParams: ['run_id', 'smoke'] },
+        pause_robust_signal_research: { label: '完成当前子任务后暂停', allowedParams: ['run_id'] },
+        resume_robust_signal_research: { label: '恢复鲁棒选股信号研究', allowedParams: ['run_id', 'smoke'] },
         generate_csi300: { label: '预演旧兼容 CSI300 股票池', allowedParams: [] },
         add_index_benchmark: { label: '预演旧兼容 benchmark', allowedParams: [] },
         run_china_astock_comparison: { label: '生成 china-astock 策略对比', allowedParams: [] },
@@ -189,9 +245,15 @@ describe('WorkflowPage', () => {
         optimize_strategy: { label: '交易策略优化预演', allowedParams: ['dry_run', 'phase', 'topk'] },
       run_dsa_backtest: { label: '运行 DSA 分析准确性回测', allowedParams: ['code', 'eval_window_days', 'force'] },
     };
-    getQuantJobTypes.mockResolvedValue(availableJobTypes);
+    const apiContract = {
+      version: 'quant-workbench-v2',
+      backendBuildId: 'backend-test-123',
+      backendStartedAt: '2026-08-02T02:00:00Z',
+    };
+    getQuantJobTypes.mockResolvedValue({ availableJobTypes, apiContract });
 
     getQuantStatus.mockResolvedValue({
+      apiContract,
       availableJobTypes,
       activeCount: 0,
       latestJobs: {
@@ -309,8 +371,39 @@ describe('WorkflowPage', () => {
     const backtestLink = screen.getByRole('link', { name: '回测 baseline_lgb_alpha158 每日 TopK 等权基线' });
     expect(backtestLink).toHaveAttribute(
       'href',
-      '/backtest?tab=trained&runId=abc123&modelId=latest&strategyId=baseline_daily',
+      '/backtest?tab=trained&runId=abc123&modelId=latest&strategyId=baseline_daily&snapshotId=snapshot-20260802',
     );
+    expect(getQuantStatus).toHaveBeenCalledWith({ includeResearch: false });
+  });
+
+  it('disables a job run button while the same job type is active', async () => {
+    const runningBaselineJob = {
+      jobId: 'qj_train_running',
+      jobType: 'train_baseline_lgb',
+      label: '训练 Qlib LightGBM 选股模型基线',
+      status: 'running',
+      params: { provider: 'canonical' },
+      command: [],
+      cwd: '/Users/cq/WorkingProjects',
+      createdAt: '2026-08-02T17:45:00+08:00',
+      updatedAt: '2026-08-02T17:45:01+08:00',
+      logPath: '/tmp/job.log',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValue({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { train_baseline_lgb: runningBaselineJob },
+      recentJobs: [runningBaselineJob],
+    });
+    listQuantJobs.mockResolvedValue({ total: 1, items: [runningBaselineJob] });
+
+    renderWorkflowPage('training');
+
+    expect(
+      await screen.findByRole('button', { name: '取消 训练 Qlib LightGBM 选股模型基线' }),
+    ).toBeEnabled();
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
   });
 
   it('blocks formal training when the data gate fails but still allows the explicit dry-run preview', async () => {
@@ -320,6 +413,19 @@ describe('WorkflowPage', () => {
       trainingReadiness: {
         status: 'blocked_data',
         summary: 'SH000300 benchmark is missing or incomplete (8710 missing days)',
+      },
+      providerQuality: {
+        ...readyResearchStatus().providerQuality,
+        canonical: {
+          provider: 'canonical',
+          datasetId: 'qlib_ashare_v2',
+          snapshotId: 'canonical-snapshot-blocked',
+          trainable: false,
+          trainingReadiness: {
+            status: 'blocked_data',
+            summary: 'SH000300 benchmark is missing or incomplete (8710 missing days)',
+          },
+        },
       },
     });
     localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
@@ -351,6 +457,656 @@ describe('WorkflowPage', () => {
       });
     });
     expect(submitQuantJob).not.toHaveBeenCalledWith('train_baseline_lgb', expect.anything());
+  });
+
+  it('launches the isolated real LightGBM equivalence run with only a provider choice', async () => {
+    renderWorkflowPage('training');
+
+    const card = await screen.findByTestId(
+      'workflow-job-train_baseline_lgb_equivalence',
+    );
+    expect(
+      within(card).getByText(/真实训练.*测试结果不会进入正式候选、最新结果或普通回测列表/),
+    ).toBeInTheDocument();
+    expect(within(card).getByText(/服务器固定短周期配置/)).toBeInTheDocument();
+    expect(within(card).queryByLabelText(/配置文件/)).not.toBeInTheDocument();
+    expect(within(card).queryByLabelText(/实验名称/)).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByTestId('workflow-run-train_baseline_lgb_equivalence'),
+    );
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith(
+        'train_baseline_lgb_equivalence',
+        { provider: 'canonical' },
+      );
+    });
+  });
+
+  it('separates quality-job completion from data acceptance and can run the full report from training', async () => {
+    const completedQualityJob = {
+      jobId: 'qj_quality_complete',
+      jobType: 'report_data_quality',
+      label: '生成数据质量报告',
+      status: 'completed',
+      params: {},
+      createdAt: '2026-08-02T09:00:00+08:00',
+      completedAt: '2026-08-02T09:05:00+08:00',
+      updatedAt: '2026-08-02T09:05:00+08:00',
+      artifactPaths: ['data_quality_report_latest.json'],
+    };
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValueOnce({
+      ...status,
+      trainable: false,
+      trainingReadiness: { status: 'blocked_data', summary: 'benchmark coverage is incomplete' },
+      providerQuality: {
+        ...status.providerQuality,
+        canonical: {
+          ...status.providerQuality.canonical,
+          trainable: false,
+          trainingReadiness: { status: 'blocked_data', summary: 'benchmark coverage is incomplete' },
+        },
+      },
+    });
+    getQuantStatus.mockResolvedValue({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: { report_data_quality: completedQualityJob },
+      recentJobs: [completedQualityJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [completedQualityJob] });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('质量报告任务：已完成')).toBeInTheDocument();
+    expect(screen.getByText('数据验收：阻塞')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '运行正式全量数据验收' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('report_data_quality', {});
+    });
+  });
+
+  it('does not report data acceptance as blocked while status is still loading', () => {
+    getResearchStatus.mockReturnValueOnce(new Promise(() => undefined));
+    getQuantStatus.mockReturnValueOnce(new Promise(() => undefined));
+
+    renderWorkflowPage('training');
+
+    expect(screen.getByText('正在读取数据状态')).toBeInTheDocument();
+    expect(screen.getByText('数据验收：读取中')).toBeInTheDocument();
+    expect(screen.queryByText('数据验收：阻塞')).not.toBeInTheDocument();
+  });
+
+  it('shows structured model-training progress and runner health', async () => {
+    const candidateJob = {
+      jobId: 'qj_candidate_progress',
+      jobType: 'run_candidate_pipeline',
+      label: '运行五个选股模型候选流程',
+      status: 'running',
+      params: { provider: 'canonical' },
+      pid: 43210,
+      runnerAlive: true,
+      progress: {
+        stage: 'models',
+        completed: 2,
+        total: 5,
+        percent: 40,
+        current: 'lightgbm',
+        currentArtifact: 'pred.pkl',
+        elapsedSeconds: 120,
+        etaSeconds: 180,
+      },
+      createdAt: '2026-08-02T10:00:00+08:00',
+      startedAt: '2026-08-02T10:00:00+08:00',
+      updatedAt: '2026-08-02T10:02:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValue({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { run_candidate_pipeline: candidateJob },
+      recentJobs: [candidateJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [candidateJob] });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('2 / 5 · 40%')).toBeInTheDocument();
+    expect(screen.getByText('阶段：models · 当前：lightgbm')).toBeInTheDocument();
+    expect(screen.getByText('已用 2分钟 · 预计剩余 3分钟 · 当前产物 pred.pkl')).toBeInTheDocument();
+    expect(screen.getByText('Runner PID 43210 · 存活')).toBeInTheDocument();
+  });
+
+  it('provides controlled robust-signal plan, smoke, formal, pause and resume actions', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        status: 'signal_diagnosis_complete',
+        lifecycleStatus: 'paused',
+        runId: 'robust_signal_20260802_100000',
+        currentStage: 'validation',
+        pauseState: 'paused',
+        nextGate: 'resume_validation',
+        completedCount: 17,
+        expectedCount: 24,
+        configHash: 'config-hash',
+        dataManifestHash: 'data-hash',
+        gitCommit: 'abcdef123456',
+        dataReadiness: {
+          status: 'ready',
+          trainable: true,
+          summaryZh: '鲁棒 CSI800 数据已验收并绑定当前数据清单。',
+          providerKey: 'robust-provider-key',
+          dataManifestSha256: 'e'.repeat(64),
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByRole('heading', { name: '鲁棒选股信号研究' })).toBeInTheDocument();
+    expect(screen.getByText('17 / 24 · validation · 已暂停')).toBeInTheDocument();
+    expect(screen.getByText('检查点：robust_signal_20260802_100000')).toBeInTheDocument();
+    expect(screen.getByText('配置 config-hash · 数据 data-hash · 代码 abcdef123456')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '预览鲁棒信号研究计划' }));
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('preview_robust_signal_plan', {});
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '运行鲁棒信号单季度测试' }));
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('run_robust_signal_research', { smoke: true });
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '恢复鲁棒信号研究' }));
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('resume_robust_signal_research', {
+        run_id: 'robust_signal_20260802_100000',
+      });
+    });
+    expect(screen.getByRole('button', { name: '正式启动鲁棒信号研究' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '完成当前子任务后暂停' })).toBeDisabled();
+  });
+
+  it('disables robust-signal launch and resume actions missing from the backend catalog', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        status: 'signal_diagnosis_complete',
+        lifecycleStatus: 'paused',
+        pauseState: 'paused',
+        runId: 'robust_signal_20260802_100000',
+      },
+    });
+    getQuantJobTypes.mockResolvedValueOnce({
+      availableJobTypes: {
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['provider'] },
+        train_baseline_lgb_equivalence: { label: '运行真实 LightGBM 网页等价验收', allowedParams: ['provider'] },
+        run_candidate_pipeline: { label: '运行五个选股模型候选流程', allowedParams: ['dry_run', 'provider'] },
+      },
+      apiContract: {
+        version: 'quant-workbench-v2',
+        backendBuildId: 'backend-test-123',
+        backendStartedAt: '2026-08-02T02:00:00Z',
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('后端未启用鲁棒信号研究任务')).toBeInTheDocument();
+    expect(screen.getByText(/不可用操作：预览计划、启动研究、协作暂停、恢复研究/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '预览鲁棒信号研究计划' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '运行鲁棒信号单季度测试' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '正式启动鲁棒信号研究' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '恢复鲁棒信号研究' })).toBeDisabled();
+  });
+
+  it('disables robust-signal pause when that backend action is not advertised', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        status: 'running',
+        lifecycleStatus: 'running',
+        pauseState: 'running',
+        runId: 'robust_signal_20260802_110000',
+      },
+    });
+    getQuantJobTypes.mockResolvedValueOnce({
+      availableJobTypes: {
+        preview_robust_signal_plan: { label: '预览鲁棒选股信号研究计划', allowedParams: [] },
+        run_robust_signal_research: { label: '启动鲁棒选股信号研究', allowedParams: ['run_id', 'smoke'] },
+        resume_robust_signal_research: { label: '恢复鲁棒选股信号研究', allowedParams: ['run_id', 'smoke'] },
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['provider'] },
+        train_baseline_lgb_equivalence: { label: '运行真实 LightGBM 网页等价验收', allowedParams: ['provider'] },
+        run_candidate_pipeline: { label: '运行五个选股模型候选流程', allowedParams: ['dry_run', 'provider'] },
+      },
+      apiContract: {
+        version: 'quant-workbench-v2',
+        backendBuildId: 'backend-test-123',
+        backendStartedAt: '2026-08-02T02:00:00Z',
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('后端未启用鲁棒信号研究任务')).toBeInTheDocument();
+    expect(screen.getByText(/不可用操作：协作暂停/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '完成当前子任务后暂停' })).toBeDisabled();
+  });
+
+  it('blocks every robust-signal run mode on its own CSI800 readiness contract', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        status: 'missing',
+        lifecycleStatus: 'not_started',
+        dataReadiness: {
+          status: 'blocked_data',
+          trainable: false,
+          reasonCode: 'data_manifest_changed',
+          summary: 'The robust provider was built from an older data manifest.',
+          summaryZh: '鲁棒 CSI800 provider 绑定的是旧数据清单，请重新验收并准备。',
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('鲁棒 CSI800 provider 绑定的是旧数据清单，请重新验收并准备。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '预览鲁棒信号研究计划' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '运行鲁棒信号单季度测试' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '正式启动鲁棒信号研究' })).toBeDisabled();
+    expect(screen.getByRole('link', { name: '去数据页准备鲁棒 CSI800 数据' })).toHaveAttribute('href', '/data');
+  });
+
+  it('shows the latest one-quarter test separately from formal robust research', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        status: 'missing',
+        lifecycleStatus: 'not_started',
+        dataReadiness: {
+          status: 'ready',
+          trainable: true,
+          summaryZh: '鲁棒 CSI800 数据已验收并绑定当前数据清单。',
+        },
+        smokeRun: {
+          status: 'signal_diagnosis_complete',
+          lifecycleStatus: 'completed',
+          runId: 'robust_signal_20260802_165707',
+          currentStage: 'smoke_complete',
+          pauseState: 'completed',
+          completedCount: 1,
+          expectedCount: 1,
+          testOnly: true,
+          progress: {
+            currentStage: 'smoke_complete',
+            completedCount: 1,
+            expectedCount: 1,
+          },
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('最近单季度测试')).toBeInTheDocument();
+    expect(screen.getByText('测试数据，不可用于研究或交易')).toBeInTheDocument();
+    expect(screen.getByText('1 / 1 · smoke_complete · 已完成')).toBeInTheDocument();
+    expect(screen.getByText('测试检查点：robust_signal_20260802_165707')).toBeInTheDocument();
+    expect(screen.getByText('0 / 0 · - · not_started')).toBeInTheDocument();
+  });
+
+  it('polls a durable robust smoke runner until its visible status is complete', async () => {
+    const running = {
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        smokeRun: {
+          status: 'signal_diagnosis_complete',
+          lifecycleStatus: 'running',
+          runId: 'robust_signal_20260802_170000',
+          currentStage: 'screening',
+          pauseState: 'running',
+          completedCount: 0,
+          expectedCount: 1,
+          testOnly: true,
+        },
+      },
+    };
+    const completed = {
+      ...running,
+      robustSignal: {
+        ...running.robustSignal,
+        smokeRun: {
+          ...running.robustSignal.smokeRun,
+          lifecycleStatus: 'completed',
+          currentStage: 'smoke_complete',
+          pauseState: 'completed',
+          completedCount: 1,
+        },
+      },
+    };
+    getResearchStatus.mockReset();
+    getResearchStatus.mockResolvedValueOnce(running).mockResolvedValue(completed);
+
+    renderWorkflowPage('training');
+
+    const panel = await screen.findByLabelText('最近鲁棒信号单季度测试');
+    expect(within(panel).getByText('0 / 1 · screening · 运行中')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(within(panel).getByText('1 / 1 · smoke_complete · 已完成')).toBeInTheDocument();
+    }, { timeout: 5000 });
+    expect(getResearchStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not let an older research response roll back a newer robust status', async () => {
+    renderWorkflowPage('training');
+    await screen.findByText('当前数据可训练');
+
+    let resolveOlder: (value: unknown) => void = () => undefined;
+    let resolveNewer: (value: unknown) => void = () => undefined;
+    getResearchStatus
+      .mockReturnValueOnce(new Promise((resolve) => {
+        resolveOlder = resolve;
+      }))
+      .mockReturnValueOnce(new Promise((resolve) => {
+        resolveNewer = resolve;
+      }));
+
+    const refreshButton = screen.getByRole('button', { name: '刷新' });
+    fireEvent.click(refreshButton);
+    fireEvent.click(refreshButton);
+    await waitFor(() => {
+      expect(getResearchStatus).toHaveBeenCalledTimes(3);
+    });
+
+    const newer = {
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        status: 'signal_candidate_ready',
+        lifecycleStatus: 'completed',
+        runId: 'robust_signal_newer',
+        currentStage: 'validation_complete',
+        pauseState: 'completed',
+        completedCount: 24,
+        expectedCount: 24,
+      },
+    };
+    await act(async () => {
+      resolveNewer(newer);
+    });
+    expect(await screen.findByText('24 / 24 · validation_complete · completed')).toBeInTheDocument();
+
+    const older = {
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        status: 'signal_diagnosis_complete',
+        lifecycleStatus: 'running',
+        runId: 'robust_signal_older',
+        currentStage: 'screening',
+        pauseState: 'running',
+        completedCount: 3,
+        expectedCount: 24,
+      },
+    };
+    await act(async () => {
+      resolveOlder(older);
+    });
+
+    expect(screen.getByText('24 / 24 · validation_complete · completed')).toBeInTheDocument();
+    expect(screen.queryByText('3 / 24 · screening · 运行中')).not.toBeInTheDocument();
+  });
+
+  it('lets a human cancel a durable robust run after its launcher job completed', async () => {
+    const completedLauncher = {
+      jobId: 'qj_robust_launcher',
+      jobType: 'run_robust_signal_research',
+      label: '启动鲁棒选股信号研究',
+      status: 'completed',
+      params: { run_id: 'robust_signal_20260802_170000', smoke: false },
+      returnCode: 0,
+      createdAt: '2026-08-02T17:00:00+08:00',
+      startedAt: '2026-08-02T17:00:01+08:00',
+      completedAt: '2026-08-02T17:00:11+08:00',
+      updatedAt: '2026-08-02T17:00:11+08:00',
+      artifactPaths: [],
+      canCancel: true,
+      progress: {
+        runId: 'robust_signal_20260802_170000',
+        lifecycleStatus: 'running',
+        pauseState: 'running',
+      },
+    };
+    getResearchStatus.mockResolvedValue({
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        runId: 'robust_signal_20260802_170000',
+        lifecycleStatus: 'running',
+        pauseState: 'running',
+        currentStage: 'screening',
+        completedCount: 1,
+        expectedCount: 8,
+      },
+    });
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: { run_robust_signal_research: completedLauncher },
+      recentJobs: [completedLauncher],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [completedLauncher] });
+    cancelQuantJob.mockResolvedValueOnce({
+      ...completedLauncher,
+      status: 'cancelled',
+      canCancel: false,
+    });
+
+    renderWorkflowPage('training');
+
+    const cancel = await screen.findByRole('button', {
+      name: '取消正在运行的鲁棒信号研究',
+    });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    expect(cancelQuantJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '确认取消' }));
+
+    await waitFor(() => {
+      expect(cancelQuantJob).toHaveBeenCalledWith('qj_robust_launcher');
+    });
+  });
+
+  it('shows durable cancellation failure instead of pretending the run stopped', async () => {
+    const completedLauncher = {
+      jobId: 'qj_robust_cancel_failure',
+      jobType: 'run_robust_signal_research',
+      label: '启动鲁棒选股信号研究',
+      status: 'completed',
+      params: { run_id: 'robust_signal_20260802_170500', smoke: false },
+      returnCode: 0,
+      createdAt: '2026-08-02T17:05:00+08:00',
+      completedAt: '2026-08-02T17:05:11+08:00',
+      updatedAt: '2026-08-02T17:05:11+08:00',
+      artifactPaths: [],
+      canCancel: true,
+    };
+    getResearchStatus.mockResolvedValue({
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        runId: 'robust_signal_20260802_170500',
+        lifecycleStatus: 'running',
+        pauseState: 'running',
+      },
+    });
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: { run_robust_signal_research: completedLauncher },
+      recentJobs: [completedLauncher],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [completedLauncher] });
+    cancelQuantJob.mockResolvedValueOnce({
+      ...completedLauncher,
+      error: '取消未确认：后台训练仍可能运行。',
+    });
+
+    renderWorkflowPage('training');
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: '取消正在运行的鲁棒信号研究',
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '确认取消' }));
+
+    expect(await screen.findByText('取消未确认：后台训练仍可能运行。')).toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: '取消正在运行的鲁棒信号研究',
+    })).toBeEnabled();
+  });
+
+  it('treats a completed launcher with a cancellable runner as active and blocks duplicate launch', async () => {
+    const completedLauncher = {
+      jobId: 'qj_robust_detached_runner',
+      jobType: 'run_robust_signal_research',
+      label: '启动鲁棒选股信号研究',
+      status: 'completed',
+      params: { run_id: 'robust_signal_20260802_180000', smoke: false },
+      returnCode: 0,
+      createdAt: '2026-08-02T18:00:00+08:00',
+      startedAt: '2026-08-02T18:00:01+08:00',
+      completedAt: '2026-08-02T18:00:11+08:00',
+      updatedAt: '2026-08-02T18:00:11+08:00',
+      artifactPaths: [],
+      canCancel: true,
+      runnerAlive: true,
+    };
+    getQuantStatus.mockResolvedValue({
+      availableJobTypes: {},
+      activeCount: 0,
+      latestJobs: { run_robust_signal_research: completedLauncher },
+      recentJobs: [completedLauncher],
+    });
+    listQuantJobs.mockResolvedValue({ total: 1, items: [completedLauncher] });
+
+    const view = renderWorkflowPage('all');
+
+    expect(await screen.findByText('1 个运行中')).toBeInTheDocument();
+    expect(screen.getByText('qj_robust_detached_runner')).toBeInTheDocument();
+
+    view.rerender(
+      <UiLanguageProvider>
+        <MemoryRouter>
+          <QuantTaskPage surface="training" />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    expect(await screen.findByRole('button', { name: '运行鲁棒信号单季度测试' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '正式启动鲁棒信号研究' })).toBeDisabled();
+  });
+
+  it('pauses and resumes a smoke checkpoint without switching to formal mode', async () => {
+    getResearchStatus.mockResolvedValueOnce({
+      ...readyResearchStatus(),
+      robustSignal: {
+        ...readyResearchStatus().robustSignal,
+        smokeRun: {
+          status: 'signal_diagnosis_complete',
+          lifecycleStatus: 'stopped',
+          runId: 'robust_signal_20260802_171500',
+          currentStage: 'screening',
+          pauseState: 'paused',
+          completedCount: 1,
+          expectedCount: 1,
+          testOnly: true,
+        },
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    const resume = await screen.findByRole('button', { name: '恢复鲁棒信号研究' });
+    expect(resume).toBeEnabled();
+    fireEvent.click(resume);
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('resume_robust_signal_research', {
+        run_id: 'robust_signal_20260802_171500',
+        smoke: true,
+      });
+    });
+  });
+
+  it('offers robust CSI800 data preparation on the data page', async () => {
+    renderWorkflowPage('all');
+
+    fireEvent.click(await screen.findByRole('button', { name: '运行 验收并准备鲁棒 CSI800 数据' }));
+
+    await waitFor(() => {
+      expect(submitQuantJob).toHaveBeenCalledWith('prepare_robust_signal_data', {});
+    });
+  });
+
+  it('does not present synthetic or incomplete results as backtest-ready', async () => {
+    getResearchStatus.mockResolvedValue({
+      ...readyResearchStatus(),
+      latestTraining: {
+        status: 'completed',
+        experimentName: 'synthetic_preview',
+      },
+      candidatePipeline: {
+        status: 'completed',
+        dryRun: true,
+        experimentName: 'candidate_models_preview',
+        models: [
+          { id: 'lightgbm', label: 'LightGBM', status: 'completed', runId: null },
+        ],
+        strategyEvaluations: [
+          {
+            modelId: 'lightgbm',
+            strategyId: 'baseline_daily',
+            strategyLabel: '每日 TopK 等权基线',
+            strategyConfig: { rebalanceFreq: 1 },
+          },
+        ],
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('测试数据，不可用于研究或交易')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /^回测 / })).not.toBeInTheDocument();
+    expect(screen.getAllByText('查看测试结果').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/缺少真实 Run ID/).length).toBeGreaterThan(0);
+  });
+
+  it('gates each training card with the selected provider snapshot', async () => {
+    renderWorkflowPage('training');
+
+    const baselineCard = await screen.findByTestId('workflow-job-train_baseline_lgb');
+    expect(
+      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
+    ).toHaveValue('canonical');
+    expect(within(baselineCard).getByText(/snapshot-20260802/)).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
+
+    fireEvent.change(
+      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
+      { target: { value: 'cleaned' } },
+    );
+
+    expect(within(baselineCard).getByText(/cleaned-snapshot-blocked/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/cleaned provider 缺少完整 benchmark/)).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
   });
 
   it('separates data tasks from the remaining quant tasks', async () => {
@@ -643,9 +1399,90 @@ describe('WorkflowPage', () => {
     expect(screen.queryByText('1 个运行中')).not.toBeInTheDocument();
   });
 
+  it('shows frontend and backend builds when the quant workbench contract matches', async () => {
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText(/前端构建/)).toBeInTheDocument();
+    expect(screen.getByText(/后端构建 backend-test-123/)).toBeInTheDocument();
+    expect(screen.queryByText('网页与后端版本不兼容')).not.toBeInTheDocument();
+  });
+
+  it('explains an old backend contract and keeps run actions disabled', async () => {
+    getQuantJobTypes.mockResolvedValueOnce({
+      availableJobTypes: {
+        train_baseline_lgb: {
+          label: '训练 Qlib LightGBM 选股模型基线',
+          allowedParams: ['config', 'experiment_name', 'provider'],
+        },
+      },
+      apiContract: {
+        version: 'quant-workbench-v1',
+        backendBuildId: 'backend-old',
+        backendStartedAt: '2026-08-01T01:00:00Z',
+      },
+    });
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText('网页与后端版本不兼容')).toBeInTheDocument();
+    expect(screen.getByText(/后端版本过旧或尚未重启/)).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
+  });
+
+  it('shows stale market-data freshness separately without blocking accepted training data', async () => {
+    renderWorkflowPage('training');
+
+    const baselineCard = await screen.findByTestId('workflow-job-train_baseline_lgb');
+    expect(within(baselineCard).getByText(/结构验收：通过/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/行情截止 2026-07-24/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/已落后 9 天，建议更新，不阻断训练/)).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
+  });
+
+  it('shows provider snapshots, structural acceptance, and freshness on the data page', async () => {
+    localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
+    render(
+      <UiLanguageProvider>
+        <MemoryRouter>
+          <DataPage />
+        </MemoryRouter>
+      </UiLanguageProvider>,
+    );
+
+    const canonical = await screen.findByTestId('provider-quality-canonical');
+    expect(canonical).toHaveTextContent('canonical');
+    expect(canonical).toHaveTextContent('snapshot-20260802');
+    expect(canonical).toHaveTextContent('结构验收：通过');
+    expect(canonical).toHaveTextContent('行情截止 2026-07-24');
+  });
+
+  it('localizes the live data-readiness summary without changing the API payload', async () => {
+    const status = readyResearchStatus();
+    const rawSummary = 'Qlib provider has enough calendar/instrument coverage for the baseline run. Warnings: 3152 symbols have non-positive volume rows; 252 symbols have absolute daily returns above 50%';
+    status.trainingReadiness.summary = rawSummary;
+    status.providerQuality.canonical.trainingReadiness.summary = rawSummary;
+    status.providerQuality.cleaned.trainingReadiness.summary = rawSummary;
+    getResearchStatus.mockResolvedValue(status);
+
+    renderWorkflowPage('training');
+
+    expect(await screen.findByText(/Qlib 数据快照的交易日和股票覆盖已达到基线训练要求/)).toBeInTheDocument();
+    expect(screen.getByText(/3152 只股票存在非正成交量记录/)).toBeInTheDocument();
+    expect(screen.getByText(/252 只股票存在单日绝对涨跌幅超过 50% 的记录/)).toBeInTheDocument();
+    expect(screen.queryByText(/Qlib provider has enough calendar/i)).not.toBeInTheDocument();
+    expect(status.trainingReadiness.summary).toBe(rawSummary);
+  });
+
   it('disables workflow jobs that are not advertised by the backend whitelist', async () => {
     getQuantJobTypes.mockResolvedValueOnce({
-      check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      availableJobTypes: {
+        check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      },
+      apiContract: {
+        version: 'quant-workbench-v2',
+        backendBuildId: 'backend-test-123',
+        backendStartedAt: '2026-08-02T02:00:00Z',
+      },
     });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
@@ -686,7 +1523,14 @@ describe('WorkflowPage', () => {
 
     await act(async () => {
       resolveStatus({
-        report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
+        availableJobTypes: {
+          report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
+        },
+        apiContract: {
+          version: 'quant-workbench-v2',
+          backendBuildId: 'backend-test-123',
+          backendStartedAt: '2026-08-02T02:00:00Z',
+        },
       });
     });
 
@@ -716,7 +1560,14 @@ describe('WorkflowPage', () => {
 
     await act(async () => {
       resolveStatus({
-        apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
+        availableJobTypes: {
+          apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
+        },
+        apiContract: {
+          version: 'quant-workbench-v2',
+          backendBuildId: 'backend-test-123',
+          backendStartedAt: '2026-08-02T02:00:00Z',
+        },
       });
     });
 
@@ -727,7 +1578,14 @@ describe('WorkflowPage', () => {
 
   it('disables daily guide job shortcuts that are missing from the backend whitelist', async () => {
     getQuantJobTypes.mockResolvedValueOnce({
-      check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      availableJobTypes: {
+        check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
+      },
+      apiContract: {
+        version: 'quant-workbench-v2',
+        backendBuildId: 'backend-test-123',
+        backendStartedAt: '2026-08-02T02:00:00Z',
+      },
     });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
@@ -890,6 +1748,20 @@ describe('WorkflowPage', () => {
   });
 
   it('submits the selected Qlib provider for training jobs', async () => {
+    const status = readyResearchStatus();
+    getResearchStatus.mockResolvedValueOnce({
+      ...status,
+      providerQuality: {
+        ...status.providerQuality,
+        cleaned: {
+          provider: 'cleaned',
+          datasetId: 'qlib_ashare_cleaned_v2',
+          snapshotId: 'cleaned-snapshot-ready',
+          trainable: true,
+          trainingReadiness: { status: 'trainable', summary: 'cleaned ready' },
+        },
+      },
+    });
     renderWorkflowPage();
 
     fireEvent.change(await screen.findByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'), {
@@ -906,7 +1778,14 @@ describe('WorkflowPage', () => {
 
   it('renders and submits only parameters advertised by the backend whitelist', async () => {
     getQuantJobTypes.mockResolvedValueOnce({
-      train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config'] },
+      availableJobTypes: {
+        train_baseline_lgb: { label: '训练 Qlib LightGBM 选股模型基线', allowedParams: ['config'] },
+      },
+      apiContract: {
+        version: 'quant-workbench-v2',
+        backendBuildId: 'backend-test-123',
+        backendStartedAt: '2026-08-02T02:00:00Z',
+      },
     });
     getQuantStatus.mockResolvedValueOnce({
       availableJobTypes: {
@@ -1151,6 +2030,51 @@ describe('WorkflowPage', () => {
     expect(screen.getByRole('log', { name: '产物预览 latest_training_result.json' })).toHaveTextContent('IC: 0.01');
     expect(screen.getAllByText('latest_training_result.json').length).toBeGreaterThan(0);
     expect(screen.getByText(/IC: 0.01/)).toBeInTheDocument();
+  });
+
+  it('keeps the newest artifact preview when an older request finishes later', async () => {
+    const artifactJob = {
+      jobId: 'qj_artifact_race',
+      jobType: 'train_baseline_lgb',
+      label: '训练 Qlib LightGBM 选股模型基线',
+      status: 'completed',
+      params: {},
+      createdAt: '2026-08-02T10:00:00+08:00',
+      completedAt: '2026-08-02T10:01:00+08:00',
+      updatedAt: '2026-08-02T10:01:00+08:00',
+      artifactPaths: ['/tmp/artifact-a.md', '/tmp/artifact-b.md'],
+    };
+    let resolveArtifactA: (value: string) => void = () => undefined;
+    let resolveArtifactB: (value: string) => void = () => undefined;
+    getQuantStatus.mockReturnValueOnce(new Promise(() => undefined));
+    listQuantJobs.mockReturnValueOnce(new Promise(() => undefined));
+    getQuantJobArtifactText.mockImplementation((_jobId: string, artifactIndex: number) => (
+      new Promise<string>((resolve) => {
+        if (artifactIndex === 0) resolveArtifactA = resolve;
+        if (artifactIndex === 1) resolveArtifactB = resolve;
+      })
+    ));
+
+    renderWorkflowPage('training');
+    await waitFor(() => {
+      expect(FakeEventSource.instances).toHaveLength(1);
+    });
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', { jobs: [artifactJob] });
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: '预览 artifact-a.md' }));
+    fireEvent.click(await screen.findByRole('button', { name: '预览 artifact-b.md' }));
+    await act(async () => {
+      resolveArtifactB('# Artifact B');
+    });
+    expect(screen.getByRole('log', { name: '产物预览 artifact-b.md' })).toHaveTextContent('Artifact B');
+
+    await act(async () => {
+      resolveArtifactA('# Artifact A');
+    });
+    expect(screen.getByRole('log', { name: '产物预览 artifact-b.md' })).toHaveTextContent('Artifact B');
+    expect(screen.queryByText('Artifact A')).not.toBeInTheDocument();
   });
 
   it('shows a streamed artifact while the slower status snapshot is still loading', async () => {
@@ -1418,6 +2342,8 @@ describe('WorkflowPage', () => {
     renderWorkflowPage();
     expect(await screen.findByText('2 个运行中')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '取消 检查 Qlib 数据' }));
+    expect(cancelQuantJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '确认取消' }));
     await waitFor(() => {
       expect(cancelQuantJob).toHaveBeenCalledWith('qj_cancel_target');
     });
@@ -1630,6 +2556,9 @@ describe('WorkflowPage', () => {
 
     expect(await screen.findByText('1 个运行中')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '取消 检查 Qlib 数据' }));
+    expect(cancelQuantJob).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: '确认取消任务' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认取消' }));
 
     await waitFor(() => {
       expect(cancelQuantJob).toHaveBeenCalledWith('qj_running');
@@ -1666,6 +2595,42 @@ describe('WorkflowPage', () => {
 
     expect(await screen.findByText('qj_stream')).toBeInTheDocument();
     expect(screen.getByText('qlib_check.log')).toBeInTheDocument();
+  });
+
+  it('refreshes an open log after streamed updates and identifies truncated output', async () => {
+    const runningJob = {
+      jobId: 'qj_live_log',
+      jobType: 'check_qlib_data',
+      label: '检查 Qlib 数据',
+      status: 'running',
+      params: {},
+      createdAt: '2026-08-02T10:00:00+08:00',
+      updatedAt: '2026-08-02T10:00:00+08:00',
+      artifactPaths: [],
+    };
+    getQuantStatus.mockResolvedValueOnce({
+      availableJobTypes: {},
+      activeCount: 1,
+      latestJobs: { check_qlib_data: runningJob },
+      recentJobs: [runningJob],
+    });
+    listQuantJobs.mockResolvedValueOnce({ total: 1, items: [runningJob] });
+    getQuantJobLog
+      .mockResolvedValueOnce({ jobId: runningJob.jobId, content: 'stage 1', truncated: false })
+      .mockResolvedValueOnce({ jobId: runningJob.jobId, content: 'stage 2 tail', truncated: true });
+
+    renderWorkflowPage();
+    fireEvent.click(await screen.findByRole('button', { name: '日志' }));
+    expect(await screen.findByText('stage 1')).toBeInTheDocument();
+
+    act(() => {
+      FakeEventSource.instances[0].emit('jobs', {
+        jobs: [{ ...runningJob, updatedAt: '2026-08-02T10:00:02+08:00' }],
+      });
+    });
+
+    expect(await screen.findByText('stage 2 tail')).toBeInTheDocument();
+    expect(screen.getByText('日志过长，仅显示最后一部分。')).toBeInTheDocument();
   });
 
   it('keeps the newest job per type when stream events arrive unsorted', async () => {

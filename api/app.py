@@ -56,6 +56,7 @@ _CSRF_STRICT_ORIGIN_PREFIXES = (
     "/api/v1/alphasift/",
     "/api/v1/auth/",
     "/api/v1/alerts/",
+    "/api/v1/backtest/",
     "/api/v1/portfolio/",
     "/api/v1/quant/",
     "/api/v1/research/experiments/",

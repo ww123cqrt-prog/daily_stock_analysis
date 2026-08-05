@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -50,6 +51,11 @@ from robust_signal_evaluation import (  # noqa: E402
     topk_sensitivity,
 )
 from robust_signal_models import EqualWeightRankModel  # noqa: E402
+from robust_signal_data_contract import (  # noqa: E402
+    CONTRACT_VERSION as ROBUST_DATA_CONTRACT_VERSION,
+    RobustSignalDataBlocked,
+    evaluate_robust_signal_data,
+)
 from robust_strategy_core import RollingSplit, make_rolling_split  # noqa: E402
 
 
@@ -62,6 +68,40 @@ FINAL_STATUSES = {
     "signal_not_found",
     "signal_candidate_ready",
 }
+CHECKPOINT_SCHEMA_VERSION = 1
+PREDICTION_ARTIFACT_COLUMNS = (
+    "datetime",
+    "instrument",
+    "score",
+    "label",
+    "benchmark_return",
+    "market_state",
+)
+SPLIT_FIELDS = (
+    "train_start",
+    "train_end",
+    "validation_start",
+    "validation_end",
+    "test_start",
+    "test_end",
+)
+DIAGNOSTIC_SECTION_FIELDS = (
+    "rows",
+    "feature_count",
+    "missing_rate_by_feature",
+    "constant_features",
+    "low_variance_features",
+    "nonfinite_value_count",
+    "high_correlation_pairs",
+)
+RUN_CONTEXT_CONTROL_FIELDS = frozenset(
+    {
+        "context_hash",
+        "run_mode",
+        "smoke_quarter",
+        "smoke_signal_id",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -137,8 +177,29 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _immutable_context_hash(context: Mapping[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in context.items()
+        if key not in RUN_CONTEXT_CONTROL_FIELDS
+    }
+    return _sha256_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    )
+
+
 def _sha256_file(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _git_commit(root: Path) -> str:
@@ -213,15 +274,23 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("market-state features require at least 60 trading days of lookback")
 
 
-def _resolve_provider(config: Mapping[str, Any], report_root: Path) -> tuple[Path, dict[str, Any]]:
+def _resolve_provider(
+    config: Mapping[str, Any],
+    report_root: Path,
+    *,
+    data_manifest_path: Path,
+    quant_data_dir: Path,
+) -> tuple[Path, dict[str, Any]]:
     status_path = report_root / str(config["paths"]["qlib_provider_status"])
-    status = _read_json(status_path)
-    provider = Path(str(status.get("provider_uri") or "")).expanduser()
-    if not provider.is_dir():
-        raise ValueError("verified robust provider is unavailable")
-    if not (provider / "instruments" / "csi800.txt").is_file():
-        raise ValueError("verified provider does not contain PIT csi800 instruments")
-    return provider.resolve(), status
+    status = evaluate_robust_signal_data(
+        status_path=status_path,
+        data_manifest_path=data_manifest_path,
+        provider_root=(
+            Path(quant_data_dir) / "runtime" / "robust_strategy" / "providers"
+        ),
+        quality_pointer_path=report_root / "data_quality_report_latest.json",
+    )
+    return Path(str(status["provider_uri"])), status
 
 
 def _calendar(provider: Path) -> pd.DatetimeIndex:
@@ -292,10 +361,15 @@ def _goal1_safe_split(
 def build_context(
     *, config_path: Path, config: Mapping[str, Any], quant_data_dir: Path, report_root: Path
 ) -> dict[str, Any]:
-    provider, provider_status = _resolve_provider(config, report_root)
     manifest_path = quant_data_dir / str(config["paths"]["data_manifest"])
     if not manifest_path.is_file():
         raise ValueError("DATA_MANIFEST.json is unavailable")
+    provider, provider_status = _resolve_provider(
+        config,
+        report_root,
+        data_manifest_path=manifest_path,
+        quant_data_dir=quant_data_dir,
+    )
     repo_root = SCRIPT_DIR.parents[1]
     payload = {
         "config_hash": _sha256_file(config_path),
@@ -305,17 +379,22 @@ def build_context(
         "provider_uri": str(provider),
         "provider_tree_sha256": provider_status.get("provider_tree_sha256"),
         "provider_key": provider_status.get("provider_key"),
-        "membership_snapshot_hash": provider_status.get("membership_snapshot_hash"),
-        "reference_snapshot_hash": provider_status.get("reference_snapshot_hash"),
+        "membership_intervals_sha256": provider_status.get(
+            "membership_intervals_sha256"
+        ),
+        "quality_report_id": provider_status.get("quality_report_id"),
+        "quality_evidence_sha256": provider_status.get(
+            "quality_evidence_sha256"
+        ),
+        "cleaned_provider_identity": provider_status.get(
+            "cleaned_provider_identity"
+        ),
+        "robust_data_contract_version": ROBUST_DATA_CONTRACT_VERSION,
         "locked_confirmation_start": str(LOCKED_CONFIRMATION_START.date()),
     }
     if str(config.get("fundamentals", {}).get("research_round")) == "single_extension":
         payload.update(_load_fundamental_source_context(config, quant_data_dir))
-    payload["context_hash"] = _sha256_bytes(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
-            "utf-8"
-        )
-    )
+    payload["context_hash"] = _immutable_context_hash(payload)
     return payload
 
 
@@ -446,6 +525,369 @@ def build_jobs(
     return jobs
 
 
+def _run_dir_from_progress_path(progress_path: Path, job: SignalJob) -> Path:
+    path = Path(progress_path)
+    if path.name != "progress.json" or path.parent.name != job.phase:
+        raise ValueError("job progress path does not match the job phase")
+    return path.parent.parent.absolute()
+
+
+def _artifact_paths(
+    run_dir: Path, job: SignalJob
+) -> dict[str, tuple[str, Path]]:
+    relative = {
+        "prediction": Path(job.phase) / "predictions" / f"{job.key}.parquet",
+        "model": Path(job.phase) / "models" / f"{job.key}.pkl",
+        "diagnostics": (
+            Path(job.phase)
+            / "diagnostics"
+            / f"{job.signal_id}__{job.quarter}__w{job.window_days}.json"
+        ),
+    }
+    return {
+        name: (path.as_posix(), Path(run_dir) / path)
+        for name, path in relative.items()
+    }
+
+
+def _normalized_split(
+    value: Any,
+    *,
+    job: SignalJob,
+    expected: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != set(SPLIT_FIELDS):
+        raise ValueError("job split schema is invalid")
+    normalized: dict[str, str] = {}
+    parsed: dict[str, pd.Timestamp] = {}
+    for field in SPLIT_FIELDS:
+        raw = value[field]
+        if not isinstance(raw, str):
+            raise ValueError("job split dates must be ISO strings")
+        try:
+            timestamp = pd.Timestamp(raw).normalize()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("job split contains an invalid date") from exc
+        if pd.isna(timestamp) or raw != str(timestamp.date()):
+            raise ValueError("job split dates must be normalized ISO dates")
+        normalized[field] = raw
+        parsed[field] = timestamp
+    if not (
+        parsed["train_start"] <= parsed["train_end"]
+        < parsed["validation_start"]
+        <= parsed["validation_end"]
+        < parsed["test_start"]
+        <= parsed["test_end"]
+    ):
+        raise ValueError("job split date order is invalid")
+    quarter = pd.Period(job.quarter, freq="Q")
+    if (
+        parsed["test_start"] < quarter.start_time.normalize()
+        or parsed["test_end"] > quarter.end_time.normalize()
+    ):
+        raise ValueError("job test split is outside its registered quarter")
+    if parsed["test_end"] >= LOCKED_CONFIRMATION_START:
+        raise ValueError("Goal 1 checkpoint attempted to include 2026")
+    if expected is not None:
+        expected_normalized = _normalized_split(expected, job=job)
+        if normalized != expected_normalized:
+            raise ValueError("job split does not match the locked split")
+    return normalized
+
+
+def _artifact_schema(job: SignalJob, split: Mapping[str, str]) -> dict[str, Any]:
+    model_contract = {
+        "phase": job.phase,
+        "signal_id": job.signal_id,
+        "model_id": job.model_id,
+        "quarter": job.quarter,
+        "window_days": job.window_days,
+    }
+    return {
+        "prediction": {
+            "format": "parquet",
+            "columns": list(PREDICTION_ARTIFACT_COLUMNS),
+            "datetime_column": "datetime",
+            "locked_date_range": {
+                "start": split["test_start"],
+                "end": split["test_end"],
+            },
+        },
+        "diagnostics": {
+            "format": "json",
+            "schema_version": 2,
+            "required_sections": ["raw", "processed"],
+            "required_section_fields": list(DIAGNOSTIC_SECTION_FIELDS),
+        },
+        "model": {
+            "format": "cloudpickle",
+            "validation": "path_sha256_and_model_contract_only",
+            "model_contract": model_contract,
+        },
+    }
+
+
+def _read_nonempty_artifact(path: Path) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("job artifact is missing or is a symlink")
+    content = path.read_bytes()
+    if not content:
+        raise ValueError("job artifact is empty")
+    return content
+
+
+def _prediction_artifact_evidence(
+    content: bytes, *, split: Mapping[str, str]
+) -> dict[str, Any]:
+    try:
+        frame = pd.read_parquet(io.BytesIO(content))
+    except Exception as exc:
+        raise ValueError("prediction artifact is not readable Parquet") from exc
+    if list(frame.columns) != list(PREDICTION_ARTIFACT_COLUMNS) or frame.empty:
+        raise ValueError("prediction artifact schema is invalid")
+    dates = pd.to_datetime(frame["datetime"], errors="coerce").dt.normalize()
+    if dates.isna().any():
+        raise ValueError("prediction artifact contains invalid dates")
+    locked_start = pd.Timestamp(split["test_start"]).normalize()
+    locked_end = pd.Timestamp(split["test_end"]).normalize()
+    if (dates < locked_start).any() or (dates > locked_end).any():
+        raise ValueError("prediction artifact exceeds the locked split")
+    instruments = frame["instrument"]
+    if instruments.isna().any() or instruments.astype(str).str.strip().eq("").any():
+        raise ValueError("prediction artifact contains invalid instruments")
+    for column in ("score", "benchmark_return"):
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        if numeric.isna().any() or not np.isfinite(numeric.to_numpy(dtype=float)).all():
+            raise ValueError(f"prediction artifact contains invalid {column} values")
+    labels = pd.to_numeric(frame["label"], errors="coerce")
+    invalid_labels = frame["label"].notna() & labels.isna()
+    if invalid_labels.any() or np.isinf(labels.dropna().to_numpy(dtype=float)).any():
+        raise ValueError("prediction artifact contains invalid label values")
+    states = frame["market_state"]
+    if states.isna().any() or states.astype(str).str.strip().eq("").any():
+        raise ValueError("prediction artifact contains invalid market states")
+    return {
+        "row_count": int(len(frame)),
+        "date_range": {
+            "start": str(dates.min().date()),
+            "end": str(dates.max().date()),
+        },
+    }
+
+
+def _is_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _diagnostic_section_is_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping) or not set(DIAGNOSTIC_SECTION_FIELDS).issubset(
+        value
+    ):
+        return False
+    if not _is_nonnegative_integer(value.get("rows")) or not _is_nonnegative_integer(
+        value.get("feature_count")
+    ):
+        return False
+    if not _is_nonnegative_integer(value.get("nonfinite_value_count")):
+        return False
+    missing = value.get("missing_rate_by_feature")
+    if not isinstance(missing, Mapping):
+        return False
+    try:
+        missing_is_valid = all(
+            isinstance(name, str)
+            and math.isfinite(float(rate))
+            and 0.0 <= float(rate) <= 1.0
+            for name, rate in missing.items()
+        )
+    except (TypeError, ValueError):
+        return False
+    if not missing_is_valid:
+        return False
+    for field in ("constant_features", "low_variance_features"):
+        entries = value.get(field)
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, str) for entry in entries
+        ):
+            return False
+    pairs = value.get("high_correlation_pairs")
+    if not isinstance(pairs, list):
+        return False
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            return False
+        if not isinstance(pair.get("left"), str) or not isinstance(
+            pair.get("right"), str
+        ):
+            return False
+        try:
+            correlation = float(pair["correlation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not math.isfinite(correlation) or not -1.0 <= correlation <= 1.0:
+            return False
+    return True
+
+
+def _diagnostics_artifact_is_valid(content: bytes) -> bool:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, Mapping)
+        and set(payload) == {"schema_version", "raw", "processed"}
+        and payload.get("schema_version") == 2
+        and _diagnostic_section_is_valid(payload.get("raw"))
+        and _diagnostic_section_is_valid(payload.get("processed"))
+    )
+
+
+def _diagnostics_path_is_valid(path: Path) -> bool:
+    try:
+        return _diagnostics_artifact_is_valid(_read_nonempty_artifact(path))
+    except (OSError, ValueError):
+        return False
+
+
+def _reported_artifact_path_is_exact(reported: Any, expected: Path) -> bool:
+    if not isinstance(reported, str) or not reported:
+        return False
+    path = Path(reported)
+    if not path.is_absolute() or path.is_symlink():
+        return False
+    try:
+        return path.resolve(strict=True) == expected.resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _completed_job_state(
+    *,
+    job: SignalJob,
+    result: Mapping[str, Any],
+    run_dir: Path,
+    context_hash: str,
+    expected_split: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    split = _normalized_split(result.get("split"), job=job, expected=expected_split)
+    paths = _artifact_paths(run_dir, job)
+    for name, (_relative, expected_path) in paths.items():
+        if not _reported_artifact_path_is_exact(
+            result.get(f"{name}_path"), expected_path
+        ):
+            raise ValueError(f"{name} artifact path does not match the registered job")
+    prediction_content = _read_nonempty_artifact(paths["prediction"][1])
+    model_content = _read_nonempty_artifact(paths["model"][1])
+    diagnostics_content = _read_nonempty_artifact(paths["diagnostics"][1])
+    prediction_evidence = _prediction_artifact_evidence(
+        prediction_content, split=split
+    )
+    if not _diagnostics_artifact_is_valid(diagnostics_content):
+        raise ValueError("diagnostics artifact schema is invalid")
+    try:
+        reported_rows = int(result.get("rows"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("job result row count is invalid") from exc
+    if reported_rows != prediction_evidence["row_count"]:
+        raise ValueError("job result row count does not match prediction artifact")
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "job_identity": {
+            "run_id": run_dir.name,
+            "job_key": job.key,
+            "context_hash": context_hash,
+        },
+        "context_hash": context_hash,
+        "phase": job.phase,
+        "signal_id": job.signal_id,
+        "model_id": job.model_id,
+        "quarter": job.quarter,
+        "window_days": job.window_days,
+        "split": split,
+        "row_count": prediction_evidence["row_count"],
+        "prediction_date_range": prediction_evidence["date_range"],
+        "prediction_path": paths["prediction"][0],
+        "prediction_sha256": _sha256_bytes(prediction_content),
+        "prediction_size_bytes": len(prediction_content),
+        "model_path": paths["model"][0],
+        "model_sha256": _sha256_bytes(model_content),
+        "model_size_bytes": len(model_content),
+        "diagnostics_path": paths["diagnostics"][0],
+        "diagnostics_sha256": _sha256_bytes(diagnostics_content),
+        "diagnostics_size_bytes": len(diagnostics_content),
+        "artifact_schema": _artifact_schema(job, split),
+        "rank_ic_mean": result.get("rank_ic_mean"),
+        "mlflow_run_id": result.get("mlflow_run_id"),
+    }
+
+
+def _completed_job_checkpoint_is_valid(
+    *,
+    job: SignalJob,
+    state: Mapping[str, Any],
+    run_dir: Path,
+    context_hash: str,
+    expected_split: Mapping[str, Any] | None,
+) -> bool:
+    try:
+        if state.get("status") != "completed":
+            return False
+        if state.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            return False
+        if state.get("context_hash") != context_hash:
+            return False
+        if state.get("job_identity") != {
+            "run_id": run_dir.name,
+            "job_key": job.key,
+            "context_hash": context_hash,
+        }:
+            return False
+        if any(
+            state.get(field) != expected
+            for field, expected in (
+                ("phase", job.phase),
+                ("signal_id", job.signal_id),
+                ("model_id", job.model_id),
+                ("quarter", job.quarter),
+                ("window_days", job.window_days),
+            )
+        ):
+            return False
+        split = _normalized_split(
+            state.get("split"), job=job, expected=expected_split
+        )
+        if state.get("artifact_schema") != _artifact_schema(job, split):
+            return False
+        paths = _artifact_paths(run_dir, job)
+        contents: dict[str, bytes] = {}
+        for name, (relative_path, absolute_path) in paths.items():
+            if state.get(f"{name}_path") != relative_path:
+                return False
+            digest = state.get(f"{name}_sha256")
+            if not _is_sha256(digest):
+                return False
+            content = _read_nonempty_artifact(absolute_path)
+            if _sha256_bytes(content) != digest:
+                return False
+            if state.get(f"{name}_size_bytes") != len(content):
+                return False
+            contents[name] = content
+        prediction_evidence = _prediction_artifact_evidence(
+            contents["prediction"], split=split
+        )
+        if state.get("row_count") != prediction_evidence["row_count"]:
+            return False
+        if state.get("prediction_date_range") != prediction_evidence["date_range"]:
+            return False
+        if not _diagnostics_artifact_is_valid(contents["diagnostics"]):
+            return False
+        # Model validation deliberately stops at path, non-empty bytes, hash, and contract.
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def run_job_loop(
     jobs: Sequence[SignalJob],
     *,
@@ -454,6 +896,7 @@ def run_job_loop(
     resume: bool,
     run_job: Callable[[SignalJob], Mapping[str, Any]],
     pause_requested: Callable[[], bool],
+    expected_split_for_job: Callable[[SignalJob], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     existing = _read_json(progress_path) if resume else {}
     if resume and existing and existing.get("context_hash") != context_hash:
@@ -465,14 +908,19 @@ def run_job_loop(
     progress.setdefault("jobs", {})
     progress["pause_state"] = "running"
     for job in jobs:
+        run_dir = _run_dir_from_progress_path(progress_path, job)
         previous = progress["jobs"].get(job.key) or {}
-        prediction = Path(str(previous.get("prediction_path") or ""))
-        model = Path(str(previous.get("model_path") or ""))
-        if (
-            previous.get("status") == "completed"
-            and previous.get("context_hash") == context_hash
-            and prediction.is_file()
-            and model.is_file()
+        expected_split = (
+            expected_split_for_job(job)
+            if expected_split_for_job is not None
+            else previous.get("split")
+        )
+        if _completed_job_checkpoint_is_valid(
+            job=job,
+            state=previous,
+            run_dir=run_dir,
+            context_hash=context_hash,
+            expected_split=expected_split,
         ):
             continue
         progress["current_job"] = job.key
@@ -485,6 +933,13 @@ def run_job_loop(
         _write_json(progress_path, progress)
         try:
             result = dict(run_job(job))
+            completed_state = _completed_job_state(
+                job=job,
+                result=result,
+                run_dir=run_dir,
+                context_hash=context_hash,
+                expected_split=expected_split,
+            )
         except Exception as exc:
             progress["jobs"][job.key] = {
                 "status": "failed",
@@ -498,14 +953,8 @@ def run_job_loop(
             _write_json(progress_path, progress)
             raise
         progress["jobs"][job.key] = {
-            **result,
+            **completed_state,
             "status": "completed",
-            "context_hash": context_hash,
-            "phase": job.phase,
-            "signal_id": job.signal_id,
-            "model_id": job.model_id,
-            "quarter": job.quarter,
-            "window_days": job.window_days,
             "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         progress["completed_count"] = sum(
@@ -535,6 +984,11 @@ def request_pause(report_dir: Path, run_id: str) -> dict[str, Any]:
     status = _read_json(run_dir / "status.json")
     if not status:
         raise ValueError("signal research run does not exist")
+    if (
+        status.get("lifecycle_status") != "running"
+        or status.get("pause_state") != "running"
+    ):
+        raise ValueError("signal research run is not actively running")
     payload = {
         "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "run_id": run_id,
@@ -683,10 +1137,7 @@ class QlibJobRunner:
             }
         )
 
-    def _dataset(
-        self, job: SignalJob
-    ) -> tuple[Any, pd.Series, pd.Series, RollingSplit]:
-        key = (job.signal_id, job.quarter, job.window_days)
+    def _split(self, job: SignalJob) -> RollingSplit:
         signal = self._signal(job.signal_id)
         split = make_rolling_split(
             self.calendar,
@@ -704,6 +1155,25 @@ class QlibJobRunner:
         )
         if split.test_end >= LOCKED_CONFIRMATION_START:
             raise ValueError("Goal 1 dataset attempted to read 2026")
+        return split
+
+    def split_contract(self, job: SignalJob) -> dict[str, str]:
+        split = self._split(job)
+        return {
+            "train_start": str(split.train_start.date()),
+            "train_end": str(split.train_end.date()),
+            "validation_start": str(split.validation_start.date()),
+            "validation_end": str(split.validation_end.date()),
+            "test_start": str(split.test_start.date()),
+            "test_end": str(split.test_end.date()),
+        }
+
+    def _dataset(
+        self, job: SignalJob
+    ) -> tuple[Any, pd.Series, pd.Series, RollingSplit]:
+        key = (job.signal_id, job.quarter, job.window_days)
+        signal = self._signal(job.signal_id)
+        split = self._split(job)
         if key == self._cached_key:
             return (
                 self._cached_dataset,
@@ -824,7 +1294,7 @@ class QlibJobRunner:
             / "diagnostics"
             / f"{job.signal_id}__{job.quarter}__w{job.window_days}.json"
         )
-        if not diagnostics_path.is_file():
+        if not _diagnostics_path_is_valid(diagnostics_path):
             raw_features = dataset.prepare_raw_features("test")
             features = dataset.prepare("test", col_set="feature", data_key="infer")
             diagnostic_kwargs = {
@@ -1246,7 +1716,7 @@ def _factor_contract(
     )
     family = config["feature_families"][signal["feature_family"]]
     contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "signal_candidate_ready",
         "signal_id": signal["id"],
         "model_id": report["model_id"],
@@ -1268,7 +1738,12 @@ def _factor_contract(
         "target": signal["target"],
         "data_source": "verified_local_qlib_provider",
         "provider_tree_sha256": context.get("provider_tree_sha256"),
-        "membership_snapshot_hash": context.get("membership_snapshot_hash"),
+        "membership_intervals_sha256": context.get(
+            "membership_intervals_sha256"
+        ),
+        "quality_report_id": context.get("quality_report_id"),
+        "quality_evidence_sha256": context.get("quality_evidence_sha256"),
+        "cleaned_provider_identity": context.get("cleaned_provider_identity"),
         "fundamental_source": context.get("fundamental_source"),
         "fundamental_source_manifest_hash": context.get(
             "fundamental_source_manifest_hash"
@@ -1297,12 +1772,21 @@ def write_immutable_factor_contract(path: Path, contract: Mapping[str, Any]) -> 
         _write_json(path, contract)
 
 
-def _records_for_phase(progress: Mapping[str, Any], phase: str) -> list[dict[str, Any]]:
-    return [
-        dict(value)
-        for value in (progress.get("jobs") or {}).values()
-        if value.get("status") == "completed" and value.get("phase") == phase
-    ]
+def _records_for_phase(
+    progress: Mapping[str, Any], phase: str, *, run_dir: Path
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for value in (progress.get("jobs") or {}).values():
+        if value.get("status") != "completed" or value.get("phase") != phase:
+            continue
+        record = dict(value)
+        for name in ("prediction", "model", "diagnostics"):
+            relative = Path(str(record[f"{name}_path"]))
+            if relative.is_absolute():
+                raise ValueError("completed job contains a non-relative artifact path")
+            record[f"{name}_path"] = str(Path(run_dir) / relative)
+        records.append(record)
+    return records
 
 
 def _failed_signal_outcome(
@@ -1340,6 +1824,7 @@ def _status_payload(
         raise ValueError("invalid signal research status")
     return {
         "run_id": run_id,
+        "run_mode": context.get("run_mode"),
         "status": status,
         "lifecycle_status": lifecycle_status,
         "current_stage": current_stage,
@@ -1357,6 +1842,18 @@ def _status_payload(
     }
 
 
+def _write_run_status(
+    *,
+    report_dir: Path,
+    run_id: str,
+    status: Mapping[str, Any],
+    latest_status_path: Path | None,
+) -> None:
+    _write_json(report_dir / "runs" / run_id / "status.json", status)
+    if latest_status_path is not None:
+        _write_json(latest_status_path, status)
+
+
 def _write_failed_status(
     *,
     run_id: str,
@@ -1369,6 +1866,7 @@ def _write_failed_status(
     reason_code: str = "job_failed",
     next_gate: str = "inspect_failed_job",
     publish_latest: bool = True,
+    latest_status_path: Path | None = None,
 ) -> dict[str, Any]:
     status = _status_payload(
         run_id=run_id,
@@ -1384,9 +1882,14 @@ def _write_failed_status(
     )
     status["error_type"] = type(error).__name__
     status["error"] = str(error)[:500]
-    _write_json(report_dir / "runs" / run_id / "status.json", status)
-    if publish_latest:
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+    if latest_status_path is None and publish_latest:
+        latest_status_path = report_dir / "robust_signal_status_latest.json"
+    _write_run_status(
+        report_dir=report_dir,
+        run_id=run_id,
+        status=status,
+        latest_status_path=latest_status_path,
+    )
     return status
 
 
@@ -1404,25 +1907,70 @@ def run_research(
 ) -> dict[str, Any]:
     config = load_config(config_path)
     report_root = reports_root()
-    context = build_context(
-        config_path=config_path,
-        config=config,
-        quant_data_dir=quant_data_dir,
-        report_root=report_root,
+    run_dir = report_dir / "runs" / run_id
+    latest_status_path = report_dir / (
+        "robust_signal_smoke_status_latest.json"
+        if smoke
+        else "robust_signal_status_latest.json"
     )
+    try:
+        context = build_context(
+            config_path=config_path,
+            config=config,
+            quant_data_dir=quant_data_dir,
+            report_root=report_root,
+        )
+    except RobustSignalDataBlocked as exc:
+        status = {
+            "status": "blocked_data",
+            "lifecycle_status": "stopped",
+            "reason_code": exc.reason_code,
+            "summary": exc.summary,
+            "summary_zh": exc.summary_zh,
+            "run_id": run_id,
+            "current_stage": "data_readiness",
+            "pause_state": "blocked",
+            "completed_count": 0,
+            "expected_count": 0,
+            "next_gate": "prepare_robust_signal_data",
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        _write_run_status(
+            report_dir=report_dir,
+            run_id=run_id,
+            status=status,
+            latest_status_path=latest_status_path,
+        )
+        return status
     if not smoke and context["git_clean"] is not True:
         raise ValueError("formal signal research requires a clean Git worktree")
-    run_dir = report_dir / "runs" / run_id
-    publish_latest = not smoke
     context_path = run_dir / "context.json"
+    run_mode = "smoke" if smoke else "formal"
     if resume:
         stored = _read_json(context_path)
-        if stored.get("context_hash") != context["context_hash"]:
+        stored_hash = stored.get("context_hash")
+        if not _is_sha256(stored_hash) or _immutable_context_hash(stored) != stored_hash:
+            raise ValueError("resume_context_integrity_mismatch")
+        if stored_hash != context["context_hash"]:
             raise ValueError("resume_context_mismatch")
+        if str(stored.get("run_mode") or "formal") != run_mode:
+            raise ValueError("resume_mode_mismatch")
+        if smoke and (
+            stored.get("smoke_quarter") != smoke_quarter
+            or stored.get("smoke_signal_id") != smoke_signal_id
+        ):
+            raise ValueError("resume_smoke_contract_mismatch")
+        context = dict(stored)
         (run_dir / "pause.request.json").unlink(missing_ok=True)
     else:
         if context_path.exists():
             raise ValueError("signal research run already exists; use resume")
+        context = {
+            **context,
+            "run_mode": run_mode,
+            "smoke_quarter": smoke_quarter if smoke else None,
+            "smoke_signal_id": smoke_signal_id if smoke else None,
+        }
         _write_json(context_path, context)
     provider = Path(context["provider_uri"])
     job_runner = QlibJobRunner(
@@ -1431,7 +1979,7 @@ def run_research(
         quant_data_dir=quant_data_dir,
         run_dir=run_dir,
         context_hash=str(context["context_hash"]),
-        mlflow_enabled=mlflow_enabled,
+        mlflow_enabled=mlflow_enabled and not smoke,
     )
     pause_path = run_dir / "pause.request.json"
 
@@ -1456,9 +2004,12 @@ def run_research(
         expected_count=len(screening_jobs),
         next_gate="screening_diagnostics",
     )
-    _write_json(run_dir / "status.json", status)
-    if publish_latest:
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+    _write_run_status(
+        report_dir=report_dir,
+        run_id=run_id,
+        status=status,
+        latest_status_path=latest_status_path,
+    )
     try:
         screening_progress = run_job_loop(
             screening_jobs,
@@ -1466,6 +2017,7 @@ def run_research(
             context_hash=str(context["context_hash"]),
             resume=resume,
             run_job=job_runner,
+            expected_split_for_job=job_runner.split_contract,
             pause_requested=paused,
         )
     except Exception as exc:
@@ -1481,7 +2033,7 @@ def run_research(
             ),
             expected_count=len(screening_jobs),
             error=exc,
-            publish_latest=publish_latest,
+            latest_status_path=latest_status_path,
         )
         raise
     if screening_progress.get("pause_state") == "paused":
@@ -1497,13 +2049,16 @@ def run_research(
             reason_code="user_requested_after_current_job",
             next_gate="resume_screening",
         )
-        _write_json(run_dir / "status.json", status)
-        if publish_latest:
-            _write_json(report_dir / "robust_signal_status_latest.json", status)
+        _write_run_status(
+            report_dir=report_dir,
+            run_id=run_id,
+            status=status,
+            latest_status_path=latest_status_path,
+        )
         return status
     try:
         screening_reports = evaluate_records(
-            _records_for_phase(screening_progress, "screening"),
+            _records_for_phase(screening_progress, "screening", run_dir=run_dir),
             config=config,
             phase="screening",
         )
@@ -1522,7 +2077,7 @@ def run_research(
             error=exc,
             reason_code="summary_failed",
             next_gate="inspect_failed_summary",
-            publish_latest=publish_latest,
+            latest_status_path=latest_status_path,
         )
         raise
     if smoke:
@@ -1538,9 +2093,12 @@ def run_research(
             reason_code="single_quarter_smoke_complete",
             next_gate="formal_screening",
         )
-        _write_json(run_dir / "status.json", status)
-        if publish_latest:
-            _write_json(report_dir / "robust_signal_status_latest.json", status)
+        _write_run_status(
+            report_dir=report_dir,
+            run_id=run_id,
+            status=status,
+            latest_status_path=latest_status_path,
+        )
         return status
     candidates = select_screening_candidates(
         screening_reports, maximum=int(config["screening"]["maximum_candidates"])
@@ -1575,9 +2133,12 @@ def run_research(
             reason_code=outcome["reason_code"],
             next_gate=outcome["next_gate"],
         )
-        _write_json(run_dir / "status.json", status)
-        if publish_latest:
-            _write_json(report_dir / "robust_signal_status_latest.json", status)
+        _write_run_status(
+            report_dir=report_dir,
+            run_id=run_id,
+            status=status,
+            latest_status_path=latest_status_path,
+        )
         return status
     validation_jobs = build_jobs(config, phase="validation", signal_ids=candidates)
     validation_status = _status_payload(
@@ -1591,9 +2152,12 @@ def run_research(
         expected_count=len(screening_jobs) + len(validation_jobs),
         next_gate="strict_signal_acceptance",
     )
-    _write_json(run_dir / "status.json", validation_status)
-    if publish_latest:
-        _write_json(report_dir / "robust_signal_status_latest.json", validation_status)
+    _write_run_status(
+        report_dir=report_dir,
+        run_id=run_id,
+        status=validation_status,
+        latest_status_path=latest_status_path,
+    )
     try:
         validation_progress = run_job_loop(
             validation_jobs,
@@ -1601,6 +2165,7 @@ def run_research(
             context_hash=str(context["context_hash"]),
             resume=resume,
             run_job=job_runner,
+            expected_split_for_job=job_runner.split_contract,
             pause_requested=paused,
         )
     except Exception as exc:
@@ -1617,7 +2182,7 @@ def run_research(
             ),
             expected_count=len(screening_jobs) + len(validation_jobs),
             error=exc,
-            publish_latest=publish_latest,
+            latest_status_path=latest_status_path,
         )
         raise
     if validation_progress.get("pause_state") == "paused":
@@ -1634,13 +2199,16 @@ def run_research(
             reason_code="user_requested_after_current_job",
             next_gate="resume_validation",
         )
-        _write_json(run_dir / "status.json", status)
-        if publish_latest:
-            _write_json(report_dir / "robust_signal_status_latest.json", status)
+        _write_run_status(
+            report_dir=report_dir,
+            run_id=run_id,
+            status=status,
+            latest_status_path=latest_status_path,
+        )
         return status
     try:
         validation_reports = evaluate_records(
-            _records_for_phase(validation_progress, "validation"),
+            _records_for_phase(validation_progress, "validation", run_dir=run_dir),
             config=config,
             phase="validation",
         )
@@ -1659,7 +2227,7 @@ def run_research(
             error=exc,
             reason_code="summary_failed",
             next_gate="inspect_failed_summary",
-            publish_latest=publish_latest,
+            latest_status_path=latest_status_path,
         )
         raise
     passed = [report for report in validation_reports if report.get("passed") is True]
@@ -1727,9 +2295,12 @@ def run_research(
             expected_count=total_jobs,
             next_gate="create_goal_2_trade_strategy",
         )
-    _write_json(run_dir / "status.json", status)
-    if publish_latest:
-        _write_json(report_dir / "robust_signal_status_latest.json", status)
+    _write_run_status(
+        report_dir=report_dir,
+        run_id=run_id,
+        status=status,
+        latest_status_path=latest_status_path,
+    )
     return status
 
 

@@ -20,6 +20,15 @@ def load_module():
     return module
 
 
+def load_sources_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "_benchmark_sources.py"
+    spec = importlib.util.spec_from_file_location("benchmark_sources", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def write_complete_provider(
     provider: Path,
     *,
@@ -49,6 +58,116 @@ def write_complete_provider(
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
+    def test_eastmoney_source_maps_daily_ohlcv_for_all_benchmarks(self):
+        module = load_sources_module()
+
+        class FakeResponse:
+            def __init__(self, code):
+                self.code = code
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "rc": 0,
+                    "data": {
+                        "code": self.code,
+                        "klines": [
+                            "2026-07-23,10.0,10.1,10.2,9.9,1000,0,0,0,0,0",
+                            "2026-07-24,10.2,10.3,10.4,10.1,1200,0,0,0,0,0",
+                        ],
+                    },
+                }
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = None
+                self.params = []
+                self.headers = []
+
+            def get(self, _url, *, params, headers, timeout):
+                self.params.append((params, timeout))
+                self.headers.append(headers)
+                return FakeResponse(params["secid"].split(".", 1)[1])
+
+            def close(self):
+                return None
+
+        session = FakeSession()
+        with mock.patch("requests.Session", return_value=session):
+            frames = module.download_eastmoney_benchmarks(
+                "2026-07-23",
+                "2026-07-24",
+                use_system_proxy=True,
+                sleep_fn=lambda _seconds: None,
+            )
+
+        self.assertTrue(session.trust_env)
+        self.assertEqual(set(frames), {"SH000300", "SH000905", "SH000906"})
+        self.assertEqual(
+            {params["secid"] for params, _timeout in session.params},
+            {"1.000300", "1.000905", "1.000906"},
+        )
+        self.assertTrue(
+            all("Mozilla/5.0" in headers["User-Agent"] for headers in session.headers)
+        )
+        self.assertEqual(
+            frames["SH000300"].columns.tolist(),
+            ["open", "high", "low", "close", "volume"],
+        )
+        self.assertEqual(frames["SH000300"].loc["2026-07-24", "low"], 10.1)
+
+    def test_eastmoney_source_uses_bounded_doh_curl_fallback(self):
+        module = load_sources_module()
+        import requests
+
+        class FailingSession:
+            trust_env = None
+
+            def get(self, *_args, **_kwargs):
+                raise requests.ConnectionError("synthetic DNS interception")
+
+            def close(self):
+                return None
+
+        def curl_result(command, **kwargs):
+            secid = next(
+                item.split("=", 1)[1]
+                for index, item in enumerate(command)
+                if command[index - 1] == "--data-urlencode" and item.startswith("secid=")
+            )
+            code = secid.split(".", 1)[1]
+            payload = {
+                "rc": 0,
+                "data": {
+                    "code": code,
+                    "klines": [
+                        "2026-07-24,10.2,10.3,10.4,10.1,1200,0,0,0,0,0"
+                    ],
+                },
+            }
+            return mock.Mock(stdout=json.dumps(payload), stderr="", returncode=0)
+
+        with mock.patch("requests.Session", return_value=FailingSession()), mock.patch(
+            "subprocess.run", side_effect=curl_result
+        ) as run:
+            frames = module.download_eastmoney_benchmarks(
+                "2026-07-24",
+                "2026-07-24",
+                sleep_fn=lambda _seconds: None,
+                max_attempts=1,
+            )
+
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            command = call.args[0]
+            self.assertIn("--doh-url", command)
+            self.assertIn("--noproxy", command)
+            self.assertTrue(call.kwargs["check"])
+            self.assertEqual(call.kwargs["timeout"], 35)
+        self.assertEqual(frames["SH000906"].loc["2026-07-24", "close"], 10.3)
+
     def test_tencent_robust_source_downloads_all_three_ohlcv_series(self):
         module = load_module()
 

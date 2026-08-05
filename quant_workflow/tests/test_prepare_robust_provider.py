@@ -214,6 +214,119 @@ def test_reuse_check_rejects_group_or_other_writable_snapshot(tmp_path: Path) ->
     assert module._snapshot_is_reusable(provider, result["provider_key"]) is False
 
 
+def test_runtime_identity_cache_reuses_unchanged_hashes_and_detects_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    cache_type = getattr(module, "RuntimeProviderIdentityCache", None)
+    assert cache_type is not None, "runtime provider identity cache is missing"
+    canonical = tmp_path / "canonical"
+    (canonical / "calendars").mkdir(parents=True)
+    (canonical / "features").mkdir()
+    (canonical / "features" / "sample.bin").write_bytes(b"original")
+    (canonical / "calendars" / "day.txt").write_text(
+        "2023-01-02\n2023-01-03\n", encoding="utf-8"
+    )
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    manifest = write_manifest(tmp_path)
+    prepared = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=manifest,
+    )
+    provider = Path(prepared["provider_uri"])
+    original_sha256 = module.file_sha256
+    hashed: list[Path] = []
+
+    def counted_sha256(path: Path) -> str:
+        hashed.append(Path(path))
+        return original_sha256(path)
+
+    monkeypatch.setattr(module, "file_sha256", counted_sha256)
+    cache = cache_type()
+
+    first = cache(provider, prepared["provider_key"])
+    first_hash_count = len(hashed)
+    second = cache(provider, prepared["provider_key"])
+
+    assert first == second
+    assert first_hash_count > 0
+    assert len(hashed) == first_hash_count
+
+    feature = provider / "features" / "sample.bin"
+    feature.chmod(0o644)
+    feature.write_bytes(b"tampered")
+    feature.chmod(0o444)
+
+    assert cache(provider, prepared["provider_key"]) is None
+    assert len(hashed) == first_hash_count + 1
+
+
+def test_runtime_identity_cache_scans_provider_tree_once_per_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_module()
+    canonical = tmp_path / "canonical"
+    (canonical / "calendars").mkdir(parents=True)
+    (canonical / "features").mkdir()
+    (canonical / "features" / "sample.bin").write_bytes(b"original")
+    (canonical / "calendars" / "day.txt").write_text(
+        "2023-01-02\n2023-01-03\n", encoding="utf-8"
+    )
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    prepared = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=write_manifest(tmp_path),
+    )
+    provider = Path(prepared["provider_uri"])
+    cache = module.RuntimeProviderIdentityCache()
+    assert cache(provider, prepared["provider_key"]) is not None
+
+    original_rglob = Path.rglob
+    original_stat = Path.stat
+    scan_count = 0
+    follow_stat_count = 0
+
+    def counted_rglob(path: Path, pattern: str):
+        nonlocal scan_count
+        if path == provider:
+            scan_count += 1
+        return original_rglob(path, pattern)
+
+    def counted_stat(path: Path, *args, **kwargs):
+        nonlocal follow_stat_count
+        if (
+            kwargs.get("follow_symlinks", True)
+            and (path == provider or path.is_relative_to(provider))
+        ):
+            follow_stat_count += 1
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "rglob", counted_rglob)
+    monkeypatch.setattr(Path, "stat", counted_stat)
+
+    assert cache(provider, prepared["provider_key"]) is not None
+    assert scan_count == 1
+    assert follow_stat_count == 1
+
+
 def test_main_can_write_status_to_reports_without_moving_provider_data(
     tmp_path: Path,
 ) -> None:

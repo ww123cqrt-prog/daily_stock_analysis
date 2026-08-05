@@ -224,6 +224,30 @@ def test_verification_script_quick_covers_schedule_mode_regression() -> None:
     assert 'PATH="$(dirname "${PYTHON_BIN}"):${PATH}"' in script
 
 
+def test_verification_script_sets_quant_workflow_script_import_path() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(
+        encoding="utf-8"
+    )
+    quant_body = script.split("run_quant_workflow() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert 'PYTHONPATH="${QUANT_WORKFLOW_ROOT}/scripts${PYTHONPATH:+:${PYTHONPATH}}"' in quant_body
+    assert '"${PYTHON_BIN}" -m pytest tests -q' in quant_body
+
+
+def test_backend_verification_does_not_collect_embedded_quant_workflow_tests() -> None:
+    script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(
+        encoding="utf-8"
+    )
+    ci_gate = (ROOT_DIR / "scripts" / "ci_gate.sh").read_text(encoding="utf-8")
+    backend_body = script.split("run_backend() {", 1)[1].split("\n}\n", 1)[0]
+    offline_body = ci_gate.split("offline_test_suite() {", 1)[1].split(
+        "\n}", 1
+    )[0]
+
+    assert '"${PYTHON_BIN}" -m pytest tests -q' in backend_body
+    assert 'python -m pytest tests -m "not network"' in offline_body
+
+
 def test_verification_script_opencode_review_fails_without_bridge() -> None:
     script = (ROOT_DIR / "scripts" / "verify-local-quant-workbench.sh").read_text(
         encoding="utf-8"

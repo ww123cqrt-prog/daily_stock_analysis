@@ -23,12 +23,65 @@ const STRATEGY_LABELS: Record<string, { zh: string; en: string }> = {
   combined_risk: { zh: '完整组合风控', en: 'Combined risk control' },
 };
 
-function backtestHref(runId: string | null | undefined, modelId: string, strategyId: string): string {
+function backtestHref(
+  runId: string | null | undefined,
+  modelId: string,
+  strategyId: string,
+  snapshotId?: string,
+): string {
   const params = new URLSearchParams({ tab: 'trained' });
   if (runId) params.set('runId', runId);
   params.set('modelId', modelId);
   params.set('strategyId', strategyId);
+  if (snapshotId) params.set('snapshotId', snapshotId);
   return `/backtest?${params.toString()}`;
+}
+
+type BacktestEligibility = {
+  ready: boolean;
+  reasons: string[];
+};
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
+function hasReplayArtifacts(artifacts?: Record<string, string>): boolean {
+  return Boolean(
+    artifacts
+    && SHA256_PATTERN.test(artifacts['pred.pkl'] || '')
+    && SHA256_PATTERN.test(artifacts['label.pkl'] || ''),
+  );
+}
+
+function hasSnapshot(identity?: ResearchTrainingResult['providerIdentity']): boolean {
+  return Boolean(
+    identity?.providerContract === 'immutable_snapshot_v2'
+    && identity.datasetId
+    && identity.snapshotId
+    && SHA256_PATTERN.test(identity.manifestSha256 || '')
+    && SHA256_PATTERN.test(identity.contentSha256 || ''),
+  );
+}
+
+function eligibility(
+  input: {
+    dryRun?: boolean;
+    runId?: string | null;
+    experimentId?: string | null;
+    artifacts?: Record<string, string>;
+    providerIdentity?: ResearchTrainingResult['providerIdentity'];
+    strategyConfigReady: boolean;
+  },
+  language: 'zh' | 'en',
+): BacktestEligibility {
+  const zh = language === 'zh';
+  const reasons: string[] = [];
+  if (input.dryRun) reasons.push(zh ? '测试式训练没有真实训练产物' : 'Synthetic preview has no real training artifacts');
+  if (!input.runId) reasons.push(zh ? '缺少真实 Run ID' : 'Missing real Run ID');
+  if (!input.experimentId) reasons.push(zh ? '缺少实验 ID' : 'Missing experiment ID');
+  if (!hasReplayArtifacts(input.artifacts)) reasons.push(zh ? '缺少可重放的预测和标签' : 'Missing replayable predictions and labels');
+  if (!hasSnapshot(input.providerIdentity)) reasons.push(zh ? '缺少不可变数据快照' : 'Missing immutable data snapshot');
+  if (!input.strategyConfigReady) reasons.push(zh ? '缺少交易策略配置' : 'Missing trading-strategy configuration');
+  return { ready: reasons.length === 0, reasons };
 }
 
 function percent(value?: number | null): string {
@@ -50,7 +103,7 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
   const selected = candidatePipeline?.selectedCombination ?? candidatePipeline?.partialDevelopmentLeader;
   const baselineName = latestTraining?.experimentName || (zh ? 'Qlib 单一选股模型基线' : 'Qlib single stock-selection model baseline');
   const baselineStrategy = zh ? '每日 TopK 等权基线' : 'Daily equal-weight TopK baseline';
-  const hasBaselineResult = Boolean(latestTraining?.runId || latestTraining?.experimentName);
+  const hasBaselineResult = Boolean(latestTraining);
   const hasResults = hasBaselineResult || strategyRows.length > 0;
   const latestTrainingNotice = providerStatusNotice(latestTraining, 'training', language);
   const candidateNotice = providerStatusNotice(candidatePipeline, 'candidate', language);
@@ -93,6 +146,18 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
         </div>
       ) : null}
 
+      {candidatePipeline?.dryRun ? (
+        <div className="border-b border-border/70 p-4">
+          <InlineAlert
+            variant="warning"
+            title={zh ? '测试数据，不可用于研究或交易' : 'Test data, not for research or trading'}
+            message={zh
+              ? '这是合成小样本预演，没有真实 Run ID、预测产物或 MLflow 训练记录。'
+              : 'This synthetic preview has no real Run ID, prediction artifacts, or MLflow training record.'}
+          />
+        </div>
+      ) : null}
+
       {hasResults ? (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[780px] text-left text-sm">
@@ -108,6 +173,15 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
             </thead>
             <tbody className="divide-y divide-border/60">
               {hasBaselineResult ? (
+                (() => {
+                  const resultEligibility = eligibility({
+                    runId: latestTraining?.runId,
+                    experimentId: latestTraining?.experimentId,
+                    artifacts: latestTraining?.artifactSha256,
+                    providerIdentity: latestTraining?.providerIdentity,
+                    strategyConfigReady: true,
+                  }, language);
+                  return (
                 <tr className="hover:bg-hover/45">
                   <td className="px-4 py-3 font-medium text-foreground">{baselineName}</td>
                   <td className="px-4 py-3 text-secondary-text">
@@ -122,21 +196,47 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
                   <td className="px-4 py-3 font-mono text-muted-text">-</td>
                   <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">{latestTraining?.runId || '-'}</td>
                   <td className="px-4 py-3 text-right">
-                    <Link
-                      to={backtestHref(latestTraining?.runId, 'latest', 'baseline_daily')}
-                      className="btn-secondary h-8 gap-1.5 px-2.5 text-xs"
-                      aria-label={`${zh ? '回测' : 'Backtest'} ${baselineName} ${baselineStrategy}`}
-                    >
-                      <BarChart3 className="h-3.5 w-3.5" />
-                      {zh ? '回测' : 'Backtest'}
-                    </Link>
+                    {resultEligibility.ready ? (
+                      <Link
+                        to={backtestHref(
+                          latestTraining?.runId,
+                          'latest',
+                          'baseline_daily',
+                          latestTraining?.providerIdentity?.snapshotId,
+                        )}
+                        className="btn-secondary h-8 gap-1.5 px-2.5 text-xs"
+                        aria-label={`${zh ? '回测' : 'Backtest'} ${baselineName} ${baselineStrategy}`}
+                      >
+                        <BarChart3 className="h-3.5 w-3.5" />
+                        {zh ? '回测' : 'Backtest'}
+                      </Link>
+                    ) : (
+                      <div className="flex flex-col items-end gap-1">
+                        <a href="#recent-quant-jobs" className="text-xs font-medium text-cyan hover:underline">
+                          {zh ? '查看测试结果' : 'View test result'}
+                        </a>
+                        <span className="max-w-56 text-right text-[11px] leading-4 text-muted-text">
+                          {resultEligibility.reasons.join(zh ? '；' : '; ')}
+                        </span>
+                      </div>
+                    )}
                   </td>
                 </tr>
+                  );
+                })()
               ) : null}
               {strategyRows.map((row) => {
                 const model = models.find((item) => item.id === row.modelId);
                 const label = strategyLabel(row, language);
                 const isSelected = selected?.modelId === row.modelId && selected?.strategyId === row.strategyId;
+                const resultEligibility = eligibility({
+                  dryRun: candidatePipeline?.dryRun,
+                  runId: model?.runId,
+                  experimentId: model?.experimentId,
+                  artifacts: model?.artifactSha256,
+                  providerIdentity: candidatePipeline?.providerIdentity,
+                  strategyConfigReady: Boolean(row.strategyConfig),
+                }, language);
                 return (
                   <tr key={`${row.modelId}-${row.strategyId}`} className="hover:bg-hover/45">
                     <td className="px-4 py-3 font-medium text-foreground">{model?.label || row.modelId}</td>
@@ -155,14 +255,32 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
                     <td className="px-4 py-3 font-mono text-foreground">{percent(row.holdout?.annualExcessReturn)}</td>
                     <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">{model?.runId || '-'}</td>
                     <td className="px-4 py-3 text-right">
-                      <Link
-                        to={backtestHref(model?.runId, row.modelId, row.strategyId)}
-                        className="btn-secondary h-8 gap-1.5 px-2.5 text-xs"
-                        aria-label={`${zh ? '回测' : 'Backtest'} ${model?.label || row.modelId} ${label}`}
-                      >
-                        <BarChart3 className="h-3.5 w-3.5" />
-                        {zh ? '回测' : 'Backtest'}
-                      </Link>
+                      {resultEligibility.ready ? (
+                        <Link
+                          to={backtestHref(
+                            model?.runId,
+                            row.modelId,
+                            row.strategyId,
+                            candidatePipeline?.providerIdentity?.snapshotId,
+                          )}
+                          className="btn-secondary h-8 gap-1.5 px-2.5 text-xs"
+                          aria-label={`${zh ? '回测' : 'Backtest'} ${model?.label || row.modelId} ${label}`}
+                        >
+                          <BarChart3 className="h-3.5 w-3.5" />
+                          {zh ? '回测' : 'Backtest'}
+                        </Link>
+                      ) : (
+                        <div className="flex flex-col items-end gap-1">
+                          <a href="#recent-quant-jobs" className="text-xs font-medium text-cyan hover:underline">
+                            {candidatePipeline?.dryRun
+                              ? (zh ? '查看测试结果' : 'View test result')
+                              : (zh ? '查看结果' : 'View result')}
+                          </a>
+                          <span className="max-w-56 text-right text-[11px] leading-4 text-muted-text">
+                            {resultEligibility.reasons.join(zh ? '；' : '; ')}
+                          </span>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 );

@@ -1,10 +1,12 @@
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -30,6 +32,14 @@ def prediction_frame(start: str, periods: int = 5, instruments: int = 6) -> tupl
     score = np.tile(np.arange(instruments, dtype=float), periods)
     label = score * 0.001
     return pd.DataFrame({"score": score}, index=index), pd.DataFrame({"label": label}, index=index)
+
+
+def benchmark_frame(dates: pd.DatetimeIndex, close: list[float]) -> pd.DataFrame:
+    index = pd.MultiIndex.from_product(
+        [["SH000300"], dates],
+        names=["instrument", "datetime"],
+    )
+    return pd.DataFrame({"$close": close}, index=index)
 
 
 class CandidatePipelineTest(unittest.TestCase):
@@ -104,6 +114,10 @@ class CandidatePipelineTest(unittest.TestCase):
 
         self.assertNotIn("--provider-uri", command)
         self.assertIn("--no-publish-latest", command)
+        self.assertEqual(
+            command[command.index("--result-scope") + 1],
+            "candidate_child",
+        )
         self.assertEqual(
             Path(command[command.index("--result-output") + 1]),
             result_output,
@@ -230,7 +244,11 @@ class CandidatePipelineTest(unittest.TestCase):
                     module,
                     "validate_file_store_run_artifact",
                     side_effect=[
-                        {"artifact_sha256": "a" * 64},
+                        {
+                            "artifact_sha256": module.hashlib.sha256(
+                                b"prediction"
+                            ).hexdigest()
+                        },
                         module.RunProvenanceError("label hash mismatch"),
                     ],
                 ) as validate,
@@ -274,8 +292,18 @@ class CandidatePipelineTest(unittest.TestCase):
                     module,
                     "validate_file_store_run_artifact",
                     side_effect=[
-                        {"provider_identity": expected, "artifact_sha256": "c" * 64},
-                        {"provider_identity": mismatched, "artifact_sha256": "d" * 64},
+                        {
+                            "provider_identity": expected,
+                            "artifact_sha256": module.hashlib.sha256(
+                                b"prediction"
+                            ).hexdigest(),
+                        },
+                        {
+                            "provider_identity": mismatched,
+                            "artifact_sha256": module.hashlib.sha256(
+                                b"label"
+                            ).hexdigest(),
+                        },
                     ],
                 ),
                 patch.object(
@@ -293,6 +321,54 @@ class CandidatePipelineTest(unittest.TestCase):
                 )
 
         read_pickle.assert_not_called()
+
+    def test_candidate_deserializes_the_exact_bytes_bound_to_the_validated_hash(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mlruns = root / "mlruns"
+            artifacts = mlruns / "123" / "safe_run" / "artifacts"
+            artifacts.mkdir(parents=True)
+            original_pred, original_label = prediction_frame("2025-01-02")
+            replacement_pred = original_pred.assign(score=-999.0)
+            pred_path = artifacts / "pred.pkl"
+            label_path = artifacts / "label.pkl"
+            original_pred.to_pickle(pred_path)
+            original_label.to_pickle(label_path)
+            original_pred_bytes = pred_path.read_bytes()
+            original_label_bytes = label_path.read_bytes()
+            expected = {
+                "provider_contract": "immutable_snapshot_v2",
+                "dataset_id": "qlib_ashare_v2",
+                "snapshot_id": "snapshot",
+                "content_sha256": "a" * 64,
+                "manifest_sha256": "b" * 64,
+            }
+
+            def validate(**kwargs):
+                path = Path(kwargs["artifact_path"])
+                loaded = original_pred_bytes if path.name == "pred.pkl" else original_label_bytes
+                digest = module.hashlib.sha256(loaded).hexdigest()
+                if path.name == "pred.pkl":
+                    replacement_pred.to_pickle(path)
+                return {
+                    "provider_identity": expected,
+                    "provider_path": str(root / "quant_data" / "provider"),
+                    "artifact_sha256": digest,
+                }
+
+            with patch.object(
+                module, "validate_file_store_run_artifact", side_effect=validate
+            ):
+                pred, label = module._load_artifacts(
+                    {"experiment_id": "123", "run_id": "safe_run"},
+                    mlruns_dir=mlruns,
+                    quant_data_root_path=root / "quant_data",
+                    expected_provider_identity=expected,
+                )
+
+        pd.testing.assert_frame_equal(pred, pd.read_pickle(io.BytesIO(original_pred_bytes)))
+        pd.testing.assert_frame_equal(label, original_label)
 
     def test_checked_in_spec_defines_five_distinct_models_and_holdout(self):
         module = load_module()
@@ -442,7 +518,57 @@ class CandidatePipelineTest(unittest.TestCase):
         self.assertTrue(pd.isna(result.iloc[2]))
         self.assertTrue(pd.isna(result.iloc[3]))
 
-    def test_dry_run_writes_five_models_ten_strategy_rows_and_latest_alias(self):
+    def test_market_risk_features_do_not_use_future_benchmark_prices(self):
+        module = load_module()
+        dates = pd.bdate_range("2025-01-02", periods=180)
+        close = [100.0 + index + ((index % 7) - 3) * 0.1 for index in range(len(dates))]
+        changed_future = close.copy()
+        changed_future[-2] = close[-2] * 1.5
+        changed_future[-1] = close[-1] * 0.7
+        frames = iter(
+            [
+                benchmark_frame(dates, close),
+                benchmark_frame(dates, changed_future),
+            ]
+        )
+        fake_qlib = ModuleType("qlib")
+        fake_qlib.__path__ = []
+        fake_qlib.init = lambda **_: None
+        fake_qlib_data = ModuleType("qlib.data")
+        fake_qlib_data.D = SimpleNamespace(
+            features=lambda *_args, **_kwargs: next(frames)
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {"qlib": fake_qlib, "qlib.data": fake_qlib_data},
+        ):
+            original = module.load_market_data(
+                Path("/unused/provider"),
+                str(dates[0].date()),
+                str(dates[-1].date()),
+            )
+            altered = module.load_market_data(
+                Path("/unused/provider"),
+                str(dates[0].date()),
+                str(dates[-1].date()),
+            )
+
+        decision_day = dates[-3]
+        self.assertNotAlmostEqual(
+            original.loc[decision_day, "benchmark_return"],
+            altered.loc[decision_day, "benchmark_return"],
+        )
+        self.assertAlmostEqual(
+            original.loc[decision_day, "volatility_20"],
+            altered.loc[decision_day, "volatility_20"],
+        )
+        self.assertAlmostEqual(
+            original.loc[decision_day, "vol_percentile"],
+            altered.loc[decision_day, "vol_percentile"],
+        )
+
+    def test_dry_run_writes_five_models_to_isolated_test_namespace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir) / "reports"
             result = subprocess.run(
@@ -461,23 +587,76 @@ class CandidatePipelineTest(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            report = json.loads((out_dir / "candidate_pipeline_latest.json").read_text(encoding="utf-8"))
-            timestamped = out_dir / "candidate_pipeline_20260715_170000.json"
-            markdown = (out_dir / "candidate_pipeline_latest.md").read_text(encoding="utf-8")
+            test_dir = out_dir / "test_runs" / "candidate_pipeline"
+            report = json.loads(
+                (test_dir / "candidate_pipeline_test_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            timestamped = test_dir / "candidate_pipeline_test_20260715_170000.json"
+            markdown = (
+                test_dir / "candidate_pipeline_test_latest.md"
+            ).read_text(encoding="utf-8")
+            progress = json.loads(
+                (test_dir / "candidate_pipeline_test_progress_latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertTrue(timestamped.exists())
+            self.assertFalse((out_dir / "candidate_pipeline_latest.json").exists())
+            self.assertFalse((out_dir / "candidate_pipeline_latest.md").exists())
+            self.assertFalse(
+                (out_dir / "candidate_pipeline_progress_latest.json").exists()
+            )
 
         self.assertEqual(report["status"], "completed")
         self.assertTrue(report["dry_run"])
         self.assertEqual(len(report["models"]), 5)
         self.assertEqual(len(report["selected_models"]), 2)
         self.assertEqual(len(report["strategy_evaluations"]), 10)
+        self.assertTrue(
+            all(row.get("strategy_config") for row in report["strategy_evaluations"])
+        )
+        self.assertTrue(
+            all(
+                model["backtest_eligibility"]["eligible"] is False
+                and "run_id" in model["backtest_eligibility"]["missing"]
+                for model in report["models"]
+            )
+        )
         self.assertEqual(report["selection_basis"], "selection_period_only")
+        self.assertEqual(report["backtest_contract"]["contract_version"], 2)
+        self.assertEqual(
+            report["backtest_contract"]["replay_engine"],
+            "dsa_optimized_strategy",
+        )
+        self.assertEqual(
+            report["backtest_contract"]["replay_capability"],
+            "custom_only",
+        )
+        self.assertEqual(report["backtest_contract"]["exact_strategy_ids"], [])
+        self.assertEqual(
+            report["backtest_contract"]["original_parameters"],
+            {
+                "start_date": report["periods"]["selection"][0],
+                "end_date": report["periods"]["selection"][1],
+                "topk": 50,
+                "cost_bps": 15.0,
+            },
+        )
+        self.assertRegex(
+            report["backtest_contract"]["config_hash"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertEqual(
             report["provider_identity"]["provider_contract"],
             "path_only_override",
         )
         self.assertFalse(report["experiment_notebook_appended"])
         self.assertIn("candidate", report["experiment_notebook_policy"])
+        self.assertEqual(progress["stage"], "completed")
+        self.assertTrue(progress["dry_run"])
+        self.assertIn("测试数据，不可用于研究或交易", markdown)
         self.assertIn("不自动下单", markdown)
         self.assertIn("2026 留出期不参与挑选", markdown)
 

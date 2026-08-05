@@ -254,17 +254,16 @@ def generate_report(data_dir: Path, out_dir: Path, lookback_days: int = 252, min
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data-dir", type=Path, default=MERGED_DIR or ashare_qfq_bars_dir()
-    )
+    parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--lookback-days", type=int, default=252)
     parser.add_argument("--min-symbols", type=int, default=100)
     parser.add_argument("--limit", type=int, default=0, help="Optional symbol limit for smoke runs; 0 means all symbols.")
     args = parser.parse_args()
+    data_dir = args.data_dir or MERGED_DIR or ashare_qfq_bars_dir()
 
     payload = generate_report(
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         out_dir=args.out_dir,
         lookback_days=args.lookback_days,
         min_symbols=args.min_symbols,

@@ -536,7 +536,7 @@ def main() -> int:
     parser.add_argument(
         "--market-data-dir",
         type=Path,
-        default=MERGED_DIR or ashare_qfq_bars_dir(),
+        default=None,
     )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--lookback-days", type=int, default=60)
@@ -545,6 +545,7 @@ def main() -> int:
     parser.add_argument("--return-column", default="return")
     parser.add_argument("--trading-days-per-year", type=int, default=DEFAULT_TRADING_DAYS_PER_YEAR)
     args = parser.parse_args()
+    market_data_dir = args.market_data_dir or MERGED_DIR or ashare_qfq_bars_dir()
 
     latest_training = _read_json_object(args.latest_training) or {}
     run_id = _safe_run_id(args.run_id or latest_training.get("run_id"))
@@ -567,7 +568,7 @@ def main() -> int:
         portfolio_report = args.out_dir / "missing_report_normal_1day.pkl"
     payload = generate_report(
         portfolio_report_path=portfolio_report,
-        market_data_dir=args.market_data_dir,
+        market_data_dir=market_data_dir,
         out_dir=args.out_dir,
         lookback_days=args.lookback_days,
         min_symbols=args.min_symbols,

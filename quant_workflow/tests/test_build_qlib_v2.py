@@ -113,6 +113,7 @@ def write_benchmark_provider(
     source_snapshot: dict[str, str],
     calendar: tuple[str, ...] = ("2026-07-23", "2026-07-24"),
     missing: tuple[str, str, str] | None = None,
+    invalid_ohlc: tuple[str, str] | None = None,
 ) -> Path:
     provider = root / "qlib" / "cn_data_baostock_jqdata"
     (provider / "calendars").mkdir(parents=True)
@@ -139,6 +140,8 @@ def write_benchmark_provider(
                 )
             if missing == (symbol, field, calendar[-1]):
                 values[-1] = np.nan
+            if invalid_ohlc == (symbol, calendar[-1]) and field == "low":
+                values[-1] += 5.0
             np.concatenate((np.array([0.0], dtype="<f4"), values)).tofile(
                 feature_dir / f"{field}.day.bin"
             )
@@ -258,7 +261,7 @@ def test_build_and_publish_qlib_v2_tracks_exact_qfq_snapshot(tmp_path: Path) -> 
     assert provider["source_snapshot"]["snapshot_id"] == "qfq-source-001"
     assert provider["producer"] == {
         "script": "build_qlib_v2.py",
-        "version": "8",
+        "version": "9",
     }
     assert (published / "features" / "sh600000" / "close.day.bin").is_file()
     assert resolved.manifest["benchmark_complete"] is True
@@ -326,6 +329,28 @@ def test_build_rejects_benchmark_provider_with_different_calendar(tmp_path: Path
         )
 
 
+def test_explicit_build_rejects_invalid_benchmark_ohlc(tmp_path: Path) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    provider = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+        invalid_ohlc=("SH000300", "2026-07-24"),
+    )
+
+    with pytest.raises(
+        module.DataContractError,
+        match=r"SH000300.*OHLC.*2026-07-24",
+    ):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            benchmark_provider=provider,
+            benchmark_source=benchmark_source_evidence(root),
+        )
+
+
 def test_default_build_regenerates_benchmarks_when_compatibility_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -363,6 +388,87 @@ def test_default_build_regenerates_benchmarks_when_compatibility_is_stale(
     for symbol in BENCHMARK_SYMBOLS:
         assert evidence["symbols"][symbol]["coverage"]["end"] == "2026-07-24"
         assert (snapshot / "features" / symbol.lower() / "close.day.bin").is_file()
+
+
+def test_default_build_reconciles_invalid_tencent_ohlc_with_eastmoney(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    stale_source = _qfq_source_contract(contract, root)
+    stale_source["snapshot_id"] = "older-qfq-snapshot"
+    write_benchmark_provider(root, source_snapshot=stale_source)
+
+    tencent_frames = tencent_benchmark_frames()
+    for frame in tencent_frames.values():
+        frame.loc["2026-07-24", "low"] = frame.loc["2026-07-24", "high"] + 5.0
+    eastmoney_frames = tencent_benchmark_frames()
+    for symbol, frame in eastmoney_frames.items():
+        eastmoney_frames[symbol] = frame.drop(index="2026-07-23")
+    calls: list[str] = []
+
+    def fake_tencent(*_args, **_kwargs):
+        calls.append("tencent")
+        return tencent_frames
+
+    def fake_eastmoney(*_args, **_kwargs):
+        calls.append("eastmoney")
+        return eastmoney_frames
+
+    monkeypatch.setattr(module, "download_tencent_benchmarks", fake_tencent)
+    monkeypatch.setattr(
+        module,
+        "download_eastmoney_benchmarks",
+        fake_eastmoney,
+        raising=False,
+    )
+
+    snapshot = module.build_qlib_v2(quant_data_root=root)
+    manifest = json.loads(
+        (snapshot / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    source = manifest["benchmarks"]["source"]
+    evidence = json.loads((root / source["evidence_path"]).read_text(encoding="utf-8"))
+
+    assert calls == ["tencent", "eastmoney"]
+    assert source["provider"] == "tencent+eastmoney"
+    assert source["source_dataset_id"] == "tencent_eastmoney_reconciled_index_daily"
+    assert evidence["source_attempts"] == [
+        {
+            "provider": "tencent",
+            "status": "requires_correction",
+            "reason": "SH000300 benchmark OHLC relationship is invalid on 2026-07-24",
+        },
+        {"provider": "eastmoney", "status": "correction_source"},
+    ]
+    assert evidence["corrections"] == [
+        {
+            "date": "2026-07-24",
+            "fields": ["open", "high", "low", "close", "volume"],
+            "source": "eastmoney",
+            "symbol": symbol,
+        }
+        for symbol in BENCHMARK_SYMBOLS
+    ]
+    for symbol in BENCHMARK_SYMBOLS:
+        inputs = evidence["symbols"][symbol]["input_artifacts"]
+        assert set(inputs) == {"tencent", "eastmoney"}
+        for input_evidence in inputs.values():
+            input_path = root / input_evidence["raw_path"]
+            assert input_path.is_file()
+            assert input_evidence["raw_sha256"] == module.sha256_file(input_path)
+        raw = np.fromfile(
+            snapshot / "features" / symbol.lower() / "low.day.bin", dtype="<f4"
+        )
+        np.testing.assert_allclose(
+            raw[1:],
+            eastmoney_frames[symbol]["low"]
+            .reindex(["2026-07-23", "2026-07-24"])
+            .fillna(tencent_frames[symbol]["low"])
+            .to_numpy(dtype=float),
+        )
 
 
 def test_default_rebuild_reuses_current_native_benchmarks_without_compatibility(
@@ -611,6 +717,60 @@ def test_failed_rebuild_keeps_published_native_pointer_unchanged(tmp_path: Path)
         )
 
     assert pointer.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure_stage", ["conversion", "benchmark", "publication"])
+def test_failed_build_removes_only_its_staging_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    root = tmp_path / "quant_data"
+    publish_qfq_fixture(root)
+    module = load_script("build_qlib_v2")
+    contract = load_script("quant_data_contract")
+    provider = write_benchmark_provider(
+        root,
+        source_snapshot=_qfq_source_contract(contract, root),
+    )
+    unrelated = root / "staging" / "keep-this-run" / "artifact.bin"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(b"keep")
+
+    if failure_stage == "conversion":
+        def fail_conversion(_source, target, **_kwargs):
+            Path(target).mkdir(parents=True, exist_ok=True)
+            (Path(target) / "partial.bin").write_bytes(b"partial")
+            raise RuntimeError("injected conversion failure")
+
+        monkeypatch.setattr(module, "convert_to_bin", fail_conversion)
+    elif failure_stage == "benchmark":
+        monkeypatch.setattr(
+            module,
+            "_import_benchmarks",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected benchmark failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            module,
+            "publish_qlib_snapshot",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected publication failure")
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+        module.build_qlib_v2(
+            quant_data_root=root,
+            publish=True,
+            benchmark_provider=provider,
+            benchmark_source=benchmark_source_evidence(root),
+        )
+
+    assert unrelated.read_bytes() == b"keep"
+    assert list((root / "staging").glob("qlib-v2-*")) == []
 
 
 @pytest.mark.parametrize("failure", ["missing", "hash_mismatch"])

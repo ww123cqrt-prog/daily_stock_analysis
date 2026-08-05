@@ -14,23 +14,34 @@ import {
   History,
   ListChecks,
   Loader2,
+  Pause,
   Play,
   RefreshCw,
   RotateCw,
   TerminalSquare,
 } from 'lucide-react';
-import { Badge, Card, InlineAlert, StatusDot } from '../components/common';
+import { Badge, Card, ConfirmDialog, InlineAlert, StatusDot } from '../components/common';
 import TrainingResultsPanel from '../components/workflow/TrainingResultsPanel';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { getParsedApiError } from '../api/error';
-import { parseQuantJobStreamEvent, quantApi, type QuantJob, type QuantJobTypeInfo, type QuantStatus } from '../api/quant';
+import {
+  parseQuantJobStreamEvent,
+  QUANT_API_CONTRACT_VERSION,
+  quantApi,
+  type QuantApiContract,
+  type QuantJob,
+  type QuantJobTypeInfo,
+  type QuantStatus,
+} from '../api/quant';
 import { researchApi, type ResearchStatus } from '../api/research';
+import { WEB_BUILD_INFO } from '../utils/constants';
 import { resolveMlflowUiUrl } from '../utils/mlflowUiUrl';
 
 type WorkflowJob = {
   type: string;
   label: string;
   description: string;
+  testOnly?: boolean;
   defaultParams?: Record<string, unknown>;
   params?: WorkflowParamField[];
 };
@@ -86,6 +97,12 @@ type DailyGuideAction =
 
 const STREAM_RECONNECT_INITIAL_DELAY_MS = 1000;
 const STREAM_RECONNECT_MAX_DELAY_MS = 15000;
+const ROBUST_RUNNER_DISCOVERY_DELAY_MS = 1500;
+const ROBUST_RUNNER_POLL_INTERVAL_MS = 3000;
+const DURABLE_ROBUST_JOB_TYPES = new Set([
+  'run_robust_signal_research',
+  'resume_robust_signal_research',
+]);
 const RECENT_JOB_LIMIT = 30;
 const WORKFLOW_INPUT_CLASS =
   'input-surface input-focus-glow h-9 w-full rounded-lg border bg-transparent px-2.5 text-xs transition-all focus:outline-none';
@@ -298,6 +315,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         description: '只检查保留的旧兼容目录；原生 V2 已在构建时包含三个指数。',
       },
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
+      {
+        type: 'prepare_robust_signal_data',
+        label: '验收并准备鲁棒 CSI800 数据',
+        description: '用当前 cleaned Qlib V2、历史时点 CSI800 成员区间和当前数据清单构建不可变研究 provider；数据清单变化后必须重新运行。',
+      },
     ],
   },
   {
@@ -374,6 +396,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         type: 'train_baseline_lgb',
         label: '训练 Qlib LightGBM 选股模型基线',
         description: '执行 Qlib 选股模型训练和默认交易策略回测，写入最新训练摘要。',
+        defaultParams: { provider: 'canonical' },
         params: [
           {
             key: 'provider',
@@ -386,6 +409,24 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           },
           { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
           { key: 'experiment_name', label: '实验名称', kind: 'text', placeholder: 'baseline_lgb_alpha158' },
+        ],
+      },
+      {
+        type: 'train_baseline_lgb_equivalence',
+        label: '运行真实 LightGBM 网页等价验收',
+        description: '真实训练使用服务器固定短周期配置和专用 MLflow 实验；测试结果不会进入正式候选、最新结果或普通回测列表。',
+        testOnly: true,
+        defaultParams: { provider: 'canonical' },
+        params: [
+          {
+            key: 'provider',
+            label: '数据版本',
+            kind: 'select',
+            options: [
+              { value: 'canonical', label: '原生 V2（正式数据快照）' },
+              { value: 'cleaned', label: '原生 cleaned V2（验收数据快照）' },
+            ],
+          },
         ],
       },
       {
@@ -557,23 +598,116 @@ const DATA_JOB_TYPES = new Set([
   'validate_latest_snapshot',
   'report_data_hygiene',
   'apply_data_cleaning',
+  'prepare_robust_signal_data',
 ]);
 
-const TRAINING_JOB_TYPES = new Set([
+const PROVIDER_TRAINING_JOB_TYPES = new Set([
   'train_baseline_lgb',
+  'train_baseline_lgb_equivalence',
   'run_candidate_pipeline',
 ]);
 
+const ROBUST_SIGNAL_JOB_TYPES = new Set([
+  'preview_robust_signal_plan',
+  'run_robust_signal_research',
+  'pause_robust_signal_research',
+  'resume_robust_signal_research',
+]);
+
+const TRAINING_JOB_TYPES = new Set([
+  ...PROVIDER_TRAINING_JOB_TYPES,
+  ...ROBUST_SIGNAL_JOB_TYPES,
+]);
+
+const ROBUST_SIGNAL_JOBS: WorkflowJob[] = [
+  {
+    type: 'preview_robust_signal_plan',
+    label: '预览鲁棒选股信号研究计划',
+    description: '只生成任务数量、时间范围和配置指纹，不启动训练。',
+  },
+  {
+    type: 'run_robust_signal_research',
+    label: '启动鲁棒选股信号研究',
+    description: '运行单季度测试或正式鲁棒信号研究。',
+  },
+  {
+    type: 'pause_robust_signal_research',
+    label: '完成当前子任务后暂停',
+    description: '请求运行器在当前原子任务保存完成后协作式暂停。',
+  },
+  {
+    type: 'resume_robust_signal_research',
+    label: '恢复鲁棒选股信号研究',
+    description: '校验原检查点上下文后恢复同一个研究 Run。',
+  },
+];
+
 function isTrainingDryRun(jobType: string, params: Record<string, unknown>): boolean {
-  return jobType === 'run_candidate_pipeline' && params.dry_run === true;
+  return (jobType === 'run_candidate_pipeline' && params.dry_run === true)
+    || (jobType === 'run_robust_signal_research' && params.smoke === true);
 }
 
 function isFormalTrainingBlocked(
   jobType: string,
   params: Record<string, unknown>,
-  trainable: boolean | undefined,
+  status: ResearchStatus | null,
 ): boolean {
-  return TRAINING_JOB_TYPES.has(jobType) && !isTrainingDryRun(jobType, params) && trainable !== true;
+  if (jobType === 'run_robust_signal_research' || jobType === 'resume_robust_signal_research') {
+    return status?.robustSignal?.dataReadiness?.trainable !== true
+      || status.robustSignal.dataReadiness.status !== 'ready';
+  }
+  const requiresAcceptance = PROVIDER_TRAINING_JOB_TYPES.has(jobType);
+  return requiresAcceptance
+    && !isTrainingDryRun(jobType, params)
+    && providerTrainingState(status, params).trainable !== true;
+}
+
+function selectedProvider(params: Record<string, unknown>): 'canonical' | 'cleaned' {
+  return params.provider === 'cleaned' ? 'cleaned' : 'canonical';
+}
+
+function providerTrainingState(
+  status: ResearchStatus | null,
+  params: Record<string, unknown>,
+): {
+  provider: 'canonical' | 'cleaned';
+  trainable: boolean;
+  snapshotId?: string;
+  structuralStatus: 'accepted' | 'blocked' | string;
+  calendarEnd?: string;
+  freshnessStatus?: string;
+  calendarAgeDays?: number | null;
+  summary: string;
+} {
+  const provider = selectedProvider(params);
+  const quality = status?.providerQuality?.[provider];
+  if (quality) {
+    return {
+      provider,
+      trainable: quality.trainable === true,
+      snapshotId: quality.snapshotId,
+      structuralStatus: quality.structuralStatus || (quality.trainable ? 'accepted' : 'blocked'),
+      calendarEnd: quality.freshness?.calendarEnd || quality.calendarEnd,
+      freshnessStatus: quality.freshness?.status,
+      calendarAgeDays: quality.freshness?.calendarAgeDays,
+      summary: quality.trainingReadiness?.summary || (quality.trainable ? 'ready' : 'blocked'),
+    };
+  }
+  if (provider === 'canonical') {
+    return {
+      provider,
+      trainable: status?.trainable === true,
+      snapshotId: status?.qlibProvider?.snapshotId,
+      structuralStatus: status?.trainable === true ? 'accepted' : 'blocked',
+      summary: status?.trainingReadiness?.summary || '未找到 canonical 数据验收结果。',
+    };
+  }
+  return {
+    provider,
+    trainable: false,
+    structuralStatus: 'blocked',
+    summary: '未找到 cleaned 数据验收结果。请先运行正式全量数据质量报告。',
+  };
 }
 
 function surfaceForJob(jobType: string): Exclude<QuantTaskSurface, 'all'> {
@@ -644,7 +778,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
 }
 
 const WORKFLOW_JOBS_BY_TYPE = Object.fromEntries(
-  WORKFLOW_STEPS.flatMap((step) => step.jobs).map((job) => [job.type, job]),
+  [...WORKFLOW_STEPS.flatMap((step) => step.jobs), ...ROBUST_SIGNAL_JOBS]
+    .map((job) => [job.type, job]),
 );
 
 function displayQuantJobLabel(job: Pick<QuantJob, 'jobType' | 'label'>): string {
@@ -732,6 +867,17 @@ function formatNumber(value?: number): string {
   return new Intl.NumberFormat('zh-CN').format(value);
 }
 
+function formatDuration(seconds?: number | null): string {
+  if (seconds === undefined || seconds === null || !Number.isFinite(seconds)) return '-';
+  const bounded = Math.max(0, Math.round(seconds));
+  if (bounded < 60) return `${bounded}秒`;
+  const minutes = Math.floor(bounded / 60);
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}小时${remainingMinutes}分钟` : `${hours}小时`;
+}
+
 function artifactFileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
@@ -814,11 +960,22 @@ function mergeAuthoritativeMonitoringSnapshot(
 }
 
 function activeJobCount(jobs: QuantJob[]): number {
-  return jobs.filter((job) => job.status === 'pending' || job.status === 'running').length;
+  return jobs.filter(isActiveJob).length;
 }
 
 function isActiveJob(job?: QuantJob): boolean {
-  return job?.status === 'pending' || job?.status === 'running';
+  return Boolean(
+    job
+    && (
+      job.canCancel === true
+      || job.status === 'pending'
+      || job.status === 'running'
+    )
+  );
+}
+
+function isCancelableJob(job?: QuantJob): boolean {
+  return job?.canCancel ?? isActiveJob(job);
 }
 
 function quantStatusWithJobs(
@@ -849,7 +1006,7 @@ function quantStatusWithJobs(
 }
 
 function isDoneJob(job?: QuantJob): boolean {
-  return job?.status === 'completed';
+  return job?.status === 'completed' && !isActiveJob(job);
 }
 
 function latestJobForTypes(latestJobs: Record<string, QuantJob>, jobTypes: string[]): QuantJob | undefined {
@@ -867,8 +1024,11 @@ function jobDrivenStatus(
   if (!job) {
     return { status: fallbackStatus, statusLabel: fallbackLabel, statusTone: fallbackStatus === 'waiting' ? 'neutral' : 'info' };
   }
-  if (job.status === 'running' || job.status === 'pending') {
-    return { status: 'running', statusLabel: '运行中', statusTone: 'info', meta: formatTime(job.updatedAt) };
+  if (isActiveJob(job)) {
+    const statusLabel = job.status === 'running' || job.status === 'pending'
+      ? '运行中'
+      : '后台仍运行';
+    return { status: 'running', statusLabel, statusTone: 'info', meta: formatTime(job.updatedAt) };
   }
   if (job.status === 'failed') {
     return { status: 'failed', statusLabel: '失败', statusTone: 'danger', meta: job.error || formatTime(job.updatedAt) };
@@ -1032,6 +1192,83 @@ function workflowErrorMessage(err: unknown): string {
   return parsed.message || parsed.rawMessage || '请求未成功完成，请稍后重试。';
 }
 
+function backendCompatibilityMessage(
+  contract: QuantApiContract | null,
+  statusContract: QuantApiContract | undefined,
+  loadError: string | null,
+): string | null {
+  if (loadError) {
+    return `后端版本过旧或尚未重启，任务目录接口不可用。请重启 DSA 后端后重试。接口错误：${loadError}`;
+  }
+  if (!contract?.version) {
+    return '后端版本过旧或尚未重启，任务目录没有返回版本契约。请重启 DSA 后端后重试。';
+  }
+  if (contract.version !== QUANT_API_CONTRACT_VERSION) {
+    return `后端版本过旧或尚未重启。网页要求 ${QUANT_API_CONTRACT_VERSION}，后端返回 ${contract.version}。请重启 DSA 后端后重试。`;
+  }
+  if (statusContract?.version && statusContract.version !== contract.version) {
+    return '后端接口返回了不一致的版本契约，可能仍有旧服务残留。请重启 DSA 后端后重试。';
+  }
+  if (
+    statusContract?.backendBuildId
+    && contract.backendBuildId
+    && statusContract.backendBuildId !== contract.backendBuildId
+  ) {
+    return '量化状态和任务目录来自不同的后端构建，可能仍有旧服务残留。请重启 DSA 后端后重试。';
+  }
+  return null;
+}
+
+function providerFreshnessText(
+  state: ReturnType<typeof providerTrainingState>,
+  language: 'zh' | 'en',
+): string {
+  const structural = state.structuralStatus === 'accepted'
+    ? (language === 'zh' ? '通过' : 'accepted')
+    : (language === 'zh' ? '阻塞' : 'blocked');
+  const prefix = language === 'zh' ? `结构验收：${structural}` : `Structural acceptance: ${structural}`;
+  if (!state.calendarEnd) {
+    return `${prefix} · ${language === 'zh' ? '行情截止日期未知' : 'market calendar cutoff unknown'}`;
+  }
+  if (state.freshnessStatus === 'stale' && typeof state.calendarAgeDays === 'number') {
+    return `${prefix} · ${language === 'zh'
+      ? `行情截止 ${state.calendarEnd} · 已落后 ${state.calendarAgeDays} 天，建议更新，不阻断训练`
+      : `market calendar through ${state.calendarEnd} · ${state.calendarAgeDays} days old; update recommended, training remains allowed`}`;
+  }
+  if (state.freshnessStatus === 'future') {
+    return `${prefix} · ${language === 'zh'
+      ? `行情截止 ${state.calendarEnd} · 日期晚于本机日期，请核对数据和时钟`
+      : `market calendar through ${state.calendarEnd} · date is ahead of this machine`}`;
+  }
+  return `${prefix} · ${language === 'zh'
+    ? `行情截止 ${state.calendarEnd}`
+    : `market calendar through ${state.calendarEnd}`}`;
+}
+
+function localizedTrainingReadinessSummary(
+  summary: string | undefined,
+  language: 'zh' | 'en',
+): string {
+  if (!summary || language === 'en') return summary || '';
+
+  const readyPrefix = 'Qlib provider has enough calendar/instrument coverage for the baseline run.';
+  if (!summary.startsWith(readyPrefix)) return summary;
+
+  const ready = 'Qlib 数据快照的交易日和股票覆盖已达到基线训练要求。';
+  const warningText = summary.slice(readyPrefix.length).trim().replace(/^Warnings:\s*/, '');
+  if (!warningText) return ready;
+
+  const warnings = warningText.split(';').map((item) => {
+    const warning = item.trim();
+    const nonPositiveVolume = warning.match(/^(\d+) symbols have non-positive volume rows$/);
+    if (nonPositiveVolume) return `${nonPositiveVolume[1]} 只股票存在非正成交量记录`;
+    const extremeReturn = warning.match(/^(\d+) symbols have absolute daily returns above 50%$/);
+    if (extremeReturn) return `${extremeReturn[1]} 只股票存在单日绝对涨跌幅超过 50% 的记录`;
+    return warning;
+  });
+  return `${ready} 风险提示：${warnings.join('；')}。`;
+}
+
 function getBackendJobInfo(jobTypes: Record<string, QuantJobTypeInfo> | null, jobType: string): {
   catalogLoaded: boolean;
   info?: QuantJobTypeInfo;
@@ -1089,11 +1326,15 @@ const JobStatusBadge: React.FC<{ job?: QuantJob }> = ({ job }) => {
       </Badge>
     );
   }
-  const tone = statusTone(job.status);
+  const active = isActiveJob(job);
+  const tone = active ? 'info' : statusTone(job.status);
+  const label = active && job.status !== 'running' && job.status !== 'pending'
+    ? '后台仍运行'
+    : (STATUS_LABEL[job.status] || job.status);
   return (
     <Badge variant={tone === 'success' ? 'success' : tone === 'danger' ? 'danger' : tone === 'warning' ? 'warning' : 'info'} size="sm" className="gap-1.5 shadow-none">
-      <StatusDot tone={tone} pulse={job.status === 'running'} className="h-1.5 w-1.5" />
-      {STATUS_LABEL[job.status] || job.status}
+      <StatusDot tone={tone} pulse={active} className="h-1.5 w-1.5" />
+      {label}
     </Badge>
   );
 };
@@ -1111,7 +1352,15 @@ const WorkflowParamControls: React.FC<{
     <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
       {fields.map((field) => {
         const ariaLabel = `${job.label} ${field.label}`;
-        const value = values[field.key];
+        const explicitValue = values[field.key];
+        const defaultValue = job.defaultParams?.[field.key];
+        const value = explicitValue !== undefined
+          ? explicitValue
+          : typeof defaultValue === 'boolean'
+            ? defaultValue
+            : typeof defaultValue === 'string' || typeof defaultValue === 'number'
+              ? String(defaultValue)
+              : undefined;
         if (field.kind === 'checkbox') {
           return (
             <label
@@ -1177,17 +1426,23 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [quantStatus, setQuantStatus] = useState<QuantStatus | null>(null);
   const [jobTypes, setJobTypes] = useState<Record<string, QuantJobTypeInfo> | null>(null);
+  const [jobTypesContract, setJobTypesContract] = useState<QuantApiContract | null>(null);
+  const [jobTypesLoadError, setJobTypesLoadError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<QuantJob[]>([]);
   const [jobParams, setJobParams] = useState<JobParamState>({});
-  const [selectedLogJob, setSelectedLogJob] = useState<QuantJob | null>(null);
+  const [selectedLogJobId, setSelectedLogJobId] = useState<string | null>(null);
   const [selectedArtifactName, setSelectedArtifactName] = useState<string | null>(null);
   const [logContent, setLogContent] = useState('');
+  const [logTruncated, setLogTruncated] = useState(false);
+  const [pendingCancelJobId, setPendingCancelJobId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [submittingTypes, setSubmittingTypes] = useState<Record<string, boolean>>({});
   const submittingJobTypesRef = useRef<Set<string>>(new Set());
   const jobsRef = useRef<QuantJob[]>([]);
   const jobStateRevisionRef = useRef(0);
+  const researchStatusRevisionRef = useRef(0);
+  const artifactPreviewRevisionRef = useRef(0);
 
   const applyJobSnapshot = useCallback((
     incomingJobs: QuantJob[],
@@ -1259,6 +1514,14 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     () => surface === 'all' ? jobs : jobs.filter((job) => surfaceForJob(job.jobType) === surface),
     [jobs, surface],
   );
+  const selectedLogJob = useMemo(
+    () => jobs.find((job) => job.jobId === selectedLogJobId) ?? null,
+    [jobs, selectedLogJobId],
+  );
+  const pendingCancelJob = useMemo(
+    () => jobs.find((job) => job.jobId === pendingCancelJobId) ?? null,
+    [jobs, pendingCancelJobId],
+  );
   const copy = surfaceCopy(surface, language);
   const externalServices = quantStatus?.externalServices ?? {};
   const mlflow = externalServices.mlflow ?? quantStatus?.mlflow;
@@ -1310,22 +1573,54 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       trainingReadiness: quantStatus.trainingReadiness || { status: 'unknown', summary: '' },
       dataSources: quantStatus.dataSources,
       qlibProvider: quantStatus.qlibProvider,
+      providerQuality: quantStatus.providerQuality,
       latestTraining: quantStatus.latestTraining,
       cashControlBacktest: quantStatus.cashControlBacktest,
       qlibPredictions: quantStatus.qlibPredictions,
       qlibResearch: quantStatus.qlibResearch,
+      robustStrategy: quantStatus.robustStrategy,
+      robustSignal: quantStatus.robustSignal,
       experimentNotebook: quantStatus.experimentNotebook,
     };
   }, [researchStatus, quantStatus]);
+  const backendCompatibilityIssue = loading
+    ? null
+    : backendCompatibilityMessage(jobTypesContract, quantStatus?.apiContract, jobTypesLoadError);
+  const compatibleJobTypes = backendCompatibilityIssue ? {} : jobTypes;
+
+  const requestResearchStatus = useCallback(async () => {
+    const requestRevision = researchStatusRevisionRef.current + 1;
+    researchStatusRevisionRef.current = requestRevision;
+    try {
+      const nextStatus = await researchApi.getStatus();
+      if (requestRevision === researchStatusRevisionRef.current) {
+        setResearchStatus(nextStatus);
+      }
+    } catch (err: unknown) {
+      if (requestRevision === researchStatusRevisionRef.current) {
+        throw err;
+      }
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
+    setJobTypesLoadError(null);
     const statusRequestRevision = jobStateRevisionRef.current;
     try {
       await Promise.all([
-        quantApi.getJobTypes().then(setJobTypes),
-        researchApi.getStatus().then(setResearchStatus),
-        quantApi.getStatus().then((nextStatus) => {
+        quantApi.getJobTypes()
+          .then((catalog) => {
+            setJobTypes(catalog.availableJobTypes);
+            setJobTypesContract(catalog.apiContract);
+          })
+          .catch((err: unknown) => {
+            setJobTypes({});
+            setJobTypesContract(null);
+            setJobTypesLoadError(workflowErrorMessage(err));
+          }),
+        requestResearchStatus(),
+        quantApi.getStatus({ includeResearch: false }).then((nextStatus) => {
           applyQuantStatusSnapshot(nextStatus, statusRequestRevision);
         }),
         quantApi.listJobs({ limit: RECENT_JOB_LIMIT }).then((nextJobs) => {
@@ -1340,24 +1635,31 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     } finally {
       setLoading(false);
     }
-  }, [applyJobSnapshot, applyQuantStatusSnapshot]);
+  }, [applyJobSnapshot, applyQuantStatusSnapshot, requestResearchStatus]);
 
   const refreshSummary = useCallback(async () => {
     setError(null);
     const statusRequestRevision = jobStateRevisionRef.current;
     try {
-      const [nextResearchStatus, nextQuantStatus] = await Promise.all([
-        researchApi.getStatus(),
-        quantApi.getStatus(),
+      const [, nextQuantStatus] = await Promise.all([
+        requestResearchStatus(),
+        quantApi.getStatus({ includeResearch: false }),
       ]);
-      setResearchStatus(nextResearchStatus);
       applyQuantStatusSnapshot(nextQuantStatus, statusRequestRevision);
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [applyQuantStatusSnapshot]);
+  }, [applyQuantStatusSnapshot, requestResearchStatus]);
+
+  const refreshResearchStatus = useCallback(async () => {
+    try {
+      await requestResearchStatus();
+    } catch (err: unknown) {
+      setError(workflowErrorMessage(err));
+    }
+  }, [requestResearchStatus]);
 
   useEffect(() => {
     document.title = `${copy.title} - DSA`;
@@ -1379,12 +1681,37 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
     let source: EventSource | null = null;
     let reconnectTimer: number | undefined;
+    let runnerRefreshTimer: number | undefined;
     let reconnectDelayMs = STREAM_RECONNECT_INITIAL_DELAY_MS;
     let closed = false;
 
     const handleJobs = (event: MessageEvent) => {
       const nextJobs = parseQuantJobStreamEvent(event.data);
+      const previousById = new Map(jobsRef.current.map((job) => [job.jobId, job]));
+      const reachedTerminalState = nextJobs.some((job) => {
+        const previous = previousById.get(job.jobId);
+        return Boolean(previous && isActiveJob(previous) && !isActiveJob(job));
+      });
+      const durableRunnerLaunched = nextJobs.some((job) => {
+        const previous = previousById.get(job.jobId);
+        return Boolean(
+          previous
+          && isActiveJob(previous)
+          && job.status === 'completed'
+          && DURABLE_ROBUST_JOB_TYPES.has(job.jobType),
+        );
+      });
       applyJobSnapshot(nextJobs, { authoritativeActive: true });
+      if (reachedTerminalState) {
+        void refreshResearchStatus();
+      }
+      if (durableRunnerLaunched) {
+        if (runnerRefreshTimer !== undefined) window.clearTimeout(runnerRefreshTimer);
+        runnerRefreshTimer = window.setTimeout(() => {
+          runnerRefreshTimer = undefined;
+          void refreshResearchStatus();
+        }, ROBUST_RUNNER_DISCOVERY_DELAY_MS);
+      }
     };
 
     const handleStreamEnd = () => {
@@ -1429,11 +1756,12 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     return () => {
       closed = true;
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      if (runnerRefreshTimer !== undefined) window.clearTimeout(runnerRefreshTimer);
       source?.removeEventListener('jobs', handleJobs as EventListener);
       source?.removeEventListener('stream_end', handleStreamEnd as EventListener);
       source?.close();
     };
-  }, [applyJobSnapshot, t]);
+  }, [applyJobSnapshot, refreshResearchStatus, t]);
 
   const updateJobParam = useCallback((jobType: string, key: string, value: JobParamValue) => {
     setJobParams((current) => ({
@@ -1447,20 +1775,21 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
   const submitJob = async (workflowJob: WorkflowJob, explicitParams?: Record<string, unknown>) => {
     const jobType = workflowJob.type;
-    const backendJobInfo = getBackendJobInfo(jobTypes, jobType);
+    const backendJobInfo = getBackendJobInfo(compatibleJobTypes, jobType);
     if (!backendJobInfo.catalogLoaded) {
       setError('任务白名单仍在加载，请稍后再试。');
       return;
     }
     if (!backendJobInfo.isEnabled) {
-      setError(`后端未启用任务：${workflowJob.label}`);
+      setError(backendCompatibilityIssue || `后端未启用任务：${workflowJob.label}`);
       return;
     }
     const params = explicitParams
       ? filterJobParams(explicitParams, backendJobInfo.allowedParamKeys)
       : buildJobParams(workflowJob, jobParams[jobType], backendJobInfo.allowedParamKeys);
-    if (isFormalTrainingBlocked(jobType, params, trainable)) {
-      setError('当前数据没有通过训练检查。请先到“数据更新与检查”页面修复；五个选股模型的小样本预演仍可运行。');
+    if (isFormalTrainingBlocked(jobType, params, workflowStatus)) {
+      const providerState = providerTrainingState(workflowStatus, params);
+      setError(`${providerState.provider} 数据没有通过训练检查：${providerState.summary}`);
       return;
     }
     if (submittingJobTypesRef.current.has(jobType)) {
@@ -1494,42 +1823,230 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     try {
       const cancelled = await quantApi.cancelJob(job.jobId);
       applyJobSnapshot([cancelled]);
+      if (cancelled.status !== 'cancelled' && cancelled.error) {
+        setError(cancelled.error);
+      }
     } catch (err: unknown) {
       setError(workflowErrorMessage(err));
     }
   };
 
-  const openLog = async (job: QuantJob) => {
-    setSelectedLogJob(job);
+  const openLog = (job: QuantJob) => {
+    artifactPreviewRevisionRef.current += 1;
+    setSelectedLogJobId(job.jobId);
     setSelectedArtifactName(null);
     setLogContent('日志加载中...');
+    setLogTruncated(false);
+  };
+
+  const previewArtifact = async (job: QuantJob, artifactIndex: number, path: string) => {
+    const requestRevision = artifactPreviewRevisionRef.current + 1;
+    artifactPreviewRevisionRef.current = requestRevision;
+    setSelectedLogJobId(job.jobId);
+    setSelectedArtifactName(artifactFileName(path));
+    setLogContent('产物加载中...');
+    setLogTruncated(false);
     try {
-      const payload = await quantApi.getJobLog(job.jobId);
-      setLogContent(payload.content || '日志为空。');
+      const content = await quantApi.getJobArtifactText(job.jobId, artifactIndex);
+      if (requestRevision !== artifactPreviewRevisionRef.current) return;
+      setLogContent(content || '产物为空。');
     } catch (err: unknown) {
+      if (requestRevision !== artifactPreviewRevisionRef.current) return;
       setLogContent(workflowErrorMessage(err));
     }
   };
 
-  const previewArtifact = async (job: QuantJob, artifactIndex: number, path: string) => {
-    setSelectedLogJob(job);
-    setSelectedArtifactName(artifactFileName(path));
-    setLogContent('产物加载中...');
-    try {
-      const content = await quantApi.getJobArtifactText(job.jobId, artifactIndex);
-      setLogContent(content || '产物为空。');
-    } catch (err: unknown) {
-      setLogContent(workflowErrorMessage(err));
-    }
-  };
+  useEffect(() => {
+    if (!selectedLogJobId || selectedArtifactName) return undefined;
+    let active = true;
+    void quantApi.getJobLog(selectedLogJobId)
+      .then((payload) => {
+        if (!active) return;
+        setLogContent(payload.content || '日志为空。');
+        setLogTruncated(payload.truncated === true);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setLogContent(workflowErrorMessage(err));
+        setLogTruncated(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedArtifactName, selectedLogJob?.logUpdatedAt, selectedLogJob?.updatedAt, selectedLogJobId]);
 
   const trainable = workflowStatus?.trainable;
   const latestTraining = workflowStatus?.latestTraining;
   const candidatePipeline = workflowStatus?.candidatePipeline;
+  const robustSignal = workflowStatus?.robustSignal;
+  const robustDataReadiness = robustSignal?.dataReadiness;
+  const robustDataReady = robustDataReadiness?.status === 'ready'
+    && robustDataReadiness.trainable === true;
+  const robustRunId = robustSignal?.runId;
+  const robustStage = robustSignal?.currentStage
+    || robustSignal?.progress?.currentStage
+    || '-';
+  const robustPauseState = robustSignal?.pauseState
+    || robustSignal?.progress?.pauseState
+    || '';
+  const robustLifecycle = robustSignal?.lifecycleStatus || robustSignal?.status || '';
+  const robustCompleted = robustSignal?.completedCount
+    ?? robustSignal?.progress?.completedCount
+    ?? 0;
+  const robustExpected = robustSignal?.expectedCount
+    ?? robustSignal?.progress?.expectedCount
+    ?? 0;
+  const robustSmokeRun = robustSignal?.smokeRun;
+  const robustSmokeLifecycle = robustSmokeRun?.lifecycleStatus || robustSmokeRun?.status || '';
+  const robustSmokePauseState = robustSmokeRun?.pauseState
+    || robustSmokeRun?.progress?.pauseState
+    || '';
+  const robustSmokePaused = robustSmokePauseState === 'paused'
+    || robustSmokeLifecycle === 'paused';
+  const robustSmokeRunning = robustSmokeLifecycle === 'running'
+    || robustSmokePauseState === 'running'
+    || robustSmokePauseState === 'pause_requested';
+  const robustSmokeCompleted = robustSmokeRun?.completedCount
+    ?? robustSmokeRun?.progress?.completedCount
+    ?? 0;
+  const robustSmokeExpected = robustSmokeRun?.expectedCount
+    ?? robustSmokeRun?.progress?.expectedCount
+    ?? 0;
+  const robustSmokeStage = robustSmokeRun?.currentStage
+    || robustSmokeRun?.progress?.currentStage
+    || '-';
+  const robustSmokeStatusLabel = robustSmokePaused
+    ? (language === 'zh' ? '已暂停' : 'paused')
+    : robustSmokeRunning
+      ? (language === 'zh' ? '运行中' : 'running')
+      : robustSmokeLifecycle === 'completed'
+      ? (language === 'zh' ? '已完成' : 'completed')
+      : robustSmokeLifecycle === 'failed'
+        ? (language === 'zh' ? '失败' : 'failed')
+        : robustSmokeLifecycle || (language === 'zh' ? '未运行' : 'not run');
+  const robustPaused = robustPauseState === 'paused' || robustLifecycle === 'paused';
+  const robustRunning = robustLifecycle === 'running'
+    || robustPauseState === 'running'
+    || robustPauseState === 'pause_requested';
+  const robustActiveLauncherJob = useMemo(() => [
+    ...jobs,
+    latestJobs.run_robust_signal_research,
+    latestJobs.resume_robust_signal_research,
+  ]
+    .filter((job): job is QuantJob => Boolean(
+      job
+      && DURABLE_ROBUST_JOB_TYPES.has(job.jobType)
+      && isActiveJob(job)
+    ))
+    .sort((left, right) => jobTimestamp(right) - jobTimestamp(left))[0] ?? null, [
+    jobs,
+    latestJobs.resume_robust_signal_research,
+    latestJobs.run_robust_signal_research,
+  ]);
+  const robustLaunchActive = Boolean(robustActiveLauncherJob);
+  const robustStatusLabel = robustPaused
+    ? (language === 'zh' ? '已暂停' : 'paused')
+    : robustRunning
+      ? (robustPauseState === 'pause_requested'
+          ? (language === 'zh' ? '等待当前子任务完成后暂停' : 'pause requested')
+          : (language === 'zh' ? '运行中' : 'running'))
+      : robustLaunchActive
+        ? (language === 'zh' ? '后台仍运行' : 'runner active')
+      : robustLifecycle || (language === 'zh' ? '未启动' : 'not started');
+  const robustPauseTarget = useMemo(() => (
+    robustRunning && robustRunId
+      ? { runId: robustRunId, smoke: false }
+      : robustSmokeRunning && robustSmokeRun?.runId
+        ? { runId: robustSmokeRun.runId, smoke: true }
+        : robustActiveLauncherJob
+          ? {
+              runId: String(
+                robustActiveLauncherJob.params.run_id
+                ?? robustActiveLauncherJob.params.runId
+                ?? '',
+              ),
+              smoke: robustActiveLauncherJob.params.smoke === true,
+            }
+          : null
+  ), [robustActiveLauncherJob, robustRunId, robustRunning, robustSmokeRun?.runId, robustSmokeRunning]);
+  const robustCancelableJob = useMemo(() => {
+    if (!robustPauseTarget) return null;
+    const candidates = [
+      ...jobs,
+      latestJobs.run_robust_signal_research,
+      latestJobs.resume_robust_signal_research,
+    ].filter((job): job is QuantJob => Boolean(job));
+    return candidates
+      .filter((job) => {
+        if (
+          job.jobType !== 'run_robust_signal_research'
+          && job.jobType !== 'resume_robust_signal_research'
+        ) return false;
+        const runId = job.params.run_id ?? job.params.runId;
+        return String(runId || '') === robustPauseTarget.runId && isCancelableJob(job);
+      })
+      .sort((left, right) => jobTimestamp(right) - jobTimestamp(left))[0] ?? null;
+  }, [jobs, latestJobs.resume_robust_signal_research, latestJobs.run_robust_signal_research, robustPauseTarget]);
+  const robustResumeTarget = robustPaused && robustRunId
+    ? { runId: robustRunId, smoke: false }
+    : robustSmokePaused && robustSmokeRun?.runId
+      ? { runId: robustSmokeRun.runId, smoke: true }
+      : null;
+  useEffect(() => {
+    if (!robustRunning && !robustSmokeRunning && !robustLaunchActive) return undefined;
+    const timer = window.setInterval(() => {
+      void refreshResearchStatus();
+    }, ROBUST_RUNNER_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [refreshResearchStatus, robustLaunchActive, robustRunning, robustSmokeRunning]);
+  const robustPlanActive = isActiveJob(latestJobs.preview_robust_signal_plan);
+  const robustPauseJobActive = isActiveJob(latestJobs.pause_robust_signal_research);
+  const robustFormalBlocked = isFormalTrainingBlocked(
+    'run_robust_signal_research',
+    {},
+    workflowStatus,
+  );
+  const robustPlanJobInfo = getBackendJobInfo(compatibleJobTypes, 'preview_robust_signal_plan');
+  const robustRunJobInfo = getBackendJobInfo(compatibleJobTypes, 'run_robust_signal_research');
+  const robustPauseJobInfo = getBackendJobInfo(compatibleJobTypes, 'pause_robust_signal_research');
+  const robustResumeJobInfo = getBackendJobInfo(compatibleJobTypes, 'resume_robust_signal_research');
+  const robustBackendCatalogLoaded = [
+    robustPlanJobInfo,
+    robustRunJobInfo,
+    robustPauseJobInfo,
+    robustResumeJobInfo,
+  ].every((info) => info.catalogLoaded);
+  const robustUnavailableActions = [
+    { label: language === 'zh' ? '预览计划' : 'preview plan', info: robustPlanJobInfo },
+    { label: language === 'zh' ? '启动研究' : 'start research', info: robustRunJobInfo },
+    { label: language === 'zh' ? '协作暂停' : 'cooperative pause', info: robustPauseJobInfo },
+    { label: language === 'zh' ? '恢复研究' : 'resume research', info: robustResumeJobInfo },
+  ].filter(({ info }) => info.catalogLoaded && !info.isEnabled);
+  const qualityJob = latestJobs.report_data_quality;
+  const qualityJobInfo = getBackendJobInfo(compatibleJobTypes, 'report_data_quality');
+  const qualityTaskLabel = isActiveJob(qualityJob)
+    ? (qualityJob?.status === 'running' || qualityJob?.status === 'pending'
+        ? (language === 'zh' ? '运行中' : 'running')
+        : (language === 'zh' ? '后台仍运行' : 'runner active'))
+    : qualityJob?.status === 'completed'
+    ? (language === 'zh' ? '已完成' : 'completed')
+    : qualityJob?.status === 'failed'
+        ? (language === 'zh' ? '失败' : 'failed')
+        : qualityJob?.status === 'cancelled'
+          ? (language === 'zh' ? '已取消' : 'cancelled')
+          : (language === 'zh' ? '未运行' : 'not run');
+  const acceptanceLabel = loading
+    ? (language === 'zh' ? '读取中' : 'loading')
+    : trainable
+      ? (language === 'zh' ? '通过' : 'accepted')
+      : (language === 'zh' ? '阻塞' : 'blocked');
   const dailyGuideSteps = useMemo(
     () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
     [workflowStatus, latestJobs, mlflowUrl],
   );
+  const providerQualityRows = (['canonical', 'cleaned'] as const)
+    .filter((provider) => Boolean(workflowStatus?.providerQuality?.[provider]))
+    .map((provider) => providerTrainingState(workflowStatus, { provider }));
 
   return (
     <main className="min-h-screen bg-base px-4 py-6 sm:px-6 lg:px-8">
@@ -1581,12 +2098,27 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
 
         {error ? <InlineAlert variant="danger" title="工作流接口异常" message={error} /> : null}
 
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-text" aria-label={language === 'zh' ? '构建信息' : 'Build information'}>
+          <span>{language === 'zh' ? '前端构建' : 'Frontend build'} {WEB_BUILD_INFO.buildId}</span>
+          <span>{language === 'zh' ? '后端构建' : 'Backend build'} {jobTypesContract?.backendBuildId || quantStatus?.apiContract?.backendBuildId || '-'}</span>
+          <span>{language === 'zh' ? '接口契约' : 'API contract'} {jobTypesContract?.version || '-'}</span>
+          <span>{language === 'zh' ? '后端启动' : 'Backend started'} {jobTypesContract?.backendStartedAt || '-'}</span>
+        </div>
+
+        {backendCompatibilityIssue ? (
+          <InlineAlert
+            variant="warning"
+            title={language === 'zh' ? '网页与后端版本不兼容' : 'Frontend and backend are incompatible'}
+            message={backendCompatibilityIssue}
+          />
+        ) : null}
+
         <section className={`grid gap-3 md:grid-cols-2 ${surface === 'training' ? 'xl:grid-cols-2' : 'xl:grid-cols-3'}`}>
           {surface === 'all' || surface === 'data' || surface === 'training' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
             <div className="flex items-center justify-between gap-3">
               <span className="label-uppercase">Data</span>
-              <JobStatusBadge job={undefined} />
+              <JobStatusBadge job={qualityJob} />
             </div>
             <p className="mt-3 text-lg font-semibold text-foreground">
               {trainable
@@ -1596,11 +2128,59 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   : (language === 'zh' ? '数据暂不可训练' : 'Data not ready for training')}
             </p>
             <p className="mt-2 text-sm leading-5 text-secondary-text">
-              {workflowStatus?.trainingReadiness?.summary
+              {localizedTrainingReadinessSummary(workflowStatus?.trainingReadiness?.summary, language)
                 || (language === 'zh'
                   ? '运行质量报告后，这里会显示训练准备状态。'
                   : 'Run a data quality report to see training readiness here.')}
             </p>
+            <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary-text">
+              <span>{language === 'zh' ? '质量报告任务' : 'Quality-report job'}：{qualityTaskLabel}</span>
+              <span className={loading ? 'text-muted-text' : trainable ? 'text-success' : 'text-warning'}>
+                {language === 'zh' ? '数据验收' : 'Data acceptance'}：{acceptanceLabel}
+              </span>
+            </div>
+            {providerQualityRows.length ? (
+              <div className="mt-3 divide-y divide-subtle border-y border-subtle text-xs">
+                {providerQualityRows.map((providerState) => (
+                  <div
+                    key={providerState.provider}
+                    data-testid={`provider-quality-${providerState.provider}`}
+                    className="grid gap-1 py-2 sm:grid-cols-[7rem_minmax(0,1fr)]"
+                  >
+                    <span className="font-medium text-foreground">{providerState.provider}</span>
+                    <span className={providerState.trainable && providerState.freshnessStatus !== 'stale' ? 'text-secondary-text' : 'text-warning'}>
+                      {language === 'zh' ? '快照' : 'snapshot'} {providerState.snapshotId || '-'}
+                      {' · '}{providerFreshnessText(providerState, language)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {surface === 'training' ? (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="btn-secondary h-8 gap-2 px-2.5 text-xs"
+                  aria-label={language === 'zh' ? '运行正式全量数据验收' : 'Run full data acceptance'}
+                  onClick={() => void submitGuideJob('report_data_quality')}
+                  disabled={
+                    submittingTypes.report_data_quality === true
+                    || isActiveJob(qualityJob)
+                    || !qualityJobInfo.catalogLoaded
+                    || !qualityJobInfo.isEnabled
+                  }
+                >
+                  {submittingTypes.report_data_quality === true || isActiveJob(qualityJob)
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    : <FileText className="h-3.5 w-3.5" />}
+                  {language === 'zh' ? '重新验收数据' : 'Re-run acceptance'}
+                </button>
+                <Link to="/data" className="inline-flex h-8 items-center gap-1 text-xs font-medium text-cyan">
+                  {language === 'zh' ? '查看数据页' : 'Open data page'}
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+              </div>
+            ) : null}
           </Card>
           ) : null}
 
@@ -1717,7 +2297,238 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
           </section>
         ) : null}
 
-        <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
+        {surface === 'training' ? (
+          <Card variant="bordered" padding="none" className="overflow-hidden">
+            <div className="border-b border-subtle px-4 py-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <FlaskConical className="h-5 w-5 text-cyan" />
+                    <h2 className="text-base font-semibold text-foreground">
+                      {language === 'zh' ? '鲁棒选股信号研究' : 'Robust Stock-Selection Signal Research'}
+                    </h2>
+                    <Badge
+                      variant={robustRunning || robustLaunchActive ? 'info' : robustPaused ? 'warning' : 'default'}
+                      size="sm"
+                      className="shadow-none"
+                    >
+                      {robustStatusLabel}
+                    </Badge>
+                    {!robustBackendCatalogLoaded ? (
+                      <Badge variant="default" size="sm" className="shadow-none">
+                        {language === 'zh' ? '任务目录加载中' : 'Loading task catalog'}
+                      </Badge>
+                    ) : robustUnavailableActions.length > 0 ? (
+                      <Badge variant="warning" size="sm" className="shadow-none">
+                        {backendCompatibilityIssue
+                          ? (language === 'zh' ? '后端需重启' : 'Backend restart required')
+                          : (language === 'zh' ? '后端未启用鲁棒信号研究任务' : 'Backend robust-signal tasks unavailable')}
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <p className="mt-2 max-w-3xl text-sm leading-5 text-secondary-text">
+                    {language === 'zh'
+                      ? '先预览固定研究矩阵；单季度测试不进入正式结果，正式运行必须使用已验收数据。暂停会在当前原子任务保存后生效。'
+                      : 'Preview the fixed matrix first. The one-quarter smoke run stays outside formal results; formal runs require accepted data. Cooperative pause takes effect after the current atomic task is saved.'}
+                  </p>
+                </div>
+                <div className="shrink-0 text-xs leading-5 text-secondary-text lg:text-right">
+                  <p>{robustCompleted} / {robustExpected} · {robustStage} · {robustStatusLabel}</p>
+                  <p>{language === 'zh' ? '检查点' : 'Checkpoint'}：{robustRunId || '-'}</p>
+                </div>
+              </div>
+            </div>
+            <div className="grid gap-4 px-4 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+                <div className="min-w-0 space-y-1 text-xs leading-5 text-secondary-text">
+                {robustSmokeRun ? (
+                  <div
+                    className="mb-3 border-l-2 border-warning bg-warning/5 px-3 py-2"
+                    aria-label={language === 'zh' ? '最近鲁棒信号单季度测试' : 'Latest robust signal one-quarter test'}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold text-foreground">
+                        {language === 'zh' ? '最近单季度测试' : 'Latest one-quarter test'}
+                      </span>
+                      <Badge variant="warning" size="sm" className="shadow-none">
+                        {language === 'zh'
+                          ? '测试数据，不可用于研究或交易'
+                          : 'Test data, not for research or trading'}
+                      </Badge>
+                    </div>
+                    <p className="mt-1">
+                      {robustSmokeCompleted} / {robustSmokeExpected} · {robustSmokeStage} · {robustSmokeStatusLabel}
+                    </p>
+                    <p>
+                      {language === 'zh' ? '测试检查点' : 'Test checkpoint'}：{robustSmokeRun.runId || '-'}
+                    </p>
+                    {robustSmokeRun.progress?.currentJob ? (
+                      <p className="break-all font-mono text-[11px]">
+                        {language === 'zh' ? '当前子任务' : 'Current task'}：{robustSmokeRun.progress.currentJob}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+                <p className={robustDataReady ? 'text-success' : 'text-warning'}>
+                  {language === 'zh' ? '鲁棒 CSI800 数据' : 'Robust CSI800 data'}：
+                  {robustDataReady
+                    ? (language === 'zh' ? '已就绪' : 'ready')
+                    : (language === 'zh' ? '未就绪' : 'blocked')}
+                </p>
+                <p>
+                  {language === 'zh'
+                    ? (robustDataReadiness?.summaryZh || '尚未找到鲁棒 CSI800 专用数据验收记录。')
+                    : (robustDataReadiness?.summary || 'No dedicated robust CSI800 readiness record was found.')}
+                </p>
+                {robustDataReadiness?.providerKey ? (
+                  <p>
+                    {language === 'zh' ? '鲁棒数据快照' : 'Robust data snapshot'} {robustDataReadiness.providerKey}
+                  </p>
+                ) : null}
+                <p>
+                  {language === 'zh' ? '配置' : 'Config'} {robustSignal?.configHash || '-'}
+                  {' · '}{language === 'zh' ? '数据' : 'Data'} {robustSignal?.dataManifestHash || '-'}
+                  {' · '}{language === 'zh' ? '代码' : 'Code'} {robustSignal?.gitCommit || '-'}
+                </p>
+                {robustSignal?.contextHash ? (
+                  <p>{language === 'zh' ? '完整上下文' : 'Full context'} {robustSignal.contextHash}</p>
+                ) : null}
+                {robustSignal?.nextGate ? (
+                  <p>{language === 'zh' ? '下一门槛' : 'Next gate'}：{robustSignal.nextGate}</p>
+                ) : null}
+                {robustUnavailableActions.length > 0 ? (
+                  <p className="text-warning">
+                    {language === 'zh' ? '不可用操作：' : 'Unavailable actions: '}
+                    {robustUnavailableActions.map(({ label }) => label).join(language === 'zh' ? '、' : ', ')}
+                    {language === 'zh' ? '。' : '.'}
+                  </p>
+                ) : null}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {!robustDataReady ? (
+                  <Link
+                    to="/data"
+                    className="btn-secondary h-9 gap-2 px-3 text-sm"
+                    aria-label={language === 'zh' ? '去数据页准备鲁棒 CSI800 数据' : 'Open data page to prepare robust CSI800 data'}
+                  >
+                    <Database className="h-4 w-4" />
+                    {language === 'zh' ? '准备鲁棒数据' : 'Prepare data'}
+                  </Link>
+                ) : null}
+                <button
+                  type="button"
+                  className="btn-secondary h-9 gap-2 px-3 text-sm"
+                  aria-label={language === 'zh' ? '预览鲁棒信号研究计划' : 'Preview robust signal plan'}
+                  onClick={() => void submitGuideJob('preview_robust_signal_plan', {})}
+                  disabled={
+                    !robustPlanJobInfo.catalogLoaded
+                    || !robustPlanJobInfo.isEnabled
+                    || robustPlanActive
+                    || submittingTypes.preview_robust_signal_plan === true
+                  }
+                >
+                  {robustPlanActive || submittingTypes.preview_robust_signal_plan === true
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Eye className="h-4 w-4" />}
+                  {language === 'zh' ? '预览计划' : 'Preview plan'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary h-9 gap-2 px-3 text-sm"
+                  aria-label={language === 'zh' ? '运行鲁棒信号单季度测试' : 'Run one-quarter robust signal smoke test'}
+                  onClick={() => void submitGuideJob('run_robust_signal_research', { smoke: true })}
+                  disabled={
+                    !robustRunJobInfo.catalogLoaded
+                    || !robustRunJobInfo.isEnabled
+                    || !robustDataReady
+                    || robustLaunchActive
+                    || robustRunning
+                    || robustSmokeRunning
+                    || submittingTypes.run_robust_signal_research === true
+                  }
+                >
+                  <FlaskConical className="h-4 w-4" />
+                  {language === 'zh' ? '单季度测试' : 'One-quarter test'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-primary h-9 gap-2 px-3 text-sm"
+                  aria-label={language === 'zh' ? '正式启动鲁棒信号研究' : 'Start formal robust signal research'}
+                  onClick={() => void submitGuideJob('run_robust_signal_research', {})}
+                  disabled={
+                    !robustRunJobInfo.catalogLoaded
+                    || !robustRunJobInfo.isEnabled
+                    || robustFormalBlocked
+                    || robustLaunchActive
+                    || robustRunning
+                    || robustSmokeRunning
+                    || submittingTypes.run_robust_signal_research === true
+                  }
+                >
+                  <Play className="h-4 w-4" />
+                  {language === 'zh' ? '正式启动' : 'Start formal run'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary h-9 gap-2 px-3 text-sm text-warning"
+                  aria-label={language === 'zh' ? '完成当前子任务后暂停' : 'Pause after current task'}
+                  onClick={() => robustPauseTarget && void submitGuideJob(
+                    'pause_robust_signal_research',
+                    { run_id: robustPauseTarget.runId },
+                  )}
+                  disabled={
+                    !robustPauseJobInfo.catalogLoaded
+                    || !robustPauseJobInfo.isEnabled
+                    || !robustPauseTarget
+                    || robustPauseJobActive
+                    || submittingTypes.pause_robust_signal_research === true
+                  }
+                >
+                  <Pause className="h-4 w-4" />
+                  {language === 'zh' ? '协作暂停' : 'Cooperative pause'}
+                </button>
+                {robustPauseTarget ? (
+                  <button
+                    type="button"
+                    className="btn-secondary h-9 gap-2 px-3 text-sm text-warning"
+                    aria-label={language === 'zh'
+                      ? '取消正在运行的鲁棒信号研究'
+                      : 'Cancel the running robust signal research'}
+                    onClick={() => robustCancelableJob && setPendingCancelJobId(robustCancelableJob.jobId)}
+                    disabled={!robustCancelableJob}
+                  >
+                    <CircleStop className="h-4 w-4" />
+                    {language === 'zh' ? '立即取消' : 'Cancel now'}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="btn-secondary h-9 gap-2 px-3 text-sm"
+                  aria-label={language === 'zh' ? '恢复鲁棒信号研究' : 'Resume robust signal research'}
+                  onClick={() => robustResumeTarget && void submitGuideJob(
+                    'resume_robust_signal_research',
+                    {
+                      run_id: robustResumeTarget.runId,
+                      ...(robustResumeTarget.smoke ? { smoke: true } : {}),
+                    },
+                  )}
+                  disabled={
+                    !robustResumeJobInfo.catalogLoaded
+                    || !robustResumeJobInfo.isEnabled
+                    || !robustResumeTarget
+                    || robustLaunchActive
+                    || (!robustResumeTarget.smoke && robustFormalBlocked)
+                    || submittingTypes.resume_robust_signal_research === true
+                  }
+                >
+                  <RotateCw className="h-4 w-4" />
+                  {language === 'zh' ? '恢复' : 'Resume'}
+                </button>
+              </div>
+            </div>
+          </Card>
+        ) : null}
+
+        <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
           <div className="flex flex-col gap-4">
             {visibleWorkflowSteps.map((step) => {
               const Icon = step.icon;
@@ -1737,12 +2548,14 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   <div className="grid gap-0 divide-y divide-subtle">
                     {step.jobs.map((job) => {
                       const latestJob = latestJobs[job.type];
+                      const jobIsActive = Boolean(latestJob && isActiveJob(latestJob));
                       const isSubmitting = submittingTypes[job.type] === true;
                       const paramValues = jobParams[job.type] || {};
                       const isKnownJobType = Boolean(WORKFLOW_JOBS_BY_TYPE[job.type]);
-                      const backendJobInfo = getBackendJobInfo(jobTypes, job.type);
+                      const backendJobInfo = getBackendJobInfo(compatibleJobTypes, job.type);
                       const effectiveParams = buildJobParams(job, paramValues, backendJobInfo.allowedParamKeys);
-                      const formalTrainingBlocked = isFormalTrainingBlocked(job.type, effectiveParams, trainable);
+                      const providerState = providerTrainingState(workflowStatus, effectiveParams);
+                      const formalTrainingBlocked = isFormalTrainingBlocked(job.type, effectiveParams, workflowStatus);
                       return (
                         <div
                           key={job.type}
@@ -1753,10 +2566,15 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <h3 className="text-sm font-medium text-foreground">{job.label}</h3>
+                              {job.testOnly ? (
+                                <Badge variant="warning" size="sm" className="shadow-none">
+                                  {language === 'zh' ? '隔离测试，不发布' : 'Isolated test only'}
+                                </Badge>
+                              ) : null}
                               <JobStatusBadge job={latestJob} />
                               {backendJobInfo.isDisabled ? (
                                 <Badge variant="warning" size="sm" className="shadow-none">
-                                  后端未启用
+                                  {backendCompatibilityIssue ? '后端需重启' : '后端未启用'}
                                 </Badge>
                               ) : null}
                               {formalTrainingBlocked && !loading ? (
@@ -1766,10 +2584,57 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                               ) : null}
                             </div>
                             <p className="mt-1 text-sm leading-5 text-secondary-text">{job.description}</p>
+                            {TRAINING_JOB_TYPES.has(job.type) ? (
+                              <p className={`mt-1 text-xs ${providerState.trainable && providerState.freshnessStatus !== 'stale' ? 'text-success' : 'text-warning'}`}>
+                                {language === 'zh' ? '当前数据' : 'Current data'}：{providerState.provider}
+                                {' · '}{language === 'zh' ? '快照' : 'snapshot'} {providerState.snapshotId || '-'}
+                                {' · '}{providerFreshnessText(providerState, language)}
+                                {!providerState.trainable
+                                  ? ` · ${localizedTrainingReadinessSummary(providerState.summary, language)}`
+                                  : ''}
+                              </p>
+                            ) : null}
                             <p className="mt-1 text-xs text-muted-text">
                               最近运行：{formatTime(latestJob?.updatedAt)}
                               {latestJob?.error ? ` · ${latestJob.error}` : ''}
                             </p>
+                            {latestJob?.progress && (
+                              (latestJob.progress.total ?? 0) > 0
+                              || Boolean(latestJob.progress.stage)
+                            ) ? (
+                              <div className="mt-2 max-w-xl space-y-1.5 rounded-md border border-subtle bg-surface/45 px-2.5 py-2 text-xs text-secondary-text">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span>
+                                    {latestJob.progress.completed ?? 0} / {latestJob.progress.total ?? 0}
+                                    {' · '}{Number(latestJob.progress.percent ?? 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%
+                                  </span>
+                                  <span>
+                                    阶段：{latestJob.progress.stage || '-'}
+                                    {latestJob.progress.current ? ` · 当前：${latestJob.progress.current}` : ''}
+                                  </span>
+                                </div>
+                                <div className="h-1.5 overflow-hidden rounded-full bg-border/45" aria-hidden="true">
+                                  <div
+                                    className="h-full bg-cyan transition-[width] duration-300"
+                                    style={{ width: `${Math.min(100, Math.max(0, Number(latestJob.progress.percent ?? 0)))}%` }}
+                                  />
+                                </div>
+                                <p>
+                                  已用 {formatDuration(latestJob.progress.elapsedSeconds)}
+                                  {latestJob.progress.etaSeconds !== null && latestJob.progress.etaSeconds !== undefined
+                                    ? ` · 预计剩余 ${formatDuration(latestJob.progress.etaSeconds)}`
+                                    : ''}
+                                  {latestJob.progress.currentArtifact
+                                    ? ` · 当前产物 ${latestJob.progress.currentArtifact}`
+                                    : ''}
+                                </p>
+                                {latestJob.pid ? (
+                                  <p className={latestJob.runnerAlive === false && isActiveJob(latestJob) ? 'text-warning' : 'text-muted-text'}>
+                                    Runner PID {latestJob.pid} · {latestJob.runnerAlive ? '存活' : '未存活'}
+                                  </p>
+                                ) : null}
+                              </div>
+                            ) : null}
                             {latestJob?.artifactPaths?.length ? (
                               <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-text">
                                 <span>产物：</span>
@@ -1818,11 +2683,11 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                                 日志
                               </button>
                             ) : null}
-                            {latestJob && (latestJob.status === 'running' || latestJob.status === 'pending') ? (
+                            {latestJob && isCancelableJob(latestJob) ? (
                               <button
                                 type="button"
                                 className="btn-secondary h-9 gap-2 px-3 text-sm text-warning"
-                                onClick={() => void cancelJob(latestJob)}
+                                onClick={() => setPendingCancelJobId(latestJob.jobId)}
                                 aria-label={`取消 ${job.label}`}
                               >
                                 <CircleStop className="h-4 w-4" />
@@ -1834,7 +2699,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                               data-testid={`workflow-run-${job.type}`}
                               className="btn-primary h-9 min-w-[8rem] gap-2 px-3 text-sm"
                               onClick={() => void submitJob(job)}
-                              disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled || formalTrainingBlocked}
+                              disabled={jobIsActive || isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled || formalTrainingBlocked}
                               aria-label={`运行 ${job.label}`}
                             >
                               {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -1896,14 +2761,14 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                           {step.actions.map((action) => {
                             if (action.kind === 'job') {
                               const isSubmitting = submittingTypes[action.jobType] === true;
-                              const backendJobInfo = getBackendJobInfo(jobTypes, action.jobType);
+                              const backendJobInfo = getBackendJobInfo(compatibleJobTypes, action.jobType);
                               return (
                                 <span key={`${step.id}-${action.jobType}-${action.label}`} className="inline-flex items-center gap-1.5">
                                   <button
                                     type="button"
                                     className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-cyan/25 px-2 text-xs font-medium text-cyan transition-colors hover:bg-cyan/10 disabled:cursor-not-allowed disabled:opacity-60"
                                     onClick={() => void submitGuideJob(action.jobType, action.params)}
-                                    disabled={isSubmitting || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled}
+                                    disabled={isSubmitting || isActiveJob(latestJobs[action.jobType]) || !backendJobInfo.catalogLoaded || !backendJobInfo.isEnabled}
                                     aria-label={`今日流程 ${step.title} ${action.label}`}
                                   >
                                     {isSubmitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -1967,7 +2832,11 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="min-w-0 truncate text-sm font-medium text-foreground">{displayQuantJobLabel(job)}</span>
-                      <StatusDot tone={statusTone(job.status)} pulse={job.status === 'running'} className="h-2 w-2" />
+                      <StatusDot
+                        tone={isActiveJob(job) ? 'info' : statusTone(job.status)}
+                        pulse={isActiveJob(job)}
+                        className="h-2 w-2"
+                      />
                     </div>
                     <div className="mt-1 flex items-center gap-2 text-xs text-muted-text">
                       <History className="h-3.5 w-3.5" />
@@ -1999,6 +2868,9 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   >
                     {logContent}
                   </pre>
+                  {logTruncated && !selectedArtifactName ? (
+                    <p className="mt-2 text-xs text-warning">日志过长，仅显示最后一部分。</p>
+                  ) : null}
                 </div>
               ) : (
                 <p className="mt-3 text-sm text-secondary-text">选择一个最近任务或点击任务行里的“日志”。</p>
@@ -2007,6 +2879,22 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
           </aside>
         </section>
       </div>
+      <ConfirmDialog
+        isOpen={pendingCancelJob !== null}
+        title={language === 'zh' ? '确认取消任务' : 'Cancel this job?'}
+        message={language === 'zh'
+          ? `取消会立即终止“${pendingCancelJob ? displayQuantJobLabel(pendingCancelJob) : ''}”。这不是可恢复的暂停，已完成的检查点由具体训练流程自行保留。`
+          : `Cancelling stops “${pendingCancelJob ? displayQuantJobLabel(pendingCancelJob) : ''}” immediately. This is not a resumable pause.`}
+        confirmText={language === 'zh' ? '确认取消' : 'Cancel job'}
+        cancelText={language === 'zh' ? '继续运行' : 'Keep running'}
+        isDanger
+        onCancel={() => setPendingCancelJobId(null)}
+        onConfirm={() => {
+          const job = pendingCancelJob;
+          setPendingCancelJobId(null);
+          if (job) void cancelJob(job);
+        }}
+      />
     </main>
   );
 };

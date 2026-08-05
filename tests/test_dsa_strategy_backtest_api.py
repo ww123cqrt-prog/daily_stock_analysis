@@ -14,7 +14,9 @@ def _client() -> tuple[tempfile.TemporaryDirectory, TestClient]:
     temp_dir = tempfile.TemporaryDirectory()
     static_dir = Path(temp_dir.name) / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
-    return temp_dir, TestClient(create_app(static_dir=static_dir))
+    client = TestClient(create_app(static_dir=static_dir))
+    client.headers.update({"Origin": "http://127.0.0.1:8010"})
+    return temp_dir, client
 
 
 def _report() -> dict:
@@ -90,6 +92,21 @@ def _trained_report() -> dict:
         "strategy_id": "low_turnover_weekly",
         "strategy_label": "每周低换手",
         "provider": "canonical",
+        "provider_identity": {"snapshot_id": "snapshot-1"},
+        "artifact_sha256": {"pred.pkl": "a" * 64, "label.pkl": "b" * 64},
+        "strategy_config": {"rebalance_freq": 5},
+        "replay_mode": "exact",
+        "replay_engine": "dsa_optimized_strategy",
+        "source_replay_engine": "dsa_optimized_strategy",
+        "modified_from_original": False,
+        "config_hash": "c" * 64,
+        "contract_version": 1,
+        "original_parameters": {
+            "start_date": "2024-01-01",
+            "end_date": "2025-12-31",
+            "topk": 50,
+            "cost_bps": 15.0,
+        },
         "period": {"start_date": "2024-01-02", "end_date": "2025-12-31"},
         "parameters": {
             "start_date": "2024-01-01",
@@ -230,6 +247,7 @@ def test_run_trained_strategy_backtest_passes_the_human_selected_run_and_paramet
                     "run_id": "a" * 32,
                     "model_id": "xgboost",
                     "strategy_id": "low_turnover_weekly",
+                    "replay_mode": "custom",
                     "start_date": "2024-01-01",
                     "end_date": "2025-12-31",
                     "topk": 50,
@@ -245,10 +263,91 @@ def test_run_trained_strategy_backtest_passes_the_human_selected_run_and_paramet
         run_id="a" * 32,
         model_id="xgboost",
         strategy_id="low_turnover_weekly",
+        replay_mode="custom",
         start_date="2024-01-01",
         end_date="2025-12-31",
         topk=50,
         cost_bps=15.0,
+    )
+
+
+def test_trained_strategy_catalog_returns_historical_runs() -> None:
+    temp_dir, client = _client()
+    catalog = {
+        "status": "completed",
+        "generated_at": "2026-08-02T12:00:00+08:00",
+        "runs": [
+            {
+                "run_id": "a" * 32,
+                "model_id": "xgboost",
+                "model_label": "XGBoost",
+                "source_type": "candidate",
+                "generated_at": "2026-08-02T10:00:00+08:00",
+                "provider": "canonical",
+                "provider_identity": {"snapshot_id": "snapshot-1"},
+                "periods": {"selection": ["2024-01-01", "2025-12-31"]},
+                "original_parameters": {
+                    "start_date": "2024-01-01",
+                    "end_date": "2025-12-31",
+                    "topk": 50,
+                    "cost_bps": 15.0,
+                },
+                "strategies": [
+                    {
+                        "id": "low_turnover_weekly",
+                        "label": "每周低换手",
+                        "config": {"rebalance_freq": 5},
+                    }
+                ],
+                "config_hash": "c" * 64,
+                "contract_version": 1,
+                "exact_replay_available": True,
+                "custom_replay_available": True,
+                "replay_capability": "exact_and_custom",
+                "replay_unavailable_reason": None,
+            }
+        ],
+    }
+    try:
+        with patch("api.v1.endpoints.backtest.TrainedStrategyBacktestService") as service_cls:
+            service_cls.return_value.catalog.return_value = catalog
+            response = client.get("/api/v1/backtest/strategy/trained/catalog")
+    finally:
+        temp_dir.cleanup()
+
+    assert response.status_code == 200
+    assert response.json()["runs"][0]["run_id"] == "a" * 32
+    assert "/Users/" not in response.text
+    service_cls.return_value.catalog.assert_called_once_with()
+
+
+def test_exact_replay_does_not_require_browser_backtest_parameters() -> None:
+    temp_dir, client = _client()
+    try:
+        with patch("api.v1.endpoints.backtest.TrainedStrategyBacktestService") as service_cls:
+            service_cls.return_value.run.return_value = _trained_report()
+            response = client.post(
+                "/api/v1/backtest/strategy/trained",
+                json={
+                    "run_id": "a" * 32,
+                    "model_id": "xgboost",
+                    "strategy_id": "low_turnover_weekly",
+                    "replay_mode": "exact",
+                },
+            )
+    finally:
+        temp_dir.cleanup()
+
+    assert response.status_code == 200
+    service_cls.return_value.run.assert_called_once_with(
+        run_id="a" * 32,
+        model_id="xgboost",
+        strategy_id="low_turnover_weekly",
+        replay_mode="exact",
+        start_date=None,
+        end_date=None,
+        topk=None,
+        cost_bps=None,
     )
 
 

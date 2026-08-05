@@ -14,7 +14,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -26,9 +26,16 @@ from quant_workflow.scripts.quant_data_contract import (
     AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
     DataContractError,
     filesystem_state_fingerprint,
+    validate_latest_pointer,
     validate_qlib_snapshot,
 )
 from quant_workflow.scripts._file_lock import lock_file, unlock_file
+from quant_workflow.scripts.robust_signal_data_contract import (
+    RobustSignalDataBlocked,
+    RuntimeProviderIdentityCache,
+    evaluate_robust_signal_data,
+    public_readiness_payload,
+)
 from src.safe_errors import sanitize_public_error
 from src.safe_urls import public_http_url
 from src.services.quant_workflow_paths import (
@@ -52,6 +59,7 @@ QUANT_WORKFLOW_REPORTS_ROOT = reports_root(DSA_ROOT)
 QUANT_DATA_ROOT = quant_data_root(DSA_ROOT)
 QLIB_PROVIDER_ROOT = _env_path("QLIB_PROVIDER_ROOT", QUANT_DATA_ROOT / "qlib")
 RESEARCH_STATUS_PATH = QUANT_WORKFLOW_REPORTS_ROOT / "research_status_latest.json"
+_ROBUST_PROVIDER_IDENTITY = RuntimeProviderIdentityCache()
 EXPERIMENT_LOG_FILENAME = "experiment_log.md"
 EXPERIMENT_RUNS_FILENAME = "experiment_runs.jsonl"
 EXPERIMENT_DELETED_RUNS_FILENAME = "experiment_runs_deleted.jsonl"
@@ -61,6 +69,8 @@ CASH_CONTROL_BACKTEST_FILENAME = "cash_control_backtest_latest.json"
 QLIB_PREDICTIONS_FILENAME = "qlib_predictions_latest.json"
 CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
 DATA_MANIFEST_FILENAME = "DATA_MANIFEST.json"
+ASHARE_DAILY_QFQ_DATASET_ID = "ashare_daily_qfq"
+ASHARE_DAILY_QFQ_DATASET_ROOT = Path("parquet/ashare_1d/ashare_daily_qfq")
 NATIVE_QLIB_DATASET_ID = "qlib_ashare_v2"
 NATIVE_QLIB_DATASET_ROOT = Path("qlib/cn_data_ashare_v2")
 NATIVE_QLIB_LATEST_POINTER = NATIVE_QLIB_DATASET_ROOT / "LATEST.json"
@@ -117,6 +127,7 @@ TONGHUASHUN_CANDIDATE_PATHS = (
     Path.home() / "Applications" / "同花顺远航版.app",
     Path.home() / "Applications" / "同花顺iFinD.app",
 )
+PROVIDER_FRESHNESS_STALE_AFTER_DAYS = 4
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,52 @@ def _is_finite_number(value: Any) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(float(value))
     )
+
+
+def _annotate_provider_quality_freshness(
+    provider_quality: Dict[str, Any],
+    *,
+    as_of_date: Optional[date] = None,
+) -> None:
+    """Add freshness metadata without changing structural training eligibility."""
+
+    effective_as_of = as_of_date or datetime.now().astimezone().date()
+    for record in provider_quality.values():
+        if not isinstance(record, dict):
+            continue
+        record["structural_status"] = (
+            "accepted" if record.get("trainable") is True else "blocked"
+        )
+        raw_calendar_end = record.get("calendar_end")
+        calendar_end = None
+        if isinstance(raw_calendar_end, str) and raw_calendar_end:
+            try:
+                calendar_end = date.fromisoformat(raw_calendar_end)
+            except ValueError:
+                calendar_end = None
+
+        calendar_age_days = (
+            (effective_as_of - calendar_end).days
+            if calendar_end is not None
+            else None
+        )
+        if calendar_age_days is None:
+            status = "unknown"
+        elif calendar_age_days < 0:
+            status = "future"
+        elif calendar_age_days > PROVIDER_FRESHNESS_STALE_AFTER_DAYS:
+            status = "stale"
+        else:
+            status = "current"
+        record["freshness"] = {
+            "status": status,
+            "calendar_end": (
+                calendar_end.isoformat() if calendar_end is not None else None
+            ),
+            "as_of_date": effective_as_of.isoformat(),
+            "calendar_age_days": calendar_age_days,
+            "blocks_training": False,
+        }
 
 
 def _validate_native_qlib_snapshot_cached(
@@ -586,6 +643,10 @@ def _candidate_pipeline_payload(
     payload = _read_json_object(reports_dir / CANDIDATE_PIPELINE_FILENAME)
     if payload is None:
         return None
+    # Older builds published synthetic dry-runs through the formal latest alias.
+    # Treat those files as test artifacts, never as trained candidate results.
+    if payload.get("dry_run") is True:
+        return None
     _annotate_provider_payload(payload, native_resolution)
     if payload.get("provider_uri"):
         payload["provider_uri"] = _public_path_label(payload["provider_uri"])
@@ -630,30 +691,155 @@ def _robust_signal_report_matrix(raw: Any) -> list[Dict[str, Any]]:
     ]
 
 
-def _robust_signal_payload(reports_dir: Path) -> Dict[str, Any]:
-    signal_dir = reports_dir / ROBUST_SIGNAL_DIRNAME
-    status_path = signal_dir / "robust_signal_status_latest.json"
-    status = _read_robust_json_object(status_path)
-    if not isinstance(status, dict):
-        return {
-            "status": "missing",
-            "lifecycle_status": "not_started",
-            "screening_reports": [],
-            "validation_reports": [],
-        }
+def _robust_signal_data_readiness_payload(reports_dir: Path) -> Dict[str, Any]:
+    status_path = (
+        reports_dir
+        / ROBUST_SIGNAL_DIRNAME
+        / "robust_signal_data_readiness_latest.json"
+    )
+    try:
+        payload = evaluate_robust_signal_data(
+            status_path=status_path,
+            data_manifest_path=QUANT_DATA_ROOT / DATA_MANIFEST_FILENAME,
+            provider_root=(
+                QUANT_DATA_ROOT / "runtime" / "robust_strategy" / "providers"
+            ),
+            quality_pointer_path=reports_dir / "data_quality_report_latest.json",
+            provider_identity=_ROBUST_PROVIDER_IDENTITY,
+        )
+    except RobustSignalDataBlocked as exc:
+        payload = exc.to_payload()
+    return public_readiness_payload(payload)
 
-    run_id = status.get("run_id")
+
+ROBUST_SIGNAL_STATUS_FIELDS = (
+    "status",
+    "lifecycle_status",
+    "reason_code",
+    "run_id",
+    "current_stage",
+    "pause_state",
+    "next_gate",
+    "completed_count",
+    "expected_count",
+    "updated_at",
+    "config_hash",
+    "git_commit",
+    "data_manifest_hash",
+    "context_hash",
+)
+
+
+def _robust_signal_status_source(
+    signal_dir: Path, alias_name: str
+) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    alias = _read_robust_json_object(signal_dir / alias_name)
+    if not isinstance(alias, dict):
+        return None, None
+    run_id = alias.get("run_id")
     run_dir = (
         signal_dir / "runs" / run_id
         if isinstance(run_id, str) and ROBUST_RUN_ID_RE.fullmatch(run_id)
         else None
     )
-    result = _read_robust_json_object(run_dir / "result.json") if run_dir else None
-    contract = (
-        _read_robust_json_object(run_dir / "factor_contract.json")
-        if run_dir
-        else None
+    if run_dir is not None:
+        live_status = _read_robust_json_object(run_dir / "status.json")
+        if (
+            isinstance(live_status, dict)
+            and live_status.get("run_id") == run_id
+        ):
+            return live_status, run_dir
+    return alias, run_dir
+
+
+def _robust_signal_progress_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _robust_signal_progress_payload(
+    status: Dict[str, Any], run_dir: Optional[Path]
+) -> Dict[str, Any]:
+    progress = {
+        key: status[key]
+        for key in (
+            "current_stage",
+            "pause_state",
+            "completed_count",
+            "expected_count",
+        )
+        if key in status
+    }
+    if status.get("lifecycle_status") != "running" or run_dir is None:
+        return progress
+    stage = status.get("current_stage")
+    if stage not in {"screening", "validation"}:
+        return progress
+    phase_progress = _read_robust_json_object(run_dir / stage / "progress.json")
+    if not isinstance(phase_progress, dict):
+        return progress
+    current_job = phase_progress.get("current_job")
+    if isinstance(current_job, str):
+        progress["current_job"] = current_job[:240]
+    phase_completed = _robust_signal_progress_count(
+        phase_progress.get("completed_count")
     )
+    if stage == "validation":
+        phase_completed += _robust_signal_progress_count(status.get("completed_count"))
+    progress["completed_count"] = phase_completed
+    progress["expected_count"] = _robust_signal_progress_count(
+        status.get("expected_count")
+    )
+    return progress
+
+
+def _robust_signal_run_summary(
+    status: Dict[str, Any],
+    run_dir: Optional[Path],
+    *,
+    test_only: bool = False,
+) -> Dict[str, Any]:
+    payload = {
+        key: status[key]
+        for key in ROBUST_SIGNAL_STATUS_FIELDS
+        if key in status
+    }
+    payload["progress"] = _robust_signal_progress_payload(status, run_dir)
+    if test_only:
+        payload["test_only"] = True
+    return payload
+
+
+def _robust_signal_payload(reports_dir: Path) -> Dict[str, Any]:
+    signal_dir = reports_dir / ROBUST_SIGNAL_DIRNAME
+    data_readiness = _robust_signal_data_readiness_payload(reports_dir)
+    status, run_dir = _robust_signal_status_source(
+        signal_dir, "robust_signal_status_latest.json"
+    )
+    smoke_status, smoke_run_dir = _robust_signal_status_source(
+        signal_dir, "robust_signal_smoke_status_latest.json"
+    )
+    if not isinstance(status, dict):
+        payload: Dict[str, Any] = {
+            "status": "missing",
+            "lifecycle_status": "not_started",
+            "screening_reports": [],
+            "validation_reports": [],
+        }
+        result = None
+        contract = None
+    else:
+        payload = _robust_signal_run_summary(status, run_dir)
+        result = _read_robust_json_object(run_dir / "result.json") if run_dir else None
+        contract = (
+            _read_robust_json_object(run_dir / "factor_contract.json")
+            if run_dir
+            else None
+        )
 
     def read_reports(phase: str) -> list[Dict[str, Any]]:
         if run_dir is None:
@@ -663,31 +849,11 @@ def _robust_signal_payload(reports_dir: Path) -> Dict[str, Any]:
         )
         return _robust_signal_report_matrix(report.get("reports") if report else None)
 
-    payload = {
-        key: status[key]
-        for key in (
-            "status",
-            "lifecycle_status",
-            "reason_code",
-            "run_id",
-            "current_stage",
-            "pause_state",
-            "next_gate",
-            "completed_count",
-            "expected_count",
-            "updated_at",
-            "config_hash",
-            "git_commit",
-            "data_manifest_hash",
-            "context_hash",
-        )
-        if key in status
-    }
-    payload["progress"] = {
-        key: status[key]
-        for key in ("current_stage", "pause_state", "completed_count", "expected_count")
-        if key in status
-    }
+    payload["smoke_run"] = (
+        _robust_signal_run_summary(smoke_status, smoke_run_dir, test_only=True)
+        if isinstance(smoke_status, dict)
+        else None
+    )
     payload["result"] = _sanitize_robust_tree(
         {
             key: result[key]
@@ -718,6 +884,7 @@ def _robust_signal_payload(reports_dir: Path) -> Dict[str, Any]:
     )
     payload["screening_reports"] = read_reports("screening")
     payload["validation_reports"] = read_reports("validation")
+    payload["data_readiness"] = data_readiness
     return _sanitize_robust_tree(payload)
 
 
@@ -1948,6 +2115,181 @@ def _manifest_path_contains_symlink(root: Path, relative_path: Path) -> bool:
         if candidate.is_symlink():
             return True
     return False
+
+
+def approved_ashare_qfq_snapshot_identity() -> Dict[str, Any]:
+    """Return the current market snapshot only when full quality evidence still matches."""
+
+    pointer_path = QUANT_WORKFLOW_REPORTS_ROOT / "data_quality_report_latest.json"
+    publication = _data_quality_publication_from_json(pointer_path)
+    if publication is None or publication.training_authoritative is not True:
+        raise DataContractError("approved A-share data quality evidence is unavailable")
+
+    quality_payload = publication.payload
+    thresholds = quality_payload.get("training_thresholds")
+    minimum_instruments = (
+        thresholds.get("min_instruments") if isinstance(thresholds, dict) else None
+    )
+    scanned_instruments = quality_payload.get("scanned_instruments")
+    if (
+        quality_payload.get("trainable") is not True
+        or quality_payload.get("scan_mode") != "full"
+        or quality_payload.get("coverage_status") != "full"
+        or quality_payload.get("verification_status") != "verified"
+        or quality_payload.get("requested_sample") != 0
+        or not isinstance(thresholds, dict)
+        or thresholds.get("authoritative") is not True
+        or not isinstance(minimum_instruments, int)
+        or isinstance(minimum_instruments, bool)
+        or minimum_instruments < AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS
+        or not isinstance(scanned_instruments, int)
+        or isinstance(scanned_instruments, bool)
+        or scanned_instruments < minimum_instruments
+    ):
+        raise DataContractError("A-share data quality evidence is not a verified full scan")
+
+    data_contract = quality_payload.get("data_contract")
+    identity = (
+        data_contract.get(ASHARE_DAILY_QFQ_DATASET_ID)
+        if isinstance(data_contract, dict)
+        else None
+    )
+    snapshot_state = (
+        data_contract.get("snapshot_state")
+        if isinstance(data_contract, dict)
+        else None
+    )
+    identity_fields = (
+        "dataset_id",
+        "snapshot_id",
+        "manifest_sha256",
+        "content_sha256",
+    )
+    if (
+        not isinstance(data_contract, dict)
+        or data_contract.get("status") != "verified"
+        or not isinstance(identity, dict)
+        or identity.get("dataset_id") != ASHARE_DAILY_QFQ_DATASET_ID
+        or not isinstance(identity.get("snapshot_id"), str)
+        or not identity.get("snapshot_id")
+        or Path(str(identity.get("snapshot_id"))).name != identity.get("snapshot_id")
+        or identity.get("snapshot_id") in {".", ".."}
+        or any(
+            not isinstance(identity.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(identity.get(field))) is None
+            for field in ("manifest_sha256", "content_sha256")
+        )
+    ):
+        raise DataContractError("A-share data quality evidence has an invalid identity")
+
+    snapshot_stages = ("before", "after_scan", "after_revalidation", "after")
+    stage_states = [
+        snapshot_state.get(stage, {}).get(ASHARE_DAILY_QFQ_DATASET_ID)
+        if isinstance(snapshot_state, dict)
+        and isinstance(snapshot_state.get(stage), dict)
+        else None
+        for stage in snapshot_stages
+    ]
+    expected_state = stage_states[0]
+    if (
+        not isinstance(snapshot_state, dict)
+        or snapshot_state.get("stable") is not True
+        or snapshot_state.get("content_revalidated") is not True
+        or not all(_valid_filesystem_state_fingerprint(state) for state in stage_states)
+        or not all(state == expected_state for state in stage_states[1:])
+    ):
+        raise DataContractError("A-share snapshot was not stable during the quality scan")
+
+    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+    catalog_path = root / DATA_MANIFEST_FILENAME
+    if catalog_path.is_symlink():
+        raise DataContractError("A-share root catalog path is unsafe")
+    catalog = _read_json_object(catalog_path)
+    datasets = catalog.get("datasets") if isinstance(catalog, dict) else None
+    catalog_entry = (
+        datasets.get(ASHARE_DAILY_QFQ_DATASET_ID)
+        if isinstance(datasets, dict)
+        else None
+    )
+    expected_pointer = ASHARE_DAILY_QFQ_DATASET_ROOT / "LATEST.json"
+    if (
+        not isinstance(catalog, dict)
+        or catalog.get("schema_version") != 2
+        or catalog.get("path_format") != "relative_to_quant_data_root"
+        or not isinstance(catalog_entry, dict)
+        or catalog_entry.get("dataset_id") != ASHARE_DAILY_QFQ_DATASET_ID
+        or catalog_entry.get("dataset_root")
+        != ASHARE_DAILY_QFQ_DATASET_ROOT.as_posix()
+        or catalog_entry.get("role") != "canonical"
+        or catalog_entry.get("status") != "ready"
+        or catalog_entry.get("price_basis") != "qfq"
+        or catalog_entry.get("latest_pointer") != expected_pointer.as_posix()
+        or catalog_entry.get("snapshot_id") != identity.get("snapshot_id")
+        or catalog_entry.get("snapshot_manifest_sha256")
+        != identity.get("manifest_sha256")
+        or catalog_entry.get("content_sha256") != identity.get("content_sha256")
+    ):
+        raise DataContractError("A-share root catalog does not match quality evidence")
+
+    live_pointer_path = root / expected_pointer
+    if _manifest_path_contains_symlink(root, expected_pointer):
+        raise DataContractError("A-share latest pointer path is unsafe")
+    try:
+        latest_pointer, snapshot = validate_latest_pointer(
+            live_pointer_path,
+            quant_data_root=root,
+            expected_dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
+        )
+    except (DataContractError, OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise DataContractError("A-share latest pointer is invalid") from exc
+    expected_snapshot_relative = (
+        ASHARE_DAILY_QFQ_DATASET_ROOT
+        / "snapshots"
+        / str(identity["snapshot_id"])
+    )
+    if (
+        latest_pointer.get("snapshot_id") != identity.get("snapshot_id")
+        or latest_pointer.get("manifest_sha256") != identity.get("manifest_sha256")
+        or latest_pointer.get("snapshot_path")
+        != expected_snapshot_relative.as_posix()
+        or _manifest_path_contains_symlink(root, expected_snapshot_relative)
+    ):
+        raise DataContractError("A-share latest pointer does not match quality evidence")
+
+    manifest, manifest_bytes = _read_json_object_bytes(
+        snapshot / "DATASET_MANIFEST.json"
+    )
+    actual_manifest_sha256 = (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        if manifest_bytes is not None
+        else None
+    )
+    if (
+        not isinstance(manifest, dict)
+        or actual_manifest_sha256 != identity.get("manifest_sha256")
+        or any(manifest.get(field) != identity.get(field) for field in identity_fields[:2])
+        or manifest.get("content_sha256") != identity.get("content_sha256")
+        or manifest.get("data_kind") != "daily_bars"
+        or manifest.get("role") != "canonical"
+        or manifest.get("status") != "ready"
+        or manifest.get("price_basis") != "qfq"
+    ):
+        raise DataContractError("A-share snapshot manifest does not match quality evidence")
+    bars_path = snapshot / "bars"
+    if bars_path.is_symlink() or not bars_path.is_dir():
+        raise DataContractError("A-share snapshot bars directory is unavailable")
+
+    try:
+        current_state = _filesystem_state_fingerprint_live(snapshot)
+    except (DataContractError, OSError) as exc:
+        raise DataContractError("A-share snapshot state cannot be verified") from exc
+    if current_state != expected_state:
+        raise DataContractError("A-share snapshot changed after the quality scan")
+
+    return {
+        **{field: str(identity[field]) for field in identity_fields},
+        "state_fingerprint": dict(expected_state),
+    }
 
 
 def _is_trusted_qlib_provider_path(path: Path) -> bool:
@@ -3618,6 +3960,7 @@ def _missing_status_payload() -> Dict[str, Any]:
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "trainable": False,
         "training_readiness": training_readiness,
+        "provider_quality": {},
         "data_sources": [],
         "qlib_provider": qlib_provider,
         "latest_training": latest_training,
@@ -3900,6 +4243,9 @@ def build_research_status_payload(
     payload["function_inventory"] = _function_inventory_payload()
     payload["china_astock_reuse"] = _china_astock_reuse_payload()
     payload["acceptance_checklist"] = _acceptance_checklist_payload()
+    provider_quality = payload.get("provider_quality")
+    if isinstance(provider_quality, dict):
+        _annotate_provider_quality_freshness(provider_quality)
     return payload
 
 

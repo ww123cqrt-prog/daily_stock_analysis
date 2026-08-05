@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -71,10 +71,46 @@ class TrainedStrategyBacktestRunRequest(BaseModel):
     run_id: str = Field(..., pattern=r"^[0-9a-f]{32}$", description="本地 MLflow Run ID")
     model_id: str = Field(..., min_length=1, max_length=64)
     strategy_id: str = Field(..., min_length=1, max_length=64)
-    start_date: date
-    end_date: date
-    topk: int = Field(50, ge=1, le=500, description="每次持有的模型评分前K只股票")
-    cost_bps: float = Field(15.0, ge=0, le=1000, description="按换手扣除的成本；1基点=0.01%")
+    replay_mode: Literal["exact", "custom"] = "custom"
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    topk: Optional[int] = Field(None, ge=1, le=500, description="每次持有的模型评分前K只股票")
+    cost_bps: Optional[float] = Field(None, ge=0, le=1000, description="按换手扣除的成本；1基点=0.01%")
+
+
+class TrainedStrategyCatalogStrategy(BaseModel):
+    id: str
+    label: str
+    config: Dict[str, Any]
+    exact_replay_available: bool = False
+    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"] = (
+        "dsa_optimized_strategy"
+    )
+
+
+class TrainedStrategyCatalogRun(BaseModel):
+    run_id: str
+    model_id: str
+    model_label: str
+    source_type: Literal["baseline", "candidate"]
+    generated_at: str
+    provider: str
+    provider_identity: Dict[str, str]
+    periods: Dict[str, List[str]]
+    original_parameters: Dict[str, Any]
+    strategies: List[TrainedStrategyCatalogStrategy] = Field(default_factory=list)
+    config_hash: Optional[str] = None
+    contract_version: Optional[int] = None
+    exact_replay_available: bool
+    custom_replay_available: bool
+    replay_capability: Literal["exact_and_custom", "custom_only", "unavailable"]
+    replay_unavailable_reason: Optional[str] = None
+
+
+class TrainedStrategyCatalogResponse(BaseModel):
+    status: Literal["completed", "missing"]
+    generated_at: str
+    runs: List[TrainedStrategyCatalogRun] = Field(default_factory=list)
 
 
 class TrainedStrategyBacktestMetrics(BaseModel):
@@ -112,6 +148,18 @@ class TrainedStrategyBacktestResponse(BaseModel):
     strategy_id: str
     strategy_label: str
     provider: str
+    provider_identity: Dict[str, Any]
+    artifact_sha256: Dict[str, str]
+    strategy_config: Dict[str, Any]
+    replay_mode: Literal["exact", "custom"]
+    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"]
+    source_replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"]
+    modified_from_original: bool
+    config_hash: Optional[str] = None
+    contract_version: Optional[int] = None
+    original_parameters: Dict[str, Any]
+    execution_assumptions: Dict[str, Any] = Field(default_factory=dict)
+    exact_metric_validation: Optional[Dict[str, Any]] = None
     period: Dict[str, str]
     parameters: Dict[str, Any]
     metrics: TrainedStrategyBacktestMetrics

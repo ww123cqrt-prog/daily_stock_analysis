@@ -11,6 +11,7 @@ export type ApiErrorCategory =
   | 'upstream_llm_400'
   | 'upstream_timeout'
   | 'upstream_network'
+  | 'local_operation_timeout'
   | 'local_connection_failed'
   | 'http_error'
   | 'unknown';
@@ -31,6 +32,9 @@ type ResponseLike = {
 
 type ErrorCarrier = {
   response?: ResponseLike;
+  config?: {
+    url?: string;
+  };
   code?: string;
   message?: string;
   parsedError?: ParsedApiError;
@@ -91,6 +95,14 @@ function getErrorCode(error: unknown): string | undefined {
   return isRecord(error) && typeof (error as ErrorCarrier).code === 'string'
     ? (error as ErrorCarrier).code
     : undefined;
+}
+
+function getRequestUrl(error: unknown): string | undefined {
+  if (!isRecord(error)) {
+    return undefined;
+  }
+  const config = (error as ErrorCarrier).config;
+  return config && typeof config.url === 'string' ? config.url : undefined;
 }
 
 function getErrorMessage(error: unknown): string | null {
@@ -297,6 +309,7 @@ export function parseApiError(error: unknown): ParsedApiError {
   const errorMessage = getErrorMessage(error);
   const causeMessage = getCauseMessage(error);
   const code = getErrorCode(error);
+  const requestUrl = getRequestUrl(error);
   const rawMessage = pickString(payloadText, response?.statusText, errorMessage, causeMessage, code)
     ?? '请求未成功完成，请稍后重试。';
   const matchText = buildMatchText([rawMessage, errorMessage, causeMessage, code, errorCode, response?.statusText]);
@@ -463,7 +476,22 @@ export function parseApiError(error: unknown): ParsedApiError {
     });
   }
 
-  if (includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout']) || code === 'ECONNABORTED') {
+  const requestTimedOut = (
+    includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout'])
+    || code === 'ECONNABORTED'
+  );
+  const requestPath = requestUrl?.split('?', 1)[0];
+  if (requestTimedOut && requestPath?.endsWith('/api/v1/backtest/strategy/trained')) {
+    return createParsedApiError({
+      title: '本地回测等待超时',
+      message: '本地回测在浏览器等待时间内没有完成。请稍后重试；这不代表外部数据源或网络故障。',
+      rawMessage,
+      status,
+      category: 'local_operation_timeout',
+    });
+  }
+
+  if (requestTimedOut) {
     return createParsedApiError({
       title: '连接上游服务超时',
       message: '服务端访问外部依赖时超时，请稍后重试，或检查当前网络与代理设置。',
