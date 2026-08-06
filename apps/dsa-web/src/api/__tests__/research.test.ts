@@ -27,6 +27,27 @@ describe('researchApi', () => {
         trainable: true,
         training_readiness: { status: 'trainable', summary: 'ready' },
         data_sources: [],
+        robust_signal: {
+          status: 'missing',
+          data_readiness: {
+            contract_version: 'robust_signal_data_v3',
+            acceptance_owner: 'data_module',
+            acceptance_contract: 'data_module_accepted_content_addressed_snapshot_v2',
+            status: 'ready',
+            trainable: true,
+            readiness_artifact_name: `robust_signal_data_readiness_${'e'.repeat(64)}.json`,
+            readiness_artifact_sha256: 'e'.repeat(64),
+            quality_report_id: 'data-quality-0123456789abcdef',
+            quality_evidence_artifact_name: 'data_quality_report_20260805_120000_0123456789abcdef.json',
+            quality_evidence_sha256: 'f'.repeat(64),
+            cleaned_provider_identity: {
+              dataset_id: 'qlib_ashare_cleaned_v2',
+              snapshot_id: 'cleaned-v2',
+              manifest_sha256: 'a'.repeat(64),
+              content_sha256: 'b'.repeat(64),
+            },
+          },
+        },
         qlib_predictions: {
           generated_at: '2026-07-05T10:00:00+08:00',
           mode: 'read_only_qlib_prediction_summary',
@@ -98,6 +119,24 @@ describe('researchApi', () => {
 
     expect(get).toHaveBeenCalledWith('/api/v1/research/status');
     expect(status.generatedAt).toBe('2026-07-05T12:00:00+08:00');
+    expect(status.robustSignal?.dataReadiness?.acceptanceOwner).toBe('data_module');
+    expect(status.robustSignal?.dataReadiness?.acceptanceContract).toBe(
+      'data_module_accepted_content_addressed_snapshot_v2',
+    );
+    expect(status.robustSignal?.dataReadiness?.readinessArtifactName).toBe(
+      `robust_signal_data_readiness_${'e'.repeat(64)}.json`,
+    );
+    expect(status.robustSignal?.dataReadiness?.readinessArtifactSha256).toBe('e'.repeat(64));
+    expect(status.robustSignal?.dataReadiness?.qualityReportId).toBe(
+      'data-quality-0123456789abcdef',
+    );
+    expect(status.robustSignal?.dataReadiness?.qualityEvidenceArtifactName).toBe(
+      'data_quality_report_20260805_120000_0123456789abcdef.json',
+    );
+    expect(status.robustSignal?.dataReadiness?.qualityEvidenceSha256).toBe('f'.repeat(64));
+    expect(status.robustSignal?.dataReadiness?.cleanedProviderIdentity?.snapshotId).toBe(
+      'cleaned-v2',
+    );
     expect(status.qlibPredictions?.latestDate).toBe('2026-07-02');
     expect(status.qlibPredictions?.top?.[0].instrument).toBe('SZ000002');
     expect(status.qlibPredictions?.bottom?.[0].score).toBe(-0.4);

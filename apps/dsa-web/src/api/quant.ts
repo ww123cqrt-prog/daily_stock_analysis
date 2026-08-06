@@ -182,8 +182,13 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
 export function parseQuantJobStreamEvent(data: string): QuantJob[] {
   try {
     const payload = JSON.parse(data) as { jobs?: unknown };
-    return Array.isArray(payload.jobs) ? payload.jobs.map(convertJob) : [];
+    if (!Array.isArray(payload.jobs)) {
+      console.warn('[quant job stream] ignored event without a jobs array');
+      return [];
+    }
+    return payload.jobs.map(convertJob);
   } catch {
+    console.warn('[quant job stream] ignored event with invalid JSON');
     return [];
   }
 }

@@ -7,12 +7,14 @@ import type {
   ResearchTrainingResult,
 } from '../../api/research';
 import { providerStatusNotice } from '../../utils/providerStatus';
+import { buildMlflowRunUiUrl } from '../../utils/mlflowUiUrl';
 import { Badge, InlineAlert } from '../common';
 
 type TrainingResultsPanelProps = {
   latestTraining?: ResearchTrainingResult | null;
   candidatePipeline?: ResearchCandidatePipeline | null;
   language: 'zh' | 'en';
+  mlflowUrl?: string;
 };
 
 const STRATEGY_LABELS: Record<string, { zh: string; en: string }> = {
@@ -96,6 +98,7 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
   latestTraining,
   candidatePipeline,
   language,
+  mlflowUrl = 'http://127.0.0.1:6006/',
 }) => {
   const zh = language === 'zh';
   const models = candidatePipeline?.models ?? [];
@@ -194,7 +197,19 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
                   </td>
                   <td className="px-4 py-3 font-mono text-muted-text">-</td>
                   <td className="px-4 py-3 font-mono text-muted-text">-</td>
-                  <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">{latestTraining?.runId || '-'}</td>
+                  <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">
+                    {latestTraining?.runId ? (
+                      <a
+                        href={buildMlflowRunUiUrl(mlflowUrl, latestTraining.experimentId, latestTraining.runId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan hover:underline"
+                        aria-label={`${zh ? '在 MLflow 中打开 Run' : 'Open MLflow Run'} ${latestTraining.runId}`}
+                      >
+                        {latestTraining.runId}
+                      </a>
+                    ) : '-'}
+                  </td>
                   <td className="px-4 py-3 text-right">
                     {resultEligibility.ready ? (
                       <Link
@@ -253,7 +268,19 @@ const TrainingResultsPanel: React.FC<TrainingResultsPanelProps> = ({
                     </td>
                     <td className="px-4 py-3 font-mono text-foreground">{percent(row.selection?.annualExcessReturn)}</td>
                     <td className="px-4 py-3 font-mono text-foreground">{percent(row.holdout?.annualExcessReturn)}</td>
-                    <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">{model?.runId || '-'}</td>
+                    <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-secondary-text">
+                      {model?.runId ? (
+                        <a
+                          href={buildMlflowRunUiUrl(mlflowUrl, model.experimentId, model.runId)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-cyan hover:underline"
+                          aria-label={`${zh ? '在 MLflow 中打开 Run' : 'Open MLflow Run'} ${model.runId}`}
+                        >
+                          {model.runId}
+                        </a>
+                      ) : '-'}
+                    </td>
                     <td className="px-4 py-3 text-right">
                       {resultEligibility.ready ? (
                         <Link

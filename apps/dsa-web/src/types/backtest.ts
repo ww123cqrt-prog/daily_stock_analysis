@@ -82,6 +82,7 @@ export interface TrainedStrategyCatalogStrategy {
 
 export interface TrainedStrategyCatalogRun {
   runId: string;
+  experimentId?: string | null;
   modelId: string;
   modelLabel: string;
   sourceType: 'baseline' | 'candidate';

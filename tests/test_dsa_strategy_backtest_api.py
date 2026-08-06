@@ -279,6 +279,7 @@ def test_trained_strategy_catalog_returns_historical_runs() -> None:
         "runs": [
             {
                 "run_id": "a" * 32,
+                "experiment_id": "42",
                 "model_id": "xgboost",
                 "model_label": "XGBoost",
                 "source_type": "candidate",
@@ -317,6 +318,7 @@ def test_trained_strategy_catalog_returns_historical_runs() -> None:
 
     assert response.status_code == 200
     assert response.json()["runs"][0]["run_id"] == "a" * 32
+    assert response.json()["runs"][0]["experiment_id"] == "42"
     assert "/Users/" not in response.text
     service_cls.return_value.catalog.assert_called_once_with()
 

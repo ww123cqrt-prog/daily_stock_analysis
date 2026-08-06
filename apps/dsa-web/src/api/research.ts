@@ -380,17 +380,30 @@ export type ResearchRobustSignal = {
   contextHash?: string;
   dataReadiness?: {
     contractVersion?: string;
+    acceptanceOwner?: string;
+    acceptanceContract?: string;
     status: string;
     trainable: boolean;
     reasonCode?: string;
     summary?: string;
     summaryZh?: string;
     generatedAt?: string;
+    readinessArtifactName?: string;
+    readinessArtifactSha256?: string;
     providerName?: string;
     providerKey?: string;
     providerTreeSha256?: string;
     dataManifestSha256?: string;
     membershipIntervalsSha256?: string;
+    qualityReportId?: string;
+    qualityEvidenceArtifactName?: string;
+    qualityEvidenceSha256?: string;
+    cleanedProviderIdentity?: {
+      datasetId?: string;
+      snapshotId?: string;
+      manifestSha256?: string;
+      contentSha256?: string;
+    };
     canonicalSnapshotId?: string;
     symbols?: number;
     intervals?: number;

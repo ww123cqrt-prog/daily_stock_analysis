@@ -13,7 +13,10 @@ from launch_robust_signal_research import (
 from robust_signal_data_contract import RobustSignalDataBlocked
 
 
-def test_build_command_uses_isolated_signal_entrypoint_and_resume(tmp_path: Path) -> None:
+def test_build_command_uses_isolated_signal_entrypoint_and_resume(
+    tmp_path: Path,
+) -> None:
+    readiness_artifact = tmp_path / "readiness.json"
     command = build_command(
         config=tmp_path / "config.yaml",
         quant_data_dir=tmp_path / "data",
@@ -22,10 +25,16 @@ def test_build_command_uses_isolated_signal_entrypoint_and_resume(tmp_path: Path
         resume=True,
         smoke=False,
         no_mlflow=False,
+        readiness_artifact=readiness_artifact,
+        readiness_artifact_sha256="a" * 64,
     )
 
     assert command[1].endswith("run_robust_signal_research.py")
     assert "--resume" in command
+    assert command[command.index("--readiness-artifact") + 1] == str(
+        readiness_artifact.resolve()
+    )
+    assert command[command.index("--readiness-artifact-sha256") + 1] == "a" * 64
     assert "run_robust_strategy.py" not in " ".join(command)
 
 
@@ -41,6 +50,8 @@ def test_launcher_reuses_sanitized_launchd_runner_without_mps(tmp_path: Path) ->
             smoke=False,
             no_mlflow=False,
             warmup_seconds=0,
+            readiness_artifact=tmp_path / "readiness.json",
+            readiness_artifact_sha256="a" * 64,
         )
 
     assert result["status"] == "running"
@@ -69,6 +80,10 @@ def test_main_returns_nonzero_when_signal_child_fails_during_warmup(
                 "failed-signal-warmup",
                 "--warmup-seconds",
                 "0",
+                "--readiness-artifact",
+                str(tmp_path / "readiness.json"),
+                "--readiness-artifact-sha256",
+                "a" * 64,
             ]
         )
 
@@ -211,7 +226,10 @@ def test_plan_preview_publishes_structured_blocked_data_instead_of_traceback(
 
     with (
         patch("launch_robust_signal_research.load_config", return_value={}),
-        patch("launch_robust_signal_research.build_context", side_effect=blocked),
+        patch(
+            "launch_robust_signal_research.resolve_robust_signal_data_readiness",
+            side_effect=blocked,
+        ),
     ):
         payload = preview_signal_research_plan(
             config_path=tmp_path / "config.yaml",

@@ -382,6 +382,7 @@ def test_catalog_keeps_multiple_historical_runs_and_sanitizes_paths(
 
     baseline_runs = [item for item in catalog["runs"] if item["source_type"] == "baseline"]
     assert [item["run_id"] for item in baseline_runs] == ["b" * 32, RUN_ID]
+    assert all(item["experiment_id"] == EXPERIMENT_ID for item in baseline_runs)
     assert all(item["exact_replay_available"] for item in baseline_runs)
     assert all(item["custom_replay_available"] for item in baseline_runs)
     serialized = json.dumps(catalog, ensure_ascii=False)
@@ -418,6 +419,7 @@ def test_catalog_skips_candidate_child_registry_and_uses_candidate_model_identit
     assert len(matching) == 1
     assert matching[0]["source_type"] == "candidate"
     assert matching[0]["model_id"] == "xgboost"
+    assert matching[0]["experiment_id"] == EXPERIMENT_ID
 
 
 def test_baseline_exact_replay_uses_qlib_portana_and_matches_saved_metrics(

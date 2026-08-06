@@ -890,6 +890,18 @@ describe('WorkflowPage', () => {
     expect(screen.queryByText('3 / 24 · screening · 运行中')).not.toBeInTheDocument();
   });
 
+  it('clears the previous research status when the newest refresh fails', async () => {
+    renderWorkflowPage('training');
+    await screen.findByText('当前数据可训练');
+
+    getResearchStatus.mockRejectedValueOnce(new Error('research status unavailable'));
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+
+    await waitFor(() => {
+      expect(screen.queryByText('当前数据可训练')).not.toBeInTheDocument();
+    });
+  });
+
   it('lets a human cancel a durable robust run after its launcher job completed', async () => {
     const completedLauncher = {
       jobId: 'qj_robust_launcher',

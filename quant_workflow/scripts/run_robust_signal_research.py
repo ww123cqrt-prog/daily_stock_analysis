@@ -54,7 +54,7 @@ from robust_signal_models import EqualWeightRankModel  # noqa: E402
 from robust_signal_data_contract import (  # noqa: E402
     CONTRACT_VERSION as ROBUST_DATA_CONTRACT_VERSION,
     RobustSignalDataBlocked,
-    evaluate_robust_signal_data,
+    consume_accepted_robust_signal_data,
 )
 from robust_strategy_core import RollingSplit, make_rolling_split  # noqa: E402
 
@@ -278,17 +278,18 @@ def _resolve_provider(
     config: Mapping[str, Any],
     report_root: Path,
     *,
-    data_manifest_path: Path,
     quant_data_dir: Path,
+    readiness_artifact_path: Path,
+    readiness_artifact_sha256: str,
 ) -> tuple[Path, dict[str, Any]]:
-    status_path = report_root / str(config["paths"]["qlib_provider_status"])
-    status = evaluate_robust_signal_data(
-        status_path=status_path,
-        data_manifest_path=data_manifest_path,
+    del config
+    status = consume_accepted_robust_signal_data(
+        artifact_path=readiness_artifact_path,
+        artifact_sha256=readiness_artifact_sha256,
         provider_root=(
             Path(quant_data_dir) / "runtime" / "robust_strategy" / "providers"
         ),
-        quality_pointer_path=report_root / "data_quality_report_latest.json",
+        reports_dir=report_root,
     )
     return Path(str(status["provider_uri"])), status
 
@@ -359,23 +360,27 @@ def _goal1_safe_split(
 
 
 def build_context(
-    *, config_path: Path, config: Mapping[str, Any], quant_data_dir: Path, report_root: Path
+    *,
+    config_path: Path,
+    config: Mapping[str, Any],
+    quant_data_dir: Path,
+    report_root: Path,
+    readiness_artifact_path: Path,
+    readiness_artifact_sha256: str,
 ) -> dict[str, Any]:
-    manifest_path = quant_data_dir / str(config["paths"]["data_manifest"])
-    if not manifest_path.is_file():
-        raise ValueError("DATA_MANIFEST.json is unavailable")
     provider, provider_status = _resolve_provider(
         config,
         report_root,
-        data_manifest_path=manifest_path,
         quant_data_dir=quant_data_dir,
+        readiness_artifact_path=readiness_artifact_path,
+        readiness_artifact_sha256=readiness_artifact_sha256,
     )
     repo_root = SCRIPT_DIR.parents[1]
     payload = {
         "config_hash": _sha256_file(config_path),
         "git_commit": _git_commit(repo_root),
         "git_clean": _git_clean(repo_root),
-        "data_manifest_hash": _sha256_file(manifest_path),
+        "data_manifest_hash": provider_status.get("data_manifest_sha256"),
         "provider_uri": str(provider),
         "provider_tree_sha256": provider_status.get("provider_tree_sha256"),
         "provider_key": provider_status.get("provider_key"),
@@ -383,6 +388,9 @@ def build_context(
             "membership_intervals_sha256"
         ),
         "quality_report_id": provider_status.get("quality_report_id"),
+        "quality_evidence_artifact_name": provider_status.get(
+            "quality_evidence_artifact_name"
+        ),
         "quality_evidence_sha256": provider_status.get(
             "quality_evidence_sha256"
         ),
@@ -390,6 +398,7 @@ def build_context(
             "cleaned_provider_identity"
         ),
         "robust_data_contract_version": ROBUST_DATA_CONTRACT_VERSION,
+        "readiness_artifact_sha256": readiness_artifact_sha256,
         "locked_confirmation_start": str(LOCKED_CONFIRMATION_START.date()),
     }
     if str(config.get("fundamentals", {}).get("research_round")) == "single_extension":
@@ -1904,6 +1913,8 @@ def run_research(
     smoke_quarter: str,
     smoke_signal_id: str,
     mlflow_enabled: bool,
+    readiness_artifact_path: Path,
+    readiness_artifact_sha256: str,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     report_root = reports_root()
@@ -1919,6 +1930,8 @@ def run_research(
             config=config,
             quant_data_dir=quant_data_dir,
             report_root=report_root,
+            readiness_artifact_path=readiness_artifact_path,
+            readiness_artifact_sha256=readiness_artifact_sha256,
         )
     except RobustSignalDataBlocked as exc:
         status = {
@@ -2316,6 +2329,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--smoke-quarter", default="2023Q1")
     parser.add_argument("--smoke-signal-id", default="trend_momentum_excess_5d")
     parser.add_argument("--no-mlflow", action="store_true")
+    parser.add_argument("--readiness-artifact", type=Path, required=True)
+    parser.add_argument("--readiness-artifact-sha256", required=True)
     args = parser.parse_args(argv)
     report_dir = args.report_dir.expanduser().resolve()
     if args.request_pause:
@@ -2331,6 +2346,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             smoke_quarter=args.smoke_quarter,
             smoke_signal_id=args.smoke_signal_id,
             mlflow_enabled=not args.no_mlflow,
+            readiness_artifact_path=args.readiness_artifact.expanduser().resolve(),
+            readiness_artifact_sha256=args.readiness_artifact_sha256,
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

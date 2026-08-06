@@ -19,3 +19,24 @@ export function resolveMlflowUiUrl(rawUrl: string): string {
   }
   return rawUrl;
 }
+
+export function buildMlflowRunUiUrl(
+  rawUrl: string,
+  experimentId?: string | null,
+  runId?: string | null,
+): string {
+  const baseUrl = resolveMlflowUiUrl(rawUrl);
+  if (!experimentId || !runId) return baseUrl;
+
+  const route = `#/experiments/${encodeURIComponent(experimentId)}/runs/${encodeURIComponent(runId)}`;
+  if (baseUrl.startsWith('/')) {
+    return `${baseUrl.replace(/\/?$/, '/')}${route}`;
+  }
+  try {
+    const url = new URL(baseUrl);
+    url.hash = route.slice(1);
+    return url.toString();
+  } catch {
+    return `${baseUrl.replace(/\/?$/, '/')}${route}`;
+  }
+}

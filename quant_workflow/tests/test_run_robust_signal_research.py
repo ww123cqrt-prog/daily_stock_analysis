@@ -151,9 +151,6 @@ def _context_config() -> dict[str, object]:
     return {
         "paths": {
             "data_manifest": "DATA_MANIFEST.json",
-            "qlib_provider_status": (
-                "robust_signal/robust_signal_data_readiness_latest.json"
-            ),
         },
         "fundamentals": {"research_round": "price_volume_baseline"},
     }
@@ -163,6 +160,20 @@ def _write_context_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "robust_signal.yaml"
     config_path.write_text("name: robust-signal-test\n", encoding="utf-8")
     return config_path
+
+
+def _frozen_readiness_kwargs(tmp_path: Path) -> dict[str, object]:
+    artifact_sha256 = "9" * 64
+    return {
+        "readiness_artifact_path": (
+            tmp_path
+            / "reports"
+            / "robust_signal"
+            / "readiness_artifacts"
+            / f"robust_signal_data_readiness_{artifact_sha256}.json"
+        ),
+        "readiness_artifact_sha256": artifact_sha256,
+    }
 
 
 def test_build_context_reports_missing_robust_data_readiness_without_csi800_misdirection(
@@ -178,13 +189,14 @@ def test_build_context_reports_missing_robust_data_readiness_without_csi800_misd
             config=_context_config(),
             quant_data_dir=quant_data,
             report_root=tmp_path / "reports",
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
-    assert getattr(caught.value, "reason_code", None) == "robust_readiness_missing"
+    assert getattr(caught.value, "reason_code", None) == "readiness_artifact_missing"
     assert "does not contain PIT csi800 instruments" not in str(caught.value)
 
 
-def test_build_context_rejects_robust_provider_bound_to_an_old_data_manifest(
+def test_build_context_rejects_legacy_readiness_without_data_module_attestation(
     tmp_path: Path,
 ) -> None:
     quant_data = tmp_path / "quant_data"
@@ -195,27 +207,28 @@ def test_build_context_rejects_robust_provider_bound_to_an_old_data_manifest(
     (provider / "instruments" / "csi800.txt").write_text(
         "SH600000\t2020-01-02\t2025-12-31\n", encoding="utf-8"
     )
-    status_path = (
+    legacy_payload = {
+        "contract_version": "robust_signal_data_v2",
+        "status": "ready",
+        "trainable": True,
+        "provider_uri": str(provider),
+        "provider_key": "provider-v1",
+        "provider_tree_sha256": "a" * 64,
+        "data_manifest_sha256": "b" * 64,
+    }
+    legacy_bytes = (
+        json.dumps(legacy_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    legacy_sha256 = hashlib.sha256(legacy_bytes).hexdigest()
+    artifact_path = (
         tmp_path
         / "reports"
         / "robust_signal"
-        / "robust_signal_data_readiness_latest.json"
+        / "readiness_artifacts"
+        / f"robust_signal_data_readiness_{legacy_sha256}.json"
     )
-    status_path.parent.mkdir(parents=True)
-    status_path.write_text(
-        json.dumps(
-            {
-                "contract_version": "robust_signal_data_v1",
-                "status": "ready",
-                "trainable": True,
-                "provider_uri": str(provider),
-                "provider_key": "provider-v1",
-                "provider_tree_sha256": "a" * 64,
-                "data_manifest_sha256": "b" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(legacy_bytes)
 
     with pytest.raises(ValueError) as caught:
         build_context(
@@ -223,9 +236,40 @@ def test_build_context_rejects_robust_provider_bound_to_an_old_data_manifest(
             config=_context_config(),
             quant_data_dir=quant_data,
             report_root=tmp_path / "reports",
+            readiness_artifact_path=artifact_path,
+            readiness_artifact_sha256=legacy_sha256,
         )
 
-    assert getattr(caught.value, "reason_code", None) == "data_manifest_changed"
+    assert getattr(caught.value, "reason_code", None) == "robust_readiness_invalid"
+
+
+def test_build_context_rejects_readiness_outside_controlled_report_root(
+    tmp_path: Path,
+) -> None:
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    readiness_bytes = b"{}\n"
+    readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+    artifact = (
+        tmp_path
+        / "attacker"
+        / "readiness_artifacts"
+        / f"robust_signal_data_readiness_{readiness_sha256}.json"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(readiness_bytes)
+
+    with pytest.raises(RobustSignalDataBlocked) as caught:
+        build_context(
+            config_path=_write_context_config(tmp_path),
+            config=_context_config(),
+            quant_data_dir=quant_data,
+            report_root=tmp_path / "reports",
+            readiness_artifact_path=artifact,
+            readiness_artifact_sha256=readiness_sha256,
+        )
+
+    assert caught.value.reason_code == "robust_readiness_invalid"
 
 
 def test_build_context_uses_versioned_readiness_provenance_fields(
@@ -241,6 +285,9 @@ def test_build_context_uses_versioned_readiness_provenance_fields(
         "provider_key": "b" * 64,
         "membership_intervals_sha256": "c" * 64,
         "quality_report_id": "data-quality-" + "d" * 16,
+        "quality_evidence_artifact_name": (
+            "data_quality_report_20260805_120000_" + "d" * 16 + ".json"
+        ),
         "quality_evidence_sha256": "d" * 64,
         "cleaned_provider_identity": {
             "dataset_id": "qlib_ashare_cleaned_v2",
@@ -263,16 +310,102 @@ def test_build_context_uses_versioned_readiness_provenance_fields(
             config=_context_config(),
             quant_data_dir=quant_data,
             report_root=tmp_path / "reports",
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
     assert context["membership_intervals_sha256"] == "c" * 64
     assert context["quality_report_id"] == "data-quality-" + "d" * 16
+    assert context["quality_evidence_artifact_name"].startswith(
+        "data_quality_report_"
+    )
     assert context["quality_evidence_sha256"] == "d" * 64
-    assert context["cleaned_provider_identity"] == provider_status[
-        "cleaned_provider_identity"
-    ]
+    assert (
+        context["cleaned_provider_identity"]
+        == provider_status["cleaned_provider_identity"]
+    )
+    assert context["readiness_artifact_sha256"] == "9" * 64
     assert "membership_snapshot_hash" not in context
     assert "reference_snapshot_hash" not in context
+
+
+def test_build_context_consumes_frozen_manifest_hash_without_current_manifest(
+    tmp_path: Path,
+) -> None:
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    provider = tmp_path / "provider"
+    provider.mkdir()
+    provider_status = {
+        "provider_tree_sha256": "a" * 64,
+        "provider_key": "b" * 64,
+        "membership_intervals_sha256": "c" * 64,
+        "data_manifest_sha256": "d" * 64,
+        "quality_report_id": "data-quality-" + "e" * 16,
+        "quality_evidence_artifact_name": (
+            "data_quality_report_20260805_120000_" + "e" * 16 + ".json"
+        ),
+        "quality_evidence_sha256": "e" * 64,
+        "cleaned_provider_identity": {
+            "dataset_id": "qlib_ashare_cleaned_v2",
+            "snapshot_id": "cleaned-v2",
+            "manifest_sha256": "f" * 64,
+            "content_sha256": "a" * 64,
+        },
+    }
+
+    with (
+        patch(
+            "run_robust_signal_research._resolve_provider",
+            return_value=(provider, provider_status),
+        ),
+        patch("run_robust_signal_research._git_commit", return_value="commit"),
+        patch("run_robust_signal_research._git_clean", return_value=True),
+    ):
+        context = build_context(
+            config_path=_write_context_config(tmp_path),
+            config=_context_config(),
+            quant_data_dir=quant_data,
+            report_root=tmp_path / "reports",
+            **_frozen_readiness_kwargs(tmp_path),
+        )
+
+    assert context["data_manifest_hash"] == "d" * 64
+
+
+def test_resolve_provider_consumes_only_the_frozen_readiness_artifact(
+    tmp_path: Path,
+) -> None:
+    from run_robust_signal_research import _resolve_provider
+
+    artifact = tmp_path / "readiness.json"
+    artifact.write_text("{}\n", encoding="utf-8")
+    provider = (
+        tmp_path / "quant_data" / "runtime" / "robust_strategy" / "providers" / "a"
+    )
+    status = {"provider_uri": str(provider)}
+
+    with patch(
+        "run_robust_signal_research.consume_accepted_robust_signal_data",
+        return_value=status,
+    ) as consume:
+        resolved, returned = _resolve_provider(
+            _context_config(),
+            tmp_path / "reports",
+            quant_data_dir=tmp_path / "quant_data",
+            readiness_artifact_path=artifact,
+            readiness_artifact_sha256="a" * 64,
+        )
+
+    assert resolved == provider
+    assert returned == status
+    consume.assert_called_once_with(
+        artifact_path=artifact,
+        artifact_sha256="a" * 64,
+        provider_root=(
+            tmp_path / "quant_data" / "runtime" / "robust_strategy" / "providers"
+        ),
+        reports_dir=tmp_path / "reports",
+    )
 
 
 def test_runner_publishes_blocked_data_if_readiness_changes_after_web_submission(
@@ -299,6 +432,7 @@ def test_runner_publishes_blocked_data_if_readiness_changes_after_web_submission
             smoke_quarter="2025Q4",
             smoke_signal_id="alpha158_raw_5d",
             mlflow_enabled=False,
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
     assert payload["status"] == "blocked_data"
@@ -660,6 +794,7 @@ def test_research_resume_rejects_formal_smoke_mode_mismatch(tmp_path: Path) -> N
             smoke_quarter="2023Q1",
             smoke_signal_id="trend_momentum_excess_5d",
             mlflow_enabled=False,
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
 
@@ -710,6 +845,7 @@ def test_smoke_resume_emits_the_stored_run_mode(tmp_path: Path) -> None:
             smoke_quarter="2023Q1",
             smoke_signal_id="trend_momentum_excess_5d",
             mlflow_enabled=False,
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
     assert captured["run_mode"] == "smoke"
@@ -751,6 +887,7 @@ def test_resume_rejects_tampered_context_with_stale_hash(tmp_path: Path) -> None
             smoke_quarter="2023Q1",
             smoke_signal_id="trend_momentum_excess_5d",
             mlflow_enabled=False,
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
 
@@ -1367,6 +1504,7 @@ def test_smoke_forces_mlflow_off_even_when_caller_enables_it(
         smoke_quarter="2023Q1",
         smoke_signal_id="signal",
         mlflow_enabled=True,
+        **_frozen_readiness_kwargs(tmp_path),
     )
 
     assert captured["mlflow_enabled"] is False
@@ -1462,6 +1600,7 @@ def test_validation_summary_failure_updates_run_and_latest_status(
             smoke_quarter="2023Q1",
             smoke_signal_id="signal",
             mlflow_enabled=False,
+            **_frozen_readiness_kwargs(tmp_path),
         )
 
     assert evaluation_calls == 2

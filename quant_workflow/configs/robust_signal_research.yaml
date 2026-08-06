@@ -17,7 +17,6 @@ paths:
   report_namespace: robust_signal
   industry_intervals: reference/industry_intervals.parquet
   data_manifest: DATA_MANIFEST.json
-  qlib_provider_status: robust_signal/robust_signal_data_readiness_latest.json
 
 periods:
   screening_quarters:

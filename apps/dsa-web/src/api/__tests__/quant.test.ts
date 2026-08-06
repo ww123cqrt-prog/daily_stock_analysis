@@ -215,6 +215,17 @@ describe('quantApi', () => {
     expect((jobs[0] as unknown as { logPath?: unknown }).logPath).toBeUndefined();
   });
 
+  it('warns when a streamed snapshot is malformed instead of silently hiding it', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    expect(parseQuantJobStreamEvent('{not-json')).toEqual([]);
+    expect(parseQuantJobStreamEvent(JSON.stringify({ type: 'jobs' }))).toEqual([]);
+
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain('quant job stream');
+    warn.mockRestore();
+  });
+
   it('builds artifact URLs without treating artifact paths as user input', () => {
     expect(quantApi.getJobArtifactUrl('qj_1/unsafe', 2)).toBe('/api/v1/quant/jobs/qj_1%2Funsafe/artifacts/2');
   });

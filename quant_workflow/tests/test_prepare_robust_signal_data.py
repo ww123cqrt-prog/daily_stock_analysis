@@ -151,10 +151,39 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
     assert payload["trainable"] is True
     assert payload["canonical_snapshot_id"] == "snapshot-v2"
     assert payload["quality_report_id"].startswith("data-quality-")
+    assert payload["quality_evidence_artifact_name"].startswith(
+        "data_quality_report_"
+    )
     assert len(payload["quality_evidence_sha256"]) == 64
     assert payload["cleaned_provider_identity"] == quality_identity
+    assert payload["acceptance_owner"] == "data_module"
+    assert (
+        payload["acceptance_contract"]
+        == "data_module_accepted_content_addressed_snapshot_v2"
+    )
     assert payload["data_manifest_sha256"] != payload["membership_intervals_sha256"]
     assert status_path.is_file()
+    pointer = json.loads(status_path.read_text(encoding="utf-8"))
+    assert pointer["pointer_contract"] == "robust_signal_data_readiness_pointer_v1"
+    assert pointer["artifact_sha256"] == payload["readiness_artifact_sha256"]
+    artifact_path = status_path.parent / pointer["artifact"]
+    assert artifact_path.name == (
+        f"robust_signal_data_readiness_{pointer['artifact_sha256']}.json"
+    )
+    assert (
+        hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        == pointer["artifact_sha256"]
+    )
+    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert artifact_payload["provider_key"] == payload["provider_key"]
+    assert (
+        artifact_payload["quality_evidence_artifact_name"]
+        == payload["quality_evidence_artifact_name"]
+    )
+    assert (
+        artifact_payload["quality_evidence_sha256"]
+        == payload["quality_evidence_sha256"]
+    )
 
 
 def test_prepare_records_blocked_data_when_pit_membership_is_missing(
@@ -224,7 +253,12 @@ def test_prepare_records_sanitized_bounded_provider_build_error(tmp_path: Path) 
     assert isinstance(payload.get("error"), str)
     assert len(payload["error"]) <= 500
     assert str(tmp_path) not in payload["error"]
-    assert json.loads(status_path.read_text(encoding="utf-8")) == payload
+    pointer = json.loads(status_path.read_text(encoding="utf-8"))
+    artifact_payload = json.loads(
+        (status_path.parent / pointer["artifact"]).read_text(encoding="utf-8")
+    )
+    assert artifact_payload["error_type"] == payload["error_type"]
+    assert artifact_payload["error"] == payload["error"]
 
 
 def test_prepare_refuses_full_verified_quality_evidence_when_not_trainable(

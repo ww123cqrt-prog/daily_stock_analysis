@@ -25,6 +25,7 @@ import type {
   TrainedStrategyCatalogStrategy,
 } from '../../types/backtest';
 import { providerStatusNotice } from '../../utils/providerStatus';
+import { buildMlflowRunUiUrl } from '../../utils/mlflowUiUrl';
 import { Badge, InlineAlert } from '../common';
 import TrainedStrategyBacktestResults from './TrainedStrategyBacktestResults';
 
@@ -281,6 +282,7 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
   const loadedProviderNotice = loadedRun && loadedProvider
     ? providerStatusNotice(loadedProvider, loadedArtifact, language)
     : null;
+  const mlflowUrl = status?.mlflow?.url || 'http://127.0.0.1:6006/';
 
   const handleRunChange = (nextKey: string) => {
     setDraftRunKey(nextKey);
@@ -528,7 +530,17 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
               </div>
               <div className="bg-card px-3 py-3">
                 <p className="text-xs text-muted-text">Run ID</p>
-                <p className="mt-1 break-all font-mono text-xs text-foreground">{loadedRun.runId}</p>
+                <p className="mt-1 break-all font-mono text-xs text-foreground">
+                  <a
+                    href={buildMlflowRunUiUrl(mlflowUrl, loadedRun.experimentId, loadedRun.runId)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-cyan hover:underline"
+                    aria-label={`${zh ? '在 MLflow 中打开 Run' : 'Open MLflow Run'} ${loadedRun.runId}`}
+                  >
+                    {loadedRun.runId}
+                  </a>
+                </p>
               </div>
               <div className="bg-card px-3 py-3">
                 <p className="text-xs text-muted-text">{zh ? '数据快照' : 'Data snapshot'}</p>
@@ -617,7 +629,7 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
                     aria-label={zh ? '回测开始日期' : 'Backtest start date'}
                     value={startDate}
                     onChange={(event) => setStartDate(event.currentTarget.value)}
-                    disabled={running}
+                    disabled={running || !loadedRun}
                     className="input-surface input-focus-glow h-10 w-full border bg-transparent px-3 text-sm focus:outline-none"
                   />
                 </label>
@@ -628,7 +640,7 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
                     aria-label={zh ? '回测结束日期' : 'Backtest end date'}
                     value={endDate}
                     onChange={(event) => setEndDate(event.currentTarget.value)}
-                    disabled={running}
+                    disabled={running || !loadedRun}
                     className="input-surface input-focus-glow h-10 w-full border bg-transparent px-3 text-sm focus:outline-none"
                   />
                 </label>
@@ -642,7 +654,7 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
                     aria-label={zh ? '每次持有股票数（TopK）' : 'Stocks held each time (TopK)'}
                     value={topk}
                     onChange={(event) => setTopk(event.currentTarget.value)}
-                    disabled={running}
+                    disabled={running || !loadedRun}
                     className="input-surface input-focus-glow h-10 w-full border bg-transparent px-3 text-sm focus:outline-none"
                   />
                 </label>
@@ -656,7 +668,7 @@ const ModelStrategyBacktestPanel: React.FC<ModelStrategyBacktestPanelProps> = ({
                     aria-label={zh ? '回测成本（基点，1基点=0.01%）' : 'Backtest cost (1 bp = 0.01%)'}
                     value={costBps}
                     onChange={(event) => setCostBps(event.currentTarget.value)}
-                    disabled={running}
+                    disabled={running || !loadedRun}
                     className="input-surface input-focus-glow h-10 w-full border bg-transparent px-3 text-sm focus:outline-none"
                   />
                 </label>

@@ -34,9 +34,14 @@ from api.v1.schemas.quant_jobs import (
 )
 from api.v1.endpoints.research_status import (
     approved_ashare_qfq_snapshot_identity,
+    approved_robust_signal_data_publication,
     build_research_status_payload,
 )
 from quant_workflow.scripts.quant_data_contract import DataContractError
+from quant_workflow.scripts.robust_signal_data_contract import (
+    RobustSignalDataBlocked,
+    readiness_artifact_path_for_sha,
+)
 from src.safe_errors import sanitize_public_error
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
 from src.safe_urls import public_http_url
@@ -385,12 +390,49 @@ def _requires_training_readiness_gate(
     return True
 
 
-def _robust_signal_data_readiness(research_status: Dict[str, Any]) -> Dict[str, Any]:
-    robust_signal = research_status.get("robust_signal")
-    if not isinstance(robust_signal, dict):
-        return {}
-    readiness = robust_signal.get("data_readiness")
-    return readiness if isinstance(readiness, dict) else {}
+def _approved_robust_signal_submission_data(
+    job_type: str, params: Dict[str, Any]
+) -> Dict[str, Any]:
+    if job_type != "resume_robust_signal_research":
+        return approved_robust_signal_data_publication()
+
+    run_id = params.get("run_id")
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,256}", run_id) is None
+    ):
+        raise ValueError("A valid run_id is required to resume robust signal research.")
+    context_path = REPORTS_ROOT / "robust_signal" / "runs" / run_id / "context.json"
+    try:
+        if (
+            context_path.is_symlink()
+            or not context_path.is_file()
+            or context_path.stat().st_size > 1024 * 1024
+        ):
+            raise ValueError
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            "The original robust signal run has no valid frozen data context."
+        ) from exc
+    artifact_sha256 = (
+        context.get("readiness_artifact_sha256") if isinstance(context, dict) else None
+    )
+    if (
+        not isinstance(artifact_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
+    ):
+        raise ValueError(
+            "The original robust signal run has no frozen readiness artifact hash."
+        )
+    pointer_path = (
+        REPORTS_ROOT / "robust_signal" / "robust_signal_data_readiness_latest.json"
+    )
+    artifact_path = readiness_artifact_path_for_sha(pointer_path, artifact_sha256)
+    return approved_robust_signal_data_publication(
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+    )
 
 
 def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
@@ -515,6 +557,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
     service = get_quant_job_service()
     approved_provider_identity = None
     approved_market_data_identity = None
+    approved_robust_signal_data = None
     try:
         if request.job_type in MARKET_DATA_PINNED_JOB_TYPES:
             try:
@@ -528,18 +571,24 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                     "A股日线数据尚未通过完整验收，或验收后的快照已经变化。请先在数据页重新运行完整数据质量报告。",
                 ) from exc
         if request.job_type in ROBUST_SIGNAL_READINESS_GATED_JOB_TYPES:
-            research_status = await asyncio.to_thread(build_research_status_payload)
-            readiness = _robust_signal_data_readiness(research_status)
-            if readiness.get("trainable") is not True or readiness.get("status") != "ready":
+            try:
+                approved_robust_signal_data = await asyncio.to_thread(
+                    _approved_robust_signal_submission_data,
+                    request.job_type,
+                    request.params,
+                )
+            except RobustSignalDataBlocked as exc:
                 raise api_error(
                     409,
                     "robust_signal_data_blocked",
-                    str(
-                        readiness.get("summary_zh")
-                        or readiness.get("summary")
-                        or "Robust CSI800 data has not passed its dedicated readiness check."
-                    ),
-                )
+                    exc.summary_zh,
+                ) from exc
+            except ValueError as exc:
+                raise api_error(
+                    409,
+                    "robust_signal_resume_blocked",
+                    str(exc),
+                ) from exc
         elif _requires_training_readiness_gate(request.job_type, request.params):
             provider_dataset_id = _training_provider_dataset_id(request.params)
             research_status = await asyncio.to_thread(
@@ -580,6 +629,8 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
             submit_kwargs["approved_market_data_identity"] = (
                 approved_market_data_identity
             )
+        if approved_robust_signal_data is not None:
+            submit_kwargs["approved_robust_signal_data"] = approved_robust_signal_data
         job = await asyncio.to_thread(
             service.submit_job,
             request.job_type,

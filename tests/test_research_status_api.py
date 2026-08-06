@@ -26,6 +26,12 @@ from quant_workflow.scripts.quant_data_contract import (
     filesystem_state_fingerprint,
     finalize_qlib_snapshot,
 )
+from quant_workflow.scripts.robust_signal_data_contract import (
+    ACCEPTANCE_CONTRACT,
+    ACCEPTANCE_OWNER,
+    CONTRACT_VERSION,
+    publish_robust_signal_data_readiness,
+)
 
 
 def write_quality_evidence(
@@ -1001,26 +1007,31 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     },
                 },
             )
-            (signal_dir / "robust_signal_data_readiness_latest.json").write_text(
-                json.dumps(
-                    {
-                        "contract_version": "robust_signal_data_v1",
-                        "status": "ready",
-                        "trainable": True,
-                        "generated_at": "2026-08-02T16:00:00+08:00",
-                        "provider_uri": str(provider),
-                        "provider_key": provider_key,
-                        "provider_tree_sha256": "b" * 64,
-                        "data_manifest_sha256": manifest_hash,
-                        "quality_report_id": quality_report_id,
-                        "quality_evidence_sha256": quality_evidence_sha256,
-                        "cleaned_provider_identity": cleaned_identity,
-                        "canonical_snapshot_id": "cleaned-snapshot-v2",
-                        "symbols": 1633,
-                        "intervals": 2058,
-                    }
-                ),
-                encoding="utf-8",
+            publish_robust_signal_data_readiness(
+                pointer_path=(signal_dir / "robust_signal_data_readiness_latest.json"),
+                payload={
+                    "contract_version": CONTRACT_VERSION,
+                    "acceptance_owner": ACCEPTANCE_OWNER,
+                    "acceptance_contract": ACCEPTANCE_CONTRACT,
+                    "status": "ready",
+                    "trainable": True,
+                    "generated_at": "2026-08-02T16:00:00+08:00",
+                    "provider_uri": str(provider),
+                    "provider_key": provider_key,
+                    "provider_tree_sha256": "b" * 64,
+                    "data_manifest_sha256": manifest_hash,
+                    "membership_intervals_sha256": "c" * 64,
+                    "quality_report_id": quality_report_id,
+                    "quality_evidence_artifact_name": (
+                        "data_quality_report_20260731_110000_"
+                        f"{quality_evidence_sha256[:16]}.json"
+                    ),
+                    "quality_evidence_sha256": quality_evidence_sha256,
+                    "cleaned_provider_identity": cleaned_identity,
+                    "canonical_snapshot_id": "cleaned-snapshot-v2",
+                    "symbols": 1633,
+                    "intervals": 2058,
+                },
             )
 
             with (
@@ -1040,6 +1051,13 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertTrue(readiness["trainable"])
         self.assertEqual(readiness["provider_name"], provider_key[:16])
         self.assertEqual(readiness["canonical_snapshot_id"], "cleaned-snapshot-v2")
+        self.assertTrue(readiness["readiness_artifact_name"].startswith(
+            "robust_signal_data_readiness_"
+        ))
+        self.assertEqual(len(readiness["readiness_artifact_sha256"]), 64)
+        self.assertTrue(readiness["quality_evidence_artifact_name"].startswith(
+            "data_quality_report_"
+        ))
         self.assertNotIn(str(root), json.dumps(payload))
 
     def test_robust_signal_status_keeps_smoke_run_separate_and_reads_live_progress(

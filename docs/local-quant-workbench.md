@@ -143,6 +143,44 @@ JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baosto
 
 外部端口被封、上游数据源拒绝连接或本机网络暂时不可达属于运行环境状态，本身不作为 DSA 软件缺陷或代码审查阻塞项。DSA 必须把这类失败明确显示为外部连接失败，并允许重试或切换已批准来源；误报成功、写入半套数据、破坏现有快照、无限等待或无法恢复才属于产品缺陷。测试和审查不得为了让外部连接变绿而降低数据验收门槛。
 
+### 数据验收与训练消费边界
+
+数据模块负责下载、清洗、完整业务质量验收，以及发布带内容身份的不可变 provider 和
+readiness 记录。训练模块不下载数据、不清洗数据、不重新执行业务质量报告，也不读取
+当前的 `latest` 质量指针来替换正在使用的输入。数据模块把每次验收结果写为
+`readiness_artifacts/robust_signal_data_readiness_<sha256>.json`，再原子更新
+`robust_signal_data_readiness_latest.json` 指针。网页提交新 Run 时只解析一次 latest，
+把不可变文件路径和 SHA-256 写进持久化任务命令；训练运行器只消费这份冻结文件，并验证
+readiness 必须位于受控的
+`quant_workflow/reports/robust_signal/readiness_artifacts/`，不能用其他位置的同名目录
+冒充。readiness 同时记录数据模块实际发布的质量证据文件名和 SHA-256；训练运行器只在
+受控 `quant_workflow/reports/` 根下读取该冻结证据，核对证据契约、文件哈希、cleaned
+provider 身份、provider 元数据、provider 内容身份和历史 CSI800 成员区间身份。它不
+读取当前 `data_quality_report_latest.json`，也不重新计算覆盖率、质量阈值或训练资格。
+
+正式 Goal 1 只接受 `robust_signal_data_v3`、
+`acceptance_owner=data_module` 和
+`acceptance_contract=data_module_accepted_content_addressed_snapshot_v2`。旧版 v1/v2
+正文即使手工改字段，也不能冒充 latest 指针。数据更新后由数据模块发布新验收文件；
+已经开始的 Run 继续使用自己的旧哈希，恢复任务也从原 `context.json` 取回该哈希。
+需要使用新数据时，应创建新 Run。外部网络失败本身只是环境事件；
+只有 DSA 误报成功、发布损坏或不完整数据、无限挂起、恢复失败或绕过质量门槛，才算软件缺陷。
+
+### 本轮已修复的四个非阻塞 P3
+
+1. 未加载 Run 时，回测日期、TopK 和成本输入框与执行按钮同时禁用。
+2. 训练结果和回测详情中的 MLflow Run ID 直接链接到对应实验和 Run。
+3. SSE 事件 JSON 损坏或缺少 `jobs` 数组时记录诊断警告，不再静默吞掉事件。
+4. 研究状态刷新失败时清除旧状态，避免页面继续展示过期训练信息。
+
+独立复审进一步发现并已纳入本轮修复：候选模型目录使用模型级 MLflow
+`experiment_id` 生成 Run 深链；前端数据验收类型补齐验收所有者、验收契约、质量报告、
+质量证据、readiness 文件名/SHA-256 和 cleaned provider 身份字段；训练任务提交和直接
+CLI 运行都拒绝受控报告根之外的 readiness 文件。
+
+以下两项仍是明确记录的后续维护项，不阻碍当前单机训练：任务列表逐行执行
+`ps`/glob/stat 的性能优化，以及未来多 worker 部署时为通用任务更新增加 SQL 状态守卫。
+
 自动调度用本机 launchd（不写入 Git，属机器本地配置）。安装脚本从仓内模板生成含绝对路径的 plist：
 
 ```bash
@@ -372,4 +410,4 @@ PYTHONPATH=quant_workflow/scripts .venv/bin/python -m pytest quant_workflow/test
 - 实验记录支持归档和永久删除。
 - `china-astock-quant` 的复用能力已列账，交易相关能力保持禁区。
 - 同花顺只作为只读观察方向，手机连接暂不做。
-- 后端 pytest、前端 test/lint/build、浏览器 smoke、opencode 只读 review 都完成后，才算阶段闭环。
+- 后端 pytest、前端 test/lint/build、浏览器 smoke 和一个 Codex 子 Agent 只读 review 都完成后，才算阶段闭环；本项目当前不再把 OpenCode 或 Claude review 作为门槛。

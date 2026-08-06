@@ -90,6 +90,7 @@ class TrainedStrategyCatalogStrategy(BaseModel):
 
 class TrainedStrategyCatalogRun(BaseModel):
     run_id: str
+    experiment_id: Optional[str] = None
     model_id: str
     model_label: str
     source_type: Literal["baseline", "candidate"]

@@ -22,11 +22,13 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from quant_workflow.scripts.robust_signal_data_contract import RobustSignalDataBlocked
 from src.services.quant_job_service import (
     MLRUNS_ROOT,
     QuantJob,
     QuantJobService,
     REPORTS_ROOT,
+    _approved_robust_signal_data_args,
     _python_bin,
 )
 
@@ -1204,6 +1206,14 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "api.v1.endpoints.quant_jobs.build_research_status_payload",
                     return_value=blocked_status,
                 ),
+                patch(
+                    "api.v1.endpoints.quant_jobs.approved_robust_signal_data_publication",
+                    side_effect=RobustSignalDataBlocked(
+                        "data_manifest_changed",
+                        "Robust CSI800 data is bound to an older manifest.",
+                        "鲁棒 CSI800 数据绑定的是旧清单。",
+                    ),
+                ),
                 patch.object(service, "_start_job"),
             ):
                 baseline = client.post(
@@ -1273,25 +1283,31 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 },
             )
             client = self._make_client(service)
-            status = {
-                "trainable": False,
-                "training_readiness": {
-                    "status": "blocked",
-                    "summary": "Generic LightGBM quality is blocked.",
-                },
-                "robust_signal": {
-                    "data_readiness": {
-                        "status": "ready",
-                        "trainable": True,
-                        "summary": "Robust CSI800 data is ready.",
-                    }
-                },
+            readiness_bytes = b"{}\n"
+            readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+            readiness_artifact = (
+                Path(temp_dir)
+                / "robust_signal"
+                / "readiness_artifacts"
+                / ("robust_signal_data_readiness_" + readiness_sha256 + ".json")
+            )
+            readiness_artifact.parent.mkdir(parents=True)
+            readiness_artifact.write_bytes(readiness_bytes)
+            publication = {
+                "status": "ready",
+                "trainable": True,
+                "readiness_artifact_path": str(readiness_artifact),
+                "readiness_artifact_sha256": readiness_sha256,
             }
 
             with (
                 patch(
-                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
-                    return_value=status,
+                    "api.v1.endpoints.quant_jobs.approved_robust_signal_data_publication",
+                    return_value=publication,
+                ),
+                patch(
+                    "src.services.quant_job_service.REPORTS_ROOT",
+                    Path(temp_dir),
                 ),
                 patch.object(service, "_start_job"),
             ):
@@ -1306,14 +1322,84 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "params": {"smoke": True},
                     },
                 )
-                resume = client.post(
-                    "/api/v1/quant/jobs",
-                    json={"job_type": "resume_robust_signal_research", "params": {}},
-                )
+                jobs = service.list_jobs()
 
         self.assertEqual(formal.status_code, 200)
         self.assertEqual(smoke.status_code, 200)
-        self.assertEqual(resume.status_code, 200)
+        self.assertEqual(len(jobs), 2)
+        for job in jobs:
+            self.assertEqual(job.params["readiness_artifact_sha256"], readiness_sha256)
+            self.assertEqual(
+                job.command[job.command.index("--readiness-artifact") + 1],
+                str(readiness_artifact.resolve()),
+            )
+            self.assertEqual(
+                job.command[job.command.index("--readiness-artifact-sha256") + 1],
+                readiness_sha256,
+            )
+
+    def test_robust_signal_resume_reuses_the_original_run_readiness_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_id = "robust_signal_20260802_100000"
+            readiness_bytes = b'{"frozen": true}\n'
+            readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+            readiness_artifact = (
+                root
+                / "robust_signal"
+                / "readiness_artifacts"
+                / f"robust_signal_data_readiness_{readiness_sha256}.json"
+            )
+            readiness_artifact.parent.mkdir(parents=True)
+            readiness_artifact.write_bytes(readiness_bytes)
+            context_path = root / "robust_signal" / "runs" / run_id / "context.json"
+            context_path.parent.mkdir(parents=True)
+            context_path.write_text(
+                json.dumps({"readiness_artifact_sha256": readiness_sha256}),
+                encoding="utf-8",
+            )
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={
+                    "resume_robust_signal_research": {
+                        "label": "恢复鲁棒信号研究",
+                        "command": [sys.executable, "-c", "print('resume')"],
+                        "allowed_params": {"run_id"},
+                    }
+                },
+            )
+            client = self._make_client(service)
+            publication = {
+                "status": "ready",
+                "trainable": True,
+                "readiness_artifact_path": str(readiness_artifact),
+                "readiness_artifact_sha256": readiness_sha256,
+            }
+
+            with (
+                patch("api.v1.endpoints.quant_jobs.REPORTS_ROOT", root),
+                patch("src.services.quant_job_service.REPORTS_ROOT", root),
+                patch(
+                    "api.v1.endpoints.quant_jobs.approved_robust_signal_data_publication",
+                    return_value=publication,
+                ) as approved,
+                patch.object(service, "_start_job"),
+            ):
+                response = client.post(
+                    "/api/v1/quant/jobs",
+                    json={
+                        "job_type": "resume_robust_signal_research",
+                        "params": {"run_id": run_id},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        approved.assert_called_once_with(
+            artifact_path=readiness_artifact.resolve(),
+            artifact_sha256=readiness_sha256,
+        )
 
     def test_submit_pins_the_quality_approved_cleaned_snapshot_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6383,10 +6469,29 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
     def test_submission_freezes_generated_progress_identity_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-            with patch.object(service, "_start_job"):
+            root = Path(temp_dir)
+            readiness_bytes = b"{}\n"
+            readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+            readiness_artifact = (
+                root
+                / "robust_signal"
+                / "readiness_artifacts"
+                / f"robust_signal_data_readiness_{readiness_sha256}.json"
+            )
+            readiness_artifact.parent.mkdir(parents=True)
+            readiness_artifact.write_bytes(readiness_bytes)
+            service = QuantJobService(jobs_root=root / "jobs")
+            with (
+                patch("src.services.quant_job_service.REPORTS_ROOT", root),
+                patch.object(service, "_start_job"),
+            ):
                 robust = service.submit_job(
-                    "run_robust_signal_research", {"smoke": True}
+                    "run_robust_signal_research",
+                    {"smoke": True},
+                    approved_robust_signal_data={
+                        "readiness_artifact_path": str(readiness_artifact),
+                        "readiness_artifact_sha256": readiness_sha256,
+                    },
                 )
                 candidate = service.submit_job(
                     "run_candidate_pipeline",
@@ -6398,6 +6503,36 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertRegex(candidate.params["batch_id"], r"^candidate-alpha158-[0-9]{8}_[0-9]{6}$")
         timestamp = candidate.params["batch_id"].removeprefix("candidate-alpha158-")
         self.assertEqual(candidate.command[-2:], ["--timestamp", timestamp])
+
+    def test_approved_robust_signal_data_rejects_same_named_directory_outside_reports_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            readiness_bytes = b"{}\n"
+            readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+            readiness_artifact = (
+                root
+                / "attacker"
+                / "readiness_artifacts"
+                / f"robust_signal_data_readiness_{readiness_sha256}.json"
+            )
+            readiness_artifact.parent.mkdir(parents=True)
+            readiness_artifact.write_bytes(readiness_bytes)
+
+            with (
+                patch("src.services.quant_job_service.REPORTS_ROOT", root / "reports"),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "Approved robust signal readiness artifact is invalid",
+                ),
+            ):
+                _approved_robust_signal_data_args(
+                    {
+                        "readiness_artifact_path": str(readiness_artifact),
+                        "readiness_artifact_sha256": readiness_sha256,
+                    }
+                )
 
 
 if __name__ == "__main__":

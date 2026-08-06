@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime
@@ -20,9 +19,12 @@ from _paths import quant_data_root, reports_root  # noqa: E402
 from prepare_robust_provider import file_sha256, prepare_runtime_provider  # noqa: E402
 from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
 from robust_signal_data_contract import (  # noqa: E402
+    ACCEPTANCE_CONTRACT,
+    ACCEPTANCE_OWNER,
     CONTRACT_VERSION,
     RobustSignalDataBlocked,
     load_verified_cleaned_quality_evidence,
+    publish_robust_signal_data_readiness,
 )
 
 
@@ -38,19 +40,6 @@ def _sanitized_error(exc: Exception) -> str:
 DEFAULT_STATUS_PATH = (
     reports_root() / "robust_signal" / "robust_signal_data_readiness_latest.json"
 )
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _blocked_payload(reason_code: str) -> dict[str, Any]:
@@ -79,6 +68,8 @@ def _blocked_payload(reason_code: str) -> dict[str, Any]:
     summary, summary_zh = messages[reason_code]
     return {
         "contract_version": CONTRACT_VERSION,
+        "acceptance_owner": ACCEPTANCE_OWNER,
+        "acceptance_contract": ACCEPTANCE_CONTRACT,
         "status": "blocked_data",
         "trainable": False,
         "reason_code": reason_code,
@@ -108,25 +99,30 @@ def prepare_robust_signal_data(
 
     if not manifest_path.is_file():
         payload = _blocked_payload("data_manifest_missing")
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
     if not intervals_path.is_file():
         payload = _blocked_payload("membership_intervals_missing")
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
 
     try:
         quality = load_verified_cleaned_quality_evidence(quality_pointer_path)
     except RobustSignalDataBlocked as exc:
         payload = {
             "contract_version": CONTRACT_VERSION,
+            "acceptance_owner": ACCEPTANCE_OWNER,
+            "acceptance_contract": ACCEPTANCE_CONTRACT,
             **exc.to_payload(),
             "generated_at": datetime.now()
             .astimezone()
             .isoformat(timespec="seconds"),
         }
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
 
     try:
         resolved = resolve_dataset(
@@ -137,8 +133,9 @@ def prepare_robust_signal_data(
         canonical_provider = Path(resolved.snapshot_path)
     except (DataContractError, OSError, RuntimeError, ValueError):
         payload = _blocked_payload("cleaned_provider_unavailable")
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
 
     resolved_identity = {
         "dataset_id": str(resolved.dataset_id),
@@ -150,8 +147,9 @@ def prepare_robust_signal_data(
     }
     if resolved_identity != quality.get("cleaned_provider_identity"):
         payload = _blocked_payload("cleaned_provider_quality_mismatch")
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
 
     try:
         result = prepare_runtime_provider(
@@ -164,11 +162,14 @@ def prepare_robust_signal_data(
         payload = _blocked_payload("provider_build_failed")
         payload["error_type"] = type(exc).__name__
         payload["error"] = _sanitized_error(exc) or "provider build failed"
-        _write_json(status_path, payload)
-        return payload
+        return publish_robust_signal_data_readiness(
+            pointer_path=status_path, payload=payload
+        )
 
     payload = {
         "contract_version": CONTRACT_VERSION,
+        "acceptance_owner": ACCEPTANCE_OWNER,
+        "acceptance_contract": ACCEPTANCE_CONTRACT,
         "status": "ready",
         "trainable": True,
         "reason_code": None,
@@ -181,6 +182,9 @@ def prepare_robust_signal_data(
         "data_manifest_sha256": file_sha256(manifest_path),
         "membership_intervals_sha256": file_sha256(intervals_path),
         "quality_report_id": quality["quality_report_id"],
+        "quality_evidence_artifact_name": quality[
+            "quality_evidence_artifact_name"
+        ],
         "quality_evidence_sha256": quality["quality_evidence_sha256"],
         "cleaned_provider_identity": resolved_identity,
         "canonical_snapshot_id": canonical_provider.name,
@@ -188,8 +192,9 @@ def prepare_robust_signal_data(
         "intervals": result["intervals"],
         "reused": result["reused"],
     }
-    _write_json(status_path, payload)
-    return payload
+    return publish_robust_signal_data_readiness(
+        pointer_path=status_path, payload=payload
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

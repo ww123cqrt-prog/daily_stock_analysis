@@ -245,8 +245,8 @@ A 股前复权日线快照，子进程却没有收到明确的数据目录。脚
 
 Codex Goal 卡片当前系统状态为 `active`。正式网页训练和原条件重放已有历史真人
 证据，但当前续审 diff 仍需重新完成主后端、quant_workflow、前端、构建、
-Playwright、Edge 桌面/移动路径及三方独立审查。因此不能宣称本轮升级已经完成，
-也不能提前提交。
+Playwright、Edge 桌面/移动路径及一个 Codex 子 Agent 独立只读审查。因此不能宣称
+本轮升级已经完成，也不能提前提交。OpenCode 和 Claude 不再是本轮提交门槛。
 
 ## 2026-08-03 独立审查六项问题及修复
 
@@ -266,6 +266,9 @@ Planck 独立只读审查曾报告三项 P1 和三项 P2。当前 diff 已分别
    `quality_evidence_sha256`；缺少必需哈希时失败关闭，不静默记录空 provenance。
 6. 已存在的 `{run_id}.json` 必须与本次规范化内容完全一致才能复用；碰撞、损坏
    或本地篡改会被拒绝，不能把旧 provenance 关联到新训练输出。
+7. 训练 consumer 只接受固定 reports 根下的 content-addressed readiness；readiness
+   必须记录真实冻结质量证据文件名和 SHA-256。consumer 只验证证据契约、哈希及 cleaned
+   provider 身份，不读取当前 latest、不执行数据清洗，也不重新判定业务质量门槛。
 
 对应测试分布在 `test_robust_signal_data_contract.py`、
 `test_prepare_robust_signal_data.py`、`test_research_status_api.py`、
@@ -823,3 +826,37 @@ OpenCode 与 Codex 子 Agent 合计记录 8 项 P3。它们不影响当前单机
 当前最终审查门槛已满足：OpenCode `PASS`，Codex 子 Agent 复审 `PASS`；用户已取消
 Claude Code 审查。完成最终文档、Ruff、差异格式和 Git 卫生检查后允许本地 commit，
 仍然不 push。
+
+## 2026-08-06 r21 P3 修复与数据职责边界
+
+本轮 Goal 的范围是修复四个非阻塞 P3，并把“数据模块负责验收、训练模块只消费已验收
+快照”落实为代码契约。以下四项已在当前工作树中实现并增加回归测试：
+
+1. 未加载 Run 时，回测日期、TopK 和成本输入框与执行按钮一起禁用。
+2. 工作流训练结果和训练回测详情中的 MLflow Run ID 增加指定实验/Run 深链。
+3. SSE 事件 JSON 损坏或缺少 `jobs` 数组时写入 `console.warn`，不再静默返回空列表。
+4. 研究状态刷新失败时清除旧 `researchStatus`，不再显示可能过期的训练状态。
+
+本轮边界固定如下：数据模块负责下载、清洗、完整业务质量验收、质量证据和不可变
+provider/readiness 的发布；训练模块不执行清洗、不重新判定业务质量，也不在运行时读取
+当前质量 `latest` 指针来改变输入。数据模块发布内容寻址的
+`robust_signal_data_v3` 验收文件并原子更新 latest 指针；网页提交时解析一次指针，把验收
+文件路径和 SHA-256 固化进任务命令，运行器只验证并消费该文件。正式记录必须包含
+`acceptance_owner=data_module` 与
+`acceptance_contract=data_module_accepted_content_addressed_snapshot_v2`。直接把旧 v1/v2
+JSON 改成新字段不能冒充指针；恢复任务从原 Run 上下文取回旧验收哈希，因此数据更新不会
+改变已开始 Run 的输入。需要新数据时创建新 Run。
+
+外部端口被封、上游服务器拒绝连接或本机网络不可达是环境事件，不作为 DSA Bug 或审查
+阻塞项；只有 DSA 误报成功、发布部分/损坏数据、无限挂起、重试/恢复失效或降低质量
+门槛，才属于软件缺陷。任务列表逐行 `ps`/glob/stat 的性能开销，以及未来多 worker
+部署时通用任务更新的 SQL 状态守卫，仍作为后续非阻塞维护项，不影响本轮训练资格。
+
+本轮最终只需要一个 Codex 子 Agent 的独立只读审查；OpenCode 和 Claude Code 阶段已按
+用户要求取消。本地 commit 前仍必须完成聚焦/全量测试、前端 lint/build、`git diff
+--check` 和 Git 卫生检查，不 push。
+
+第一次 Codex 子 Agent 复审指出 1 个 P2 和 2 个 P3，当前实现已据此补充：数据验收改为
+“内容寻址不可变文件 + latest 指针 + 提交时冻结 + 运行时哈希验证”；候选模型回测目录保留
+模型级 MLflow `experiment_id`；前端 readiness 类型补齐验收与 cleaned provider 来源字段。
+这些修复仍需通过本轮全量验证和同一子 Agent 的最终只读复审后才允许提交。

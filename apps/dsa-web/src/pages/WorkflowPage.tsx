@@ -1685,6 +1685,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       }
     } catch (err: unknown) {
       if (requestRevision === researchStatusRevisionRef.current) {
+        setResearchStatus(null);
         throw err;
       }
     }
@@ -2875,6 +2876,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                 latestTraining={latestTraining}
                 candidatePipeline={candidatePipeline}
                 language={language}
+                mlflowUrl={mlflowUrl}
               />
             </div>
           ) : null}

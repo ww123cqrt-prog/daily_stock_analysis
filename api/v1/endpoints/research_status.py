@@ -30,11 +30,12 @@ from quant_workflow.scripts.quant_data_contract import (
     validate_qlib_snapshot,
 )
 from quant_workflow.scripts._file_lock import lock_file, unlock_file
+from quant_workflow.scripts.prepare_robust_provider import RuntimeProviderIdentityCache
 from quant_workflow.scripts.robust_signal_data_contract import (
     RobustSignalDataBlocked,
-    RuntimeProviderIdentityCache,
-    evaluate_robust_signal_data,
+    consume_accepted_robust_signal_data,
     public_readiness_payload,
+    resolve_robust_signal_data_readiness,
 )
 from src.safe_errors import sanitize_public_error
 from src.safe_urls import public_http_url
@@ -692,21 +693,35 @@ def _robust_signal_report_matrix(raw: Any) -> list[Dict[str, Any]]:
     ]
 
 
-def _robust_signal_data_readiness_payload(reports_dir: Path) -> Dict[str, Any]:
-    status_path = (
-        reports_dir
-        / ROBUST_SIGNAL_DIRNAME
-        / "robust_signal_data_readiness_latest.json"
+def approved_robust_signal_data_publication(
+    *,
+    reports_dir: Path = QUANT_WORKFLOW_REPORTS_ROOT,
+    artifact_path: Path | None = None,
+    artifact_sha256: str | None = None,
+) -> Dict[str, Any]:
+    pointer_path = (
+        reports_dir / ROBUST_SIGNAL_DIRNAME / "robust_signal_data_readiness_latest.json"
     )
+    if artifact_path is None and artifact_sha256 is None:
+        artifact_path, artifact_sha256, _payload = resolve_robust_signal_data_readiness(
+            pointer_path
+        )
+    elif artifact_path is None or artifact_sha256 is None:
+        raise ValueError("Both readiness artifact path and SHA-256 are required.")
+    payload = consume_accepted_robust_signal_data(
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        provider_root=(QUANT_DATA_ROOT / "runtime" / "robust_strategy" / "providers"),
+        reports_dir=reports_dir,
+        provider_identity=_ROBUST_PROVIDER_IDENTITY,
+    )
+    return {**payload, "readiness_artifact_path": str(artifact_path)}
+
+
+def _robust_signal_data_readiness_payload(reports_dir: Path) -> Dict[str, Any]:
     try:
-        payload = evaluate_robust_signal_data(
-            status_path=status_path,
-            data_manifest_path=QUANT_DATA_ROOT / DATA_MANIFEST_FILENAME,
-            provider_root=(
-                QUANT_DATA_ROOT / "runtime" / "robust_strategy" / "providers"
-            ),
-            quality_pointer_path=reports_dir / "data_quality_report_latest.json",
-            provider_identity=_ROBUST_PROVIDER_IDENTITY,
+        payload = approved_robust_signal_data_publication(
+            reports_dir=reports_dir,
         )
     except RobustSignalDataBlocked as exc:
         payload = exc.to_payload()

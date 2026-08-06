@@ -20,7 +20,10 @@ from launch_robust_strategy import (  # noqa: E402
     launch,
     launch_result_exit_code,
 )
-from robust_signal_data_contract import RobustSignalDataBlocked  # noqa: E402
+from robust_signal_data_contract import (  # noqa: E402
+    RobustSignalDataBlocked,
+    resolve_robust_signal_data_readiness,
+)
 from run_robust_signal_research import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_REPORT_DIR,
@@ -87,11 +90,18 @@ def preview_signal_research_plan(
 ) -> dict[str, Any]:
     config = load_config(config_path)
     try:
+        readiness_artifact, readiness_sha256, _readiness = (
+            resolve_robust_signal_data_readiness(
+                report_dir / "robust_signal_data_readiness_latest.json"
+            )
+        )
         context = build_context(
             config_path=config_path,
             config=config,
             quant_data_dir=quant_data_dir,
             report_root=reports_root(),
+            readiness_artifact_path=readiness_artifact,
+            readiness_artifact_sha256=readiness_sha256,
         )
         payload = build_plan_payload(config=config, context=context)
     except RobustSignalDataBlocked as exc:
@@ -118,6 +128,8 @@ def build_command(
     resume: bool,
     smoke: bool,
     no_mlflow: bool,
+    readiness_artifact: Path,
+    readiness_artifact_sha256: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -130,6 +142,10 @@ def build_command(
         str(report_dir.resolve()),
         "--run-id",
         run_id,
+        "--readiness-artifact",
+        str(readiness_artifact.resolve()),
+        "--readiness-artifact-sha256",
+        readiness_artifact_sha256,
     ]
     if resume:
         command.append("--resume")
@@ -151,6 +167,8 @@ def launch_signal_research(
     smoke: bool,
     no_mlflow: bool,
     warmup_seconds: float,
+    readiness_artifact: Path,
+    readiness_artifact_sha256: str,
 ) -> dict[str, Any]:
     command = build_command(
         config=config,
@@ -160,6 +178,8 @@ def launch_signal_research(
         resume=resume,
         smoke=smoke,
         no_mlflow=no_mlflow,
+        readiness_artifact=readiness_artifact,
+        readiness_artifact_sha256=readiness_artifact_sha256,
     )
     return launch(
         config=config,
@@ -234,6 +254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--no-mlflow", action="store_true")
     parser.add_argument("--warmup-seconds", type=float, default=10.0)
+    parser.add_argument("--readiness-artifact", type=Path)
+    parser.add_argument("--readiness-artifact-sha256")
     args = parser.parse_args(argv)
     report_dir = args.report_dir.expanduser().resolve()
     if args.cancel and not args.run_id:
@@ -243,6 +265,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--plan cannot be combined with pause, resume, or smoke")
     if args.cancel and (args.request_pause or args.resume or args.smoke):
         parser.error("--cancel cannot be combined with pause, resume, or smoke")
+    starts_runner = not (args.plan or args.request_pause or args.cancel)
+    if starts_runner and (
+        args.readiness_artifact is None or not args.readiness_artifact_sha256
+    ):
+        parser.error(
+            "starting or resuming research requires --readiness-artifact and "
+            "--readiness-artifact-sha256"
+        )
     if args.plan:
         result = preview_signal_research_plan(
             config_path=args.config.expanduser().resolve(),
@@ -264,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             smoke=args.smoke,
             no_mlflow=args.no_mlflow,
             warmup_seconds=args.warmup_seconds,
+            readiness_artifact=args.readiness_artifact.expanduser().resolve(),
+            readiness_artifact_sha256=args.readiness_artifact_sha256,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     if args.plan or args.request_pause or args.cancel:

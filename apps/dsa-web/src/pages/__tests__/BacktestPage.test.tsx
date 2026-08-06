@@ -210,6 +210,7 @@ describe('BacktestPage', () => {
         {
           runId: 'run-xgb',
           modelId: 'xgboost',
+          experimentId: '42',
           modelLabel: 'XGBoost',
           sourceType: 'candidate',
           generatedAt: '2026-08-02T10:00:00+08:00',
@@ -244,6 +245,7 @@ describe('BacktestPage', () => {
         {
           runId: 'latest-run',
           modelId: 'latest',
+          experimentId: '1',
           modelLabel: 'baseline_lgb_alpha158',
           sourceType: 'baseline',
           generatedAt: '2026-08-02T09:00:00+08:00',
@@ -396,6 +398,10 @@ describe('BacktestPage', () => {
     expect(screen.getAllByText('XGBoost').length).toBeGreaterThan(0);
     expect(screen.getAllByText('完整组合风控').length).toBeGreaterThan(0);
     expect(screen.getAllByText('run-xgb').length).toBeGreaterThan(0);
+    expect(screen.getByRole('link', { name: '在 MLflow 中打开 Run run-xgb' })).toHaveAttribute(
+      'href',
+      '/experiments/#/experiments/42/runs/run-xgb',
+    );
     expect(screen.getByText('开发期年化超额')).toBeInTheDocument();
     expect(screen.getByText('9.00%')).toBeInTheDocument();
     expect(screen.getByText('留出期年化超额')).toBeInTheDocument();

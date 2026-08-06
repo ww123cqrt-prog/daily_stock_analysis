@@ -5,23 +5,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 try:
+    from ._paths import reports_root
     from .prepare_robust_provider import (
-        RuntimeProviderIdentityCache,
         runtime_provider_identity,
     )
 except ImportError:  # Direct script execution and quant_workflow test mode.
+    from _paths import reports_root
     from prepare_robust_provider import (
-        RuntimeProviderIdentityCache,
         runtime_provider_identity,
     )
 
 
-CONTRACT_VERSION = "robust_signal_data_v1"
+CONTRACT_VERSION = "robust_signal_data_v3"
+ACCEPTANCE_OWNER = "data_module"
+ACCEPTANCE_CONTRACT = "data_module_accepted_content_addressed_snapshot_v2"
+READINESS_POINTER_CONTRACT = "robust_signal_data_readiness_pointer_v1"
+READINESS_ARTIFACT_DIRNAME = "readiness_artifacts"
+READINESS_ARTIFACT_PREFIX = "robust_signal_data_readiness_"
 PROVIDER_FORMAT_VERSION = 3
 PROVIDER_METADATA_FILENAME = "ROBUST_PROVIDER.json"
 MAX_STATUS_BYTES = 1024 * 1024
@@ -77,6 +83,14 @@ def _blocked(reason_code: str) -> RobustSignalDataBlocked:
         "robust_readiness_invalid": (
             "The robust CSI800 readiness record is invalid.",
             "鲁棒 CSI800 数据验收记录无效，请重新运行数据准备任务。",
+        ),
+        "readiness_artifact_missing": (
+            "The frozen robust CSI800 readiness artifact is unavailable.",
+            "冻结的鲁棒 CSI800 数据验收文件不存在，请重新运行数据准备任务。",
+        ),
+        "readiness_artifact_changed": (
+            "The frozen robust CSI800 readiness artifact no longer matches its hash.",
+            "冻结的鲁棒 CSI800 数据验收文件与提交时哈希不一致，已拒绝训练。",
         ),
         "data_manifest_missing": (
             "DATA_MANIFEST.json is unavailable.",
@@ -158,6 +172,112 @@ def _read_regular_bytes(path: Path, *, max_bytes: int) -> bytes | None:
         return path.read_bytes()
     except OSError:
         return None
+
+
+def _json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def readiness_artifact_path_for_sha(pointer_path: Path, artifact_sha256: str) -> Path:
+    if not isinstance(artifact_sha256, str) or not SHA256_RE.fullmatch(artifact_sha256):
+        raise _blocked("robust_readiness_invalid")
+    pointer_path = Path(pointer_path).expanduser().resolve(strict=False)
+    return (
+        pointer_path.parent
+        / READINESS_ARTIFACT_DIRNAME
+        / f"{READINESS_ARTIFACT_PREFIX}{artifact_sha256}.json"
+    )
+
+
+def publish_robust_signal_data_readiness(
+    *, pointer_path: Path, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Publish one immutable readiness artifact and atomically advance latest."""
+
+    pointer_path = Path(pointer_path).expanduser().resolve(strict=False)
+    artifact_bytes = _json_bytes(payload)
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    artifact_path = readiness_artifact_path_for_sha(pointer_path, artifact_sha256)
+    existing = _read_regular_bytes(artifact_path, max_bytes=MAX_STATUS_BYTES)
+    if existing is None:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with artifact_path.open("xb") as stream:
+                stream.write(artifact_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            artifact_path.chmod(0o444)
+        except FileExistsError:
+            existing = _read_regular_bytes(artifact_path, max_bytes=MAX_STATUS_BYTES)
+    verified_artifact = _read_regular_bytes(artifact_path, max_bytes=MAX_STATUS_BYTES)
+    if verified_artifact != artifact_bytes:
+        raise RuntimeError("content-addressed readiness artifact collision")
+
+    relative_artifact = artifact_path.relative_to(pointer_path.parent).as_posix()
+    pointer = {
+        "pointer_contract": READINESS_POINTER_CONTRACT,
+        "artifact": relative_artifact,
+        "artifact_sha256": artifact_sha256,
+        "status": payload.get("status"),
+        "trainable": payload.get("trainable"),
+        "reason_code": payload.get("reason_code"),
+        "generated_at": payload.get("generated_at"),
+    }
+    _atomic_write_bytes(pointer_path, _json_bytes(pointer))
+    return {
+        **dict(payload),
+        "readiness_artifact_name": artifact_path.name,
+        "readiness_artifact_sha256": artifact_sha256,
+    }
+
+
+def resolve_robust_signal_data_readiness(
+    pointer_path: Path,
+) -> tuple[Path, str, dict[str, Any]]:
+    """Resolve and hash-check the immutable artifact selected by latest."""
+
+    pointer_path = Path(pointer_path).expanduser().resolve(strict=False)
+    pointer = _read_json_object(pointer_path)
+    if pointer is None:
+        raise _blocked("robust_readiness_missing")
+    artifact_sha256 = pointer.get("artifact_sha256")
+    if (
+        pointer.get("pointer_contract") != READINESS_POINTER_CONTRACT
+        or not isinstance(artifact_sha256, str)
+        or not SHA256_RE.fullmatch(artifact_sha256)
+    ):
+        raise _blocked("robust_readiness_invalid")
+    artifact_path = readiness_artifact_path_for_sha(pointer_path, artifact_sha256)
+    expected_relative = artifact_path.relative_to(pointer_path.parent).as_posix()
+    if pointer.get("artifact") != expected_relative:
+        raise _blocked("robust_readiness_invalid")
+    artifact_bytes = _read_regular_bytes(artifact_path, max_bytes=MAX_STATUS_BYTES)
+    if artifact_bytes is None:
+        raise _blocked("readiness_artifact_missing")
+    if hashlib.sha256(artifact_bytes).hexdigest() != artifact_sha256:
+        raise _blocked("readiness_artifact_changed")
+    try:
+        payload = json.loads(artifact_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise _blocked("robust_readiness_invalid") from exc
+    if not isinstance(payload, dict):
+        raise _blocked("robust_readiness_invalid")
+    return artifact_path, artifact_sha256, payload
 
 
 def _valid_snapshot_fingerprint(value: Any) -> bool:
@@ -344,6 +464,7 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
 
     return {
         "quality_report_id": report_id,
+        "quality_evidence_artifact_name": evidence_artifact,
         "quality_evidence_sha256": evidence_sha256,
         "cleaned_provider_identity": {
             field: str(cleaned_identity[field])
@@ -419,6 +540,8 @@ def evaluate_robust_signal_data(
     current_quality = dict(quality_evidence_loader(Path(quality_pointer_path)))
     if (
         status.get("quality_report_id") != current_quality.get("quality_report_id")
+        or status.get("quality_evidence_artifact_name")
+        != current_quality.get("quality_evidence_artifact_name")
         or status.get("quality_evidence_sha256")
         != current_quality.get("quality_evidence_sha256")
     ):
@@ -487,6 +610,9 @@ def evaluate_robust_signal_data(
             "membership_intervals_sha256"
         ),
         "quality_report_id": current_quality.get("quality_report_id"),
+        "quality_evidence_artifact_name": current_quality.get(
+            "quality_evidence_artifact_name"
+        ),
         "quality_evidence_sha256": current_quality.get("quality_evidence_sha256"),
         "cleaned_provider_identity": current_quality.get(
             "cleaned_provider_identity"
@@ -497,6 +623,252 @@ def evaluate_robust_signal_data(
     }
 
 
+def consume_accepted_robust_signal_data(
+    *,
+    artifact_path: Path,
+    artifact_sha256: str,
+    provider_root: Path,
+    reports_dir: Path | None = None,
+    provider_identity: Callable[[Path, str], Mapping[str, str] | None] = (
+        runtime_provider_identity
+    ),
+) -> dict[str, Any]:
+    """Consume one submission-frozen data-module readiness artifact.
+
+    The data module owns source resolution, cleaning, business-quality checks and
+    publication. Training and status consumers only verify the frozen readiness
+    record plus the provider's content identity so an updated data catalog cannot
+    silently change an existing training input.
+    """
+
+    controlled_reports_dir = Path(reports_dir or reports_root()).expanduser().resolve()
+    readiness_artifact_root = (
+        controlled_reports_dir / "robust_signal" / READINESS_ARTIFACT_DIRNAME
+    ).resolve()
+    artifact_path = Path(os.path.abspath(Path(artifact_path).expanduser()))
+    provider_root = Path(provider_root).expanduser().resolve()
+    if (
+        not isinstance(artifact_sha256, str)
+        or not SHA256_RE.fullmatch(artifact_sha256)
+        or artifact_path.parent.resolve(strict=False) != readiness_artifact_root
+        or artifact_path.name != f"{READINESS_ARTIFACT_PREFIX}{artifact_sha256}.json"
+    ):
+        raise _blocked("robust_readiness_invalid")
+    artifact_bytes = _read_regular_bytes(artifact_path, max_bytes=MAX_STATUS_BYTES)
+    if artifact_bytes is None:
+        raise _blocked("readiness_artifact_missing")
+    if hashlib.sha256(artifact_bytes).hexdigest() != artifact_sha256:
+        raise _blocked("readiness_artifact_changed")
+    try:
+        status = json.loads(artifact_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise _blocked("robust_readiness_invalid") from exc
+    if not isinstance(status, dict):
+        raise _blocked("robust_readiness_invalid")
+    if status.get("status") == "blocked_data":
+        reason_code = str(status.get("reason_code") or "robust_readiness_invalid")
+        if reason_code not in {
+            "robust_readiness_missing",
+            "robust_readiness_invalid",
+            "data_manifest_missing",
+            "provider_outside_runtime",
+            "provider_unavailable",
+            "provider_identity_mismatch",
+            "csi800_instruments_missing",
+            "cleaned_provider_unavailable",
+            "membership_intervals_missing",
+            "provider_build_failed",
+            "quality_evidence_missing",
+            "quality_evidence_invalid",
+            "quality_evidence_not_trainable",
+            "quality_evidence_changed",
+            "cleaned_provider_quality_mismatch",
+            "readiness_artifact_missing",
+            "readiness_artifact_changed",
+        }:
+            reason_code = "robust_readiness_invalid"
+        raise _blocked(reason_code)
+
+    if (
+        status.get("contract_version") != CONTRACT_VERSION
+        or status.get("acceptance_owner") != ACCEPTANCE_OWNER
+        or status.get("acceptance_contract") != ACCEPTANCE_CONTRACT
+        or status.get("status") != "ready"
+        or status.get("trainable") is not True
+    ):
+        raise _blocked("robust_readiness_invalid")
+
+    recorded_manifest_sha256 = status.get("data_manifest_sha256")
+    membership_intervals_sha256 = status.get("membership_intervals_sha256")
+    if (
+        not isinstance(recorded_manifest_sha256, str)
+        or not SHA256_RE.fullmatch(recorded_manifest_sha256)
+        or not isinstance(membership_intervals_sha256, str)
+        or not SHA256_RE.fullmatch(membership_intervals_sha256)
+    ):
+        raise _blocked("robust_readiness_invalid")
+    report_id = status.get("quality_report_id")
+    evidence_artifact_name = status.get("quality_evidence_artifact_name")
+    evidence_sha256 = status.get("quality_evidence_sha256")
+    cleaned_identity = status.get("cleaned_provider_identity")
+    if (
+        not isinstance(report_id, str)
+        or not QUALITY_REPORT_ID_RE.fullmatch(report_id)
+        or not isinstance(evidence_artifact_name, str)
+        or not QUALITY_EVIDENCE_NAME_RE.fullmatch(evidence_artifact_name)
+        or not isinstance(evidence_sha256, str)
+        or not SHA256_RE.fullmatch(evidence_sha256)
+        or report_id != f"data-quality-{evidence_sha256[:16]}"
+        or not evidence_artifact_name.endswith(
+            f"_{evidence_sha256[:16]}.json"
+        )
+        or not isinstance(cleaned_identity, Mapping)
+        or cleaned_identity.get("dataset_id") != CLEANED_PROVIDER_DATASET_ID
+        or not isinstance(cleaned_identity.get("snapshot_id"), str)
+        or Path(str(cleaned_identity.get("snapshot_id"))).name
+        != cleaned_identity.get("snapshot_id")
+        or any(
+            not isinstance(cleaned_identity.get(field), str)
+            or not SHA256_RE.fullmatch(str(cleaned_identity[field]))
+            for field in ("manifest_sha256", "content_sha256")
+        )
+    ):
+        raise _blocked("robust_readiness_invalid")
+
+    evidence_path = controlled_reports_dir / evidence_artifact_name
+    if evidence_path.parent != controlled_reports_dir:
+        raise _blocked("quality_evidence_invalid")
+    evidence_bytes = _read_regular_bytes(
+        evidence_path,
+        max_bytes=MAX_QUALITY_EVIDENCE_BYTES,
+    )
+    if evidence_bytes is None:
+        raise _blocked("quality_evidence_missing")
+    if hashlib.sha256(evidence_bytes).hexdigest() != evidence_sha256:
+        raise _blocked("quality_evidence_changed")
+    try:
+        evidence = json.loads(evidence_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise _blocked("quality_evidence_invalid") from exc
+    data_contract = evidence.get("data_contract") if isinstance(evidence, Mapping) else None
+    provider_identities = (
+        data_contract.get("qlib_providers")
+        if isinstance(data_contract, Mapping)
+        else None
+    )
+    evidence_cleaned_identity = (
+        provider_identities.get("cleaned")
+        if isinstance(provider_identities, Mapping)
+        else None
+    )
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("schema_version") != 3
+        or evidence.get("evidence_contract")
+        != "immutable_data_quality_evidence_v2"
+        or not isinstance(evidence_cleaned_identity, Mapping)
+    ):
+        raise _blocked("quality_evidence_invalid")
+    if any(
+        evidence_cleaned_identity.get(field) != cleaned_identity.get(field)
+        for field in CLEANED_PROVIDER_IDENTITY_FIELDS
+    ):
+        raise _blocked("cleaned_provider_quality_mismatch")
+
+    provider_text = status.get("provider_uri")
+    if not isinstance(provider_text, str) or not provider_text.strip():
+        raise _blocked("provider_unavailable")
+    provider = Path(provider_text).expanduser()
+    try:
+        provider = provider.resolve(strict=False)
+    except OSError as exc:
+        raise _blocked("provider_unavailable") from exc
+    if provider.parent != provider_root or provider.is_symlink():
+        raise _blocked("provider_outside_runtime")
+    if not provider.is_dir():
+        raise _blocked("provider_unavailable")
+
+    provider_key = status.get("provider_key")
+    provider_tree_sha256 = status.get("provider_tree_sha256")
+    if (
+        not isinstance(provider_key, str)
+        or not SHA256_RE.fullmatch(provider_key)
+        or provider.name != provider_key[:16]
+        or not isinstance(provider_tree_sha256, str)
+        or not SHA256_RE.fullmatch(provider_tree_sha256)
+    ):
+        raise _blocked("provider_identity_mismatch")
+    metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
+    if (
+        metadata is None
+        or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
+        or metadata.get("provider_key") != provider_key
+        or metadata.get("provider_tree_sha256") != provider_tree_sha256
+        or metadata.get("data_manifest_sha256") != recorded_manifest_sha256
+        or metadata.get("membership_intervals_sha256") != membership_intervals_sha256
+    ):
+        raise _blocked("provider_identity_mismatch")
+    runtime_identity = provider_identity(provider, provider_key)
+    if (
+        runtime_identity is None
+        or runtime_identity.get("provider_key") != provider_key
+        or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
+    ):
+        raise _blocked("provider_identity_mismatch")
+    if not (provider / "instruments" / "csi800.txt").is_file():
+        raise _blocked("csi800_instruments_missing")
+
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "acceptance_owner": ACCEPTANCE_OWNER,
+        "acceptance_contract": ACCEPTANCE_CONTRACT,
+        "status": "ready",
+        "trainable": True,
+        "reason_code": None,
+        "summary": "The data module published an accepted immutable Robust CSI800 snapshot.",
+        "summary_zh": "数据模块已发布通过验收的不可变鲁棒 CSI800 数据快照。",
+        "generated_at": status.get("generated_at"),
+        "provider_uri": str(provider),
+        "provider_name": provider.name,
+        "provider_key": provider_key,
+        "provider_tree_sha256": provider_tree_sha256,
+        "data_manifest_sha256": recorded_manifest_sha256,
+        "membership_intervals_sha256": membership_intervals_sha256,
+        "quality_report_id": report_id,
+        "quality_evidence_artifact_name": evidence_artifact_name,
+        "quality_evidence_sha256": evidence_sha256,
+        "cleaned_provider_identity": dict(cleaned_identity),
+        "canonical_snapshot_id": status.get("canonical_snapshot_id"),
+        "symbols": status.get("symbols"),
+        "intervals": status.get("intervals"),
+        "readiness_artifact_name": artifact_path.name,
+        "readiness_artifact_sha256": artifact_sha256,
+    }
+
+
+def consume_latest_accepted_robust_signal_data(
+    *,
+    pointer_path: Path,
+    provider_root: Path,
+    reports_dir: Path | None = None,
+    provider_identity: Callable[[Path, str], Mapping[str, str] | None] = (
+        runtime_provider_identity
+    ),
+) -> dict[str, Any]:
+    """Resolve latest once, then consume the selected immutable artifact."""
+
+    artifact_path, artifact_sha256, _payload = resolve_robust_signal_data_readiness(
+        pointer_path
+    )
+    return consume_accepted_robust_signal_data(
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        provider_root=provider_root,
+        reports_dir=reports_dir,
+        provider_identity=provider_identity,
+    )
+
+
 def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Remove local paths before readiness data is returned by an API."""
 
@@ -504,6 +876,8 @@ def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         key: payload.get(key)
         for key in (
             "contract_version",
+            "acceptance_owner",
+            "acceptance_contract",
             "status",
             "trainable",
             "reason_code",
@@ -516,11 +890,14 @@ def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "data_manifest_sha256",
             "membership_intervals_sha256",
             "quality_report_id",
+            "quality_evidence_artifact_name",
             "quality_evidence_sha256",
             "cleaned_provider_identity",
             "canonical_snapshot_id",
             "symbols",
             "intervals",
+            "readiness_artifact_name",
+            "readiness_artifact_sha256",
         )
         if payload.get(key) is not None
     }

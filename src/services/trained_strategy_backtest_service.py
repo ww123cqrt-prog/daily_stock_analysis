@@ -854,6 +854,7 @@ class TrainedStrategyBacktestService:
                 self._catalog_row(
                     report=report,
                     run_id=run_id,
+                    experiment_id=experiment_id,
                     model_id=str(model.get("id") or ""),
                     model_label=str(model.get("label") or model.get("id") or "Model"),
                     source_type="candidate",
@@ -870,6 +871,7 @@ class TrainedStrategyBacktestService:
         *,
         report: dict[str, Any],
         run_id: str,
+        experiment_id: str | None = None,
         model_id: str,
         model_label: str,
         source_type: str,
@@ -941,6 +943,9 @@ class TrainedStrategyBacktestService:
                 )
         return {
             "run_id": run_id,
+            "experiment_id": experiment_id
+            or str(report.get("experiment_id") or "")
+            or None,
             "model_id": model_id,
             "model_label": model_label,
             "source_type": source_type,

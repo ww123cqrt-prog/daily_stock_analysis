@@ -146,6 +146,10 @@ FORMAL_TRAINING_JOB_TYPES = {"train_baseline_lgb", "run_candidate_pipeline"}
 PROVIDER_PINNED_TRAINING_JOB_TYPES = FORMAL_TRAINING_JOB_TYPES | {
     "train_baseline_lgb_equivalence"
 }
+ROBUST_SIGNAL_DATA_PINNED_JOB_TYPES = {
+    "run_robust_signal_research",
+    "resume_robust_signal_research",
+}
 TRAINING_PROVIDER_DATASET_IDS = {
     "canonical": "qlib_ashare_v2",
     "cleaned": "qlib_ashare_cleaned_v2",
@@ -590,6 +594,36 @@ def _safe_run_id(value: Any) -> str:
             "run_id may only contain letters, numbers, underscores, or hyphens."
         )
     return raw
+
+
+def _approved_robust_signal_data_args(
+    value: Mapping[str, Any],
+) -> tuple[Path, str]:
+    artifact_text = value.get("readiness_artifact_path")
+    artifact_sha256 = value.get("readiness_artifact_sha256")
+    if (
+        not isinstance(artifact_text, str)
+        or not artifact_text.strip()
+        or not isinstance(artifact_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
+    ):
+        raise ValueError("Approved robust signal readiness identity is invalid.")
+    artifact = Path(os.path.abspath(Path(artifact_text).expanduser()))
+    readiness_root = (
+        REPORTS_ROOT / "robust_signal" / "readiness_artifacts"
+    ).resolve()
+    expected_name = f"robust_signal_data_readiness_{artifact_sha256}.json"
+    if (
+        artifact.is_symlink()
+        or not artifact.is_file()
+        or artifact.parent.resolve(strict=False) != readiness_root
+        or artifact.name != expected_name
+        or artifact.stat().st_size > 1024 * 1024
+    ):
+        raise ValueError("Approved robust signal readiness artifact is invalid.")
+    if hashlib.sha256(artifact.read_bytes()).hexdigest() != artifact_sha256:
+        raise ValueError("Approved robust signal readiness artifact hash mismatch.")
+    return artifact.resolve(), artifact_sha256
 
 
 def _safe_iso_date(value: Any, key: str) -> str:
@@ -2058,6 +2092,7 @@ class QuantJobService:
         *,
         approved_provider_identity: Optional[Mapping[str, Any]] = None,
         approved_market_data_identity: Optional[Mapping[str, Any]] = None,
+        approved_robust_signal_data: Optional[Mapping[str, Any]] = None,
     ) -> QuantJob:
         params_dict = dict(params or {})
         generated_robust_run_id: Optional[str] = None
@@ -2081,6 +2116,11 @@ class QuantJobService:
         if market_data_pinned and approved_market_data_identity is None:
             raise ValueError(
                 "Market report jobs require an approved market data identity."
+            )
+        robust_signal_data_pinned = job_type in ROBUST_SIGNAL_DATA_PINNED_JOB_TYPES
+        if robust_signal_data_pinned and approved_robust_signal_data is None:
+            raise ValueError(
+                "Robust signal research requires an approved frozen readiness artifact."
             )
         command = self._build_command(job_type, params_dict)
         if generated_robust_run_id is not None:
@@ -2118,6 +2158,23 @@ class QuantJobService:
                 else "--market-data-dir"
             )
             command.extend([data_flag, str(bars_path)])
+        if approved_robust_signal_data is not None:
+            if not robust_signal_data_pinned:
+                raise ValueError(
+                    "Approved robust signal data is only valid for robust signal jobs."
+                )
+            readiness_artifact, readiness_sha256 = _approved_robust_signal_data_args(
+                approved_robust_signal_data
+            )
+            command.extend(
+                [
+                    "--readiness-artifact",
+                    str(readiness_artifact),
+                    "--readiness-artifact-sha256",
+                    readiness_sha256,
+                ]
+            )
+            params_dict["readiness_artifact_sha256"] = readiness_sha256
         with self._lock:
             with self._connect() as conn:
                 # Serialize the conflict check and pending-row claim across all
