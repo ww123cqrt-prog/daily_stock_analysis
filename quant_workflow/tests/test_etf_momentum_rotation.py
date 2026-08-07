@@ -58,6 +58,79 @@ def test_cash_when_top_asset_is_below_its_moving_average() -> None:
     assert table.iloc[20]["signal"] == "CASH"
 
 
+def test_signal_table_accepts_three_assets_with_filter_then_rank() -> None:
+    module = load_module()
+    first = [100.0] * 20 + [130.0]
+    second = [100.0] * 20 + [120.0]
+    third = [100.0] * 20 + [110.0]
+
+    table = module.build_signal_table(
+        {
+            "SZ159915": frame("SZ159915", first),
+            "SH513100": frame("SH513100", second),
+            "SH512890": frame("SH512890", third),
+        },
+        lookback_days=20,
+        moving_average_days=20,
+        eligibility_mode="filter_then_rank",
+    )
+
+    assert table.iloc[20]["signal"] == "SZ159915"
+    assert table.iloc[20]["SZ159915_rank"] == 1
+    assert table.iloc[20]["SH513100_rank"] == 2
+    assert table.iloc[20]["SH512890_rank"] == 3
+
+
+def test_filter_then_rank_uses_best_eligible_asset_when_raw_leader_is_below_ma() -> None:
+    module = load_module()
+    # A large value 20 sessions ago lets the raw leader retain the best
+    # 20-session return while its current close remains below its 20-day MA.
+    raw_leader = [100.0] + [200.0] * 19 + [180.0]
+    eligible_runner_up = [100.0] * 20 + [120.0]
+    third = [100.0] * 20 + [105.0]
+    data = {
+        "SZ159915": frame("SZ159915", raw_leader),
+        "SH513100": frame("SH513100", eligible_runner_up),
+        "SH512890": frame("SH512890", third),
+    }
+
+    legacy = module.build_signal_table(
+        data,
+        lookback_days=20,
+        moving_average_days=20,
+    )
+    defensive = module.build_signal_table(
+        data,
+        lookback_days=20,
+        moving_average_days=20,
+        eligibility_mode="filter_then_rank",
+    )
+
+    assert legacy.iloc[20]["top_symbol"] == "SZ159915"
+    assert legacy.iloc[20]["signal"] == "CASH"
+    assert defensive.iloc[20]["top_symbol"] == "SZ159915"
+    assert defensive.iloc[20]["signal"] == "SH513100"
+
+
+def test_filter_then_rank_ties_follow_caller_symbol_order() -> None:
+    module = load_module()
+    closes = [100.0] * 20 + [120.0]
+    data = {
+        "SH512890": frame("SH512890", closes),
+        "SZ159915": frame("SZ159915", closes),
+        "SH513100": frame("SH513100", closes),
+    }
+
+    table = module.build_signal_table(
+        data,
+        lookback_days=20,
+        moving_average_days=20,
+        eligibility_mode="filter_then_rank",
+    )
+
+    assert table.iloc[20]["signal"] == "SH512890"
+
+
 def test_switch_pays_two_sides_and_cost_reduces_wealth() -> None:
     module = load_module()
     dates = pd.date_range("2026-01-01", periods=4, freq="B")

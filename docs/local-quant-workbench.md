@@ -99,6 +99,8 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 
 另设公开策略研究候选清单 `quant_workflow/configs/public_strategy_candidates.yaml`。用户提供的“两只 ETF 20 日动量轮动”已登记为 `etf_20d_two_asset_momentum_rotation`：它只比较 159915 和 513100，收盘计算信号、下一交易日开盘执行，不能与 CSI800 个股模型或 Qlib 选股结果混称。回测使用独立的 ETF 数据目录和报告目录；公开文章的收益数字只保留为未核验声明。该候选在基准成本口径下允许最大回撤 35%，这一放宽只适用于该 ETF 研究候选，不改变 CSI800 鲁棒策略的 20% 开发/确认门槛和 12% 纸面跟踪门槛。
 
+三 ETF 防守轮动是独立版本：固定使用 159915、513100、512890，先筛选站上自身 20 日均线的 ETF，再选择 20 日涨幅第一，T 日收盘产生信号、T+1 共同开盘执行；没有参数搜索。离线研究写入 `quant_workflow/reports/etf_defensive_rotation/`，网页通过 `/backtest/etf-momentum?variant=three_etf` 查看。当前只消费 `quant_data` 发布但尚未正式验收的 51 标的测试快照，所以页面和 JSON 必须保持 `research_preview`、`usable_for_trading=false`，不能输出正式候选评级。ETF 下载、清洗、修补、快照发布和质量验收全部由 `quant_data` 负责；DSA 只严格核对清单与哈希后消费，不得自行补数据。打板轨道同样遵守这条边界，目前因缺少已验收历史分钟数据而暂停，只保留只读数据契约和离线研究骨架，不启动下载、训练或实时页面。
+
 `/workflow` 的“鲁棒策略生命周期”是一条独立研究链路，不覆盖日常 `candidate_pipeline_latest` 或 `latest_training_result`。它以历史时点 CSI800 为股票池，要求按每个历史日期使用当时的 CSI300 与 CSI500 成分股，不能拿今天的成分股回看过去。历史成员默认先查询 JQData；如果历史权限不可用，才整批切换到 Baostock 的历史成分接口，实际来源、回退原因、指数代码和日期范围写入 `reference/pit_csi800/MEMBERSHIP_SOURCE.json`，同一份成员库不得静默混用两个来源。行情、成员区间、行业、ST、停牌、上市日期和板块元数据先通过固定门槛；成员区间覆盖率低于 99%、有效行情覆盖率低于 98%，或存在重复日期、未来数据、基准缺口时，状态必须是 `blocked_data`，训练不会启动。
 
 网页按以下顺序使用：
@@ -288,6 +290,7 @@ Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canoni
 - `Qlib 研究增强`：读取最新或指定 MLflow run 的 `pred.pkl`、`label.pkl`、`params.pkl` 和 `portfolio_analysis`，生成模型解释、回测明细、多实验对比、因子 IC、滚动训练计划和风险诊断报告。
 - `实验复现与产物`：在 `/experiments/` 核对本次训练使用的数据版本、provider、source config、runtime config、MLflow run id、参数、指标和关键 artifact，例如 `pred.pkl`、`portfolio_analysis`、`task`。
 - `交易策略优化预演`：在 `/workflow` 用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；它只读生成报告，不训练选股模型、不连接券商、不自动下单。
+- `ETF 固定规则报告`：`/backtest/etf-momentum` 可在旧两 ETF 报告和三 ETF 防守轮动研究预览之间切换。三 ETF 页面只读取已有报告，不从网页触发下载或重新计算；未验收快照上的最新信号始终标记为不可用于交易。
 - “按原条件重放”会在本机重新运行冻结的组合回测，冷启动可能超过 30 秒。前端只对该本地计算使用 120 秒等待上限；若仍超时，页面会说明“本地回测等待超时”，不能把它误报成外部行情、代理或网络故障。
 - `/workflow` 的任务轮询使用 `/api/v1/quant/status?include_research=false`，避免和独立研究状态接口重复组装大数据快照。需要完整状态时，后端先完成研究数据和本地服务探测，再读取可变的任务状态；因此任务在慢查询期间完成时，响应不会继续显示请求开始时的旧“运行中”状态。
 

@@ -1,6 +1,6 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -30,10 +30,13 @@ import {
 } from 'recharts';
 import {
   etfMomentumApi,
+  isEtfDefensiveRotationReport,
   isEtfMomentumStrategyReport,
+  type EtfMomentumVariant,
   type EtfMomentumStrategyResponse,
 } from '../api/etfMomentum';
 import { quantApi } from '../api/quant';
+import EtfDefensiveRotationReport from '../components/backtest/EtfDefensiveRotationReport';
 import { Badge, EmptyState, InlineAlert } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 
@@ -49,6 +52,11 @@ const COPY = {
     title: 'ETF 动量轮动完整策略报告',
     eyebrow: 'Fixed-rule research',
     subtitle: '固定比较创业板 ETF（159915）和纳指 ETF（513100）的 20 日动量与 20 日均线，不做参数优化。',
+    twoEtfVariant: '两 ETF 动量轮动',
+    threeEtfVariant: '三 ETF 防守轮动',
+    variantLabel: '报告版本',
+    defensiveTitle: '三 ETF 防守轮动研究预览',
+    defensiveSubtitle: '固定轮动创业板 ETF（159915）、纳指 ETF（513100）和红利低波 ETF（512890）；仅消费 quant_data 已发布的测试快照。',
     back: '返回回测页',
     workflow: '工作流',
     reload: '重新读取',
@@ -137,9 +145,13 @@ const COPY = {
     reproducibility: '复现信息',
     missingTitle: '尚未生成 ETF 策略报告',
     missingDescription: '点击“生成报告”后，后台会读取本地 ETF 数据并生成统一 JSON；不会连接券商或下单。',
+    defensiveMissingTitle: '尚无三 ETF 研究预览',
+    defensiveMissingDescription: '请先运行离线研究，再重新读取本页。',
     generate: '生成报告',
     invalidTitle: 'ETF 策略报告无法读取',
     invalidDescription: '报告文件损坏或超出安全大小。请重新生成后再试。',
+    defensiveInvalidTitle: '三 ETF 研究预览无法读取',
+    defensiveInvalidDescription: '研究产物损坏或超出安全大小；请重新运行离线研究后再读取。',
     loading: '正在读取 ETF 策略报告',
     generationFailed: '报告生成失败',
     readFailed: '报告读取失败',
@@ -148,6 +160,11 @@ const COPY = {
     title: 'Complete ETF Momentum Rotation Report',
     eyebrow: 'Fixed-rule research',
     subtitle: 'A fixed 20-day momentum and 20-day moving-average rule for ChiNext ETF 159915 and Nasdaq ETF 513100. No parameter optimization.',
+    twoEtfVariant: 'Two-ETF momentum',
+    threeEtfVariant: 'Three-ETF defensive',
+    variantLabel: 'Report variant',
+    defensiveTitle: 'Three-ETF Defensive Rotation Research Preview',
+    defensiveSubtitle: 'A fixed rotation across ChiNext ETF 159915, Nasdaq ETF 513100, and dividend low-volatility ETF 512890, consuming only the test snapshot published by quant_data.',
     back: 'Back to backtests',
     workflow: 'Workflow',
     reload: 'Reload',
@@ -236,9 +253,13 @@ const COPY = {
     reproducibility: 'Reproducibility',
     missingTitle: 'ETF strategy report has not been generated',
     missingDescription: 'Generate it from local ETF data. This does not connect to a broker or place orders.',
+    defensiveMissingTitle: 'No three-ETF research preview is available',
+    defensiveMissingDescription: 'Run the offline research first, then reload this page.',
     generate: 'Generate report',
     invalidTitle: 'ETF strategy report cannot be read',
     invalidDescription: 'The report is malformed or exceeds the safe response size. Regenerate it and retry.',
+    defensiveInvalidTitle: 'The three-ETF research preview cannot be read',
+    defensiveInvalidDescription: 'The research artifact is malformed or exceeds the safe size. Rerun the offline research, then reload.',
     loading: 'Loading ETF strategy report',
     generationFailed: 'Report generation failed',
     readFailed: 'Report loading failed',
@@ -404,30 +425,73 @@ async function waitForJob(jobId: string): Promise<'completed' | 'failed' | 'canc
 const EtfMomentumReportPage: React.FC = () => {
   const { language } = useUiLanguage();
   const copy = COPY[language];
+  const [searchParams, setSearchParams] = useSearchParams();
+  const variant: EtfMomentumVariant = searchParams.get('variant') === 'three_etf'
+    ? 'three_etf'
+    : 'two_etf';
+  const defensiveMode = variant === 'three_etf';
   const [response, setResponse] = useState<EtfMomentumStrategyResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestSequence = useRef(0);
+  const generationSequence = useRef(0);
+  const activeVariant = useRef<EtfMomentumVariant>(variant);
 
   const loadReport = useCallback(async () => {
+    if (activeVariant.current !== variant) return;
+    const requestId = requestSequence.current + 1;
+    requestSequence.current = requestId;
     setLoading(true);
     setError(null);
     try {
-      setResponse(await etfMomentumApi.getReport());
+      const nextResponse = await etfMomentumApi.getReport(variant);
+      if (requestSequence.current === requestId) {
+        setResponse(nextResponse);
+      }
     } catch {
-      setError(copy.readFailed);
+      if (requestSequence.current === requestId) {
+        setError(copy.readFailed);
+      }
     } finally {
-      setLoading(false);
+      if (requestSequence.current === requestId) {
+        setLoading(false);
+      }
     }
-  }, [copy.readFailed]);
+  }, [copy.readFailed, variant]);
 
   useEffect(() => {
-    document.title = `${copy.title} - DSA`;
+    activeVariant.current = variant;
+  }, [variant]);
+
+  useEffect(() => {
+    document.title = `${defensiveMode ? copy.defensiveTitle : copy.title} - DSA`;
     void loadReport();
-  }, [copy.title, loadReport]);
+  }, [copy.defensiveTitle, copy.title, defensiveMode, loadReport]);
+
+  const selectVariant = useCallback((nextVariant: EtfMomentumVariant) => {
+    if (nextVariant === variant) return;
+    activeVariant.current = nextVariant;
+    requestSequence.current += 1;
+    generationSequence.current += 1;
+    setResponse(null);
+    setLoading(true);
+    setGenerating(false);
+    setError(null);
+    const nextParams = new URLSearchParams(searchParams);
+    if (nextVariant === 'three_etf') {
+      nextParams.set('variant', 'three_etf');
+    } else {
+      nextParams.delete('variant');
+    }
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, setSearchParams, variant]);
 
   const generateReport = useCallback(async () => {
     if (generating) return;
+    const generationId = generationSequence.current + 1;
+    generationSequence.current = generationId;
+    const generationVariant = variant;
     setGenerating(true);
     setError(null);
     try {
@@ -438,15 +502,29 @@ const EtfMomentumReportPage: React.FC = () => {
       if (status !== 'completed') {
         throw new Error(status);
       }
-      await loadReport();
+      if (
+        generationSequence.current === generationId
+        && activeVariant.current === generationVariant
+      ) {
+        await loadReport();
+      }
     } catch {
-      setError(copy.generationFailed);
+      if (
+        generationSequence.current === generationId
+        && activeVariant.current === generationVariant
+      ) {
+        setError(copy.generationFailed);
+      }
     } finally {
-      setGenerating(false);
+      if (generationSequence.current === generationId) {
+        setGenerating(false);
+      }
     }
-  }, [copy.generationFailed, generating, loadReport]);
+  }, [copy.generationFailed, generating, loadReport, variant]);
 
-  const report = isEtfMomentumStrategyReport(response) ? response : null;
+  const report = !defensiveMode && isEtfMomentumStrategyReport(response) ? response : null;
+  const defensiveReport = defensiveMode && isEtfDefensiveRotationReport(response) ? response : null;
+  const activeReport = defensiveMode ? defensiveReport : report;
   const stale = report ? isStale(report.generatedAt) : false;
   const failureConditions = useMemo(() => {
     if (!report) return [];
@@ -455,12 +533,39 @@ const EtfMomentumReportPage: React.FC = () => {
       : report.risk.knownFailureConditions;
   }, [language, report]);
 
+  const pageTitle = defensiveMode ? copy.defensiveTitle : copy.title;
+  const pageSubtitle = defensiveMode ? copy.defensiveSubtitle : copy.subtitle;
+
   const header = (
     <header className="flex flex-col gap-5 border-b border-border/60 pb-6 lg:flex-row lg:items-end lg:justify-between">
       <div className="min-w-0">
         <span className="label-uppercase">{copy.eyebrow}</span>
-        <h1 className="mt-2 text-2xl font-semibold text-foreground sm:text-3xl">{copy.title}</h1>
-        <p className="mt-2 max-w-4xl text-sm leading-6 text-secondary-text">{copy.subtitle}</p>
+        <h1 className="mt-2 text-2xl font-semibold text-foreground sm:text-3xl">{pageTitle}</h1>
+        <p className="mt-2 max-w-4xl text-sm leading-6 text-secondary-text">{pageSubtitle}</p>
+        <div
+          className="mt-4 inline-flex max-w-full border border-border/70 bg-card/45 p-1"
+          aria-label={copy.variantLabel}
+          data-print-hide
+        >
+          {([
+            ['two_etf', copy.twoEtfVariant],
+            ['three_etf', copy.threeEtfVariant],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={`min-h-8 px-3 py-1 text-sm font-medium transition-colors ${
+                variant === value
+                  ? 'bg-foreground text-base'
+                  : 'text-secondary-text hover:bg-hover hover:text-foreground'
+              }`}
+              aria-pressed={variant === value}
+              onClick={() => selectVariant(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       <div className="flex flex-wrap gap-2" data-print-hide>
         <Link to="/backtest" className="btn-secondary h-9 gap-2 px-3 text-sm">
@@ -472,10 +577,12 @@ const EtfMomentumReportPage: React.FC = () => {
           <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           {copy.reload}
         </button>
-        <button type="button" className="btn-primary h-9 gap-2 px-3 text-sm" onClick={() => void generateReport()} disabled={generating}>
-          {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-          {generating ? copy.generating : copy.regenerate}
-        </button>
+        {!defensiveMode ? (
+          <button type="button" className="btn-primary h-9 gap-2 px-3 text-sm" onClick={() => void generateReport()} disabled={generating}>
+            {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {generating ? copy.generating : copy.regenerate}
+          </button>
+        ) : null}
         <button type="button" className="btn-secondary h-9 gap-2 px-3 text-sm" onClick={() => window.print()}>
           <FileDown className="h-4 w-4" />
           {copy.print}
@@ -498,8 +605,14 @@ const EtfMomentumReportPage: React.FC = () => {
     );
   }
 
-  if (!report) {
+  if (!activeReport) {
     const missing = response?.status === 'missing';
+    const emptyTitle = defensiveMode
+      ? (missing ? copy.defensiveMissingTitle : copy.defensiveInvalidTitle)
+      : (missing ? copy.missingTitle : copy.invalidTitle);
+    const emptyDescription = defensiveMode
+      ? (missing ? copy.defensiveMissingDescription : copy.defensiveInvalidDescription)
+      : (missing ? copy.missingDescription : copy.invalidDescription);
     return (
       <main className="etf-report-page min-h-screen bg-base px-4 py-6 sm:px-6 lg:px-8">
         <div className="mx-auto max-w-[1480px]">
@@ -508,20 +621,34 @@ const EtfMomentumReportPage: React.FC = () => {
           <div className="py-10">
             <EmptyState
               icon={missing ? <FileDown className="h-8 w-8" /> : <AlertTriangle className="h-8 w-8" />}
-              title={missing ? copy.missingTitle : copy.invalidTitle}
-              description={missing ? copy.missingDescription : copy.invalidDescription}
-              action={(
+              title={emptyTitle}
+              description={emptyDescription}
+              action={!defensiveMode ? (
                 <button type="button" className="btn-primary gap-2" onClick={() => void generateReport()} disabled={generating}>
                   {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                   {generating ? copy.generating : copy.generate}
                 </button>
-              )}
+              ) : undefined}
             />
           </div>
         </div>
       </main>
     );
   }
+
+  if (defensiveReport) {
+    return (
+      <main className="etf-report-page min-h-screen bg-base px-4 py-6 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-[1480px]">
+          {header}
+          {error ? <InlineAlert className="mt-5" variant="danger" title={copy.readFailed} message={error} /> : null}
+          <EtfDefensiveRotationReport report={defensiveReport} language={language} />
+        </div>
+      </main>
+    );
+  }
+
+  if (!report) return null;
 
   const baseline = report.performance.variants.baseline?.metrics ?? {};
   const stress = report.performance.variants.stress?.metrics ?? {};

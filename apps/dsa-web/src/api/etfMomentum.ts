@@ -1,6 +1,8 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
 
+export type EtfMomentumVariant = 'two_etf' | 'three_etf';
+
 export type EtfMomentumMetrics = {
   periods?: number;
   startDate?: string;
@@ -178,19 +180,176 @@ export type EtfMomentumStrategyReport = {
   };
 };
 
-export type EtfMomentumStrategyResponse = EtfMomentumStrategyReport | EtfMomentumReportState;
+export type EtfDefensiveRotationMetrics = EtfMomentumMetrics & {
+  endDate?: string;
+  startDate?: string;
+};
+
+export type EtfDefensiveRotationReport = {
+  schemaVersion: number;
+  status: 'research_preview' | string;
+  generatedAt: string;
+  researchId: string;
+  runId: string;
+  summary: {
+    status: string;
+    formalCandidateStatus: string | null;
+    classificationEnabled: boolean;
+    classificationReason: string;
+    usableForTrading: boolean;
+    dataStart: string;
+    dataEnd: string;
+    primaryMetrics: EtfDefensiveRotationMetrics;
+    maxDrawdownLimit: number;
+    historyWarning: string;
+  };
+  strategy: {
+    name: string;
+    symbols: string[];
+    lookbackDays: number;
+    movingAverageDays: number;
+    eligibilityMode: string;
+    signalAt: string;
+    executionAt: string;
+    parameterSearch: boolean;
+    commissionBpsEachSide: number;
+    baseSlippageBpsEachSide: number;
+    allIneligiblePosition?: string;
+    warmupPosition?: string;
+    stampDutyApplied?: boolean;
+    transferFeeApplied?: boolean;
+  };
+  dataQuality: {
+    runtimeStatus: string;
+    formallyAccepted: boolean;
+    usableForTrading: boolean;
+    datasetId: string;
+    snapshotId: string;
+    commonStart: string;
+    commonEnd: string;
+    contentSha256?: string;
+    manifestSha256?: string;
+    requiredSymbols?: string[];
+  };
+  performance: {
+    primaryMetrics: EtfDefensiveRotationMetrics;
+    comparators: Record<string, EtfDefensiveRotationMetrics>;
+    periods: Record<string, {
+      start: string;
+      end: string;
+      strategy: EtfDefensiveRotationMetrics;
+      legacyTwoEtf: EtfDefensiveRotationMetrics;
+    }>;
+    incrementalEvidenceVsLegacyTwoEtf: {
+      fullAnnualizedDelta: number | null;
+      validationAnnualizedDelta: number | null;
+      observationAnnualizedDelta: number | null;
+      bootstrapCi95Lower: number | null;
+      leaveOneYearPositiveRatio: number | null;
+      maxDrawdown?: number | null;
+    };
+  };
+  stability: {
+    costStress: Record<string, EtfDefensiveRotationMetrics>;
+    blockBootstrap: {
+      ci95Lower: number | null;
+      ci95Upper: number | null;
+      positiveProbability: number | null;
+      blockDays?: number;
+      samples?: number;
+      method?: string;
+    };
+    leaveOneYearPositiveRatio: number | null;
+    startDateSensitivity: Array<{
+      requestedStart: string;
+      actualStart: string;
+      annualizedReturnDelta: number | null;
+      strategy: EtfDefensiveRotationMetrics;
+      legacyTwoEtf: EtfDefensiveRotationMetrics;
+    }>;
+    marketRegimeAttribution: {
+      status: string;
+      benchmark?: string;
+      momentumDays?: number;
+      trendDays?: number;
+      reason?: string;
+      regimes?: Record<string, EtfDefensiveRotationMetrics>;
+    };
+  };
+  holdingBehavior: {
+    positionFraction: Record<string, number>;
+    switchCount: number;
+    investedFraction: number;
+  };
+  latestSignal: {
+    asOfDate: string;
+    signalForNextCommonOpen: string;
+    positionAtLatestOpen: string;
+    usableForTrading: boolean;
+  };
+  benchmarks: {
+    available: Array<{ symbol: string; name: string }>;
+    missing: string[];
+    substitutionUsed: boolean;
+    dataIdentity?: {
+      datasetId: string;
+      snapshotId: string;
+      contentSha256?: string;
+    };
+    loadError?: string | null;
+  };
+  chartData: {
+    equity: Array<{ date: string } & Record<string, number | string | null>>;
+    drawdown: Array<{ date: string; strategy: number | null }>;
+    yearlyReturns: Array<{
+      year: number;
+      strategy: number;
+      twoEtfEligibleFirst?: number;
+      twoEtfLegacyExact?: number;
+    }>;
+  };
+  reproducibility: {
+    configSha256?: string;
+    gitCommit?: string;
+    gitBranch?: string;
+    gitDirty?: boolean;
+    configFile?: string;
+  };
+  boundaries?: {
+    automaticOrders?: boolean;
+    brokerConnected?: boolean;
+    dataCleaningPerformedByDsa?: boolean;
+    dataDownloadPerformedByDsa?: boolean;
+    formalCandidateLabelsSuppressed?: boolean;
+    parameterSearchPerformed?: boolean;
+  };
+};
+
+export type EtfMomentumStrategyResponse =
+  | EtfMomentumStrategyReport
+  | EtfDefensiveRotationReport
+  | EtfMomentumReportState;
 
 export function isEtfMomentumStrategyReport(
   value: EtfMomentumStrategyResponse | null,
 ): value is EtfMomentumStrategyReport {
-  return Boolean(value && 'summary' in value && 'chartData' in value);
+  return Boolean(value && 'strategyId' in value && 'chartData' in value);
+}
+
+export function isEtfDefensiveRotationReport(
+  value: EtfMomentumStrategyResponse | null,
+): value is EtfDefensiveRotationReport {
+  return Boolean(value && 'researchId' in value && 'chartData' in value);
 }
 
 export const etfMomentumApi = {
-  async getReport(): Promise<EtfMomentumStrategyResponse> {
+  async getReport(variant: EtfMomentumVariant = 'two_etf'): Promise<EtfMomentumStrategyResponse> {
     const response = await apiClient.get<Record<string, unknown>>(
       '/api/v1/research/strategies/etf-momentum',
+      { params: { variant } },
     );
-    return toCamelCase<EtfMomentumStrategyResponse>(response.data);
+    return toCamelCase<EtfMomentumStrategyResponse>(response.data, {
+      exclude: [/^(?:SH|SZ)\d{6}$/, 'CASH'],
+    });
   },
 };

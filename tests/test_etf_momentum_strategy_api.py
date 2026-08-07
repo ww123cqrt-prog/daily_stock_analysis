@@ -35,6 +35,41 @@ def test_etf_momentum_strategy_api_returns_canonical_report(tmp_path: Path) -> N
     assert response.json() == payload
 
 
+def test_etf_momentum_strategy_api_selects_three_etf_preview(tmp_path: Path) -> None:
+    report_path = tmp_path / "three_etf" / "strategy_report_latest.json"
+    report_path.parent.mkdir()
+    payload = {
+        "schema_version": 1,
+        "status": "research_preview",
+        "research_id": "etf_20d_three_asset_defensive_rotation",
+        "summary": {
+            "formal_candidate_status": None,
+            "usable_for_trading": False,
+        },
+        "chart_data": {"equity": []},
+    }
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with patch(
+        "api.v1.endpoints.etf_momentum_strategy.ETF_DEFENSIVE_REPORT_PATH",
+        report_path,
+    ):
+        response = client().get(
+            "/api/v1/research/strategies/etf-momentum?variant=three_etf"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == payload
+
+
+def test_etf_momentum_strategy_api_rejects_unknown_variant() -> None:
+    response = client().get(
+        "/api/v1/research/strategies/etf-momentum?variant=unknown"
+    )
+
+    assert response.status_code == 422
+
+
 def test_etf_momentum_strategy_api_reports_missing_artifact(tmp_path: Path) -> None:
     with patch(
         "api.v1.endpoints.etf_momentum_strategy.ETF_REPORT_PATH",

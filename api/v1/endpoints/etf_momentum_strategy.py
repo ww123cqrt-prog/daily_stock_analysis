@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from fastapi import APIRouter
 
@@ -15,6 +15,11 @@ from src.services.quant_workflow_paths import dsa_root, reports_root
 ETF_REPORT_PATH = (
     reports_root(dsa_root())
     / "etf_momentum_rotation"
+    / "strategy_report_latest.json"
+)
+ETF_DEFENSIVE_REPORT_PATH = (
+    reports_root(dsa_root())
+    / "etf_defensive_rotation"
     / "strategy_report_latest.json"
 )
 ETF_REPORT_MAX_BYTES = 12 * 1024 * 1024
@@ -74,5 +79,8 @@ def read_etf_momentum_strategy_report(
 
 
 @router.get("/strategies/etf-momentum")
-async def get_etf_momentum_strategy_report() -> Dict[str, Any]:
-    return read_etf_momentum_strategy_report(ETF_REPORT_PATH)
+async def get_etf_momentum_strategy_report(
+    variant: Literal["two_etf", "three_etf"] = "two_etf",
+) -> Dict[str, Any]:
+    path = ETF_DEFENSIVE_REPORT_PATH if variant == "three_etf" else ETF_REPORT_PATH
+    return read_etf_momentum_strategy_report(path)
