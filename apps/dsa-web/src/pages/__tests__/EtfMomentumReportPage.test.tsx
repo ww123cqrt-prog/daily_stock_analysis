@@ -1,5 +1,5 @@
 import type React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
@@ -14,7 +14,8 @@ const { getReport, submitJob, getJob } = vi.hoisted(() => ({
 
 vi.mock('../../api/etfMomentum', () => ({
   etfMomentumApi: { getReport },
-  isEtfMomentumStrategyReport: (value: Record<string, unknown> | null) => Boolean(value?.summary && value?.chartData),
+  isEtfMomentumStrategyReport: (value: Record<string, unknown> | null) => Boolean(value?.strategyId && value?.summary && value?.chartData),
+  isEtfDefensiveRotationReport: (value: Record<string, unknown> | null) => Boolean(value?.researchId && value?.summary && value?.chartData),
 }));
 
 vi.mock('../../api/quant', () => ({
@@ -23,6 +24,9 @@ vi.mock('../../api/quant', () => ({
 
 vi.mock('recharts', () => {
   const Wrapper = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
+  const Line = ({ dataKey, name }: { dataKey?: string; name?: string }) => (
+    <div data-testid={`mock-line-${dataKey}`}>{name ?? dataKey}</div>
+  );
   return {
     Area: Wrapper,
     AreaChart: Wrapper,
@@ -32,7 +36,7 @@ vi.mock('recharts', () => {
     Cell: Wrapper,
     ComposedChart: Wrapper,
     Legend: Wrapper,
-    Line: Wrapper,
+    Line,
     LineChart: Wrapper,
     ReferenceLine: Wrapper,
     ResponsiveContainer: Wrapper,
@@ -187,6 +191,135 @@ const report = {
   reproducibility: { configHash: 'config', dataManifestHash: 'data', gitCommit: 'deadbeef', gitDirty: true, generatedAt: '2026-07-25T21:48:09+08:00' },
 };
 
+const defensiveReport = {
+  schemaVersion: 1,
+  status: 'research_preview',
+  generatedAt: '2026-08-07T16:10:58+08:00',
+  researchId: 'etf_20d_three_asset_defensive_rotation',
+  runId: 'preview-run',
+  summary: {
+    status: 'research_preview',
+    formalCandidateStatus: null,
+    classificationEnabled: false,
+    classificationReason: 'not formally accepted',
+    usableForTrading: false,
+    dataStart: '2019-01-18',
+    dataEnd: '2026-08-06',
+    primaryMetrics: {
+      startDate: '2019-01-18',
+      endDate: '2026-08-06',
+      totalReturn: 4.1485,
+      annualizedReturn: 0.2538,
+      maxDrawdown: -0.2897,
+      switchCount: 327,
+      investedFraction: 0.8724,
+      sideCostBps: 0.5,
+    },
+    maxDrawdownLimit: 0.35,
+    historyWarning: '三只ETF共同历史自2019-01-18开始，约7.5年。',
+  },
+  strategy: {
+    name: '创业板ETF-纳指ETF-红利低波ETF 20日防守轮动交易策略',
+    symbols: ['SZ159915', 'SH513100', 'SH512890'],
+    lookbackDays: 20,
+    movingAverageDays: 20,
+    eligibilityMode: 'filter_then_rank',
+    signalAt: 'close',
+    executionAt: 'next_common_open',
+    parameterSearch: false,
+    commissionBpsEachSide: 0.5,
+    baseSlippageBpsEachSide: 0,
+  },
+  dataQuality: {
+    runtimeStatus: 'research_preview',
+    formallyAccepted: false,
+    usableForTrading: false,
+    datasetId: 'cn_etf_daily',
+    snapshotId: 'cn-etf-local-union51',
+    commonStart: '2019-01-18',
+    commonEnd: '2026-08-06',
+  },
+  performance: {
+    primaryMetrics: {
+      startDate: '2019-01-18',
+      endDate: '2026-08-06',
+      totalReturn: 4.1485,
+      annualizedReturn: 0.2538,
+      maxDrawdown: -0.2897,
+      switchCount: 327,
+      investedFraction: 0.8724,
+      sideCostBps: 0.5,
+    },
+    comparators: {
+      SZ159915: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 1.9069, annualizedReturn: 0.1587, maxDrawdown: -0.5693 },
+      SH513100: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.7321, annualizedReturn: 0.2393, maxDrawdown: -0.2862 },
+      SH512890: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 1.3307, annualizedReturn: 0.1239, maxDrawdown: -0.1682 },
+      threeEtfEqualWeight: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 2.3232, annualizedReturn: 0.1803, maxDrawdown: -0.2221 },
+      twoEtfLegacyExact: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.8160, annualizedReturn: 0.2423, maxDrawdown: -0.2940 },
+      twoEtfEligibleFirst: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.7987, annualizedReturn: 0.2417, maxDrawdown: -0.3115 },
+      SH000300: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.4617, annualizedReturn: 0.0538, maxDrawdown: -0.4666 },
+      SH000905: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.7337, annualizedReturn: 0.0790, maxDrawdown: -0.4219 },
+      SH000906: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.5254, annualizedReturn: 0.0601, maxDrawdown: -0.4397 },
+      SZ399006: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 1.6708, annualizedReturn: 0.1454, maxDrawdown: -0.5767 },
+      SH000688: { startDate: '2020-01-02', endDate: '2026-08-04', totalReturn: 0.5608, annualizedReturn: 0.0730, maxDrawdown: -0.6221 },
+    },
+    periods: {
+      validation: {
+        start: '2023-01-01',
+        end: '2024-12-31',
+        strategy: { annualizedReturn: 0.2213, maxDrawdown: -0.2897 },
+        legacyTwoEtf: { annualizedReturn: 0.2917, maxDrawdown: -0.2741 },
+      },
+    },
+    incrementalEvidenceVsLegacyTwoEtf: {
+      fullAnnualizedDelta: 0.0115,
+      validationAnnualizedDelta: -0.0705,
+      observationAnnualizedDelta: -0.0294,
+      bootstrapCi95Lower: -0.0733,
+      leaveOneYearPositiveRatio: 0.875,
+    },
+  },
+  stability: {
+    costStress: {
+      '0bpSlippage': { annualizedReturn: 0.2538, maxDrawdown: -0.2897, sideCostBps: 0.5 },
+      '1bpSlippage': { annualizedReturn: 0.2446, maxDrawdown: -0.2907, sideCostBps: 1.5 },
+      '2bpSlippage': { annualizedReturn: 0.2355, maxDrawdown: -0.2917, sideCostBps: 2.5 },
+    },
+    blockBootstrap: { ci95Lower: -0.0733, ci95Upper: 0.0974, positiveProbability: 0.6 },
+    leaveOneYearPositiveRatio: 0.875,
+    startDateSensitivity: [],
+    marketRegimeAttribution: { status: 'available', regimes: {} },
+  },
+  holdingBehavior: {
+    positionFraction: { CASH: 0.1276, SH512890: 0.31 },
+    switchCount: 327,
+    investedFraction: 0.8724,
+  },
+  latestSignal: {
+    asOfDate: '2026-08-06',
+    signalForNextCommonOpen: 'SH512890',
+    positionAtLatestOpen: 'SH513100',
+    usableForTrading: false,
+  },
+  benchmarks: {
+    available: [
+      { symbol: 'SH000300', name: '沪深300' },
+      { symbol: 'SH000905', name: '中证500' },
+      { symbol: 'SH000906', name: '中证800' },
+      { symbol: 'SZ399006', name: '创业板指' },
+      { symbol: 'SH000688', name: '科创50' },
+    ],
+    missing: [],
+    substitutionUsed: false,
+  },
+  chartData: {
+    equity: [{ date: '2026-08-04', strategy: 5.1, SZ159915: 2.9, SH513100: 4.7, SH512890: 2.3, SH000300: 1.46, SH000905: 1.73, SH000906: 1.53, SZ399006: 2.67, SH000688: 1.56 }],
+    drawdown: [{ date: '2026-08-04', strategy: -0.1, SH000300: -0.2, SH000905: -0.18, SH000906: -0.19, SZ399006: -0.3, SH000688: -0.35 }],
+    yearlyReturns: [{ year: 2025, strategy: 0.2 }],
+  },
+  reproducibility: { configSha256: 'config', gitCommit: 'deadbeef' },
+};
+
 function renderPage(language: 'zh' | 'en' = 'zh') {
   localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, language);
   return render(
@@ -249,5 +382,155 @@ describe('EtfMomentumReportPage', () => {
 
     expect(await screen.findByText('尚未生成 ETF 策略报告')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '生成报告' })).toBeInTheDocument();
+  });
+
+  it('switches to the three-ETF research preview without exposing a generation action', async () => {
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? defensiveReport : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '三 ETF 防守轮动' }));
+
+    expect(await screen.findByRole('heading', { name: '三 ETF 防守轮动研究预览' })).toBeInTheDocument();
+    expect(getReport).toHaveBeenLastCalledWith('three_etf');
+    expect(screen.getByText('512890')).toBeInTheDocument();
+    expect(screen.getByText('单边佣金 0.5bp = 成交金额的 0.005%')).toBeInTheDocument();
+    expect(screen.getAllByText('不可用于交易').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('defensive-equity-chart')).toBeInTheDocument();
+    expect(screen.getByTestId('defensive-drawdown-chart')).toBeInTheDocument();
+    expect(screen.getAllByRole('columnheader', { name: '年化波动' }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('columnheader', { name: '夏普比率（无风险利率 0%）' }).length).toBeGreaterThan(0);
+    const comparisonTable = screen.getByRole('table', { name: '策略、ETF 与大盘完整指标对比' });
+    expect(within(comparisonTable).getByRole('columnheader', { name: '区间' })).toBeInTheDocument();
+    const strategyRow = within(comparisonTable).getByRole('row', { name: new RegExp(defensiveReport.strategy.name) });
+    expect(within(strategyRow).getByRole('cell', { name: '2019-01-18 - 2026-08-06' })).toBeInTheDocument();
+    const chinextRow = within(comparisonTable).getByRole('row', { name: /创业板指/ });
+    expect(within(chinextRow).getByRole('cell', { name: '2019-01-18 - 2026-08-04' })).toBeInTheDocument();
+    const star50Row = within(comparisonTable).getByRole('row', { name: /科创50/ });
+    expect(within(star50Row).getByRole('cell', { name: '2020-01-02 - 2026-08-04' })).toBeInTheDocument();
+    expect(screen.getAllByText(defensiveReport.strategy.name).length).toBeGreaterThanOrEqual(4);
+    expect(screen.getByRole('cell', { name: '沪深300' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '中证500' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '中证800' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '创业板指' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '科创50' })).toBeInTheDocument();
+    expect(screen.queryByText('数据不可用')).not.toBeInTheDocument();
+    expect(screen.queryByText('年化差值')).not.toBeInTheDocument();
+    expect(screen.queryByText(/加入\s*512890\s*后/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新计算报告' })).not.toBeInTheDocument();
+  });
+
+  it('does not let a completed two-ETF generation overwrite the selected three-ETF report', async () => {
+    let finishGeneration: ((job: { jobId: string; status: string }) => void) | undefined;
+    submitJob.mockReturnValueOnce(new Promise((resolve) => {
+      finishGeneration = resolve;
+    }));
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? defensiveReport : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '重新计算报告' }));
+    await waitFor(() => expect(submitJob).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '三 ETF 防守轮动' }));
+    expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
+
+    await act(async () => {
+      finishGeneration?.({ jobId: 'qj_delayed', status: 'completed' });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(getReport).toHaveBeenLastCalledWith('three_etf'));
+    expect(screen.getByTestId('defensive-equity-chart')).toBeInTheDocument();
+  });
+
+  it('does not show a stale two-ETF generation failure after switching to three ETFs', async () => {
+    let failGeneration: ((reason?: unknown) => void) | undefined;
+    submitJob.mockReturnValueOnce(new Promise((_, reject) => {
+      failGeneration = reject;
+    }));
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? defensiveReport : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '重新计算报告' }));
+    await waitFor(() => expect(submitJob).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '三 ETF 防守轮动' }));
+    expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
+
+    await act(async () => {
+      failGeneration?.(new Error('old two-ETF job failed'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId('defensive-equity-chart')).toBeInTheDocument();
+    expect(screen.queryByText('报告生成失败')).not.toBeInTheDocument();
+  });
+
+  it('renders the three-ETF preview when market-regime attribution is unavailable', async () => {
+    const reportWithoutRegimes = {
+      ...defensiveReport,
+      stability: {
+        ...defensiveReport.stability,
+        marketRegimeAttribution: {
+          status: 'unavailable',
+          reason: 'SH000300 benchmark is missing',
+        },
+      },
+    };
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? reportWithoutRegimes : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '三 ETF 防守轮动' }));
+
+    expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
+    expect(screen.getByText('SH000300 benchmark is missing')).toBeInTheDocument();
+  });
+
+  it('does not draw unavailable benchmark series in the charts', async () => {
+    const reportWithoutChinext = {
+      ...defensiveReport,
+      benchmarks: {
+        ...defensiveReport.benchmarks,
+        available: defensiveReport.benchmarks.available.filter(({ symbol }) => symbol !== 'SZ399006'),
+        missing: ['SZ399006'],
+      },
+      performance: {
+        ...defensiveReport.performance,
+        comparators: {
+          ...defensiveReport.performance.comparators,
+          SZ399006: { status: 'unavailable', reason: 'benchmark_data_missing' },
+        },
+      },
+    };
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? reportWithoutChinext : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '三 ETF 防守轮动' }));
+
+    expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
+    expect(screen.queryByTestId('mock-line-SZ399006')).not.toBeInTheDocument();
+    expect(screen.getAllByTestId('mock-line-SH000688').length).toBeGreaterThan(0);
+  });
+
+  it('uses three-ETF-specific guidance when the preview artifact is missing', async () => {
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf'
+        ? { status: 'missing', reasonCode: 'report_not_generated', message: 'not generated' }
+        : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '三 ETF 防守轮动' }));
+
+    expect(await screen.findByText('尚无三 ETF 研究预览')).toBeInTheDocument();
+    expect(screen.getByText('请先运行离线研究，再重新读取本页。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '生成报告' })).not.toBeInTheDocument();
   });
 });

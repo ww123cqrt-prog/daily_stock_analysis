@@ -1,0 +1,92 @@
+version: 1
+research_id: etf_20d_three_asset_defensive_rotation
+research_only: true
+
+strategy:
+  name: 创业板ETF-纳指ETF-红利低波ETF 20日防守轮动交易策略
+  symbols:
+    - SZ159915
+    - SH513100
+    - SH512890
+  lookback_days: 20
+  moving_average_days: 20
+  eligibility_mode: filter_then_rank
+  signal_at: close
+  execution_at: next_common_open
+  all_ineligible_position: CASH
+  parameter_search: false
+
+costs:
+  commission_bps_each_side: 0.5
+  slippage_bps_each_side:
+    - 0.0
+    - 1.0
+    - 2.0
+  minimum_commission_applied: false
+  stamp_duty_applied: false
+  transfer_fee_applied: false
+
+data:
+  dataset_id: cn_etf_daily
+  required_data_kind: paired_daily_bars
+  required_price_basis: qfq
+  required_runtime_status: research_preview
+  formal_acceptance_proven: false
+  require_common_trading_days: true
+
+periods:
+  construction:
+    start: 2019-01-18
+    end: 2022-12-31
+  validation:
+    start: 2023-01-01
+    end: 2024-12-31
+  observation:
+    start: 2025-01-01
+    end: latest
+
+comparators:
+  etf_buy_and_hold:
+    - SZ159915
+    - SH513100
+    - SH512890
+  equal_weight_buy_and_hold: true
+  legacy_two_etf_rule: true
+  eligible_first_two_etf_rule: true
+  indexes:
+    - SH000300
+    - SH000905
+    - SH000906
+    - SZ399006
+    - SH000688
+  index_substitution_allowed: false
+
+stability:
+  start_dates:
+    - 2019-01-18
+    - 2020-01-02
+    - 2021-01-04
+    - 2022-01-04
+    - 2023-01-03
+    - 2024-01-02
+    - 2025-01-02
+  leave_one_year_out: true
+  bootstrap:
+    block_days: 20
+    samples: 2000
+    seed: 20260807
+  regime_attribution:
+    benchmark: SH000300
+    trend_days: 120
+    momentum_days: 20
+
+acceptance:
+  classification_enabled_only_after_formal_data_acceptance: true
+  max_drawdown_abs_max: 0.35
+  leave_one_year_positive_ratio_min: 0.6333
+  strong_requires_positive_bootstrap_lower_bound: true
+  no_broker_connection: true
+  no_automatic_orders: true
+
+report:
+  history_warning: 三只ETF共同历史自2019-01-18开始，约7.5年，不代表已覆盖完整长期市场周期。

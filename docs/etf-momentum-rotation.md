@@ -17,7 +17,10 @@ T+1 开盘的交易，否则会产生前视。
 
 ## 数据和回测
 
-数据下载脚本：`quant_workflow/scripts/download_etf_momentum_data.py`。
+正式 ETF 下载、清洗、快照发布、文件哈希和业务质量验收全部属于独立
+`quant_data` 模块。DSA 不发起下载、不手工修补价格，也不把研究脚本产生的
+结果发布回数据目录；仓内历史下载脚本只保留为兼容入口说明，不能作为正式
+数据生产线使用。
 
 正式数据通过 `quant_data/DATASET_CATALOG.json` 管理，当前两套数据集是：
 
@@ -75,3 +78,29 @@ T+1 开盘的交易，否则会产生前视。
 这套规则没有参数搜索，没有券商连接，也没有自动下单。即使回测结果漂亮，
 仍需第二数据源交叉核验、分红调整口径、滚动样本外检查和纸面跟踪，才能判断
 它是否有实际使用价值。
+
+## 三 ETF 防守轮动研究预览
+
+三 ETF 版本在相同 20 日规则中加入红利低波 ETF（512890）：每天收盘先筛出
+站上自身 20 日均线的 ETF，再从合格标的中选择 20 日涨幅第一；全部不合格时
+持有现金，T+1 三只 ETF 的共同开盘执行。规则固定，不搜索 15/20/25 日或其他
+邻近参数。
+
+研究配置为 `quant_workflow/configs/etf_defensive_rotation.yaml`，离线入口为
+`quant_workflow/scripts/research_etf_defensive_rotation.py`，独立报告写入
+`quant_workflow/reports/etf_defensive_rotation/`，不覆盖两 ETF 报告。网页在
+`/backtest/etf-momentum?variant=three_etf` 展示；API 使用
+`GET /api/v1/research/strategies/etf-momentum?variant=three_etf`。缺省 API 响应
+仍是旧两 ETF 报告。
+
+三 ETF 研究只消费 `quant_data` 已发布的同一 `cn_etf_daily` 前复权不可变快照，
+并逐项核对根目录清单、LATEST 指针、清单哈希、全快照内容哈希、文件索引、三只
+标的哈希和日期范围。当前 51 只 ETF 快照是未正式验收的测试版本，因此结果固定
+为 `research_preview`、`usable_for_trading=false`，不计算正式候选等级。共同历史
+自 2019-01-18 开始，约 7.5 年，不能表述为已经覆盖完整长期周期。
+
+比较对象包括三只 ETF 分别买入持有、三 ETF 等权、旧两 ETF 固定规则、两 ETF
+合格优先规则、沪深300和中证500。当前指数快照缺少创业板指 `SZ399006`，报告
+明确显示缺口且不使用 ETF 或其他指数替代。费用口径固定为 ETF 单边佣金
+`0.5bp`，即每次买入或卖出按成交金额的 `0.005%` 计费；另测单边 1bp、2bp
+滑点，不计印花税和过户费。

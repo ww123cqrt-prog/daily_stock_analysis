@@ -1,4 +1,4 @@
-"""Pure implementation of the two-ETF 20-day momentum rotation rule.
+"""Pure implementation of fixed-rule ETF momentum rotation.
 
 The strategy is intentionally separate from CSI800 model research.  A signal is
 computed from the close of day T and becomes a position at the next trading
@@ -17,6 +17,7 @@ import pandas as pd
 
 CASH = "CASH"
 DEFAULT_SYMBOLS: tuple[str, ...] = ("SZ159915", "SH513100")
+ELIGIBILITY_MODES = frozenset({"leader_then_filter", "filter_then_rank"})
 REQUIRED_COLUMNS = {"date", "open", "close"}
 # This is the research-candidate gate for the isolated ETF rule.  It does not
 # relax the separate CSI800 robust-strategy gates.
@@ -54,23 +55,30 @@ def build_signal_table(
     *,
     lookback_days: int = 20,
     moving_average_days: int = 20,
+    eligibility_mode: str = "leader_then_filter",
 ) -> pd.DataFrame:
     """Build close-time ranks and the next-open target signal.
 
     ``signal`` is the position selected using information available at that
     row's close. ``target_position`` is shifted by one common trading day and
     is the position held after the next open. Missing or incomplete windows
-    deliberately produce CASH.
+    deliberately produce CASH.  The legacy ``leader_then_filter`` mode ranks
+    all assets and only keeps the raw leader when it is above its moving
+    average.  ``filter_then_rank`` first removes ineligible assets and then
+    selects the best remaining momentum asset.  Ties follow caller order.
     """
 
     if lookback_days <= 0 or moving_average_days <= 0:
         raise ValueError("lookback_days and moving_average_days must be positive")
-    if len(data) != 2:
-        raise ValueError("the strategy requires exactly two ETF price series")
+    if len(data) < 2:
+        raise ValueError("the strategy requires at least two ETF price series")
+    if eligibility_mode not in ELIGIBILITY_MODES:
+        allowed = ", ".join(sorted(ELIGIBILITY_MODES))
+        raise ValueError(f"eligibility_mode must be one of: {allowed}")
 
     normalized = {
         symbol: normalize_price_frame(frame, symbol=symbol)
-        for symbol, frame in sorted(data.items())
+        for symbol, frame in data.items()
     }
     # Preserve the caller's explicit order so equal 20-day returns have a
     # deterministic, documented tie-break rather than depending on sorting.
@@ -107,11 +115,27 @@ def build_signal_table(
 
     has_return = return_frame.notna().any(axis=1)
     top_symbol = return_frame.fillna(-np.inf).idxmax(axis=1).where(has_return)
-    eligible = pd.Series(False, index=merged.index)
-    for symbol in symbols:
-        eligible |= (top_symbol == symbol) & merged[f"{symbol}_above_ma"].fillna(False)
-    signal = top_symbol.where(eligible, CASH).fillna(CASH).astype(str)
+    above_ma = pd.DataFrame(
+        {
+            symbol: merged[f"{symbol}_above_ma"].fillna(False)
+            for symbol in symbols
+        },
+        index=merged.index,
+    )
+    if eligibility_mode == "leader_then_filter":
+        eligible = pd.Series(False, index=merged.index)
+        for symbol in symbols:
+            eligible |= (top_symbol == symbol) & above_ma[symbol]
+        selected_symbol = top_symbol.where(eligible)
+    else:
+        eligible_returns = return_frame.where(above_ma)
+        has_eligible_return = eligible_returns.notna().any(axis=1)
+        selected_symbol = eligible_returns.fillna(-np.inf).idxmax(axis=1).where(
+            has_eligible_return
+        )
+    signal = selected_symbol.fillna(CASH).astype(str)
     merged["top_symbol"] = top_symbol.fillna(CASH).astype(str)
+    merged["eligible_top_symbol"] = selected_symbol.fillna(CASH).astype(str)
     merged["signal"] = signal
     merged["target_position"] = signal.shift(1).fillna(CASH).astype(str)
     return merged

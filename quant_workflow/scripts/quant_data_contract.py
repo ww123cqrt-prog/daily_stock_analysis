@@ -1486,7 +1486,7 @@ def _validate_qlib_benchmark_evidence(
         not isinstance(declared_symbols, list)
         or tuple(declared_symbols) != QLIB_BENCHMARK_SYMBOLS
     ):
-        raise DataContractError("Qlib benchmark required symbol declaration is invalid")
+        raise DataContractError("Qlib benchmark required symbols are invalid")
     else:
         expected_symbols = QLIB_BENCHMARK_SYMBOLS
     symbols = evidence.get("symbols")
