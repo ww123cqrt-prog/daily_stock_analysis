@@ -6,6 +6,7 @@ import json
 import subprocess
 import time
 from datetime import datetime, timedelta
+from collections.abc import Sequence
 from typing import Callable
 
 import pandas as pd
@@ -15,12 +16,29 @@ TENCENT_BENCHMARKS = {
     "SH000300": "sh000300",
     "SH000905": "sh000905",
     "SH000906": "sh000906",
+    "SZ399006": "sz399006",
+    "SH000688": "sh000688",
 }
 EASTMONEY_BENCHMARKS = {
     "SH000300": "1.000300",
     "SH000905": "1.000905",
     "SH000906": "1.000906",
+    "SZ399006": "0.399006",
+    "SH000688": "1.000688",
 }
+DEFAULT_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+
+
+def _selected_benchmarks(
+    provider_codes: dict[str, str], symbols: Sequence[str] | None
+) -> dict[str, str]:
+    requested = DEFAULT_BENCHMARK_SYMBOLS if symbols is None else tuple(symbols)
+    if not requested or len(requested) != len(set(requested)):
+        raise ValueError("benchmark symbols must be unique and non-empty")
+    unknown = set(requested).difference(provider_codes)
+    if unknown:
+        raise ValueError("unsupported benchmark symbols: " + ", ".join(sorted(unknown)))
+    return {symbol: provider_codes[symbol] for symbol in requested}
 
 
 def download_eastmoney_benchmarks(
@@ -32,8 +50,9 @@ def download_eastmoney_benchmarks(
     request_interval_seconds: float = 0.5,
     retry_backoff_seconds: float = 1.0,
     max_attempts: int = 3,
+    symbols: Sequence[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Download three index OHLCV series from Eastmoney with bounded retries."""
+    """Download only the requested index OHLCV series with bounded retries."""
 
     import requests
 
@@ -115,7 +134,9 @@ def download_eastmoney_benchmarks(
 
     result: dict[str, pd.DataFrame] = {}
     try:
-        for symbol, secid in EASTMONEY_BENCHMARKS.items():
+        for symbol, secid in _selected_benchmarks(
+            EASTMONEY_BENCHMARKS, symbols
+        ).items():
             payload = fetch(
                 {
                     "secid": secid,
@@ -166,8 +187,9 @@ def download_tencent_benchmarks(
     request_interval_seconds: float = 0.5,
     retry_backoff_seconds: float = 1.0,
     max_attempts: int = 3,
+    symbols: Sequence[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Download three index OHLCV series with bounded retries and pagination."""
+    """Download only the requested index OHLCV series with bounded retries."""
 
     import requests
 
@@ -200,7 +222,9 @@ def download_tencent_benchmarks(
 
     result: dict[str, pd.DataFrame] = {}
     try:
-        for symbol, provider_code in TENCENT_BENCHMARKS.items():
+        for symbol, provider_code in _selected_benchmarks(
+            TENCENT_BENCHMARKS, symbols
+        ).items():
             values: dict[str, dict[str, float]] = {}
             cursor_end = end_date
             for _ in range(64):

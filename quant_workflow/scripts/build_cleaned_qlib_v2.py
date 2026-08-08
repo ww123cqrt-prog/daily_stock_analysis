@@ -261,7 +261,7 @@ def build_cleaned_qlib_v2(
                 "interface": "v2_anomaly_cleaning_to_qlib",
             },
             source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-            producer={"script": "build_cleaned_qlib_v2.py", "version": "5"},
+            producer={"script": "build_cleaned_qlib_v2.py", "version": "6"},
             upstream_snapshot=upstream,
             benchmark_evidence=benchmark_evidence,
             instrument_pool_evidence=instrument_pool_evidence,

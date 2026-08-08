@@ -13,7 +13,14 @@ if str(SCRIPT_DIR) not in sys.path:
 from _paths import qlib_provider_uri  # noqa: E402
 
 
-REQUIRED_INSTRUMENTS = ("SH600000", "SH000300", "SH000905", "SH000906")
+REQUIRED_INSTRUMENTS = (
+    "SH600000",
+    "SH000300",
+    "SH000905",
+    "SH000906",
+    "SZ399006",
+    "SH000688",
+)
 REQUIRED_FIELDS = ("$open", "$high", "$low", "$close", "$volume", "$factor")
 
 

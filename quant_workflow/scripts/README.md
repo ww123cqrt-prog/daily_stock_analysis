@@ -37,6 +37,10 @@ Naming convention:
 - `check_qlib_data.py` smoke-checks the resolved native V2 provider by default.
   `--provider cleaned` performs the same real Qlib read against the native
   cleaned snapshot.
+- `update_qlib_index_benchmarks.py --publish` is the bounded native-V2 index
+  supplement. It requests only `SZ399006` and `SH000688`, reuses every existing
+  stock feature file, and publishes canonical/cleaned Qlib snapshots as one
+  atomic group. Re-running after success performs zero network requests.
 - `compare_native_qlib_benchmarks.py` joins SH000300/SH000905/SH000906 by
   trading date and requires exact equality for open/high/low/close/volume/factor
   across the full retained compatibility overlap. Directory existence is not

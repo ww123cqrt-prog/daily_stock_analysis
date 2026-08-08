@@ -13,7 +13,13 @@ import pytest
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+BENCHMARK_SYMBOLS = (
+    "SH000300",
+    "SH000905",
+    "SH000906",
+    "SZ399006",
+    "SH000688",
+)
 BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
 
 
@@ -261,13 +267,16 @@ def test_build_and_publish_qlib_v2_tracks_exact_qfq_snapshot(tmp_path: Path) -> 
     assert provider["source_snapshot"]["snapshot_id"] == "qfq-source-001"
     assert provider["producer"] == {
         "script": "build_qlib_v2.py",
-        "version": "9",
+        "version": "10",
     }
     assert (published / "features" / "sh600000" / "close.day.bin").is_file()
     assert resolved.manifest["benchmark_complete"] is True
     assert provider["benchmark_complete"] is True
     assert resolved.catalog_entry["benchmark_complete"] is True
     assert set(resolved.manifest["benchmarks"]["symbols"]) == set(BENCHMARK_SYMBOLS)
+    assert resolved.manifest["benchmarks"]["required_symbols"] == list(
+        BENCHMARK_SYMBOLS
+    )
     assert resolved.manifest["benchmarks"] == provider["benchmarks"]
     assert resolved.manifest["benchmarks"]["source"]["provider"] == "tencent"
     assert len(resolved.manifest["benchmarks"]["calendar_sha256"]) == 64
@@ -885,10 +894,10 @@ def test_cleaned_v2_builds_without_compatibility_provider_and_records_cleaning(
     provider_manifest = json.loads(
         (published / "PROVIDER_MANIFEST.json").read_text(encoding="utf-8")
     )
-    assert resolved.manifest["producer"]["version"] == "5"
+    assert resolved.manifest["producer"]["version"] == "6"
     assert provider_manifest["producer"] == {
         "script": "build_cleaned_qlib_v2.py",
-        "version": "5",
+        "version": "6",
     }
     assert provider_manifest["transformation"] == transformation
     assert provider_manifest["dependency_snapshots"] == [canonical_identity]

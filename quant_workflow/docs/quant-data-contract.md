@@ -26,7 +26,7 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 | 两只 ETF qfq | `canonical/ready` | 腾讯同源 raw/qfq 配对，正式可解析 |
 | A 股 Baostock raw (`ashare_daily_raw`) | `canonical/ready` | 保存完整 raw 行情、来源、逐文件哈希和公司行为记录 |
 | A 股 Baostock qfq (`ashare_daily_qfq`) | `canonical/ready` | 使用 Baostock `foreAdjustFactor` 本地计算，保存完整因子并用同源 qfq 核验 |
-| A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，包含三套指数基准和 CSI300/500/800 股票池，并锁定准确的上游快照 ID 和内容哈希 |
+| A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，包含沪深300、中证500、中证800、创业板指和科创50五套指数基准，以及 CSI300/500/800 股票池，并锁定准确的上游快照 ID 和内容哈希 |
 | A 股 cleaned Qlib v2 (`qlib_ashare_cleaned_v2`) | `canonical/ready` | 与 canonical 保持独立语义，保存异常屏蔽证据并复用同一套原生指数和股票池证据 |
 | 旧 JQData/东方财富/AkShare 来源目录 | `audit/legacy_unknown` | 仅审计，不再直接合并生成正式输出 |
 | V1 固定路径 merged/cleaned/Qlib | `legacy/ready` 兼容输出 | 仅供尚未迁移的旧程序和回滚，不是 DSA 正式输入 |
@@ -180,7 +180,7 @@ python quant_workflow/scripts/build_qlib_v2.py --publish
 
 该命令只解析 `ashare_daily_qfq` 的 `ready/qfq` 快照，生成不可变 `qlib_ashare_v2`，并将精确的上游快照 ID 和内容哈希写进 provider 清单。构建阶段同时写入 CSI300/500/800 股票池，训练过程不得修改快照。Qlib 指针与根清单使用同一回滚事务。
 
-`qlib_ashare_v2` 是 DSA 的正式 Qlib 快照，包含 `SH000300`、`SH000905`、`SH000906` 的 open/high/low/close/volume/factor。构建器优先复用与当前 qfq 快照、交易日历完全一致的已验证指数；不一致时只从腾讯按日期重建三个指数，把原始 Parquet、来源清单、覆盖日期和哈希保存在 `runtime/qlib_v2_upgrade/runs/`，不会重下全市场行情。任一必要交易日缺失则不发布。
+`qlib_ashare_v2` 是 DSA 的正式 Qlib 快照，包含 `SH000300`、`SH000905`、`SH000906`、`SZ399006`、`SH000688` 的 open/high/low/close/volume/factor。构建器优先复用与当前 qfq 快照、交易日历完全一致的已验证指数；不一致时只按指数代码下载和重建这五条基准，把原始 Parquet、来源清单、覆盖日期和哈希保存在 `runtime/` 的对应运行目录中，不会重下全市场行情。任一必要交易日缺失则不发布。新增单条或少量指数时使用 `update_qlib_index_benchmarks.py`，只下载明确列出的缺失指数并复用全部现有股票特征。
 
 `qlib_ashare_cleaned_v2` 是独立的正式 cleaned 快照。它要求 canonical Qlib 与当前 qfq 上游完全一致，再记录异常扫描、屏蔽统计、证据文件及哈希；cleaned 调用方不再读取旧固定路径。
 
@@ -198,7 +198,7 @@ python quant_workflow/scripts/build_qlib_v2.py --publish
 - 两只 ETF 只成功一只：不发布。
 - 因子日期不覆盖行情、哈希变化、公司行为缺失：拒绝解析或发布。
 - 请求 qfq 却解析到 raw：明确报错。
-- 腾讯指数基准请求按固定间隔发送，连接错误、429 和 5xx 最多重试三次并指数退避；任一指数仍失败时，三套基准都不发布。
+- 指数基准请求按固定间隔发送，连接错误、429 和 5xx 最多重试三次并指数退避；任一必需指数仍失败时，本轮基准快照不发布。
 - 清单过期、README 漂移或出现未登记目录：`sync_data_manifest.py --check` 返回非零。
 - 旧数据清理、移动或删除：必须另行 dry-run 并取得用户明确确认。
 

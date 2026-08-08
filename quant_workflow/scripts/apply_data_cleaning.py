@@ -42,7 +42,13 @@ REPORT_DIR = reports_root()
 ANOMALY_STOCKS_CSV = REPORT_DIR / "data_anomaly_stocks_latest.csv"
 ANOMALY_EVENTS_CSV = REPORT_DIR / "data_anomaly_events_latest.csv"
 
-BENCHMARK_SYMBOLS = {"SH000300", "SH000905", "SH000906"}
+BENCHMARK_SYMBOLS = {
+    "SH000300",
+    "SH000905",
+    "SH000906",
+    "SZ399006",
+    "SH000688",
+}
 EXCLUDE_ACTIONS = {"exclude_symbol_from_training_until_repaired"}
 VOLUME_MASK_ACTIONS = {"keep_but_mask_or_impute_volume"}
 RETURN_MASK_ACTIONS = {

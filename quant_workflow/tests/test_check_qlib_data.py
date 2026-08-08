@@ -69,7 +69,14 @@ class CheckQlibDataTest(unittest.TestCase):
 
         self.assertEqual(
             module.REQUIRED_INSTRUMENTS,
-            ("SH600000", "SH000300", "SH000905", "SH000906"),
+            (
+                "SH600000",
+                "SH000300",
+                "SH000905",
+                "SH000906",
+                "SZ399006",
+                "SH000688",
+            ),
         )
         self.assertEqual(
             module.REQUIRED_FIELDS,

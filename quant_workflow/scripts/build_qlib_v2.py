@@ -48,6 +48,8 @@ BENCHMARK_START_DATES = {
     "SH000300": "2005-04-08",
     "SH000905": "2007-01-15",
     "SH000906": "2007-01-15",
+    "SZ399006": "2010-06-01",
+    "SH000688": "2020-01-02",
 }
 INSTRUMENT_POOLS = ("csi300", "csi500", "csi800")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -488,6 +490,7 @@ def _import_benchmarks(
         }
     return {
         "calendar_sha256": calendar_sha256,
+        "required_symbols": list(BENCHMARK_START_DATES),
         "source": source,
         "symbols": symbols,
     }
@@ -657,7 +660,10 @@ def _download_benchmark_evidence(
     tencent_ready = False
     try:
         tencent_downloaded = tencent_spec["download"](
-            calendar[0], calendar[-1], use_system_proxy=use_system_proxy
+            calendar[0],
+            calendar[-1],
+            use_system_proxy=use_system_proxy,
+            symbols=tuple(BENCHMARK_START_DATES),
         )
         tencent_frames = normalize_source(tencent_spec, tencent_downloaded)
         evidence_frames_by_provider["tencent"] = tencent_frames
@@ -700,7 +706,10 @@ def _download_benchmark_evidence(
         )
         try:
             eastmoney_downloaded = eastmoney_spec["download"](
-                calendar[0], calendar[-1], use_system_proxy=use_system_proxy
+                calendar[0],
+                calendar[-1],
+                use_system_proxy=use_system_proxy,
+                symbols=tuple(BENCHMARK_START_DATES),
             )
             eastmoney_frames = normalize_source(eastmoney_spec, eastmoney_downloaded)
             evidence_frames_by_provider["eastmoney"] = eastmoney_frames
@@ -935,6 +944,7 @@ def _download_benchmark_evidence(
     }
     return {
         "calendar_sha256": calendar_sha256,
+        "required_symbols": list(BENCHMARK_START_DATES),
         "source": source,
         "symbols": symbols,
     }
@@ -1090,7 +1100,7 @@ def _build_qlib_v2_unchecked(
             "interface": "v2_snapshot_to_qlib",
         },
         source_retrieved_at=str(qfq.manifest["source_retrieved_at"]),
-        producer={"script": "build_qlib_v2.py", "version": "9"},
+        producer={"script": "build_qlib_v2.py", "version": "10"},
         upstream_snapshot=upstream,
         benchmark_evidence=benchmark_evidence,
         instrument_pool_evidence=instrument_pool_evidence,
