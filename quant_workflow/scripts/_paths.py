@@ -27,6 +27,8 @@ from quant_data_contract import (  # noqa: E402
 DEFAULT_WORKFLOW_ROOT = SCRIPT_DIR.parent
 DEFAULT_DSA_ROOT = DEFAULT_WORKFLOW_ROOT.parent
 DEFAULT_PROJECTS_ROOT = DEFAULT_DSA_ROOT.parent
+if str(DEFAULT_DSA_ROOT) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_DSA_ROOT))
 NATIVE_QLIB_DATASET_ROOTS = {
     "qlib_ashare_v2": Path("qlib/cn_data_ashare_v2"),
     "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
@@ -208,6 +210,62 @@ def qlib_provider_uri(
         root = quant_data_root().expanduser().resolve()
         return _resolve_native_qlib(str(root), "qlib_ashare_cleaned_v2")
     raise ValueError(f"Unknown Qlib provider: {provider}")
+
+
+def _resolve_direct_qlib_descriptor(
+    root_text: str,
+    membership_text: str,
+) -> Path:
+    from quant_workflow.quant_data_qlib_provider import (
+        build_direct_provider_descriptor,
+    )
+
+    return build_direct_provider_descriptor(
+        quant_data_root=Path(root_text),
+        membership_path=Path(membership_text),
+    )
+
+
+def qlib_direct_provider_descriptor() -> Path:
+    """Return the metadata-only Provider descriptor for the current qfq snapshot."""
+
+    root = quant_data_root().expanduser().resolve()
+    membership = _env_path(
+        "QLIB_DIRECT_MEMBERSHIP_PATH",
+        root / "reference" / "pit_csi800" / "membership_intervals.parquet",
+    ).expanduser()
+    return _resolve_direct_qlib_descriptor(str(root), str(membership))
+
+
+def qlib_direct_provider_uri() -> Path:
+    """Return Qlib's required URI directory without storing market-data bins."""
+
+    return qlib_direct_provider_descriptor().parent
+
+
+def init_qlib_direct(*, kernels: int | None = None, **overrides) -> Path:
+    """Initialize Qlib against the frozen quant_data Parquet snapshot."""
+
+    from quant_workflow.quant_data_qlib_provider import init_qlib_from_quant_data
+
+    descriptor = qlib_direct_provider_descriptor()
+    init_qlib_from_quant_data(
+        descriptor_path=descriptor,
+        quant_data_root=quant_data_root(),
+        kernels=kernels,
+        **overrides,
+    )
+    return descriptor
+
+
+def qlib_native_snapshot_uri(
+    provider: str = "canonical",
+    *,
+    snapshot_override: str | Path | None = None,
+) -> Path:
+    """Explicit name for the old physical Qlib snapshot compatibility path."""
+
+    return qlib_provider_uri(provider, snapshot_override=snapshot_override)
 
 
 def qlib_compatibility_provider_uri(provider: str = "canonical") -> Path:

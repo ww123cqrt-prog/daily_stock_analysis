@@ -55,10 +55,13 @@ china-astock-quant adapters, and every stable script here. Data paths use
   ashare_daily_qfq --bundle-dir /path/to/verified-bundle \
   --refresh-legacy-compatibility
 
-# Build and publish Qlib from the exact governed qfq snapshot
+# Build the metadata-only direct Qlib adapter and run a real feature smoke test
+.venv/bin/python quant_workflow/scripts/build_qlib_direct_provider.py
+
+# Migration compatibility only: build a physical Qlib copy
 .venv/bin/python quant_workflow/scripts/build_qlib_v2.py --publish
 
-# Build and publish the native cleaned Qlib snapshot
+# Migration compatibility only: build the physical cleaned Qlib copy
 .venv/bin/python quant_workflow/scripts/build_cleaned_qlib_v2.py --publish
 
 # Supervise Baostock in restartable batches
@@ -101,8 +104,9 @@ china-astock-quant adapters, and every stable script here. Data paths use
 
 ## Current Data Outputs
 
-- Canonical A-share Qlib v2 snapshots: `quant_data/qlib/cn_data_ashare_v2/snapshots/<snapshot_id>`
-- Canonical cleaned A-share Qlib v2 snapshots: `quant_data/qlib/cn_data_ashare_cleaned_v2/snapshots/<snapshot_id>`
+- Qlib direct metadata: `quant_data/runtime/qlib_direct/providers/ashare_daily_qfq/<snapshot_id>/<membership_snapshot_hash>`
+- Migration-compatible physical Qlib v2: `quant_data/qlib/cn_data_ashare_v2/snapshots/<snapshot_id>`
+- Migration-compatible physical cleaned Qlib v2: `quant_data/qlib/cn_data_ashare_cleaned_v2/snapshots/<snapshot_id>`
 - Baostock Parquet: `quant_data/parquet/ashare_1d/baostock_qfq`
 - JQData Parquet: `quant_data/parquet/ashare_1d/jqdata`
 - V1-compatible merged Parquet generated from V2: `quant_data/parquet/ashare_1d/merged_baostock_jqdata`
@@ -124,11 +128,12 @@ paths and readiness state remain authoritative in
 `${QUANT_DATA_ROOT}/DATA_MANIFEST.json`; a robust run must also pass
 `preflight_robust_data.py`.
 
-The governed A-share v2 entries are `ashare_daily_raw`, `ashare_daily_qfq`,
-`qlib_ashare_v2`, and `qlib_ashare_cleaned_v2`; resolve them through
-`quant_data_cli.py` instead of hard-coding snapshot paths. DSA training,
-prediction, backtesting, trading-calendar and quality checks resolve one exact
-native snapshot per process. Canonical and cleaned semantics remain separate.
+The governed A-share source entries are `ashare_daily_raw` and
+`ashare_daily_qfq`; resolve them through `quant_data_cli.py` instead of
+hard-coding snapshot paths. The direct Qlib adapter freezes one exact qfq
+snapshot per process. Physical `qlib_ashare_v2` and
+`qlib_ashare_cleaned_v2` remain registered during migration because some
+training, cleaned-data, benchmark, and rollback paths have not switched yet.
 The original merged paths remain legacy compatibility outputs for rollback and
 explicit old consumers only; they are not a DSA training input. `_old`
 directories and old source directories are audit-only. Do not infer readiness
@@ -178,8 +183,9 @@ directories are not supported.
   `reports/runtime_configs/` so the source config stays canonical.
 - Qlib YAML files under `configs/` contain the
   `RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME` sentinel. Run them through the DSA
-  wrappers, which replace the sentinel with one immutable snapshot path before
-  Qlib starts. Direct `qrun` use of a source template is unsupported.
+  wrappers. Direct-Provider callers must use `_paths.init_qlib_direct()`;
+  passing its descriptor directory to ordinary `qlib.init(provider_uri=...)`
+  is unsupported because that call would select Qlib's file backend.
 - `SH000300` benchmark data may exist under `features/sh000300`, but it must
   not be listed in `instruments/all.txt` or `instruments/csi300.txt`; otherwise
   model training can treat the index as a tradable stock.

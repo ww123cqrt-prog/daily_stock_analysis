@@ -95,6 +95,12 @@ Naming convention:
 - `quant_data_cli.py` is the governed entrypoint for `list`, `describe`,
   `resolve`, `validate`, and `update`. `resolve` checks status, requested price
   basis, manifest hash, bar hashes, factor hashes and company-action hash.
+- `build_qlib_direct_provider.py` creates the metadata-only Qlib adapter for the
+  current governed `ashare_daily_qfq` snapshot and runs a real `D.features`
+  smoke check. It writes only `CALENDAR.parquet`, a frozen
+  `MEMBERSHIP_INTERVALS.parquet`, and `PROVIDER_DESCRIPTOR.json`; it never
+  creates `features/` or stock `.bin` files. Python callers initialize it
+  through `_paths.init_qlib_direct()`.
 - `quant_data_cli.py update cn_etf_daily` freezes the current 51-symbol universe,
   reuses its existing files, and requests only a bounded overlap plus missing
   dates. An unchanged target date returns with zero provider requests. If the
@@ -139,10 +145,9 @@ Naming convention:
   validates all hashes and switches raw/qfq snapshots plus the root catalog as
   one rollback transaction, then builds canonical and cleaned native Qlib
   snapshots before the formal update is considered complete.
-- `build_qlib_v2.py` resolves the exact governed A-share qfq snapshot, converts
-  it to an immutable Qlib provider, records the upstream snapshot ID and
-  content hash in `PROVIDER_MANIFEST.json`, and publishes the Qlib pointer and
-  root catalog with rollback on failure.
+- `build_qlib_v2.py` is retained during the direct-Provider migration for
+  compatibility, benchmark evidence, and rollback. It still creates a physical
+  `.bin` copy and is not the target storage path for new consumers.
 - `build_cleaned_qlib_v2.py` resolves the same qfq snapshot plus the matching
   native canonical provider, applies recorded anomaly masks, imports native
   benchmark and instrument evidence, and atomically publishes
@@ -189,11 +194,12 @@ Research-only model comparison scripts live under:
 Do not promote a script from that folder into `scripts/` until its assumptions,
 data splits, and output paths are documented here.
 
-The current main provider is resolved from `DATA_MANIFEST.json` as
-`qlib_ashare_v2`. Each process receives the exact immutable snapshot path and
-keeps it for the whole training or backtest run. `QLIB_PROVIDER_URI` is an
-explicit pin for a fully validated snapshot under
-`qlib/cn_data_ashare_v2/snapshots/`; compatibility directories are rejected.
+The new storage path is `quant_data_qlib_provider.py`: it freezes the current
+`ashare_daily_qfq` identity and reads Parquet bars directly. New callers use
+`_paths.init_qlib_direct()` so Qlib receives the custom calendar, instrument,
+and feature providers. Existing `qlib_ashare_v2` and `QLIB_PROVIDER_URI` remain
+available during downstream migration and rollback; not every
+canonical/cleaned caller has switched yet.
 
 The cleaned provider resolves from `DATA_MANIFEST.json` as
 `qlib_ashare_cleaned_v2`. `QLIB_CLEANED_PROVIDER_URI` is an explicit pin and
