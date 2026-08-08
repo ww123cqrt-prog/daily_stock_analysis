@@ -5,13 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
 import pandas as pd
 import yaml
@@ -45,7 +44,7 @@ from evaluate_etf_momentum_robustness import (  # noqa: E402
 )
 from quant_data_contract import (  # noqa: E402
     DataContractError,
-    resolve_dataset,
+    resolve_dataset_component,
 )
 
 
@@ -53,22 +52,10 @@ DEFAULT_CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "etf_momentum_robustness.yaml"
 )
 DEFAULT_DATA_DIR = (
-    quant_data_root() / "parquet" / "etf_1d" / "etf_momentum_rotation" / "v1"
+    quant_data_root() / "parquet" / "etf_1d" / "cn_etf_daily"
 )
-DEFAULT_ADJUSTED_DATA_DIR = (
-    quant_data_root()
-    / "parquet"
-    / "etf_1d"
-    / "etf_momentum_rotation"
-    / "eastmoney_qfq"
-)
-DEFAULT_TENCENT_ADJUSTED_DATA_DIR = (
-    quant_data_root()
-    / "parquet"
-    / "etf_1d"
-    / "etf_momentum_rotation"
-    / "tencent_qfq"
-)
+DEFAULT_ADJUSTED_DATA_DIR = DEFAULT_DATA_DIR
+DEFAULT_TENCENT_ADJUSTED_DATA_DIR = DEFAULT_DATA_DIR
 DEFAULT_REPORT_DIR = reports_root() / "etf_momentum_rotation"
 RAW_SOURCE = "akshare.fund_etf_hist_sina"
 ADJUSTED_SOURCE = "akshare.fund_etf_hist_em_qfq"
@@ -874,51 +861,45 @@ def _load_optional_adjusted_data(path: Path) -> dict[str, pd.DataFrame] | None:
 def resolve_canonical_etf_bars(
     quant_data_dir: Path,
 ) -> tuple[Path, dict[str, object]]:
-    resolved = resolve_dataset(
-        "etf_momentum_daily_qfq",
+    resolved = resolve_dataset_component(
+        "cn_etf_daily",
         quant_data_root=Path(quant_data_dir),
-        require_basis="qfq",
+        price_basis="qfq",
     )
-    bars = resolved.snapshot_path / "bars"
+    bars = resolved.component_path
     if not bars.is_dir():
         raise DataContractError("canonical ETF snapshot bars directory is missing")
-    return bars, resolved.manifest
+    return bars, resolved.dataset.manifest
 
 
 def resolve_canonical_etf_pair(
     quant_data_dir: Path,
 ) -> tuple[Path, dict[str, object], Path, dict[str, object]]:
     root = Path(quant_data_dir)
-    raw = resolve_dataset(
-        "etf_momentum_daily_raw",
+    cache = {}
+    raw = resolve_dataset_component(
+        "cn_etf_daily",
         quant_data_root=root,
-        require_basis="raw",
+        price_basis="raw",
+        validated_cache=cache,
     )
-    qfq = resolve_dataset(
-        "etf_momentum_daily_qfq",
+    qfq = resolve_dataset_component(
+        "cn_etf_daily",
         quant_data_root=root,
-        require_basis="qfq",
+        price_basis="qfq",
+        validated_cache=cache,
     )
-    raw_bars = raw.snapshot_path / "bars"
-    qfq_bars = qfq.snapshot_path / "bars"
+    raw_bars = raw.component_path
+    qfq_bars = qfq.component_path
     if not raw_bars.is_dir() or not qfq_bars.is_dir():
         raise DataContractError("canonical ETF paired bars directory is missing")
-
-    raw_snapshot_id = str(raw.manifest.get("snapshot_id") or "")
-    upstream = qfq.manifest.get("upstream_snapshots")
-    paired = any(
-        isinstance(item, Mapping)
-        and item.get("dataset_id") == "etf_momentum_daily_raw"
-        and str(item.get("snapshot_id") or "") == raw_snapshot_id
-        for item in (upstream if isinstance(upstream, list) else [])
-    )
-    if not raw_snapshot_id or not paired:
+    if raw.dataset.snapshot_path != qfq.dataset.snapshot_path:
         raise DataContractError(
-            "canonical ETF qfq snapshot does not reference its paired raw snapshot"
+            "canonical ETF raw/qfq components are not in the same snapshot"
         )
 
-    raw_source = raw.manifest.get("source")
-    qfq_source = qfq.manifest.get("source")
+    raw_source = raw.dataset.manifest.get("source")
+    qfq_source = qfq.dataset.manifest.get("source")
     raw_provider = (
         str(raw_source.get("provider") or "")
         if isinstance(raw_source, Mapping)
@@ -931,7 +912,12 @@ def resolve_canonical_etf_pair(
     )
     if not raw_provider or raw_provider != qfq_provider:
         raise DataContractError("canonical ETF raw/qfq providers do not match")
-    return raw_bars, raw.manifest, qfq_bars, qfq.manifest
+    return (
+        raw_bars,
+        raw.dataset.manifest,
+        qfq_bars,
+        qfq.dataset.manifest,
+    )
 
 
 def _catalog_source_name(provider: str, price_basis: str) -> str:
@@ -988,47 +974,52 @@ def _load_optional_manifest(path: Path) -> dict[str, object] | None:
 
 def run(
     *,
-    data_dir: Path = DEFAULT_DATA_DIR,
-    adjusted_data_dir: Path = DEFAULT_ADJUSTED_DATA_DIR,
-    tencent_adjusted_data_dir: Path = DEFAULT_TENCENT_ADJUSTED_DATA_DIR,
+    data_dir: Path | None = None,
+    adjusted_data_dir: Path | None = None,
+    tencent_adjusted_data_dir: Path | None = None,
     report_dir: Path = DEFAULT_REPORT_DIR,
     config_path: Path = DEFAULT_CONFIG,
     generated_at: str | None = None,
     quant_data_dir: Path | None = None,
 ) -> Path:
-    catalog_root = Path(quant_data_dir).expanduser().resolve() if quant_data_dir else None
-    if catalog_root is None and Path(data_dir).resolve() == DEFAULT_DATA_DIR.resolve():
-        catalog_root = quant_data_root().resolve()
+    catalog_root = (
+        Path(quant_data_dir).expanduser().resolve()
+        if quant_data_dir is not None
+        else quant_data_root().resolve()
+    )
+    canonical_dataset_root = (
+        catalog_root / "parquet" / "etf_1d" / "cn_etf_daily"
+    ).resolve()
+    supplied_directories = (
+        data_dir,
+        adjusted_data_dir,
+        tencent_adjusted_data_dir,
+    )
+    if any(
+        value is not None and Path(value).expanduser().resolve() != canonical_dataset_root
+        for value in supplied_directories
+    ):
+        raise DataContractError(
+            "custom ETF data directories are not accepted; resolve cn_etf_daily instead"
+        )
 
-    raw_source = RAW_SOURCE
-    raw_manifest_path = Path(data_dir) / "SOURCE_MANIFEST.json"
-    canonical_candidate: tuple[
-        str, Path, Mapping[str, object] | None, Path | None
-    ] | None = None
-    if catalog_root is not None:
-        try:
-            raw_dir, raw_manifest, qfq_dir, qfq_manifest = resolve_canonical_etf_pair(
-                catalog_root
-            )
-        except DataContractError:
-            pass
-        else:
-            provider = str(
-                (qfq_manifest.get("source") or {}).get("provider", "catalog")
-                if isinstance(qfq_manifest.get("source"), Mapping)
-                else "catalog"
-            )
-            raw_source = _catalog_source_name(provider, "raw")
-            raw_manifest_path = raw_dir.parent / "DATASET_MANIFEST.json"
-            canonical_candidate = (
-                _catalog_source_name(provider, "qfq"),
-                qfq_dir,
-                _canonical_manifest_for_quality(qfq_dir.parent, qfq_manifest),
-                qfq_dir.parent / "DATASET_MANIFEST.json",
-            )
-            raw_data = load_price_data(raw_dir, DEFAULT_SYMBOLS)
-    if canonical_candidate is None:
-        raw_data = load_price_data(Path(data_dir), DEFAULT_SYMBOLS)
+    raw_dir, raw_manifest, qfq_dir, qfq_manifest = resolve_canonical_etf_pair(
+        catalog_root
+    )
+    provider = str(
+        (qfq_manifest.get("source") or {}).get("provider", "catalog")
+        if isinstance(qfq_manifest.get("source"), Mapping)
+        else "catalog"
+    )
+    raw_source = _catalog_source_name(provider, "raw")
+    raw_manifest_path = raw_dir.parent / "DATASET_MANIFEST.json"
+    canonical_candidate = (
+        _catalog_source_name(provider, "qfq"),
+        qfq_dir,
+        _canonical_manifest_for_quality(qfq_dir.parent, qfq_manifest),
+        qfq_dir.parent / "DATASET_MANIFEST.json",
+    )
+    raw_data = load_price_data(raw_dir, DEFAULT_SYMBOLS)
 
     selected_data, quality = select_price_source(
         raw_data,
@@ -1039,15 +1030,7 @@ def run(
     adjusted_candidates: list[
         tuple[str, Path, Mapping[str, object] | None, Path | None]
     ] = []
-    if canonical_candidate is not None:
-        adjusted_candidates.append(canonical_candidate)
-    else:
-        adjusted_candidates.extend(
-            [
-                (ADJUSTED_SOURCE, Path(adjusted_data_dir), None, None),
-                (TENCENT_ADJUSTED_SOURCE, Path(tencent_adjusted_data_dir), None, None),
-            ]
-        )
+    adjusted_candidates.append(canonical_candidate)
     for source_name, candidate_dir, supplied_manifest, supplied_manifest_path in adjusted_candidates:
         adjusted_data = _load_optional_adjusted_data(candidate_dir)
         if adjusted_data is None:

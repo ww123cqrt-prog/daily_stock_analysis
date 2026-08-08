@@ -41,6 +41,7 @@ ADJUSTMENT_METHODS = {
 REQUIRED_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume")
 BAR_OHLC_RELATIVE_TOLERANCE = 2e-6
 BAR_OHLC_ABSOLUTE_TOLERANCE = 1e-4
+PAIRED_PRICE_ABSOLUTE_TOLERANCE = 2e-3
 ADJUSTED_PRICE_BASES = {"qfq", "hfq"}
 QLIB_LEGACY_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
 QLIB_BENCHMARK_SYMBOLS = (
@@ -72,6 +73,12 @@ class ResolvedDataset(NamedTuple):
     snapshot_path: Path
     manifest: dict[str, Any]
     catalog_entry: dict[str, Any]
+
+
+class ResolvedDatasetComponent(NamedTuple):
+    dataset: ResolvedDataset
+    price_basis: str
+    component_path: Path
 
 
 ValidatedResolutionCache = MutableMapping[str, ResolvedDataset]
@@ -663,9 +670,18 @@ def _safe_relative(path: Path, root: Path, field: str) -> str:
 def _safe_child(root: Path, relative: object, field: str) -> Path:
     if not isinstance(relative, str) or not relative:
         raise DataContractError(f"{field} is required")
-    candidate = (Path(root).resolve() / relative).resolve()
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise DataContractError(f"{field} escapes quant_data root")
+    root = Path(root).expanduser().resolve()
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise DataContractError(f"{field} cannot use symlinks")
+    candidate = current.resolve()
     try:
-        candidate.relative_to(Path(root).resolve())
+        candidate.relative_to(root)
     except ValueError as exc:
         raise DataContractError(f"{field} escapes quant_data root") from exc
     return candidate
@@ -742,8 +758,16 @@ def _validate_bar_frame(frame: pd.DataFrame, path: Path) -> pd.Series:
     return dates
 
 
-def build_file_index(bars_dir: Path) -> pd.DataFrame:
+def build_file_index(
+    bars_dir: Path,
+    *,
+    relative_prefix: str = "bars",
+) -> pd.DataFrame:
     bars_dir = Path(bars_dir)
+    if not relative_prefix or Path(relative_prefix).is_absolute() or ".." in Path(
+        relative_prefix
+    ).parts:
+        raise DataContractError("bar index relative prefix is invalid")
     files = sorted(bars_dir.glob("*.parquet")) if bars_dir.is_dir() else []
     if not files:
         raise DataContractError("snapshot contains no bar parquet files")
@@ -762,7 +786,7 @@ def build_file_index(bars_dir: Path) -> pd.DataFrame:
         rows.append(
             {
                 "symbol": path.stem,
-                "relative_path": f"bars/{path.name}",
+                "relative_path": f"{relative_prefix}/{path.name}",
                 "row_count": int(len(frame)),
                 "first_date": dates.iloc[0].date().isoformat(),
                 "last_date": dates.iloc[-1].date().isoformat(),
@@ -870,10 +894,24 @@ def _validate_adjustment_contract(
         raise DataContractError("canonical adjusted data requires adjustment evidence")
     if canonical_ready:
         _iso_timestamp(normalized["adjusted_at"], "adjusted_at")
-        if method == "provider_native_paired" and not normalized.get(
-            "paired_raw_snapshot_id"
-        ):
-            raise DataContractError("canonical adjusted data requires adjustment evidence")
+        if method == "provider_native_paired":
+            paired_snapshot = normalized.get("paired_raw_snapshot_id")
+            paired_component = normalized.get("paired_raw_component_path")
+            if not paired_snapshot and not paired_component:
+                raise DataContractError(
+                    "canonical adjusted data requires adjustment evidence"
+                )
+            if paired_component:
+                component = Path(str(paired_component))
+                if (
+                    component.is_absolute()
+                    or ".." in component.parts
+                    or component.as_posix() != "raw"
+                    or not (snapshot / component).is_dir()
+                ):
+                    raise DataContractError(
+                        "canonical adjusted data raw component is invalid"
+                    )
         factors = snapshot / "factors"
         if not factors.is_dir() or not any(factors.glob("*.parquet")):
             raise DataContractError("canonical adjusted data requires adjustment evidence")
@@ -967,6 +1005,141 @@ def finalize_price_snapshot(
     return snapshot / "DATASET_MANIFEST.json"
 
 
+def _component_summary(
+    index: pd.DataFrame,
+    *,
+    price_basis: str,
+    path: str,
+    file_index_path: str,
+) -> dict[str, Any]:
+    return {
+        "price_basis": price_basis,
+        "path": path,
+        "file_index_path": file_index_path,
+        "date_range": {
+            "start": str(index["first_date"].min()),
+            "end": str(index["last_date"].max()),
+        },
+        "latest_trade_date": str(index["last_date"].max()),
+        "symbol_count": int(len(index)),
+        "row_count": int(index["row_count"].sum()),
+    }
+
+
+def finalize_paired_price_snapshot(
+    snapshot: Path,
+    *,
+    dataset_id: str,
+    snapshot_id: str,
+    role: str,
+    status: str,
+    source: Mapping[str, Any],
+    adjustment: Mapping[str, Any],
+    producer: Mapping[str, Any],
+    source_retrieved_at: str,
+) -> Path:
+    """Finalize one immutable dataset containing paired raw/qfq ETF histories."""
+
+    snapshot = Path(snapshot).resolve()
+    if not DATASET_ID_RE.fullmatch(dataset_id):
+        raise DataContractError("dataset_id is invalid")
+    if not snapshot_id or "/" in snapshot_id or snapshot_id in {".", ".."}:
+        raise DataContractError("snapshot_id is invalid")
+    if role not in ROLES or status not in STATUSES:
+        raise DataContractError("dataset role or status is invalid")
+    if not isinstance(source, Mapping) or not source.get("provider"):
+        raise DataContractError("source provider is required")
+    if not isinstance(producer, Mapping) or not producer.get("script"):
+        raise DataContractError("producer script is required")
+    _iso_timestamp(source_retrieved_at, "source_retrieved_at")
+
+    raw_index = build_file_index(snapshot / "raw", relative_prefix="raw")
+    qfq_index = build_file_index(snapshot / "qfq", relative_prefix="qfq")
+    if set(raw_index["symbol"].astype(str)) != set(qfq_index["symbol"].astype(str)):
+        raise DataContractError("paired raw/qfq symbols do not match")
+    raw_by_symbol = raw_index.set_index("symbol")
+    for row in qfq_index.itertuples(index=False):
+        raw_row = raw_by_symbol.loc[str(row.symbol)]
+        if (
+            int(raw_row["row_count"]) != int(row.row_count)
+            or str(raw_row["first_date"]) != str(row.first_date)
+            or str(raw_row["last_date"]) != str(row.last_date)
+        ):
+            raise DataContractError(
+                f"paired raw/qfq index metadata differs: {row.symbol}"
+            )
+
+    normalized_adjustment = _validate_adjustment_contract(
+        role=role,
+        status=status,
+        price_basis="qfq",
+        adjustment=adjustment,
+        snapshot=snapshot,
+    )
+    raw_index_path = "RAW_FILE_INDEX.parquet"
+    qfq_index_path = "QFQ_FILE_INDEX.parquet"
+    factor_index_path = "FACTOR_INDEX.parquet"
+    raw_index.to_parquet(snapshot / raw_index_path, index=False)
+    qfq_index.to_parquet(snapshot / qfq_index_path, index=False)
+    factor_index = build_factor_index(snapshot / "factors", qfq_index)
+    factor_index.to_parquet(snapshot / factor_index_path, index=False)
+    normalized_adjustment["factor_index_path"] = factor_index_path
+
+    actions_path = snapshot / "corporate_actions.parquet"
+    if not actions_path.is_file():
+        raise DataContractError("canonical adjusted data requires adjustment evidence")
+    raw_component = _component_summary(
+        raw_index,
+        price_basis="raw",
+        path="raw",
+        file_index_path=raw_index_path,
+    )
+    qfq_component = _component_summary(
+        qfq_index,
+        price_basis="qfq",
+        path="qfq",
+        file_index_path=qfq_index_path,
+    )
+    manifest: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "data_kind": "paired_daily_bars",
+        "role": role,
+        "status": status,
+        "source": dict(source),
+        "price_basis": "qfq",
+        "available_price_bases": ["raw", "qfq"],
+        "source_retrieved_at": source_retrieved_at,
+        "adjustment": normalized_adjustment,
+        "producer": dict(producer),
+        "upstream_snapshots": [],
+        "date_range": dict(qfq_component["date_range"]),
+        "latest_trade_date": qfq_component["latest_trade_date"],
+        "symbol_count": qfq_component["symbol_count"],
+        "row_count": qfq_component["row_count"],
+        "components": {
+            "raw": raw_component,
+            "qfq": qfq_component,
+            "factors": {
+                "path": "factors",
+                "file_index_path": factor_index_path,
+                "symbol_count": int(len(factor_index)),
+                "row_count": int(factor_index["row_count"].sum()),
+            },
+        },
+        "file_index_path": qfq_index_path,
+        "raw_file_index_path": raw_index_path,
+        "factor_index_path": factor_index_path,
+        "corporate_actions_path": "corporate_actions.parquet",
+        "corporate_actions_sha256": sha256_file(actions_path),
+    }
+    manifest["content_sha256"] = _content_hash(snapshot, manifest)
+    atomic_write_json(snapshot / "DATASET_MANIFEST.json", manifest)
+    validate_snapshot(snapshot, verify_hashes=True)
+    return snapshot / "DATASET_MANIFEST.json"
+
+
 def _validate_factor_coverage(
     snapshot: Path,
     index: pd.DataFrame,
@@ -1006,6 +1179,163 @@ def _validate_factor_coverage(
             raise DataContractError(f"factor file index is stale: {row.symbol}")
         if verify_hashes and str(row.sha256) != str(expected["sha256"]):
             raise DataContractError(f"factor hash mismatch: {row.symbol}")
+
+
+def _read_paired_component_index(
+    snapshot: Path,
+    *,
+    index_path: object,
+    component: str,
+) -> pd.DataFrame:
+    if not isinstance(index_path, str) or not index_path:
+        raise DataContractError(f"paired {component} file index is missing")
+    try:
+        index = pd.read_parquet(snapshot / index_path)
+    except Exception as exc:
+        raise DataContractError(
+            f"paired {component} file index is unavailable"
+        ) from exc
+    expected_columns = {
+        "symbol",
+        "relative_path",
+        "row_count",
+        "first_date",
+        "last_date",
+        "source_ids",
+        "sha256",
+    }
+    if index.empty or not expected_columns.issubset(index.columns):
+        raise DataContractError(f"paired {component} file index is invalid")
+    return index
+
+
+def _validate_paired_snapshot_components(
+    snapshot: Path,
+    manifest: Mapping[str, Any],
+    qfq_index: pd.DataFrame,
+    *,
+    verify_hashes: bool,
+) -> None:
+    if manifest.get("available_price_bases") != ["raw", "qfq"]:
+        raise DataContractError("paired snapshot price bases are invalid")
+    components = manifest.get("components")
+    if not isinstance(components, Mapping):
+        raise DataContractError("paired snapshot components are missing")
+    expected_paths = {"raw": "raw", "qfq": "qfq", "factors": "factors"}
+    for name, expected_path in expected_paths.items():
+        component = components.get(name)
+        if not isinstance(component, Mapping) or component.get("path") != expected_path:
+            raise DataContractError(f"paired {name} component is invalid")
+
+    raw_component = components["raw"]
+    qfq_component = components["qfq"]
+    if raw_component.get("price_basis") != "raw" or qfq_component.get(
+        "price_basis"
+    ) != "qfq":
+        raise DataContractError("paired snapshot component price bases are invalid")
+    if qfq_component.get("file_index_path") != manifest.get("file_index_path"):
+        raise DataContractError("paired qfq file index is inconsistent")
+    if raw_component.get("file_index_path") != manifest.get("raw_file_index_path"):
+        raise DataContractError("paired raw file index is inconsistent")
+
+    raw_index = _read_paired_component_index(
+        snapshot,
+        index_path=manifest.get("raw_file_index_path"),
+        component="raw",
+    )
+    if set(raw_index["symbol"].astype(str)) != set(qfq_index["symbol"].astype(str)):
+        raise DataContractError("paired raw/qfq symbols do not match")
+    raw_by_symbol = raw_index.set_index("symbol")
+    qfq_by_symbol = qfq_index.set_index("symbol")
+    if (
+        int(raw_component.get("symbol_count") or -1) != len(raw_index)
+        or int(raw_component.get("row_count") or -1)
+        != int(raw_index["row_count"].sum())
+        or int(qfq_component.get("symbol_count") or -1) != len(qfq_index)
+        or int(qfq_component.get("row_count") or -1)
+        != int(qfq_index["row_count"].sum())
+    ):
+        raise DataContractError("paired snapshot component summary is stale")
+
+    for symbol in sorted(qfq_by_symbol.index.astype(str)):
+        raw_row = raw_by_symbol.loc[symbol]
+        qfq_row = qfq_by_symbol.loc[symbol]
+        if (
+            int(raw_row["row_count"]) != int(qfq_row["row_count"])
+            or str(raw_row["first_date"]) != str(qfq_row["first_date"])
+            or str(raw_row["last_date"]) != str(qfq_row["last_date"])
+        ):
+            raise DataContractError(f"paired raw/qfq metadata differs: {symbol}")
+        raw_path = (snapshot / str(raw_row["relative_path"])).resolve()
+        qfq_path = (snapshot / str(qfq_row["relative_path"])).resolve()
+        for path, component_name in ((raw_path, "raw"), (qfq_path, "qfq")):
+            try:
+                path.relative_to(snapshot)
+            except ValueError as exc:
+                raise DataContractError(
+                    f"paired {component_name} path escapes snapshot"
+                ) from exc
+            if not path.is_file() or path.is_symlink():
+                raise DataContractError(
+                    f"paired {component_name} bar file is unavailable: {symbol}"
+                )
+        if verify_hashes and str(raw_row["sha256"]) != sha256_file(raw_path):
+            raise DataContractError(f"raw bar hash mismatch: {symbol}")
+        raw = pd.read_parquet(raw_path)
+        qfq = pd.read_parquet(qfq_path)
+        raw_dates = _validate_bar_frame(raw, raw_path)
+        qfq_dates = pd.to_datetime(qfq["date"], errors="coerce").dt.normalize()
+        if not raw_dates.reset_index(drop=True).equals(qfq_dates.reset_index(drop=True)):
+            raise DataContractError(f"paired raw/qfq dates differ: {symbol}")
+
+        factor_path = snapshot / "factors" / f"{symbol}.parquet"
+        factors = pd.read_parquet(factor_path)
+        factor_dates = pd.to_datetime(
+            factors["date"], errors="coerce"
+        ).dt.normalize()
+        if not factor_dates.reset_index(drop=True).equals(
+            qfq_dates.reset_index(drop=True)
+        ):
+            raise DataContractError(f"paired factor dates differ: {symbol}")
+        factor_values = pd.to_numeric(factors["factor"], errors="coerce").to_numpy(
+            dtype=float
+        )
+        offset_values = (
+            pd.to_numeric(factors["offset"], errors="coerce").to_numpy(dtype=float)
+            if "offset" in factors.columns
+            else np.zeros(len(factors), dtype=float)
+        )
+        if not np.isfinite(offset_values).all():
+            raise DataContractError(f"paired factor offsets are invalid: {symbol}")
+        for field in ("open", "high", "low", "close"):
+            expected = (
+                pd.to_numeric(raw[field], errors="coerce").to_numpy(dtype=float)
+                * factor_values
+                + offset_values
+            )
+            actual = pd.to_numeric(qfq[field], errors="coerce").to_numpy(dtype=float)
+            if not np.allclose(
+                actual,
+                expected,
+                rtol=BAR_OHLC_RELATIVE_TOLERANCE,
+                atol=PAIRED_PRICE_ABSOLUTE_TOLERANCE,
+            ):
+                raise DataContractError(f"paired raw/qfq relation is invalid: {symbol}")
+        if manifest.get("adjustment", {}).get("volume_adjusted") is False:
+            raw_volume = pd.to_numeric(raw["volume"], errors="coerce").to_numpy(
+                dtype=float
+            )
+            qfq_volume = pd.to_numeric(qfq["volume"], errors="coerce").to_numpy(
+                dtype=float
+            )
+            if not np.allclose(raw_volume, qfq_volume, equal_nan=True):
+                raise DataContractError(f"paired raw/qfq volume differs: {symbol}")
+        if not np.isclose(factor_values[-1], 1.0) or not np.isclose(
+            offset_values[-1], 0.0
+        ):
+            raise DataContractError(
+                f"paired qfq latest adjustment is not normalized: {symbol}"
+            )
 
 
 def validate_snapshot(snapshot: Path, *, verify_hashes: bool = True) -> dict[str, Any]:
@@ -1086,6 +1416,13 @@ def validate_snapshot(snapshot: Path, *, verify_hashes: bool = True) -> dict[str
             snapshot,
             index,
             factor_index_path=manifest.get("factor_index_path"),
+            verify_hashes=verify_hashes,
+        )
+    if manifest.get("data_kind") == "paired_daily_bars":
+        _validate_paired_snapshot_components(
+            snapshot,
+            manifest,
+            index,
             verify_hashes=verify_hashes,
         )
     actions_path = manifest.get("corporate_actions_path")
@@ -1748,8 +2085,16 @@ def validate_latest_pointer(
     """Validate a LATEST pointer before following it to an immutable snapshot."""
 
     quant_data_root = Path(quant_data_root).expanduser().resolve()
-    pointer_path = Path(pointer_path).expanduser().resolve()
-    _safe_relative(pointer_path, quant_data_root, "latest_pointer")
+    unresolved_pointer = Path(pointer_path).expanduser().absolute()
+    try:
+        relative_pointer = unresolved_pointer.relative_to(quant_data_root).as_posix()
+    except ValueError as exc:
+        raise DataContractError("latest_pointer must stay under quant_data root") from exc
+    pointer_path = _safe_child(
+        quant_data_root,
+        relative_pointer,
+        "latest_pointer",
+    )
     if pointer_path.name != "LATEST.json":
         raise DataContractError("latest pointer filename is invalid")
     pointer = _read_json(pointer_path)
@@ -2088,7 +2433,7 @@ def _catalog_entry_from_validated_manifest(
         if "transformation" in manifest:
             entry["transformation"] = manifest["transformation"]
         return entry
-    return {
+    entry = {
         "dataset_id": manifest["dataset_id"],
         "data_kind": manifest["data_kind"],
         "role": manifest["role"],
@@ -2117,6 +2462,10 @@ def _catalog_entry_from_validated_manifest(
             snapshot / "DATASET_MANIFEST.json"
         ),
     }
+    for field in ("available_price_bases", "components", "raw_file_index_path"):
+        if field in manifest:
+            entry[field] = manifest[field]
+    return entry
 
 
 def catalog_entry_from_snapshot(
@@ -2203,6 +2552,13 @@ def _validate_current_upstream(
                 raise DataContractError("dataset upstream snapshot is stale")
 
 
+def _supports_price_basis(payload: Mapping[str, Any], price_basis: str) -> bool:
+    if payload.get("price_basis") == price_basis:
+        return True
+    available = payload.get("available_price_bases")
+    return isinstance(available, list) and price_basis in available
+
+
 def resolve_dataset(
     dataset_id: str,
     *,
@@ -2220,7 +2576,7 @@ def resolve_dataset(
         raise DataContractError(
             f"dataset status is {entry.get('status')}, required {require_status}"
         )
-    if require_basis is not None and entry.get("price_basis") != require_basis:
+    if require_basis is not None and not _supports_price_basis(entry, require_basis):
         raise DataContractError(
             f"dataset price basis is {entry.get('price_basis')}, required {require_basis}"
         )
@@ -2261,11 +2617,18 @@ def resolve_dataset(
         raise DataContractError(
             f"snapshot status is {manifest.get('status')}, required {require_status}"
         )
-    if require_basis is not None and manifest.get("price_basis") != require_basis:
+    if require_basis is not None and not _supports_price_basis(
+        manifest, require_basis
+    ):
         raise DataContractError(
             f"snapshot price basis is {manifest.get('price_basis')}, required {require_basis}"
         )
     for field in ("dataset_id", "role", "status", "price_basis", "content_sha256"):
+        if entry.get(field) != manifest.get(field):
+            raise DataContractError(
+                f"dataset catalog and snapshot disagree on {field}"
+            )
+    for field in ("available_price_bases", "components", "raw_file_index_path"):
         if entry.get(field) != manifest.get(field):
             raise DataContractError(
                 f"dataset catalog and snapshot disagree on {field}"
@@ -2281,6 +2644,55 @@ def resolve_dataset(
     if validated_cache is not None:
         validated_cache[dataset_id] = resolved
     return resolved
+
+
+def resolve_dataset_component(
+    dataset_id: str,
+    *,
+    quant_data_root: Path,
+    price_basis: str,
+    require_status: str = "ready",
+    validated_cache: ValidatedResolutionCache | None = None,
+) -> ResolvedDatasetComponent:
+    """Resolve a price component without creating a second dataset identity."""
+
+    resolved = resolve_dataset(
+        dataset_id,
+        quant_data_root=quant_data_root,
+        require_basis=price_basis,
+        require_status=require_status,
+        validated_cache=validated_cache,
+    )
+    data_kind = resolved.manifest.get("data_kind")
+    if data_kind == "qlib_provider":
+        component_path = resolved.snapshot_path
+    elif data_kind != "paired_daily_bars":
+        if resolved.manifest.get("price_basis") != price_basis:
+            raise DataContractError(
+                f"dataset has no {price_basis} price component"
+            )
+        component_path = resolved.snapshot_path / "bars"
+    else:
+        components = resolved.manifest.get("components")
+        component = (
+            components.get(price_basis)
+            if isinstance(components, Mapping)
+            else None
+        )
+        if not isinstance(component, Mapping) or not component.get("path"):
+            raise DataContractError(
+                f"dataset has no {price_basis} price component"
+            )
+        component_path = (
+            resolved.snapshot_path / str(component["path"])
+        ).resolve()
+        try:
+            component_path.relative_to(resolved.snapshot_path)
+        except ValueError as exc:
+            raise DataContractError("dataset component path escapes snapshot") from exc
+    if not component_path.is_dir() or component_path.is_symlink():
+        raise DataContractError("dataset component directory is unavailable")
+    return ResolvedDatasetComponent(resolved, price_basis, component_path)
 
 
 def describe_dataset(dataset_id: str, *, quant_data_root: Path) -> dict[str, Any]:

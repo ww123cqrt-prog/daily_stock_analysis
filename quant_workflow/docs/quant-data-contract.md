@@ -22,8 +22,7 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 
 | 数据 | v2 状态 | 当前边界 |
 |---|---|---|
-| 两只 ETF raw | `audit/ready` | 腾讯同源原始价快照，可做复权证据和交叉检查 |
-| 两只 ETF qfq | `canonical/ready` | 腾讯同源 raw/qfq 配对，正式可解析 |
+| 统一 ETF 日线 (`cn_etf_daily`) | `canonical/ready` | 一个不可变快照同时保存腾讯同源 raw/qfq、分段复权依据和公司行为；读取方按所需价格口径解析 |
 | A 股 Baostock raw (`ashare_daily_raw`) | `canonical/ready` | 保存完整 raw 行情、来源、逐文件哈希和公司行为记录 |
 | A 股 Baostock qfq (`ashare_daily_qfq`) | `canonical/ready` | 使用 Baostock `foreAdjustFactor` 本地计算，保存完整因子并用同源 qfq 核验 |
 | A 股 Qlib v2 (`qlib_ashare_v2`) | `canonical/ready` | 由正式 qfq 快照生成，包含沪深300、中证500、中证800、创业板指和科创50五套指数基准，以及 CSI300/500/800 股票池，并锁定准确的上游快照 ID 和内容哈希 |
@@ -103,27 +102,72 @@ qlib/cn_data_baostock_jqdata_cleaned/
 
 ## ETF 更新
 
-正式数据集：
+ETF 只有一个正式数据集：`cn_etf_daily`。一个不可变快照内部同时保存：
 
-- `etf_momentum_daily_raw`：`audit/ready/raw`；
-- `etf_momentum_daily_qfq`：`canonical/ready/qfq`。
+```text
+cn_etf_daily/
+  LATEST.json
+  snapshots/<snapshot_id>/
+    raw/
+    qfq/
+    factors/
+    corporate_actions.parquet
+    DATASET_MANIFEST.json
+```
 
-每次更新都完整下载 `SZ159915` 和 `SH513100` 的同源 raw/qfq。腾讯优先，东方财富备用，新浪旧原始价只做独立审计。发布条件：
+raw、qfq和复权因子是同一份正式数据的配套组成部分，不是三个可独立发布的
+数据集。`LATEST.json` 只指向整包校验通过的快照。发布事务失败时不切换；发布
+成功后，新快照已经成为正式数据，随后才清理过旧快照并再次同步根清单。正常情况
+只保留当前和上一次两份；若这项发布后维护失败，返回
+`published_with_warnings` 并保留已发布指针，不能误报为“没有发布”。
 
-- 每只 ETF 自己的 raw/qfq 日期完全一致；
-- 两只 ETF 的最新交易日一致；
-- 两只 ETF 历史日历可因停牌而不同，回测使用交集日历；
-- qfq OHLC 与 raw 乘因子的关系通过校验；
-- 最新有效交易日的前复权因子为 1；
-- 513100 的 2022 年 1:5 拆分同时有公告和因子曲线证据；
-- 两只 ETF 全部成功后才更新正式 qfq 指针。
+当前正式证券池为51只，即已验证的原50只与本地 `513100` 的并集。普通日期更新
+冻结当前 `ETF_UNIVERSE.parquet`，不再根据新浪成交额重新选择证券，也不把证券池
+变化混入日期更新。证券池包含 `512890`、`513010`、`510720`、`159915` 和
+`513100`。
+其中 `513010` 的当前名称是恒生科技ETF易方达；红利国企ETF国泰的代码是
+`510720`，两者均保留以避免代码和名称误配。普通更新只请求每只证券的有限重叠
+窗口和缺失日期；目标日期已存在时零网络请求。重叠数据证明某只证券的复权历史
+变化时，只允许单独修复该证券。下载器使用全局限速、有限重试和单实例锁；任一
+证券缺少同源 raw/qfq 或因子验证失败时，本轮不发布。
+腾讯 ETF 前复权不总是纯乘法：拆分使用乘数，现金分配还可能产生价格偏移。
+因子证据因此按连续区间保存 `qfq_ohlc = raw_ohlc * factor + offset`，同一区间只
+使用一组参数，最新交易日必须归一为 `factor=1`、`offset=0`。每日单独反推产生的
+舍入抖动不能登记成公司行为。
 
 ```bash
 python quant_workflow/scripts/quant_data_cli.py update \
-  etf_momentum_daily_qfq --through YYYY-MM-DD
+  cn_etf_daily --through YYYY-MM-DD
+
+python quant_workflow/scripts/quant_data_cli.py \
+  validate cn_etf_daily --release
 ```
 
-每日更新编排器调用同一命令，不再只刷新最近五天。
+第二条命令是ETF正式发布的单命令验收：只读、无网络，只检查当前ETF快照、允许
+保留的一份备份、raw/qfq/factors、公司行为、证券池、根清单和旧ETF入口，不扫描无关A股
+数据。每日更新编排器会在ETF更新后、报告生成前自动调用；成功状态固定为
+`full_validation_passed`，失败会给出具体项目并返回非零。
+
+全量重建不是普通更新的兜底。只有当前正式快照经全检确认严重损坏、唯一备份经过
+实际验证仍无法恢复，并且用户明确批准本次全量重建时才允许执行；任何条件不明确
+都必须停止并询问用户。完整下载脚本还会在联网前检查对应的显式确认参数。
+
+读取方使用同一个数据集ID并声明所需口径：
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py resolve cn_etf_daily --require-basis raw
+python quant_workflow/scripts/quant_data_cli.py resolve cn_etf_daily --require-basis qfq
+```
+
+项目内ETF与校验操作由四个协作技能约束，单一真源位于 `.claude/skills/`：
+
+- `quant-data-etf-full-download`
+- `quant-data-etf-update`
+- `quant-data-sample-validation`
+- `quant-data-full-validation`
+
+抽检只检查确定性样本并报告剩余文件；正式发布验收必须使用全检。Codex等外部
+Agent通过指向上述目录的本地技能链接发现它们，不维护第二份同义内容。
 
 ## A 股更新边界
 
@@ -195,11 +239,13 @@ python quant_workflow/scripts/build_qlib_v2.py --publish
 ## 失败规则
 
 - raw 下载成功、复权失败：qfq 正式指针不前进。
-- 两只 ETF 只成功一只：不发布。
+- 统一证券池中任一 ETF 缺少同源 raw/qfq 或复权证据：不发布。
 - 因子日期不覆盖行情、哈希变化、公司行为缺失：拒绝解析或发布。
 - 请求 qfq 却解析到 raw：明确报错。
 - 指数基准请求按固定间隔发送，连接错误、429 和 5xx 最多重试三次并指数退避；任一必需指数仍失败时，本轮基准快照不发布。
 - 清单过期、README 漂移或出现未登记目录：`sync_data_manifest.py --check` 返回非零。
-- 旧数据清理、移动或删除：必须另行 dry-run 并取得用户明确确认。
+- 发布后保留策略只允许删除 `cn_etf_daily/snapshots/` 内早于唯一回滚版本的普通
+  快照目录；清理失败记为 `published_with_warnings`，不回滚已经成功的发布。
+- 保留策略之外的旧数据清理、移动或删除：必须另行 dry-run 并取得用户明确确认。
 
 运行状态和日志不属于正式数据：状态写入 `quant_workflow/reports/`，日志写入 `quant_workflow/logs/`。账号、密码、token、券商信息、行情数据、模型和 `mlruns` 不进入 Git。

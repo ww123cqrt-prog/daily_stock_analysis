@@ -83,11 +83,11 @@ china-astock-quant adapters, and every stable script here. Data paths use
 
 # Read-only data-governance inventory and dry-run cleanup plan
 .venv/bin/python quant_workflow/scripts/report_data_hygiene.py
-# Refresh and atomically publish the governed two-ETF raw/qfq snapshots
-.venv/bin/python quant_workflow/scripts/quant_data_cli.py update etf_momentum_daily_qfq
+# Incrementally update the governed 51-symbol ETF dataset as one raw/qfq/factor snapshot
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update cn_etf_daily --through YYYY-MM-DD
 
 # Inspect data basis, adjustment evidence, date range and lineage
-.venv/bin/python quant_workflow/scripts/quant_data_cli.py describe etf_momentum_daily_qfq
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py describe cn_etf_daily
 
 # Fail when the catalog, governed paths or generated README tables drift
 .venv/bin/python quant_workflow/scripts/sync_data_manifest.py --check
@@ -114,8 +114,9 @@ china-astock-quant adapters, and every stable script here. Data paths use
 - Yahoo raw responses: `quant_data/raw/global_1d/yahoo/captured_date=YYYY-MM-DD`
 - Sina snapshot raw responses: `quant_data/raw/ashare_snapshots/captured_date=YYYY-MM-DD`
 - EastMoney news raw responses: `quant_data/raw/ashare_news/captured_date=YYYY-MM-DD`
-- Governed ETF raw evidence: `quant_data/parquet/etf_1d/etf_momentum_daily_raw`
-- Governed ETF qfq snapshot: `quant_data/parquet/etf_1d/etf_momentum_daily_qfq`
+- Governed ETF bundle: `quant_data/parquet/etf_1d/cn_etf_daily`; each immutable
+  snapshot contains `raw/`, `qfq/`, `factors/` and one manifest. Only the
+  current snapshot and one previous rollback snapshot are retained.
 
 The canonical storage, schema, merge, and handoff rules are documented in
 [`docs/quant-data-contract.md`](docs/quant-data-contract.md). The live local

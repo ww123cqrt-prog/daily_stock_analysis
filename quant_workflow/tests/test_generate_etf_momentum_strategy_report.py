@@ -53,6 +53,46 @@ def sample_prices(rows: int = 180) -> dict[str, pd.DataFrame]:
     }
 
 
+def patch_canonical_etf_dataset(
+    module, monkeypatch, tmp_path: Path
+) -> Path:
+    snapshot = tmp_path / "snapshot"
+    raw_bars = snapshot / "raw"
+    qfq_bars = snapshot / "qfq"
+    raw_bars.mkdir(parents=True)
+    qfq_bars.mkdir(parents=True)
+    for symbol, frame in sample_prices(180).items():
+        frame.to_parquet(raw_bars / f"{symbol}.parquet", index=False)
+        frame.to_parquet(qfq_bars / f"{symbol}.parquet", index=False)
+
+    manifest = {
+        "dataset_id": "cn_etf_daily",
+        "snapshot_id": "snapshot-001",
+        "price_basis": "qfq",
+        "available_price_bases": ["raw", "qfq"],
+        "source": {"provider": "tencent"},
+    }
+    (snapshot / "DATASET_MANIFEST.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    quant_data_dir = tmp_path / "quant-data"
+
+    def fake_resolve(
+        dataset_id, *, quant_data_root, price_basis, validated_cache=None
+    ):
+        assert quant_data_root == quant_data_dir
+        assert dataset_id == "cn_etf_daily"
+        assert price_basis in {"raw", "qfq"}
+        del validated_cache
+        return SimpleNamespace(
+            component_path=raw_bars if price_basis == "raw" else qfq_bars,
+            dataset=SimpleNamespace(snapshot_path=snapshot, manifest=manifest),
+        )
+
+    monkeypatch.setattr(module, "resolve_dataset_component", fake_resolve)
+    return quant_data_dir
+
+
 def load_config() -> dict[str, object]:
     path = (
         Path(__file__).resolve().parents[1]
@@ -109,26 +149,29 @@ def test_resolve_canonical_etf_bars_uses_v2_catalog_snapshot(
 ) -> None:
     module = load_module()
     snapshot = tmp_path / "snapshot"
-    bars = snapshot / "bars"
+    bars = snapshot / "qfq"
     bars.mkdir(parents=True)
     calls: list[tuple[str, str]] = []
 
-    def fake_resolve(dataset_id, *, quant_data_root, require_basis):
-        calls.append((dataset_id, require_basis))
+    def fake_resolve(dataset_id, *, quant_data_root, price_basis):
+        calls.append((dataset_id, price_basis))
         return SimpleNamespace(
-            snapshot_path=snapshot,
-            manifest={
-                "dataset_id": dataset_id,
-                "snapshot_id": "snapshot-001",
-                "price_basis": "qfq",
-            },
+            component_path=bars,
+            dataset=SimpleNamespace(
+                snapshot_path=snapshot,
+                manifest={
+                    "dataset_id": dataset_id,
+                    "snapshot_id": "snapshot-001",
+                    "price_basis": "qfq",
+                },
+            ),
         )
 
-    monkeypatch.setattr(module, "resolve_dataset", fake_resolve)
+    monkeypatch.setattr(module, "resolve_dataset_component", fake_resolve)
 
     resolved_bars, manifest = module.resolve_canonical_etf_bars(tmp_path)
 
-    assert calls == [("etf_momentum_daily_qfq", "qfq")]
+    assert calls == [("cn_etf_daily", "qfq")]
     assert resolved_bars == bars
     assert manifest["snapshot_id"] == "snapshot-001"
 
@@ -137,54 +180,10 @@ def test_run_uses_paired_canonical_raw_and_qfq_without_legacy_data(
     monkeypatch, tmp_path: Path
 ) -> None:
     module = load_module()
-    raw_snapshot = tmp_path / "raw-snapshot"
-    qfq_snapshot = tmp_path / "qfq-snapshot"
-    raw_bars = raw_snapshot / "bars"
-    qfq_bars = qfq_snapshot / "bars"
-    raw_bars.mkdir(parents=True)
-    qfq_bars.mkdir(parents=True)
-    for symbol, frame in sample_prices(180).items():
-        frame.to_parquet(raw_bars / f"{symbol}.parquet", index=False)
-        frame.to_parquet(qfq_bars / f"{symbol}.parquet", index=False)
-
-    raw_manifest = {
-        "dataset_id": "etf_momentum_daily_raw",
-        "snapshot_id": "raw-001",
-        "price_basis": "raw",
-        "source": {"provider": "tencent"},
-    }
-    qfq_manifest = {
-        "dataset_id": "etf_momentum_daily_qfq",
-        "snapshot_id": "qfq-001",
-        "price_basis": "qfq",
-        "source": {"provider": "tencent"},
-        "upstream_snapshots": [
-            {"dataset_id": "etf_momentum_daily_raw", "snapshot_id": "raw-001"}
-        ],
-    }
-    (raw_snapshot / "DATASET_MANIFEST.json").write_text(
-        json.dumps(raw_manifest), encoding="utf-8"
-    )
-    (qfq_snapshot / "DATASET_MANIFEST.json").write_text(
-        json.dumps(qfq_manifest), encoding="utf-8"
-    )
-
-    def fake_resolve(dataset_id, *, quant_data_root, require_basis):
-        assert quant_data_root == tmp_path / "quant-data"
-        if dataset_id == "etf_momentum_daily_raw":
-            assert require_basis == "raw"
-            return SimpleNamespace(snapshot_path=raw_snapshot, manifest=raw_manifest)
-        assert dataset_id == "etf_momentum_daily_qfq"
-        assert require_basis == "qfq"
-        return SimpleNamespace(snapshot_path=qfq_snapshot, manifest=qfq_manifest)
-
-    monkeypatch.setattr(module, "resolve_dataset", fake_resolve)
+    quant_data_dir = patch_canonical_etf_dataset(module, monkeypatch, tmp_path)
     reports_dir = tmp_path / "reports"
 
     module.run(
-        data_dir=tmp_path / "missing-legacy-data",
-        adjusted_data_dir=tmp_path / "missing-eastmoney-data",
-        tencent_adjusted_data_dir=tmp_path / "missing-tencent-data",
         report_dir=reports_dir,
         config_path=(
             Path(__file__).resolve().parents[1]
@@ -192,7 +191,7 @@ def test_run_uses_paired_canonical_raw_and_qfq_without_legacy_data(
             / "etf_momentum_robustness.yaml"
         ),
         generated_at="2026-07-26T01:00:00+08:00",
-        quant_data_dir=tmp_path / "quant-data",
+        quant_data_dir=quant_data_dir,
     )
 
     report = json.loads(
@@ -204,45 +203,42 @@ def test_run_uses_paired_canonical_raw_and_qfq_without_legacy_data(
     assert report["reproducibility"]["data_manifest_hash"]
 
 
-def test_resolve_canonical_etf_pair_rejects_unpaired_qfq_snapshot(
+def test_resolve_canonical_etf_pair_rejects_components_from_different_snapshots(
     monkeypatch, tmp_path: Path
 ) -> None:
     module = load_module()
     raw_snapshot = tmp_path / "raw-snapshot"
     qfq_snapshot = tmp_path / "qfq-snapshot"
-    (raw_snapshot / "bars").mkdir(parents=True)
-    (qfq_snapshot / "bars").mkdir(parents=True)
+    raw_bars = raw_snapshot / "raw"
+    qfq_bars = qfq_snapshot / "qfq"
+    raw_bars.mkdir(parents=True)
+    qfq_bars.mkdir(parents=True)
 
-    def fake_resolve(dataset_id, *, quant_data_root, require_basis):
-        if dataset_id == "etf_momentum_daily_raw":
+    def fake_resolve(
+        dataset_id, *, quant_data_root, price_basis, validated_cache=None
+    ):
+        del quant_data_root, validated_cache
+        manifest = {
+            "dataset_id": dataset_id,
+            "snapshot_id": f"{price_basis}-001",
+            "price_basis": "qfq",
+            "source": {"provider": "tencent"},
+        }
+        if price_basis == "raw":
             return SimpleNamespace(
-                snapshot_path=raw_snapshot,
-                manifest={
-                    "dataset_id": dataset_id,
-                    "snapshot_id": "raw-001",
-                    "price_basis": require_basis,
-                    "source": {"provider": "tencent"},
-                },
+                component_path=raw_bars,
+                dataset=SimpleNamespace(
+                    snapshot_path=raw_snapshot, manifest=manifest
+                ),
             )
         return SimpleNamespace(
-            snapshot_path=qfq_snapshot,
-            manifest={
-                "dataset_id": dataset_id,
-                "snapshot_id": "qfq-001",
-                "price_basis": require_basis,
-                "source": {"provider": "tencent"},
-                "upstream_snapshots": [
-                    {
-                        "dataset_id": "etf_momentum_daily_raw",
-                        "snapshot_id": "different-raw-snapshot",
-                    }
-                ],
-            },
+            component_path=qfq_bars,
+            dataset=SimpleNamespace(snapshot_path=qfq_snapshot, manifest=manifest),
         )
 
-    monkeypatch.setattr(module, "resolve_dataset", fake_resolve)
+    monkeypatch.setattr(module, "resolve_dataset_component", fake_resolve)
 
-    with pytest.raises(module.DataContractError, match="paired raw snapshot"):
+    with pytest.raises(module.DataContractError, match="same snapshot"):
         module.resolve_canonical_etf_pair(tmp_path)
 
 
@@ -365,20 +361,14 @@ def test_holding_episode_summary_separates_cash_and_invested_holds() -> None:
     assert summary["invested_win_rate"] == pytest.approx(1.0)
 
 
-def test_run_writes_canonical_latest_and_run_scoped_artifacts(tmp_path: Path) -> None:
+def test_run_writes_canonical_latest_and_run_scoped_artifacts(
+    monkeypatch, tmp_path: Path
+) -> None:
     module = load_module()
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir()
-    for symbol, frame in sample_prices(180).items():
-        frame.to_parquet(raw_dir / f"{symbol}.parquet", index=False)
-    (raw_dir / "SOURCE_MANIFEST.json").write_text(
-        '{"source":"akshare.fund_etf_hist_sina"}\n', encoding="utf-8"
-    )
+    quant_data_dir = patch_canonical_etf_dataset(module, monkeypatch, tmp_path)
     reports_dir = tmp_path / "reports"
 
     run_dir = module.run(
-        data_dir=raw_dir,
-        adjusted_data_dir=tmp_path / "missing-qfq",
         report_dir=reports_dir,
         config_path=(
             Path(__file__).resolve().parents[1]
@@ -386,6 +376,7 @@ def test_run_writes_canonical_latest_and_run_scoped_artifacts(tmp_path: Path) ->
             / "etf_momentum_robustness.yaml"
         ),
         generated_at="2026-07-25T21:00:00+08:00",
+        quant_data_dir=quant_data_dir,
     )
 
     assert (run_dir / "strategy_report.json").exists()
@@ -393,6 +384,26 @@ def test_run_writes_canonical_latest_and_run_scoped_artifacts(tmp_path: Path) ->
     assert (run_dir / "signals.parquet").exists()
     assert (reports_dir / "strategy_report_latest.json").exists()
     assert (reports_dir / "strategy_report_latest.md").exists()
+
+
+def test_run_rejects_unregistered_custom_parquet_directory(tmp_path: Path) -> None:
+    module = load_module()
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    for symbol, frame in sample_prices(180).items():
+        frame.to_parquet(raw_dir / f"{symbol}.parquet", index=False)
+
+    with pytest.raises(module.DataContractError, match="custom ETF data directories"):
+        module.run(
+            data_dir=raw_dir,
+            report_dir=tmp_path / "reports",
+            config_path=(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "etf_momentum_robustness.yaml"
+            ),
+            generated_at="2026-07-25T21:00:00+08:00",
+        )
 
 
 @pytest.mark.parametrize(

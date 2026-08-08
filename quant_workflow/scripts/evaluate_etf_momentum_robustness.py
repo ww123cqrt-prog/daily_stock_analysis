@@ -9,15 +9,12 @@ used here.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
 import pandas as pd
-import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -28,8 +25,6 @@ from etf_momentum_rotation import (  # noqa: E402
     CASH,
     DEFAULT_SYMBOLS,
     build_signal_table,
-    load_price_data,
-    sanitize_json_value,
     simulate_open_to_open,
     summarize_periods,
     with_execution_lag,
@@ -40,29 +35,9 @@ DEFAULT_CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "etf_momentum_robustness.yaml"
 )
 DEFAULT_DATA_DIR = (
-    quant_data_root() / "parquet" / "etf_1d" / "etf_momentum_rotation" / "v1"
+    quant_data_root() / "parquet" / "etf_1d" / "cn_etf_daily"
 )
 DEFAULT_REPORT_DIR = reports_root() / "etf_momentum_rotation" / "robustness"
-
-
-def _json_default(value: object) -> object:
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return value.isoformat()
-    raise TypeError(f"not JSON serializable: {type(value).__name__}")
-
-
-def _write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            sanitize_json_value(dict(payload)),
-            ensure_ascii=False,
-            indent=2,
-            default=_json_default,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 def _finite_or_none(value: object) -> float | None:
@@ -441,143 +416,6 @@ def _acceptance(
     }
 
 
-def _markdown(report: Mapping[str, object]) -> str:
-    acceptance = report["acceptance"]
-    baseline_total_bps = report["config"]["evaluation"]["costs_total_bps"]["baseline"]
-    stress_total_bps = report["config"]["evaluation"]["costs_total_bps"]["stress"]
-    baseline = report["variants"][f"baseline_total_{baseline_total_bps}bps"]["metrics"]
-    stress = report["variants"][f"stress_total_{stress_total_bps}bps"]["metrics"]
-    delayed = report["variants"]["delayed_one_session"]["metrics"]
-    cash = report["cash_metrics"]
-    advisory_names = {
-        "positive_quarter_ratio": "严格完整季度正收益比例",
-        "baseline_annualized_return": "基准成本年化收益",
-        "baseline_max_drawdown": "基准成本最大回撤绝对值",
-        "stress_annualized_return": "40bp总成本下年化收益",
-        "delayed_annualized_return": "额外延迟一个交易日后年化收益",
-        "parameter_positive_ratio": "参数邻域正收益比例",
-        "parameter_max_drawdown_pass_ratio": "参数邻域回撤合格比例",
-    }
-    advisory_value_keys = {
-        "positive_quarter_ratio": "positive_quarter_ratio",
-        "baseline_annualized_return": "baseline_annualized_return",
-        "baseline_max_drawdown": "baseline_max_drawdown_abs",
-        "stress_annualized_return": "stress_annualized_return",
-        "delayed_annualized_return": "delayed_annualized_return",
-        "parameter_positive_ratio": "parameter_positive_ratio",
-        "parameter_max_drawdown_pass_ratio": "parameter_max_drawdown_pass_ratio",
-    }
-    advisory_operators = {
-        "positive_quarter_ratio": ">=",
-        "baseline_annualized_return": ">=",
-        "baseline_max_drawdown": "<=",
-        "stress_annualized_return": ">",
-        "delayed_annualized_return": ">",
-        "parameter_positive_ratio": ">=",
-        "parameter_max_drawdown_pass_ratio": ">=",
-    }
-    evidence_names = {
-        "unresolved_price_discontinuity": "513100价格序列存在尚未解释的约80%断点",
-        "independent_source_cross_check_not_done": "尚未用第二个独立数据源交叉核验",
-        "dividend_and_split_adjustment_not_verified": "分红、份额拆分和复权口径尚未核验",
-        "sixty_trading_day_paper_tracking_not_done": "尚未完成60个交易日纸面跟踪",
-    }
-    lines = [
-        "# ETF 动量轮动鲁棒性验收",
-        "",
-        "> 这是固定规则的历史验收，不是收益承诺、投资建议或自动交易信号。",
-        "",
-        f"## 状态：`{acceptance['status']}`",
-        "",
-        "主规则固定为：20日涨幅排名 + 收盘价高于20日均线，下一交易日开盘执行。自动一票否决已关闭；通过项、参考门槛未达到项和证据缺口全部保留，由用户决定是否接受。",
-        "",
-        "## 主规则验收摘要",
-        "",
-        "| 检查 | 结果 |",
-        "|---|---:|",
-        f"| 严格完整季度正收益比例 | {acceptance['values']['positive_quarter_ratio']:.2%} |",
-        f"| 含首个热身期季度的比例 | {report['quarter_summary']['all_available_positive_ratio']:.2%} |",
-        f"| 早期可比口径（总成本{report['quarter_summary']['earlier_comparison_total_bps']}bp，含首个不完整季度） | {report['quarter_summary']['earlier_comparison_positive_ratio']:.2%} |",
-        f"| 基准成本年化收益（总成本{baseline_total_bps}bp） | {baseline['annualized_return']:.2%} |",
-        f"| 基准成本最大回撤 | {baseline['max_drawdown']:.2%} |",
-        f"| 压力成本年化收益（总成本{stress_total_bps}bp） | {stress['annualized_return']:.2%} |",
-        f"| 延迟一个交易日后的年化收益 | {delayed['annualized_return']:.2%} |",
-        "",
-        f"早期可比口径的{report['quarter_summary']['earlier_comparison_positive_ratio']:.2%}和当前严格口径不是同一个数字：早期使用{report['quarter_summary']['earlier_comparison_total_bps']}bp总成本并包含首个不完整季度；当前主口径使用{baseline_total_bps}bp总成本并只统计完整季度。两者都会保留，不互相替代。",
-        "",
-        "## 全部参考线检查",
-        "",
-        "| 检查 | 实际值 | 参考线 | 结果 |",
-        "|---|---:|---:|---|",
-    ]
-    for name, passed in acceptance["advisory_checks"].items():
-        value_key = advisory_value_keys[name]
-        lines.append(
-            f"| {advisory_names[name]} | {acceptance['values'][value_key]:.2%} | "
-            f"{advisory_operators[name]} {acceptance['reference_values'][value_key]:.2%} | "
-            f"{'达到参考线' if passed else '未达到，交由用户判断'} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## 参考门槛未达到项",
-            "",
-        ]
-    )
-    if acceptance["advisory_not_met"]:
-        lines.extend(
-            f"- {advisory_names.get(name, name)}未达到原参考线；不会自动淘汰，由你判断。"
-            for name in acceptance["advisory_not_met"]
-        )
-    else:
-        lines.append("- 没有；但这不等于证据已经完整。")
-    lines.extend(
-        [
-            "",
-            "## 尚未完成的关键证据",
-            "",
-        ]
-    )
-    lines.extend(
-        f"- {evidence_names.get(name, name)}。"
-        for name in report["data_quality"]["evidence_gaps"]
-    )
-    lines.extend(
-        [
-            "",
-            "## 空仓指标",
-            "",
-            "- 指标已经存在，代码状态是 `CASH`。热身结束后，它表示20日涨幅第一名没有站在自己的20日均线上方；并不要求两只ETF都跌破均线。",
-            f"- 指标热身期排除了 `{cash['warmup_rows_excluded']}` 行；这部分只是指标还没形成，不能算策略主动空仓。",
-            f"- 热身期之后，收盘信号为空仓 `{cash['signal_cash']['cash_days']}` 天，占 `{cash['signal_cash']['cash_fraction']:.2%}`；最长连续空仓 `{cash['signal_cash']['longest_cash_streak_days']}` 个交易日。",
-            f"- 下一开盘目标为空仓 `{cash['next_open_target_cash']['cash_days']}` 天，占 `{cash['next_open_target_cash']['cash_fraction']:.2%}`。",
-            "",
-            "## 参数稳定性",
-            "",
-            f"- 预先声明的邻域：lookback={report['config']['evaluation']['parameter_lookbacks']}，均线={report['config']['evaluation']['parameter_moving_averages']}。",
-            f"- 通过成本和回撤的邻域比例：{acceptance['values']['parameter_max_drawdown_pass_ratio']:.2%}。",
-            "- 邻域只用于发现敏感性，不能据此改成新的20日策略，也不能事后挑选冠军。",
-            "",
-            "## 已知可能失效的情况",
-            "",
-        ]
-    )
-    for condition in report["failure_diagnostics"]["known_failure_conditions"]:
-        lines.append(f"- {condition}")
-    lines.extend(
-        [
-            "",
-            "## 解释边界",
-            "",
-            "- 这套规则没有训练模型，因此没有训练集/测试集意义上的模型泛化证明；它只能通过固定规则的时间分段、成本、执行延迟和参数敏感性检查。",
-            "- 当前数据是新浪原始收盘价，不是已核验的分红再投资总收益序列；这会影响与原帖数字比较。",
-            "- 513100在2022-01-14出现约80%的单位价格断点，疑似份额拆分或未复权企业行为；在用独立来源和复权因子确认前，收益、回撤和信号都不能视为最终结果。",
-            "- 513100是A股场内上市的QDII ETF，仍有汇率、海外市场时差、跟踪误差和场内溢价折价风险。",
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
 def evaluate(
     *,
     data_dir: Path = DEFAULT_DATA_DIR,
@@ -596,181 +434,6 @@ def evaluate(
         report_dir=resolved_report_dir,
         config_path=Path(config_path),
     )
-
-    # The implementation below is retained temporarily because the canonical
-    # generator imports its bounded calculation helpers from this module. It is
-    # no longer reachable through this compatibility entry point.
-    config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-    data = load_price_data(Path(data_dir), DEFAULT_SYMBOLS)
-    primary_full = build_signal_table(
-        data,
-        lookback_days=int(config["primary_rule"]["lookback_days"]),
-        moving_average_days=int(config["primary_rule"]["moving_average_days"]),
-    )
-    valid_columns = [
-        column for column in primary_full if "return_" in column or "_ma_" in column
-    ]
-    valid = primary_full.loc[primary_full[valid_columns].notna().all(axis=1)]
-    if valid.empty:
-        raise ValueError("primary rule has no rows after indicator warm-up")
-    primary = primary_full.loc[primary_full["date"] >= valid["date"].min()].reset_index(
-        drop=True
-    )
-
-    total_costs = config["evaluation"]["costs_total_bps"]
-    variants: dict[str, object] = {}
-    for name, total_bps in total_costs.items():
-        result = _metrics_without_warmup(primary, side_cost_bps=float(total_bps) / 2.0)
-        variants[f"{name}_total_{total_bps}bps"] = {
-            "metrics": result["metrics"],
-            "total_cost_bps": float(total_bps),
-            "periods": result["periods"],
-        }
-    delayed = _metrics_without_warmup(
-        primary,
-        side_cost_bps=float(total_costs["baseline"]) / 2.0,
-        lag_days=int(config["evaluation"]["delayed_execution_lag_days"]),
-    )
-    variants["delayed_one_session"] = {
-        "metrics": delayed["metrics"],
-        "total_cost_bps": float(total_costs["baseline"]),
-        "additional_execution_lag_days": int(
-            config["evaluation"]["delayed_execution_lag_days"]
-        )
-        - 1,
-        "periods": delayed["periods"],
-    }
-
-    baseline_key = f"baseline_total_{total_costs['baseline']}bps"
-    stress_key = f"stress_total_{total_costs['stress']}bps"
-    baseline_periods = variants[baseline_key]["periods"]
-    strict_quarter_labels = complete_quarter_labels(primary)
-    all_available_quarter_labels = _available_finished_quarter_labels(primary)
-    quarters = _quarter_report(baseline_periods, strict_quarter_labels)
-    all_available_quarters = _quarter_report(
-        baseline_periods, all_available_quarter_labels
-    )
-    earlier_comparison_total_bps = float(
-        config["evaluation"]["earlier_comparison_total_bps"]
-    )
-    earlier_comparison = _metrics_without_warmup(
-        primary, side_cost_bps=earlier_comparison_total_bps / 2.0
-    )
-    earlier_comparison_quarters = _quarter_report(
-        earlier_comparison["periods"],
-        all_available_quarter_labels,
-    )
-    parameter_grid = evaluate_parameter_grid(
-        data,
-        lookbacks=[int(value) for value in config["evaluation"]["parameter_lookbacks"]],
-        moving_averages=[
-            int(value) for value in config["evaluation"]["parameter_moving_averages"]
-        ],
-        side_cost_bps=float(total_costs["baseline"]) / 2.0,
-    )
-    discontinuities = price_discontinuity_report(data)
-    evidence_gaps = [
-        "independent_source_cross_check_not_done",
-        "dividend_and_split_adjustment_not_verified",
-        "sixty_trading_day_paper_tracking_not_done",
-    ]
-    if not discontinuities["passed"]:
-        evidence_gaps.insert(0, "unresolved_price_discontinuity")
-    report: dict[str, object] = {
-        "schema_version": 1,
-        "status": "robustness_evaluated",
-        "strategy_id": config["strategy_id"],
-        "config": config,
-        "data": {
-            "source": config["data"]["source"],
-            "adjustment": config["data"]["adjustment"],
-            "symbols": list(DEFAULT_SYMBOLS),
-            "start_date": str(primary["date"].min().date()),
-            "end_date": str(primary["date"].max().date()),
-            "common_trading_days_after_warmup": int(len(primary)),
-            "independent_source_cross_check": False,
-            "dividend_total_return_verified": False,
-        },
-        "primary_rule": {
-            "lookback_days": int(config["primary_rule"]["lookback_days"]),
-            "moving_average_days": int(config["primary_rule"]["moving_average_days"]),
-            "signal_at": "close",
-            "execution_at": "next_open",
-            "selection_from_parameter_grid": False,
-        },
-        "variants": {
-            name: {key: value for key, value in item.items() if key != "periods"}
-            for name, item in variants.items()
-        },
-        "quarterly_baseline": quarters,
-        "quarterly_all_available": all_available_quarters,
-        "quarter_summary": {
-            "strict_complete_count": len(quarters),
-            "strict_complete_positive_count": int(
-                sum(bool(row["positive"]) for row in quarters)
-            ),
-            "strict_complete_positive_ratio": (
-                float(sum(bool(row["positive"]) for row in quarters) / len(quarters))
-                if quarters
-                else None
-            ),
-            "all_available_count": len(all_available_quarters),
-            "all_available_positive_count": int(
-                sum(bool(row["positive"]) for row in all_available_quarters)
-            ),
-            "all_available_positive_ratio": (
-                float(
-                    sum(bool(row["positive"]) for row in all_available_quarters)
-                    / len(all_available_quarters)
-                )
-                if all_available_quarters
-                else None
-            ),
-            "earlier_comparison_total_bps": earlier_comparison_total_bps,
-            "earlier_comparison_count": len(earlier_comparison_quarters),
-            "earlier_comparison_positive_count": int(
-                sum(bool(row["positive"]) for row in earlier_comparison_quarters)
-            ),
-            "earlier_comparison_positive_ratio": (
-                float(
-                    sum(bool(row["positive"]) for row in earlier_comparison_quarters)
-                    / len(earlier_comparison_quarters)
-                )
-                if earlier_comparison_quarters
-                else None
-            ),
-        },
-        "cash_metrics": cash_metrics(primary_full),
-        "parameter_grid": {key: value for key, value in parameter_grid.items()},
-        "reference_metrics": _reference_metrics(primary),
-        "data_quality": {
-            "price_discontinuities": discontinuities,
-            "independent_source_cross_check": False,
-            "dividend_and_split_adjustment_verified": False,
-            "paper_tracking_days_completed": 0,
-            "evidence_gaps": evidence_gaps,
-        },
-        "failure_diagnostics": _failure_diagnostics(variants[baseline_key]["periods"]),
-    }
-    report["acceptance"] = _acceptance(
-        baseline=variants[baseline_key],
-        stress=variants[stress_key],
-        delayed=variants["delayed_one_session"],
-        quarters=quarters,
-        parameter_grid=parameter_grid,
-        config=config,
-    )
-    report_dir = Path(report_dir).expanduser().resolve()
-    run_id = f"etf_momentum_robustness_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = report_dir / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(run_dir / "result.json", report)
-    (run_dir / "report.md").write_text(_markdown(report), encoding="utf-8")
-    _write_json(report_dir / "etf_momentum_robustness_latest.json", report)
-    (report_dir / "etf_momentum_robustness_latest.md").write_text(
-        _markdown(report), encoding="utf-8"
-    )
-    return run_dir
 
 
 def parse_args() -> argparse.Namespace:

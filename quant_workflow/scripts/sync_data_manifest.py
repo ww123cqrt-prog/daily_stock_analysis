@@ -547,36 +547,6 @@ def _v2_dataset_catalog(
             role="audit",
         ),
         **compatibility_entries,
-        "etf_momentum_sina_raw_legacy": _legacy_dataset_entry(
-            quant_data=quant_data,
-            dataset_id="etf_momentum_sina_raw_legacy",
-            path=etf_root / "etf_momentum_rotation" / "v1",
-            data_kind="daily_bars",
-            source_provider="sina",
-            source_interface="akshare_fund_etf_hist_sina",
-            price_basis="raw",
-            role="audit",
-        ),
-        "etf_momentum_eastmoney_qfq_legacy": _legacy_dataset_entry(
-            quant_data=quant_data,
-            dataset_id="etf_momentum_eastmoney_qfq_legacy",
-            path=etf_root / "etf_momentum_rotation" / "eastmoney_qfq",
-            data_kind="daily_bars",
-            source_provider="eastmoney",
-            source_interface="fund_etf_hist_em_adjust_qfq",
-            price_basis="qfq",
-            role="audit",
-        ),
-        "etf_momentum_tencent_qfq_legacy": _legacy_dataset_entry(
-            quant_data=quant_data,
-            dataset_id="etf_momentum_tencent_qfq_legacy",
-            path=etf_root / "etf_momentum_rotation" / "tencent_qfq",
-            data_kind="daily_bars",
-            source_provider="tencent",
-            source_interface="ifzq_qfqday",
-            price_basis="qfq",
-            role="audit",
-        ),
         "global_daily_legacy": _legacy_dataset_entry(
             quant_data=quant_data,
             dataset_id="global_daily_legacy",
@@ -1308,7 +1278,6 @@ def robust_manifest_entries(reference_dir: Path) -> tuple[
 def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, Any]:
     quant_data = Path(quant_data_root).expanduser().resolve()
     parquet_root = quant_data / "parquet" / "ashare_1d"
-    etf_root = quant_data / "parquet" / "etf_1d"
     global_parquet_root = quant_data / "parquet" / "global_1d"
     raw_root = quant_data / "raw"
     qlib_root = quant_data / "qlib"
@@ -1420,10 +1389,6 @@ def build_manifest(*, quant_data_root: Path, reports_root: Path) -> dict[str, An
             "compatibility_qlib_provider": qlib_entry(
                 compatibility_provider,
                 "Legacy mutable Qlib path retained only for old consumers and rollback.",
-            ),
-            "etf_momentum_rotation": parquet_entry(
-                etf_root / "etf_momentum_rotation" / "v1",
-                "Isolated two-ETF momentum-rotation candidate data; not part of the Qlib stock provider.",
             ),
             "global_daily": parquet_entry(
                 global_parquet_root,

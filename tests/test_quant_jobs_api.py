@@ -5487,7 +5487,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("download_akshare.py", akshare[1])
         self.assertIn("--incremental", akshare)
         self.assertIn("quant_data_cli.py", etf[1])
-        self.assertIn("etf_momentum_daily_qfq", etf)
+        self.assertIn("cn_etf_daily", etf)
         self.assertIn("--through", etf)
         self.assertNotIn("--output-dir", etf)
         self.assertIn("generate_etf_momentum_strategy_report.py", etf_report[1])
@@ -5555,7 +5555,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn(
             "Unsupported params for download_eastmoney", str(unsafe_ctx.exception)
         )
-        self.assertEqual(default_etf[-2:], ["update", "etf_momentum_daily_qfq"])
+        self.assertEqual(default_etf[-2:], ["update", "cn_etf_daily"])
 
     def test_ashare_source_jobs_enforce_conservative_request_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

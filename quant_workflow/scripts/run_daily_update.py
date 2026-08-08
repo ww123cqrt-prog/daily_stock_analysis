@@ -265,11 +265,25 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 "--root",
                 str(QUANT_DATA),
                 "update",
-                "etf_momentum_daily_qfq",
+                "cn_etf_daily",
                 "--through",
                 str(args.end),
             ]
             stages.append(Stage("download_etf_momentum", etf_update, required=False))
+            stages.append(
+                Stage(
+                    "validate_cn_etf_daily_release",
+                    _script("quant_data_cli.py")
+                    + [
+                        "--root",
+                        str(QUANT_DATA),
+                        "validate",
+                        "cn_etf_daily",
+                        "--release",
+                    ],
+                    required=False,
+                )
+            )
             stages.append(
                 Stage(
                     "generate_etf_momentum_report",
@@ -413,6 +427,22 @@ def summary_status(results: list[StageResult]) -> str:
     return "ok"
 
 
+def etf_report_skip_reason(results: list[StageResult]) -> str | None:
+    """Return why the ETF report must keep the previous accepted artifact."""
+
+    by_name = {result.name: result for result in results}
+    for stage_name in (
+        "download_etf_momentum",
+        "validate_cn_etf_daily_release",
+    ):
+        result = by_name.get(stage_name)
+        if result is None:
+            return f"prerequisite stage did not run: {stage_name}"
+        if result.status != "ok":
+            return f"prerequisite stage {stage_name} ended with {result.status}"
+    return None
+
+
 def write_summary(results: list[StageResult], meta: dict[str, Any]) -> Path:
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
     override = meta.pop("status_override", None)
@@ -542,17 +572,17 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
     )
     governed_before = latest_dataset_dates(
         (
-            "etf_momentum_daily_qfq",
+            "cn_etf_daily",
             "ashare_daily_qfq",
             "qlib_ashare_v2",
             "qlib_ashare_cleaned_v2",
         )
     )
-    etf_before = governed_before["etf_momentum_daily_qfq"]
+    etf_before = governed_before["cn_etf_daily"]
     qfq_before = governed_before["ashare_daily_qfq"]
     qlib_before = governed_before["qlib_ashare_v2"]
     qlib_cleaned_before = governed_before["qlib_ashare_cleaned_v2"]
-    _log(f"latest ETF momentum date before: {etf_before or 'n/a'}")
+    _log(f"latest unified ETF date before: {etf_before or 'n/a'}")
     write_runtime_status(run_id, "running", current_stage="starting", source_coverage_before=before)
 
     stages = build_stages(args, run_id=run_id)
@@ -565,7 +595,26 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             current_stage=stage.name,
             stages=[stage_payload(item) for item in results],
         )
-        result = run_stage(stage, args.dry_run)
+        report_skip_reason = (
+            etf_report_skip_reason(results)
+            if stage.name == "generate_etf_momentum_report" and not args.dry_run
+            else None
+        )
+        if report_skip_reason is not None:
+            _log(
+                "stage generate_etf_momentum_report: skipped; "
+                + report_skip_reason
+            )
+            result = StageResult(
+                stage.name,
+                "skipped",
+                0.0,
+                0,
+                required=stage.required,
+                details={"reason": report_skip_reason},
+            )
+        else:
+            result = run_stage(stage, args.dry_run)
         results.append(result)
         write_runtime_status(
             run_id,
@@ -594,13 +643,13 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
     )
     governed_after = latest_dataset_dates(
         (
-            "etf_momentum_daily_qfq",
+            "cn_etf_daily",
             "ashare_daily_qfq",
             "qlib_ashare_v2",
             "qlib_ashare_cleaned_v2",
         )
     )
-    etf_after = governed_after["etf_momentum_daily_qfq"]
+    etf_after = governed_after["cn_etf_daily"]
     qfq_after = governed_after["ashare_daily_qfq"]
     qlib_after = governed_after["qlib_ashare_v2"]
     qlib_cleaned_after = governed_after["qlib_ashare_cleaned_v2"]

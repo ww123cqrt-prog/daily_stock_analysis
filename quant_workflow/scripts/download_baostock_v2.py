@@ -67,6 +67,32 @@ class ProviderDenied(BaostockV2Error):
     """Baostock explicitly denied this client; the run must stop immediately."""
 
 
+def resolve_bundle_file(bundle_dir: Path, relative: object, *, label: str) -> Path:
+    """Resolve a regular bundle file without following path symlinks."""
+
+    if not isinstance(relative, str) or not relative:
+        raise BaostockV2Error(f"{label} must stay inside bundle")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise BaostockV2Error(f"{label} must stay inside bundle")
+    bundle_root = Path(bundle_dir).expanduser().resolve()
+    current = bundle_root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise BaostockV2Error(
+                f"{label} must stay inside bundle and cannot use symlinks"
+            )
+    candidate = current.resolve()
+    try:
+        candidate.relative_to(bundle_root)
+    except ValueError as exc:
+        raise BaostockV2Error(f"{label} must stay inside bundle") from exc
+    if not candidate.is_file():
+        raise BaostockV2Error(f"{label} is unavailable")
+    return candidate
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -860,7 +886,12 @@ def _query_with_retry(
     raise BaostockV2Error(str(last_error or "Baostock query failed"))
 
 
-def _symbol_source_files_complete(root: Path, symbol: str) -> bool:
+def _symbol_source_files_complete(
+    root: Path,
+    symbol: str,
+    *,
+    allow_empty_raw: bool = False,
+) -> bool:
     raw_path = root / "raw" / f"{symbol}.parquet"
     factor_path = root / "factor_events" / f"{symbol}.parquet"
     try:
@@ -868,7 +899,9 @@ def _symbol_source_files_complete(root: Path, symbol: str) -> bool:
             return False
         raw = pd.read_parquet(raw_path)
         factors = pd.read_parquet(factor_path)
-        return not raw.empty and set(FACTOR_COLUMNS).issubset(factors.columns)
+        return (allow_empty_raw or not raw.empty) and set(FACTOR_COLUMNS).issubset(
+            factors.columns
+        )
     except Exception:
         return False
 
@@ -887,12 +920,40 @@ def download_bundle(
     qfq_audit_since: str | None = None,
     qfq_sample_modulus: int = 100,
     resume: bool = False,
+    mode: str = "full",
+    factor_start: str | None = None,
+    base_latest_trade_date: str | None = None,
     provider: Any | None = None,
 ) -> Path:
     if request_interval < 0.2:
         raise BaostockV2Error("request interval must be at least 0.2 seconds")
     if retries < 1 or retries > 2:
         raise BaostockV2Error("retries must be between 1 and 2")
+    if mode not in {"full", "incremental"}:
+        raise BaostockV2Error("bundle mode must be full or incremental")
+    through_day = pd.Timestamp(through).normalize()
+    start_day = pd.Timestamp(start).normalize()
+    factor_start_day = pd.Timestamp(factor_start or "1990-01-01").normalize()
+    if start_day > through_day:
+        raise BaostockV2Error("bundle start must not be after through")
+    if mode == "incremental":
+        if not base_latest_trade_date:
+            raise BaostockV2Error(
+                "incremental bundle requires base_latest_trade_date"
+            )
+        base_day = pd.Timestamp(base_latest_trade_date).normalize()
+        if not start_day <= base_day < through_day:
+            raise BaostockV2Error(
+                "incremental bundle must overlap the base date and extend through it"
+            )
+        if (base_day - start_day).days > 62:
+            raise BaostockV2Error(
+                "incremental bundle overlap is limited to 62 calendar days"
+            )
+        if factor_start_day > pd.Timestamp("1990-01-01"):
+            raise BaostockV2Error(
+                "incremental bundle must query the complete factor history"
+            )
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "RUNNING.lock"
@@ -956,7 +1017,11 @@ def download_bundle(
                 "source_retrieved_at": source_retrieved_at,
             }
             atomic_json(output_dir / "progress.json", progress)
-            if resume and _symbol_source_files_complete(output_dir, symbol):
+            if resume and _symbol_source_files_complete(
+                output_dir,
+                symbol,
+                allow_empty_raw=mode == "incremental",
+            ):
                 raw = pd.read_parquet(output_dir / "raw" / f"{symbol}.parquet")
                 events = pd.read_parquet(
                     output_dir / "factor_events" / f"{symbol}.parquet"
@@ -976,17 +1041,18 @@ def download_bundle(
                         adjustflag="3",
                     )
                     raw = normalize_bars(raw_result, symbol, source_id="baostock_raw")
-                    if raw.empty:
-                        empty_symbols.append(symbol)
-                        consecutive_failures = 0
-                        continue
+                    factor_query_start = (
+                        factor_start_day.date().isoformat()
+                        if mode == "incremental"
+                        else start
+                    )
                     factor_result = _query_with_retry(
                         gate,
                         bs.query_adjust_factor,
                         retries=retries,
                         relogin=relogin,
                         code=provider_code,
-                        start_date=start,
+                        start_date=factor_query_start,
                         end_date=through,
                     )
                     events = normalize_factor_events(factor_result, symbol)
@@ -994,6 +1060,35 @@ def download_bundle(
                     atomic_parquet(
                         events, output_dir / "factor_events" / f"{symbol}.parquet"
                     )
+                    if raw.empty:
+                        empty_symbols.append(symbol)
+                        rows.append(
+                            {
+                                "symbol": symbol,
+                                "provider_code": provider_code,
+                                "raw_path": f"raw/{symbol}.parquet",
+                                "qfq_provider_path": None,
+                                "factor_events_path": f"factor_events/{symbol}.parquet",
+                                "raw_rows": 0,
+                                "factor_event_rows": len(events),
+                                "factor_start_backfill_days": 0,
+                                "factor_paired_fallback_days": 0,
+                                "first_date": None,
+                                "last_date": None,
+                                "raw_sha256": sha256_file(
+                                    output_dir / "raw" / f"{symbol}.parquet"
+                                ),
+                                "qfq_provider_sha256": None,
+                                "factor_events_sha256": sha256_file(
+                                    output_dir
+                                    / "factor_events"
+                                    / f"{symbol}.parquet"
+                                ),
+                                "qfq_max_absolute_error": None,
+                            }
+                        )
+                        consecutive_failures = 0
+                        continue
                 except ProviderDenied:
                     raise
                 except Exception as exc:
@@ -1010,6 +1105,37 @@ def download_bundle(
                             f"stopped after {consecutive_failures} consecutive failures"
                         ) from exc
                     continue
+            if raw.empty:
+                if mode != "incremental":
+                    empty_symbols.append(symbol)
+                    consecutive_failures = 0
+                    continue
+                empty_symbols.append(symbol)
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "provider_code": provider_code,
+                        "raw_path": f"raw/{symbol}.parquet",
+                        "qfq_provider_path": None,
+                        "factor_events_path": f"factor_events/{symbol}.parquet",
+                        "raw_rows": 0,
+                        "factor_event_rows": len(events),
+                        "factor_start_backfill_days": 0,
+                        "factor_paired_fallback_days": 0,
+                        "first_date": None,
+                        "last_date": None,
+                        "raw_sha256": sha256_file(
+                            output_dir / "raw" / f"{symbol}.parquet"
+                        ),
+                        "qfq_provider_sha256": None,
+                        "factor_events_sha256": sha256_file(
+                            output_dir / "factor_events" / f"{symbol}.parquet"
+                        ),
+                        "qfq_max_absolute_error": None,
+                    }
+                )
+                consecutive_failures = 0
+                continue
             qfq_path = output_dir / "qfq_provider" / f"{symbol}.parquet"
             raw_first = pd.to_datetime(raw["date"], errors="coerce").min()
             event_first = (
@@ -1113,7 +1239,7 @@ def download_bundle(
         nonempty_coverage = len(rows) / len(symbols)
         if failures:
             raise BaostockV2Error(f"{len(failures)} symbols failed")
-        if nonempty_coverage < 0.98:
+        if mode == "full" and nonempty_coverage < 0.98:
             raise BaostockV2Error(
                 f"non-empty symbol coverage {nonempty_coverage:.4%} is below 98%"
             )
@@ -1143,8 +1269,11 @@ def download_bundle(
                 "execution_environment": "private_remote_windows",
             },
             "source_retrieved_at": source_retrieved_at,
+            "bundle_mode": mode,
             "requested_start": start,
             "requested_through": through,
+            "factor_requested_start": factor_start_day.date().isoformat(),
+            "base_latest_trade_date": base_latest_trade_date,
             "requested_symbols": len(symbols),
             "completed_symbols": len(rows),
             "empty_symbols": len(empty_symbols),
@@ -1193,12 +1322,20 @@ def build_snapshots_from_bundle(
 
     bundle_dir = Path(bundle_dir).expanduser().resolve()
     root = Path(quant_data_root).expanduser().resolve()
-    manifest = json.loads(
-        (bundle_dir / "BUNDLE_MANIFEST.json").read_text(encoding="utf-8")
+    manifest_path = resolve_bundle_file(
+        bundle_dir,
+        "BUNDLE_MANIFEST.json",
+        label="source bundle manifest",
     )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") != "ready":
         raise BaostockV2Error("source bundle is not ready")
-    index = pd.read_parquet(bundle_dir / str(manifest["index_path"]))
+    index_path = resolve_bundle_file(
+        bundle_dir,
+        manifest.get("index_path"),
+        label="source bundle index",
+    )
+    index = pd.read_parquet(index_path)
     if index.empty or len(index) != int(manifest["completed_symbols"]):
         raise BaostockV2Error("source bundle index is incomplete")
     run_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
@@ -1208,7 +1345,7 @@ def build_snapshots_from_bundle(
     raw_stage = staging_run / raw_snapshot_id
     qfq_stage = staging_run / qfq_snapshot_id
     actions: list[pd.DataFrame] = []
-    source_files: list[Path] = [bundle_dir / "BUNDLE_MANIFEST.json"]
+    source_files: list[Path] = [manifest_path]
     maximum_error = 0.0
     audited_symbols = 0
     bounded_factor_backfill_symbols = 0
@@ -1216,8 +1353,16 @@ def build_snapshots_from_bundle(
     non_unit_terminal_factor_symbols = 0
     for row in index.itertuples(index=False):
         symbol = str(row.symbol)
-        raw_path = bundle_dir / str(row.raw_path)
-        events_path = bundle_dir / str(row.factor_events_path)
+        raw_path = resolve_bundle_file(
+            bundle_dir,
+            row.raw_path,
+            label=f"raw bundle file for {symbol}",
+        )
+        events_path = resolve_bundle_file(
+            bundle_dir,
+            row.factor_events_path,
+            label=f"factor bundle file for {symbol}",
+        )
         source_files.extend([raw_path, events_path])
         if sha256_file(raw_path) != str(row.raw_sha256):
             raise BaostockV2Error(f"raw bundle hash mismatch: {symbol}")
@@ -1228,7 +1373,11 @@ def build_snapshots_from_bundle(
         provider_relative = getattr(row, "qfq_provider_path", None)
         provider_qfq: pd.DataFrame | None = None
         if isinstance(provider_relative, str) and provider_relative:
-            provider_path = bundle_dir / provider_relative
+            provider_path = resolve_bundle_file(
+                bundle_dir,
+                provider_relative,
+                label=f"qfq bundle file for {symbol}",
+            )
             source_files.append(provider_path)
             if sha256_file(provider_path) != str(row.qfq_provider_sha256):
                 raise BaostockV2Error(f"qfq bundle hash mismatch: {symbol}")

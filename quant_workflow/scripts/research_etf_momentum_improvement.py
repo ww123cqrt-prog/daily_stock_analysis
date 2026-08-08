@@ -34,7 +34,7 @@ from etf_momentum_rotation import (  # noqa: E402
     summarize_periods,
     with_execution_lag,
 )
-from quant_data_contract import resolve_dataset  # noqa: E402
+from quant_data_contract import resolve_dataset_component  # noqa: E402
 
 
 DEFAULT_CONFIG = (
@@ -536,13 +536,13 @@ def run(
         else quant_data_root().resolve()
     )
     data_config = config["data"]
-    resolved = resolve_dataset(
+    resolved = resolve_dataset_component(
         str(data_config["dataset_id"]),
         quant_data_root=root,
-        require_basis=str(data_config["required_price_basis"]),
+        price_basis=str(data_config["required_price_basis"]),
         require_status=str(data_config["required_status"]),
     )
-    data = load_price_data(resolved.snapshot_path / "bars")
+    data = load_price_data(resolved.component_path)
 
     parameter_config = config["parameter_research"]
     variants = [
@@ -618,13 +618,13 @@ def run(
             ),
         },
         "data": {
-            "dataset_id": resolved.dataset_id,
-            "snapshot_id": resolved.manifest["snapshot_id"],
-            "price_basis": resolved.manifest["price_basis"],
-            "provider": resolved.manifest["source"]["provider"],
-            "date_range": resolved.manifest["date_range"],
+            "dataset_id": resolved.dataset.dataset_id,
+            "snapshot_id": resolved.dataset.manifest["snapshot_id"],
+            "price_basis": resolved.price_basis,
+            "provider": resolved.dataset.manifest["source"]["provider"],
+            "date_range": resolved.dataset.manifest["date_range"],
             "manifest_sha256": _sha256(
-                resolved.snapshot_path / "DATASET_MANIFEST.json"
+                resolved.dataset.snapshot_path / "DATASET_MANIFEST.json"
             ),
         },
         "time_splits": splits,

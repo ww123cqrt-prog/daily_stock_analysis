@@ -14,7 +14,7 @@ from _paths import quant_data_root, reports_root  # noqa: E402
 
 
 DEFAULT_DATA_DIR = (
-    quant_data_root() / "parquet" / "etf_1d" / "etf_momentum_rotation" / "v1"
+    quant_data_root() / "parquet" / "etf_1d" / "cn_etf_daily"
 )
 DEFAULT_REPORT_DIR = reports_root() / "etf_momentum_rotation"
 

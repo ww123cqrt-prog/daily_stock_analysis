@@ -95,12 +95,36 @@ Naming convention:
 - `quant_data_cli.py` is the governed entrypoint for `list`, `describe`,
   `resolve`, `validate`, and `update`. `resolve` checks status, requested price
   basis, manifest hash, bar hashes, factor hashes and company-action hash.
-- `download_etf_momentum_data.py` is the producer behind
-  `quant_data_cli.py update etf_momentum_daily_qfq`. It downloads complete
-  same-provider raw/qfq histories for 159915 and 513100, validates the factor
-  curve and 513100 split, stages both ETFs, then atomically publishes immutable
-  raw and qfq snapshots. Tencent is preferred and EastMoney is the fallback;
-  the old Sina directory remains audit-only.
+- `quant_data_cli.py update cn_etf_daily` freezes the current 51-symbol universe,
+  reuses its existing files, and requests only a bounded overlap plus missing
+  dates. An unchanged target date returns with zero provider requests. If the
+  overlap proves one symbol's provider adjustment changed, only that symbol may
+  receive a targeted history refresh. `download_cn_etf_data.py` retains the
+  separate full-rebuild producer, but its command line refuses to run unless
+  severe current corruption, an unrecoverable backup, and explicit user
+  approval are all confirmed.
+  Tencent raw/qfq history uses a single-instance lock, request budget and
+  bounded retries.
+  Paired adjustment evidence uses piecewise affine transforms
+  (`qfq = raw * factor + offset`) so cash distributions are not mistaken for
+  multiplicative splits. One immutable snapshot contains `raw/`, `qfq/`,
+  `factors/` and one manifest. Incomplete runs remain in cache and never update
+  `LATEST.json`. After publication, retention and root-manifest housekeeping
+  normally leave only the current and immediately previous complete snapshots;
+  a housekeeping failure returns `published_with_warnings` without pretending
+  that the already-committed snapshot was not published.
+  `download_etf_momentum_data.py` now delegates its
+  command-line publication to this unified producer and cannot create a second
+  formal ETF dataset.
+- `quant_data_cli.py validate cn_etf_daily --release` is the single offline ETF
+  release check. It validates the current snapshot and sole backup, all
+  raw/qfq/factor files, corporate actions, the frozen universe, root catalog,
+  retired ETF paths, and the shared qfq availability of the five registered
+  strategy symbols (`SH512890`, `SH513010`, `SH510720`, `SZ159915`, and
+  `SH513100`). It does not scan unrelated A-share datasets. The daily updater
+  runs it automatically after the ETF update and before report generation. If
+  either the update or release check fails, the previous report is retained and
+  the unrelated A-share stages continue.
 - `download_baostock_v2.py` creates a restartable full-market Baostock source
   bundle containing complete raw bars and `query_adjust_factor` events. It
   rebuilds qfq locally as raw OHLC times `foreAdjustFactor`, while provider qfq
@@ -139,18 +163,17 @@ Naming convention:
 - `sync_data_manifest.py` writes schema-v2 `DATA_MANIFEST.json`, keeps all data
   paths relative to `QUANT_DATA_ROOT`, refreshes generated README catalog
   blocks, and supports `--check` for catalog/path/README drift.
-- `backtest_etf_momentum_rotation.py` replays the fixed 20-day ranking and
-  20-day moving-average rule with close-to-next-open execution. It writes an
-  isolated report under `reports/etf_momentum_rotation/`, including zero-cost
-  and costed variants. The result is a research candidate, not a promoted
-  model or an order instruction.
-- `evaluate_etf_momentum_robustness.py` keeps that 20/20 rule fixed and writes
-  a manual-review robustness report under
-  `reports/etf_momentum_rotation/robustness/`. It reports complete-quarter
-  consistency, 10/20/40bp total-cost cases, one-session execution delay,
-  pre-declared 15/20/25-day parameter sensitivity, explicit `CASH` periods,
-  and unresolved price discontinuities. It never promotes a parameter-grid
-  winner or issues an order.
+- `generate_etf_momentum_strategy_report.py` is the sole calculation and report
+  entry for the fixed two-ETF 20-day ranking and moving-average rule. It writes
+  the core backtest and manual-review robustness evidence into one versioned
+  report under `reports/etf_momentum_rotation/`, including cost cases,
+  one-session execution delay, pre-declared parameter sensitivity, explicit
+  `CASH` periods and price-discontinuity evidence. The result is a research
+  candidate, not a promoted model or an order instruction.
+- `backtest_etf_momentum_rotation.py` and
+  `evaluate_etf_momentum_robustness.py` are compatibility wrappers around that
+  generator; they do not publish separate formal reports or choose a
+  parameter-grid winner.
 - `research_etf_momentum_improvement.py` applies the user-supplied single-side
   commission from `configs/etf_momentum_improvement.yaml`, selects one bounded
   15/20/25-day candidate from the 2019-2022 development split only, and reports

@@ -23,7 +23,7 @@ fee:
   legacy_report_total_cost_bps_round_trip: 20.0
 
 data:
-  dataset_id: etf_momentum_daily_qfq
+  dataset_id: cn_etf_daily
   required_status: ready
   required_price_basis: qfq
 

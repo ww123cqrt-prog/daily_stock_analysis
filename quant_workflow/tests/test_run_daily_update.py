@@ -81,6 +81,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("download_global_daily", names)
         self.assertIn("download_ashare_news", names)
         self.assertIn("download_etf_momentum", names)
+        self.assertIn("validate_cn_etf_daily_release", names)
         self.assertIn("generate_etf_momentum_report", names)
         self.assertIn("validate_ashare_daily_qfq", names)
         self.assertIn("validate_qlib_ashare_v2", names)
@@ -160,6 +161,9 @@ class BuildStagesTest(unittest.TestCase):
     def test_etf_momentum_update_and_report_are_isolated_nonfatal_stages(self):
         stages = self.module.build_stages(_args())
         update = next(stage for stage in stages if stage.name == "download_etf_momentum")
+        validation = next(
+            stage for stage in stages if stage.name == "validate_cn_etf_daily_release"
+        )
         report = next(
             stage for stage in stages if stage.name == "generate_etf_momentum_report"
         )
@@ -167,16 +171,21 @@ class BuildStagesTest(unittest.TestCase):
         self.assertFalse(update.required)
         self.assertIn("quant_data_cli.py", update.argv[1])
         self.assertIn("update", update.argv)
-        self.assertIn("etf_momentum_daily_qfq", update.argv)
+        self.assertIn("cn_etf_daily", update.argv)
         self.assertIn("--through", update.argv)
+        self.assertFalse(validation.required)
+        self.assertIn("quant_data_cli.py", validation.argv[1])
+        self.assertEqual(validation.argv[-2:], ["cn_etf_daily", "--release"])
         self.assertFalse(report.required)
         self.assertIn("generate_etf_momentum_strategy_report.py", report.argv[1])
-        self.assertLess(stages.index(update), stages.index(report))
+        self.assertLess(stages.index(update), stages.index(validation))
+        self.assertLess(stages.index(validation), stages.index(report))
 
     def test_etf_momentum_stages_can_be_skipped(self):
         stages = self.module.build_stages(_args(skip_etf_momentum=True))
         names = [stage.name for stage in stages]
         self.assertNotIn("download_etf_momentum", names)
+        self.assertNotIn("validate_cn_etf_daily_release", names)
         self.assertNotIn("generate_etf_momentum_report", names)
 
     def test_verified_bundle_uses_contract_updater_before_native_validation(self):
@@ -257,7 +266,7 @@ class LatestSourceDateTest(unittest.TestCase):
                     {
                         "schema_version": 2,
                         "datasets": {
-                            "etf_momentum_daily_qfq": {
+                            "cn_etf_daily": {
                                 "latest_trade_date": "2026-07-24"
                             }
                         },
@@ -265,9 +274,7 @@ class LatestSourceDateTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            latest = self.module.latest_dataset_date(
-                "etf_momentum_daily_qfq", root=root
-            )
+            latest = self.module.latest_dataset_date("cn_etf_daily", root=root)
 
         self.assertEqual(latest, "2026-07-24")
 
@@ -275,7 +282,7 @@ class LatestSourceDateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
                 self.module.latest_dataset_date(
-                    "etf_momentum_daily_qfq", root=Path(tmp)
+                    "cn_etf_daily", root=Path(tmp)
                 ),
                 "",
             )
@@ -505,6 +512,57 @@ class DryRunMainTest(unittest.TestCase):
         self.assertFalse(summary["official_published"])
         self.assertFalse(summary["manifest_synced"])
         self.assertNotIn("publish_official", [item["name"] for item in summary["stages"]])
+
+    def test_etf_report_keeps_previous_artifact_when_update_or_release_check_fails(self):
+        module = self.module
+
+        for failed_stage in (
+            "download_etf_momentum",
+            "validate_cn_etf_daily_release",
+        ):
+            with self.subTest(failed_stage=failed_stage), tempfile.TemporaryDirectory() as tmp:
+                called: list[str] = []
+
+                def fake_run_stage(stage, dry_run):
+                    called.append(stage.name)
+                    status = "failed" if stage.name == failed_stage else "ok"
+                    return module.StageResult(
+                        stage.name,
+                        status,
+                        0.0,
+                        1 if status == "failed" else 0,
+                        required=stage.required,
+                    )
+
+                reports = Path(tmp) / "reports"
+                with (
+                    patch.object(module, "REPORTS_ROOT", reports),
+                    patch.object(module, "load_expected_symbols", return_value={"000001"}),
+                    patch.object(
+                        module,
+                        "source_coverage_snapshot",
+                        return_value=_snapshot("2026-07-08"),
+                    ),
+                    patch.object(module, "run_stage", side_effect=fake_run_stage),
+                    patch.object(sys, "argv", ["run_daily_update.py"]),
+                ):
+                    rc = module.main()
+                summary = json.loads(
+                    (reports / "daily_update_summary_latest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                report_stage = next(
+                    stage
+                    for stage in summary["stages"]
+                    if stage["name"] == "generate_etf_momentum_report"
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(summary["status"], "ok_with_warnings")
+                self.assertEqual(report_stage["status"], "skipped")
+                self.assertIn(failed_stage, report_stage["details"]["reason"])
+                self.assertNotIn("generate_etf_momentum_report", called)
 
     def test_native_validation_failure_stops_before_downstream_checks(self):
         module = self.module

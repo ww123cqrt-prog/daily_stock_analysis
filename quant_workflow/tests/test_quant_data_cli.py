@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 
@@ -46,6 +48,152 @@ def write_catalog(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_etf_release_snapshot(
+    contract,
+    quant_data: Path,
+    *,
+    snapshot_id: str,
+    symbols: tuple[str, ...],
+    retrieved_at: str,
+) -> Path:
+    snapshot = quant_data / "staging" / snapshot_id / snapshot_id
+    for symbol in symbols:
+        bars = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                "open": [1.0, 1.1],
+                "high": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "close": [1.1, 1.2],
+                "volume": [100.0, 110.0],
+                "source_id": ["tencent", "tencent"],
+            }
+        )
+        factors = pd.DataFrame(
+            {
+                "date": bars["date"],
+                "factor": [1.0, 1.0],
+                "offset": [0.0, 0.0],
+            }
+        )
+        for component in ("raw", "qfq"):
+            path = snapshot / component / f"{symbol}.parquet"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            bars.to_parquet(path, index=False)
+        factor_path = snapshot / "factors" / f"{symbol}.parquet"
+        factor_path.parent.mkdir(parents=True, exist_ok=True)
+        factors.to_parquet(factor_path, index=False)
+
+    pd.DataFrame(
+        columns=["symbol", "effective_trade_date", "action_type"]
+    ).to_parquet(snapshot / "corporate_actions.parquet", index=False)
+    universe = pd.DataFrame(
+        {
+            "symbol": list(symbols),
+            "code": [symbol[2:] for symbol in symbols],
+            "market": [symbol[:2] for symbol in symbols],
+            "name": [f"ETF {symbol[2:]}" for symbol in symbols],
+        }
+    )
+    universe.to_parquet(snapshot / "ETF_UNIVERSE.parquet", index=False)
+    universe_file_sha256 = contract.sha256_file(snapshot / "ETF_UNIVERSE.parquet")
+    contract.atomic_write_json(
+        snapshot / "UNIVERSE_MANIFEST.json",
+        {
+            "schema_version": 1,
+            "snapshot_id": snapshot_id,
+            "symbol_count": len(symbols),
+            "universe_sha256": "u" * 64,
+            "universe_file_sha256": universe_file_sha256,
+        },
+    )
+    contract.finalize_paired_price_snapshot(
+        snapshot,
+        dataset_id="cn_etf_daily",
+        snapshot_id=snapshot_id,
+        role="canonical",
+        status="ready",
+        source={
+            "provider": "tencent",
+            "interface": "test_fixture",
+            "universe_path": "ETF_UNIVERSE.parquet",
+            "universe_manifest_path": "UNIVERSE_MANIFEST.json",
+            "universe_sha256": "u" * 64,
+            "snapshot_retention": {
+                "policy": "current_plus_one_previous",
+                "max_complete_snapshots": 2,
+            },
+        },
+        adjustment={
+            "method": "provider_native_paired",
+            "adjusted_at": retrieved_at,
+            "adjustment_as_of": "2026-08-06",
+            "adjusted_fields": ["open", "high", "low", "close"],
+            "normalization_rule": (
+                "latest_valid_trade_date_factor_equals_1_and_offset_equals_0"
+            ),
+            "algorithm_version": "provider-native-affine-paired-v1",
+            "paired_raw_component_path": "raw",
+            "volume_adjusted": False,
+        },
+        producer={"script": "test_quant_data_cli.py", "version": "1"},
+        source_retrieved_at=retrieved_at,
+    )
+    return snapshot
+
+
+def _build_etf_release_fixture(
+    module,
+    tmp_path: Path,
+    *,
+    current_symbols: tuple[str, ...] = (
+        "SH512890",
+        "SH513010",
+        "SH510720",
+        "SZ159915",
+        "SH513100",
+    ),
+) -> tuple[Path, Path, Path]:
+    contract = sys.modules["quant_data_contract"]
+    quant_data = tmp_path / "quant_data"
+    dataset_root = quant_data / "parquet" / "etf_1d" / "cn_etf_daily"
+    backup_staging = _write_etf_release_snapshot(
+        contract,
+        quant_data,
+        snapshot_id="cn-etf-backup",
+        symbols=("SZ159915",),
+        retrieved_at="2026-08-06T18:00:00+08:00",
+    )
+    backup = contract.publish_snapshot(
+        backup_staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    current_staging = _write_etf_release_snapshot(
+        contract,
+        quant_data,
+        snapshot_id="cn-etf-current",
+        symbols=current_symbols,
+        retrieved_at="2026-08-07T18:00:00+08:00",
+    )
+    current = contract.publish_snapshot(
+        current_staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    contract.write_root_manifest(
+        quant_data,
+        {
+            "cn_etf_daily": contract.catalog_entry_from_snapshot(
+                current,
+                quant_data_root=quant_data,
+                dataset_root=dataset_root,
+            )
+        },
+    )
+    return quant_data, current, backup
 
 
 def write_pointer_state(module, root: Path, marker: str) -> dict[Path, bytes]:
@@ -98,6 +246,256 @@ def test_resolve_returns_nonzero_for_unusable_legacy_dataset(
 
     assert result == 2
     assert "不能使用" in capsys.readouterr().err
+
+
+def test_release_validation_checks_current_backup_and_strategy_symbols(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, _backup = _build_etf_release_fixture(module, tmp_path)
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "full_validation_passed"
+    assert payload["dataset_id"] == "cn_etf_daily"
+    assert payload["network_requests"] == 0
+    assert payload["snapshot_retention"] == {
+        "count": 2,
+        "policy": "current_plus_one_previous",
+    }
+    assert payload["current"]["snapshot_id"] == "cn-etf-current"
+    assert payload["backup"]["snapshot_id"] == "cn-etf-backup"
+    assert payload["strategy_symbols"]["status"] == "passed"
+
+
+def test_release_validation_allows_governed_resume_cache(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, _backup = _build_etf_release_fixture(module, tmp_path)
+    cache = quant_data / "cache" / "cn_etf_daily" / "v1"
+    cache.mkdir(parents=True)
+    (cache / "progress.json").write_text('{"status":"incomplete"}', encoding="utf-8")
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "full_validation_passed"
+
+
+def test_release_validation_fails_when_backup_is_missing(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, backup = _build_etf_release_fixture(module, tmp_path)
+    shutil.rmtree(backup)
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "full_validation_failed"
+    assert "backup" in payload["error"]["message"]
+
+
+def test_release_validation_fails_on_extra_snapshot_or_old_entry(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, current, _backup = _build_etf_release_fixture(module, tmp_path)
+    snapshots = current.parent
+    shutil.copytree(snapshots / "cn-etf-backup", snapshots / "cn-etf-extra")
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "full_validation_failed"
+    assert "exactly" in payload["error"]["message"]
+
+    shutil.rmtree(snapshots / "cn-etf-extra")
+    (quant_data / "parquet" / "etf_1d" / "etf_momentum_daily_qfq").mkdir(
+        parents=True
+    )
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert "legacy" in payload["error"]["message"]
+
+
+def test_release_validation_reports_missing_strategy_symbol(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, _backup = _build_etf_release_fixture(
+        module,
+        tmp_path,
+        current_symbols=("SH513010", "SH510720", "SZ159915", "SH513100"),
+    )
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert "SH512890" in payload["error"]["message"]
+
+
+def test_release_validation_fails_on_backup_hash_damage(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, backup = _build_etf_release_fixture(module, tmp_path)
+    damaged = pd.read_parquet(backup / "qfq" / "SZ159915.parquet")
+    damaged.loc[0, "close"] = 1.15
+    damaged.to_parquet(backup / "qfq" / "SZ159915.parquet", index=False)
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "full_validation_failed"
+    assert "hash mismatch" in payload["error"]["message"]
+
+
+def test_release_validation_rejects_old_etf_catalog_identity(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data, _current, _backup = _build_etf_release_fixture(module, tmp_path)
+    catalog_path = quant_data / "DATA_MANIFEST.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["datasets"]["cn_etf_daily_qfq"] = {
+        "dataset_id": "cn_etf_daily_qfq",
+        "data_kind": "daily_bars",
+        "role": "canonical",
+        "status": "ready",
+        "price_basis": "qfq",
+        "dataset_root": "parquet/etf_1d/cn_etf_daily_qfq",
+    }
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    result = module.main(
+        [
+            "--root",
+            str(quant_data),
+            "validate",
+            "cn_etf_daily",
+            "--release",
+        ]
+    )
+
+    assert result == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "full_validation_failed"
+    assert "legacy" in payload["error"]["message"]
+
+
+def test_release_helpers_reject_symlinks_and_malformed_universe_counts(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data, current, _backup = _build_etf_release_fixture(module, tmp_path)
+    linked = current / "linked-universe.parquet"
+    linked.symlink_to(current / "ETF_UNIVERSE.parquet")
+    with pytest.raises(module.DataContractError, match="unsafe"):
+        module._release_path(current, linked.name, "test path")
+
+    universe_manifest_path = current / "UNIVERSE_MANIFEST.json"
+    universe_manifest = json.loads(
+        universe_manifest_path.read_text(encoding="utf-8")
+    )
+    universe_manifest["selected_count"] = "not-an-integer"
+    universe_manifest_path.write_text(json.dumps(universe_manifest), encoding="utf-8")
+    manifest = json.loads(
+        (current / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    qfq_index = pd.read_parquet(current / "QFQ_FILE_INDEX.parquet")
+
+    with pytest.raises(module.DataContractError, match="symbol count"):
+        module._validate_release_universe(current, manifest, qfq_index)
+
+
+def test_release_validation_rejects_strategy_symbol_outside_qfq_component(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data, current, _backup = _build_etf_release_fixture(module, tmp_path)
+    qfq_index_path = current / "QFQ_FILE_INDEX.parquet"
+    qfq_index = pd.read_parquet(qfq_index_path)
+    qfq_index.loc[
+        qfq_index["symbol"] == "SH513100",
+        "relative_path",
+    ] = "raw/SH513100.parquet"
+    qfq_index.to_parquet(qfq_index_path, index=False)
+    manifest = json.loads(
+        (current / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+
+    with pytest.raises(module.DataContractError, match="outside qfq component"):
+        module._validate_release_snapshot(
+            quant_data,
+            current,
+            manifest=manifest,
+            required_symbols=module.ETF_RELEASE_REQUIRED_SYMBOLS,
+        )
 
 
 def test_update_reports_registered_ashare_v2_blockers(
@@ -612,6 +1010,36 @@ def test_atomic_restore_deletion_fsyncs_parent_directory(
 
     assert not pointer.exists()
     assert len(fsync_calls) == (0 if module.os.name == "nt" else 1)
+
+
+def test_update_dispatches_common_etf_updater(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    published = tmp_path / "quant_data" / "published-qfq"
+    calls: list[dict[str, object]] = []
+    fake_module = types.SimpleNamespace(
+        update_cn_etf_snapshot=lambda **kwargs: calls.append(kwargs) or published
+    )
+
+    with patch.dict(sys.modules, {"download_cn_etf_data": fake_module}):
+        assert (
+            module._update(
+                tmp_path / "quant_data",
+                "cn_etf_daily",
+                "2026-08-06",
+                None,
+            )
+            == 0
+        )
+
+    assert calls == [
+        {
+            "quant_data_dir": tmp_path / "quant_data",
+            "end_date": "2026-08-06",
+        }
+    ]
+    assert capsys.readouterr().out.strip() == str(published)
 
 
 def test_completed_status_write_failure_does_not_report_publication_failure(

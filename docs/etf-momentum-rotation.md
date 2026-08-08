@@ -22,18 +22,23 @@ T+1 开盘的交易，否则会产生前视。
 结果发布回数据目录；仓内历史下载脚本只保留为兼容入口说明，不能作为正式
 数据生产线使用。
 
-正式数据通过 `quant_data/DATASET_CATALOG.json` 管理，当前两套数据集是：
+正式数据通过 `quant_data/DATA_MANIFEST.json` 管理：
 
-- `etf_momentum_daily_raw`：同一次抓取保存的原始价格，仅用于核验；
-- `etf_momentum_daily_qfq`：与上述 raw 快照成对的前复权价格，供正式回测和报告使用。
+- `cn_etf_daily`：唯一正式ETF数据集；同一快照内的 `raw/` 用于核验，
+  `qfq/` 供正式回测和报告使用，`factors/` 保存复权依据。
 
-实际文件位于 `quant_data/parquet/etf_1d/<dataset_id>/snapshots/`。下载器会在
-腾讯和东方财富的 raw/qfq 成对接口中选择一套完整来源，两个快照记录彼此关系、
-日期范围和文件哈希。旧目录
-`quant_data/parquet/etf_1d/etf_momentum_rotation/v1/` 只保留为兼容输入，
-不再是每日更新和正式报告的默认数据。
+实际文件位于
+`quant_data/parquet/etf_1d/cn_etf_daily/snapshots/<snapshot_id>/`。当前正式
+生产器使用腾讯同源 raw/qfq 数据；一个快照同时记录两种价格、分段复权依据、
+日期范围和文件哈希。正式回测只通过根清单解析该数据集，不接受任意 Parquet
+目录，也不会读取旧两 ETF 数据入口。
 
-回测脚本：`quant_workflow/scripts/backtest_etf_momentum_rotation.py`。
+统一报告入口：
+`quant_workflow/scripts/generate_etf_momentum_strategy_report.py`。
+
+`backtest_etf_momentum_rotation.py` 和
+`evaluate_etf_momentum_robustness.py` 只保留为兼容入口，内部调用统一报告生成器，
+不再各自维护一套指标计算或正式报告。
 
 报告目录：`quant_workflow/reports/etf_momentum_rotation/`。
 
@@ -52,11 +57,9 @@ T+1 开盘的交易，否则会产生前视。
 
 ## 鲁棒性验收
 
-配置：`quant_workflow/configs/etf_momentum_robustness.yaml`。
-
-脚本：`quant_workflow/scripts/evaluate_etf_momentum_robustness.py`。
-
-报告：`quant_workflow/reports/etf_momentum_rotation/robustness/`。
+配置：`quant_workflow/configs/etf_momentum_robustness.yaml`。鲁棒性结果与核心回测
+统一写入 `quant_workflow/reports/etf_momentum_rotation/strategy_report_latest.json`
+及对应 `runs/<run_id>/strategy_report.json`，不再发布一份口径可能分叉的独立报告。
 
 验收保持 20 日涨幅和 20 日均线主规则不变，检查完整季度、10/20/40bp
 总成本、额外延迟一个交易日、15/20/25 日参数邻域和空仓持续时间。参数
@@ -100,7 +103,8 @@ T+1 开盘的交易，否则会产生前视。
 自 2019-01-18 开始，约 7.5 年，不能表述为已经覆盖完整长期周期。
 
 比较对象包括三只 ETF 分别买入持有、三 ETF 等权、旧两 ETF 固定规则、两 ETF
-合格优先规则、沪深300和中证500。当前指数快照缺少创业板指 `SZ399006`，报告
-明确显示缺口且不使用 ETF 或其他指数替代。费用口径固定为 ETF 单边佣金
+合格优先规则，以及沪深300、中证500、中证800、创业板指和科创50。指数只读取
+当前已验收 Qlib 快照中真实存在且日期重叠的序列；缺失时明确显示不可用，不使用
+ETF 或其他指数替代。费用口径固定为 ETF 单边佣金
 `0.5bp`，即每次买入或卖出按成交金额的 `0.005%` 计费；另测单边 1bp、2bp
 滑点，不计印花税和过户费。

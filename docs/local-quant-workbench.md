@@ -132,9 +132,9 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 `run_daily_update.py` 在 `/workflow` 中显示为“运行每日数据更新与 V2 校验”。它不再生成旧 merged/cleaned 候选，也不再调用 `publish_daily_candidate.py`：
 
 1. 可选 A 股来源刷新默认关闭。显式选择 Baostock、东方财富或 AkShare 时，一次只运行一个来源，并沿用至少 2 秒间隔、1 次尝试、连续失败最多 3 次和最多 7 天重叠窗口。这些结果只进入审计缓存，不能发布正式 V2；明确选择的来源失败时本轮返回非零。
-2. 全球日线、限定范围的 A 股新闻和 ETF raw/qfq 各自独立更新。ETF 仍通过 `quant_data_cli.py update etf_momentum_daily_qfq` 原子发布，失败不会生成半套 ETF 数据。
+2. 全球日线、限定范围的 A 股新闻和 ETF 分别更新。ETF 通过 `quant_data_cli.py update cn_etf_daily` 整包原子发布；raw、qfq和因子位于同一个快照，失败不会切换正式指针。更新后自动运行 `quant_data_cli.py validate cn_etf_daily --release`，只用一条离线命令验收当前快照、唯一备份、根清单和策略标的，不扫描无关A股数据；只有更新和验收都成功才生成新ETF报告。任一步失败时保留上一份报告并继续A股主流程。
 3. 正式 A 股更新只能由已核验的 raw/factor/qfq bundle 触发。命令行显式传 `--ashare-v2-bundle-dir <bundle>` 后，编排器委托 `quant_data_cli.py update ashare_daily_qfq --bundle-dir <bundle>`；该事务构建新的 `ashare_daily_raw`、`ashare_daily_qfq` 和 `qlib_ashare_v2` 不可变快照，并在失败时恢复原指针。网页不接受任意本机 bundle 路径。
-4. 无论是否发布新 bundle，编排器最后直接运行 `quant_data_cli validate ashare_daily_qfq`、`quant_data_cli validate qlib_ashare_v2`、`check_qlib_data.py`、`report_data_quality.py --fail-on-not-trainable` 和 `sync_data_manifest.py --check`。质量报告默认扫描原生 qfq bars 和原生 Qlib V2，不再把兼容目录当 canonical 输入。
+4. 无论是否发布新 bundle，编排器最后直接运行 `quant_data_cli validate ashare_daily_qfq`、`quant_data_cli validate qlib_ashare_v2`、`check_qlib_data.py`、`report_data_quality.py --fail-on-not-trainable` 和 `sync_data_manifest.py --check`。ETF专项验收已在ETF更新后单独完成，不借此重复扫描整套A股数据。质量报告默认扫描原生 qfq bars 和原生 Qlib V2，不再把兼容目录当 canonical 输入。
 5. `official_published=true` 只表示本轮 V2 bundle 事务真实成功；普通审计缓存下载成功不会设置该标志。运行摘要同时记录 qfq、Qlib V2 和 ETF 更新前后的日期以及 `legacy_source_role=audit_cache_only`。
 
 `--skip-download` 表示跳过独立下载、只校验现有 V2；`--dry-run` 只列出计划且不启动子进程。固定路径兼容输出只能由 `publish_v2_compatibility.py` 维护；mutable 修复工具不得写入原生快照。

@@ -539,3 +539,124 @@ def test_build_snapshot_records_provider_verified_non_unit_terminal_factor(
     assert qfq_bars.sort_values("date")["close"].iloc[-1] == pytest.approx(
         raw.sort_values("date")["close"].iloc[-1]
     )
+
+
+def test_build_snapshot_rejects_bundle_index_outside_bundle(tmp_path: Path) -> None:
+    module = load_module()
+    bundle = tmp_path / "bundle"
+    outside_index = tmp_path / "outside-index.parquet"
+    pd.DataFrame([{"symbol": "SH600786"}]).to_parquet(outside_index, index=False)
+    module.atomic_json(
+        bundle / "BUNDLE_MANIFEST.json",
+        {
+            "status": "ready",
+            "completed_symbols": 1,
+            "index_path": "../outside-index.parquet",
+        },
+    )
+
+    with pytest.raises(module.BaostockV2Error, match="inside bundle"):
+        module.build_snapshots_from_bundle(
+            bundle_dir=bundle,
+            quant_data_root=tmp_path / "quant_data",
+        )
+
+
+def test_incremental_bundle_keeps_empty_symbols_and_queries_full_factor_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_module()
+    universe = tmp_path / "universe.json"
+    universe.write_text(
+        json.dumps({"all": ["600000.XSHG", "000001.XSHE"]}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "bundle"
+    calls: list[tuple[str, str, str, str | None]] = []
+
+    class LoginResult:
+        error_code = "0"
+        error_msg = ""
+
+    class Provider:
+        def login(self):
+            return LoginResult()
+
+        def logout(self):
+            return LoginResult()
+
+        def query_history_k_data_plus(self):
+            raise AssertionError("query is intercepted")
+
+        def query_adjust_factor(self):
+            raise AssertionError("query is intercepted")
+
+    provider = Provider()
+    fields = module.HISTORY_FIELDS.split(",")
+
+    def fake_query(_gate, function, **kwargs):
+        calls.append(
+            (
+                function.__name__,
+                str(kwargs["code"]),
+                str(kwargs["start_date"]),
+                kwargs.get("adjustflag"),
+            )
+        )
+        if function.__name__ == "query_adjust_factor":
+            return pd.DataFrame(columns=module.FACTOR_COLUMNS)
+        if kwargs["code"] == "sz.000001":
+            return pd.DataFrame(columns=fields)
+        row = {field: "" for field in fields}
+        row.update(
+            {
+                "date": "2026-08-04",
+                "code": kwargs["code"],
+                "open": "10.0",
+                "high": "10.2",
+                "low": "9.9",
+                "close": "10.1",
+                "preclose": "10.0",
+                "volume": "1000",
+                "amount": "10100",
+                "turn": "0.1",
+                "pctChg": "1.0",
+                "tradestatus": "1",
+                "isST": "0",
+            }
+        )
+        return pd.DataFrame([row], columns=fields)
+
+    monkeypatch.setattr(module, "_query_with_retry", fake_query)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    manifest_path = module.download_bundle(
+        universe_file=universe,
+        output_dir=output,
+        through="2026-08-07",
+        start="2026-07-27",
+        factor_start="1990-01-01",
+        mode="incremental",
+        base_latest_trade_date="2026-08-04",
+        request_interval=0.2,
+        request_budget=20,
+        retries=1,
+        provider=provider,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    index = pd.read_parquet(output / "BUNDLE_FILE_INDEX.parquet")
+    assert manifest["bundle_mode"] == "incremental"
+    assert manifest["base_latest_trade_date"] == "2026-08-04"
+    assert manifest["requested_start"] == "2026-07-27"
+    assert manifest["factor_requested_start"] == "1990-01-01"
+    assert manifest["completed_symbols"] == 2
+    assert manifest["empty_symbols"] == 1
+    assert index["symbol"].tolist() == ["SH600000", "SZ000001"]
+    assert index.set_index("symbol").loc["SZ000001", "raw_rows"] == 0
+    factor_calls = [call for call in calls if call[0] == "query_adjust_factor"]
+    assert factor_calls == [
+        ("query_adjust_factor", "sh.600000", "1990-01-01", None),
+        ("query_adjust_factor", "sz.000001", "1990-01-01", None),
+    ]

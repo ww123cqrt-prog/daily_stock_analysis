@@ -46,7 +46,7 @@ const report = {
   period: { startDate: '2020-01-01', endDate: '2020-06-30' },
   strategy: { strategyId: 'momentum_rotation' },
   dataQuality: {
-    datasetId: 'etf_momentum_daily_qfq',
+    datasetId: 'cn_etf_daily',
     snapshotId: 'snapshot-1',
     priceBasis: 'qfq',
     provider: 'tencent',
@@ -363,7 +363,7 @@ describe('BacktestPage', () => {
     expect(request.symbols).toEqual(['159915', '513100']);
     expect(request.script).toContain('data.rank_by_return');
     expect(await screen.findByText('Alpha（年化）')).toBeInTheDocument();
-    expect(screen.getByText('etf_momentum_daily_qfq')).toBeInTheDocument();
+    expect(screen.getByText('cn_etf_daily')).toBeInTheDocument();
   });
 
   it('switches to a no-code form with explicit strategy rules and parameters', async () => {

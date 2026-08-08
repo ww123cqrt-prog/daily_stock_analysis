@@ -1088,7 +1088,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def download_etf_momentum(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("quant_data_cli.py")
-        command.extend(["update", "etf_momentum_daily_qfq"])
+        command.extend(["update", "cn_etf_daily"])
         _append_value(command, params, "end", "--through")
         return command
 
@@ -1593,7 +1593,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "download_etf_momentum": {
-            "label": "更新 ETF 动量数据",
+            "label": "更新统一 ETF 数据",
             "command": download_etf_momentum,
             "allowed_params": {"end"},
             "artifact_patterns": [
@@ -1601,14 +1601,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                     quant_data_root(DSA_ROOT)
                     / "parquet"
                     / "etf_1d"
-                    / "etf_momentum_daily_raw"
-                    / "LATEST.json"
-                ),
-                str(
-                    quant_data_root(DSA_ROOT)
-                    / "parquet"
-                    / "etf_1d"
-                    / "etf_momentum_daily_qfq"
+                    / "cn_etf_daily"
                     / "LATEST.json"
                 ),
             ],

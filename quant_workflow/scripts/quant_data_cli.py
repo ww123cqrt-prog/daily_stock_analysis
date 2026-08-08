@@ -10,11 +10,14 @@ import hashlib
 import json
 import os
 import sys
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+
+import pandas as pd
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -29,6 +32,7 @@ from quant_data_contract import (  # noqa: E402
     dataset_publication_lock,
     describe_dataset,
     resolve_dataset,
+    resolve_dataset_component,
     validate_dataset_snapshot,
 )
 
@@ -45,6 +49,61 @@ ASHARE_UPDATE_TRANSACTION_PATH = Path(
 )
 ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION = 1
 ASHARE_UPDATE_TRANSACTION_MAX_BYTES = 16 * 1024 * 1024
+
+ETF_RELEASE_DATASET_ID = "cn_etf_daily"
+ETF_RELEASE_DATASET_ROOT = Path("parquet/etf_1d/cn_etf_daily")
+# The formal ETF universe must cover every strategy input that the research
+# workflow can consume.  Keeping this list here prevents a release from
+# passing on the legacy two-ETF minimum while the three-ETF strategy is
+# missing its defensive holding or the frozen required pool is incomplete.
+ETF_RELEASE_REQUIRED_SYMBOLS = (
+    "SH512890",
+    "SH513010",
+    "SH510720",
+    "SZ159915",
+    "SH513100",
+)
+ETF_RELEASE_LEGACY_DATASET_IDS = frozenset(
+    {
+        "cn_etf_daily_raw",
+        "cn_etf_daily_qfq",
+        "etf_momentum_daily_raw",
+        "etf_momentum_daily_qfq",
+        "etf_momentum_rotation",
+    }
+)
+ETF_RELEASE_LEGACY_PATHS = (
+    Path("parquet/etf_1d/cn_etf_daily_raw"),
+    Path("parquet/etf_1d/cn_etf_daily_qfq"),
+    Path("parquet/etf_1d/etf_momentum_daily_raw"),
+    Path("parquet/etf_1d/etf_momentum_daily_qfq"),
+    Path("parquet/etf_1d/etf_momentum_rotation"),
+    Path("cache/etf_momentum_daily_raw"),
+    Path("cache/etf_momentum_daily_qfq"),
+)
+ETF_RELEASE_CATALOG_FIELDS = (
+    "dataset_id",
+    "data_kind",
+    "role",
+    "status",
+    "source",
+    "price_basis",
+    "available_price_bases",
+    "source_retrieved_at",
+    "adjustment",
+    "producer",
+    "date_range",
+    "latest_trade_date",
+    "row_count",
+    "symbol_count",
+    "components",
+    "file_index_path",
+    "raw_file_index_path",
+    "factor_index_path",
+    "corporate_actions_path",
+    "corporate_actions_sha256",
+    "content_sha256",
+)
 
 
 def _read_catalog(root: Path) -> dict[str, Any]:
@@ -365,6 +424,14 @@ def _human_description(payload: dict[str, Any]) -> str:
         f"可用状态: {payload.get('status', '')}",
         f"数据来源: {source.get('provider', 'unknown')} / {source.get('interface', 'unknown')}",
         f"价格口径: {payload.get('price_basis', 'not_applicable')}",
+        "可读取价格口径: "
+        + ", ".join(
+            str(item)
+            for item in payload.get(
+                "available_price_bases",
+                [payload.get("price_basis", "not_applicable")],
+            )
+        ),
         f"复权方法: {adjustment.get('method', 'unknown')}",
         f"原始数据取得时间: {payload.get('source_retrieved_at', 'unknown')}",
         f"复权执行时间: {adjustment.get('adjusted_at', 'not_applicable')}",
@@ -447,16 +514,426 @@ def _describe(root: Path, dataset_id: str, *, as_json: bool) -> int:
 
 
 def _resolve(root: Path, dataset_id: str, require_basis: str | None) -> int:
+    if require_basis is not None:
+        component = resolve_dataset_component(
+            dataset_id,
+            quant_data_root=root,
+            price_basis=require_basis,
+        )
+        print(component.component_path)
+        return 0
     resolved = resolve_dataset(
         dataset_id,
         quant_data_root=root,
-        require_basis=require_basis,
     )
     print(resolved.snapshot_path)
     return 0
 
 
-def _validate(root: Path, target: str) -> int:
+def _release_path(root: Path, value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise DataContractError(f"ETF release {label} is missing")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise DataContractError(f"ETF release {label} is unsafe")
+    root = Path(root).resolve()
+    candidate = root / relative
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise DataContractError(f"ETF release {label} is unsafe")
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise DataContractError(f"ETF release {label} escapes its root") from exc
+    return candidate
+
+
+def _release_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DataContractError(f"ETF release {label} is invalid")
+    return value
+
+
+def _release_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_release_index(
+    snapshot: Path,
+    manifest: Mapping[str, Any],
+    field: str,
+    label: str,
+) -> pd.DataFrame:
+    path = _release_path(snapshot, manifest.get(field), label)
+    if path.is_symlink() or not path.is_file():
+        raise DataContractError(f"ETF release {label} is unavailable")
+    try:
+        frame = pd.read_parquet(path)
+    except Exception as exc:
+        raise DataContractError(f"ETF release {label} is unreadable") from exc
+    required = {"symbol", "relative_path", "row_count", "first_date", "last_date"}
+    if frame.empty or not required.issubset(frame.columns):
+        raise DataContractError(f"ETF release {label} is invalid")
+    symbols = frame["symbol"].astype(str)
+    if symbols.duplicated().any():
+        raise DataContractError(f"ETF release {label} contains duplicate symbols")
+    return frame
+
+
+def _validate_release_universe(
+    snapshot: Path,
+    manifest: Mapping[str, Any],
+    qfq_index: pd.DataFrame,
+) -> dict[str, Any]:
+    source = manifest.get("source")
+    if not isinstance(source, Mapping):
+        raise DataContractError("ETF release source metadata is invalid")
+    universe_path = _release_path(
+        snapshot,
+        source.get("universe_path"),
+        "universe path",
+    )
+    universe_manifest_path = _release_path(
+        snapshot,
+        source.get("universe_manifest_path"),
+        "universe manifest path",
+    )
+    if universe_path.is_symlink() or not universe_path.is_file():
+        raise DataContractError("ETF release universe file is unavailable")
+    if universe_manifest_path.is_symlink() or not universe_manifest_path.is_file():
+        raise DataContractError("ETF release universe manifest is unavailable")
+    try:
+        universe = pd.read_parquet(universe_path)
+        universe_manifest = json.loads(
+            universe_manifest_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise DataContractError("ETF release universe evidence is unreadable") from exc
+    required = {"symbol", "code", "market", "name"}
+    if universe.empty or not required.issubset(universe.columns):
+        raise DataContractError("ETF release universe is invalid")
+    universe_symbols = universe["symbol"].astype(str)
+    if universe_symbols.duplicated().any():
+        raise DataContractError("ETF release universe contains duplicate symbols")
+    indexed_symbols = set(qfq_index["symbol"].astype(str))
+    if set(universe_symbols) != indexed_symbols:
+        raise DataContractError("ETF release universe and qfq index disagree")
+    if not isinstance(universe_manifest, dict):
+        raise DataContractError("ETF release universe manifest is invalid")
+    recorded_file_hash = universe_manifest.get("universe_file_sha256")
+    if recorded_file_hash != _release_sha256(universe_path):
+        raise DataContractError("ETF release universe file hash mismatch")
+    source_universe_hash = source.get("universe_sha256")
+    if (
+        source_universe_hash
+        and universe_manifest.get("universe_sha256") != source_universe_hash
+    ):
+        raise DataContractError("ETF release universe lineage hash mismatch")
+    recorded_count = universe_manifest.get("selected_count")
+    if recorded_count is None:
+        recorded_count = universe_manifest.get("symbol_count")
+    if _release_int(recorded_count, "universe symbol count") != len(universe):
+        raise DataContractError("ETF release universe symbol count is stale")
+    return {
+        "symbol_count": int(len(universe)),
+        "file_sha256": str(recorded_file_hash),
+    }
+
+
+def _validate_release_snapshot(
+    root: Path,
+    snapshot: Path,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    required_symbols: Sequence[str] = (),
+) -> dict[str, Any]:
+    snapshot = Path(snapshot).resolve()
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise DataContractError("ETF release snapshot directory is unavailable")
+    validated = (
+        dict(manifest)
+        if manifest is not None
+        else validate_dataset_snapshot(
+            snapshot,
+            verify_hashes=True,
+            evidence_root=root,
+        )
+    )
+    if (
+        validated.get("dataset_id") != ETF_RELEASE_DATASET_ID
+        or validated.get("snapshot_id") != snapshot.name
+        or validated.get("data_kind") != "paired_daily_bars"
+        or validated.get("role") != "canonical"
+        or validated.get("status") != "ready"
+        or validated.get("price_basis") != "qfq"
+    ):
+        raise DataContractError(
+            f"ETF release snapshot contract is invalid: {snapshot.name}"
+        )
+
+    qfq_index = _read_release_index(
+        snapshot,
+        validated,
+        "file_index_path",
+        "qfq file index",
+    )
+    raw_index = _read_release_index(
+        snapshot,
+        validated,
+        "raw_file_index_path",
+        "raw file index",
+    )
+    factor_index = _read_release_index(
+        snapshot,
+        validated,
+        "factor_index_path",
+        "factor file index",
+    )
+    qfq_symbols = set(qfq_index["symbol"].astype(str))
+    if (
+        set(raw_index["symbol"].astype(str)) != qfq_symbols
+        or set(factor_index["symbol"].astype(str)) != qfq_symbols
+    ):
+        raise DataContractError("ETF release raw/qfq/factor symbols disagree")
+    component_rows = {
+        "raw": int(raw_index["row_count"].sum()),
+        "qfq": int(qfq_index["row_count"].sum()),
+        "factors": int(factor_index["row_count"].sum()),
+    }
+    if len(set(component_rows.values())) != 1:
+        raise DataContractError("ETF release raw/qfq/factor row counts disagree")
+    symbol_count = _release_int(
+        validated.get("symbol_count"), "snapshot symbol count"
+    )
+    row_count = _release_int(validated.get("row_count"), "snapshot row count")
+    if symbol_count != len(qfq_index):
+        raise DataContractError("ETF release snapshot symbol count is stale")
+    if row_count != component_rows["qfq"]:
+        raise DataContractError("ETF release snapshot row count is stale")
+
+    universe = _validate_release_universe(snapshot, validated, qfq_index)
+    missing = sorted(set(required_symbols) - qfq_symbols)
+    if missing:
+        raise DataContractError(
+            "ETF release strategy symbols are missing from the same qfq component: "
+            + ", ".join(missing)
+        )
+    if required_symbols:
+        by_symbol = {
+            str(row.symbol): str(row.relative_path)
+            for row in qfq_index.itertuples(index=False)
+        }
+        qfq_component = _release_path(
+            snapshot,
+            validated["components"]["qfq"]["path"],
+            "qfq component path",
+        )
+        for symbol in required_symbols:
+            path = _release_path(snapshot, by_symbol[symbol], f"{symbol} qfq bar")
+            try:
+                path.relative_to(qfq_component)
+            except ValueError as exc:
+                raise DataContractError(
+                    f"ETF release strategy symbol is outside qfq component: {symbol}"
+                ) from exc
+            try:
+                sample = pd.read_parquet(path, columns=["date", "close"])
+            except Exception as exc:
+                raise DataContractError(
+                    f"ETF release strategy symbol is unreadable: {symbol}"
+                ) from exc
+            if sample.empty:
+                raise DataContractError(
+                    f"ETF release strategy symbol has no rows: {symbol}"
+                )
+
+    return {
+        "snapshot_id": str(validated["snapshot_id"]),
+        "latest_trade_date": str(validated["latest_trade_date"]),
+        "content_sha256": str(validated["content_sha256"]),
+        "symbol_count": symbol_count,
+        "row_count": row_count,
+        "component_rows": component_rows,
+        "indexed_files_checked": int(
+            len(raw_index) + len(qfq_index) + len(factor_index) + 1
+        ),
+        "universe": universe,
+    }
+
+
+def _validate_etf_release(root: Path) -> dict[str, Any]:
+    root = Path(root).expanduser().resolve()
+    catalog = _read_catalog(root)
+    datasets = catalog["datasets"]
+    entry = datasets.get(ETF_RELEASE_DATASET_ID)
+    if not isinstance(entry, dict):
+        raise DataContractError("ETF release dataset is not registered")
+    if set(datasets).intersection(ETF_RELEASE_LEGACY_DATASET_IDS):
+        found = sorted(set(datasets).intersection(ETF_RELEASE_LEGACY_DATASET_IDS))
+        raise DataContractError(
+            "ETF release legacy dataset identities remain registered: "
+            + ", ".join(found)
+        )
+    canonical_etf_ids = sorted(
+        str(dataset_id)
+        for dataset_id, candidate in datasets.items()
+        if isinstance(candidate, Mapping)
+        and candidate.get("role") == "canonical"
+        and (
+            candidate.get("data_kind") == "paired_daily_bars"
+            or str(candidate.get("dataset_root") or "").startswith(
+                "parquet/etf_1d/"
+            )
+        )
+    )
+    if canonical_etf_ids != [ETF_RELEASE_DATASET_ID]:
+        raise DataContractError(
+            "ETF release must have exactly one canonical ETF dataset: cn_etf_daily"
+        )
+    if entry.get("dataset_root") != ETF_RELEASE_DATASET_ROOT.as_posix():
+        raise DataContractError("ETF release dataset root is not canonical")
+    expected_pointer = (ETF_RELEASE_DATASET_ROOT / "LATEST.json").as_posix()
+    if entry.get("latest_pointer") != expected_pointer:
+        raise DataContractError("ETF release latest pointer is not canonical")
+
+    for relative in ETF_RELEASE_LEGACY_PATHS:
+        path = root / relative
+        if path.exists() or path.is_symlink():
+            raise DataContractError(
+                f"ETF release legacy path remains: {relative.as_posix()}"
+            )
+    etf_parent = root / "parquet" / "etf_1d"
+    if not etf_parent.is_dir() or etf_parent.is_symlink():
+        raise DataContractError("ETF release parent directory is unavailable")
+    unexpected_directories = sorted(
+        child.name
+        for child in etf_parent.iterdir()
+        if (child.is_dir() or child.is_symlink())
+        and child.name != ETF_RELEASE_DATASET_ROOT.name
+    )
+    if unexpected_directories:
+        raise DataContractError(
+            "ETF release legacy or unregistered directories remain: "
+            + ", ".join(unexpected_directories)
+        )
+
+    resolved = resolve_dataset(
+        ETF_RELEASE_DATASET_ID,
+        quant_data_root=root,
+        require_basis="qfq",
+    )
+    current_manifest = resolved.manifest
+    for field in ETF_RELEASE_CATALOG_FIELDS:
+        if entry.get(field) != current_manifest.get(field):
+            raise DataContractError(
+                f"ETF release root manifest disagrees with current snapshot: {field}"
+            )
+
+    dataset_root = root / ETF_RELEASE_DATASET_ROOT
+    snapshots_root = dataset_root / "snapshots"
+    if snapshots_root.is_symlink() or not snapshots_root.is_dir():
+        raise DataContractError("ETF release snapshots directory is unavailable")
+    snapshots = sorted(snapshots_root.iterdir(), key=lambda path: path.name)
+    if any(path.is_symlink() or not path.is_dir() for path in snapshots):
+        raise DataContractError("ETF release snapshots directory contains unsafe entries")
+    if len(snapshots) != 2:
+        raise DataContractError(
+            "ETF release requires exactly two complete snapshots: current plus one "
+            f"backup; found {len(snapshots)}"
+        )
+    current = resolved.snapshot_path.resolve()
+    if current not in snapshots:
+        raise DataContractError("ETF release current snapshot is not retained")
+    backup = next(path for path in snapshots if path != current)
+
+    current_summary = _validate_release_snapshot(
+        root,
+        current,
+        manifest=current_manifest,
+        required_symbols=ETF_RELEASE_REQUIRED_SYMBOLS,
+    )
+    backup_summary = _validate_release_snapshot(root, backup)
+    current_source = current_manifest.get("source")
+    retention = (
+        current_source.get("snapshot_retention")
+        if isinstance(current_source, Mapping)
+        else None
+    )
+    if not isinstance(retention, Mapping) or (
+        retention.get("policy") != "current_plus_one_previous"
+        or _release_int(
+            retention.get("max_complete_snapshots"),
+            "snapshot retention count",
+        )
+        != 2
+    ):
+        raise DataContractError("ETF release snapshot retention contract is invalid")
+    return {
+        "status": "full_validation_passed",
+        "dataset_id": ETF_RELEASE_DATASET_ID,
+        "network_requests": 0,
+        "scope": "ETF only; no unrelated A-share dataset was scanned",
+        "root_manifest": {
+            "status": "passed",
+            "canonical_etf_datasets": canonical_etf_ids,
+        },
+        "snapshot_retention": {
+            "count": len(snapshots),
+            "policy": "current_plus_one_previous",
+        },
+        "current": current_summary,
+        "backup": backup_summary,
+        "strategy_symbols": {
+            "status": "passed",
+            "component": "qfq",
+            "symbols": list(ETF_RELEASE_REQUIRED_SYMBOLS),
+        },
+        "legacy_entries": {
+            "status": "passed",
+            "registered_dataset_ids": [],
+            "existing_paths": [],
+        },
+    }
+
+
+def _validate_release(root: Path, target: str) -> int:
+    started = time.monotonic()
+    try:
+        if target != ETF_RELEASE_DATASET_ID:
+            raise DataContractError(
+                "--release currently supports only cn_etf_daily"
+            )
+        payload = _validate_etf_release(root)
+    except Exception as exc:
+        message = str(exc).replace(str(Path(root).resolve()), "<quant_data_root>")
+        _json_dump(
+            {
+                "status": "full_validation_failed",
+                "dataset_id": target,
+                "network_requests": 0,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": message,
+                },
+            }
+        )
+        return 2
+    payload["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    _json_dump(payload)
+    return 0
+
+
+def _validate(root: Path, target: str, *, release: bool = False) -> int:
+    if release:
+        return _validate_release(root, target)
     candidate = Path(target).expanduser()
     if candidate.exists():
         snapshot = candidate.resolve()
@@ -678,14 +1155,15 @@ def _update(
             + ", ".join(str(item) for item in blockers)
             + "; pass --bundle-dir after the remote raw/factor/qfq bundle is verified"
         )
-    if dataset_id != "etf_momentum_daily_qfq":
-        raise DataContractError(f"dataset has no registered updater: {dataset_id}")
-    from download_etf_momentum_data import publish_canonical_snapshot
+    if dataset_id == "cn_etf_daily":
+        from download_cn_etf_data import update_cn_etf_snapshot
 
-    path = publish_canonical_snapshot(
-        quant_data_dir=root,
-        end_date=through,
-    )
+        path = update_cn_etf_snapshot(
+            quant_data_dir=root,
+            end_date=through,
+        )
+    else:
+        raise DataContractError(f"dataset has no registered updater: {dataset_id}")
     print(path)
     return 0
 
@@ -708,6 +1186,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = commands.add_parser("validate")
     validate_parser.add_argument("target")
+    validate_parser.add_argument(
+        "--release",
+        action="store_true",
+        help="Run the read-only ETF release acceptance check without network access",
+    )
 
     update_parser = commands.add_parser("update")
     update_parser.add_argument("dataset_id")
@@ -732,7 +1215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "resolve":
             return _resolve(root, args.dataset_id, args.require_basis)
         if args.command == "validate":
-            return _validate(root, args.target)
+            return _validate(root, args.target, release=args.release)
         if args.command == "update":
             return _update(
                 root,

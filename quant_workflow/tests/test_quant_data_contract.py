@@ -705,6 +705,100 @@ def test_finalize_snapshot_records_price_basis_adjustment_and_file_index(
     assert len(factor_index.loc[0, "sha256"]) == 64
 
 
+def _finalize_paired_etf_snapshot(module, quant_data: Path) -> Path:
+    snapshot = quant_data / "staging" / "paired-etf" / "cn-etf-001"
+    write_bars(snapshot / "raw" / "SZ159915.parquet", source="tencent.raw")
+    write_bars(snapshot / "qfq" / "SZ159915.parquet", source="tencent.qfq")
+    write_factors(snapshot / "factors" / "SZ159915.parquet")
+    factors = pd.read_parquet(snapshot / "factors" / "SZ159915.parquet")
+    factors["factor"] = 1.0
+    factors["offset"] = 0.0
+    factors.to_parquet(snapshot / "factors" / "SZ159915.parquet", index=False)
+    pd.DataFrame(
+        columns=["symbol", "effective_trade_date", "action_type"]
+    ).to_parquet(snapshot / "corporate_actions.parquet", index=False)
+    module.finalize_paired_price_snapshot(
+        snapshot,
+        dataset_id="cn_etf_daily",
+        snapshot_id="cn-etf-001",
+        role="canonical",
+        status="ready",
+        source={"provider": "tencent", "interface": "paired_history"},
+        adjustment={
+            "method": "provider_native_paired",
+            "adjusted_at": "2026-07-25T22:59:00+08:00",
+            "adjustment_as_of": "2026-07-24",
+            "adjusted_fields": ["open", "high", "low", "close"],
+            "normalization_rule": (
+                "latest_valid_trade_date_factor_equals_1_and_offset_equals_0"
+            ),
+            "algorithm_version": "provider-native-affine-paired-v1",
+            "paired_raw_component_path": "raw",
+            "volume_adjusted": False,
+        },
+        producer={"script": "test", "version": "1"},
+        source_retrieved_at="2026-07-25T22:59:00+08:00",
+    )
+    return snapshot
+
+
+def test_paired_price_snapshot_is_one_dataset_with_raw_and_qfq_components(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    staging = _finalize_paired_etf_snapshot(module, quant_data)
+    dataset_root = quant_data / "parquet" / "etf_1d" / "cn_etf_daily"
+    published = module.publish_snapshot(
+        staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    module.write_root_manifest(
+        quant_data,
+        {
+            "cn_etf_daily": module.catalog_entry_from_snapshot(
+                published,
+                quant_data_root=quant_data,
+                dataset_root=dataset_root,
+            )
+        },
+    )
+
+    raw = module.resolve_dataset_component(
+        "cn_etf_daily",
+        quant_data_root=quant_data,
+        price_basis="raw",
+    )
+    qfq = module.resolve_dataset_component(
+        "cn_etf_daily",
+        quant_data_root=quant_data,
+        price_basis="qfq",
+    )
+
+    assert raw.dataset.snapshot_path == qfq.dataset.snapshot_path == published
+    assert raw.component_path == published / "raw"
+    assert qfq.component_path == published / "qfq"
+    assert raw.dataset.manifest["available_price_bases"] == ["raw", "qfq"]
+    assert raw.dataset.manifest["data_kind"] == "paired_daily_bars"
+    assert raw.dataset.manifest["components"]["raw"]["row_count"] == 2
+    assert qfq.dataset.manifest["components"]["qfq"]["row_count"] == 2
+
+
+def test_paired_price_snapshot_rejects_tampered_raw_component(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    snapshot = _finalize_paired_etf_snapshot(module, tmp_path / "quant_data")
+    raw_path = snapshot / "raw" / "SZ159915.parquet"
+    raw = pd.read_parquet(raw_path)
+    raw.loc[0, "close"] = 9.0
+    raw.to_parquet(raw_path, index=False)
+
+    with pytest.raises(module.DataContractError, match="raw bar hash mismatch"):
+        module.validate_snapshot(snapshot, verify_hashes=True)
+
+
 def test_canonical_qfq_without_reproducible_adjustment_evidence_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -758,6 +852,46 @@ def test_publish_and_resolve_immutable_snapshot(tmp_path: Path) -> None:
     assert resolved.snapshot_path == published
     assert resolved.manifest["snapshot_id"] == "snap-001"
     assert not staging.exists()
+
+
+def test_resolve_dataset_rejects_symlinked_latest_pointer(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    staging = finalize_qfq_snapshot(module, quant_data)
+    dataset_root = quant_data / "parquet" / "etf_1d" / "etf_momentum_daily_qfq"
+    published = module.publish_snapshot(
+        staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    module.write_root_manifest(
+        quant_data,
+        {
+            "etf_momentum_daily_qfq": module.catalog_entry_from_snapshot(
+                published,
+                quant_data_root=quant_data,
+                dataset_root=dataset_root,
+            )
+        },
+    )
+    pointer_path = dataset_root / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    relocated_root = dataset_root / "relocated"
+    relocated_snapshot = relocated_root / "snapshots" / published.name
+    relocated_snapshot.parent.mkdir(parents=True)
+    os.replace(published, relocated_snapshot)
+    pointer["snapshot_path"] = relocated_snapshot.relative_to(quant_data).as_posix()
+    relocated_pointer = relocated_root / "LATEST.json"
+    module.atomic_write_json(relocated_pointer, pointer)
+    pointer_path.unlink()
+    pointer_path.symlink_to(relocated_pointer)
+
+    with pytest.raises(module.DataContractError, match="symlink"):
+        module.resolve_dataset(
+            "etf_momentum_daily_qfq",
+            quant_data_root=quant_data,
+            require_basis="qfq",
+        )
 
 
 def test_publication_reuses_its_validated_manifest_for_catalog_entry(
@@ -1443,6 +1577,12 @@ def test_finalize_publish_and_resolve_qlib_v2_snapshot(tmp_path: Path) -> None:
     assert resolved.manifest["data_kind"] == "qlib_provider"
     assert resolved.manifest["instrument_count"] == 1
     assert resolved.catalog_entry["upstream_snapshots"][0]["snapshot_id"] == "qfq-source-001"
+    component = module.resolve_dataset_component(
+        "qlib_ashare_v2",
+        quant_data_root=quant_data,
+        price_basis="qfq",
+    )
+    assert component.component_path == published
 
 
 def test_resolve_rejects_qlib_when_current_qfq_snapshot_changes(

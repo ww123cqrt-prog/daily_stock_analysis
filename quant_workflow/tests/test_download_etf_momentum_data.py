@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,43 +59,6 @@ def test_daily_pipeline_end_alias_is_supported(monkeypatch) -> None:
     args = module.parse_args()
 
     assert args.end_date == "20260724"
-
-
-def test_download_writes_only_the_two_etf_files_and_source_manifest(
-    monkeypatch, tmp_path
-) -> None:
-    module = load_module()
-
-    def fake_fetch(symbol: str, *, start_date: str, end_date: str) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "symbol": [symbol],
-                "name": [module.DEFAULT_SYMBOLS[symbol]["name"]],
-                "date": [pd.Timestamp("2026-07-24")],
-                "open": [1.0],
-                "high": [1.1],
-                "low": [0.9],
-                "close": [1.05],
-                "volume": [10.0],
-                "amount": [10.5],
-                "source": [module.SOURCE_NAME],
-            }
-        )
-
-    monkeypatch.setattr(module, "fetch_one", fake_fetch)
-    manifest_path = module.download(
-        output_dir=tmp_path / "parquet" / "etf_1d" / "etf_momentum_rotation" / "v1",
-        start_date="2026-07-01",
-        end_date="2026-07-24",
-    )
-
-    output_dir = manifest_path.parent
-    assert sorted(path.name for path in output_dir.glob("*.parquet")) == [
-        "SH513100.parquet",
-        "SZ159915.parquet",
-    ]
-    assert manifest_path.name == "SOURCE_MANIFEST.json"
-    assert not (tmp_path / "parquet" / "ashare_1d").exists()
 
 
 def test_fetch_one_adjusted_uses_eastmoney_qfq_and_normalizes_rows(monkeypatch) -> None:
@@ -230,144 +192,36 @@ def test_fetch_one_tencent_raw_uses_raw_kline_endpoint() -> None:
     assert result["source"].unique().tolist() == [module.TENCENT_RAW_SOURCE_NAME]
 
 
-def test_adjusted_download_writes_isolated_manifest(monkeypatch, tmp_path) -> None:
-    module = load_module()
-
-    def fake_fetch(symbol: str, *, start_date: str, end_date: str) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "symbol": [symbol],
-                "name": [module.DEFAULT_SYMBOLS[symbol]["name"]],
-                "date": [pd.Timestamp("2026-07-24")],
-                "open": [1.0],
-                "high": [1.1],
-                "low": [0.9],
-                "close": [1.05],
-                "volume": [10.0],
-                "amount": [10.5],
-                "source": [module.ADJUSTED_SOURCE_NAME],
-                "adjustment": ["qfq"],
-            }
-        )
-
-    monkeypatch.setattr(module, "fetch_one_adjusted", fake_fetch)
-    output_dir = tmp_path / "eastmoney_qfq"
-    manifest_path = module.download_adjusted(
-        output_dir=output_dir,
-        start_date="2026-07-01",
-        end_date="2026-07-24",
-    )
-
-    assert sorted(path.name for path in output_dir.glob("*.parquet")) == [
-        "SH513100.parquet",
-        "SZ159915.parquet",
-    ]
-    assert manifest_path == output_dir / "SOURCE_MANIFEST.json"
-    assert '"adjustment": "qfq"' in manifest_path.read_text(encoding="utf-8")
-    assert '"source": "akshare.fund_etf_hist_em_qfq"' in manifest_path.read_text(
-        encoding="utf-8"
-    )
-
-
-def test_adjusted_download_failure_preserves_existing_cache(monkeypatch, tmp_path) -> None:
-    module = load_module()
-    output_dir = tmp_path / "eastmoney_qfq"
-    output_dir.mkdir()
-    existing = output_dir / "SZ159915.parquet"
-    existing.write_bytes(b"existing-cache")
-
-    def fail_fetch(symbol: str, *, start_date: str, end_date: str) -> pd.DataFrame:
-        raise ConnectionError(f"offline: {symbol}")
-
-    monkeypatch.setattr(module, "fetch_one_adjusted", fail_fetch)
-
-    with pytest.raises(ConnectionError, match="offline"):
-        module.download_adjusted(
-            output_dir=output_dir,
-            start_date="2026-07-01",
-            end_date="2026-07-24",
-        )
-
-    assert existing.read_bytes() == b"existing-cache"
-    assert not (output_dir / "SH513100.parquet").exists()
-
-
-def test_main_keeps_raw_update_success_when_adjusted_source_is_unavailable(
+def test_main_delegates_to_unified_etf_dataset(
     monkeypatch, tmp_path, capsys
 ) -> None:
     module = load_module()
-    raw_manifest = tmp_path / "raw" / "SOURCE_MANIFEST.json"
-    calls: list[str] = []
+    published = tmp_path / "cn_etf_daily" / "snapshots" / "snapshot-001"
+    calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         module,
         "parse_args",
         lambda: SimpleNamespace(
-            output_dir=tmp_path / "raw",
-            adjusted_output_dir=tmp_path / "eastmoney_qfq",
-            tencent_adjusted_output_dir=tmp_path / "tencent_qfq",
+            quant_data_root=tmp_path / "quant_data",
             start_date="2019-01-01",
             end_date="2026-07-24",
-            incremental=True,
-            overlap_days=5,
-            skip_adjusted=False,
         ),
     )
-
-    def fake_raw(**kwargs):
-        calls.append("raw")
-        return raw_manifest
-
-    def fail_adjusted(**kwargs):
-        calls.append("adjusted")
-        raise ConnectionError("Eastmoney unavailable")
-
-    def fallback_adjusted(**kwargs):
-        calls.append("tencent")
-        return tmp_path / "tencent_qfq" / "SOURCE_MANIFEST.json"
-
-    monkeypatch.setattr(module, "download", fake_raw)
-    monkeypatch.setattr(module, "download_adjusted", fail_adjusted)
-    monkeypatch.setattr(module, "download_tencent_adjusted", fallback_adjusted)
-
-    assert module.main() == 0
-    assert calls == ["raw", "adjusted", "tencent"]
-    assert "Eastmoney qfq refresh unavailable" in capsys.readouterr().err
-
-
-def test_tencent_adjusted_download_writes_separate_manifest(monkeypatch, tmp_path) -> None:
-    module = load_module()
-
-    def fake_fetch(symbol: str, *, start_date: str, end_date: str) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "symbol": [symbol],
-                "name": [module.DEFAULT_SYMBOLS[symbol]["name"]],
-                "date": [pd.Timestamp("2026-07-24")],
-                "open": [1.0],
-                "high": [1.1],
-                "low": [0.9],
-                "close": [1.05],
-                "volume": [10.0],
-                "source": [module.TENCENT_ADJUSTED_SOURCE_NAME],
-                "adjustment": ["qfq"],
-            }
-        )
-
-    monkeypatch.setattr(module, "fetch_one_tencent_adjusted", fake_fetch)
-    output_dir = tmp_path / "tencent_qfq"
-    manifest_path = module.download_tencent_adjusted(
-        output_dir=output_dir,
-        start_date="2026-07-01",
-        end_date="2026-07-24",
+    monkeypatch.setattr(
+        module,
+        "publish_canonical_snapshot",
+        lambda **kwargs: calls.append(kwargs) or published,
     )
 
-    payload = manifest_path.read_text(encoding="utf-8")
-    assert '"source": "tencent.ifzq_qfq"' in payload
-    assert '"ratio": "1:5"' in payload
-    assert sorted(path.name for path in output_dir.glob("*.parquet")) == [
-        "SH513100.parquet",
-        "SZ159915.parquet",
+    assert module.main() == 0
+    assert calls == [
+        {
+            "quant_data_dir": tmp_path / "quant_data",
+            "start_date": "2019-01-01",
+            "end_date": "2026-07-24",
+        }
     ]
+    assert str(published) in capsys.readouterr().out
 
 
 def paired_frame(
@@ -464,100 +318,18 @@ def test_corporate_actions_include_announcement_and_inferred_factor_events() -> 
     assert inferred["evidence_method"] == "derived_from_same_provider_raw_qfq_pair"
 
 
-def test_publish_canonical_snapshot_writes_paired_raw_and_qfq_snapshots(
+def test_publish_canonical_snapshot_delegates_to_unified_dataset(
     monkeypatch, tmp_path
 ) -> None:
     module = load_module()
-
-    def fake_pair(provider, symbol, *, start_date, end_date):
-        assert provider == "tencent"
-        if symbol == "SH513100":
-            raw_close = [5.19, 1.015, 2.0]
-            qfq_close = [1.038, 1.015, 2.0]
-        else:
-            raw_close = [1.0, 1.1, 1.2]
-            qfq_close = [1.0, 1.1, 1.2]
-        return (
-            paired_frame(
-                symbol,
-                source=module.TENCENT_RAW_SOURCE_NAME,
-                closes=raw_close,
-            ),
-            paired_frame(
-                symbol,
-                source=module.TENCENT_ADJUSTED_SOURCE_NAME,
-                closes=qfq_close,
-            ),
-        )
-
-    monkeypatch.setattr(module, "fetch_provider_pair", fake_pair)
-    monkeypatch.setattr(module, "_sync_root_manifest", lambda root: None)
-
-    published = module.publish_canonical_snapshot(
-        quant_data_dir=tmp_path / "quant_data",
-        start_date="2019-01-01",
-        end_date="2026-07-24",
-        generated_at="2026-07-25T23:00:00+08:00",
+    published = tmp_path / "cn_etf_daily" / "snapshots" / "snapshot-001"
+    calls: list[dict[str, object]] = []
+    fake_module = SimpleNamespace(
+        update_cn_etf_snapshot=lambda **kwargs: calls.append(kwargs) or published
     )
+    monkeypatch.setitem(sys.modules, "download_cn_etf_data", fake_module)
 
-    qfq_manifest = json.loads(
-        (published / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
-    )
-    raw_root = (
-        tmp_path
-        / "quant_data"
-        / "parquet"
-        / "etf_1d"
-        / "etf_momentum_daily_raw"
-    )
-    raw_pointer = json.loads((raw_root / "LATEST.json").read_text(encoding="utf-8"))
-    factors = pd.read_parquet(published / "factors" / "SH513100.parquet")
-
-    assert qfq_manifest["price_basis"] == "qfq"
-    assert qfq_manifest["adjustment"]["method"] == "provider_native_paired"
-    assert (
-        qfq_manifest["adjustment"]["paired_raw_snapshot_id"]
-        == raw_pointer["snapshot_id"]
-    )
-    assert factors["factor"].round(4).tolist() == [0.2, 1.0, 1.0]
-    assert qfq_manifest["symbol_count"] == 2
-    assert qfq_manifest["latest_trade_date"] == "2026-07-24"
-
-
-def test_publish_canonical_snapshot_allows_different_historical_etf_calendars(
-    monkeypatch, tmp_path
-) -> None:
-    module = load_module()
-
-    def fake_pair(provider, symbol, *, start_date, end_date):
-        assert provider == "tencent"
-        if symbol == "SH513100":
-            dates = ["2022-01-12", "2022-01-14", "2026-07-24"]
-            raw_close = [5.19, 1.015, 2.0]
-            qfq_close = [1.038, 1.015, 2.0]
-        else:
-            dates = ["2022-01-13", "2022-01-14", "2026-07-24"]
-            raw_close = [1.0, 1.1, 1.2]
-            qfq_close = raw_close
-        return (
-            paired_frame(
-                symbol,
-                source=module.TENCENT_RAW_SOURCE_NAME,
-                closes=raw_close,
-                dates=dates,
-            ),
-            paired_frame(
-                symbol,
-                source=module.TENCENT_ADJUSTED_SOURCE_NAME,
-                closes=qfq_close,
-                dates=dates,
-            ),
-        )
-
-    monkeypatch.setattr(module, "fetch_provider_pair", fake_pair)
-    monkeypatch.setattr(module, "_sync_root_manifest", lambda root: None)
-
-    published = module.publish_canonical_snapshot(
+    result = module.publish_canonical_snapshot(
         quant_data_dir=tmp_path / "quant_data",
         start_date="2019-01-01",
         end_date="2026-07-24",
@@ -565,37 +337,11 @@ def test_publish_canonical_snapshot_allows_different_historical_etf_calendars(
         generated_at="2026-07-25T23:00:00+08:00",
     )
 
-    manifest = json.loads(
-        (published / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
-    )
-    assert manifest["latest_trade_date"] == "2026-07-24"
-    assert manifest["symbol_count"] == 2
-
-
-def test_publish_canonical_snapshot_does_not_publish_partial_two_etf_data(
-    monkeypatch, tmp_path
-) -> None:
-    module = load_module()
-
-    def fake_pair(provider, symbol, *, start_date, end_date):
-        if symbol == "SH513100":
-            raise ConnectionError("second ETF failed")
-        frame = paired_frame(
-            symbol,
-            source=module.TENCENT_RAW_SOURCE_NAME,
-            closes=[1.0, 1.1, 1.2],
-        )
-        return frame, frame.assign(source=module.TENCENT_ADJUSTED_SOURCE_NAME)
-
-    monkeypatch.setattr(module, "fetch_provider_pair", fake_pair)
-
-    with pytest.raises(RuntimeError, match="all ETF paired providers failed"):
-        module.publish_canonical_snapshot(
-            quant_data_dir=tmp_path / "quant_data",
-            start_date="2019-01-01",
-            end_date="2026-07-24",
-            provider_order=("tencent",),
-            generated_at="2026-07-25T23:00:00+08:00",
-        )
-
-    assert not list((tmp_path / "quant_data").rglob("LATEST.json"))
+    assert result == published
+    assert calls == [
+        {
+            "quant_data_dir": tmp_path / "quant_data",
+            "end_date": "2026-07-24",
+            "generated_at": "2026-07-25T23:00:00+08:00",
+        }
+    ]
