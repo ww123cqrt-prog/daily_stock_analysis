@@ -56,7 +56,9 @@ comparators:
   indexes:
     - SH000300
     - SH000905
+    - SH000906
     - SZ399006
+    - SH000688
   index_substitution_allowed: false
 
 stability:

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -449,6 +450,85 @@ def test_qlib_structural_validation_skips_file_hashing(tmp_path: Path) -> None:
         manifest = module.validate_qlib_snapshot(snapshot, verify_hashes=False)
 
     assert manifest["snapshot_id"] == "qlib-001"
+
+
+def _benchmark_evidence_fixture(
+    module,
+    snapshot: Path,
+    symbols: tuple[str, ...],
+    *,
+    required_symbols: tuple[str, ...] | None,
+) -> dict[str, object]:
+    calendar_path = snapshot / "calendars" / "day.txt"
+    calendar_path.parent.mkdir(parents=True, exist_ok=True)
+    calendar_path.write_text("2026-08-05\n2026-08-06\n", encoding="utf-8")
+    evidence: dict[str, object] = {
+        "calendar_sha256": module.sha256_file(calendar_path),
+        "source": {
+            "provider": "test",
+            "interface": "fixture",
+            "source_dataset_id": "fixture",
+            "source_path": "runtime/fixture",
+            "source_run_id": "fixture-run",
+            "evidence_path": "runtime/fixture/evidence.json",
+            "evidence_sha256": "a" * 64,
+            "source_manifest_sha256": "b" * 64,
+        },
+        "symbols": {},
+    }
+    if required_symbols is not None:
+        evidence["required_symbols"] = list(required_symbols)
+    symbol_evidence = evidence["symbols"]
+    assert isinstance(symbol_evidence, dict)
+    for symbol in symbols:
+        features: dict[str, object] = {}
+        feature_dir = snapshot / "features" / symbol.lower()
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        for field in module.QLIB_BENCHMARK_FIELDS:
+            path = feature_dir / f"{field}.day.bin"
+            np.asarray([0.0, 1.0, 1.01], dtype="<f4").tofile(path)
+            features[field] = {
+                "relative_path": f"features/{symbol.lower()}/{field}.day.bin",
+                "size_bytes": path.stat().st_size,
+                "sha256": module.sha256_file(path),
+            }
+        symbol_evidence[symbol] = {
+            "coverage": {
+                "start": "2026-08-05",
+                "end": "2026-08-06",
+                "observations": 2,
+            },
+            "features": features,
+        }
+    return evidence
+
+
+def test_legacy_benchmark_evidence_without_required_symbols_keeps_three_symbol_contract(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    legacy = ("SH000300", "SH000905", "SH000906")
+    evidence = _benchmark_evidence_fixture(
+        module, tmp_path / "legacy", legacy, required_symbols=None
+    )
+
+    module._validate_qlib_benchmark_evidence(tmp_path / "legacy", evidence)
+
+
+def test_declared_benchmark_evidence_requires_exact_five_symbol_contract(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    required = ("SH000300", "SH000905", "SH000906", "SZ399006", "SH000688")
+    evidence = _benchmark_evidence_fixture(
+        module, tmp_path / "current", required, required_symbols=required
+    )
+
+    module._validate_qlib_benchmark_evidence(tmp_path / "current", evidence)
+
+    evidence["required_symbols"] = list(required[:-1])
+    with pytest.raises(module.DataContractError, match="required symbols"):
+        module._validate_qlib_benchmark_evidence(tmp_path / "current", evidence)
 
 
 def test_qlib_provider_manifest_records_and_validates_producer(

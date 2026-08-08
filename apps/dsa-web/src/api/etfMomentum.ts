@@ -4,12 +4,21 @@ import { toCamelCase } from './utils';
 export type EtfMomentumVariant = 'two_etf' | 'three_etf';
 
 export type EtfMomentumMetrics = {
+  status?: 'available' | 'unavailable' | string;
+  reason?: string;
   periods?: number;
   startDate?: string;
   endDate?: string;
   totalReturn?: number | null;
   annualizedReturn?: number | null;
   maxDrawdown?: number | null;
+  annualizedVolatility?: number | null;
+  sharpeRatio?: number | null;
+  sharpeRiskFreeRate?: number | null;
+  calmarRatio?: number | null;
+  positiveDayRatio?: number | null;
+  bestDay?: number | null;
+  worstDay?: number | null;
   investedFraction?: number | null;
   switchCount?: number;
   totalTurnoverSides?: number;
@@ -248,9 +257,19 @@ export type EtfDefensiveRotationReport = {
       leaveOneYearPositiveRatio: number | null;
       maxDrawdown?: number | null;
     };
+    metricDefinitions?: {
+      annualizationPeriods: number;
+      sharpeRiskFreeRate: number;
+      positiveDayDefinition: string;
+    };
   };
   stability: {
     costStress: Record<string, EtfDefensiveRotationMetrics>;
+    costStressComparison?: Record<string, {
+      sideCostBps: number;
+      threeEtfDefensive: EtfDefensiveRotationMetrics;
+      twoEtfLegacyExact: EtfDefensiveRotationMetrics;
+    }>;
     blockBootstrap: {
       ci95Lower: number | null;
       ci95Upper: number | null;
@@ -260,6 +279,13 @@ export type EtfDefensiveRotationReport = {
       method?: string;
     };
     leaveOneYearPositiveRatio: number | null;
+    leaveOneYearOut?: Array<{
+      omittedYear: number;
+      strategyAnnualizedReturn: number | null;
+      baselineAnnualizedReturn: number | null;
+      annualizedReturnDelta?: number | null;
+      positiveDelta?: boolean;
+    }>;
     startDateSensitivity: Array<{
       requestedStart: string;
       actualStart: string;
@@ -274,6 +300,17 @@ export type EtfDefensiveRotationReport = {
       trendDays?: number;
       reason?: string;
       regimes?: Record<string, EtfDefensiveRotationMetrics>;
+    };
+    marketRegimeComparison?: {
+      status: string;
+      benchmark?: string;
+      momentumDays?: number;
+      trendDays?: number;
+      reason?: string;
+      regimes?: Record<string, {
+        threeEtfDefensive: EtfDefensiveRotationMetrics;
+        twoEtfLegacyExact: EtfDefensiveRotationMetrics;
+      }>;
     };
   };
   holdingBehavior: {
@@ -300,7 +337,7 @@ export type EtfDefensiveRotationReport = {
   };
   chartData: {
     equity: Array<{ date: string } & Record<string, number | string | null>>;
-    drawdown: Array<{ date: string; strategy: number | null }>;
+    drawdown: Array<{ date: string } & Record<string, number | string | null>>;
     yearlyReturns: Array<{
       year: number;
       strategy: number;

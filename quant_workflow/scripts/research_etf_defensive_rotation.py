@@ -38,7 +38,12 @@ from etf_research_preview_data import (  # noqa: E402
     EtfResearchPreview,
     resolve_etf_research_preview,
 )
-from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
+from quant_data_contract import (  # noqa: E402
+    QLIB_BENCHMARK_SYMBOLS,
+    QLIB_LEGACY_BENCHMARK_SYMBOLS,
+    DataContractError,
+    resolve_dataset,
+)
 
 
 DEFAULT_CONFIG = (
@@ -50,7 +55,9 @@ DEFAULT_REPORT_DIR = reports_root() / "etf_defensive_rotation"
 INDEX_NAMES = {
     "SH000300": "沪深300",
     "SH000905": "中证500",
+    "SH000906": "中证800",
     "SZ399006": "创业板指",
+    "SH000688": "科创50",
 }
 VARIANT_SPECS = {
     "three_etf_defensive": {
@@ -220,10 +227,14 @@ def evaluate_locked_variants(
             slippage_value = float(slippage)
             if not math.isfinite(slippage_value) or slippage_value < 0:
                 raise ValueError("slippage must be finite and nonnegative")
-            stress[_slippage_label(slippage_value)] = simulate_open_to_open(
+            simulation = simulate_open_to_open(
                 table,
                 side_cost_bps=float(commission_bps_each_side) + slippage_value,
             )
+            simulation["metrics"].update(
+                _return_metrics(simulation["periods"]["net_return"])
+            )
+            stress[_slippage_label(slippage_value)] = simulation
         result[variant_id] = {
             "name": spec["name"],
             "rule": {
@@ -258,15 +269,46 @@ def _return_metrics(returns: Sequence[float]) -> dict[str, Any]:
             "total_return": None,
             "annualized_return": None,
             "max_drawdown": None,
+            "annualized_volatility": None,
+            "sharpe_ratio": None,
+            "sharpe_risk_free_rate": 0.0,
+            "calmar_ratio": None,
+            "positive_day_ratio": None,
+            "best_day": None,
+            "worst_day": None,
         }
     wealth = np.cumprod(1.0 + values)
     curve = np.concatenate(([1.0], wealth))
     drawdown = curve / np.maximum.accumulate(curve) - 1.0
+    annualized_return = _annualized_return(values)
+    max_drawdown = float(drawdown.min())
+    annualized_volatility = (
+        float(np.std(values, ddof=1) * math.sqrt(252.0))
+        if len(values) > 1
+        else 0.0
+    )
+    sharpe_ratio = (
+        float(np.mean(values) * 252.0 / annualized_volatility)
+        if annualized_volatility > 0
+        else None
+    )
+    calmar_ratio = (
+        float(annualized_return / abs(max_drawdown))
+        if max_drawdown < 0
+        else None
+    )
     return {
         "periods": int(len(values)),
         "total_return": float(wealth[-1] - 1.0),
-        "annualized_return": _annualized_return(values),
-        "max_drawdown": float(drawdown.min()),
+        "annualized_return": annualized_return,
+        "max_drawdown": max_drawdown,
+        "annualized_volatility": annualized_volatility,
+        "sharpe_ratio": sharpe_ratio,
+        "sharpe_risk_free_rate": 0.0,
+        "calmar_ratio": calmar_ratio,
+        "positive_day_ratio": float((values > 0).mean()),
+        "best_day": float(values.max()),
+        "worst_day": float(values.min()),
     }
 
 
@@ -395,15 +437,25 @@ def _qlib_open_series(
     return frame.reset_index(drop=True)
 
 
-def load_index_benchmarks_from_provider(provider: Path) -> dict[str, Any]:
+def load_index_benchmarks_from_provider(
+    provider: Path,
+    *,
+    required_symbols: Sequence[str] = QLIB_BENCHMARK_SYMBOLS,
+) -> dict[str, Any]:
     raw = Path(provider).expanduser().absolute()
     if raw.is_symlink() or not raw.is_dir():
         raise DataContractError("Qlib benchmark provider is unavailable")
+    declared = tuple(required_symbols)
+    if declared not in (QLIB_LEGACY_BENCHMARK_SYMBOLS, QLIB_BENCHMARK_SYMBOLS):
+        raise DataContractError("Qlib benchmark required symbols are invalid")
     resolved = raw.resolve(strict=True)
     calendar = _qlib_calendar(resolved)
     available: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
     for symbol in INDEX_NAMES:
+        if symbol not in declared:
+            missing.append(symbol)
+            continue
         frame = _qlib_open_series(resolved, calendar, symbol)
         if frame is None:
             missing.append(symbol)
@@ -419,7 +471,23 @@ def resolve_index_benchmarks(root: Path) -> dict[str, Any]:
             quant_data_root=root,
             require_basis="qfq",
         )
-        result = load_index_benchmarks_from_provider(resolved.snapshot_path)
+        evidence = resolved.manifest.get("benchmarks")
+        if not isinstance(evidence, Mapping):
+            raise DataContractError("Qlib benchmark evidence is unavailable")
+        declared_required = evidence.get("required_symbols")
+        if declared_required is None:
+            required_symbols = QLIB_LEGACY_BENCHMARK_SYMBOLS
+        elif (
+            isinstance(declared_required, list)
+            and tuple(declared_required) == QLIB_BENCHMARK_SYMBOLS
+        ):
+            required_symbols = QLIB_BENCHMARK_SYMBOLS
+        else:
+            raise DataContractError("Qlib benchmark required symbols are invalid")
+        result = load_index_benchmarks_from_provider(
+            resolved.snapshot_path,
+            required_symbols=required_symbols,
+        )
         result["data_identity"] = {
             "dataset_id": resolved.dataset_id,
             "snapshot_id": resolved.manifest["snapshot_id"],
@@ -449,6 +517,26 @@ def _curve_metrics(curve: pd.DataFrame, column: str) -> dict[str, Any]:
         }
     )
     return result
+
+
+def _unavailable_metrics(reason: str) -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "reason": reason,
+        "periods": 0,
+        "start_date": None,
+        "end_date": None,
+        "total_return": None,
+        "annualized_return": None,
+        "max_drawdown": None,
+        "annualized_volatility": None,
+        "sharpe_ratio": None,
+        "sharpe_risk_free_rate": 0.0,
+        "calmar_ratio": None,
+        "positive_day_ratio": None,
+        "best_day": None,
+        "worst_day": None,
+    }
 
 
 def _price_comparator_curves(common: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
@@ -487,7 +575,23 @@ def _append_index_curves(
 def _period_summary(
     periods: pd.DataFrame, start: str, end: str
 ) -> dict[str, Any]:
-    return dict(summarize_periods(periods, start_date=start, end_date=end))
+    summary = dict(summarize_periods(periods, start_date=start, end_date=end))
+    start_date = pd.Timestamp(start).normalize()
+    end_date = pd.Timestamp(end).normalize()
+    frame = periods[["date", "next_date", "net_return"]].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["next_date"] = pd.to_datetime(
+        frame["next_date"], errors="coerce"
+    ).dt.normalize()
+    frame["net_return"] = pd.to_numeric(frame["net_return"], errors="coerce")
+    scoped = frame.loc[
+        (frame["date"] >= start_date)
+        & (frame["next_date"] <= end_date)
+        & frame["net_return"].notna(),
+        "net_return",
+    ]
+    summary.update(_return_metrics(scoped.to_numpy(dtype=float)))
+    return summary
 
 
 def _yearly_returns(periods_by_name: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
@@ -577,9 +681,10 @@ def _regime_attribution(
     *,
     trend_days: int,
     momentum_days: int,
+    unavailable_reason: str = "SH000300 benchmark is missing",
 ) -> dict[str, Any]:
     if benchmark is None:
-        return {"status": "unavailable", "reason": "SH000300 benchmark is missing"}
+        return {"status": "unavailable", "reason": unavailable_reason}
     market = benchmark[["date", "open"]].copy()
     market["date"] = pd.to_datetime(market["date"]).dt.normalize()
     market = market.sort_values("date", kind="stable")
@@ -599,6 +704,52 @@ def _regime_attribution(
     for regime in ("risk_on", "transition", "risk_off"):
         scoped = merged.loc[merged["regime"] == regime, "net_return"]
         rows[regime] = _return_metrics(scoped.to_numpy(dtype=float))
+    return {
+        "status": "available",
+        "benchmark": "SH000300",
+        "trend_days": int(trend_days),
+        "momentum_days": int(momentum_days),
+        "regimes": rows,
+    }
+
+
+def _regime_comparison(
+    periods_by_name: Mapping[str, pd.DataFrame],
+    benchmark: pd.DataFrame | None,
+    *,
+    trend_days: int,
+    momentum_days: int,
+    unavailable_reason: str = "SH000300 benchmark is missing",
+) -> dict[str, Any]:
+    if benchmark is None:
+        return {"status": "unavailable", "reason": unavailable_reason}
+    market = benchmark[["date", "open"]].copy()
+    market["date"] = pd.to_datetime(market["date"]).dt.normalize()
+    market = market.sort_values("date", kind="stable")
+    market["trend"] = market["open"].rolling(trend_days).mean()
+    market["momentum"] = market["open"].pct_change(momentum_days)
+    market["regime"] = "transition"
+    market.loc[
+        (market["open"] > market["trend"]) & (market["momentum"] > 0), "regime"
+    ] = "risk_on"
+    market.loc[
+        (market["open"] < market["trend"]) & (market["momentum"] < 0), "regime"
+    ] = "risk_off"
+
+    rows: dict[str, dict[str, Any]] = {
+        regime: {} for regime in ("risk_on", "transition", "risk_off")
+    }
+    for name, periods in periods_by_name.items():
+        scoped_periods = periods[["date", "net_return"]].copy()
+        scoped_periods["date"] = pd.to_datetime(
+            scoped_periods["date"]
+        ).dt.normalize()
+        merged = scoped_periods.merge(
+            market[["date", "regime"]], on="date", how="left"
+        )
+        for regime in rows:
+            returns = merged.loc[merged["regime"] == regime, "net_return"]
+            rows[regime][name] = _return_metrics(returns.to_numpy(dtype=float))
     return {
         "status": "available",
         "benchmark": "SH000300",
@@ -672,6 +823,23 @@ def build_report(
         *[symbol for symbol in INDEX_NAMES if symbol in equity],
     ]:
         comparator_metrics[column] = _curve_metrics(equity, column)
+    calculable_indexes = [
+        symbol
+        for symbol in INDEX_NAMES
+        if int(comparator_metrics.get(symbol, {}).get("periods") or 0) > 0
+    ]
+    for symbol in INDEX_NAMES:
+        if symbol not in calculable_indexes:
+            reason = (
+                "benchmark_has_insufficient_date_overlap"
+                if symbol in index_result.get("available", {})
+                else "benchmark_data_missing"
+            )
+            comparator_metrics[symbol] = _unavailable_metrics(
+                reason
+            )
+            if symbol in equity:
+                equity = equity.drop(columns=[symbol])
 
     common_start = str(pd.Timestamp(equity.iloc[0]["date"]).date())
     common_end = str(pd.Timestamp(equity.iloc[-1]["date"]).date())
@@ -743,23 +911,61 @@ def build_report(
     )
     regime_config = config["stability"]["regime_attribution"]
     available_indexes = index_result.get("available", {})
+    regime_benchmark_symbol = str(regime_config["benchmark"])
+    regime_unavailable_reason = (
+        f"{regime_benchmark_symbol} benchmark has no overlapping dates"
+        if regime_benchmark_symbol in available_indexes
+        else f"{regime_benchmark_symbol} benchmark is missing"
+    )
+    regime_benchmark = (
+        available_indexes.get(regime_benchmark_symbol)
+        if regime_benchmark_symbol in calculable_indexes
+        else None
+    )
     regime = _regime_attribution(
         primary["periods"],
-        available_indexes.get(str(regime_config["benchmark"])),
+        regime_benchmark,
         trend_days=int(regime_config["trend_days"]),
         momentum_days=int(regime_config["momentum_days"]),
+        unavailable_reason=regime_unavailable_reason,
+    )
+    regime_comparison = _regime_comparison(
+        {
+            "three_etf_defensive": primary["periods"],
+            "two_etf_legacy_exact": legacy["periods"],
+        },
+        regime_benchmark,
+        trend_days=int(regime_config["trend_days"]),
+        momentum_days=int(regime_config["momentum_days"]),
+        unavailable_reason=regime_unavailable_reason,
     )
 
-    drawdown = equity[["date", "strategy"]].copy()
-    drawdown["strategy"] = (
-        drawdown["strategy"] / drawdown["strategy"].cummax() - 1.0
-    )
+    drawdown_columns = [
+        "strategy",
+        "two_etf_legacy_exact",
+        "two_etf_eligible_first",
+        "three_etf_equal_weight",
+        *[symbol for symbol in INDEX_NAMES if symbol in equity],
+    ]
+    drawdown = equity[["date", *drawdown_columns]].copy()
+    for column in drawdown_columns:
+        drawdown[column] = (
+            drawdown[column] / drawdown[column].cummax() - 1.0
+        )
     latest = primary_variant["signal_table"].iloc[-1]
     position_fraction = (
         primary["periods"]["position"].value_counts(normalize=True).sort_index()
     )
     cost_stress = {
         key: value["metrics"]
+        for key, value in primary_variant["cost_stress"].items()
+    }
+    cost_stress_comparison = {
+        key: {
+            "side_cost_bps": value["metrics"]["side_cost_bps"],
+            "three_etf_defensive": value["metrics"],
+            "two_etf_legacy_exact": legacy_variant["cost_stress"][key]["metrics"],
+        }
         for key, value in primary_variant["cost_stress"].items()
     }
 
@@ -805,14 +1011,21 @@ def build_report(
             "comparators": comparator_metrics,
             "periods": split_metrics,
             "incremental_evidence_vs_legacy_two_etf": evidence,
+            "metric_definitions": {
+                "annualization_periods": 252,
+                "sharpe_risk_free_rate": 0.0,
+                "positive_day_definition": "net_return > 0",
+            },
         },
         "stability": {
             "cost_stress": cost_stress,
+            "cost_stress_comparison": cost_stress_comparison,
             "block_bootstrap": bootstrap,
             "leave_one_year_out": leave_one_year,
             "leave_one_year_positive_ratio": positive_ratio,
             "start_date_sensitivity": start_sensitivity,
             "market_regime_attribution": regime,
+            "market_regime_comparison": regime_comparison,
         },
         "holding_behavior": {
             "position_fraction": {
@@ -830,9 +1043,11 @@ def build_report(
         "benchmarks": {
             "available": [
                 {"symbol": symbol, "name": INDEX_NAMES[symbol]}
-                for symbol in index_result.get("available", {})
+                for symbol in calculable_indexes
             ],
-            "missing": list(index_result.get("missing", [])),
+            "missing": [
+                symbol for symbol in INDEX_NAMES if symbol not in calculable_indexes
+            ],
             "substitution_used": False,
             "data_identity": index_result.get("data_identity"),
             "load_error": index_result.get("error"),
@@ -862,14 +1077,24 @@ def _fmt_pct(value: Any) -> str:
     return "--" if not math.isfinite(number) else f"{number * 100:.2f}%"
 
 
+def _fmt_number(value: Any, digits: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    return "--" if not math.isfinite(number) else f"{number:.{digits}f}"
+
+
 def _line_svg(
     rows: Sequence[Mapping[str, Any]],
     *,
     title: str,
     series: Sequence[tuple[str, str, str]],
 ) -> str:
-    width, height = 1000, 300
-    left, right, top, bottom = 58, 18, 34, 34
+    width, base_height = 1000, 300
+    left, right, top = 58, 18, 34
+    plot_bottom = 266
+    legend_line_height = 22
     points_by_series: dict[str, list[tuple[int, float]]] = {}
     values: list[float] = []
     for key, _, _ in series:
@@ -884,13 +1109,35 @@ def _line_svg(
                 values.append(value)
         points_by_series[key] = points
     if not rows or not values:
-        return f'<svg viewBox="0 0 {width} {height}" role="img"><text x="24" y="36">{html.escape(title)}：无数据</text></svg>'
+        return f'<svg viewBox="0 0 {width} {base_height}" role="img"><text x="24" y="36">{html.escape(title)}：无数据</text></svg>'
     low, high = min(values), max(values)
     if math.isclose(low, high):
         low -= 0.05
         high += 0.05
     plot_width = width - left - right
-    plot_height = height - top - bottom
+    plot_height = plot_bottom - top
+
+    # Grow the viewBox for wrapped legend rows while keeping the plot fixed.
+    legend_entries = [
+        (label, color)
+        for key, label, color in series
+        if points_by_series[key]
+    ]
+    legend_rows: list[list[tuple[str, str]]] = []
+    current_row: list[tuple[str, str]] = []
+    current_width = 0
+    for label, color in legend_entries:
+        item_width = max(115, len(label) * 14)
+        if current_row and current_width + item_width > plot_width:
+            legend_rows.append(current_row)
+            current_row = []
+            current_width = 0
+        current_row.append((label, color))
+        current_width += item_width
+    if current_row:
+        legend_rows.append(current_row)
+    height = base_height + max(len(legend_rows) - 1, 0) * legend_line_height
+    bottom = height - plot_bottom
 
     def x_coord(index: int) -> float:
         return left + plot_width * index / max(len(rows) - 1, 1)
@@ -916,15 +1163,19 @@ def _line_svg(
         lines.append(
             f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2" vector-effect="non-scaling-stroke"/>'
         )
-    legend_x = left
-    for _, label, color in series:
-        lines.append(
-            f'<line x1="{legend_x}" y1="{height-10}" x2="{legend_x+16}" y2="{height-10}" stroke="{color}" stroke-width="3"/>'
-        )
-        lines.append(
-            f'<text x="{legend_x+21}" y="{height-6}" class="axis">{html.escape(label)}</text>'
-        )
-        legend_x += max(115, len(label) * 14)
+    for row_index, legend_row in enumerate(legend_rows):
+        legend_x = left
+        legend_y = plot_bottom + 24 + row_index * legend_line_height
+        for label, color in legend_row:
+            item_width = max(115, len(label) * 14)
+            legend_row_number = row_index + 1
+            lines.append(
+                f'<line data-legend-row="{legend_row_number}" x1="{legend_x}" y1="{legend_y}" x2="{legend_x+16}" y2="{legend_y}" stroke="{color}" stroke-width="3"/>'
+            )
+            lines.append(
+                f'<text data-legend-row="{legend_row_number}" x="{legend_x+21}" y="{legend_y+4}" class="axis">{html.escape(label)}</text>'
+            )
+            legend_x += item_width
     lines.append("</svg>")
     return "".join(lines)
 
@@ -969,37 +1220,126 @@ def _bar_svg(
     return "".join(parts)
 
 
+def _grouped_bar_svg(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    title: str,
+    series: Sequence[tuple[str, str, str]],
+) -> str:
+    width, height = 1000, 320
+    left, right, top, bottom = 58, 18, 34, 58
+    groups: list[tuple[str, list[float | None]]] = []
+    values: list[float] = []
+    for row in rows:
+        current: list[float | None] = []
+        for key, _, _ in series:
+            try:
+                value = float(row.get(key))
+            except (TypeError, ValueError):
+                current.append(None)
+                continue
+            if not math.isfinite(value):
+                current.append(None)
+                continue
+            current.append(value)
+            values.append(value)
+        groups.append((str(row.get("year", "")), current))
+    if not groups or not values:
+        return f'<svg viewBox="0 0 {width} {height}" role="img"><text x="24" y="36">{html.escape(title)}：无数据</text></svg>'
+    bound = max(abs(value) for value in values) or 0.01
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    zero = top + plot_height / 2
+    slot = plot_width / len(groups)
+    bar_width = slot * 0.66 / max(len(series), 1)
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{html.escape(title)}">',
+        f'<text x="{left}" y="22" class="chart-title">{html.escape(title)}</text>',
+        f'<line x1="{left}" y1="{zero}" x2="{width-right}" y2="{zero}" class="grid"/>',
+    ]
+    for group_index, (label, current) in enumerate(groups):
+        group_left = left + group_index * slot + slot * 0.17
+        for series_index, value in enumerate(current):
+            if value is None:
+                continue
+            bar_height = abs(value) / bound * (plot_height / 2)
+            x = group_left + series_index * bar_width
+            y = zero - bar_height if value >= 0 else zero
+            color = series[series_index][2]
+            parts.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width*0.86:.1f}" height="{bar_height:.1f}" fill="{color}"/>'
+            )
+        parts.append(
+            f'<text x="{left+(group_index+0.5)*slot:.1f}" y="{height-30}" text-anchor="middle" class="axis">{html.escape(label)}</text>'
+        )
+    legend_x = left
+    for _, label, color in series:
+        parts.append(
+            f'<rect x="{legend_x}" y="{height-16}" width="14" height="8" fill="{color}"/>'
+        )
+        parts.append(
+            f'<text x="{legend_x+20}" y="{height-7}" class="axis">{html.escape(label)}</text>'
+        )
+        legend_x += max(150, len(label) * 14)
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def render_html(report: Mapping[str, Any]) -> str:
     summary = report.get("summary", {})
     performance = report.get("performance", {})
     metrics = performance.get("primary_metrics") or summary.get("primary_metrics", {})
     chart_data = report.get("chart_data", {})
     missing = report.get("benchmarks", {}).get("missing", [])
+    strategy = report.get("strategy", {})
+    strategy_name = str(strategy.get("name") or "三ETF防守轮动交易策略")
     equity_chart = _line_svg(
         chart_data.get("equity", []),
         title="净值对比",
         series=(
-            ("strategy", "三ETF策略", "#c62828"),
+            ("strategy", strategy_name, "#c62828"),
             ("SZ159915", "159915", "#2563eb"),
             ("SH513100", "513100", "#d97706"),
             ("SH512890", "512890", "#0f766e"),
             ("two_etf_legacy_exact", "原两ETF", "#7c3aed"),
+            ("two_etf_eligible_first", "两ETF先过滤", "#9333ea"),
+            ("three_etf_equal_weight", "三ETF等权", "#64748b"),
+            ("SH000300", "沪深300", "#d97706"),
+            ("SH000905", "中证500", "#0f766e"),
+            ("SH000906", "中证800", "#a855f7"),
+            ("SZ399006", "创业板指", "#0891b2"),
+            ("SH000688", "科创50", "#be123c"),
         ),
     )
     drawdown_chart = _line_svg(
         chart_data.get("drawdown", []),
-        title="策略回撤",
-        series=(("strategy", "回撤", "#16865b"),),
+        title="回撤对比",
+        series=(
+            ("strategy", strategy_name, "#c62828"),
+            ("two_etf_legacy_exact", "原两ETF", "#2563eb"),
+            ("two_etf_eligible_first", "两ETF先过滤", "#7c3aed"),
+            ("three_etf_equal_weight", "三ETF等权", "#64748b"),
+            ("SH000300", "沪深300", "#d97706"),
+            ("SH000905", "中证500", "#0f766e"),
+            ("SH000906", "中证800", "#9333ea"),
+            ("SZ399006", "创业板指", "#0891b2"),
+            ("SH000688", "科创50", "#be123c"),
+        ),
     )
-    yearly_chart = _bar_svg(
-        chart_data.get("yearly_returns", []), title="逐年收益"
+    yearly_chart = _grouped_bar_svg(
+        chart_data.get("yearly_returns", []),
+        title="逐年收益对比",
+        series=(
+            ("strategy", strategy_name, "#c62828"),
+            ("two_etf_legacy_exact", "原两ETF", "#2563eb"),
+        ),
     )
-    strategy = report.get("strategy", {})
     symbols = "、".join(strategy.get("symbols", []))
     missing_text = "、".join(missing) if missing else "无"
     commission_bps = float(strategy.get("commission_bps_each_side", 0.0))
     commission_pct = commission_bps * 0.01
     comparator_names = {
+        "three_etf_defensive": strategy_name,
         "SZ159915": "159915 买入持有",
         "SH513100": "513100 买入持有",
         "SH512890": "512890 买入持有",
@@ -1008,39 +1348,181 @@ def render_html(report: Mapping[str, Any]) -> str:
         "two_etf_eligible_first": "两ETF先过滤再排名",
         "SH000300": "沪深300",
         "SH000905": "中证500",
+        "SH000906": "中证800",
         "SZ399006": "创业板指",
+        "SH000688": "科创50",
     }
-    comparator_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(comparator_names.get(str(key), str(key)))}</td>"
-        f"<td>{_fmt_pct(value.get('annualized_return'))}</td>"
-        f"<td>{_fmt_pct(value.get('total_return'))}</td>"
-        f"<td>{_fmt_pct(value.get('max_drawdown'))}</td>"
-        "</tr>"
-        for key, value in performance.get("comparators", {}).items()
-        if isinstance(value, Mapping)
+    comparator_metrics = dict(performance.get("comparators", {}))
+    for symbol in missing:
+        comparator_metrics.setdefault(
+            str(symbol), _unavailable_metrics("benchmark_data_missing")
+        )
+    comparison_order = (
+        "three_etf_defensive",
+        "two_etf_legacy_exact",
+        "two_etf_eligible_first",
+        "SZ159915",
+        "SH513100",
+        "SH512890",
+        "three_etf_equal_weight",
+        "SH000300",
+        "SH000905",
+        "SH000906",
+        "SZ399006",
+        "SH000688",
     )
-    period_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(name))}</td>"
-        f"<td>{_fmt_pct(value.get('strategy', {}).get('annualized_return'))}</td>"
-        f"<td>{_fmt_pct(value.get('legacy_two_etf', {}).get('annualized_return'))}</td>"
-        f"<td>{_fmt_pct(value.get('strategy', {}).get('max_drawdown'))}</td>"
-        "</tr>"
-        for name, value in performance.get("periods", {}).items()
-        if isinstance(value, Mapping)
-    )
+    comparison_values = {"three_etf_defensive": metrics, **comparator_metrics}
+
+    def raw_metric_cells(
+        value: Mapping[str, Any], *, include_range: bool = False
+    ) -> str:
+        range_cell = ""
+        if include_range:
+            start = value.get("start_date") or "--"
+            end = value.get("end_date") or "--"
+            range_cell = f"<td>{html.escape(str(start))} 至 {html.escape(str(end))}</td>"
+        return "".join(
+            (
+                range_cell,
+                f"<td>{html.escape(str(value.get('periods') or '--'))}</td>",
+                f"<td>{_fmt_pct(value.get('annualized_return'))}</td>",
+                f"<td>{_fmt_pct(value.get('total_return'))}</td>",
+                f"<td>{_fmt_pct(value.get('max_drawdown'))}</td>",
+                f"<td>{_fmt_pct(value.get('annualized_volatility'))}</td>",
+                f"<td>{_fmt_number(value.get('sharpe_ratio'))}</td>",
+                f"<td>{_fmt_number(value.get('calmar_ratio'))}</td>",
+                f"<td>{_fmt_pct(value.get('positive_day_ratio'))}</td>",
+                f"<td>{_fmt_pct(value.get('best_day'))}</td>",
+                f"<td>{_fmt_pct(value.get('worst_day'))}</td>",
+            )
+        )
+
+    comparator_rows_parts: list[str] = []
+    for key in comparison_order:
+        value = comparison_values.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        availability = (
+            "数据不可用" if value.get("status") == "unavailable" else "可计算"
+        )
+        comparator_rows_parts.append(
+            "<tr>"
+            f"<td>{html.escape(comparator_names.get(key, key))}</td>"
+            f"<td>{availability}</td>"
+                f"{raw_metric_cells(value, include_range=True)}"
+            "</tr>"
+        )
+    comparator_rows = "".join(comparator_rows_parts)
+
+    period_labels = {
+        "construction": "构建期",
+        "validation": "验证期",
+        "observation": "观察期",
+    }
+    period_rows_parts: list[str] = []
+    for name, value in performance.get("periods", {}).items():
+        if not isinstance(value, Mapping):
+            continue
+        date_range = f"{value.get('start', '--')} 至 {value.get('end', '--')}"
+        for strategy_key, label in (
+            ("strategy", strategy_name),
+            ("legacy_two_etf", "原两ETF精确旧规则"),
+        ):
+            strategy_metrics = value.get(strategy_key, {})
+            if not isinstance(strategy_metrics, Mapping):
+                continue
+            period_rows_parts.append(
+                "<tr>"
+                f"<td>{html.escape(period_labels.get(str(name), str(name)))}</td>"
+                f"<td>{html.escape(label)}</td><td>{html.escape(date_range)}</td>"
+                f"{raw_metric_cells(strategy_metrics)}"
+                "</tr>"
+            )
+    period_rows = "".join(period_rows_parts)
     stability = report.get("stability", {})
-    cost_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(name).replace('_slippage', '滑点'))}</td>"
-        f"<td>{float(value.get('side_cost_bps', 0)):.2f}bp</td>"
-        f"<td>{_fmt_pct(value.get('annualized_return'))}</td>"
-        f"<td>{_fmt_pct(value.get('max_drawdown'))}</td>"
-        "</tr>"
-        for name, value in stability.get("cost_stress", {}).items()
-        if isinstance(value, Mapping)
-    )
+    cost_comparison = stability.get("cost_stress_comparison", {})
+    if not cost_comparison:
+        cost_comparison = {
+            name: {
+                "side_cost_bps": value.get("side_cost_bps"),
+                "three_etf_defensive": value,
+            }
+            for name, value in stability.get("cost_stress", {}).items()
+            if isinstance(value, Mapping)
+        }
+    cost_rows_parts: list[str] = []
+    for name, value in cost_comparison.items():
+        if not isinstance(value, Mapping):
+            continue
+        scenario = str(name).replace("_slippage", "滑点")
+        for strategy_key, label in (
+            ("three_etf_defensive", strategy_name),
+            ("two_etf_legacy_exact", "原两ETF精确旧规则"),
+        ):
+            strategy_metrics = value.get(strategy_key)
+            if not isinstance(strategy_metrics, Mapping):
+                continue
+            cost_rows_parts.append(
+                "<tr>"
+                f"<td>{html.escape(scenario)}</td><td>{html.escape(label)}</td>"
+                f"<td>{_fmt_number(value.get('side_cost_bps'))}bp</td>"
+                f"{raw_metric_cells(strategy_metrics)}"
+                "</tr>"
+            )
+    cost_rows = "".join(cost_rows_parts)
+
+    start_rows_parts: list[str] = []
+    for item in stability.get("start_date_sensitivity", []):
+        if not isinstance(item, Mapping):
+            continue
+        for strategy_key, label in (
+            ("strategy", strategy_name),
+            ("legacy_two_etf", "原两ETF精确旧规则"),
+        ):
+            strategy_metrics = item.get(strategy_key)
+            if isinstance(strategy_metrics, Mapping):
+                start_rows_parts.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(item.get('actual_start', '--')))}</td>"
+                    f"<td>{html.escape(label)}</td>{raw_metric_cells(strategy_metrics)}"
+                    "</tr>"
+                )
+    start_rows = "".join(start_rows_parts)
+
+    leave_rows_parts: list[str] = []
+    for item in stability.get("leave_one_year_out", []):
+        if not isinstance(item, Mapping):
+            continue
+        for key, label in (
+            ("strategy_annualized_return", strategy_name),
+            ("baseline_annualized_return", "原两ETF精确旧规则"),
+        ):
+            leave_rows_parts.append(
+                "<tr>"
+                f"<td>{html.escape(str(item.get('omitted_year', '--')))}</td>"
+                f"<td>{html.escape(label)}</td><td>{_fmt_pct(item.get(key))}</td>"
+                "</tr>"
+            )
+    leave_rows = "".join(leave_rows_parts)
+
+    regime_rows_parts: list[str] = []
+    regime_comparison = stability.get("market_regime_comparison", {})
+    for regime_name, values in regime_comparison.get("regimes", {}).items():
+        if not isinstance(values, Mapping):
+            continue
+        for strategy_key, label in (
+            ("three_etf_defensive", strategy_name),
+            ("two_etf_legacy_exact", "原两ETF精确旧规则"),
+        ):
+            strategy_metrics = values.get(strategy_key)
+            if isinstance(strategy_metrics, Mapping):
+                regime_rows_parts.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(regime_name))}</td>"
+                    f"<td>{html.escape(label)}</td>{raw_metric_cells(strategy_metrics)}"
+                    "</tr>"
+                )
+    regime_rows = "".join(regime_rows_parts)
     holding = report.get("holding_behavior", {})
     holding_rows = "".join(
         "<tr>"
@@ -1048,21 +1530,12 @@ def render_html(report: Mapping[str, Any]) -> str:
         "</tr>"
         for position, fraction in holding.get("position_fraction", {}).items()
     )
-    bootstrap = stability.get("block_bootstrap", {})
-    bootstrap_text = (
-        "区块Bootstrap的年化增量95%区间："
-        f"{_fmt_pct(bootstrap.get('ci95_lower'))} 至 "
-        f"{_fmt_pct(bootstrap.get('ci95_upper'))}；"
-        f"增量为正的模拟占比 {_fmt_pct(bootstrap.get('positive_probability'))}。"
-        if bootstrap
-        else "区块Bootstrap：暂无数据。"
-    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>三ETF防守轮动研究预览</title>
+<title>{html.escape(strategy_name)}研究预览</title>
 <style>
 :root{{--red:#c62828;--green:#16865b;--ink:#17212b;--muted:#5d6975;--line:#d8dee5;--paper:#fff;--wash:#f4f6f8}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--wash);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;line-height:1.55}}
@@ -1073,14 +1546,15 @@ h1{{font-size:28px;margin:0 0 8px}} h2{{font-size:19px;margin:34px 0 12px;border
 .metric b{{display:block;font-size:22px;margin-top:4px}} .muted{{color:var(--muted)}}
 .chart{{border:1px solid var(--line);border-radius:6px;padding:8px;margin:12px 0;overflow-x:auto}} svg{{display:block;width:100%;min-width:720px;height:auto}}
 .grid{{stroke:#cbd3dc;stroke-width:1}} .axis{{font-size:12px;fill:#65717d}} .chart-title{{font-size:15px;font-weight:600;fill:#17212b}}
-table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left}} th{{background:#f7f8fa}}
+table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}} th{{background:#f7f8fa}}
+.table-wrap{{overflow-x:auto;border:1px solid var(--line);border-radius:4px}} .raw-metrics{{min-width:1380px}}
 code{{background:#eef1f4;padding:2px 5px;border-radius:3px}} .status{{color:#9a5b00;font-weight:700}}
 @media(max-width:720px){{main{{padding:22px 16px}}.metrics{{grid-template-columns:1fr}}h1{{font-size:23px}}}}
 @media print{{body{{background:#fff}}main{{max-width:none;padding:12mm}}.chart{{break-inside:avoid}}}}
 </style>
 </head>
 <body><main>
-<h1>三ETF防守轮动研究预览</h1>
+<h1>{html.escape(strategy_name)}</h1>
 <p class="muted">状态：<span class="status">{html.escape(str(report.get('status', 'research_preview')))}</span> · 数据截止 {html.escape(str(summary.get('data_end', '--')))}</p>
 <div class="warning">当前 ETF 快照尚未完成 quant_data 正式验收。本报告仅用于研究预览，不可用于交易，也不会生成正式候选评级。</div>
 <h2>固定规则</h2>
@@ -1091,14 +1565,17 @@ code{{background:#eef1f4;padding:2px 5px;border-radius:3px}} .status{{color:#9a5
   <div class="metric"><span>累计收益</span><b>{_fmt_pct(metrics.get('total_return'))}</b></div>
   <div class="metric"><span>最大回撤</span><b style="color:var(--green)">{_fmt_pct(metrics.get('max_drawdown'))}</b></div>
 </div>
-<h2>收益与风险</h2><div class="chart">{equity_chart}</div><div class="chart">{drawdown_chart}</div><div class="chart">{yearly_chart}</div>
-<h2>策略与基准对比</h2>
-<table><thead><tr><th>对象</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th></tr></thead><tbody>{comparator_rows or '<tr><td colspan="4">暂无数据</td></tr>'}</tbody></table>
+<h2>收益与风险图</h2><div class="chart">{equity_chart}</div><div class="chart">{drawdown_chart}</div><div class="chart">{yearly_chart}</div>
+<h2>策略、ETF与大盘完整指标对比</h2>
+<p class="muted">夏普比率按无风险利率0%计算；Calmar比率=年化收益/最大回撤绝对值；正收益日只统计净收益大于0的交易日。所有单日指标均基于各对象在表中所列共同回测区间的日收益。</p>
+<div class="table-wrap"><table class="raw-metrics"><thead><tr><th>对象</th><th>数据状态</th><th>区间</th><th>交易日</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th><th>年化波动</th><th>夏普比率（无风险利率0%）</th><th>Calmar比率</th><th>正收益日比例</th><th>最佳单日</th><th>最差单日</th></tr></thead><tbody>{comparator_rows or '<tr><td colspan="13">暂无数据</td></tr>'}</tbody></table></div>
 <h2>分阶段表现</h2>
-<table><thead><tr><th>阶段</th><th>三ETF年化</th><th>原两ETF年化</th><th>三ETF最大回撤</th></tr></thead><tbody>{period_rows or '<tr><td colspan="4">暂无数据</td></tr>'}</tbody></table>
+<div class="table-wrap"><table class="raw-metrics"><thead><tr><th>阶段</th><th>对象</th><th>区间</th><th>交易日</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th><th>年化波动</th><th>夏普比率</th><th>Calmar比率</th><th>正收益日比例</th><th>最佳单日</th><th>最差单日</th></tr></thead><tbody>{period_rows or '<tr><td colspan="13">暂无数据</td></tr>'}</tbody></table></div>
 <h2>成本压力与稳定性</h2>
-<table><thead><tr><th>滑点假设</th><th>单边总成本</th><th>年化收益</th><th>最大回撤</th></tr></thead><tbody>{cost_rows or '<tr><td colspan="4">暂无数据</td></tr>'}</tbody></table>
-<p>{html.escape(bootstrap_text)}</p><p>逐年留一后，三ETF年化收益高于原两ETF的比例：{_fmt_pct(stability.get('leave_one_year_positive_ratio'))}。</p>
+<div class="table-wrap"><table class="raw-metrics"><thead><tr><th>滑点假设</th><th>对象</th><th>单边总成本</th><th>交易日</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th><th>年化波动</th><th>夏普比率</th><th>Calmar比率</th><th>正收益日比例</th><th>最佳单日</th><th>最差单日</th></tr></thead><tbody>{cost_rows or '<tr><td colspan="13">暂无数据</td></tr>'}</tbody></table></div>
+<h2>起始日期敏感性</h2><div class="table-wrap"><table class="raw-metrics"><thead><tr><th>实际起始日</th><th>对象</th><th>交易日</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th><th>年化波动</th><th>夏普比率</th><th>Calmar比率</th><th>正收益日比例</th><th>最佳单日</th><th>最差单日</th></tr></thead><tbody>{start_rows or '<tr><td colspan="12">暂无数据</td></tr>'}</tbody></table></div>
+<h2>逐年留一稳定性</h2><div class="table-wrap"><table><thead><tr><th>剔除年份</th><th>对象</th><th>剩余样本年化收益</th></tr></thead><tbody>{leave_rows or '<tr><td colspan="3">暂无数据</td></tr>'}</tbody></table></div>
+<h2>市场状态归因</h2><div class="table-wrap"><table class="raw-metrics"><thead><tr><th>市场状态</th><th>对象</th><th>交易日</th><th>年化收益</th><th>累计收益</th><th>最大回撤</th><th>年化波动</th><th>夏普比率</th><th>Calmar比率</th><th>正收益日比例</th><th>最佳单日</th><th>最差单日</th></tr></thead><tbody>{regime_rows or '<tr><td colspan="12">暂无数据</td></tr>'}</tbody></table></div>
 <h2>持仓行为</h2>
 <p>换仓次数：{html.escape(str(holding.get('switch_count', '--')))}；持有ETF的交易日占比：{_fmt_pct(holding.get('invested_fraction'))}。</p>
 <table><thead><tr><th>持仓</th><th>时间占比</th></tr></thead><tbody>{holding_rows or '<tr><td colspan="2">暂无数据</td></tr>'}</tbody></table>

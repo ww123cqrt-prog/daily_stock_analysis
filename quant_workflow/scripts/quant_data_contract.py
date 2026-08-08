@@ -42,7 +42,14 @@ REQUIRED_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume")
 BAR_OHLC_RELATIVE_TOLERANCE = 2e-6
 BAR_OHLC_ABSOLUTE_TOLERANCE = 1e-4
 ADJUSTED_PRICE_BASES = {"qfq", "hfq"}
-QLIB_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+QLIB_LEGACY_BENCHMARK_SYMBOLS = ("SH000300", "SH000905", "SH000906")
+QLIB_BENCHMARK_SYMBOLS = (
+    "SH000300",
+    "SH000905",
+    "SH000906",
+    "SZ399006",
+    "SH000688",
+)
 QLIB_BENCHMARK_FIELDS = ("open", "high", "low", "close", "volume", "factor")
 AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS = 252
 AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS = 100
@@ -1472,10 +1479,17 @@ def _validate_qlib_benchmark_evidence(
             raise DataContractError("Qlib benchmark source evidence is unavailable")
         if sha256_file(evidence_path) != source["evidence_sha256"]:
             raise DataContractError("Qlib benchmark source evidence hash mismatch")
+    declared_required = evidence.get("required_symbols")
+    if declared_required is None:
+        required_symbols = QLIB_LEGACY_BENCHMARK_SYMBOLS
+    elif isinstance(declared_required, list) and tuple(declared_required) == QLIB_BENCHMARK_SYMBOLS:
+        required_symbols = QLIB_BENCHMARK_SYMBOLS
+    else:
+        raise DataContractError("Qlib benchmark required symbols are invalid")
     symbols = evidence.get("symbols")
-    if not isinstance(symbols, Mapping) or set(symbols) != set(QLIB_BENCHMARK_SYMBOLS):
+    if not isinstance(symbols, Mapping) or set(symbols) != set(required_symbols):
         raise DataContractError("Qlib benchmark symbol evidence is incomplete")
-    for symbol in QLIB_BENCHMARK_SYMBOLS:
+    for symbol in required_symbols:
         item = symbols[symbol]
         if not isinstance(item, Mapping):
             raise DataContractError(f"Qlib benchmark evidence is invalid: {symbol}")

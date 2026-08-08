@@ -1,5 +1,5 @@
 import type React from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
@@ -24,6 +24,9 @@ vi.mock('../../api/quant', () => ({
 
 vi.mock('recharts', () => {
   const Wrapper = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
+  const Line = ({ dataKey, name }: { dataKey?: string; name?: string }) => (
+    <div data-testid={`mock-line-${dataKey}`}>{name ?? dataKey}</div>
+  );
   return {
     Area: Wrapper,
     AreaChart: Wrapper,
@@ -33,7 +36,7 @@ vi.mock('recharts', () => {
     Cell: Wrapper,
     ComposedChart: Wrapper,
     Legend: Wrapper,
-    Line: Wrapper,
+    Line,
     LineChart: Wrapper,
     ReferenceLine: Wrapper,
     ResponsiveContainer: Wrapper,
@@ -203,6 +206,8 @@ const defensiveReport = {
     dataStart: '2019-01-18',
     dataEnd: '2026-08-06',
     primaryMetrics: {
+      startDate: '2019-01-18',
+      endDate: '2026-08-06',
       totalReturn: 4.1485,
       annualizedReturn: 0.2538,
       maxDrawdown: -0.2897,
@@ -236,6 +241,8 @@ const defensiveReport = {
   },
   performance: {
     primaryMetrics: {
+      startDate: '2019-01-18',
+      endDate: '2026-08-06',
       totalReturn: 4.1485,
       annualizedReturn: 0.2538,
       maxDrawdown: -0.2897,
@@ -244,9 +251,17 @@ const defensiveReport = {
       sideCostBps: 0.5,
     },
     comparators: {
-      SH513100: { totalReturn: 3.7321, annualizedReturn: 0.2393, maxDrawdown: -0.2862 },
-      twoEtfLegacyExact: { totalReturn: 3.8160, annualizedReturn: 0.2423, maxDrawdown: -0.2940 },
-      SH000300: { totalReturn: 0.4617, annualizedReturn: 0.0538, maxDrawdown: -0.4666 },
+      SZ159915: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 1.9069, annualizedReturn: 0.1587, maxDrawdown: -0.5693 },
+      SH513100: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.7321, annualizedReturn: 0.2393, maxDrawdown: -0.2862 },
+      SH512890: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 1.3307, annualizedReturn: 0.1239, maxDrawdown: -0.1682 },
+      threeEtfEqualWeight: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 2.3232, annualizedReturn: 0.1803, maxDrawdown: -0.2221 },
+      twoEtfLegacyExact: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.8160, annualizedReturn: 0.2423, maxDrawdown: -0.2940 },
+      twoEtfEligibleFirst: { startDate: '2019-01-18', endDate: '2026-08-06', totalReturn: 3.7987, annualizedReturn: 0.2417, maxDrawdown: -0.3115 },
+      SH000300: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.4617, annualizedReturn: 0.0538, maxDrawdown: -0.4666 },
+      SH000905: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.7337, annualizedReturn: 0.0790, maxDrawdown: -0.4219 },
+      SH000906: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 0.5254, annualizedReturn: 0.0601, maxDrawdown: -0.4397 },
+      SZ399006: { startDate: '2019-01-18', endDate: '2026-08-04', totalReturn: 1.6708, annualizedReturn: 0.1454, maxDrawdown: -0.5767 },
+      SH000688: { startDate: '2020-01-02', endDate: '2026-08-04', totalReturn: 0.5608, annualizedReturn: 0.0730, maxDrawdown: -0.6221 },
     },
     periods: {
       validation: {
@@ -287,13 +302,19 @@ const defensiveReport = {
     usableForTrading: false,
   },
   benchmarks: {
-    available: [{ symbol: 'SH000300', name: '沪深300' }],
-    missing: ['SZ399006'],
+    available: [
+      { symbol: 'SH000300', name: '沪深300' },
+      { symbol: 'SH000905', name: '中证500' },
+      { symbol: 'SH000906', name: '中证800' },
+      { symbol: 'SZ399006', name: '创业板指' },
+      { symbol: 'SH000688', name: '科创50' },
+    ],
+    missing: [],
     substitutionUsed: false,
   },
   chartData: {
-    equity: [{ date: '2026-08-05', strategy: 4.1, SZ159915: 2.9, SH513100: 3.7, SH512890: 2.3 }],
-    drawdown: [{ date: '2026-08-05', strategy: -0.1 }],
+    equity: [{ date: '2026-08-04', strategy: 5.1, SZ159915: 2.9, SH513100: 4.7, SH512890: 2.3, SH000300: 1.46, SH000905: 1.73, SH000906: 1.53, SZ399006: 2.67, SH000688: 1.56 }],
+    drawdown: [{ date: '2026-08-04', strategy: -0.1, SH000300: -0.2, SH000905: -0.18, SH000906: -0.19, SZ399006: -0.3, SH000688: -0.35 }],
     yearlyReturns: [{ year: 2025, strategy: 0.2 }],
   },
   reproducibility: { configSha256: 'config', gitCommit: 'deadbeef' },
@@ -378,6 +399,25 @@ describe('EtfMomentumReportPage', () => {
     expect(screen.getAllByText('不可用于交易').length).toBeGreaterThan(0);
     expect(screen.getByTestId('defensive-equity-chart')).toBeInTheDocument();
     expect(screen.getByTestId('defensive-drawdown-chart')).toBeInTheDocument();
+    expect(screen.getAllByRole('columnheader', { name: '年化波动' }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('columnheader', { name: '夏普比率（无风险利率 0%）' }).length).toBeGreaterThan(0);
+    const comparisonTable = screen.getByRole('table', { name: '策略、ETF 与大盘完整指标对比' });
+    expect(within(comparisonTable).getByRole('columnheader', { name: '区间' })).toBeInTheDocument();
+    const strategyRow = within(comparisonTable).getByRole('row', { name: new RegExp(defensiveReport.strategy.name) });
+    expect(within(strategyRow).getByRole('cell', { name: '2019-01-18 - 2026-08-06' })).toBeInTheDocument();
+    const chinextRow = within(comparisonTable).getByRole('row', { name: /创业板指/ });
+    expect(within(chinextRow).getByRole('cell', { name: '2019-01-18 - 2026-08-04' })).toBeInTheDocument();
+    const star50Row = within(comparisonTable).getByRole('row', { name: /科创50/ });
+    expect(within(star50Row).getByRole('cell', { name: '2020-01-02 - 2026-08-04' })).toBeInTheDocument();
+    expect(screen.getAllByText(defensiveReport.strategy.name).length).toBeGreaterThanOrEqual(4);
+    expect(screen.getByRole('cell', { name: '沪深300' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '中证500' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '中证800' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '创业板指' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: '科创50' })).toBeInTheDocument();
+    expect(screen.queryByText('数据不可用')).not.toBeInTheDocument();
+    expect(screen.queryByText('年化差值')).not.toBeInTheDocument();
+    expect(screen.queryByText(/加入\s*512890\s*后/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新计算报告' })).not.toBeInTheDocument();
   });
 
@@ -449,6 +489,34 @@ describe('EtfMomentumReportPage', () => {
 
     expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
     expect(screen.getByText('SH000300 benchmark is missing')).toBeInTheDocument();
+  });
+
+  it('does not draw unavailable benchmark series in the charts', async () => {
+    const reportWithoutChinext = {
+      ...defensiveReport,
+      benchmarks: {
+        ...defensiveReport.benchmarks,
+        available: defensiveReport.benchmarks.available.filter(({ symbol }) => symbol !== 'SZ399006'),
+        missing: ['SZ399006'],
+      },
+      performance: {
+        ...defensiveReport.performance,
+        comparators: {
+          ...defensiveReport.performance.comparators,
+          SZ399006: { status: 'unavailable', reason: 'benchmark_data_missing' },
+        },
+      },
+    };
+    getReport.mockImplementation(async (variant?: string) => (
+      variant === 'three_etf' ? reportWithoutChinext : report
+    ));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '三 ETF 防守轮动' }));
+
+    expect(await screen.findByTestId('defensive-equity-chart')).toBeInTheDocument();
+    expect(screen.queryByTestId('mock-line-SZ399006')).not.toBeInTheDocument();
+    expect(screen.getAllByTestId('mock-line-SH000688').length).toBeGreaterThan(0);
   });
 
   it('uses three-ETF-specific guidance when the preview artifact is missing', async () => {

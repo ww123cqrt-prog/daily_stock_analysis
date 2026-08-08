@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -75,6 +77,13 @@ def test_config_freezes_the_three_etf_rule_without_parameter_search() -> None:
     assert config["costs"]["stamp_duty_applied"] is False
     assert config["costs"]["transfer_fee_applied"] is False
     assert config["data"]["required_runtime_status"] == "research_preview"
+    assert config["comparators"]["indexes"] == [
+        "SH000300",
+        "SH000905",
+        "SH000906",
+        "SZ399006",
+        "SH000688",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -128,6 +137,12 @@ def test_locked_variants_include_three_etf_and_both_two_etf_rules() -> None:
     assert result["three_etf_defensive"]["cost_stress"]["0bp_slippage"][
         "metrics"
     ]["side_cost_bps"] == pytest.approx(0.5)
+    assert result["three_etf_defensive"]["cost_stress"]["0bp_slippage"][
+        "metrics"
+    ]["annualized_volatility"] is not None
+    assert result["two_etf_legacy_exact"]["cost_stress"]["0bp_slippage"][
+        "metrics"
+    ]["sharpe_risk_free_rate"] == pytest.approx(0.0)
 
 
 def test_common_period_uses_all_three_etfs_and_keeps_warmup_as_cash() -> None:
@@ -146,6 +161,20 @@ def test_common_period_uses_all_three_etfs_and_keeps_warmup_as_cash() -> None:
     periods = result["periods"]
     assert periods.iloc[0]["position"] == "CASH"
     assert (periods.iloc[:20]["position"] == "CASH").all()
+
+
+def test_return_metrics_include_risk_adjusted_and_tail_metrics() -> None:
+    module = load_module()
+
+    metrics = module._return_metrics(np.asarray([0.01, -0.005, 0.002, 0.0]))
+
+    assert metrics["annualized_volatility"] > 0
+    assert metrics["sharpe_ratio"] is not None
+    assert metrics["sharpe_risk_free_rate"] == pytest.approx(0.0)
+    assert metrics["calmar_ratio"] is not None
+    assert 0 <= metrics["positive_day_ratio"] <= 1
+    assert metrics["best_day"] == pytest.approx(0.01)
+    assert metrics["worst_day"] == pytest.approx(-0.005)
 
 
 def test_block_bootstrap_is_deterministic_and_reports_incremental_interval() -> None:
@@ -222,13 +251,100 @@ def test_missing_chinext_index_is_reported_without_etf_substitution(tmp_path: Pa
     result = module.load_index_benchmarks_from_provider(provider)
 
     assert set(result["available"]) == {"SH000300", "SH000905"}
-    assert result["missing"] == ["SZ399006"]
+    assert result["missing"] == ["SH000906", "SZ399006", "SH000688"]
     assert "SZ159915" not in result["available"]
     assert "SZ159915" not in result["missing"]
 
 
+def test_resolved_legacy_evidence_ignores_stray_new_index_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_module()
+    provider = tmp_path / "provider"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars/day.txt").write_text(
+        "2026-01-05\n2026-01-06\n2026-01-07\n", encoding="utf-8"
+    )
+    for symbol in module.INDEX_NAMES:
+        feature_dir = provider / "features" / symbol.lower()
+        feature_dir.mkdir(parents=True)
+        np.asarray([0.0, 100.0, 101.0, 102.0], dtype="<f4").tofile(
+            feature_dir / "open.day.bin"
+        )
+    legacy_symbols = ("SH000300", "SH000905", "SH000906")
+    resolved = SimpleNamespace(
+        dataset_id="qlib_ashare_v2",
+        snapshot_path=provider,
+        manifest={
+            "snapshot_id": "legacy-snapshot",
+            "content_sha256": "a" * 64,
+            "benchmarks": {"symbols": {}, "source": {}},
+        },
+    )
+    monkeypatch.setattr(module, "resolve_dataset", lambda *args, **kwargs: resolved)
+
+    result = module.resolve_index_benchmarks(tmp_path)
+
+    assert set(result["available"]) == set(legacy_symbols)
+    assert result["missing"] == ["SZ399006", "SH000688"]
+
+
+def test_benchmark_without_overlapping_etf_dates_is_only_reported_as_missing(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    config = module.load_config(CONFIG_PATH)
+    config["stability"]["bootstrap"]["samples"] = 10
+    bars = _three_asset_data(1980)
+    preview = module.EtfResearchPreview(
+        status="research_preview",
+        dataset_id="cn_etf_daily",
+        snapshot_id="preview-snapshot",
+        snapshot_path=tmp_path,
+        manifest_sha256="b" * 64,
+        content_sha256="c" * 64,
+        date_range={"start": "2019-01-18", "end": "2026-08-06"},
+        bars=bars,
+        formally_accepted=False,
+        usable_for_trading=False,
+    )
+    nonoverlapping = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2010-01-04", periods=3),
+            "open": [100.0, 101.0, 102.0],
+        }
+    )
+    index_result = {
+        "available": {"SH000300": nonoverlapping},
+        "missing": ["SH000905", "SH000906", "SZ399006", "SH000688"],
+        "data_identity": None,
+        "error": None,
+    }
+
+    report = module.build_report(
+        preview,
+        config,
+        index_result,
+        generated_at="2026-08-08T15:00:00+08:00",
+        reproducibility={},
+    )
+
+    assert report["benchmarks"]["available"] == []
+    assert report["benchmarks"]["missing"] == list(module.INDEX_NAMES)
+    assert report["performance"]["comparators"]["SH000300"]["status"] == (
+        "unavailable"
+    )
+    assert report["stability"]["market_regime_attribution"]["reason"] == (
+        "SH000300 benchmark has no overlapping dates"
+    )
+    assert report["stability"]["market_regime_comparison"]["reason"] == (
+        "SH000300 benchmark has no overlapping dates"
+    )
+
+
 def test_html_report_has_inline_charts_and_preview_warning() -> None:
     module = load_module()
+    strategy_name = "创业板ETF-纳指ETF-红利低波ETF 20日防守轮动交易策略"
     report = {
         "status": "research_preview",
         "summary": {
@@ -237,13 +353,16 @@ def test_html_report_has_inline_charts_and_preview_warning() -> None:
             "data_end": "2026-08-06",
         },
         "strategy": {
-            "name": "三ETF防守轮动",
+            "name": strategy_name,
             "symbols": list(LOCKED_SYMBOLS),
             "commission_bps_each_side": 0.5,
             "base_slippage_bps_each_side": 0.0,
         },
         "performance": {
             "primary_metrics": {
+                "periods": 1800,
+                "start_date": "2019-01-18",
+                "end_date": "2026-08-04",
                 "annualized_return": 0.12,
                 "total_return": 0.8,
                 "max_drawdown": -0.2,
@@ -312,5 +431,65 @@ def test_html_report_has_inline_charts_and_preview_warning() -> None:
     assert "分阶段表现" in html
     assert "成本压力" in html
     assert "持仓行为" in html
+    assert html.count(strategy_name) >= 4
+    assert "三 ETF 策略" not in html
+    assert "three_etf_defensive</td>" not in html
+    assert "2019-01-18 至 2026-08-04" in html
     assert "原两ETF精确旧规则" in html
     assert "沪深300" in html
+
+
+def test_line_svg_wraps_large_legend_inside_viewbox() -> None:
+    module = load_module()
+    series = tuple(
+        (f"series_{index}", f"比较对象{index}", "#2563eb")
+        for index in range(11)
+    )
+    rows = [
+        {"date": "2026-08-03", **{key: 1.0 for key, _, _ in series}},
+        {"date": "2026-08-04", **{key: 1.1 for key, _, _ in series}},
+    ]
+
+    svg = module._line_svg(rows, title="多基准图", series=series)
+
+    match = re.search(r'viewBox="0 0 1000 (\d+)"', svg)
+    assert match is not None
+    viewbox_height = int(match.group(1))
+    assert viewbox_height > 300
+    assert 'data-legend-row="2"' in svg
+    legend_elements = re.findall(
+        r'<(?:line|text)[^>]*data-legend-row="\d+"[^>]*>', svg
+    )
+    assert legend_elements
+    for element in legend_elements:
+        for attribute, value in re.findall(r'\b(x1|x2|x|y1|y2|y)="([0-9.]+)"', element):
+            coordinate = float(value)
+            limit = 1000 if attribute.startswith("x") else viewbox_height
+            assert 0 <= coordinate <= limit, element
+
+
+def test_html_report_keeps_missing_benchmark_as_unavailable_raw_comparison_row() -> None:
+    module = load_module()
+    report = {
+        "status": "research_preview",
+        "summary": {"primary_metrics": {}, "data_end": "2026-08-06"},
+        "performance": {
+            "primary_metrics": {},
+            "comparators": {
+                "three_etf_defensive": {"annualized_return": 0.1},
+                "two_etf_legacy_exact": {"annualized_return": 0.09},
+            },
+            "periods": {},
+        },
+        "strategy": {"symbols": [], "commission_bps_each_side": 0.5},
+        "stability": {"cost_stress": {}},
+        "holding_behavior": {},
+        "benchmarks": {"missing": ["SZ399006"]},
+        "chart_data": {"equity": [], "drawdown": [], "yearly_returns": []},
+        "reproducibility": {},
+    }
+
+    html = module.render_html(report)
+
+    assert "创业板指" in html
+    assert "数据不可用" in html
