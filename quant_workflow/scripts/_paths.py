@@ -191,6 +191,12 @@ def qlib_provider_uri(
     *,
     snapshot_override: str | Path | None = None,
 ) -> Path:
+    """Resolve the old physical ``.bin`` provider for compatibility only.
+
+    New code must use :func:`qlib_workflow_provider_uri`.  The separate
+    ``qlib_native_snapshot_uri`` name makes the remaining legacy call sites
+    explicit without changing the old snapshot contract.
+    """
     if provider in {"canonical", "raw"}:
         configured = snapshot_override or os.environ.get("QLIB_PROVIDER_URI")
         if configured:
@@ -215,6 +221,9 @@ def qlib_provider_uri(
 def _resolve_direct_qlib_descriptor(
     root_text: str,
     membership_text: str,
+    index_dataset_id: str = "cn_index_daily",
+    cleaning_mode: str = "canonical",
+    cleaning_plan_text: str = "",
 ) -> Path:
     from quant_workflow.quant_data_qlib_provider import (
         build_direct_provider_descriptor,
@@ -223,32 +232,58 @@ def _resolve_direct_qlib_descriptor(
     return build_direct_provider_descriptor(
         quant_data_root=Path(root_text),
         membership_path=Path(membership_text),
+        index_dataset_id=index_dataset_id,
+        cleaning_mode=cleaning_mode,
+        cleaning_plan_path=Path(cleaning_plan_text) if cleaning_plan_text else None,
     )
 
 
-def qlib_direct_provider_descriptor() -> Path:
+def qlib_direct_provider_descriptor(provider: str = "canonical") -> Path:
     """Return the metadata-only Provider descriptor for the current qfq snapshot."""
 
+    provider = provider.strip().lower()
+    if provider not in {"canonical", "cleaned"}:
+        raise ValueError(f"Unknown direct Qlib provider: {provider}")
+    if os.environ.get("QLIB_PROVIDER_URI") or os.environ.get("QLIB_CLEANED_PROVIDER_URI"):
+        raise RuntimeError(
+            "legacy compatibility providers are rejected; remove QLIB_PROVIDER_URI/"
+            "QLIB_CLEANED_PROVIDER_URI and use the governed direct Provider"
+        )
     root = quant_data_root().expanduser().resolve()
     membership = _env_path(
         "QLIB_DIRECT_MEMBERSHIP_PATH",
         root / "reference" / "pit_csi800" / "membership_intervals.parquet",
     ).expanduser()
-    return _resolve_direct_qlib_descriptor(str(root), str(membership))
+    plan = _env_path(
+        "QLIB_DIRECT_CLEANING_PLAN_PATH",
+        root / "reference" / "qlib_cleaning" / "CLEANING_PLAN.json",
+    ).expanduser()
+    return _resolve_direct_qlib_descriptor(
+        str(root),
+        str(membership),
+        "cn_index_daily",
+        provider,
+        str(plan) if provider == "cleaned" else "",
+    )
 
 
-def qlib_direct_provider_uri() -> Path:
+def qlib_direct_provider_uri(provider: str = "canonical") -> Path:
     """Return Qlib's required URI directory without storing market-data bins."""
 
-    return qlib_direct_provider_descriptor().parent
+    return qlib_direct_provider_descriptor(provider).parent
 
 
-def init_qlib_direct(*, kernels: int | None = None, **overrides) -> Path:
+def init_qlib_direct(
+    *,
+    provider: str = "canonical",
+    kernels: int | None = None,
+    **overrides,
+) -> Path:
     """Initialize Qlib against the frozen quant_data Parquet snapshot."""
 
     from quant_workflow.quant_data_qlib_provider import init_qlib_from_quant_data
 
-    descriptor = qlib_direct_provider_descriptor()
+    descriptor = qlib_direct_provider_descriptor(provider)
     init_qlib_from_quant_data(
         descriptor_path=descriptor,
         quant_data_root=quant_data_root(),
@@ -256,6 +291,159 @@ def init_qlib_direct(*, kernels: int | None = None, **overrides) -> Path:
         **overrides,
     )
     return descriptor
+
+
+def qlib_workflow_provider_descriptor(provider: str = "canonical") -> Path:
+    """Return the formal direct Provider descriptor used by runtime workflows."""
+
+    return qlib_direct_provider_descriptor(provider)
+
+
+def qlib_workflow_provider_uri(provider: str = "canonical") -> Path:
+    """Return the formal direct Provider URI used by runtime workflows."""
+
+    return qlib_direct_provider_uri(provider)
+
+
+def _direct_descriptor_from_uri(provider_uri: str | Path) -> Path | None:
+    candidate = Path(provider_uri).expanduser()
+    if candidate.name == "PROVIDER_DESCRIPTOR.json":
+        return candidate
+    descriptor = candidate / "PROVIDER_DESCRIPTOR.json"
+    return descriptor if descriptor.is_file() else None
+
+
+def qlib_workflow_init_config(
+    *,
+    provider: str = "canonical",
+    provider_uri: str | Path | None = None,
+    kernels: int | None = None,
+) -> dict:
+    """Return a YAML-safe Qlib config for the formal direct Provider."""
+
+    from quant_workflow.quant_data_qlib_provider import qlib_direct_init_config
+
+    descriptor = (
+        _direct_descriptor_from_uri(provider_uri)
+        if provider_uri is not None
+        else qlib_workflow_provider_descriptor(provider)
+    )
+    if descriptor is None:
+        raise RuntimeError(
+            "formal Qlib workflow requires a direct Provider descriptor; "
+            "the old physical .bin Provider is compatibility-only"
+        )
+    return qlib_direct_init_config(
+        descriptor_path=descriptor,
+        quant_data_root=quant_data_root(),
+        kernels=kernels,
+    )
+
+
+def init_qlib_workflow(
+    *,
+    provider: str = "canonical",
+    provider_uri: str | Path | None = None,
+    kernels: int | None = None,
+    **overrides,
+) -> Path:
+    """Initialize Qlib for a workflow using the direct Parquet Provider."""
+
+    from quant_workflow.quant_data_qlib_provider import init_qlib_from_quant_data
+
+    descriptor = (
+        _direct_descriptor_from_uri(provider_uri)
+        if provider_uri is not None
+        else qlib_workflow_provider_descriptor(provider)
+    )
+    if descriptor is None:
+        raise RuntimeError(
+            "formal Qlib workflow requires a direct Provider descriptor; "
+            "the old physical .bin Provider is compatibility-only"
+        )
+    init_qlib_from_quant_data(
+        descriptor_path=descriptor,
+        quant_data_root=quant_data_root(),
+        kernels=kernels,
+        **overrides,
+    )
+    return descriptor
+
+
+def qlib_init_config_for_uri(
+    provider_uri: str | Path,
+    *,
+    provider: str = "canonical",
+    kernels: int | None = None,
+) -> dict:
+    """Build config for direct URI; explicit old paths remain compatibility-only."""
+
+    descriptor = _direct_descriptor_from_uri(provider_uri)
+    if descriptor is None:
+        legacy = Path(provider_uri).expanduser().resolve()
+        return {
+            "provider_uri": str(legacy),
+            "provider": "LocalProvider",
+            "region": "cn",
+        }
+    return qlib_workflow_init_config(
+        provider=provider,
+        provider_uri=descriptor,
+        kernels=kernels,
+    )
+
+
+def provider_calendar_days(provider_uri: str | Path) -> list[str]:
+    """Read the frozen calendar from a direct Provider or an old snapshot."""
+
+    descriptor = _direct_descriptor_from_uri(provider_uri)
+    if descriptor is not None:
+        import pandas as pd
+
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        context = _load_descriptor(descriptor, quant_data_root())
+        return [value.date().isoformat() for value in context.calendar]
+
+    calendar = Path(provider_uri) / "calendars" / "day.txt"
+    if not calendar.is_file():
+        raise FileNotFoundError(f"Provider calendar is missing: {calendar}")
+    return [
+        line.strip()
+        for line in calendar.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def provider_instrument_ranges(
+    provider_uri: str | Path,
+) -> dict[str, tuple[str, str]]:
+    """Read instrument coverage from direct metadata or a legacy snapshot."""
+
+    descriptor = _direct_descriptor_from_uri(provider_uri)
+    if descriptor is not None:
+        import pandas as pd
+
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        context = _load_descriptor(descriptor, quant_data_root())
+        return {
+            str(row.symbol): (
+                pd.Timestamp(row.first_date).date().isoformat(),
+                pd.Timestamp(row.last_date).date().isoformat(),
+            )
+            for row in context.file_index.itertuples(index=False)
+        }
+
+    all_path = Path(provider_uri) / "instruments" / "all.txt"
+    if not all_path.is_file():
+        raise FileNotFoundError(f"Provider instruments file is missing: {all_path}")
+    ranges: dict[str, tuple[str, str]] = {}
+    for line in all_path.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            ranges[parts[0].upper()] = (parts[1], parts[2])
+    return ranges
 
 
 def qlib_native_snapshot_uri(

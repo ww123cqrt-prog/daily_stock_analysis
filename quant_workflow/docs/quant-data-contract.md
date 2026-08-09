@@ -25,9 +25,10 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 | 统一 ETF 日线 (`cn_etf_daily`) | `canonical/ready` | 一个不可变快照同时保存腾讯同源 raw/qfq、分段复权依据和公司行为；读取方按所需价格口径解析 |
 | A 股 Baostock raw (`ashare_daily_raw`) | `canonical/ready` | 保存完整 raw 行情、来源、逐文件哈希和公司行为记录 |
 | A 股 Baostock qfq (`ashare_daily_qfq`) | `canonical/ready` | 使用 Baostock `foreAdjustFactor` 本地计算，保存完整因子并用同源 qfq 核验 |
-| Qlib Parquet 直接适配器 | `ready` | 直接读取 `ashare_daily_qfq` 的冻结快照，只生成约几十 KB 的日历和描述符，不再复制全市场 `.bin` 行情 |
-| 物理 Qlib v2 (`qlib_ashare_v2`) | 迁移期兼容 | 现有约 487 MB 快照暂留给尚未迁移的调用方、指数证据和回滚；新适配器不依赖其中的股票行情 |
-| 物理 cleaned Qlib v2 (`qlib_ashare_cleaned_v2`) | 迁移期兼容 | cleaned 语义尚未改成直接读取路径，不能在下游切换完成前删除或冒充已迁移 |
+| Qlib Parquet 直接适配器 | `canonical/ready` | 正式运行入口，直接读取 `ashare_daily_qfq` 和 `cn_index_daily` 的冻结快照，只生成约几十 KB 的日历、股票池副本和描述符，不复制全市场 `.bin` 行情 |
+| cleaned Qlib 直接适配器 | `canonical/ready` | 与 canonical 使用同一份 qfq Parquet，通过冻结清洗计划在读取时屏蔽异常，不生成第二份行情数据 |
+| 物理 Qlib v2 (`qlib_ashare_v2`) | `legacy/audit` | 旧 `.bin` 快照保留作兼容、审计和回滚；不再是训练、预测、回测或质量报告的默认输入 |
+| 物理 cleaned Qlib v2 (`qlib_ashare_cleaned_v2`) | `legacy/audit` | 旧 cleaned `.bin` 快照保留作兼容、审计和回滚；不再是正式 cleaned Provider |
 | 旧 JQData/东方财富/AkShare 来源目录 | `audit/legacy_unknown` | 仅审计，不再直接合并生成正式输出 |
 | V1 固定路径 merged/cleaned/Qlib | `legacy/ready` 兼容输出 | 仅供尚未迁移的旧程序和回滚，不是 DSA 正式输入 |
 | 带 `_old` 后缀的 merged/cleaned/Qlib | `audit/legacy_unknown` | 迁移前旧数据，只用于回滚和审计 |
@@ -45,7 +46,7 @@ parquet/ashare_1d/ashare_daily_qfq/snapshots/<snapshot_id>/
 runtime/qlib_direct/providers/ashare_daily_qfq/<snapshot_id>/<membership_snapshot_hash>/
 ```
 
-尚未迁移的旧程序可以继续读取原路径：
+需要回放旧格式的兼容工具可以继续读取原路径，但正式 DSA 运行不读取这些路径：
 
 ```text
 parquet/ashare_1d/merged_baostock_jqdata/
@@ -54,7 +55,7 @@ qlib/cn_data_baostock_jqdata/
 qlib/cn_data_baostock_jqdata_cleaned/
 ```
 
-这些固定路径由 `publish_v2_compatibility.py` 从同一个 `ashare_daily_qfq` 快照成组生成。DSA canonical 和 cleaned 训练、预测、回测、交易日历及质量检查都不再读取它们，而是分别通过根清单解析 `qlib_ashare_v2` 和 `qlib_ashare_cleaned_v2`。兼容 Parquet 保持六位文件名、V1 列顺序和 `datetime64[ns]`；价格已经前复权，因此对外 `factor=1.0`。真实逐日因子只保存在 V2 `factors/`。兼容刷新是正式原生发布成功后的旧系统维护；它失败时记录警告，不撤销原生 V2 指针。
+这些固定路径由 `publish_v2_compatibility.py` 从同一个 `ashare_daily_qfq` 快照成组生成，只服务仍需旧格式的显式兼容工具。DSA canonical 和 cleaned 训练、预测、回测、交易日历及质量检查都直接使用 `runtime/qlib_direct/providers/.../PROVIDER_DESCRIPTOR.json`。兼容 Parquet 保持六位文件名、V1 列顺序和 `datetime64[ns]`；价格已经前复权，因此对外 `factor=1.0`。真实逐日因子只保存在 A 股正式 qfq 快照。兼容刷新不是正式数据发布的一部分。
 
 ## 清单结构
 
@@ -176,7 +177,7 @@ Agent通过指向上述目录的本地技能链接发现它们，不维护第二
 - qfq 增量更新先检查历史锚点；供应商重算历史尺度时整只股票全历史刷新；锚点无法核验时不更新该股票。
 - `merge_to_qlib.py` 的 qfq 模式只能为每只股票选一个完整供应商，禁止跨供应商按日期拼接；只有 raw 模式允许整行补缺，并记录 `source_id`。
 
-正式入口已经切换为 `ashare_daily_raw`、`ashare_daily_qfq` 和 `qlib_ashare_v2`。后续更新必须继续生成完整来源 bundle，核对 raw、`query_adjust_factor`、同源 qfq 证据和旧数据价格路径，再以不可变快照成组发布；任一证据失败时旧正式指针保持不变。其他供应商只有完成同等级 raw、因子和公司行为迁移后才能进入正式入口，禁止把不同供应商已经复权的价格直接拼接。
+正式数据入口是 `ashare_daily_raw`、`ashare_daily_qfq`、`cn_index_daily` 和 direct Qlib Provider 描述符。后续更新必须继续生成完整来源 bundle，核对 raw、`query_adjust_factor`、同源 qfq 证据和旧数据价格路径，再以不可变快照成组发布；任一证据失败时旧正式指针保持不变。其他供应商只有完成同等级 raw、因子和公司行为迁移后才能进入正式入口，禁止把不同供应商已经复权的价格直接拼接。每日自动更新当前按用户要求暂停，恢复前不得启动下载或切换 Provider。
 
 ### A 股 v2 Baostock 事务
 
@@ -212,7 +213,7 @@ python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir <verified-bundle>
 ```
 
-任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。完整更新链路持有 `runtime/locks/ashare_v2_update.lock` 单实例锁，第二个并发更新会在改写任何正式指针前退出。第一次发布前，命令把根清单和四个旧 `LATEST.json` 的原始内容持久化到 `runtime/transactions/ashare_v2_update.json` 并执行 `fsync`。每个 staging 快照发布时，先对全部文件和子目录执行 `fsync`，再原子 rename，并同步 staging 与正式 `snapshots/` 目录；只有这些步骤成功后才写 `LATEST.json` 和根清单。raw、qfq、canonical Qlib 和 cleaned Qlib 都通过校验后才删除该事务记录并正式提交；普通异常会立即恢复旧指针，进程被强制结束或机器断电时，下一次更新会在持有更新锁和发布锁后先自动恢复，再开始新的发布。事务记录缺失字段、内容哈希不符或无法读取时直接阻断更新，不能猜测旧状态。恢复结果写入 `runtime/status/quant_data_update_latest.json`，状态为 `rolled_back` 或 `recovered_interrupted_update`。已经完成校验但失去正式指针的不可变快照可以保留作审计，它们不会被 `resolve` 选中。默认更新到这里结束，不改四套旧固定路径。只有显式传入 `--refresh-legacy-compatibility` 才会在原生链成功后维护兼容输出；该可选步骤失败只写 `completed_with_legacy_warning`，不能撤销有效的原生快照。回滚本身失败则明确写 `rollback_failed`，并保留事务记录供下次恢复。
+任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。完整更新链路持有 `runtime/locks/ashare_v2_update.lock` 单实例锁，第二个并发更新会在改写任何正式指针前退出。第一次发布前，命令把根清单以及 raw、qfq 两个正式 `LATEST.json` 的原始内容持久化到 `runtime/transactions/ashare_v2_update.json` 并执行 `fsync`。每个 staging 快照发布时，先对全部文件和子目录执行 `fsync`，再原子 rename，并同步 staging 与正式 `snapshots/` 目录；只有这些步骤成功后才写 `LATEST.json` 和根清单。raw、qfq 发布完成后，事务继续生成并校验 canonical、cleaned 两个 metadata-only Direct Provider 描述符；两者都成功才删除事务记录并正式提交。普通异常会立即恢复旧指针，进程被强制结束或机器断电时，下一次更新会在持有更新锁和发布锁后先自动恢复，再开始新的发布。事务记录缺失字段、内容哈希不符或无法读取时直接阻断更新，不能猜测旧状态。恢复结果写入 `runtime/status/quant_data_update_latest.json`，状态为 `rolled_back` 或 `recovered_interrupted_update`。已经完成校验但失去正式指针的不可变快照可以保留作审计，它们不会被 `resolve` 选中。默认更新到这里结束，不改旧固定路径或物理 `.bin` 数据。只有显式传入 `--refresh-legacy-compatibility` 才会在正式链成功后维护兼容输出；该可选步骤失败只写 `completed_with_legacy_warning`，不能撤销有效的原生快照。回滚本身失败则明确写 `rollback_failed`，并保留事务记录供下次恢复。
 
 ## Qlib 直接适配层
 
@@ -226,26 +227,36 @@ Qlib 的模型、Alpha158 表达式、训练、策略和回测逻辑不变。`qu
 python quant_workflow/scripts/build_qlib_direct_provider.py
 ```
 
+正式五指数增量更新使用：
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py update cn_index_daily --through YYYY-MM-DD
+```
+
+该命令只请求 `SH000300`、`SH000905`、`SH000906`、`SZ399006` 和 `SH000688`，按 XSHG 交易日解释 `--through`，校验七日重叠后原子发布 `cn_index_daily`；不会下载股票，也不会改旧 `.bin`。`update_qlib_index_benchmarks.py` 只保留给明确指定的旧物理 Provider 回放，不是正式更新入口。
+
 该命令解析当前 `ashare_daily_qfq`，写入：
 
 ```text
-runtime/qlib_direct/providers/ashare_daily_qfq/<snapshot_id>/<membership_snapshot_hash>/
-  CALENDAR.parquet
-  MEMBERSHIP_INTERVALS.parquet
-  PROVIDER_DESCRIPTOR.json
+runtime/qlib_direct/providers/ashare_daily_qfq/
+  <stock_snapshot_id>/<membership_snapshot_hash>/<index_snapshot_identity>/<mode>/
+    CALENDAR.parquet
+    MEMBERSHIP_INTERVALS.parquet
+    CLEANING_PLAN.json             # 仅 cleaned 模式
+    PROVIDER_DESCRIPTOR.json
 ```
 
-这里没有 `features/`，也没有 `.bin` 行情。当前正式实测目录约 92 KB；作为对照，保留的单份物理 Qlib v2 股票快照约 487 MB。前复权价格已经在 `ashare_daily_qfq` 中完成，因此 Provider 对 Qlib 暴露的 `$factor` 在有行情的日期为 `1.0`，不会再次复权；无行情日期保持 `NaN`，不会向前填充。
+这里没有 `features/`，也没有 `.bin` 行情。当前 canonical 正式描述符目录实测约 92 KB，全部 Direct Provider 元数据约 660 KB；作为对照，保留的物理 `qlib/cn_data_ashare_v2` 目录约 5.2 GB。前复权价格已经在 `ashare_daily_qfq` 中完成，因此 Provider 对 Qlib 暴露的 `$factor` 在有行情的日期为 `1.0`，不会再次复权；无行情日期保持 `NaN`，不会向前填充。
 
 描述符记录行情快照 ID、内容哈希、文件索引哈希、股票池快照哈希和适配器版本，并把股票池区间复制为一份很小的冻结证据。一个训练进程启动后只读该描述符锁定的行情与股票池，即使 `LATEST.json` 或正式股票池随后更新，也不会切到新数据。每只股票第一次读取时会核对其 Parquet 哈希。已有描述符再次启动只做快速身份核对；完整 5516 只股票验证只发生在新行情快照第一次生成描述符时。
 
-真实验证已覆盖基础字段、滚动表达式、两进程读取和 Alpha158 的 158 个因子。对 3 只股票、8 个字段/表达式的对照结果与同源旧 `.bin` 完全一致。
+真实验证已覆盖基础字段、滚动表达式、两进程读取和 Alpha158 的 158 个因子。对 3 只股票、8 个字段/表达式的对照结果与同源旧 `.bin` 完全一致；当前正式 direct smoke 按每只证券自身的有效行情日期抽取最多 5 个历史点，覆盖 5 个指数的 `$open/$close` 和个股的 `$close/$volume/$factor`，任一必需字段为空都判定失败。
 
-当前迁移边界必须说清：直接适配器已经可用，但现有 canonical/cleaned 训练入口尚未全部改用它；独立的五指数正式 Parquet 数据集和 cleaned 直接语义也仍需接线。因此旧 `qlib_ashare_v2`、`qlib_ashare_cleaned_v2` 暂时只保留作迁移兼容、指数证据和回滚，不能现在删除。后续调用方应使用 `_paths.init_qlib_direct()`，而不是把描述符目录交给普通 `qlib.init(provider_uri=...)`；后者不会自动加载自定义 Provider。
+当前迁移已经完成到正式运行入口：canonical/cleaned 训练、预测、回测、交易日历和质量报告都通过 `_paths.init_qlib_workflow()` 读取 direct Provider；五个正式指数来自 `cn_index_daily`，不是旧 `.bin`。旧 `qlib_ashare_v2`、`qlib_ashare_cleaned_v2` 只保留作兼容、审计和回滚，不能被默认解析。清洗模式不是另一份行情数据库，而是同一份 qfq Parquet 加一个哈希锁定的读取规则。后续调用方必须使用 `_paths.init_qlib_workflow()`，不能把描述符目录交给普通 `qlib.init(provider_uri=...)`；普通初始化不会自动加载自定义 Provider。
 
 ### 兼容输出退役边界
 
-本轮不删除兼容输出。清单将这些输出登记为 `role: legacy` 和 `lifecycle: compatibility_output`；`status: ready` 只表示旧程序仍可读取，不代表它们是正式主入口。以后只有在生产代码不再引用旧路径、训练/预测/回测均有原生实跑证据、CatDesk 等调用方已迁移或明确保留 cleaned 需求，并获得用户单独授权后，才能提出删除计划。生产回滚只能让 `QLIB_PROVIDER_URI` 或 `QLIB_CLEANED_PROVIDER_URI` 固定到对应 `snapshots/` 下经过完整校验的原生 V2 快照；旧兼容目录只能通过显式兼容工具读取，不能重新成为 DSA 的训练、预测或回测入口。不得改写或删除原生快照和 `_old` 审计数据。
+本轮不删除旧 `.bin` 数据。清单将这些输出登记为 `role: legacy` 和 `lifecycle: compatibility_output`；`status: ready` 只表示旧程序仍可读取，不代表它们是正式主入口。正式代码不再默认引用这些目录；只有 `build_qlib_v2.py`、`build_cleaned_qlib_v2.py`、`compare_native_qlib_benchmarks.py` 等明确标注的兼容/审计工具可以读取或生成它们。生产回滚只能在人工明确指定并通过完整校验后使用旧原生快照；不能把旧兼容目录重新设为 DSA 的训练、预测或回测入口。不得改写或删除原生 Parquet 快照和 `_old` 审计数据。
 
 ## 失败规则
 

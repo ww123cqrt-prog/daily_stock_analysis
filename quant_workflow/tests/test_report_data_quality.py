@@ -80,7 +80,69 @@ def write_instrument_features(provider: Path, symbol: str) -> None:
         )
 
 
+def write_direct_descriptor(
+    provider: Path,
+    *,
+    cleaning_mode: str,
+    stock_snapshot_id: str = "ashare-snapshot",
+    index_snapshot_id: str = "index-snapshot",
+) -> Path:
+    provider.mkdir(parents=True, exist_ok=True)
+    descriptor = provider / "PROVIDER_DESCRIPTOR.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "dataset": {
+                    "dataset_id": "ashare_daily_qfq",
+                    "snapshot_id": stock_snapshot_id,
+                    "manifest_sha256": "a" * 64,
+                    "content_sha256": "b" * 64,
+                },
+                "index_dataset": {
+                    "dataset_id": "cn_index_daily",
+                    "snapshot_id": index_snapshot_id,
+                    "manifest_sha256": "c" * 64,
+                    "content_sha256": "d" * 64,
+                },
+                "cleaning": {"mode": cleaning_mode},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return descriptor
+
+
 class ReportDataQualityTest(unittest.TestCase):
+    def test_default_quality_report_fails_closed_when_direct_provider_is_unavailable(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ashare_snapshot = root / "ashare"
+            (ashare_snapshot / "bars").mkdir(parents=True)
+            resolution = SimpleNamespace(snapshot_path=ashare_snapshot)
+            resolved_ids: list[str] = []
+
+            def resolve_only_formal_bars(dataset_id, **_kwargs):
+                resolved_ids.append(dataset_id)
+                if dataset_id == "ashare_daily_qfq":
+                    return resolution
+                self.fail(f"quality report must not fall back to {dataset_id}")
+
+            with (
+                patch.object(module, "QUANT_DATA", root),
+                patch.object(module, "resolve_dataset", side_effect=resolve_only_formal_bars),
+                patch.object(
+                    module,
+                    "qlib_workflow_provider_descriptor",
+                    side_effect=RuntimeError("direct Provider unavailable"),
+                ),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "direct Provider unavailable"):
+                    module.main(["--out-dir", str(root / "reports")])
+
+        self.assertEqual(resolved_ids, ["ashare_daily_qfq"])
+
     def test_lowered_training_thresholds_are_not_authoritative(self):
         module = load_module()
 
@@ -195,13 +257,25 @@ class ReportDataQualityTest(unittest.TestCase):
             ashare_snapshot = root / "ashare-snapshot"
             canonical_snapshot = root / "canonical-snapshot"
             cleaned_snapshot = root / "cleaned-snapshot"
+            index_snapshot = root / "index-snapshot"
             for snapshot in (
                 ashare_snapshot,
                 canonical_snapshot,
                 cleaned_snapshot,
+                index_snapshot,
             ):
                 snapshot.mkdir(parents=True)
                 (snapshot / "stable.bin").write_bytes(b"stable")
+            descriptors = {
+                "canonical": write_direct_descriptor(
+                    canonical_snapshot,
+                    cleaning_mode="canonical",
+                ),
+                "cleaned": write_direct_descriptor(
+                    cleaned_snapshot,
+                    cleaning_mode="cleaned",
+                ),
+            }
             identities = {
                 "ashare_daily_qfq": SimpleNamespace(
                     dataset_id="ashare_daily_qfq",
@@ -228,6 +302,16 @@ class ReportDataQualityTest(unittest.TestCase):
                         "snapshot_id": "cleaned-snapshot",
                         "snapshot_manifest_sha256": "e" * 64,
                         "content_sha256": "f" * 64,
+                    },
+                ),
+                "cn_index_daily": SimpleNamespace(
+                    dataset_id="cn_index_daily",
+                    snapshot_path=index_snapshot,
+                    catalog_entry={
+                        "snapshot_id": "index-snapshot",
+                        "snapshot_manifest_sha256": "c" * 64,
+                        "content_sha256": "d" * 64,
+                        "price_basis": "derived",
                     },
                 ),
             }
@@ -289,6 +373,12 @@ class ReportDataQualityTest(unittest.TestCase):
                     "resolve_dataset",
                     side_effect=lambda dataset_id, **_kwargs: identities[dataset_id],
                 ),
+                patch.object(module, "QUANT_DATA", root),
+                patch.object(
+                    module,
+                    "qlib_workflow_provider_descriptor",
+                    side_effect=lambda provider: descriptors[provider],
+                ),
                 patch.object(
                     module,
                     "source_stats",
@@ -326,7 +416,11 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertFalse(quality["provider_quality"]["cleaned"]["trainable"])
         self.assertEqual(
             quality["provider_quality"]["cleaned"]["dataset_id"],
-            "qlib_ashare_cleaned_v2",
+            "ashare_daily_qfq",
+        )
+        self.assertEqual(
+            quality["provider_quality"]["cleaned"]["provider_contract"],
+            "direct_parquet_v1",
         )
         self.assertEqual(
             quality["provider_quality"]["cleaned"]["calendar_days"], 251
@@ -345,13 +439,25 @@ class ReportDataQualityTest(unittest.TestCase):
             ashare_snapshot = root / "ashare-snapshot"
             canonical_snapshot = root / "canonical-snapshot"
             cleaned_snapshot = root / "cleaned-snapshot"
+            index_snapshot = root / "index-snapshot"
             for snapshot in (
                 ashare_snapshot,
                 canonical_snapshot,
                 cleaned_snapshot,
+                index_snapshot,
             ):
                 snapshot.mkdir(parents=True)
                 (snapshot / "initial.bin").write_bytes(b"initial")
+            descriptors = {
+                "canonical": write_direct_descriptor(
+                    canonical_snapshot,
+                    cleaning_mode="canonical",
+                ),
+                "cleaned": write_direct_descriptor(
+                    cleaned_snapshot,
+                    cleaning_mode="cleaned",
+                ),
+            }
 
             identities = {
                 "ashare_daily_qfq": SimpleNamespace(
@@ -379,6 +485,16 @@ class ReportDataQualityTest(unittest.TestCase):
                         "snapshot_id": "cleaned-snapshot",
                         "snapshot_manifest_sha256": "e" * 64,
                         "content_sha256": "f" * 64,
+                    },
+                ),
+                "cn_index_daily": SimpleNamespace(
+                    dataset_id="cn_index_daily",
+                    snapshot_path=index_snapshot,
+                    catalog_entry={
+                        "snapshot_id": "index-snapshot",
+                        "snapshot_manifest_sha256": "c" * 64,
+                        "content_sha256": "d" * 64,
+                        "price_basis": "derived",
                     },
                 ),
             }
@@ -418,7 +534,7 @@ class ReportDataQualityTest(unittest.TestCase):
             }
 
             def mutate_during_scan(*_args, **_kwargs):
-                (canonical_snapshot / "changed-during-scan.bin").write_bytes(b"changed")
+                (ashare_snapshot / "changed-during-scan.bin").write_bytes(b"changed")
                 return summary, pd.DataFrame()
 
             module.STOCK_LIST = root / "missing_stock_lists.json"
@@ -433,6 +549,12 @@ class ReportDataQualityTest(unittest.TestCase):
                     module,
                     "resolve_dataset",
                     side_effect=lambda dataset_id, **_kwargs: identities[dataset_id],
+                ),
+                patch.object(module, "QUANT_DATA", root),
+                patch.object(
+                    module,
+                    "qlib_workflow_provider_descriptor",
+                    side_effect=lambda provider: descriptors[provider],
                 ),
                 patch.object(
                     module,
@@ -486,13 +608,25 @@ class ReportDataQualityTest(unittest.TestCase):
             ashare_snapshot = root / "ashare-snapshot"
             canonical_snapshot = root / "canonical-snapshot"
             cleaned_snapshot = root / "cleaned-snapshot"
+            index_snapshot = root / "index-snapshot"
             for snapshot in (
                 ashare_snapshot,
                 canonical_snapshot,
                 cleaned_snapshot,
+                index_snapshot,
             ):
                 snapshot.mkdir(parents=True)
                 (snapshot / "initial.bin").write_bytes(b"initial")
+            descriptors = {
+                "canonical": write_direct_descriptor(
+                    canonical_snapshot,
+                    cleaning_mode="canonical",
+                ),
+                "cleaned": write_direct_descriptor(
+                    cleaned_snapshot,
+                    cleaning_mode="cleaned",
+                ),
+            }
 
             identities = {
                 "ashare_daily_qfq": SimpleNamespace(
@@ -522,22 +656,24 @@ class ReportDataQualityTest(unittest.TestCase):
                         "content_sha256": "f" * 64,
                     },
                 ),
+                "cn_index_daily": SimpleNamespace(
+                    dataset_id="cn_index_daily",
+                    snapshot_path=index_snapshot,
+                    catalog_entry={
+                        "snapshot_id": "index-snapshot",
+                        "snapshot_manifest_sha256": "c" * 64,
+                        "content_sha256": "d" * 64,
+                        "price_basis": "derived",
+                    },
+                ),
             }
             resolve_calls: dict[str, int] = {}
 
             def resolve_with_post_validation_mutation(dataset_id: str, **_kwargs):
                 resolve_calls[dataset_id] = resolve_calls.get(dataset_id, 0) + 1
-                if dataset_id == "qlib_ashare_v2" and resolve_calls[dataset_id] > 1:
+                if dataset_id == "ashare_daily_qfq" and resolve_calls[dataset_id] > 1:
                     raise module.DataContractError("content hash changed")
-                resolution = identities[dataset_id]
-                if (
-                    dataset_id == "qlib_ashare_cleaned_v2"
-                    and resolve_calls[dataset_id] == 1
-                ):
-                    (canonical_snapshot / "changed-after-resolution.bin").write_bytes(
-                        b"changed"
-                    )
-                return resolution
+                return identities[dataset_id]
 
             summary = pd.DataFrame(
                 {
@@ -593,6 +729,12 @@ class ReportDataQualityTest(unittest.TestCase):
                     "resolve_dataset",
                     side_effect=resolve_with_post_validation_mutation,
                 ),
+                patch.object(module, "QUANT_DATA", root),
+                patch.object(
+                    module,
+                    "qlib_workflow_provider_descriptor",
+                    side_effect=lambda provider: descriptors[provider],
+                ),
                 patch.object(
                     module,
                     "source_stats",
@@ -630,7 +772,7 @@ class ReportDataQualityTest(unittest.TestCase):
             _pointer, quality, _evidence_bytes = load_quality_publication(out_dir)
 
         self.assertEqual(result, 0)
-        self.assertGreater(resolve_calls["qlib_ashare_v2"], 1)
+        self.assertGreater(resolve_calls["ashare_daily_qfq"], 1)
         self.assertEqual(quality["data_contract"]["status"], "unverified")
         self.assertFalse(quality["data_contract"]["snapshot_state"]["stable"])
         self.assertFalse(quality["trainable"])
@@ -671,6 +813,56 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertFalse(stats["benchmark_complete"])
         self.assertFalse(ready)
         self.assertIn("benchmark", detail["summary"].lower())
+
+    def test_fifth_formal_index_failure_is_reported_as_a_blocker(self):
+        module = load_module()
+        details = {
+            symbol: {
+                "complete": symbol != "SH000688",
+                "missing_fields": [] if symbol != "SH000688" else ["close"],
+                "missing_days": 0,
+                "invalid_ohlc_dates": [],
+            }
+            for symbol in (
+                "SH000300",
+                "SH000905",
+                "SH000906",
+                "SZ399006",
+                "SH000688",
+            )
+        }
+        ready, result = module.build_training_readiness(
+            {
+                "calendar_valid": True,
+                "invalid_calendar_entries": 0,
+                "instrument_records_valid": True,
+                "invalid_instrument_records": 0,
+                "calendar_days": 252,
+                "instruments": 100,
+                "feature_dirs": 100,
+                "instrument_feature_dirs": 100,
+                "missing_instrument_feature_dirs": 0,
+                "complete_instrument_feature_dirs": 100,
+                "incomplete_instrument_feature_dirs": 0,
+                "missing_instrument_feature_files": 0,
+                "invalid_instrument_feature_files": 0,
+                "misaligned_instrument_feature_dirs": 0,
+                "benchmark_complete": False,
+                "benchmark_details": details,
+            },
+            {f"{index:06d}" for index in range(100)},
+            {
+                "duplicate_dates": 0,
+                "null_dates": 0,
+                "missing_columns": 0,
+                "bad_ohlc_rows": 0,
+            },
+        )
+
+        self.assertFalse(ready)
+        self.assertTrue(
+            any("SH000688" in reason for reason in result["failure_reasons"])
+        )
 
     def test_missing_instrument_feature_directories_block_training(self):
         module = load_module()
@@ -1238,6 +1430,7 @@ class ReportDataQualityTest(unittest.TestCase):
 
             status_path = module.write_research_status(
                 out_dir=out_dir,
+                provider_dir=out_dir / "test-provider",
                 source_rows=[
                     {
                         "name": "merged",
@@ -1278,6 +1471,7 @@ class ReportDataQualityTest(unittest.TestCase):
             out_dir = Path(temp_dir)
             status_path = module.write_research_status(
                 out_dir=out_dir,
+                provider_dir=out_dir / "test-provider",
                 source_rows=[
                     {
                         "name": "baostock",
@@ -1591,6 +1785,22 @@ class ReportDataQualityTest(unittest.TestCase):
                 "SH600000\t2026-07-17\t2026-07-20\n", encoding="utf-8"
             )
             write_benchmark_features(qlib_snapshot)
+            canonical_direct = root / "direct-canonical"
+            cleaned_direct = root / "direct-cleaned"
+            descriptors = {
+                "canonical": write_direct_descriptor(
+                    canonical_direct,
+                    cleaning_mode="canonical",
+                ),
+                "cleaned": write_direct_descriptor(
+                    cleaned_direct,
+                    cleaning_mode="cleaned",
+                ),
+            }
+            index_snapshot = root / "index-snapshot"
+            index_snapshot.mkdir()
+            (index_snapshot / "stable.parquet").write_bytes(b"stable")
+            provider_stats = module.qlib_provider_stats(qlib_snapshot)
             module.STOCK_LIST = root / "missing_stock_lists.json"
             module.EMPTY_CODES = root / "missing_empty_codes.json"
             module.TIMEOUT_CODES = root / "missing_timeout_codes.json"
@@ -1626,6 +1836,16 @@ class ReportDataQualityTest(unittest.TestCase):
                         "content_sha256": "f" * 64,
                     },
                 ),
+                "cn_index_daily": SimpleNamespace(
+                    dataset_id="cn_index_daily",
+                    snapshot_path=index_snapshot,
+                    catalog_entry={
+                        "snapshot_id": "index-snapshot",
+                        "snapshot_manifest_sha256": "c" * 64,
+                        "content_sha256": "d" * 64,
+                        "price_basis": "derived",
+                    },
+                ),
             }
 
             with (
@@ -1633,6 +1853,17 @@ class ReportDataQualityTest(unittest.TestCase):
                     module,
                     "resolve_dataset",
                     side_effect=lambda dataset_id, **_kwargs: identities[dataset_id],
+                ),
+                patch.object(module, "QUANT_DATA", root),
+                patch.object(
+                    module,
+                    "qlib_workflow_provider_descriptor",
+                    side_effect=lambda provider: descriptors[provider],
+                ),
+                patch.object(
+                    module,
+                    "qlib_provider_stats",
+                    return_value=provider_stats,
                 ),
                 patch.dict(os.environ, {}, clear=True),
             ):

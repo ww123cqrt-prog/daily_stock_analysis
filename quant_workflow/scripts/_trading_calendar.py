@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from _paths import qlib_provider_uri
+from _paths import provider_calendar_days, qlib_workflow_provider_uri
 
 
 QLIB_CALENDAR_SOURCE = "qlib_day_calendar"
@@ -50,17 +50,28 @@ class TradingCalendar:
 
 
 def load_trading_calendar(path: Path | None = None) -> TradingCalendar:
-    calendar_path = path or (qlib_provider_uri() / "calendars" / "day.txt")
+    provider_path = Path(path) if path is not None else qlib_workflow_provider_uri()
+    calendar_path = provider_path
     days: list[date] = []
-    if calendar_path.is_file():
-        for raw in calendar_path.read_text(encoding="utf-8").splitlines():
-            value = raw.strip()
-            if not value:
-                continue
-            try:
-                days.append(date.fromisoformat(value))
-            except ValueError:
-                continue
+    try:
+        if (
+            provider_path.name != "PROVIDER_DESCRIPTOR.json"
+            and (provider_path.is_file() or (path is not None and provider_path.suffix))
+        ):
+            raw_days = (
+                provider_path.read_text(encoding="utf-8").splitlines()
+                if provider_path.is_file()
+                else []
+            )
+        else:
+            raw_days = provider_calendar_days(provider_path)
+    except (FileNotFoundError, OSError, UnicodeError):
+        raw_days = []
+    for raw in raw_days:
+        try:
+            days.append(date.fromisoformat(raw))
+        except ValueError:
+            continue
     return TradingCalendar(tuple(sorted(set(days))), calendar_path)
 
 

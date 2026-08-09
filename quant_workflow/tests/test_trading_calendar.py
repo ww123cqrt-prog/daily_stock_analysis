@@ -8,6 +8,8 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 def load_module():
     path = SCRIPTS / "_trading_calendar.py"
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
     spec = importlib.util.spec_from_file_location("_trading_calendar_test", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -28,12 +30,12 @@ def test_default_calendar_uses_canonical_native_provider(tmp_path, monkeypatch):
         calls.append(provider_name)
         return provider
 
-    monkeypatch.setattr(module, "qlib_provider_uri", fake_provider_uri)
+    monkeypatch.setattr(module, "qlib_workflow_provider_uri", fake_provider_uri)
 
     result = module.load_trading_calendar()
 
     assert calls == ["canonical"]
-    assert result.path == calendar
+    assert result.path == provider
     assert [item.isoformat() for item in result.days] == [
         "2026-07-23",
         "2026-07-24",

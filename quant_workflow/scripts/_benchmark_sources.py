@@ -172,6 +172,7 @@ def download_eastmoney_benchmarks(
                 frame = frame[["open", "high", "low", "close", "volume"]]
                 frame.index = frame.index.astype(str)
                 frame = frame.sort_index()
+                frame.index.name = "date"
             result[symbol] = frame
     finally:
         session.close()
@@ -273,6 +274,7 @@ def download_tencent_benchmarks(
                 frame = frame[["open", "high", "low", "close", "volume"]]
                 frame.index = frame.index.astype(str)
                 frame = frame.sort_index()
+                frame.index.name = "date"
             result[symbol] = frame
     finally:
         session.close()

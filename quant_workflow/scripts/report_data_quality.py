@@ -24,7 +24,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import (  # noqa: E402
-    qlib_provider_uri,
+    qlib_workflow_provider_descriptor,
+    qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
     workflow_root,
@@ -121,31 +122,61 @@ def native_dataset_identity(resolved) -> dict[str, str]:
     }
 
 
+def direct_provider_identity(descriptor: Path, quant_data_root_path: Path) -> dict[str, str]:
+    payload = json.loads(Path(descriptor).read_text(encoding="utf-8"))
+    dataset = payload.get("dataset") or {}
+    index = payload.get("index_dataset") or {}
+    cleaning = payload.get("cleaning") or {}
+    descriptor = Path(descriptor).resolve()
+    root = Path(quant_data_root_path).resolve()
+    return {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": str(dataset.get("dataset_id") or ""),
+        "snapshot_id": str(dataset.get("snapshot_id") or ""),
+        "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
+        "content_sha256": str(dataset.get("content_sha256") or ""),
+        "descriptor_path": descriptor.relative_to(root).as_posix(),
+        "descriptor_sha256": hashlib.sha256(descriptor.read_bytes()).hexdigest(),
+        "cleaning_mode": str(cleaning.get("mode") or ""),
+        "index_dataset_id": str(index.get("dataset_id") or ""),
+        "index_snapshot_id": str(index.get("snapshot_id") or ""),
+        "index_content_sha256": str(index.get("content_sha256") or ""),
+        "index_manifest_sha256": str(index.get("manifest_sha256") or ""),
+    }
+
+
 def build_quality_data_contract(
     *,
     ashare_resolution,
     canonical_qlib_resolution,
     cleaned_qlib_resolution,
     has_path_override: bool,
+    canonical_qlib_identity: dict[str, str] | None = None,
+    cleaned_qlib_identity: dict[str, str] | None = None,
 ) -> dict:
     contract = {
         "status": "unverified" if has_path_override else "verified",
         "reason": (
-            "Explicit data path overrides are diagnostic only and are not proof of the current native V2 snapshot."
+            "Explicit data path overrides are diagnostic only and are not proof of the current formal Parquet/direct Provider snapshot."
             if has_path_override
-            else "Resolved from the current native V2 catalog and immutable LATEST pointers."
+            else "Resolved from the current formal Parquet snapshots and immutable LATEST pointers; Qlib reads them through the direct Provider descriptor."
         ),
     }
     if ashare_resolution is not None:
         contract["ashare_daily_qfq"] = native_dataset_identity(ashare_resolution)
 
     providers = {}
-    if canonical_qlib_resolution is not None:
+    if canonical_qlib_identity is not None:
+        providers["canonical"] = dict(canonical_qlib_identity)
+        contract["qlib_provider"] = providers["canonical"]
+    elif canonical_qlib_resolution is not None:
         providers["canonical"] = native_dataset_identity(
             canonical_qlib_resolution
         )
         contract["qlib_provider"] = providers["canonical"]
-    if cleaned_qlib_resolution is not None:
+    if cleaned_qlib_identity is not None:
+        providers["cleaned"] = dict(cleaned_qlib_identity)
+    elif cleaned_qlib_resolution is not None:
         providers["cleaned"] = native_dataset_identity(cleaned_qlib_resolution)
     if providers:
         contract["qlib_providers"] = providers
@@ -231,22 +262,22 @@ def bind_snapshot_state(
     data_contract["status"] = "unverified"
     if content_revalidation_status == "failed":
         data_contract["reason"] = (
-            "Native V2 snapshot content could not be revalidated after the "
+            "Formal Parquet/direct Provider snapshot content could not be revalidated after the "
             "data-quality scan."
         )
     elif fingerprint_failed:
         data_contract["reason"] = (
-            "Native V2 snapshot filesystem state could not be verified across the "
+            "Formal Parquet/direct Provider snapshot filesystem state could not be verified across the "
             "data-quality scan."
         )
     elif content_revalidation_status == "skipped_sampled":
         data_contract["reason"] = (
-            "Sampled quality scans skip the second full native snapshot content "
+            "Sampled quality scans skip the second full formal snapshot content "
             "revalidation; run a full quality scan before training."
         )
     else:
         data_contract["reason"] = (
-            "Native V2 snapshot filesystem state changed during the data-quality scan."
+            "Formal Parquet/direct Provider snapshot filesystem state changed during the data-quality scan."
         )
 
 
@@ -801,7 +832,14 @@ def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
 
 
 def qlib_provider_stats(provider_dir: Path | None = None) -> dict:
-    provider_dir = Path(provider_dir or qlib_provider_uri())
+    provider_dir = Path(provider_dir or qlib_workflow_provider_uri())
+    descriptor = (
+        provider_dir
+        if provider_dir.name == "PROVIDER_DESCRIPTOR.json"
+        else provider_dir / "PROVIDER_DESCRIPTOR.json"
+    )
+    if descriptor.is_file():
+        return direct_qlib_provider_stats(provider_dir)
     cal = provider_dir / "calendars" / "day.txt"
     inst = provider_dir / "instruments" / "all.txt"
     calendar_lines, calendar_issues = _read_qlib_calendar(cal)
@@ -942,6 +980,151 @@ def qlib_provider_stats(provider_dir: Path | None = None) -> dict:
     }
 
 
+def direct_qlib_provider_stats(provider_dir: Path) -> dict:
+    """Validate the metadata and frozen Parquet view used by the direct Provider.
+
+    Direct mode has no per-field ``.bin`` files.  The descriptor and its frozen
+    file indexes prove the storage identity; the existing full bar scan proves
+    row-level quality.  The returned keys intentionally match the old report
+    shape so the readiness rules remain shared.
+    """
+
+    from quant_workflow.quant_data_qlib_provider import (
+        _load_descriptor,
+        discover_quant_data_root,
+    )
+
+    provider_dir = Path(provider_dir)
+    descriptor = (
+        provider_dir
+        if provider_dir.name == "PROVIDER_DESCRIPTOR.json"
+        else provider_dir / "PROVIDER_DESCRIPTOR.json"
+    )
+    root = discover_quant_data_root(descriptor)
+    context = _load_descriptor(descriptor, root)
+    cleaning = context.cleaning
+    excluded = set(cleaning.get("plan", {}).get("excluded_symbols", []))
+    instrument_index = context.file_index[
+        ~context.file_index["symbol"].astype(str).isin(excluded)
+    ].copy()
+    calendar = [value.date().isoformat() for value in context.calendar]
+    instrument_names = set(instrument_index["symbol"].astype(str))
+    benchmark_stats = direct_benchmark_feature_stats(context, calendar)
+    complete = len(instrument_names)
+    return {
+        "calendar_valid": True,
+        "invalid_calendar_entries": 0,
+        "invalid_calendar_entry_sample": "",
+        "instrument_records_valid": True,
+        "invalid_instrument_records": 0,
+        "invalid_instrument_record_sample": "",
+        "calendar_days": len(calendar),
+        "calendar_start": calendar[0] if calendar else "",
+        "calendar_end": calendar[-1] if calendar else "",
+        "instruments": len(instrument_names),
+        "feature_dirs": complete,
+        "instrument_feature_dirs": complete,
+        "missing_instrument_feature_dirs": 0,
+        "missing_instrument_feature_sample": "",
+        "complete_instrument_feature_dirs": complete,
+        "incomplete_instrument_feature_dirs": 0,
+        "missing_instrument_feature_files": 0,
+        "missing_instrument_feature_file_sample": "",
+        "invalid_instrument_feature_files": 0,
+        "invalid_instrument_feature_file_sample": "",
+        "required_feature_min_coverage": MIN_REQUIRED_FEATURE_COVERAGE,
+        "minimum_valid_instrument_feature_coverage": 1.0,
+        "misaligned_instrument_feature_dirs": 0,
+        "misaligned_instrument_feature_dir_sample": "",
+        "benchmark_feature_dirs": (
+            len(context.index_file_index) if context.index_file_index is not None else 0
+        ),
+        "unexpected_extra_feature_dirs": 0,
+        "unexpected_extra_feature_sample": "",
+        "size_mb": file_size_mb(provider_dir),
+        **benchmark_stats,
+    }
+
+
+def direct_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
+    required = tuple(
+        context.descriptor.get("index_dataset", {}).get("required_symbols")
+        or BENCHMARK_SYMBOLS
+    )
+    details: dict[str, dict[str, Any]] = {}
+    first_observations: list[str] = []
+    total_missing_days = 0
+    direct_fields = ("open", "high", "low", "close", "volume")
+    index_frame = context.index_file_index
+    index_snapshot = context.index_snapshot_path
+    for symbol in required:
+        detail = {
+            "complete": False,
+            "first_observation": "",
+            "missing_days": 0,
+            "missing_fields": [],
+            "invalid_ohlc_dates": [],
+        }
+        row = None
+        if index_frame is not None:
+            matches = index_frame[index_frame["symbol"].astype(str) == symbol]
+            if len(matches) == 1:
+                row = matches.iloc[0]
+        if row is None or index_snapshot is None:
+            detail["missing_fields"] = list(direct_fields)
+            details[symbol] = detail
+            continue
+        path = index_snapshot / str(row["relative_path"])
+        try:
+            frame = pd.read_parquet(path)
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+            frame = frame.dropna(subset=["date"]).drop_duplicates("date").sort_values("date")
+        except Exception:
+            detail["missing_fields"] = list(direct_fields)
+            details[symbol] = detail
+            continue
+        if frame.empty:
+            detail["missing_fields"] = list(direct_fields)
+            details[symbol] = detail
+            continue
+        detail["first_observation"] = frame["date"].iloc[0].date().isoformat()
+        first_observations.append(detail["first_observation"])
+        missing_fields = [field for field in direct_fields if field not in frame.columns]
+        detail["missing_fields"] = missing_fields
+        if not missing_fields:
+            tolerance = np.maximum(
+                np.abs(frame["high"].to_numpy(dtype=float)),
+                np.abs(frame["low"].to_numpy(dtype=float)),
+            ) * QLIB_OHLC_RELATIVE_TOLERANCE + QLIB_OHLC_ABSOLUTE_TOLERANCE
+            high = frame["high"].to_numpy(dtype=float)
+            low = frame["low"].to_numpy(dtype=float)
+            open_values = frame["open"].to_numpy(dtype=float)
+            close = frame["close"].to_numpy(dtype=float)
+            invalid_mask = (
+                (high + tolerance < np.maximum(open_values, close))
+                | (low - tolerance > np.minimum(open_values, close))
+                | (low <= 0)
+                | (high <= 0)
+            )
+            detail["invalid_ohlc_dates"] = [
+                value.date().isoformat()
+                for value in frame.loc[invalid_mask, "date"].tolist()
+            ]
+            expected = pd.DatetimeIndex(pd.to_datetime(calendar)).normalize()
+            expected = expected[expected >= frame["date"].iloc[0]]
+            present = pd.DatetimeIndex(frame["date"])
+            detail["missing_days"] = int(len(expected.difference(present)))
+        detail["complete"] = not detail["missing_fields"] and not detail["invalid_ohlc_dates"] and detail["missing_days"] == 0
+        total_missing_days += detail["missing_days"]
+        details[symbol] = detail
+    return {
+        "benchmark_complete": bool(details) and all(item["complete"] for item in details.values()),
+        "benchmark_first_observation": min(first_observations) if first_observations else "",
+        "benchmark_missing_days": total_missing_days,
+        "benchmark_details": details,
+    }
+
+
 def validate_qlib_feature_binary(
     path: Path,
     *,
@@ -1036,7 +1219,10 @@ def build_training_readiness(
     if not qlib_stats.get("benchmark_complete", False):
         details = qlib_stats.get("benchmark_details") or {}
         benchmark_blockers: list[str] = []
-        for symbol in BENCHMARK_SYMBOLS:
+        benchmark_symbols = tuple(
+            dict.fromkeys([*BENCHMARK_SYMBOLS, *(str(symbol) for symbol in details)])
+        )
+        for symbol in benchmark_symbols:
             detail = details.get(symbol) or {}
             invalid_dates = list(detail.get("invalid_ohlc_dates") or [])
             if invalid_dates:
@@ -1071,7 +1257,7 @@ def build_training_readiness(
                 benchmark_blockers.append(f"{symbol} benchmark validation is incomplete")
         blockers.extend(
             benchmark_blockers
-            or ["SH000300/SH000905/SH000906 benchmark validation is incomplete"]
+            or [f"{'/'.join(benchmark_symbols)} benchmark validation is incomplete"]
         )
     instrument_feature_dirs = qlib_stats.get("instrument_feature_dirs")
     if not isinstance(instrument_feature_dirs, int) or isinstance(
@@ -1247,7 +1433,7 @@ def build_provider_quality_record(
                 "failure_reasons": failure_reasons,
             }
 
-    return {
+    record = {
         "provider": provider_key,
         "dataset_id": identity.get("dataset_id"),
         "snapshot_id": identity.get("snapshot_id"),
@@ -1320,6 +1506,19 @@ def build_provider_quality_record(
         ),
         "training_readiness": training_readiness,
     }
+    if identity.get("provider_contract") == "direct_parquet_v1":
+        for field in (
+            "provider_contract",
+            "descriptor_path",
+            "descriptor_sha256",
+            "cleaning_mode",
+            "index_dataset_id",
+            "index_snapshot_id",
+            "index_content_sha256",
+            "index_manifest_sha256",
+        ):
+            record[field] = identity.get(field)
+    return record
 
 
 def write_research_status(
@@ -1342,7 +1541,7 @@ def write_research_status(
     provider_quality: dict | None = None,
     status_filename: str = "research_status_latest.json",
 ) -> Path:
-    provider_dir = Path(provider_dir or qlib_provider_uri())
+    provider_dir = Path(provider_dir or qlib_workflow_provider_uri())
     trainable, training_readiness = build_training_readiness(
         qlib_stats=qlib_stats,
         merged_success=merged_success,
@@ -1362,7 +1561,7 @@ def write_research_status(
             training_readiness = {
                 "status": "blocked",
                 "summary": (
-                    "Data quality evidence is not bound to the current native V2 "
+                    "Data quality evidence is not bound to the current formal Parquet/direct Provider "
                     "snapshot; rerun without path overrides before training."
                 ),
             }
@@ -1516,23 +1715,28 @@ def main(argv: list[str] | None = None) -> int:
 
     qlib_resolution = None
     cleaned_qlib_resolution = None
+    direct_canonical_identity = None
+    direct_cleaned_identity = None
+    direct_index_resolution = None
     if configured_qlib_dir is not None:
         args.qlib_dir = Path(configured_qlib_dir)
     else:
-        qlib_resolution = resolve_dataset(
-            "qlib_ashare_v2",
-            quant_data_root=QUANT_DATA,
-            require_basis="qfq",
+        canonical_descriptor = qlib_workflow_provider_descriptor("canonical")
+        cleaned_descriptor = qlib_workflow_provider_descriptor("cleaned")
+        direct_canonical_identity = direct_provider_identity(
+            canonical_descriptor,
+            QUANT_DATA,
         )
-        args.qlib_dir = qlib_resolution.snapshot_path
-        try:
-            cleaned_qlib_resolution = resolve_dataset(
-                "qlib_ashare_cleaned_v2",
-                quant_data_root=QUANT_DATA,
-                require_basis="qfq",
-            )
-        except DataContractError:
-            cleaned_qlib_resolution = None
+        direct_cleaned_identity = direct_provider_identity(
+            cleaned_descriptor,
+            QUANT_DATA,
+        )
+        direct_index_resolution = resolve_dataset(
+            "cn_index_daily",
+            quant_data_root=QUANT_DATA,
+            require_basis="derived",
+        )
+        args.qlib_dir = canonical_descriptor.parent
 
     bars_source_name = "merged" if configured_legacy_dir else "ashare_daily_qfq"
     data_contract = build_quality_data_contract(
@@ -1540,11 +1744,14 @@ def main(argv: list[str] | None = None) -> int:
         canonical_qlib_resolution=qlib_resolution,
         cleaned_qlib_resolution=cleaned_qlib_resolution,
         has_path_override=has_path_override,
+        canonical_qlib_identity=direct_canonical_identity,
+        cleaned_qlib_identity=direct_cleaned_identity,
     )
     snapshot_resolutions = native_snapshot_resolutions(
         ashare_resolution,
         qlib_resolution,
         cleaned_qlib_resolution,
+        direct_index_resolution,
     )
     snapshot_state_before: dict[str, dict] = {}
     snapshot_fingerprint_failed = False
@@ -1597,9 +1804,11 @@ def main(argv: list[str] | None = None) -> int:
     qlib_stats_by_provider = {
         "canonical": qlib_provider_stats(args.qlib_dir),
     }
-    if cleaned_qlib_resolution is not None:
+    if cleaned_qlib_resolution is not None or direct_cleaned_identity is not None:
         qlib_stats_by_provider["cleaned"] = qlib_provider_stats(
             cleaned_qlib_resolution.snapshot_path
+            if cleaned_qlib_resolution is not None
+            else qlib_workflow_provider_descriptor("cleaned").parent
         )
     qlib_stats = qlib_stats_by_provider["canonical"]
     bs_success = load_source_index(BAOSTOCK_DIR)
@@ -1700,11 +1909,11 @@ def main(argv: list[str] | None = None) -> int:
     elif data_contract["status"] != "verified":
         verification_block_reason = (
             f"{data_contract['reason']} Rerun the full data quality report after "
-            "the native V2 snapshots are stable."
+            "the formal Parquet/direct Provider snapshots are stable."
         )
     else:
         verification_block_reason = (
-            "Data quality evidence is not bound to the current native V2 "
+            "Data quality evidence is not bound to the current formal Parquet/direct Provider "
             "snapshot; rerun without path overrides before training."
         )
     provider_identities = data_contract.get("qlib_providers") or {}
@@ -1791,7 +2000,7 @@ Generated: {generated_at.strftime("%Y-%m-%d %H:%M:%S")}
 - Minimum instruments used: {training_thresholds["min_instruments"]}
 - Thresholds authoritative: {training_thresholds["authoritative"]}
 
-## Native V2 Data Contract
+## Formal Parquet / Direct Qlib Provider Contract
 
 - Contract status: {data_contract["status"]}
 - Contract reason: {data_contract["reason"]}
@@ -1810,8 +2019,9 @@ Generated: {generated_at.strftime("%Y-%m-%d %H:%M:%S")}
 
 ## Source Coverage
 
-`ashare_daily_qfq` is the canonical immutable V2 input. Rows marked `audit`
-are retained for source comparison only; `legacy` is a compatibility output.
+`ashare_daily_qfq` is the canonical immutable Parquet input. Qlib reads it through
+the metadata-only direct Provider; rows marked `audit` are retained for source
+comparison only, and `legacy` is a compatibility output.
 
 {markdown_table(rows, ["source", "role", "files", "rows", "date_range", "size_mb"])}
 

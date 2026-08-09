@@ -10,7 +10,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import qlib_provider_uri  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    provider_calendar_days,
+    qlib_workflow_provider_uri,
+)
 
 
 REQUIRED_INSTRUMENTS = (
@@ -25,10 +29,9 @@ REQUIRED_FIELDS = ("$open", "$high", "$low", "$close", "$volume", "$factor")
 
 
 def read_provider_calendar_range(provider: Path) -> tuple[str, str]:
-    calendar_path = provider / "calendars" / "day.txt"
-    days = [line.strip() for line in calendar_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    days = provider_calendar_days(provider)
     if not days:
-        raise ValueError(f"empty Qlib calendar: {calendar_path}")
+        raise ValueError(f"empty Qlib calendar: {provider}")
     return days[0], days[-1]
 
 
@@ -97,14 +100,13 @@ def validate_feature_sample(features, sample_days: list[str]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    provider_dir = args.provider_dir or qlib_provider_uri(args.provider)
+    provider_dir = args.provider_dir or qlib_workflow_provider_uri(args.provider)
     multiprocessing.set_start_method("fork", force=True)
 
-    import qlib
     from qlib.data import D
 
     start_date, end_date = read_provider_calendar_range(provider_dir)
-    qlib.init(provider_uri=str(provider_dir), region="cn")
+    init_qlib_workflow(provider=args.provider, provider_uri=provider_dir)
 
     calendar = D.calendar(start_time=start_date, end_time=end_date, freq="day")
     if len(calendar) < 1:

@@ -16,7 +16,8 @@ Path convention:
 - `QUANT_WORKFLOW_ROOT`, `QUANT_WORKFLOW_REPORTS_ROOT`,
   `QUANT_WORKFLOW_MLRUNS_DIR`, `QUANT_DATA_ROOT`, `QLIB_PROVIDER_URI`,
   `QLIB_CLEANED_PROVIDER_URI`, `QLIB_COMPATIBILITY_PROVIDER_URI`,
-  `QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI`, and `CHINA_ASTOCK_QUANT_ROOT`
+  `QLIB_CLEANED_COMPATIBILITY_PROVIDER_URI`, `QLIB_DIRECT_MEMBERSHIP_PATH`,
+  `QLIB_DIRECT_CLEANING_PLAN_PATH`, and `CHINA_ASTOCK_QUANT_ROOT`
   override specific
   paths when needed.
 - Do not add new hardcoded local absolute paths in scripts.
@@ -28,19 +29,29 @@ Naming convention:
   parsing check used by the web workflow; omit `--dry-run` only when you intend
   to write real Parquet files.
 - `supervise_<source>.py` runs a restartable long download.
-- `merge_to_qlib.py` creates mutable V1-compatible merged Parquet/Qlib output;
-  it is not the canonical native V2 builder.
-- `build_cleaned_qlib_v2.py` creates and atomically publishes the native
-  immutable cleaned provider from the governed qfq snapshot and canonical
-  benchmark evidence. `apply_data_cleaning.py` remains a bounded legacy/manual
-  candidate tool and cannot overwrite an immutable V2 snapshot.
-- `check_qlib_data.py` smoke-checks the resolved native V2 provider by default.
-  `--provider cleaned` performs the same real Qlib read against the native
-  cleaned snapshot.
-- `update_qlib_index_benchmarks.py --publish` is the bounded native-V2 index
-  supplement. It requests only `SZ399006` and `SH000688`, reuses every existing
-  stock feature file, and publishes canonical/cleaned Qlib snapshots as one
-  atomic group. Re-running after success performs zero network requests.
+- `build_qlib_direct_provider.py` is the formal Qlib entry. It creates a
+  metadata-only descriptor that reads the governed Parquet snapshot directly;
+  the canonical and cleaned modes use the same stock/index data and differ
+  only by the frozen cleaning plan.
+- `merge_to_qlib.py`, `build_qlib_v2.py` and `build_cleaned_qlib_v2.py` are
+  compatibility/audit producers. They may create `.bin` data only when an
+  operator explicitly runs the old tool; they are not the DSA web default and
+  are not used by training, prediction or backtest callers.
+- `apply_data_cleaning.py` remains a bounded read-only/dry-run legacy report
+  tool. The normal web action now creates the cleaned direct descriptor with
+  `build_qlib_direct_provider.py --cleaning-mode cleaned`.
+- `check_qlib_data.py` smoke-checks the resolved direct Provider by default.
+  `--provider cleaned` performs the same real Qlib read through the frozen
+  cleaned descriptor.
+- `quant_data_cli.py update cn_index_daily --through YYYY-MM-DD` is the formal
+  five-index incremental update. It requests only SH000300, SH000905,
+  SH000906, SZ399006 and SH000688, verifies the bounded overlap, resolves the
+  requested calendar date to the latest XSHG session, and atomically publishes
+  `cn_index_daily`. It never updates stocks or creates Qlib `.bin` files.
+- `update_qlib_index_benchmarks.py --publish` is a legacy native-provider index
+  supplement retained only for an explicitly identified old consumer. The
+  formal five-index set is `cn_index_daily`, which the direct Provider reads
+  directly; normal updates do not publish this native `.bin` supplement.
 - `compare_native_qlib_benchmarks.py` joins SH000300/SH000905/SH000906 by
   trading date and requires exact equality for open/high/low/close/volume/factor
   across the full retained compatibility overlap. Directory existence is not
@@ -53,8 +64,9 @@ Naming convention:
 - `supervise_baostock.py` is a restartable long-download supervisor. It is not
   exposed as a separate DSA web button because the web task center already wraps
   Baostock downloads with durable job logs and cancellation.
-- `report_data_quality.py` scans native `ashare_daily_qfq` bars and native
-  `qlib_ashare_v2` by default, while retaining legacy-source overlap evidence.
+- `report_data_quality.py` scans native `ashare_daily_qfq` bars and the direct
+  canonical/cleaned descriptors by default, while retaining legacy-source
+  overlap evidence.
   Use `--overlap-sample` to limit
   Baostock/JQData overlap comparisons and `--merged-sample` to limit merged
   Parquet scans for browser smoke checks; omit both for a full report.
@@ -97,7 +109,10 @@ Naming convention:
   basis, manifest hash, bar hashes, factor hashes and company-action hash.
 - `build_qlib_direct_provider.py` creates the metadata-only Qlib adapter for the
   current governed `ashare_daily_qfq` snapshot and runs a real `D.features`
-  smoke check. It writes only `CALENDAR.parquet`, a frozen
+  smoke check. Without an explicit date range, it deterministically samples up
+  to five dates from each symbol's own Parquet history, so a stock suspension
+  cannot be mistaken for a Provider failure. Every requested field must be
+  present and non-null on each sampled row. It writes only `CALENDAR.parquet`, a frozen
   `MEMBERSHIP_INTERVALS.parquet`, and `PROVIDER_DESCRIPTOR.json`; it never
   creates `features/` or stock `.bin` files. Python callers initialize it
   through `_paths.init_qlib_direct()`.
@@ -143,16 +158,20 @@ Naming convention:
   legacy incremental splices from unexplained price-path drift.
   `quant_data_cli.py update ashare_daily_qfq --bundle-dir <verified-bundle>`
   validates all hashes and switches raw/qfq snapshots plus the root catalog as
-  one rollback transaction, then builds canonical and cleaned native Qlib
-  snapshots before the formal update is considered complete.
-- `build_qlib_v2.py` is retained during the direct-Provider migration for
-  compatibility, benchmark evidence, and rollback. It still creates a physical
-  `.bin` copy and is not the target storage path for new consumers.
-- `build_cleaned_qlib_v2.py` resolves the same qfq snapshot plus the matching
-  native canonical provider, applies recorded anomaly masks, imports native
-  benchmark and instrument evidence, and atomically publishes
-  `qlib_ashare_cleaned_v2`.
-- `publish_v2_compatibility.py` rebuilds the four stable V1 Parquet/Qlib paths
+  one rollback transaction, then builds canonical and cleaned direct Provider
+  descriptors before the formal update is considered complete. The direct
+  descriptors contain no copied stock market data.
+- `build_qlib_v2.py` is retained as an explicit compatibility/audit producer.
+  It still creates a physical `.bin` copy and is not called by the normal update,
+  training, prediction or backtest path.
+- `build_cleaned_qlib_v2.py` is the matching explicit legacy cleaned producer.
+  The formal cleaned Provider instead reuses the qfq Parquet snapshot and
+  applies its frozen cleaning plan at read time.
+- `build_robust_price_provider.py` is a separate legacy robust-strategy product
+  builder. It may create `.bin` files only inside its hash-isolated compatibility
+  product; the live robust pipeline uses `prepare_robust_provider.py` over the
+  formal direct descriptor and does not call this builder.
+- `publish_v2_compatibility.py` rebuilds the four stable V1 Parquet/legacy-Qlib paths
   from the exact governed qfq snapshot. It preserves six-digit Parquet names,
   nanosecond dates, the V1 column order, and unit Qlib factors because prices
   are already qfq. It runs a fresh anomaly/cleaning pass, installs Tencent
@@ -194,23 +213,32 @@ Research-only model comparison scripts live under:
 Do not promote a script from that folder into `scripts/` until its assumptions,
 data splits, and output paths are documented here.
 
-The new storage path is `quant_data_qlib_provider.py`: it freezes the current
-`ashare_daily_qfq` identity and reads Parquet bars directly. New callers use
-`_paths.init_qlib_direct()` so Qlib receives the custom calendar, instrument,
-and feature providers. Existing `qlib_ashare_v2` and `QLIB_PROVIDER_URI` remain
-available during downstream migration and rollback; not every
-canonical/cleaned caller has switched yet.
+The formal storage path is `quant_data_qlib_provider.py`: it freezes the current
+`ashare_daily_qfq` and `cn_index_daily` identities and reads their Parquet bars
+directly. All training, prediction, backtest, calendar and data-quality
+callers use `_paths.init_qlib_workflow()` / `qlib_workflow_provider_uri()` so
+Qlib receives the custom calendar, instrument and feature providers. A direct
+descriptor records the exact stock snapshot, index snapshot, membership hash
+and (for cleaned mode) cleaning-plan hash; changing `LATEST.json` later cannot
+change an already-running process.
 
-The cleaned provider resolves from `DATA_MANIFEST.json` as
-`qlib_ashare_cleaned_v2`. `QLIB_CLEANED_PROVIDER_URI` is an explicit pin and
-must pass the same full snapshot validation under
-`qlib/cn_data_ashare_cleaned_v2/snapshots/`.
+The cleaned Provider is not a second market-data copy. It points to the same
+`ashare_daily_qfq` Parquet snapshot and applies the frozen cleaning plan while
+reading. `QLIB_PROVIDER_URI` and `QLIB_CLEANED_PROVIDER_URI` are retained only
+for explicitly pinned legacy native replays and are rejected by the direct
+default resolver; compatibility paths use the explicit
+`QLIB_COMPATIBILITY_PROVIDER_URI` names.
 
 Mutable maintenance scripts such as `merge_to_qlib.py`,
 `add_index_benchmark.py`, `generate_csi300.py` and
-`repair_qlib_provider.py` default to the compatibility output instead of the
-immutable native snapshot. Qlib config files are runtime templates; the DSA
-wrappers replace `RESOLVE_QLIB_ASHARE_V2_AT_RUNTIME` before invoking Qlib.
+`repair_qlib_provider.py` remain compatibility/audit tools. They do not change
+the formal Provider and are not invoked by the paused daily update. Qlib config
+files are runtime templates; DSA wrappers replace the provider configuration
+with the frozen direct descriptor before invoking Qlib.
+
+`run_robust_strategy.py` also fails closed when the formal direct Provider
+cannot be built. Its `--allow-legacy-compatibility` flag is only for an
+explicit replay of an old frozen run; it is not a normal live-run fallback.
 
 ## Robust Signal Goal 1
 

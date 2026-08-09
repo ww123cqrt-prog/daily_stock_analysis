@@ -45,8 +45,8 @@ china-astock-quant adapters, and every stable script here. Data paths use
   --output-dir /path/to/staging-bundle \
   --through YYYY-MM-DD --resume
 
-# Publish verified A-share raw/qfq plus native canonical and cleaned Qlib v2.
-# This does not touch legacy fixed paths unless the explicit refresh flag is added.
+# Publish verified A-share raw/qfq plus direct canonical and cleaned Provider descriptors.
+# This does not generate a second physical Qlib market-data copy.
 .venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir /path/to/verified-bundle
 
@@ -56,7 +56,13 @@ china-astock-quant adapters, and every stable script here. Data paths use
   --refresh-legacy-compatibility
 
 # Build the metadata-only direct Qlib adapter and run a real feature smoke test
+# By default this samples up to five dates from each symbol's own history.
 .venv/bin/python quant_workflow/scripts/build_qlib_direct_provider.py
+
+# Incrementally update only the five governed index series. This publishes
+# cn_index_daily Parquet and never rewrites stocks or legacy Qlib .bin files.
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update \
+  cn_index_daily --through YYYY-MM-DD
 
 # Migration compatibility only: build a physical Qlib copy
 .venv/bin/python quant_workflow/scripts/build_qlib_v2.py --publish
@@ -73,15 +79,21 @@ china-astock-quant adapters, and every stable script here. Data paths use
 # Repair provider metadata after manual benchmark/instrument edits
 .venv/bin/python quant_workflow/scripts/repair_qlib_provider.py
 
-# Smoke-check the resolved native Qlib V2 provider
+# Smoke-check the resolved direct Parquet Provider
 .venv/bin/python quant_workflow/scripts/check_qlib_data.py
+
+# Only for an explicitly identified old frozen-run replay; normal runs reject
+# the old physical Qlib compatibility provider.
+.venv/bin/python quant_workflow/scripts/run_robust_strategy.py \
+  --allow-legacy-compatibility
 
 # Inspect a legacy/manual cleaning candidate without publishing native data
 .venv/bin/python quant_workflow/scripts/apply_data_cleaning.py --dry-run
 
-# Update independent sources and validate existing native A-share V2. A history
+# Update independent sources and validate existing formal Parquet/direct Provider. A history
 # source selected here updates audit cache only; canonical publication requires
 # --ashare-v2-bundle-dir /path/to/verified-bundle on the command line.
+# The scheduled LaunchAgent remains disabled until the user explicitly restores it.
 .venv/bin/python quant_workflow/scripts/run_daily_update.py
 
 # Read-only data-governance inventory and dry-run cleanup plan
@@ -132,16 +144,17 @@ The governed A-share source entries are `ashare_daily_raw` and
 `ashare_daily_qfq`; resolve them through `quant_data_cli.py` instead of
 hard-coding snapshot paths. The direct Qlib adapter freezes one exact qfq
 snapshot per process. Physical `qlib_ashare_v2` and
-`qlib_ashare_cleaned_v2` remain registered during migration because some
-training, cleaned-data, benchmark, and rollback paths have not switched yet.
-The original merged paths remain legacy compatibility outputs for rollback and
-explicit old consumers only; they are not a DSA training input. `_old`
+`qlib_ashare_cleaned_v2` remain registered only as legacy/audit datasets for
+rollback and explicit old consumers. Formal training, cleaned-data checks,
+benchmarks and backtests use the direct Provider over the governed Parquet
+snapshots. The original merged paths are not a DSA training input. `_old`
 directories and old source directories are audit-only. Do not infer readiness
 from directory names; the live manifest is authoritative.
 
 The robust strategy configuration uses verified offline reuse for the one-time
-reference snapshot and the three Qlib benchmarks. It does not silently redownload
-when local data is missing or mismatched; the correct state is `blocked_data`.
+reference snapshot and the formal `cn_index_daily` index snapshot. It does not
+silently redownload when local data is missing or mismatched; the correct state
+is `blocked_data`.
 Remote artifacts remain staging until they are imported locally with
 `download_robust_reference.py --import-dir` and
 `add_index_benchmark.py --import-provider-dir`. Both commands revalidate local

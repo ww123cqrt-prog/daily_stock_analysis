@@ -35,14 +35,15 @@ from quant_data_contract import (  # noqa: E402
     resolve_dataset_component,
     validate_dataset_snapshot,
 )
+from quant_workflow.quant_data_qlib_provider import (  # noqa: E402
+    build_direct_provider_descriptor,
+)
 
 
 ASHARE_UPDATE_POINTERS = (
     Path("DATA_MANIFEST.json"),
     Path("parquet/ashare_1d/ashare_daily_raw/LATEST.json"),
     Path("parquet/ashare_1d/ashare_daily_qfq/LATEST.json"),
-    Path("qlib/cn_data_ashare_v2/LATEST.json"),
-    Path("qlib/cn_data_ashare_cleaned_v2/LATEST.json"),
 )
 ASHARE_UPDATE_TRANSACTION_PATH = Path(
     "runtime/transactions/ashare_v2_update.json"
@@ -963,12 +964,9 @@ def _update_ashare_from_bundle(
     *,
     refresh_legacy_compatibility: bool = False,
 ) -> int:
-    from build_cleaned_qlib_v2 import build_cleaned_qlib_v2
-    from build_qlib_v2 import build_qlib_v2
     from download_baostock_v2 import build_snapshots_from_bundle
 
     previous_files: dict[Path, bytes | None] = {}
-    validated_cache: dict[str, Any] = {}
     completed_steps: list[str] = []
     failed_step = "capture_state"
     started_at = _timestamp()
@@ -993,31 +991,31 @@ def _update_ashare_from_bundle(
         _write_update_transaction_progress(
             root,
             transaction,
-            active_step="qlib_v2",
+            active_step="direct_provider_canonical",
             completed_steps=completed_steps,
         )
-        failed_step = "qlib_v2"
-        qlib_v2 = build_qlib_v2(
+        failed_step = "direct_provider_canonical"
+        qlib_provider = build_direct_provider_descriptor(
             quant_data_root=root,
-            publish=True,
-            publication_lock_held=True,
-            validated_cache=validated_cache,
+            dataset_id="ashare_daily_qfq",
+            index_dataset_id="cn_index_daily",
+            cleaning_mode="canonical",
         )
-        completed_steps.append("qlib_v2")
+        completed_steps.append("direct_provider_canonical")
         _write_update_transaction_progress(
             root,
             transaction,
-            active_step="qlib_cleaned_v2",
+            active_step="direct_provider_cleaned",
             completed_steps=completed_steps,
         )
-        failed_step = "qlib_cleaned_v2"
-        qlib_cleaned_v2 = build_cleaned_qlib_v2(
+        failed_step = "direct_provider_cleaned"
+        qlib_cleaned_provider = build_direct_provider_descriptor(
             quant_data_root=root,
-            publish=True,
-            publication_lock_held=True,
-            validated_cache=validated_cache,
+            dataset_id="ashare_daily_qfq",
+            index_dataset_id="cn_index_daily",
+            cleaning_mode="cleaned",
         )
-        completed_steps.append("qlib_cleaned_v2")
+        completed_steps.append("direct_provider_cleaned")
         failed_step = "commit_transaction"
         _write_update_transaction_progress(
             root,
@@ -1099,8 +1097,8 @@ def _update_ashare_from_bundle(
     output = {
         "raw": str(raw),
         "qfq": str(qfq),
-        "qlib_v2": str(qlib_v2),
-        "qlib_cleaned_v2": str(qlib_cleaned_v2),
+        "qlib_provider": str(Path(qlib_provider).parent),
+        "qlib_cleaned_provider": str(Path(qlib_cleaned_provider).parent),
         "legacy_compatibility": legacy_compatibility,
     }
     if status_error:
@@ -1119,6 +1117,7 @@ def _update(
     bundle_dir: Path | None,
     *,
     refresh_legacy_compatibility: bool = False,
+    use_system_proxy: bool = False,
 ) -> int:
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
         update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
@@ -1162,10 +1161,22 @@ def _update(
             quant_data_dir=root,
             end_date=through,
         )
+        print(path)
+        return 0
+    if dataset_id == "cn_index_daily":
+        from update_cn_index_dataset import update_cn_index_snapshot
+
+        kwargs: dict[str, Any] = {
+            "quant_data_root": root,
+            "end_date": through,
+        }
+        if use_system_proxy:
+            kwargs["use_system_proxy"] = True
+        result = update_cn_index_snapshot(**kwargs)
+        _json_dump(result)
+        return 0
     else:
         raise DataContractError(f"dataset has no registered updater: {dataset_id}")
-    print(path)
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1201,6 +1212,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly rebuild retained mutable V1 compatibility outputs",
     )
+    update_parser.add_argument(
+        "--use-system-proxy",
+        action="store_true",
+        help="Use the configured system proxy for bounded public index requests",
+    )
     return parser
 
 
@@ -1223,8 +1239,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.through,
                 args.bundle_dir,
                 refresh_legacy_compatibility=args.refresh_legacy_compatibility,
+                use_system_proxy=args.use_system_proxy,
             )
-    except DataContractError as exc:
+    except (DataContractError, ValueError, TypeError) as exc:
         print(f"不能使用 quant_data 数据：{exc}", file=sys.stderr)
         return 2
     return 2
