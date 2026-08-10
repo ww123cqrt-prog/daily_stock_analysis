@@ -31,10 +31,13 @@ from quant_data_contract import (  # noqa: E402
     atomic_write_json,
     dataset_publication_lock,
     describe_dataset,
+    publish_snapshot_group,
     resolve_dataset,
+    resolve_dataset_artifact,
     resolve_dataset_component,
     validate_dataset_snapshot,
 )
+from quant_data_reader import build_update_universe, read_bars  # noqa: E402
 from quant_workflow.quant_data_qlib_provider import (  # noqa: E402
     build_direct_provider_descriptor,
 )
@@ -50,6 +53,7 @@ ASHARE_UPDATE_TRANSACTION_PATH = Path(
 )
 ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION = 1
 ASHARE_UPDATE_TRANSACTION_MAX_BYTES = 16 * 1024 * 1024
+ASHARE_BUNDLE_MANIFEST_MAX_BYTES = 1024 * 1024
 
 ETF_RELEASE_DATASET_ID = "cn_etf_daily"
 ETF_RELEASE_DATASET_ROOT = Path("parquet/etf_1d/cn_etf_daily")
@@ -514,7 +518,20 @@ def _describe(root: Path, dataset_id: str, *, as_json: bool) -> int:
     return 0
 
 
-def _resolve(root: Path, dataset_id: str, require_basis: str | None) -> int:
+def _resolve(
+    root: Path,
+    dataset_id: str,
+    require_basis: str | None,
+    component_name: str | None = None,
+) -> int:
+    if component_name is not None:
+        component = resolve_dataset_artifact(
+            dataset_id,
+            component_name,
+            quant_data_root=root,
+        )
+        print(component.artifact_path)
+        return 0
     if require_basis is not None:
         component = resolve_dataset_component(
             dataset_id,
@@ -528,6 +545,57 @@ def _resolve(root: Path, dataset_id: str, require_basis: str | None) -> int:
         quant_data_root=root,
     )
     print(resolved.snapshot_path)
+    return 0
+
+
+def _bars(
+    root: Path,
+    dataset_id: str,
+    symbol: str,
+    *,
+    basis: str | None,
+    fields: list[str] | None,
+    start: str | None,
+    end: str | None,
+) -> int:
+    frame = read_bars(
+        dataset_id,
+        symbol,
+        quant_data_root=root,
+        price_basis=basis,
+        fields=fields,
+        start=start,
+        end=end,
+    )
+    output = frame.copy()
+    if "date" in output.columns:
+        output["date"] = pd.to_datetime(output["date"]).dt.strftime("%Y-%m-%d")
+    _json_dump(json.loads(output.to_json(orient="records")))
+    return 0
+
+
+def _export_universe(
+    root: Path,
+    dataset_id: str,
+    *,
+    basis: str | None,
+    output: Path,
+) -> int:
+    payload = build_update_universe(
+        dataset_id,
+        quant_data_root=root,
+        price_basis=basis,
+    )
+    output = Path(output).expanduser().resolve()
+    atomic_write_json(output, payload)
+    _json_dump(
+        {
+            "dataset_id": payload["dataset_id"],
+            "snapshot_id": payload["snapshot_id"],
+            "symbol_count": payload["symbol_count"],
+            "output": str(output),
+        }
+    )
     return 0
 
 
@@ -957,6 +1025,71 @@ def _validate(root: Path, target: str, *, release: bool = False) -> int:
     return 0
 
 
+def _ashare_bundle_mode(bundle_dir: Path) -> str:
+    manifest_path = Path(bundle_dir).expanduser().resolve() / "BUNDLE_MANIFEST.json"
+    if not manifest_path.exists():
+        # The selected builder will return the authoritative missing-manifest error.
+        return "full"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise DataContractError("A-share bundle manifest path is unsafe")
+    try:
+        if manifest_path.stat().st_size > ASHARE_BUNDLE_MANIFEST_MAX_BYTES:
+            raise DataContractError("A-share bundle manifest is too large")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except DataContractError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DataContractError("A-share bundle manifest is unavailable or invalid") from exc
+    if not isinstance(payload, dict):
+        raise DataContractError("A-share bundle manifest must be a JSON object")
+    mode = str(payload.get("bundle_mode") or "full")
+    if mode not in {"full", "incremental"}:
+        raise DataContractError("A-share bundle mode is invalid")
+    return mode
+
+
+def _build_ashare_price_snapshots(
+    *,
+    root: Path,
+    bundle_dir: Path,
+) -> tuple[Path, Path, str, dict[str, Any] | None]:
+    mode = _ashare_bundle_mode(bundle_dir)
+    if mode == "incremental":
+        from incremental_update_ashare_v2 import build_incremental_price_snapshots
+
+        result = build_incremental_price_snapshots(
+            bundle_dir=bundle_dir,
+            quant_data_root=root,
+        )
+        raw_root = root / "parquet" / "ashare_1d" / "ashare_daily_raw"
+        qfq_root = root / "parquet" / "ashare_1d" / "ashare_daily_qfq"
+        raw, qfq = publish_snapshot_group(
+            [(result.raw_stage, raw_root), (result.qfq_stage, qfq_root)],
+            quant_data_root=root,
+            update_root_catalog=True,
+            publication_lock_held=True,
+        )
+        metrics = {
+            "base_latest_trade_date": result.base_latest_trade_date,
+            "latest_trade_date": result.latest_trade_date,
+            "downloaded_rows": int(result.downloaded_rows),
+            "reused_symbols": len(result.reused_symbols),
+            "factor_changed_symbols": len(result.factor_changed_symbols),
+            "qfq_recalculated_symbols": len(result.qfq_recalculated_symbols),
+        }
+        return raw, qfq, mode, metrics
+
+    from download_baostock_v2 import build_snapshots_from_bundle
+
+    raw, qfq = build_snapshots_from_bundle(
+        bundle_dir=bundle_dir,
+        quant_data_root=root,
+        publish=True,
+        publication_lock_held=True,
+    )
+    return raw, qfq, mode, None
+
+
 def _update_ashare_from_bundle(
     root: Path,
     dataset_id: str,
@@ -964,13 +1097,13 @@ def _update_ashare_from_bundle(
     *,
     refresh_legacy_compatibility: bool = False,
 ) -> int:
-    from download_baostock_v2 import build_snapshots_from_bundle
-
     previous_files: dict[Path, bytes | None] = {}
     completed_steps: list[str] = []
     failed_step = "capture_state"
     started_at = _timestamp()
     transaction: dict[str, Any] | None = None
+    update_mode = "unknown"
+    incremental_metrics: dict[str, Any] | None = None
     try:
         previous_files = _capture_file_state(root)
         failed_step = "prepare_transaction"
@@ -981,11 +1114,9 @@ def _update_ashare_from_bundle(
             started_at=started_at,
         )
         failed_step = "raw_qfq_v2"
-        raw, qfq = build_snapshots_from_bundle(
+        raw, qfq, update_mode, incremental_metrics = _build_ashare_price_snapshots(
+            root=root,
             bundle_dir=bundle_dir,
-            quant_data_root=root,
-            publish=True,
-            publication_lock_held=True,
         )
         completed_steps.append("raw_qfq_v2")
         _write_update_transaction_progress(
@@ -1091,6 +1222,8 @@ def _update_ashare_from_bundle(
             "dataset_id": dataset_id,
             "started_at": started_at,
             "completed_steps": completed_steps,
+            "update_mode": update_mode,
+            "incremental": incremental_metrics,
             "legacy_compatibility": legacy_compatibility,
         },
     )
@@ -1101,6 +1234,9 @@ def _update_ashare_from_bundle(
         "qlib_cleaned_provider": str(Path(qlib_cleaned_provider).parent),
         "legacy_compatibility": legacy_compatibility,
     }
+    if update_mode == "incremental":
+        output["update_mode"] = update_mode
+        output["incremental"] = incremental_metrics
     if status_error:
         output["status_record"] = {
             "status": "write_failed",
@@ -1193,7 +1329,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve_parser = commands.add_parser("resolve")
     resolve_parser.add_argument("dataset_id")
-    resolve_parser.add_argument("--require-basis")
+    resolve_mode = resolve_parser.add_mutually_exclusive_group()
+    resolve_mode.add_argument("--require-basis")
+    resolve_mode.add_argument("--component")
+
+    bars_parser = commands.add_parser("bars")
+    bars_parser.add_argument("dataset_id")
+    bars_parser.add_argument("symbol")
+    bars_parser.add_argument("--basis")
+    bars_parser.add_argument("--fields", nargs="+")
+    bars_parser.add_argument("--start")
+    bars_parser.add_argument("--end")
+
+    universe_parser = commands.add_parser("export-universe")
+    universe_parser.add_argument("dataset_id")
+    universe_parser.add_argument("--basis")
+    universe_parser.add_argument("--output", type=Path, required=True)
 
     validate_parser = commands.add_parser("validate")
     validate_parser.add_argument("target")
@@ -1229,7 +1380,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "describe":
             return _describe(root, args.dataset_id, as_json=args.json)
         if args.command == "resolve":
-            return _resolve(root, args.dataset_id, args.require_basis)
+            return _resolve(
+                root,
+                args.dataset_id,
+                args.require_basis,
+                args.component,
+            )
+        if args.command == "bars":
+            return _bars(
+                root,
+                args.dataset_id,
+                args.symbol,
+                basis=args.basis,
+                fields=args.fields,
+                start=args.start,
+                end=args.end,
+            )
+        if args.command == "export-universe":
+            return _export_universe(
+                root,
+                args.dataset_id,
+                basis=args.basis,
+                output=args.output,
+            )
         if args.command == "validate":
             return _validate(root, args.target, release=args.release)
         if args.command == "update":

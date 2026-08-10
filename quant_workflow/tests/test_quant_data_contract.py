@@ -50,6 +50,59 @@ def write_factors(path: Path) -> None:
     ).to_parquet(path, index=False)
 
 
+def write_artifact_snapshot(
+    module,
+    quant_data: Path,
+    snapshot_id: str = "pit-csi800-001",
+    second_symbol: str = "SZ000001",
+) -> Path:
+    snapshot = quant_data / "staging" / "reference-run" / snapshot_id
+    (snapshot / "daily").mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "symbol": ["SH600000", second_symbol],
+            "index_code": ["000300.XSHG", "000905.XSHG"],
+        }
+    ).to_parquet(snapshot / "daily" / "2025.parquet", index=False)
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000", second_symbol],
+            "index_code": ["000300.XSHG", "000905.XSHG"],
+            "start_date": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "end_date": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+        }
+    ).to_parquet(snapshot / "membership_intervals.parquet", index=False)
+    (snapshot / "MEMBERSHIP_SOURCE.json").write_text(
+        json.dumps({"selected": "baostock"}), encoding="utf-8"
+    )
+    module.finalize_artifact_snapshot(
+        snapshot,
+        dataset_id="pit_csi800",
+        snapshot_id=snapshot.name,
+        data_kind="point_in_time_membership",
+        role="canonical",
+        status="ready",
+        source={"provider": "baostock", "interface": "pit_membership_builder"},
+        price_basis="not_applicable",
+        producer={"script": "publish_reference_snapshots.py", "version": "1"},
+        source_retrieved_at="2026-08-10T10:00:00+08:00",
+        date_range={"start": "2025-01-02", "end": "2025-01-02"},
+        components={
+            "daily": {"path": "daily", "kind": "partitioned_parquet"},
+            "membership_intervals": {
+                "path": "membership_intervals.parquet",
+                "kind": "parquet",
+            },
+            "source_manifest": {
+                "path": "MEMBERSHIP_SOURCE.json",
+                "kind": "json",
+            },
+        },
+    )
+    return snapshot
+
+
 @pytest.mark.parametrize("column", ["open", "high", "low", "close"])
 def test_validate_bar_frame_rejects_non_positive_prices(column: str) -> None:
     module = load_module()
@@ -1798,3 +1851,108 @@ def test_qlib_snapshot_validation_rejects_manifest_path_escape(
 
     with pytest.raises(module.DataContractError, match="must stay inside snapshot"):
         module.validate_dataset_snapshot(snapshot, verify_hashes=True)
+
+
+def test_artifact_snapshot_can_be_published_resolved_and_component_locked(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    module.write_root_manifest(quant_data, {})
+    staged = write_artifact_snapshot(module, quant_data)
+
+    published = module.publish_snapshot_group(
+        [(staged, quant_data / "reference" / "pit_csi800")],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+    )[0]
+
+    resolved = module.resolve_dataset("pit_csi800", quant_data_root=quant_data)
+    component = module.resolve_dataset_artifact(
+        "pit_csi800",
+        "daily",
+        quant_data_root=quant_data,
+    )
+    assert resolved.snapshot_path == published
+    assert component.artifact_path == published / "daily"
+    assert component.component["kind"] == "partitioned_parquet"
+
+
+def test_artifact_snapshot_rejects_unindexed_file_added_after_finalize(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    staged = write_artifact_snapshot(module, quant_data)
+    (staged / "unexpected.txt").write_text("not indexed", encoding="utf-8")
+
+    with pytest.raises(module.DataContractError, match="file index is stale"):
+        module.validate_dataset_snapshot(staged)
+
+
+def test_artifact_resolver_rejects_snapshot_with_stale_frozen_upstream(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    module.write_root_manifest(quant_data, {})
+    pit_root = quant_data / "reference" / "pit_csi800"
+    first_pit = module.publish_snapshot_group(
+        [(write_artifact_snapshot(module, quant_data), pit_root)],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+    )[0]
+    first_manifest = module.validate_dataset_snapshot(first_pit)
+    pit_identity = {
+        field: first_manifest[field]
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    }
+    robust = quant_data / "staging" / "reference-run" / "robust-reference-001"
+    robust.mkdir(parents=True)
+    (robust / "REFERENCE_SOURCE.json").write_text("{}", encoding="utf-8")
+    module.finalize_artifact_snapshot(
+        robust,
+        dataset_id="robust_reference",
+        snapshot_id=robust.name,
+        data_kind="point_in_time_reference",
+        role="canonical",
+        status="ready",
+        source={"provider": "baostock", "interface": "reference_builder"},
+        price_basis="not_applicable",
+        producer={"script": "test_quant_data_contract.py", "version": "1"},
+        source_retrieved_at="2026-08-10T10:00:00+08:00",
+        date_range={"start": "2025-01-02", "end": "2025-01-02"},
+        components={
+            "source_manifest": {
+                "path": "REFERENCE_SOURCE.json",
+                "kind": "json",
+            }
+        },
+        upstream_snapshots=[pit_identity],
+    )
+    module.publish_snapshot_group(
+        [(robust, quant_data / "reference")],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+    )
+    module.publish_snapshot_group(
+        [
+            (
+                write_artifact_snapshot(
+                    module,
+                    quant_data,
+                    snapshot_id="pit-csi800-002",
+                    second_symbol="SZ000002",
+                ),
+                pit_root,
+            )
+        ],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+    )
+
+    with pytest.raises(module.DataContractError, match="upstream snapshot is stale"):
+        module.resolve_dataset("robust_reference", quant_data_root=quant_data)

@@ -268,6 +268,126 @@ def test_resolve_returns_nonzero_for_unusable_legacy_dataset(
     assert "不能使用" in capsys.readouterr().err
 
 
+def test_resolve_named_artifact_component(tmp_path: Path, capsys) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    write_catalog(quant_data)
+    artifact = tmp_path / "snapshot" / "daily"
+    artifact.mkdir(parents=True)
+
+    with patch.object(
+        module,
+        "resolve_dataset_artifact",
+        return_value=types.SimpleNamespace(artifact_path=artifact),
+    ) as resolver:
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "resolve",
+                "pit_csi800",
+                "--component",
+                "daily",
+            ]
+        )
+
+    assert result == 0
+    assert capsys.readouterr().out.strip() == str(artifact)
+    resolver.assert_called_once_with(
+        "pit_csi800",
+        "daily",
+        quant_data_root=quant_data.resolve(),
+    )
+
+
+def test_bars_command_returns_json_records(tmp_path: Path, capsys) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    write_catalog(quant_data)
+    frame = pd.DataFrame(
+        {"date": pd.to_datetime(["2026-08-04"]), "close": [10.2]}
+    )
+
+    with patch.object(module, "read_bars", return_value=frame) as reader:
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "bars",
+                "ashare_daily_qfq",
+                "SH600000",
+                "--basis",
+                "qfq",
+                "--fields",
+                "close",
+                "--start",
+                "2026-08-04",
+                "--end",
+                "2026-08-04",
+            ]
+        )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"date": "2026-08-04", "close": 10.2}
+    ]
+    reader.assert_called_once_with(
+        "ashare_daily_qfq",
+        "SH600000",
+        quant_data_root=quant_data.resolve(),
+        price_basis="qfq",
+        fields=["close"],
+        start="2026-08-04",
+        end="2026-08-04",
+    )
+
+
+def test_export_universe_writes_snapshot_bound_update_input(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    write_catalog(quant_data)
+    output = tmp_path / "ashare-update-universe.json"
+    payload = {
+        "schema_version": 1,
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-001",
+        "manifest_sha256": "a" * 64,
+        "latest_trade_date": "2026-08-04",
+        "symbol_count": 2,
+        "all": ["SH600000", "SZ000001"],
+    }
+
+    with patch.object(module, "build_update_universe", return_value=payload) as builder:
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "export-universe",
+                "ashare_daily_qfq",
+                "--basis",
+                "qfq",
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert result == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert json.loads(capsys.readouterr().out) == {
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-001",
+        "symbol_count": 2,
+        "output": str(output.resolve()),
+    }
+    builder.assert_called_once_with(
+        "ashare_daily_qfq",
+        quant_data_root=quant_data.resolve(),
+        price_basis="qfq",
+    )
+
+
 def test_release_validation_checks_current_backup_and_strategy_symbols(
     tmp_path: Path, capsys
 ) -> None:
@@ -602,6 +722,105 @@ def test_update_ashare_v2_builds_and_publishes_a_verified_bundle(
     assert status["status"] == "completed"
     assert status["legacy_compatibility"] == {"status": "not_requested"}
     assert not (quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH).exists()
+
+
+def test_update_ashare_v2_dispatches_incremental_bundle_without_full_rebuild(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "BUNDLE_MANIFEST.json").write_text(
+        json.dumps({"bundle_mode": "incremental"}),
+        encoding="utf-8",
+    )
+    write_catalog(quant_data)
+    raw_stage = quant_data / "staging" / "raw-incremental"
+    qfq_stage = quant_data / "staging" / "qfq-incremental"
+    raw_published = quant_data / "published-raw"
+    qfq_published = quant_data / "published-qfq"
+    incremental_calls: list[dict[str, object]] = []
+    publish_calls: list[dict[str, object]] = []
+
+    def build_incremental(**kwargs):
+        incremental_calls.append(kwargs)
+        return types.SimpleNamespace(
+            raw_stage=raw_stage,
+            qfq_stage=qfq_stage,
+            base_latest_trade_date="2026-08-04",
+            latest_trade_date="2026-08-07",
+            downloaded_rows=16_548,
+            reused_symbols=("SH600000",),
+            factor_changed_symbols=("SZ000001",),
+            qfq_recalculated_symbols=("SZ000001",),
+        )
+
+    def reject_full_rebuild(**_kwargs):
+        raise AssertionError("incremental bundle must not use the full builder")
+
+    def publish_group(snapshots, **kwargs):
+        publish_calls.append({"snapshots": snapshots, **kwargs})
+        return [raw_published, qfq_published]
+
+    fake_modules = {
+        "download_baostock_v2": types.SimpleNamespace(
+            build_snapshots_from_bundle=reject_full_rebuild
+        ),
+        "incremental_update_ashare_v2": types.SimpleNamespace(
+            build_incremental_price_snapshots=build_incremental
+        ),
+    }
+    with patch.dict(sys.modules, fake_modules), patch.object(
+        module,
+        "publish_snapshot_group",
+        side_effect=publish_group,
+        create=True,
+    ), patch.object(
+        module,
+        "build_direct_provider_descriptor",
+        side_effect=fake_direct_provider_builder(quant_data),
+    ):
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "update",
+                "ashare_daily_qfq",
+                "--bundle-dir",
+                str(bundle),
+            ]
+        )
+
+    assert result == 0
+    assert incremental_calls == [
+        {"bundle_dir": bundle, "quant_data_root": quant_data.resolve()}
+    ]
+    assert publish_calls == [
+        {
+            "snapshots": [
+                (
+                    raw_stage,
+                    quant_data.resolve()
+                    / "parquet/ashare_1d/ashare_daily_raw",
+                ),
+                (
+                    qfq_stage,
+                    quant_data.resolve()
+                    / "parquet/ashare_1d/ashare_daily_qfq",
+                ),
+            ],
+            "quant_data_root": quant_data.resolve(),
+            "update_root_catalog": True,
+            "publication_lock_held": True,
+        }
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["update_mode"] == "incremental"
+    assert payload["incremental"]["base_latest_trade_date"] == "2026-08-04"
+    assert payload["incremental"]["latest_trade_date"] == "2026-08-07"
+    assert payload["incremental"]["downloaded_rows"] == 16_548
+    assert payload["incremental"]["factor_changed_symbols"] == 1
 
 
 def test_update_ashare_v2_builds_direct_provider_descriptors_not_bin_snapshots(

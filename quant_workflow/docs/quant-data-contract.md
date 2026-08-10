@@ -32,7 +32,11 @@ python quant_workflow/scripts/sync_data_manifest.py --check
 | 旧 JQData/东方财富/AkShare 来源目录 | `audit/legacy_unknown` | 仅审计，不再直接合并生成正式输出 |
 | V1 固定路径 merged/cleaned/Qlib | `legacy/ready` 兼容输出 | 仅供尚未迁移的旧程序和回滚，不是 DSA 正式输入 |
 | 带 `_old` 后缀的 merged/cleaned/Qlib | `audit/legacy_unknown` | 迁移前旧数据，只用于回滚和审计 |
-| PIT CSI800 和参考表 | `canonical/ready`（完整时） | 由原有事务锁和内容哈希保护，仍在逐步迁移到统一快照结构 |
+| PIT CSI800 (`pit_csi800`) | `canonical/ready` | `LATEST.json` 指向不可变快照；提供每日成员、成员区间和来源清单组件 |
+| 鲁棒参考表 (`robust_reference`) | `canonical/ready` | 冻结对应 PIT CSI800 快照；提供证券主表、行业区间、ST、停牌和来源清单组件 |
+| PIT 基本面 (`ashare_fundamentals_pit`) | `canonical/ready` | 东方财富历史报表，使用公告/更新时间后一个交易日生效，来源覆盖率不低于 98% |
+| 分钟线、盘中快照 | 尚未建立 | 日频读取器和 Qlib Provider 不会推导或伪造分钟数据 |
+| 全球日线 | `audit/legacy_unknown` | 尚无可复现 canonical 快照，不能进入正式港美日韩训练或回测 |
 
 首个正式 A 股 v2 快照覆盖到 `2026-07-24`。后续是否已更新到更晚日期，必须以 `quant_data_cli.py describe` 和根 `DATA_MANIFEST.json` 为准，不能把本文日期当成动态状态。迁移前旧 A 股输出改名为 `_old` 后保留，仅供回滚和审计。
 
@@ -91,6 +95,63 @@ qlib/cn_data_baostock_jqdata_cleaned/
 - `LATEST.json` 最后原子更新，只指向完整快照。
 - 失败时旧 `LATEST.json` 不变；新训练锁定启动时解析到的快照路径，不随之后的更新跳转。
 - bar、因子和公司行为都有独立哈希，整个快照另有 `content_sha256`。
+
+### 非行情组件与统一读取接口
+
+PIT 股票池、参考表和基本面数据同样使用不可变快照，但以
+`ARTIFACT_INDEX.parquet` 登记文件，以 `components` 声明可读取的逻辑组件。读取方
+只能按组件名解析，不能传入任意路径：
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py resolve \
+  pit_csi800 --component daily
+python quant_workflow/scripts/quant_data_cli.py resolve \
+  robust_reference --component security_master
+python quant_workflow/scripts/quant_data_cli.py resolve \
+  ashare_fundamentals_pit --component daily
+```
+
+A 股、ETF 和指数日线共用一个只读接口。它按正式文件索引解析证券代码，验证所选
+Parquet 哈希，再做字段和日期裁剪：
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py bars \
+  ashare_daily_qfq SH600000 --basis qfq \
+  --fields close volume --start 2026-08-01 --end 2026-08-07
+
+python quant_workflow/scripts/quant_data_cli.py bars \
+  cn_etf_daily 513100 --basis qfq --fields close
+```
+
+项目 Python 调用方使用：
+
+```python
+from quant_data_reader import read_bars
+
+bars = read_bars(
+    "cn_index_daily",
+    "SH000300",
+    quant_data_root=quant_data_root,
+    fields=["close", "volume"],
+    start="2026-08-01",
+    end="2026-08-07",
+)
+```
+
+A 股增量下载的证券清单必须从本次锁定的 base snapshot 导出，不能直接复用独立的
+`stock_lists.json`：
+
+```bash
+python quant_workflow/scripts/quant_data_cli.py export-universe \
+  ashare_daily_qfq --basis qfq --output <run-universe.json>
+```
+
+导出文件记录 `snapshot_id`、`manifest_sha256`、`latest_trade_date` 和
+`symbol_count`，用于在远端下载前确认证券集合与正式输入一致。
+
+该接口当前契约是**日频 bar**。分钟线和盘中快照需要独立 canonical 数据集、索引
+和读取契约；在这些数据建立前，打板等盘中研究保持暂停。全球日线当前也仍是
+`audit/legacy_unknown`，不能通过此接口绕过治理状态进入正式训练。
 
 ## 复权证据
 
@@ -212,6 +273,11 @@ python quant_workflow/scripts/download_baostock_v2.py download \
 python quant_workflow/scripts/quant_data_cli.py update \
   ashare_daily_qfq --bundle-dir <verified-bundle>
 ```
+
+CLI 必须先读取 `BUNDLE_MANIFEST.json.bundle_mode`。`incremental` bundle 只调用
+`incremental_update_ashare_v2.py`：复用当前完整历史，合并有限重叠窗口，只有完整
+复权因子指纹变化的证券才重算自身全历史 qfq；`full` bundle 才调用完整构建器。
+两种模式都将 raw/qfq 成组校验并原子发布，禁止把增量 bundle 误送到完整构建器。
 
 任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。完整更新链路持有 `runtime/locks/ashare_v2_update.lock` 单实例锁，第二个并发更新会在改写任何正式指针前退出。第一次发布前，命令把根清单以及 raw、qfq 两个正式 `LATEST.json` 的原始内容持久化到 `runtime/transactions/ashare_v2_update.json` 并执行 `fsync`。每个 staging 快照发布时，先对全部文件和子目录执行 `fsync`，再原子 rename，并同步 staging 与正式 `snapshots/` 目录；只有这些步骤成功后才写 `LATEST.json` 和根清单。raw、qfq 发布完成后，事务继续生成并校验 canonical、cleaned 两个 metadata-only Direct Provider 描述符；两者都成功才删除事务记录并正式提交。普通异常会立即恢复旧指针，进程被强制结束或机器断电时，下一次更新会在持有更新锁和发布锁后先自动恢复，再开始新的发布。事务记录缺失字段、内容哈希不符或无法读取时直接阻断更新，不能猜测旧状态。恢复结果写入 `runtime/status/quant_data_update_latest.json`，状态为 `rolled_back` 或 `recovered_interrupted_update`。已经完成校验但失去正式指针的不可变快照可以保留作审计，它们不会被 `resolve` 选中。默认更新到这里结束，不改旧固定路径或物理 `.bin` 数据。只有显式传入 `--refresh-legacy-compatibility` 才会在正式链成功后维护兼容输出；该可选步骤失败只写 `completed_with_legacy_warning`，不能撤销有效的原生快照。回滚本身失败则明确写 `rollback_failed`，并保留事务记录供下次恢复。
 

@@ -327,6 +327,9 @@ def test_build_product_writes_events_daily_partitions_and_source_contract(
     assert (output / "daily" / "2024.parquet").is_file()
     source = json.loads((output / "FUNDAMENTAL_SOURCE.json").read_text())
     assert source["effective_date_rule"] == "max_notice_or_update_plus_one_trading_day"
+    assert source["source_retrieved_at"].endswith("+00:00") or "+" in source[
+        "source_retrieved_at"
+    ][10:]
     assert "derived_field_rules" in source
     assert source["coverage"]["passed"] is True
 

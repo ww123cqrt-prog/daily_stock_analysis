@@ -223,7 +223,7 @@ def _legacy_dataset_entry(
         ),
     }
     if path.is_dir():
-        entry["file_count"] = len(list(path.glob("*.parquet")))
+        entry["file_count"] = sum(1 for item in path.rglob("*") if item.is_file())
         entry["size_bytes"] = directory_size_bytes(path)
     elif path.is_file():
         entry["file_count"] = 1
@@ -696,6 +696,7 @@ def _v2_dataset_catalog(
     for search_root in (
         quant_data / "parquet",
         quant_data / "qlib",
+        quant_data / "reference",
         quant_data / "runtime",
     ):
         if not search_root.is_dir():
@@ -813,17 +814,27 @@ def _v2_dataset_catalog(
 
 
 def _enrich_derived_entries(datasets: dict[str, Any]) -> None:
-    """Mark native derived providers stale when their frozen input has moved."""
+    """Mark any canonical derived snapshot stale when its frozen input moved."""
 
     for entry in datasets.values():
+        upstream_snapshots = (
+            entry.get("upstream_snapshots") if isinstance(entry, dict) else None
+        )
         if (
             not isinstance(entry, dict)
-            or entry.get("data_kind") != "qlib_provider"
             or entry.get("role") != "canonical"
             or entry.get("status") not in {"ready", "stale"}
+            or (
+                entry.get("data_kind") != "qlib_provider"
+                and (
+                    not str(entry.get("data_kind") or "").startswith(
+                        "point_in_time_"
+                    )
+                    or not upstream_snapshots
+                )
+            )
         ):
             continue
-        upstream_snapshots = entry.get("upstream_snapshots")
         dependencies = entry.get("dependency_snapshots", [])
         valid_upstream_shape = bool(
             isinstance(upstream_snapshots, list)
@@ -1001,6 +1012,9 @@ def _dataset_id_for_pointer(
         "parquet/ashare_1d/ashare_daily_qfq": "ashare_daily_qfq",
         "qlib/cn_data_ashare_v2": "qlib_ashare_v2",
         "qlib/cn_data_ashare_cleaned_v2": "qlib_ashare_cleaned_v2",
+        "reference": "robust_reference",
+        "reference/pit_csi800": "pit_csi800",
+        "reference/fundamentals": "ashare_fundamentals_pit",
     }
     return known_roots.get(relative_root, pointer_path.parent.name)
 

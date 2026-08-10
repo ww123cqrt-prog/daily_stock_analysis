@@ -91,6 +91,29 @@ def default_reference_dir() -> Path:
     return quant_data_root() / "reference"
 
 
+def _publish_v2_snapshots_if_default(reference_dir: Path) -> bool:
+    if Path(reference_dir).expanduser().resolve() != default_reference_dir().resolve():
+        return True
+    try:
+        from publish_reference_snapshots import (
+            publish_pit_snapshot,
+            publish_robust_reference_snapshot,
+        )
+        from sync_data_manifest import sync_data_manifest
+
+        root = default_reference_dir().parent
+        publish_pit_snapshot(quant_data_root=root)
+        publish_robust_reference_snapshot(quant_data_root=root)
+        sync_data_manifest(quant_data_root=root)
+        return True
+    except Exception as exc:
+        print(
+            f"ERROR: v2 reference snapshot publication failed ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return False
+
+
 def qlib_to_jq_symbol(value: Any) -> str:
     matched = QLIB_SYMBOL_PATTERN.fullmatch(str(value).strip().upper())
     if matched is None:
@@ -2027,6 +2050,8 @@ def main(
                     "download_robust_reference: imported existing snapshot; "
                     f"members={member_count}; member_days={member_day_count}"
                 )
+                if not _publish_v2_snapshots_if_default(reference_dir):
+                    return blocked("v2_snapshot_publish_failed")
                 return 0
 
             if args.reuse_existing:
@@ -2086,6 +2111,8 @@ def main(
                     "download_robust_reference: reused existing snapshot; "
                     f"members={member_count}; member_days={member_day_count}"
                 )
+                if not _publish_v2_snapshots_if_default(reference_dir):
+                    return blocked("v2_snapshot_publish_failed")
                 return 0
 
             baostock_cache_dir = (
@@ -2256,6 +2283,8 @@ def main(
             "download_robust_reference: completed; "
             f"members={member_count}; member_days={member_day_count}"
         )
+        if not _publish_v2_snapshots_if_default(reference_dir):
+            return blocked("v2_snapshot_publish_failed")
         return 0
     finally:
         for adapter in reversed(cleanup_adapters):

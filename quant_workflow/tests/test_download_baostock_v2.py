@@ -569,7 +569,17 @@ def test_incremental_bundle_keeps_empty_symbols_and_queries_full_factor_history(
     module = load_module()
     universe = tmp_path / "universe.json"
     universe.write_text(
-        json.dumps({"all": ["600000.XSHG", "000001.XSHE"]}),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dataset_id": "ashare_daily_qfq",
+                "snapshot_id": "qfq-001",
+                "manifest_sha256": "a" * 64,
+                "latest_trade_date": "2026-08-04",
+                "symbol_count": 2,
+                "all": ["600000.XSHG", "000001.XSHE"],
+            }
+        ),
         encoding="utf-8",
     )
     output = tmp_path / "bundle"
@@ -651,6 +661,14 @@ def test_incremental_bundle_keeps_empty_symbols_and_queries_full_factor_history(
     assert manifest["base_latest_trade_date"] == "2026-08-04"
     assert manifest["requested_start"] == "2026-07-27"
     assert manifest["factor_requested_start"] == "1990-01-01"
+    assert manifest["universe"] == {
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-001",
+        "manifest_sha256": "a" * 64,
+        "latest_trade_date": "2026-08-04",
+        "symbol_count": 2,
+        "universe_file_sha256": module.sha256_file(universe),
+    }
     assert manifest["completed_symbols"] == 2
     assert manifest["empty_symbols"] == 1
     assert index["symbol"].tolist() == ["SH600000", "SZ000001"]
@@ -660,3 +678,73 @@ def test_incremental_bundle_keeps_empty_symbols_and_queries_full_factor_history(
         ("query_adjust_factor", "sh.600000", "1990-01-01", None),
         ("query_adjust_factor", "sz.000001", "1990-01-01", None),
     ]
+
+
+def test_incremental_bundle_rejects_unbound_universe_before_provider_login(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    universe = tmp_path / "universe.json"
+    universe.write_text(
+        json.dumps({"all": ["600000.XSHG"]}),
+        encoding="utf-8",
+    )
+
+    class Provider:
+        def login(self):
+            raise AssertionError("provider login must not run")
+
+    with pytest.raises(module.BaostockV2Error, match="frozen base snapshot"):
+        module.download_bundle(
+            universe_file=universe,
+            output_dir=tmp_path / "bundle",
+            through="2026-08-07",
+            start="2026-07-27",
+            factor_start="1990-01-01",
+            mode="incremental",
+            base_latest_trade_date="2026-08-04",
+            request_interval=0.2,
+            request_budget=20,
+            retries=1,
+            provider=Provider(),
+        )
+
+
+def test_download_cli_forwards_incremental_bundle_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_module()
+    calls: list[dict[str, object]] = []
+    manifest = tmp_path / "bundle" / "BUNDLE_MANIFEST.json"
+
+    def fake_download_bundle(**kwargs):
+        calls.append(kwargs)
+        return manifest
+
+    monkeypatch.setattr(module, "download_bundle", fake_download_bundle)
+
+    result = module.main(
+        [
+            "download",
+            "--universe-file",
+            str(tmp_path / "universe.json"),
+            "--output-dir",
+            str(tmp_path / "bundle"),
+            "--through",
+            "2026-08-07",
+            "--start",
+            "2026-07-27",
+            "--mode",
+            "incremental",
+            "--factor-start",
+            "1990-01-01",
+            "--base-latest-trade-date",
+            "2026-08-04",
+        ]
+    )
+
+    assert result == 0
+    assert calls[0]["mode"] == "incremental"
+    assert calls[0]["factor_start"] == "1990-01-01"
+    assert calls[0]["base_latest_trade_date"] == "2026-08-04"

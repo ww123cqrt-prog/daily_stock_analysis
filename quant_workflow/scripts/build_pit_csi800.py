@@ -249,6 +249,27 @@ def default_output_dir() -> Path:
     return quant_data_root() / "reference" / "pit_csi800"
 
 
+def _publish_v2_snapshot_if_default(output_dir: Path) -> bool:
+    """Keep the fixed writer output as compatibility while publishing v2."""
+
+    if Path(output_dir).expanduser().resolve() != default_output_dir().resolve():
+        return True
+    try:
+        from publish_reference_snapshots import publish_pit_snapshot
+        from sync_data_manifest import sync_data_manifest
+
+        root = default_output_dir().parents[1]
+        publish_pit_snapshot(quant_data_root=root)
+        sync_data_manifest(quant_data_root=root)
+        return True
+    except Exception as exc:
+        print(
+            f"ERROR: v2 PIT snapshot publication failed ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return False
+
+
 def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -1809,6 +1830,11 @@ def main(
         f"PIT CSI800 build completed: {status['completed_date_count']} trading dates; "
         f"data={output_dir}; status={status_path}"
     )
+    if (
+        source_metadata.get("requested") != "injected"
+        and not _publish_v2_snapshot_if_default(output_dir)
+    ):
+        return BLOCKED_RETURN_CODE
     return 0
 
 

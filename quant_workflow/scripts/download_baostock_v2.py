@@ -188,6 +188,54 @@ def load_universe(path: Path) -> list[tuple[str, str]]:
     return result
 
 
+def validate_incremental_universe(
+    path: Path,
+    symbols: Sequence[tuple[str, str]],
+    *,
+    base_latest_trade_date: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BaostockV2Error(
+            "incremental universe is not bound to a frozen base snapshot"
+        ) from exc
+    manifest_sha256 = (
+        str(payload.get("manifest_sha256") or "")
+        if isinstance(payload, dict)
+        else ""
+    )
+    snapshot_id = (
+        str(payload.get("snapshot_id") or "")
+        if isinstance(payload, dict)
+        else ""
+    )
+    valid_hash = len(manifest_sha256) == 64 and all(
+        character in "0123456789abcdef" for character in manifest_sha256
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("dataset_id") not in {"ashare_daily_raw", "ashare_daily_qfq"}
+        or not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or not valid_hash
+        or payload.get("latest_trade_date") != base_latest_trade_date
+        or payload.get("symbol_count") != len(symbols)
+    ):
+        raise BaostockV2Error(
+            "incremental universe is not bound to the requested frozen base snapshot"
+        )
+    return {
+        "dataset_id": str(payload["dataset_id"]),
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_sha256,
+        "latest_trade_date": str(payload["latest_trade_date"]),
+        "symbol_count": len(symbols),
+        "universe_file_sha256": sha256_file(Path(path)),
+    }
+
+
 def collect_result(result: Any, *, maximum_rows: int = 20_000) -> pd.DataFrame:
     if maximum_rows < 1:
         raise BaostockV2Error("maximum result rows must be positive")
@@ -954,6 +1002,16 @@ def download_bundle(
             raise BaostockV2Error(
                 "incremental bundle must query the complete factor history"
             )
+    symbols = load_universe(universe_file)
+    universe_identity = (
+        validate_incremental_universe(
+            universe_file,
+            symbols,
+            base_latest_trade_date=str(base_latest_trade_date),
+        )
+        if mode == "incremental"
+        else None
+    )
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "RUNNING.lock"
@@ -964,7 +1022,6 @@ def download_bundle(
     os.write(lock_fd, str(os.getpid()).encode("ascii"))
     os.close(lock_fd)
 
-    symbols = load_universe(universe_file)
     audit_since = qfq_audit_since or (
         pd.Timestamp(through) - pd.Timedelta(days=45)
     ).date().isoformat()
@@ -1274,6 +1331,7 @@ def download_bundle(
             "requested_through": through,
             "factor_requested_start": factor_start_day.date().isoformat(),
             "base_latest_trade_date": base_latest_trade_date,
+            "universe": universe_identity,
             "requested_symbols": len(symbols),
             "completed_symbols": len(rows),
             "empty_symbols": len(empty_symbols),
@@ -1547,6 +1605,9 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--qfq-audit-since")
     download.add_argument("--qfq-sample-modulus", type=int, default=100)
     download.add_argument("--resume", action="store_true")
+    download.add_argument("--mode", choices=("full", "incremental"), default="full")
+    download.add_argument("--factor-start")
+    download.add_argument("--base-latest-trade-date")
     build = commands.add_parser("build")
     build.add_argument("--bundle-dir", type=Path, required=True)
     build.add_argument("--quant-data-root", type=Path, required=True)
@@ -1571,6 +1632,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 qfq_audit_since=args.qfq_audit_since,
                 qfq_sample_modulus=args.qfq_sample_modulus,
                 resume=args.resume,
+                mode=args.mode,
+                factor_start=args.factor_start,
+                base_latest_trade_date=args.base_latest_trade_date,
             )
             print(path)
             return 0

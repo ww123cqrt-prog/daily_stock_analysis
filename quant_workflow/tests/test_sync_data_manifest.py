@@ -968,6 +968,29 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertIn("ashare_cleaned_qfq_legacy", ashare_readme)
         self.assertEqual(manifest_issues, [])
 
+    def test_legacy_dataset_file_count_includes_nested_audit_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            quant_data = Path(tmp) / "quant_data"
+            dataset = quant_data / "parquet" / "global_1d"
+            (dataset / "us").mkdir(parents=True)
+            (dataset / "jp").mkdir(parents=True)
+            (dataset / "us" / "AAPL.parquet").write_bytes(b"us")
+            (dataset / "jp" / "7203.T.parquet").write_bytes(b"jp")
+
+            entry = module._legacy_dataset_entry(
+                quant_data=quant_data,
+                dataset_id="global_daily_legacy",
+                path=dataset,
+                data_kind="daily_bars",
+                source_provider="yahoo",
+                source_interface="chart_api_normalized",
+                price_basis="derived",
+                role="audit",
+            )
+
+        self.assertEqual(entry["file_count"], 2)
+
     def test_manifest_registers_complete_pit_and_marks_reference_pending(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1243,6 +1266,40 @@ class SyncDataManifestTest(unittest.TestCase):
         self.assertEqual(manifest["pending_entries"]["remote"]["status"], "pending")
         self.assertEqual(manifest["source_report"], "data_hygiene_inventory_latest.json")
         self.assertNotIn("daily_stock_analysis-robust", json.dumps(manifest))
+
+    def test_generic_snapshot_is_stale_when_frozen_upstream_pointer_moves(self):
+        module = load_module()
+        datasets = {
+            "pit_csi800": {
+                "dataset_id": "pit_csi800",
+                "status": "ready",
+                "snapshot_id": "pit-002",
+                "content_sha256": "b" * 64,
+                "price_basis": "not_applicable",
+            },
+            "robust_reference": {
+                "dataset_id": "robust_reference",
+                "data_kind": "point_in_time_reference",
+                "role": "canonical",
+                "status": "ready",
+                "upstream_snapshots": [
+                    {
+                        "dataset_id": "pit_csi800",
+                        "snapshot_id": "pit-001",
+                        "content_sha256": "a" * 64,
+                        "price_basis": "not_applicable",
+                    }
+                ],
+            },
+        }
+
+        module._enrich_derived_entries(datasets)
+
+        self.assertEqual(datasets["robust_reference"]["status"], "stale")
+        self.assertEqual(
+            datasets["robust_reference"]["blocker_codes"],
+            ["upstream_snapshot_mismatch"],
+        )
 
 
 if __name__ == "__main__":

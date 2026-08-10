@@ -12,7 +12,7 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, NamedTuple, Sequence
 
@@ -79,6 +79,13 @@ class ResolvedDatasetComponent(NamedTuple):
     dataset: ResolvedDataset
     price_basis: str
     component_path: Path
+
+
+class ResolvedDatasetArtifact(NamedTuple):
+    dataset: ResolvedDataset
+    component_name: str
+    component: dict[str, Any]
+    artifact_path: Path
 
 
 ValidatedResolutionCache = MutableMapping[str, ResolvedDataset]
@@ -709,6 +716,30 @@ def _snapshot_file(snapshot: Path, relative: object, field: str) -> Path:
     return candidate
 
 
+def _snapshot_artifact(snapshot: Path, relative: object, field: str) -> Path:
+    """Resolve a declared file or directory component inside one snapshot."""
+
+    if not isinstance(relative, str) or not relative:
+        raise DataContractError(f"{field} is required")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise DataContractError(f"{field} must stay inside snapshot")
+    snapshot = Path(snapshot).resolve()
+    current = snapshot
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise DataContractError(f"{field} cannot use symlinks")
+    candidate = current.resolve()
+    try:
+        candidate.relative_to(snapshot)
+    except ValueError as exc:
+        raise DataContractError(f"{field} must stay inside snapshot") from exc
+    if not candidate.exists() or candidate.is_symlink():
+        raise DataContractError(f"{field} is unavailable")
+    return candidate
+
+
 def _validate_bar_frame(frame: pd.DataFrame, path: Path) -> pd.Series:
     missing = [column for column in REQUIRED_BAR_COLUMNS if column not in frame.columns]
     if missing:
@@ -861,6 +892,273 @@ def _content_hash(snapshot: Path, manifest: Mapping[str, Any] | None = None) -> 
         stable.pop("content_sha256", None)
         digest.update(_json_bytes(stable))
     return digest.hexdigest()
+
+
+ARTIFACT_INDEX_FILENAME = "ARTIFACT_INDEX.parquet"
+ARTIFACT_DATA_KINDS = {
+    "point_in_time_membership",
+    "point_in_time_reference",
+    "point_in_time_fundamentals",
+}
+
+
+def _build_artifact_index(
+    snapshot: Path,
+    *,
+    hash_files: bool = True,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(Path(snapshot).rglob("*")):
+        if path.is_symlink():
+            raise DataContractError(
+                f"artifact snapshot cannot contain symlinks: {path.relative_to(snapshot)}"
+            )
+        if (
+            not path.is_file()
+            or path.name in {"DATASET_MANIFEST.json", ARTIFACT_INDEX_FILENAME}
+        ):
+            continue
+        row_count: int | None = None
+        file_type = path.suffix.lower().lstrip(".") or "binary"
+        if path.suffix.lower() == ".parquet":
+            try:
+                row_count = int(len(pd.read_parquet(path)))
+            except Exception as exc:
+                raise DataContractError(
+                    f"artifact parquet is unavailable: {path.relative_to(snapshot)}"
+                ) from exc
+        rows.append(
+            {
+                "relative_path": path.relative_to(snapshot).as_posix(),
+                "file_type": file_type,
+                "size_bytes": int(path.stat().st_size),
+                "row_count": row_count,
+                "sha256": sha256_file(path) if hash_files else None,
+            }
+        )
+    if not rows:
+        raise DataContractError("artifact snapshot contains no indexed files")
+    return pd.DataFrame(rows)
+
+
+def _normalize_artifact_components(
+    snapshot: Path,
+    components: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(components, Mapping) or not components:
+        raise DataContractError("artifact snapshot components are required")
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, raw in components.items():
+        if (
+            not isinstance(name, str)
+            or not DATASET_ID_RE.fullmatch(name)
+            or not isinstance(raw, Mapping)
+        ):
+            raise DataContractError("artifact snapshot component is invalid")
+        path = _snapshot_artifact(
+            snapshot,
+            raw.get("path"),
+            f"artifact component {name}",
+        )
+        kind = str(raw.get("kind") or "")
+        if not kind:
+            raise DataContractError("artifact snapshot component kind is required")
+        normalized[name] = {
+            **json.loads(json.dumps(dict(raw))),
+            "path": path.relative_to(Path(snapshot).resolve()).as_posix(),
+            "kind": kind,
+        }
+    return normalized
+
+
+def _normalize_artifact_date_range(value: Mapping[str, Any]) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise DataContractError("artifact snapshot date range is invalid")
+    start = str(value.get("start") or "")
+    end = str(value.get("end") or "")
+    try:
+        parsed_start = date.fromisoformat(start)
+        parsed_end = date.fromisoformat(end)
+    except ValueError as exc:
+        raise DataContractError("artifact snapshot date range is invalid") from exc
+    if parsed_start > parsed_end:
+        raise DataContractError("artifact snapshot date range is invalid")
+    return {"start": start, "end": end}
+
+
+def finalize_artifact_snapshot(
+    snapshot: Path,
+    *,
+    dataset_id: str,
+    snapshot_id: str,
+    data_kind: str,
+    role: str,
+    status: str,
+    source: Mapping[str, Any],
+    price_basis: str,
+    producer: Mapping[str, Any],
+    source_retrieved_at: str,
+    date_range: Mapping[str, Any],
+    components: Mapping[str, Mapping[str, Any]],
+    upstream_snapshots: Sequence[Mapping[str, Any]] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Finalize an immutable non-price dataset with a complete file index."""
+
+    snapshot = Path(snapshot).resolve()
+    if not DATASET_ID_RE.fullmatch(dataset_id):
+        raise DataContractError("dataset_id is invalid")
+    if not snapshot_id or Path(snapshot_id).name != snapshot_id:
+        raise DataContractError("snapshot_id is invalid")
+    if data_kind not in ARTIFACT_DATA_KINDS:
+        raise DataContractError("artifact data kind is invalid")
+    if role not in ROLES or status not in STATUSES or price_basis not in PRICE_BASES:
+        raise DataContractError("dataset role, status, or price basis is invalid")
+    if not isinstance(source, Mapping) or not source.get("provider"):
+        raise DataContractError("source provider is required")
+    if not isinstance(producer, Mapping) or not producer.get("script"):
+        raise DataContractError("producer script is required")
+    _iso_timestamp(source_retrieved_at, "source_retrieved_at")
+    normalized_range = _normalize_artifact_date_range(date_range)
+    normalized_components = _normalize_artifact_components(snapshot, components)
+    normalized_upstream = [
+        json.loads(json.dumps(dict(item))) for item in (upstream_snapshots or [])
+    ]
+    index = _build_artifact_index(snapshot)
+    index.to_parquet(snapshot / ARTIFACT_INDEX_FILENAME, index=False)
+    row_counts = pd.to_numeric(index["row_count"], errors="coerce")
+    manifest: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": dataset_id,
+        "snapshot_id": snapshot_id,
+        "data_kind": data_kind,
+        "role": role,
+        "status": status,
+        "source": dict(source),
+        "price_basis": price_basis,
+        "source_retrieved_at": source_retrieved_at,
+        "adjustment": {"method": "none"},
+        "producer": dict(producer),
+        "upstream_snapshots": normalized_upstream,
+        "date_range": normalized_range,
+        "latest_trade_date": normalized_range["end"],
+        "artifact_count": int(len(index)),
+        "row_count": int(row_counts.fillna(0).sum()),
+        "artifact_index_path": ARTIFACT_INDEX_FILENAME,
+        "components": normalized_components,
+    }
+    if metadata is not None:
+        manifest["metadata"] = json.loads(json.dumps(dict(metadata)))
+    manifest["content_sha256"] = _content_hash(snapshot, manifest)
+    atomic_write_json(snapshot / "DATASET_MANIFEST.json", manifest)
+    validate_artifact_snapshot(snapshot, verify_hashes=True)
+    return snapshot / "DATASET_MANIFEST.json"
+
+
+def validate_artifact_snapshot(
+    snapshot: Path,
+    *,
+    verify_hashes: bool = True,
+) -> dict[str, Any]:
+    snapshot = Path(snapshot).resolve()
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise DataContractError("artifact snapshot directory is unavailable")
+    manifest = _read_json(snapshot / "DATASET_MANIFEST.json")
+    required = {
+        "schema_version",
+        "dataset_id",
+        "snapshot_id",
+        "data_kind",
+        "role",
+        "status",
+        "source",
+        "price_basis",
+        "source_retrieved_at",
+        "adjustment",
+        "producer",
+        "date_range",
+        "latest_trade_date",
+        "artifact_count",
+        "row_count",
+        "artifact_index_path",
+        "components",
+        "content_sha256",
+    }
+    if (
+        not required.issubset(manifest)
+        or manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("data_kind") not in ARTIFACT_DATA_KINDS
+    ):
+        raise DataContractError("artifact snapshot manifest is incomplete or invalid")
+    if manifest.get("role") not in ROLES or manifest.get("status") not in STATUSES:
+        raise DataContractError("artifact snapshot role or status is invalid")
+    if manifest.get("price_basis") not in PRICE_BASES:
+        raise DataContractError("artifact snapshot price basis is invalid")
+    _iso_timestamp(manifest["source_retrieved_at"], "source_retrieved_at")
+    normalized_range = _normalize_artifact_date_range(manifest["date_range"])
+    if manifest.get("latest_trade_date") != normalized_range["end"]:
+        raise DataContractError("artifact snapshot latest date is invalid")
+    _validate_adjustment_contract(
+        role=str(manifest["role"]),
+        status=str(manifest["status"]),
+        price_basis=str(manifest["price_basis"]),
+        adjustment=manifest["adjustment"],
+        snapshot=snapshot,
+    )
+    index_path = _snapshot_file(
+        snapshot,
+        manifest["artifact_index_path"],
+        "artifact file index",
+    )
+    try:
+        recorded = pd.read_parquet(index_path)
+    except Exception as exc:
+        raise DataContractError("artifact file index is unavailable") from exc
+    required_index = {
+        "relative_path",
+        "file_type",
+        "size_bytes",
+        "row_count",
+        "sha256",
+    }
+    if recorded.empty or not required_index.issubset(recorded.columns):
+        raise DataContractError("artifact file index is invalid")
+    rebuilt = _build_artifact_index(snapshot, hash_files=verify_hashes)
+    recorded = recorded.sort_values("relative_path").reset_index(drop=True)
+    rebuilt = rebuilt.sort_values("relative_path").reset_index(drop=True)
+    if recorded["relative_path"].tolist() != rebuilt["relative_path"].tolist():
+        raise DataContractError("artifact file index is stale")
+    for actual, expected in zip(
+        recorded.itertuples(index=False), rebuilt.itertuples(index=False)
+    ):
+        if (
+            str(actual.file_type) != str(expected.file_type)
+            or int(actual.size_bytes) != int(expected.size_bytes)
+            or (
+                not pd.isna(actual.row_count)
+                and int(actual.row_count) != int(expected.row_count)
+            )
+        ):
+            raise DataContractError(
+                f"artifact file index is stale: {actual.relative_path}"
+            )
+        if verify_hashes and str(actual.sha256) != str(expected.sha256):
+            raise DataContractError(
+                f"artifact hash mismatch: {actual.relative_path}"
+            )
+    if int(manifest["artifact_count"]) != len(rebuilt):
+        raise DataContractError("artifact file count is stale")
+    expected_rows = int(
+        pd.to_numeric(rebuilt["row_count"], errors="coerce").fillna(0).sum()
+    )
+    if int(manifest["row_count"]) != expected_rows:
+        raise DataContractError("artifact row count is stale")
+    _normalize_artifact_components(snapshot, manifest["components"])
+    if verify_hashes and str(manifest["content_sha256"]) != _content_hash(
+        snapshot, manifest
+    ):
+        raise DataContractError("artifact snapshot content hash mismatch")
+    return manifest
 
 
 def _validate_adjustment_contract(
@@ -2073,6 +2371,8 @@ def validate_dataset_snapshot(
             verify_hashes=verify_hashes,
             evidence_root=evidence_root,
         )
+    if manifest.get("data_kind") in ARTIFACT_DATA_KINDS:
+        return validate_artifact_snapshot(snapshot, verify_hashes=verify_hashes)
     return validate_snapshot(snapshot, verify_hashes=verify_hashes)
 
 
@@ -2433,6 +2733,39 @@ def _catalog_entry_from_validated_manifest(
         if "transformation" in manifest:
             entry["transformation"] = manifest["transformation"]
         return entry
+    if manifest["data_kind"] in ARTIFACT_DATA_KINDS:
+        entry = {
+            "dataset_id": manifest["dataset_id"],
+            "data_kind": manifest["data_kind"],
+            "role": manifest["role"],
+            "status": manifest["status"],
+            "source": manifest["source"],
+            "price_basis": manifest["price_basis"],
+            "latest_trade_date": manifest["latest_trade_date"],
+            "date_range": manifest["date_range"],
+            "row_count": manifest["row_count"],
+            "artifact_count": manifest["artifact_count"],
+            "source_retrieved_at": manifest["source_retrieved_at"],
+            "adjustment": manifest["adjustment"],
+            "artifact_index_path": manifest["artifact_index_path"],
+            "components": manifest["components"],
+            "content_sha256": manifest["content_sha256"],
+            "producer": manifest["producer"],
+            "upstream_snapshots": manifest.get("upstream_snapshots", []),
+            "dataset_root": _safe_relative(
+                dataset_root, quant_data_root, "dataset_root"
+            ),
+            "latest_pointer": _safe_relative(
+                dataset_root / "LATEST.json", quant_data_root, "latest_pointer"
+            ),
+            "snapshot_id": manifest["snapshot_id"],
+            "snapshot_manifest_sha256": sha256_file(
+                snapshot / "DATASET_MANIFEST.json"
+            ),
+        }
+        if "metadata" in manifest:
+            entry["metadata"] = manifest["metadata"]
+        return entry
     entry = {
         "dataset_id": manifest["dataset_id"],
         "data_kind": manifest["data_kind"],
@@ -2462,7 +2795,14 @@ def _catalog_entry_from_validated_manifest(
             snapshot / "DATASET_MANIFEST.json"
         ),
     }
-    for field in ("available_price_bases", "components", "raw_file_index_path"):
+    for field in (
+        "available_price_bases",
+        "components",
+        "raw_file_index_path",
+        "artifact_index_path",
+        "artifact_count",
+        "metadata",
+    ):
         if field in manifest:
             entry[field] = manifest[field]
     return entry
@@ -2527,9 +2867,13 @@ def _validate_current_upstream(
 ) -> None:
     """Reject a derived provider whose frozen input is no longer current."""
 
-    if manifest.get("data_kind") != "qlib_provider":
+    data_kind = manifest.get("data_kind")
+    is_qlib_provider = data_kind == "qlib_provider"
+    if not is_qlib_provider and data_kind not in ARTIFACT_DATA_KINDS:
         return
-    upstream_snapshots = manifest.get("upstream_snapshots")
+    upstream_snapshots = manifest.get("upstream_snapshots", [])
+    if not upstream_snapshots and not is_qlib_provider:
+        return
     if not isinstance(upstream_snapshots, list) or len(upstream_snapshots) != 1:
         raise DataContractError("dataset upstream snapshot contract is invalid")
     dependencies = manifest.get("dependency_snapshots", [])
@@ -2693,6 +3037,43 @@ def resolve_dataset_component(
     if not component_path.is_dir() or component_path.is_symlink():
         raise DataContractError("dataset component directory is unavailable")
     return ResolvedDatasetComponent(resolved, price_basis, component_path)
+
+
+def resolve_dataset_artifact(
+    dataset_id: str,
+    component_name: str,
+    *,
+    quant_data_root: Path,
+    require_status: str = "ready",
+    validated_cache: ValidatedResolutionCache | None = None,
+) -> ResolvedDatasetArtifact:
+    """Resolve a named immutable component from a non-price dataset."""
+
+    resolved = resolve_dataset(
+        dataset_id,
+        quant_data_root=quant_data_root,
+        require_status=require_status,
+        validated_cache=validated_cache,
+    )
+    if resolved.manifest.get("data_kind") not in ARTIFACT_DATA_KINDS:
+        raise DataContractError("dataset is not an artifact snapshot")
+    components = resolved.manifest.get("components")
+    component = (
+        components.get(component_name) if isinstance(components, Mapping) else None
+    )
+    if not isinstance(component, Mapping):
+        raise DataContractError(f"dataset component is unavailable: {component_name}")
+    artifact_path = _snapshot_artifact(
+        resolved.snapshot_path,
+        component.get("path"),
+        f"dataset component {component_name}",
+    )
+    return ResolvedDatasetArtifact(
+        resolved,
+        component_name,
+        dict(component),
+        artifact_path,
+    )
 
 
 def describe_dataset(dataset_id: str, *, quant_data_root: Path) -> dict[str, Any]:

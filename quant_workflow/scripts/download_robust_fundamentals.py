@@ -539,6 +539,7 @@ def build_fundamental_product(
     source = {
         "schema_version": 1,
         **dict(source_metadata),
+        "source_retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": status,
         "reason_code": None if status == "pass" else coverage["reason_code"],
         "source_contract_version": SOURCE_CONTRACT_VERSION,
@@ -925,11 +926,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    quant_data_dir = args.quant_data_dir.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    status_path = args.status_path.expanduser().resolve()
     try:
         status = run_download(
-            quant_data_dir=args.quant_data_dir.expanduser().resolve(),
+            quant_data_dir=quant_data_dir,
             cache_dir=args.cache_dir.expanduser().resolve(),
-            output_dir=args.output_dir.expanduser().resolve(),
+            output_dir=output_dir,
             membership_dir=args.membership_dir.expanduser().resolve(),
             price_dir=args.price_dir.expanduser().resolve(),
             provider_dir=args.provider_dir.expanduser().resolve(),
@@ -940,11 +944,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             coverage_minimum=args.coverage_minimum,
             timeout=args.timeout,
             limit_symbols=args.limit_symbols,
-            status_path=args.status_path.expanduser().resolve(),
+            status_path=status_path,
         )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    if (
+        status.get("status") == "pass"
+        and output_dir == quant_data_dir / "reference" / "fundamentals"
+    ):
+        try:
+            from publish_reference_snapshots import publish_fundamentals_snapshot
+            from sync_data_manifest import sync_data_manifest
+
+            publish_fundamentals_snapshot(quant_data_root=quant_data_dir)
+            sync_data_manifest(quant_data_root=quant_data_dir)
+        except Exception as exc:
+            status.update(
+                {
+                    "status": "blocked_data",
+                    "reason_code": "v2_snapshot_publish_failed",
+                    "updated_at": datetime.now()
+                    .astimezone()
+                    .isoformat(timespec="seconds"),
+                }
+            )
+            _atomic_json(status, status_path)
+            print(
+                f"ERROR: v2 fundamental snapshot publication failed ({type(exc).__name__})",
+                file=sys.stderr,
+            )
     print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True, default=str))
     return 0 if status["status"] == "pass" else 3
 
