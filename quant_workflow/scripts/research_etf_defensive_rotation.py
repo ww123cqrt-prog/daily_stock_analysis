@@ -24,7 +24,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import (  # noqa: E402
+    provider_calendar_days,
+    quant_data_root,
+    reports_root,
+)
 from etf_momentum_rotation import (  # noqa: E402
     CASH,
     build_signal_table,
@@ -401,14 +405,10 @@ def classify_incremental_value(
 
 
 def _qlib_calendar(provider: Path) -> tuple[str, ...]:
-    path = provider / "calendars/day.txt"
-    if path.is_symlink() or not path.is_file():
-        raise DataContractError("Qlib benchmark calendar is unavailable")
-    values = tuple(
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    )
+    try:
+        values = tuple(provider_calendar_days(provider))
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise DataContractError("Qlib benchmark calendar is unavailable") from exc
     if not values or values != tuple(sorted(values)) or len(values) != len(set(values)):
         raise DataContractError("Qlib benchmark calendar is invalid")
     return values
@@ -417,6 +417,35 @@ def _qlib_calendar(provider: Path) -> tuple[str, ...]:
 def _qlib_open_series(
     provider: Path, calendar: tuple[str, ...], symbol: str
 ) -> pd.DataFrame | None:
+    descriptor = provider / "PROVIDER_DESCRIPTOR.json"
+    if descriptor.is_file():
+        try:
+            from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+            root = next(
+                parent
+                for parent in (provider, *provider.parents)
+                if parent.name == "quant_data"
+            )
+            context = _load_descriptor(descriptor, root)
+            index_frame = context.index_file_index
+            if index_frame is None or context.index_snapshot_path is None:
+                return None
+            matches = index_frame[index_frame["symbol"].astype(str) == symbol]
+            if len(matches) != 1:
+                return None
+            frame = pd.read_parquet(
+                context.index_snapshot_path / str(matches.iloc[0]["relative_path"]),
+                columns=["date", "open"],
+            )
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+            frame["open"] = pd.to_numeric(frame["open"], errors="coerce")
+            frame = frame.dropna().drop_duplicates("date").sort_values("date")
+            return frame.reset_index(drop=True) if not frame.empty else None
+        except (OSError, ValueError, KeyError, DataContractError):
+            raise
+        except Exception as exc:
+            raise DataContractError(f"direct benchmark feature is invalid: {symbol}") from exc
     path = provider / "features" / symbol.lower() / "open.day.bin"
     if not path.exists():
         return None
@@ -467,26 +496,15 @@ def load_index_benchmarks_from_provider(
 def resolve_index_benchmarks(root: Path) -> dict[str, Any]:
     try:
         resolved = resolve_dataset(
-            "qlib_ashare_v2",
+            "cn_index_daily",
             quant_data_root=root,
-            require_basis="qfq",
+            require_basis="derived",
         )
-        evidence = resolved.manifest.get("benchmarks")
-        if not isinstance(evidence, Mapping):
-            raise DataContractError("Qlib benchmark evidence is unavailable")
-        declared_required = evidence.get("required_symbols")
-        if declared_required is None:
-            required_symbols = QLIB_LEGACY_BENCHMARK_SYMBOLS
-        elif (
-            isinstance(declared_required, list)
-            and tuple(declared_required) == QLIB_BENCHMARK_SYMBOLS
-        ):
-            required_symbols = QLIB_BENCHMARK_SYMBOLS
-        else:
-            raise DataContractError("Qlib benchmark required symbols are invalid")
+        from _paths import qlib_workflow_provider_uri
+
         result = load_index_benchmarks_from_provider(
-            resolved.snapshot_path,
-            required_symbols=required_symbols,
+            qlib_workflow_provider_uri("canonical"),
+            required_symbols=QLIB_BENCHMARK_SYMBOLS,
         )
         result["data_identity"] = {
             "dataset_id": resolved.dataset_id,

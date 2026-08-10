@@ -17,6 +17,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from quant_workflow.scripts._optimized_strategy_core import OptimizedStrategy
+from quant_workflow.scripts._paths import init_qlib_workflow
 from quant_workflow.scripts._mlflow_run_provenance import (
     RunProvenanceError,
     resolve_immutable_provider_identity,
@@ -59,6 +60,20 @@ PROVIDER_IDENTITY_FIELDS = (
     "snapshot_id",
     "content_sha256",
     "manifest_sha256",
+)
+DIRECT_PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "content_sha256",
+    "manifest_sha256",
+    "descriptor_path",
+    "descriptor_sha256",
+    "cleaning_mode",
+    "index_dataset_id",
+    "index_snapshot_id",
+    "index_content_sha256",
+    "index_manifest_sha256",
 )
 LEGACY_BASELINE_STRATEGY = {
     "id": "baseline_daily",
@@ -110,10 +125,9 @@ def _default_market_loader(provider_uri: Path, start: str, end: str) -> pd.DataF
     if not provider_uri.is_dir():
         raise FileNotFoundError("The Qlib data provider used by this training run is unavailable")
 
-    import qlib
     from qlib.data import D
 
-    qlib.init(provider_uri=str(provider_uri), region="cn")
+    init_qlib_workflow(provider_uri=provider_uri)
     buffered_end = (pd.Timestamp(end) + pd.Timedelta(days=14)).date().isoformat()
     raw = D.features(["SH000300"], ["$close"], start_time=start, end_time=buffered_end)
     if raw.empty:
@@ -138,10 +152,9 @@ def _default_qlib_backtest_runner(
 ) -> pd.DataFrame:
     """Run the frozen Qlib portfolio configuration against saved predictions."""
 
-    import qlib
     from qlib.backtest import backtest as qlib_backtest
 
-    qlib.init(provider_uri=str(provider_uri), region="cn")
+    init_qlib_workflow(provider_uri=provider_uri)
     config = copy.deepcopy(portana_config)
     strategy = config["strategy"]
     strategy["kwargs"]["signal"] = pred
@@ -208,9 +221,14 @@ def _contract_hash(payload: dict[str, Any]) -> str:
 def _sanitized_provider_identity(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
+    fields = (
+        DIRECT_PROVIDER_IDENTITY_FIELDS
+        if value.get("provider_contract") == "direct_parquet_v1"
+        else PROVIDER_IDENTITY_FIELDS
+    )
     return {
         field: str(value[field])
-        for field in PROVIDER_IDENTITY_FIELDS
+        for field in fields
         if isinstance(value.get(field), str) and value.get(field)
     }
 
@@ -881,7 +899,12 @@ class TrainedStrategyBacktestService:
         original_parameters: dict[str, Any],
     ) -> dict[str, Any]:
         identity = _sanitized_provider_identity(report.get("provider_identity"))
-        provider_complete = all(identity.get(field) for field in PROVIDER_IDENTITY_FIELDS)
+        identity_fields = (
+            DIRECT_PROVIDER_IDENTITY_FIELDS
+            if identity.get("provider_contract") == "direct_parquet_v1"
+            else PROVIDER_IDENTITY_FIELDS
+        )
+        provider_complete = all(identity.get(field) for field in identity_fields)
         artifact_hashes_complete = self._artifact_hashes_complete(
             artifact_sha256,
             CUSTOM_REPLAY_ARTIFACTS,
@@ -1454,9 +1477,16 @@ class TrainedStrategyBacktestService:
                 f"Saved training artifact provenance cannot be verified: {filename}"
             ) from exc
         actual_identity = provenance.get("provider_identity")
+        identity_fields = (
+            DIRECT_PROVIDER_IDENTITY_FIELDS
+            if isinstance(expected_provider_identity, dict)
+            and expected_provider_identity.get("provider_contract")
+            == "direct_parquet_v1"
+            else PROVIDER_IDENTITY_FIELDS
+        )
         if not isinstance(actual_identity, dict) or any(
             actual_identity.get(field) != expected_provider_identity.get(field)
-            for field in PROVIDER_IDENTITY_FIELDS
+            for field in identity_fields
         ):
             raise ValueError(
                 f"Saved training artifact does not match the training report provider: {filename}"

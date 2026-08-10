@@ -22,7 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import (  # noqa: E402
     ashare_qfq_bars_dir,
-    qlib_provider_uri,
+    qlib_native_snapshot_uri,
     quant_data_root,
     reports_root,
     workflow_root,
@@ -534,7 +534,7 @@ def main() -> int:
     parser.add_argument(
         "--benchmark-provider-dir",
         type=Path,
-        default=CANONICAL_QLIB_DIR or qlib_provider_uri(),
+        default=CANONICAL_QLIB_DIR or qlib_native_snapshot_uri(),
     )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--no-overwrite", action="store_true")

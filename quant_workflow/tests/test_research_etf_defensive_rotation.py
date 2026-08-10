@@ -256,7 +256,7 @@ def test_missing_chinext_index_is_reported_without_etf_substitution(tmp_path: Pa
     assert "SZ159915" not in result["missing"]
 
 
-def test_resolved_legacy_evidence_ignores_stray_new_index_files(
+def test_formal_provider_reads_the_declared_index_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = load_module()
@@ -271,22 +271,24 @@ def test_resolved_legacy_evidence_ignores_stray_new_index_files(
         np.asarray([0.0, 100.0, 101.0, 102.0], dtype="<f4").tofile(
             feature_dir / "open.day.bin"
         )
-    legacy_symbols = ("SH000300", "SH000905", "SH000906")
     resolved = SimpleNamespace(
-        dataset_id="qlib_ashare_v2",
+        dataset_id="cn_index_daily",
         snapshot_path=provider,
         manifest={
-            "snapshot_id": "legacy-snapshot",
+            "snapshot_id": "index-snapshot",
             "content_sha256": "a" * 64,
             "benchmarks": {"symbols": {}, "source": {}},
         },
     )
     monkeypatch.setattr(module, "resolve_dataset", lambda *args, **kwargs: resolved)
+    import _paths as paths_module
+
+    monkeypatch.setattr(paths_module, "qlib_workflow_provider_uri", lambda *_args: provider)
 
     result = module.resolve_index_benchmarks(tmp_path)
 
-    assert set(result["available"]) == set(legacy_symbols)
-    assert result["missing"] == ["SZ399006", "SH000688"]
+    assert set(result["available"]) == set(module.INDEX_NAMES)
+    assert result["missing"] == []
 
 
 def test_benchmark_without_overlapping_etf_dates_is_only_reported_as_missing(

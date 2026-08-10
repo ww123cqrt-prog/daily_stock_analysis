@@ -63,8 +63,18 @@ def test_default_market_loader_keeps_risk_features_free_of_future_prices(
         "sys.modules",
         {"qlib": fake_qlib, "qlib.data": fake_qlib_data},
     ):
-        original = _default_market_loader(tmp_path, str(dates[0].date()), str(dates[-3].date()))
-        altered = _default_market_loader(tmp_path, str(dates[0].date()), str(dates[-3].date()))
+        # The production loader now requires a formal direct Provider
+        # descriptor.  This test isolates the look-ahead calculation, so the
+        # Qlib initialization itself is stubbed.
+        with patch(
+            "src.services.trained_strategy_backtest_service.init_qlib_workflow"
+        ):
+            original = _default_market_loader(
+                tmp_path, str(dates[0].date()), str(dates[-3].date())
+            )
+            altered = _default_market_loader(
+                tmp_path, str(dates[0].date()), str(dates[-3].date())
+            )
 
     decision_day = dates[-3]
     assert original.loc[decision_day, "benchmark_return"] != pytest.approx(

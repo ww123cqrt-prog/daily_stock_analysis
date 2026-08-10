@@ -25,13 +25,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import mlruns_root, qlib_provider_uri, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    mlruns_root,
+    provider_calendar_days,
+    qlib_workflow_provider_uri,
+    reports_root,
+    workflow_root,
+)
 
 
 WORKFLOW = workflow_root()
 REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
-CANONICAL_PROVIDER = qlib_provider_uri()
+CANONICAL_PROVIDER = qlib_workflow_provider_uri()
 LATEST_TRAINING_RESULT = REPORT_DIR / "latest_training_result.json"
 DEFAULT_MAX_RUNS = 8
 DEFAULT_TOPK = 20
@@ -622,10 +628,10 @@ def factor_analysis(run_dir: Path, *, topk: int = DEFAULT_TOPK) -> dict[str, Any
 
 
 def _calendar(provider_uri: Path = CANONICAL_PROVIDER) -> pd.DatetimeIndex:
-    path = provider_uri / "calendars" / "day.txt"
-    if not path.exists():
+    try:
+        dates = provider_calendar_days(provider_uri)
+    except (FileNotFoundError, OSError, ValueError):
         return pd.DatetimeIndex([])
-    dates = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return pd.DatetimeIndex(pd.to_datetime(dates, errors="coerce")).dropna().sort_values()
 
 

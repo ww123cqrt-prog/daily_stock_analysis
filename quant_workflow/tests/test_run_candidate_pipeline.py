@@ -43,6 +43,46 @@ def benchmark_frame(dates: pd.DatetimeIndex, close: list[float]) -> pd.DataFrame
 
 
 class CandidatePipelineTest(unittest.TestCase):
+    def test_default_pipeline_provider_is_the_direct_quant_data_provider(self):
+        module = load_module()
+        direct = Path("/quant_data/runtime/qlib_direct/provider")
+
+        with (
+            patch.object(module, "qlib_workflow_provider_uri", return_value=direct),
+        ):
+            self.assertEqual(module.resolve_pipeline_provider("canonical"), direct)
+
+    def test_direct_provider_is_eligible_for_candidate_backtest(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_direct/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+        eligibility = module._backtest_eligibility(
+            {
+                "run_id": "candidate-run",
+                "experiment_id": "candidate-experiment",
+                "artifact_sha256": {
+                    "pred.pkl": "f" * 64,
+                    "label.pkl": "0" * 64,
+                },
+            },
+            identity,
+            dry_run=False,
+        )
+        self.assertTrue(eligibility["eligible"])
+        self.assertEqual(eligibility["missing"], [])
+
     def test_atomic_write_fsyncs_file_and_parent_directory(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -78,7 +118,7 @@ class CandidatePipelineTest(unittest.TestCase):
             ) as approved_resolver,
             patch.object(
                 module,
-                "qlib_provider_uri",
+                "qlib_workflow_provider_uri",
                 side_effect=AssertionError("LATEST was resolved"),
             ),
         ):
@@ -543,16 +583,17 @@ class CandidatePipelineTest(unittest.TestCase):
             "sys.modules",
             {"qlib": fake_qlib, "qlib.data": fake_qlib_data},
         ):
-            original = module.load_market_data(
-                Path("/unused/provider"),
-                str(dates[0].date()),
-                str(dates[-1].date()),
-            )
-            altered = module.load_market_data(
-                Path("/unused/provider"),
-                str(dates[0].date()),
-                str(dates[-1].date()),
-            )
+            with patch.object(module, "init_qlib_workflow", return_value=Path("/unused/provider")):
+                original = module.load_market_data(
+                    Path("/unused/provider"),
+                    str(dates[0].date()),
+                    str(dates[-1].date()),
+                )
+                altered = module.load_market_data(
+                    Path("/unused/provider"),
+                    str(dates[0].date()),
+                    str(dates[-1].date()),
+                )
 
         decision_day = dates[-3]
         self.assertNotAlmostEqual(

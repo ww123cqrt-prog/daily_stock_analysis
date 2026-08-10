@@ -292,6 +292,19 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 )
             )
 
+        if not getattr(args, "skip_index_update", False):
+            index_update = _script("quant_data_cli.py") + [
+                "--root",
+                str(QUANT_DATA),
+                "update",
+                "cn_index_daily",
+                "--through",
+                str(args.end),
+            ]
+            if args.use_system_proxy:
+                index_update.append("--use-system-proxy")
+            stages.append(Stage("update_cn_index_daily", index_update, required=True))
+
     bundle_dir = getattr(args, "ashare_v2_bundle_dir", None)
     if bundle_dir is not None:
         stages.append(
@@ -309,11 +322,10 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
             )
         )
 
-    for dataset_id in (
-        "ashare_daily_qfq",
-        "qlib_ashare_v2",
-        "qlib_ashare_cleaned_v2",
-    ):
+    # The formal Qlib input is the governed Parquet snapshot plus the direct
+    # Provider descriptor.  The old physical .bin dataset IDs are not part of
+    # this runner, even when an old compatibility snapshot is still present.
+    for dataset_id in ("ashare_daily_qfq", "cn_index_daily"):
         stages.append(
             Stage(
                 f"validate_{dataset_id}",
@@ -321,10 +333,12 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
                 + ["--root", str(QUANT_DATA), "validate", dataset_id],
             )
         )
-    stages.append(Stage("check_qlib_data", _script("check_qlib_data.py")))
+    stages.append(
+        Stage("check_qlib_direct_data", _script("check_qlib_data.py"))
+    )
     stages.append(
         Stage(
-            "check_qlib_cleaned_data",
+            "check_qlib_direct_cleaned_data",
             _script("check_qlib_data.py") + ["--provider", "cleaned"],
         )
     )
@@ -525,6 +539,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-global-daily", action="store_true")
     parser.add_argument("--skip-ashare-news", action="store_true")
     parser.add_argument("--skip-etf-momentum", action="store_true")
+    parser.add_argument(
+        "--skip-index-update",
+        action="store_true",
+        help="Skip the formal five-index incremental update and only validate the current snapshot.",
+    )
     parser.add_argument("--use-system-proxy", action="store_true")
     parser.add_argument("--news-limit", type=int, default=0)
     parser.add_argument("--overlap-sample", type=int, default=0)
@@ -574,14 +593,12 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         (
             "cn_etf_daily",
             "ashare_daily_qfq",
-            "qlib_ashare_v2",
-            "qlib_ashare_cleaned_v2",
+            "cn_index_daily",
         )
     )
     etf_before = governed_before["cn_etf_daily"]
     qfq_before = governed_before["ashare_daily_qfq"]
-    qlib_before = governed_before["qlib_ashare_v2"]
-    qlib_cleaned_before = governed_before["qlib_ashare_cleaned_v2"]
+    index_before = governed_before["cn_index_daily"]
     _log(f"latest unified ETF date before: {etf_before or 'n/a'}")
     write_runtime_status(run_id, "running", current_stage="starting", source_coverage_before=before)
 
@@ -645,14 +662,12 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
         (
             "cn_etf_daily",
             "ashare_daily_qfq",
-            "qlib_ashare_v2",
-            "qlib_ashare_cleaned_v2",
+            "cn_index_daily",
         )
     )
     etf_after = governed_after["cn_etf_daily"]
     qfq_after = governed_after["ashare_daily_qfq"]
-    qlib_after = governed_after["qlib_ashare_v2"]
-    qlib_cleaned_after = governed_after["qlib_ashare_cleaned_v2"]
+    index_after = governed_after["cn_index_daily"]
     summary_path = write_summary(
         results,
         {
@@ -667,10 +682,9 @@ def execute_pipeline(args: argparse.Namespace, run_id: str) -> int:
             "etf_date_after": etf_after,
             "ashare_qfq_date_before": qfq_before,
             "ashare_qfq_date_after": qfq_after,
-            "qlib_v2_date_before": qlib_before,
-            "qlib_v2_date_after": qlib_after,
-            "qlib_cleaned_v2_date_before": qlib_cleaned_before,
-            "qlib_cleaned_v2_date_after": qlib_cleaned_after,
+            "index_date_before": index_before,
+            "index_date_after": index_after,
+            "qlib_storage_mode": "direct_parquet",
             "dry_run": bool(args.dry_run),
             "skip_download": bool(args.skip_download),
             "official_published": published,

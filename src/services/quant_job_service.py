@@ -151,8 +151,8 @@ ROBUST_SIGNAL_DATA_PINNED_JOB_TYPES = {
     "resume_robust_signal_research",
 }
 TRAINING_PROVIDER_DATASET_IDS = {
-    "canonical": "qlib_ashare_v2",
-    "cleaned": "qlib_ashare_cleaned_v2",
+    "canonical": "ashare_daily_qfq",
+    "cleaned": "ashare_daily_qfq",
 }
 PROVIDER_IDENTITY_FIELDS = (
     "provider_contract",
@@ -160,6 +160,20 @@ PROVIDER_IDENTITY_FIELDS = (
     "snapshot_id",
     "manifest_sha256",
     "content_sha256",
+)
+DIRECT_PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+    "descriptor_path",
+    "descriptor_sha256",
+    "cleaning_mode",
+    "index_dataset_id",
+    "index_snapshot_id",
+    "index_content_sha256",
+    "index_manifest_sha256",
 )
 MARKET_DATA_PINNED_JOB_TYPES = {
     "report_market_regime",
@@ -780,6 +794,35 @@ def _approved_provider_identity_json(
 ) -> str:
     expected_dataset_id = TRAINING_PROVIDER_DATASET_IDS[provider]
     payload = {field: identity.get(field) for field in PROVIDER_IDENTITY_FIELDS}
+    if identity.get("provider_contract") == "direct_parquet_v1":
+        payload = {
+            field: identity.get(field) for field in DIRECT_PROVIDER_IDENTITY_FIELDS
+        }
+        descriptor_path = str(payload.get("descriptor_path") or "")
+        if (
+            payload.get("dataset_id") != expected_dataset_id
+            or payload.get("cleaning_mode") != provider
+            or not descriptor_path
+            or Path(descriptor_path).is_absolute()
+            or ".." in Path(descriptor_path).parts
+            or payload.get("index_dataset_id") != "cn_index_daily"
+            or not isinstance(payload.get("index_snapshot_id"), str)
+            or Path(str(payload.get("index_snapshot_id"))).name
+            != payload.get("index_snapshot_id")
+            or any(
+                not isinstance(payload.get(field), str)
+                or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
+                for field in (
+                    "manifest_sha256",
+                    "content_sha256",
+                    "descriptor_sha256",
+                    "index_content_sha256",
+                    "index_manifest_sha256",
+                )
+            )
+        ):
+            raise ValueError("Approved direct Provider identity is invalid or mismatched.")
+        return _json_dumps(payload)
     snapshot_id = payload.get("snapshot_id")
     if (
         payload.get("provider_contract") != "immutable_snapshot_v2"
@@ -1143,7 +1186,10 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             return command
         if _as_bool(params.get("no_overwrite")):
             raise ValueError("no_overwrite is only supported by the isolated smoke fixture")
-        return _script_command("build_qlib_v2.py") + ["--publish"]
+        return _script_command("build_qlib_direct_provider.py") + [
+            "--cleaning-mode",
+            "canonical",
+        ]
 
     def apply_data_cleaning(params: Mapping[str, Any]) -> List[str]:
         if _as_bool(params.get("dry_run")):
@@ -1151,7 +1197,10 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_reports_out_dir(command)
             command.append("--dry-run")
             return command
-        return _script_command("build_cleaned_qlib_v2.py") + ["--publish"]
+        return _script_command("build_qlib_direct_provider.py") + [
+            "--cleaning-mode",
+            "cleaned",
+        ]
 
     def repair_qlib_provider(_params: Mapping[str, Any]) -> List[str]:
         return _script_command("repair_qlib_provider.py") + ["--dry-run"]
@@ -1648,12 +1697,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
         "merge_to_qlib": {
-            "label": "构建并发布原生 Qlib V2",
+            "label": "生成正式 Qlib 直读 Provider",
             "command": merge_to_qlib,
             "allowed_params": {"no_overwrite", "smoke"},
         },
         "apply_data_cleaning": {
-            "label": "构建原生 cleaned Qlib V2 快照",
+            "label": "生成正式 cleaned 直读 Qlib Provider",
             "command": apply_data_cleaning,
             "allowed_params": {"dry_run"},
             "artifact_patterns": [

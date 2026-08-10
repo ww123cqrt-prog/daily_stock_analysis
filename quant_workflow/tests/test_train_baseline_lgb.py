@@ -188,7 +188,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
             ) as approved_resolver,
             patch.object(
                 module,
-                "qlib_provider_uri",
+                "qlib_native_snapshot_uri",
                 side_effect=AssertionError("LATEST was resolved"),
             ),
         ):
@@ -207,7 +207,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
         module = load_module()
         pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
 
-        with patch.object(module, "qlib_provider_uri", return_value=pinned) as resolver:
+        with patch.object(module, "qlib_native_snapshot_uri", return_value=pinned) as resolver:
             resolved = module.resolve_provider_uri("canonical", pinned)
 
         self.assertEqual(resolved, pinned)
@@ -261,16 +261,19 @@ class TrainBaselineLgbTest(unittest.TestCase):
         canonical = module.resolve_provider_uri("canonical")
         cleaned = module.resolve_provider_uri("cleaned")
 
-        manifest = json.loads(
-            (canonical / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        descriptor = json.loads(
+            (canonical / "PROVIDER_DESCRIPTOR.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["dataset_id"], "qlib_ashare_v2")
-        self.assertTrue(manifest["benchmark_complete"])
-        cleaned_manifest = json.loads(
-            (cleaned / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        self.assertEqual(descriptor["storage_mode"], "direct_parquet")
+        self.assertEqual(descriptor["dataset"]["dataset_id"], "ashare_daily_qfq")
+        self.assertEqual(
+            set(descriptor["index_dataset"]["required_symbols"]),
+            {"SH000300", "SH000905", "SH000906", "SZ399006", "SH000688"},
         )
-        self.assertEqual(cleaned_manifest["dataset_id"], "qlib_ashare_cleaned_v2")
-        self.assertTrue(cleaned_manifest["benchmark_complete"])
+        cleaned_descriptor = json.loads(
+            (cleaned / "PROVIDER_DESCRIPTOR.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(cleaned_descriptor["cleaning"]["mode"], "cleaned")
 
     def test_rejects_unknown_provider_name(self):
         module = load_module()
@@ -293,7 +296,6 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-
             runtime = module.write_runtime_config_with_provider(
                 source,
                 Path("/new/provider"),
@@ -307,6 +309,48 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(source_payload["qlib_init"]["provider_uri"], "/old/provider")
         self.assertEqual(runtime_payload["qlib_init"]["provider_uri"], "/new/provider")
         self.assertIn("cleaned", runtime.name)
+
+    def test_runtime_config_contains_direct_provider_components(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "baseline.yaml"
+            source.write_text(
+                yaml.safe_dump({"qlib_init": {"provider_uri": "/old/provider"}}),
+                encoding="utf-8",
+            )
+            direct_provider = base / "direct" / "provider"
+            direct_provider.mkdir(parents=True)
+            (direct_provider / "PROVIDER_DESCRIPTOR.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            direct_config = {
+                "provider_uri": "/direct/provider",
+                "calendar_provider": {"class": "QuantDataCalendarProvider"},
+                "instrument_provider": {"class": "QuantDataInstrumentProvider"},
+                "feature_provider": {"class": "QuantDataFeatureProvider"},
+                "provider": {"class": "QuantDataProvider"},
+            }
+            with patch.object(
+                module,
+                "qlib_init_config_for_uri",
+                return_value=direct_config,
+            ):
+                runtime = module.write_runtime_config_with_provider(
+                    source,
+                    direct_provider,
+                    "canonical",
+                    base / "runtime",
+                    extend_dates_to_provider_latest=False,
+                )
+
+            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["qlib_init"]["provider_uri"], "/direct/provider")
+        self.assertEqual(
+            payload["qlib_init"]["feature_provider"]["class"],
+            "QuantDataFeatureProvider",
+        )
 
     def test_runtime_config_extends_dates_to_provider_latest_calendar_day(self):
         module = load_module()

@@ -31,7 +31,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import mlruns_root, qlib_provider_uri, quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    mlruns_root,
+    qlib_init_config_for_uri,
+    qlib_workflow_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from _mlflow_run_provenance import (  # noqa: E402
     experiment_run_ids,
     provider_identity,
@@ -48,7 +56,7 @@ REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
 MLFLOW_TRACKING_URI = f"file://{MLRUNS_DIR}"
 QUANT_DATA = quant_data_root()
-DATA_DIR = qlib_provider_uri()
+DATA_DIR = qlib_workflow_provider_uri()
 
 os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
 os.environ["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
@@ -75,9 +83,9 @@ def _experiment_by_name(client, experiment_name: str):
 def init_qlib(data_dir: Path = DATA_DIR):
     """Initialize Qlib lazily so browser-safe dry-runs can import this module."""
     configure_mlflow_env()
+    init_qlib_workflow(provider_uri=data_dir)
     import qlib
 
-    qlib.init(provider_uri=str(data_dir), region="cn")
     return qlib
 
 
@@ -94,7 +102,10 @@ def write_training_config_with_provider(
     config_path = Path(config_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
-    qlib_init["provider_uri"] = str(Path(provider_uri))
+    if Path(provider_uri).exists():
+        qlib_init.update(qlib_init_config_for_uri(provider_uri))
+    else:
+        qlib_init["provider_uri"] = str(Path(provider_uri))
     payload["qlib_init"] = qlib_init
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,7 +164,7 @@ def train_and_predict(
         str(experiment.experiment_id),
         before_run_ids,
     )
-    identity = provider_identity(Path(provider_uri))
+    identity = provider_identity(Path(provider_uri), quant_data_root=QUANT_DATA)
     tag_run_with_provider(client, str(run.info.run_id), identity)
 
     # 下载预测结果
@@ -180,7 +191,7 @@ def load_existing_predictions(
     run = select_matching_prediction_run(
         client,
         str(experiment.experiment_id),
-        provider_identity(Path(provider_uri)),
+        provider_identity(Path(provider_uri), quant_data_root=QUANT_DATA),
     )
     if run is None:
         return None, None, {}

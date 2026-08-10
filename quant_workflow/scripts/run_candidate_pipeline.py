@@ -28,7 +28,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import (  # noqa: E402
     mlruns_root,
-    qlib_provider_uri,
+    provider_calendar_days,
+    qlib_init_config_for_uri,
+    qlib_workflow_provider_uri,
+    init_qlib_workflow,
     quant_data_root,
     reports_root,
     workflow_root,
@@ -68,7 +71,7 @@ def resolve_pipeline_provider(
             expected_provider_identity,
             quant_data_root=QUANT_DATA,
         )
-    return qlib_provider_uri(provider)
+    return qlib_workflow_provider_uri(provider)
 
 
 REQUIRED_MODEL_IDS = ["linear_ols", "linear_ridge", "lightgbm", "xgboost", "catboost"]
@@ -371,10 +374,9 @@ def pipeline_status(candidates: list[dict[str, Any]]) -> str:
 
 
 def provider_days(provider_uri: Path) -> tuple[str, str, str]:
-    calendar = provider_uri / "calendars" / "day.txt"
-    days = [line.strip() for line in calendar.read_text(encoding="utf-8").splitlines() if line.strip()]
+    days = provider_calendar_days(provider_uri)
     if len(days) < 3:
-        raise ValueError(f"Provider calendar needs at least three days: {calendar}")
+        raise ValueError(f"Provider calendar needs at least three days: {provider_uri}")
     return days[-1], days[-2], days[-3]
 
 
@@ -385,10 +387,9 @@ def benchmark_label_returns(close: pd.Series) -> pd.Series:
 
 
 def load_market_data(provider_uri: Path, start: str, end: str) -> pd.DataFrame:
-    import qlib
     from qlib.data import D
 
-    qlib.init(provider_uri=str(provider_uri), region="cn")
+    init_qlib_workflow(provider_uri=provider_uri)
     raw = D.features(["SH000300"], ["$close"], start_time=start, end_time=end)
     if raw.empty:
         raise ValueError("SH000300 benchmark data is unavailable")
@@ -608,8 +609,44 @@ def _backtest_eligibility(
         for name in ("pred.pkl", "label.pkl")
     ):
         missing.append("replayable_predictions")
-    if (
-        provider.get("provider_contract") != "immutable_snapshot_v2"
+    provider_contract = provider.get("provider_contract")
+    if provider_contract == "direct_parquet_v1":
+        direct_required = (
+            "dataset_id",
+            "snapshot_id",
+            "manifest_sha256",
+            "content_sha256",
+            "descriptor_path",
+            "descriptor_sha256",
+            "cleaning_mode",
+            "index_dataset_id",
+            "index_snapshot_id",
+            "index_content_sha256",
+            "index_manifest_sha256",
+        )
+        direct_valid = (
+            provider.get("dataset_id") == "ashare_daily_qfq"
+            and provider.get("index_dataset_id") == "cn_index_daily"
+            and provider.get("cleaning_mode") in {"canonical", "cleaned"}
+            and isinstance(provider.get("descriptor_path"), str)
+            and not Path(str(provider.get("descriptor_path"))).is_absolute()
+            and ".." not in Path(str(provider.get("descriptor_path"))).parts
+            and all(provider.get(field) for field in direct_required)
+            and all(
+                SHA256_RE.fullmatch(str(provider.get(field) or ""))
+                for field in (
+                    "manifest_sha256",
+                    "content_sha256",
+                    "descriptor_sha256",
+                    "index_content_sha256",
+                    "index_manifest_sha256",
+                )
+            )
+        )
+        if not direct_valid:
+            missing.append("provider_snapshot")
+    elif (
+        provider_contract != "immutable_snapshot_v2"
         or not provider.get("dataset_id")
         or not provider.get("snapshot_id")
         or any(
@@ -636,7 +673,14 @@ def _run_model_training(
 ) -> tuple[dict[str, Any], pd.DataFrame | pd.Series, pd.DataFrame | pd.Series]:
     base = yaml.safe_load(_resolve_base_config(spec).read_text(encoding="utf-8")) or {}
     candidate_config = build_candidate_config(base, model)
-    candidate_config.setdefault("qlib_init", {})["provider_uri"] = str(provider_uri)
+    qlib_init = dict(candidate_config.get("qlib_init") or {})
+    qlib_init.update(
+        qlib_init_config_for_uri(
+            provider_uri,
+            provider=provider,
+        )
+    )
+    candidate_config["qlib_init"] = qlib_init
     apply_common_periods(
         candidate_config,
         spec,

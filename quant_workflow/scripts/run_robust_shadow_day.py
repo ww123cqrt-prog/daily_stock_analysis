@@ -445,9 +445,9 @@ def _split_for_inference(record: Mapping[str, Any], as_of_date: str) -> RollingS
 
 
 def _default_qlib_initializer(provider_uri: Path) -> None:
-    import qlib
+    from _paths import init_qlib_workflow
 
-    qlib.init(provider_uri=str(provider_uri), region="cn", kernels=8)
+    init_qlib_workflow(provider_uri=provider_uri, kernels=8)
 
 
 def _default_dataset_factory(

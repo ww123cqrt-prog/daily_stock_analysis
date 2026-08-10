@@ -18,7 +18,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import (  # noqa: E402
     qlib_compatibility_provider_uri,
-    qlib_provider_uri,
+    qlib_native_snapshot_uri,
 )
 from quant_data_contract import (  # noqa: E402
     DataContractError,
@@ -136,7 +136,7 @@ def compare_benchmark_providers(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--native-provider", type=Path, default=qlib_provider_uri())
+    parser.add_argument("--native-provider", type=Path, default=qlib_native_snapshot_uri())
     parser.add_argument(
         "--compatibility-provider",
         type=Path,

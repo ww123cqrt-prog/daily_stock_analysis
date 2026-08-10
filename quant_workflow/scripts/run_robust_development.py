@@ -29,7 +29,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from robust_strategy_core import RollingSplit, make_rolling_split  # noqa: E402
-from _paths import mlruns_root  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    mlruns_root,
+    provider_calendar_days,
+)
 from robust_evaluation import (  # noqa: E402
     aggregate_prediction_frames,
     aggregate_training_artifacts,
@@ -1247,9 +1251,7 @@ def run_training_jobs(
     dataset_factory = dataset_factory or _default_dataset_factory
     model_factory = model_factory or _default_model_factory
     if dataset_factory is _default_dataset_factory:
-        import qlib
-
-        qlib.init(provider_uri=str(provider_uri), region="cn", kernels=8)
+        init_qlib_workflow(provider_uri=provider_uri, kernels=8)
 
     groups: dict[tuple[str, int], list[TrainingJob]] = {}
     for job in pending:
@@ -1674,8 +1676,9 @@ def _run_development_impl(
         _write_json(report_dir / "development_latest.json", payload)
         return payload
     provider_tree_sha256 = provider_identity["provider_tree_sha256"]
-    calendar_path = provider_uri / "calendars" / "day.txt"
-    if not calendar_path.is_file():
+    try:
+        provider_days = provider_calendar_days(provider_uri)
+    except (FileNotFoundError, RuntimeError, ValueError):
         payload = _failure_report("provider_calendar_missing", as_of_date=as_of_date)
         _write_json(report_dir / "development_latest.json", payload)
         return payload
@@ -1724,11 +1727,7 @@ def _run_development_impl(
         payload = _failure_report(exc.reason_code, as_of_date=as_of_date)
         _write_json(report_dir / "development_latest.json", payload)
         return payload
-    calendar = pd.DatetimeIndex(
-        pd.to_datetime(
-            calendar_path.read_text(encoding="utf-8").splitlines(), errors="coerce"
-        )
-    ).dropna()
+    calendar = pd.DatetimeIndex(pd.to_datetime(provider_days, errors="coerce")).dropna()
     jobs = build_training_jobs(config)
     run_dir = report_dir / "runs" / run_id / "development"
     context_path = run_dir / "development_context.json"

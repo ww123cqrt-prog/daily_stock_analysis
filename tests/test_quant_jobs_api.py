@@ -1414,11 +1414,21 @@ class QuantJobsApiTestCase(unittest.TestCase):
             )
             client = self._make_client(service)
             approved_identity = {
-                "provider_contract": "immutable_snapshot_v2",
-                "dataset_id": "qlib_ashare_cleaned_v2",
+                "provider_contract": "direct_parquet_v1",
+                "dataset_id": "ashare_daily_qfq",
                 "snapshot_id": "cleaned-snapshot",
                 "manifest_sha256": "a" * 64,
                 "content_sha256": "b" * 64,
+                "descriptor_path": (
+                    "runtime/qlib_direct/providers/ashare_daily_qfq/"
+                    "cleaned-snapshot/cleaned/PROVIDER_DESCRIPTOR.json"
+                ),
+                "descriptor_sha256": "c" * 64,
+                "cleaning_mode": "cleaned",
+                "index_dataset_id": "cn_index_daily",
+                "index_snapshot_id": "index-snapshot",
+                "index_content_sha256": "d" * 64,
+                "index_manifest_sha256": "e" * 64,
             }
             ready_status = {
                 "trainable": True,
@@ -1458,7 +1468,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         build_status.assert_called_once_with(
-            provider_dataset_id="qlib_ashare_cleaned_v2"
+            provider_dataset_id="ashare_daily_qfq",
+            provider="cleaned",
         )
         submit.assert_called_once_with(
             "train_baseline_lgb",
@@ -1500,11 +1511,21 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
     def test_formal_training_commands_receive_approved_provider_identity(self) -> None:
         approved_identity = {
-            "provider_contract": "immutable_snapshot_v2",
-            "dataset_id": "qlib_ashare_v2",
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
             "snapshot_id": "canonical-snapshot",
             "manifest_sha256": "c" * 64,
             "content_sha256": "d" * 64,
+            "descriptor_path": (
+                "runtime/qlib_direct/providers/ashare_daily_qfq/"
+                "canonical-snapshot/canonical/PROVIDER_DESCRIPTOR.json"
+            ),
+            "descriptor_sha256": "e" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "f" * 64,
+            "index_manifest_sha256": "a" * 64,
         }
         commands = []
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4435,11 +4456,21 @@ class QuantJobsApiTestCase(unittest.TestCase):
             submitted = []
             errors = []
             approved_identity = {
-                "provider_contract": "immutable_snapshot_v2",
-                "dataset_id": "qlib_ashare_v2",
+                "provider_contract": "direct_parquet_v1",
+                "dataset_id": "ashare_daily_qfq",
                 "snapshot_id": "canonical-snapshot",
                 "manifest_sha256": "a" * 64,
                 "content_sha256": "b" * 64,
+                "descriptor_path": (
+                    "runtime/qlib_direct/providers/ashare_daily_qfq/"
+                    "canonical-snapshot/canonical/PROVIDER_DESCRIPTOR.json"
+                ),
+                "descriptor_sha256": "c" * 64,
+                "cleaning_mode": "canonical",
+                "index_dataset_id": "cn_index_daily",
+                "index_snapshot_id": "index-snapshot",
+                "index_content_sha256": "d" * 64,
+                "index_manifest_sha256": "e" * 64,
             }
 
             def submit(service: QuantJobService, job_type: str) -> None:
@@ -5331,10 +5362,12 @@ class QuantJobsApiTestCase(unittest.TestCase):
             status = service.available_job_types()
             spec = service.command_specs["apply_data_cleaning"]
 
-        self.assertIn("build_cleaned_qlib_v2.py", command[1])
-        self.assertIn("--publish", command)
+        self.assertIn("build_qlib_direct_provider.py", command[1])
+        self.assertIn("--cleaning-mode", command)
+        self.assertIn("cleaned", command)
         self.assertEqual(
-            status["apply_data_cleaning"]["label"], "构建原生 cleaned Qlib V2 快照"
+            status["apply_data_cleaning"]["label"],
+            "生成正式 cleaned 直读 Qlib Provider",
         )
         self.assertEqual(
             status["apply_data_cleaning"]["allowed_params"],
@@ -5376,19 +5409,20 @@ class QuantJobsApiTestCase(unittest.TestCase):
         )
         self.assertIn("Unsupported params for merge_to_qlib", str(ctx.exception))
 
-    def test_merge_to_qlib_job_publishes_native_v2_by_default(self) -> None:
+    def test_merge_to_qlib_job_publishes_direct_provider_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
 
             command = service._build_command("merge_to_qlib", {})
             status = service.available_job_types()
 
-        self.assertIn("build_qlib_v2.py", command[1])
-        self.assertIn("--publish", command)
+        self.assertIn("build_qlib_direct_provider.py", command[1])
+        self.assertIn("--cleaning-mode", command)
+        self.assertIn("canonical", command)
         self.assertNotIn("merge_to_qlib.py", command[1])
         self.assertEqual(
             status["merge_to_qlib"]["label"],
-            "构建并发布原生 Qlib V2",
+            "生成正式 Qlib 直读 Provider",
         )
 
     def test_download_jqdata_job_supports_browser_safe_dry_run(self) -> None:

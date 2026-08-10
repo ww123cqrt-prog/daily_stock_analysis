@@ -97,6 +97,63 @@ def test_prepare_runtime_provider_keeps_canonical_provider_untouched(
     ) == "2023-01-02\n2023-01-03\n"
 
 
+def test_prepare_runtime_provider_uses_direct_descriptor_without_copying_market_data(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    canonical = tmp_path / "direct-provider"
+    canonical.mkdir()
+    descriptor = canonical / "PROVIDER_DESCRIPTOR.json"
+    descriptor.write_text("{}\n", encoding="utf-8")
+    manifest = write_manifest(tmp_path)
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "index_code": ["000300.XSHG"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    context = type(
+        "Context",
+        (),
+        {
+            "descriptor": {
+                "cleaning": {"mode": "cleaned"},
+                "dataset": {"snapshot_id": "qfq-001"},
+            },
+            "calendar": pd.DatetimeIndex(
+                ["2023-01-02", "2023-01-03"]
+            ),
+            "membership": pd.read_parquet(intervals),
+            "file_index": pd.DataFrame(
+                {
+                    "symbol": ["SH600000"],
+                    "first_date": ["2023-01-02"],
+                    "last_date": ["2023-01-03"],
+                }
+            ),
+        },
+    )()
+    module._read_direct_provider_context = lambda *_args, **_kwargs: context
+
+    result = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=manifest,
+    )
+
+    assert Path(result["provider_uri"]) == canonical.resolve()
+    assert result["direct_provider"] is True
+    assert not (tmp_path / "runtime" / "providers").exists()
+    latest = json.loads(
+        (tmp_path / "runtime" / "latest_provider.json").read_text(encoding="utf-8")
+    )
+    assert latest["provider_uri"] == str(canonical.resolve())
+
+
 def test_prepare_runtime_provider_is_content_addressed_and_reusable(
     tmp_path: Path,
 ) -> None:

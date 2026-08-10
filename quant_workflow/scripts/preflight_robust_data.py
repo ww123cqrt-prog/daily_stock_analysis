@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import provider_calendar_days, quant_data_root, reports_root  # noqa: E402
 from _robust_reference_integrity import (  # noqa: E402
     ReferenceIntegrityError,
     reference_read_lock,
@@ -85,10 +85,10 @@ def _to_dates(values: Iterable[Any]) -> pd.Series:
 def _read_calendar(
     provider_dir: Path, start: pd.Timestamp, end: pd.Timestamp
 ) -> tuple[list[pd.Timestamp], str | None]:
-    path = provider_dir / "calendars" / "day.txt"
-    if not path.is_file():
-        return [], f"calendar file is missing: {path}"
-    days = _to_dates(path.read_text(encoding="utf-8").splitlines()).dropna()
+    try:
+        days = _to_dates(provider_calendar_days(provider_dir)).dropna()
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        return [], f"calendar is unavailable: {type(exc).__name__}"
     selected = days[(days >= start) & (days <= end)].drop_duplicates().sort_values()
     if selected.empty:
         return [], f"calendar has no trading days in {start.date()} to {end.date()}"
@@ -184,6 +184,61 @@ def _find_symbol_file(directory: Path, symbol: str) -> Path | None:
 def _benchmark_gaps(
     provider_dir: Path, expected_dates: pd.DatetimeIndex
 ) -> dict[str, list[str]]:
+    descriptor = provider_dir / "PROVIDER_DESCRIPTOR.json"
+    if descriptor.is_file():
+        try:
+            from quant_workflow.quant_data_qlib_provider import _load_descriptor, _safe_snapshot_child
+
+            root = provider_dir
+            for parent in [provider_dir, *provider_dir.parents]:
+                if parent.name == "quant_data":
+                    root = parent
+                    break
+            context = _load_descriptor(descriptor, root)
+        except Exception:
+            return {symbol: ["direct_provider_unavailable"] for symbol in REQUIRED_BENCHMARKS}
+        rows = {
+            str(row.symbol): row
+            for row in (context.index_file_index.itertuples(index=False)
+                        if context.index_file_index is not None else [])
+        }
+        gaps: dict[str, list[str]] = {}
+        for symbol in REQUIRED_BENCHMARKS:
+            row = rows.get(symbol)
+            if row is None or context.index_snapshot_path is None:
+                gaps[symbol] = ["missing_index_file"]
+                continue
+            try:
+                frame = pd.read_parquet(
+                    _safe_snapshot_child(
+                        context.index_snapshot_path,
+                        row.relative_path,
+                        "index bar path",
+                    )
+                )
+                frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+                frame = frame.set_index("date")
+            except Exception:
+                gaps[symbol] = ["unreadable_index_file"]
+                continue
+            symbol_gaps: list[str] = []
+            for day in expected_dates:
+                if day not in frame.index:
+                    symbol_gaps.append(str(day.date()))
+                    continue
+                current = frame.loc[day]
+                if isinstance(current, pd.DataFrame):
+                    current = current.iloc[0]
+                for field in OHLCV_COLUMNS:
+                    value = pd.to_numeric(current.get(field), errors="coerce")
+                    valid = math.isfinite(float(value)) and (
+                        float(value) >= 0 if field == "volume" else float(value) > 0
+                    )
+                    if not valid:
+                        symbol_gaps.append(f"{field}:{day.date()}")
+            if symbol_gaps:
+                gaps[symbol] = symbol_gaps[:20]
+        return gaps
     calendar_path = provider_dir / "calendars" / "day.txt"
     if not calendar_path.is_file():
         return {symbol: ["calendar_missing"] for symbol in REQUIRED_BENCHMARKS}

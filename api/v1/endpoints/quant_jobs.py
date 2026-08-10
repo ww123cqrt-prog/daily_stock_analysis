@@ -73,8 +73,8 @@ MARKET_DATA_PINNED_JOB_TYPES = {
     "report_cash_control_backtest",
 }
 TRAINING_PROVIDER_DATASET_IDS = {
-    "canonical": "qlib_ashare_v2",
-    "cleaned": "qlib_ashare_cleaned_v2",
+    "canonical": "ashare_daily_qfq",
+    "cleaned": "ashare_daily_qfq",
 }
 PROVIDER_IDENTITY_FIELDS = (
     "provider_contract",
@@ -82,6 +82,20 @@ PROVIDER_IDENTITY_FIELDS = (
     "snapshot_id",
     "manifest_sha256",
     "content_sha256",
+)
+DIRECT_PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+    "descriptor_path",
+    "descriptor_sha256",
+    "cleaning_mode",
+    "index_dataset_id",
+    "index_snapshot_id",
+    "index_content_sha256",
+    "index_manifest_sha256",
 )
 LOCAL_CATDESK_HEALTH_PORTS = {8765}
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
@@ -443,14 +457,53 @@ def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
     return dataset_id
 
 
+def _training_provider_name(params: Dict[str, Any]) -> str:
+    provider = str(params.get("provider") or "canonical").strip().lower()
+    if provider not in TRAINING_PROVIDER_DATASET_IDS:
+        raise ValueError("Provider must be one of: canonical, cleaned.")
+    return provider
+
+
 def _approved_provider_identity_from_status(
     research_status: Dict[str, Any],
     *,
     expected_dataset_id: str,
+    expected_provider: str = "canonical",
 ) -> Dict[str, str]:
     provider = research_status.get("qlib_provider")
     if not isinstance(provider, dict):
         raise ValueError("Training status does not expose an approved Qlib snapshot.")
+    if provider.get("provider_contract") == "direct_parquet_v1":
+        identity = {
+            field: provider.get(field) for field in DIRECT_PROVIDER_IDENTITY_FIELDS
+        }
+        descriptor_path = str(identity.get("descriptor_path") or "")
+        index_snapshot_id = identity.get("index_snapshot_id")
+        if (
+            identity.get("dataset_id") != expected_dataset_id
+            or identity.get("cleaning_mode") != expected_provider
+            or not descriptor_path
+            or Path(descriptor_path).is_absolute()
+            or ".." in Path(descriptor_path).parts
+            or identity.get("index_dataset_id") != "cn_index_daily"
+            or not isinstance(index_snapshot_id, str)
+            or Path(index_snapshot_id).name != index_snapshot_id
+            or index_snapshot_id in {".", ".."}
+            or any(
+                not isinstance(identity.get(field), str)
+                or re.fullmatch(r"[0-9a-f]{64}", str(identity.get(field))) is None
+                for field in (
+                    "manifest_sha256",
+                    "content_sha256",
+                    "descriptor_sha256",
+                    "index_content_sha256",
+                    "index_manifest_sha256",
+                )
+            )
+        ):
+            raise ValueError("Training status has an invalid direct Provider identity.")
+        return {field: str(identity[field]) for field in DIRECT_PROVIDER_IDENTITY_FIELDS}
+
     identity = {field: provider.get(field) for field in PROVIDER_IDENTITY_FIELDS}
     snapshot_id = identity.get("snapshot_id")
     if (
@@ -594,6 +647,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
             research_status = await asyncio.to_thread(
                 build_research_status_payload,
                 provider_dataset_id=provider_dataset_id,
+                provider=_training_provider_name(request.params),
             )
             if research_status.get("trainable") is not True:
                 readiness = research_status.get("training_readiness")
@@ -615,6 +669,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                     approved_provider_identity = _approved_provider_identity_from_status(
                         research_status,
                         expected_dataset_id=provider_dataset_id,
+                        expected_provider=_training_provider_name(request.params),
                     )
                 except ValueError as exc:
                     raise api_error(

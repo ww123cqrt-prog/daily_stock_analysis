@@ -22,6 +22,10 @@ except ImportError:  # Direct script execution and quant_workflow test mode.
     )
 
 
+DIRECT_PROVIDER_CONTRACT = "direct_parquet_v1"
+DIRECT_CLEANED_PROVIDER_DATASET_ID = "ashare_daily_qfq"
+
+
 CONTRACT_VERSION = "robust_signal_data_v3"
 ACCEPTANCE_OWNER = "data_module"
 ACCEPTANCE_CONTRACT = "data_module_accepted_content_addressed_snapshot_v2"
@@ -44,6 +48,20 @@ CLEANED_PROVIDER_IDENTITY_FIELDS = (
     "snapshot_id",
     "manifest_sha256",
     "content_sha256",
+)
+DIRECT_CLEANED_PROVIDER_IDENTITY_FIELDS = (
+    "provider_contract",
+    "dataset_id",
+    "snapshot_id",
+    "manifest_sha256",
+    "content_sha256",
+    "descriptor_path",
+    "descriptor_sha256",
+    "cleaning_mode",
+    "index_dataset_id",
+    "index_snapshot_id",
+    "index_content_sha256",
+    "index_manifest_sha256",
 )
 
 
@@ -72,6 +90,196 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cleaned_identity_kind(identity: Mapping[str, Any] | None) -> str | None:
+    """Return the accepted cleaned-provider format without guessing from paths."""
+
+    if not isinstance(identity, Mapping):
+        return None
+    dataset_id = identity.get("dataset_id")
+    if dataset_id == CLEANED_PROVIDER_DATASET_ID:
+        if all(
+            isinstance(identity.get(field), str)
+            and SHA256_RE.fullmatch(str(identity[field]))
+            for field in ("manifest_sha256", "content_sha256")
+        ):
+            snapshot_id = str(identity.get("snapshot_id") or "")
+            if snapshot_id and Path(snapshot_id).name == snapshot_id:
+                return "native"
+        return None
+    if dataset_id != DIRECT_CLEANED_PROVIDER_DATASET_ID:
+        return None
+    if identity.get("provider_contract") != DIRECT_PROVIDER_CONTRACT:
+        return None
+    if identity.get("cleaning_mode") != "cleaned":
+        return None
+    if not all(
+        isinstance(identity.get(field), str)
+        and SHA256_RE.fullmatch(str(identity[field]))
+        for field in (
+            "manifest_sha256",
+            "content_sha256",
+            "descriptor_sha256",
+            "index_content_sha256",
+            "index_manifest_sha256",
+        )
+    ):
+        return None
+    snapshot_id = str(identity.get("snapshot_id") or "")
+    index_snapshot_id = str(identity.get("index_snapshot_id") or "")
+    descriptor_path = str(identity.get("descriptor_path") or "")
+    if (
+        not snapshot_id
+        or Path(snapshot_id).name != snapshot_id
+        or not index_snapshot_id
+        or Path(index_snapshot_id).name != index_snapshot_id
+        or not descriptor_path
+        or Path(descriptor_path).is_absolute()
+        or ".." in Path(descriptor_path).parts
+        or identity.get("index_dataset_id") != "cn_index_daily"
+    ):
+        return None
+    return "direct"
+
+
+def _cleaned_identity_is_valid(identity: Mapping[str, Any] | None) -> bool:
+    return _cleaned_identity_kind(identity) is not None
+
+
+def _cleaned_identities_match(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+) -> bool:
+    left_kind = _cleaned_identity_kind(left)
+    right_kind = _cleaned_identity_kind(right)
+    if left_kind is None or left_kind != right_kind:
+        return False
+    fields = (
+        CLEANED_PROVIDER_IDENTITY_FIELDS
+        if left_kind == "native"
+        else DIRECT_CLEANED_PROVIDER_IDENTITY_FIELDS
+    )
+    return all(left.get(field) == right.get(field) for field in fields)
+
+
+def _cleaned_identity_for_output(identity: Mapping[str, Any]) -> dict[str, str]:
+    kind = _cleaned_identity_kind(identity)
+    if kind is None:
+        raise _blocked("quality_evidence_invalid")
+    fields = (
+        CLEANED_PROVIDER_IDENTITY_FIELDS
+        if kind == "native"
+        else DIRECT_CLEANED_PROVIDER_IDENTITY_FIELDS
+    )
+    return {field: str(identity[field]) for field in fields}
+
+
+def _snapshot_state_dataset_id(kind: str) -> str:
+    return (
+        CLEANED_PROVIDER_DATASET_ID
+        if kind == "native"
+        else DIRECT_CLEANED_PROVIDER_DATASET_ID
+    )
+
+
+def _direct_descriptor_for_provider(provider: Path) -> Path | None:
+    candidate = provider if provider.name == "PROVIDER_DESCRIPTOR.json" else provider / "PROVIDER_DESCRIPTOR.json"
+    return candidate if candidate.is_file() and not candidate.is_symlink() else None
+
+
+def _quant_data_root_for_provider(provider: Path) -> Path:
+    for parent in (provider, *provider.parents):
+        if parent.name == "quant_data":
+            return parent
+    raise _blocked("provider_outside_runtime")
+
+
+def _direct_cleaned_identity(provider: Path) -> dict[str, str]:
+    descriptor = _direct_descriptor_for_provider(provider)
+    if descriptor is None:
+        raise _blocked("provider_unavailable")
+    try:
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        root = _quant_data_root_for_provider(provider)
+        context = _load_descriptor(descriptor, root)
+    except RobustSignalDataBlocked:
+        raise
+    except Exception as exc:
+        raise _blocked("provider_identity_mismatch") from exc
+    payload = context.descriptor
+    dataset = payload.get("dataset")
+    index = payload.get("index_dataset")
+    cleaning = payload.get("cleaning") or {}
+    if (
+        not isinstance(dataset, Mapping)
+        or not isinstance(index, Mapping)
+        or cleaning.get("mode") != "cleaned"
+        or dataset.get("dataset_id") != DIRECT_CLEANED_PROVIDER_DATASET_ID
+        or index.get("dataset_id") != "cn_index_daily"
+        or set(index.get("required_symbols") or ())
+        != {
+            "SH000300",
+            "SH000905",
+            "SH000906",
+            "SZ399006",
+            "SH000688",
+        }
+    ):
+        raise _blocked("provider_identity_mismatch")
+    try:
+        descriptor_path = descriptor.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise _blocked("provider_outside_runtime") from exc
+    return {
+        "provider_contract": DIRECT_PROVIDER_CONTRACT,
+        "dataset_id": str(dataset.get("dataset_id") or ""),
+        "snapshot_id": str(dataset.get("snapshot_id") or ""),
+        "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
+        "content_sha256": str(dataset.get("content_sha256") or ""),
+        "descriptor_path": descriptor_path,
+        "descriptor_sha256": file_sha256(descriptor),
+        "cleaning_mode": str(cleaning.get("mode") or ""),
+        "index_dataset_id": str(index.get("dataset_id") or ""),
+        "index_snapshot_id": str(index.get("snapshot_id") or ""),
+        "index_content_sha256": str(index.get("content_sha256") or ""),
+        "index_manifest_sha256": str(index.get("manifest_sha256") or ""),
+    }
+
+
+def _read_direct_membership(provider: Path) -> Any:
+    descriptor = _direct_descriptor_for_provider(provider)
+    if descriptor is None:
+        return None
+    try:
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        return _load_descriptor(
+            descriptor,
+            _quant_data_root_for_provider(provider),
+        ).membership
+    except Exception as exc:
+        raise _blocked("csi800_instruments_missing") from exc
+
+
+def _has_csi800_membership(membership: Any) -> bool:
+    try:
+        codes = set(membership["index_code"].astype(str).str.upper())
+    except (AttributeError, KeyError, TypeError):
+        return False
+    return bool(
+        codes.intersection({"000300.XSHG", "SH000300", "000300"})
+        and codes.intersection({"000905.XSHG", "SH000905", "000905"})
+    )
+
+
+def _provider_is_under(provider: Path, root: Path) -> bool:
+    try:
+        provider.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _blocked(reason_code: str) -> RobustSignalDataBlocked:
@@ -397,20 +605,11 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
         if isinstance(data_contract, Mapping)
         else None
     )
+    cleaned_kind = _cleaned_identity_kind(cleaned_identity)
     if (
         not isinstance(data_contract, Mapping)
         or data_contract.get("status") != "verified"
-        or not isinstance(cleaned_identity, Mapping)
-        or cleaned_identity.get("dataset_id") != CLEANED_PROVIDER_DATASET_ID
-        or not isinstance(cleaned_identity.get("snapshot_id"), str)
-        or not cleaned_identity.get("snapshot_id")
-        or Path(str(cleaned_identity.get("snapshot_id"))).name
-        != cleaned_identity.get("snapshot_id")
-        or any(
-            not isinstance(cleaned_identity.get(field), str)
-            or not SHA256_RE.fullmatch(str(cleaned_identity[field]))
-            for field in ("manifest_sha256", "content_sha256")
-        )
+        or cleaned_kind is None
         or not isinstance(snapshot_state, Mapping)
         or snapshot_state.get("stable") is not True
         or snapshot_state.get("content_revalidated") is not True
@@ -425,10 +624,7 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
     )
     if not isinstance(cleaned_quality, Mapping):
         raise _blocked("quality_evidence_invalid")
-    if any(
-        cleaned_quality.get(field) != cleaned_identity.get(field)
-        for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-    ):
+    if not _cleaned_identities_match(cleaned_quality, cleaned_identity):
         raise _blocked("cleaned_provider_quality_mismatch")
 
     cleaned_readiness = cleaned_quality.get("training_readiness")
@@ -450,8 +646,9 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
         raise _blocked("quality_evidence_not_trainable")
 
     stage_names = ("before", "after_scan", "after_revalidation", "after")
+    stage_dataset_id = _snapshot_state_dataset_id(cleaned_kind)
     stage_states = [
-        snapshot_state.get(stage, {}).get(CLEANED_PROVIDER_DATASET_ID)
+        snapshot_state.get(stage, {}).get(stage_dataset_id)
         if isinstance(snapshot_state.get(stage), Mapping)
         else None
         for stage in stage_names
@@ -466,10 +663,7 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
         "quality_report_id": report_id,
         "quality_evidence_artifact_name": evidence_artifact,
         "quality_evidence_sha256": evidence_sha256,
-        "cleaned_provider_identity": {
-            field: str(cleaned_identity[field])
-            for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-        },
+        "cleaned_provider_identity": _cleaned_identity_for_output(cleaned_identity),
     }
 
 
@@ -559,30 +753,42 @@ def evaluate_robust_signal_data(
         provider = provider.resolve(strict=False)
     except OSError as exc:
         raise _blocked("provider_unavailable") from exc
-    if provider.parent != provider_root or provider.is_symlink():
+    if provider.is_symlink() or not _provider_is_under(provider, provider_root):
         raise _blocked("provider_outside_runtime")
     if not provider.is_dir():
         raise _blocked("provider_unavailable")
 
     provider_key = status.get("provider_key")
     provider_tree_sha256 = status.get("provider_tree_sha256")
+    direct_descriptor = _direct_descriptor_for_provider(provider)
+    direct_provider = direct_descriptor is not None
     if (
         not isinstance(provider_key, str)
         or not SHA256_RE.fullmatch(provider_key)
-        or provider.name != provider_key[:16]
         or not isinstance(provider_tree_sha256, str)
         or not SHA256_RE.fullmatch(provider_tree_sha256)
+        or (not direct_provider and provider.name != provider_key[:16])
     ):
         raise _blocked("provider_identity_mismatch")
-    metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
-    if (
-        metadata is None
-        or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
-        or metadata.get("provider_key") != provider_key
-        or metadata.get("provider_tree_sha256") != provider_tree_sha256
-        or metadata.get("data_manifest_sha256") != current_manifest_sha256
-    ):
-        raise _blocked("provider_identity_mismatch")
+    if direct_provider:
+        if provider_key != file_sha256(direct_descriptor) or provider_tree_sha256 != provider_key:
+            raise _blocked("provider_identity_mismatch")
+        actual_cleaned_identity = _direct_cleaned_identity(provider)
+        if not _cleaned_identities_match(actual_cleaned_identity, status.get("cleaned_provider_identity")):
+            raise _blocked("cleaned_provider_quality_mismatch")
+        if not _has_csi800_membership(_read_direct_membership(provider)):
+            raise _blocked("csi800_instruments_missing")
+        metadata = None
+    else:
+        metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
+        if (
+            metadata is None
+            or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
+            or metadata.get("provider_key") != provider_key
+            or metadata.get("provider_tree_sha256") != provider_tree_sha256
+            or metadata.get("data_manifest_sha256") != current_manifest_sha256
+        ):
+            raise _blocked("provider_identity_mismatch")
     runtime_identity = provider_identity(provider, provider_key)
     if (
         runtime_identity is None
@@ -590,7 +796,7 @@ def evaluate_robust_signal_data(
         or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
     ):
         raise _blocked("provider_identity_mismatch")
-    if not (provider / "instruments" / "csi800.txt").is_file():
+    if not direct_provider and not (provider / "instruments" / "csi800.txt").is_file():
         raise _blocked("csi800_instruments_missing")
 
     return {
@@ -606,8 +812,10 @@ def evaluate_robust_signal_data(
         "provider_key": provider_key,
         "provider_tree_sha256": provider_tree_sha256,
         "data_manifest_sha256": current_manifest_sha256,
-        "membership_intervals_sha256": metadata.get(
-            "membership_intervals_sha256"
+        "membership_intervals_sha256": (
+            metadata.get("membership_intervals_sha256")
+            if metadata is not None
+            else status.get("membership_intervals_sha256")
         ),
         "quality_report_id": current_quality.get("quality_report_id"),
         "quality_evidence_artifact_name": current_quality.get(
@@ -722,16 +930,7 @@ def consume_accepted_robust_signal_data(
         or not evidence_artifact_name.endswith(
             f"_{evidence_sha256[:16]}.json"
         )
-        or not isinstance(cleaned_identity, Mapping)
-        or cleaned_identity.get("dataset_id") != CLEANED_PROVIDER_DATASET_ID
-        or not isinstance(cleaned_identity.get("snapshot_id"), str)
-        or Path(str(cleaned_identity.get("snapshot_id"))).name
-        != cleaned_identity.get("snapshot_id")
-        or any(
-            not isinstance(cleaned_identity.get(field), str)
-            or not SHA256_RE.fullmatch(str(cleaned_identity[field]))
-            for field in ("manifest_sha256", "content_sha256")
-        )
+        or _cleaned_identity_kind(cleaned_identity) is None
     ):
         raise _blocked("robust_readiness_invalid")
 
@@ -769,10 +968,7 @@ def consume_accepted_robust_signal_data(
         or not isinstance(evidence_cleaned_identity, Mapping)
     ):
         raise _blocked("quality_evidence_invalid")
-    if any(
-        evidence_cleaned_identity.get(field) != cleaned_identity.get(field)
-        for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-    ):
+    if not _cleaned_identities_match(evidence_cleaned_identity, cleaned_identity):
         raise _blocked("cleaned_provider_quality_mismatch")
 
     provider_text = status.get("provider_uri")
@@ -790,24 +986,36 @@ def consume_accepted_robust_signal_data(
 
     provider_key = status.get("provider_key")
     provider_tree_sha256 = status.get("provider_tree_sha256")
+    direct_descriptor = _direct_descriptor_for_provider(provider)
+    direct_provider = direct_descriptor is not None
     if (
         not isinstance(provider_key, str)
         or not SHA256_RE.fullmatch(provider_key)
-        or provider.name != provider_key[:16]
         or not isinstance(provider_tree_sha256, str)
         or not SHA256_RE.fullmatch(provider_tree_sha256)
+        or (not direct_provider and provider.name != provider_key[:16])
     ):
         raise _blocked("provider_identity_mismatch")
-    metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
-    if (
-        metadata is None
-        or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
-        or metadata.get("provider_key") != provider_key
-        or metadata.get("provider_tree_sha256") != provider_tree_sha256
-        or metadata.get("data_manifest_sha256") != recorded_manifest_sha256
-        or metadata.get("membership_intervals_sha256") != membership_intervals_sha256
-    ):
-        raise _blocked("provider_identity_mismatch")
+    if direct_provider:
+        if provider_key != file_sha256(direct_descriptor) or provider_tree_sha256 != provider_key:
+            raise _blocked("provider_identity_mismatch")
+        actual_cleaned_identity = _direct_cleaned_identity(provider)
+        if not _cleaned_identities_match(actual_cleaned_identity, cleaned_identity):
+            raise _blocked("cleaned_provider_quality_mismatch")
+        if not _has_csi800_membership(_read_direct_membership(provider)):
+            raise _blocked("csi800_instruments_missing")
+        metadata = None
+    else:
+        metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
+        if (
+            metadata is None
+            or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
+            or metadata.get("provider_key") != provider_key
+            or metadata.get("provider_tree_sha256") != provider_tree_sha256
+            or metadata.get("data_manifest_sha256") != recorded_manifest_sha256
+            or metadata.get("membership_intervals_sha256") != membership_intervals_sha256
+        ):
+            raise _blocked("provider_identity_mismatch")
     runtime_identity = provider_identity(provider, provider_key)
     if (
         runtime_identity is None
@@ -815,7 +1023,7 @@ def consume_accepted_robust_signal_data(
         or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
     ):
         raise _blocked("provider_identity_mismatch")
-    if not (provider / "instruments" / "csi800.txt").is_file():
+    if not direct_provider and not (provider / "instruments" / "csi800.txt").is_file():
         raise _blocked("csi800_instruments_missing")
 
     return {

@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] Qlib 正式训练、预测、回测、交易日历和质量报告统一切换到 `quant_data` 的 direct Parquet Provider；canonical 与 cleaned 共用同一份 qfq 行情，cleaned 只应用哈希锁定的清洗计划，不再生成第二份股票 `.bin` 数据。
+- [维护] 旧 `qlib_ashare_v2`、`qlib_ashare_cleaned_v2`、`merge_to_qlib.py` 和旧构建脚本明确降为兼容/审计工具；DSA 网页中的 Qlib 生成和 cleaned 操作默认只生成 direct Provider 描述符。
+- [文档] 补充 direct Provider 的指数、股票池、快照锁定、旧 `.bin` 回滚边界，并明确当前每日数据更新 LaunchAgent 仍处于暂停状态。
 - [新功能] `/backtest/etf-momentum` 新增“两 ETF 动量轮动 / 三 ETF 防守轮动”版本切换；三 ETF 版本固定使用 159915、513100、512890 的 20 日动量与 20 日均线、T 日收盘信号和 T+1 共同开盘执行，展示净值、回撤、全部比较基准、分阶段结果、成本压力、Bootstrap、起始日期、市场状态和仓位比例，不提供参数搜索或重新计算入口。
 - [边界] 三 ETF 结果在 51 只 ETF 测试快照完成 `quant_data` 正式验收前固定标记为 `research_preview` 和“不可用于交易”；DSA 研究模块只核对并消费发布快照，不下载、清洗、修补或发布行情。五个指数只读取已验收 Qlib 快照中的真实序列，缺失时明确报告缺口，不使用 ETF 或其他指数替代。
 - [修复] ETF 数据入口统一为 `cn_etf_daily` 的 raw/qfq/factors 整包快照；增量更新锁覆盖组装与发布，发布后保留清理失败改报 `published_with_warnings`，正式报告拒绝任意 Parquet 目录，旧两 ETF 写入 API 和独立鲁棒性报告入口退为只读兼容调用。
 - [修复] ETF 报告 API 的 camelCase 转换保留 `SH/SZ` 六位证券代码和 `CASH` 对象键，避免真实 JSON 经转换后图表与持仓字段变成小写、页面按大写键读取为空。
-- [数据] DSA canonical 训练、预测、回测、交易日历、数据质量和 CatDesk 历史价格验证改为通过 `DATA_MANIFEST.json` 直接锁定原生 `qlib_ashare_v2` / `ashare_daily_qfq` 快照；原生 Qlib 已包含 SH000300、SH000905、SH000906 及 CSI300/500/800 股票池。每日编排器不再构建或发布旧 merged provider，普通 A 股下载仅作审计缓存，只有显式核验 bundle 才能事务发布 V2。
+- [数据] DSA canonical 训练、预测、回测、交易日历、数据质量和 CatDesk 历史价格验证改为通过 `DATA_MANIFEST.json` 锁定正式 `ashare_daily_qfq` 与 `cn_index_daily`，再由 direct Provider 读取；五个指数和 CSI300/500/800 历史股票池均不再依赖旧 `.bin`。每日编排器不再把旧 merged/provider 作为正式发布结果，普通 A 股下载仅作审计缓存，只有显式核验 bundle 才能事务发布新 Parquet/direct Provider。
 - [安全] A 股公开源下载改为保守请求配置：默认关闭自动历史源和东方财富新闻，一次只允许 Baostock、东方财富或 AkShare 之一；请求间隔至少 2 秒、只尝试 1 次、连续失败最多 3 次、单次请求预算 6000、增量重叠最多 7 天，遇到黑名单、403/429 或远端拒绝立即熔断。DSA 网页同时只允许一个 `quant_data` 网络任务；本机 18:40 LaunchAgent 保持禁用。
 - [新功能] `/backtest` 改为两个真实策略入口：“脚本回测”提供带静态安全检查、隔离子进程和超时限制的 DSA Python 策略编辑器；“条件回测”提供动量轮动、双均线和等权持有表单。两者共用与资产类型无关的目标仓位引擎，股票、ETF 和多标的组合统一计算现金、整手、用户显式成本、下一交易日开盘成交、净值、基准、回撤、换手及成交；网页成本默认 `0%`。Qlib 训练结果统一到 `/experiments/`，旧 DSA 历史判断不再作为网页策略入口。
 - [新功能] 量化任务中心新增五个选股模型候选流程：统一训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost，只用 2024-2025 选择候选选股模型及五套交易策略，并用 2026 留出期独立终审；结果写入 MLflow 和可追溯报告，不自动替换日常选股模型或下单。

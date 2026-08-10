@@ -823,7 +823,12 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 data_root / "qlib",
             ),
         ):
-            return build_research_status_payload()
+            # These fixtures exercise the retained legacy .bin compatibility
+            # catalog.  The production default is the direct Parquet Provider;
+            # opt into the old catalog explicitly in legacy-focused tests.
+            return build_research_status_payload(
+                provider_dataset_id="qlib_ashare_v2"
+            )
 
     def test_robust_signal_status_exposes_bounded_sanitized_matrices(self) -> None:
         from api.v1.endpoints.research_status import _robust_signal_payload
@@ -2451,7 +2456,9 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     data_root / "qlib",
                 ),
             ):
-                payload = build_research_status_payload()
+                payload = build_research_status_payload(
+                    provider_dataset_id="qlib_ashare_v2"
+                )
 
         self.assertEqual(
             Path(payload["qlib_provider"]["path"]).resolve(), provider.resolve()
@@ -2518,7 +2525,9 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     data_root / "qlib",
                 ),
             ):
-                payload = build_research_status_payload()
+                payload = build_research_status_payload(
+                    provider_dataset_id="qlib_ashare_v2"
+                )
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertFalse(payload["trainable"])
@@ -2650,7 +2659,9 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     data_root / "qlib",
                 ),
             ):
-                payload = build_research_status_payload()
+                payload = build_research_status_payload(
+                    provider_dataset_id="qlib_ashare_v2"
+                )
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertNotEqual(payload["qlib_provider"].get("path"), str(legacy_provider))

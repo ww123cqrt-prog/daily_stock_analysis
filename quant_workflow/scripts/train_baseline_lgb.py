@@ -26,7 +26,11 @@ from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
     china_astock_root,
     mlruns_root,
-    qlib_provider_uri,
+    provider_calendar_days,
+    provider_instrument_ranges,
+    qlib_init_config_for_uri,
+    qlib_native_snapshot_uri,
+    qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
     workflow_root,
@@ -101,7 +105,10 @@ def resolve_provider_uri(
             expected_provider_identity,
             quant_data_root=QUANT_DATA,
         )
-    return qlib_provider_uri(name, snapshot_override=snapshot_override)
+    if snapshot_override is not None:
+        # An explicit old snapshot is retained only for replay/compatibility.
+        return qlib_native_snapshot_uri(name, snapshot_override=snapshot_override)
+    return qlib_workflow_provider_uri(name)
 
 
 def to_qlib_name(sym: str) -> str:
@@ -109,16 +116,7 @@ def to_qlib_name(sym: str) -> str:
 
 
 def load_provider_instrument_ranges(provider_uri: Path) -> dict[str, tuple[str, str]]:
-    all_path = provider_uri / "instruments" / "all.txt"
-    if not all_path.exists():
-        raise FileNotFoundError(f"Missing provider instruments file: {all_path}")
-    ranges: dict[str, tuple[str, str]] = {}
-    for line in all_path.read_text(encoding="utf-8").splitlines():
-        parts = line.strip().split()
-        if len(parts) < 3:
-            continue
-        ranges[parts[0].upper()] = (parts[1], parts[2])
-    return ranges
+    return provider_instrument_ranges(provider_uri)
 
 
 def build_csi300_lines(symbols: Iterable[str], ranges: dict[str, tuple[str, str]]) -> list[str]:
@@ -144,13 +142,19 @@ def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
 
 def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):
     """Require the immutable provider to contain its CSI300 pool."""
+    if (provider_uri / "PROVIDER_DESCRIPTOR.json").is_file():
+        ranges = load_provider_instrument_ranges(provider_uri)
+        if not ranges:
+            raise FileNotFoundError("Direct Provider has no instruments")
+        del csi300_symbols
+        return
     instruments_path = provider_uri / "instruments" / "csi300.txt"
     if instruments_path.exists():
         return
     del csi300_symbols
     raise FileNotFoundError(
-        "Provider is missing instruments/csi300.txt; rebuild qlib_ashare_v2 "
-        "instead of modifying an immutable snapshot at training time"
+        "Explicit legacy Provider is missing instruments/csi300.txt; use the formal "
+        "direct Parquet Provider, or rebuild legacy data only for an approved replay"
     )
 
 
@@ -166,7 +170,17 @@ def write_runtime_config_with_provider(
 
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
-    qlib_init["provider_uri"] = str(provider_uri)
+    if provider_uri.exists():
+        qlib_init.update(
+            qlib_init_config_for_uri(
+                provider_uri,
+                provider=provider_name,
+            )
+        )
+    else:
+        # Keep unit-test and dry-run placeholders readable; real existing
+        # legacy paths fail closed through qlib_init_config_for_uri above.
+        qlib_init["provider_uri"] = str(provider_uri)
     payload["qlib_init"] = qlib_init
     if extend_dates_to_provider_latest:
         calendar_tail = provider_calendar_tail(provider_uri)
@@ -188,11 +202,10 @@ def write_runtime_config_with_provider(
 
 
 def provider_calendar_tail(provider_uri: Path, count: int = 2) -> list[str]:
-    calendar = provider_uri / "calendars" / "day.txt"
-    if not calendar.exists():
+    try:
+        return provider_calendar_days(provider_uri)[-count:]
+    except (FileNotFoundError, RuntimeError, ValueError):
         return []
-    values = [line.strip() for line in calendar.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    return values[-count:]
 
 
 def _portana_record_config(record: dict) -> dict | None:
@@ -1057,7 +1070,7 @@ def main():
         training_provider_identity = (
             dict(expected_provider_identity)
             if expected_provider_identity is not None
-            else provider_identity(provider_uri)
+            else provider_identity(provider_uri, quant_data_root=QUANT_DATA)
         )
     except Exception as exc:
         print(f"[error] {exc}")
