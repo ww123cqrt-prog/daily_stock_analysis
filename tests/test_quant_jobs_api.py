@@ -1477,6 +1477,31 @@ class QuantJobsApiTestCase(unittest.TestCase):
             approved_provider_identity=approved_identity,
         )
 
+    def test_status_provider_lineage_is_serialized_without_business_storage_checks(
+        self,
+    ) -> None:
+        from api.v1.endpoints.quant_jobs import _approved_provider_identity_from_status
+
+        identity = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "provider-snapshot",
+            "manifest_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+
+        self.assertEqual(
+            _approved_provider_identity_from_status({"qlib_provider": identity}),
+            identity,
+        )
+
     def test_submit_blocks_trainable_status_without_approved_snapshot_identity(
         self,
     ) -> None:
@@ -1547,6 +1572,26 @@ class QuantJobsApiTestCase(unittest.TestCase):
         for command in commands:
             identity_json = command[command.index("--provider-identity-json") + 1]
             self.assertEqual(json.loads(identity_json), approved_identity)
+
+    def test_training_command_serializes_an_opaque_provider_lineage(self) -> None:
+        from src.services.quant_job_service import _approved_provider_identity_json
+
+        identity = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "provider-snapshot",
+            "manifest_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+
+        self.assertEqual(json.loads(_approved_provider_identity_json(identity)), identity)
 
     def test_service_rejects_formal_training_without_approved_provider_identity(
         self,
@@ -5367,7 +5412,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("cleaned", command)
         self.assertEqual(
             status["apply_data_cleaning"]["label"],
-            "生成正式 cleaned 直读 Qlib Provider",
+            "生成正式 cleaned Qlib Provider",
         )
         self.assertEqual(
             status["apply_data_cleaning"]["allowed_params"],
@@ -5422,7 +5467,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("merge_to_qlib.py", command[1])
         self.assertEqual(
             status["merge_to_qlib"]["label"],
-            "生成正式 Qlib 直读 Provider",
+            "生成正式 Qlib Provider",
         )
 
     def test_download_jqdata_job_supports_browser_safe_dry_run(self) -> None:
@@ -5577,6 +5622,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(
             status["download_etf_momentum"]["allowed_params"],
             ["end"],
+        )
+        self.assertEqual(
+            status["run_daily_update"]["label"],
+            "运行每日 quant_data 更新与校验",
         )
         self.assertEqual(
             status["generate_etf_momentum_report"]["allowed_params"], []

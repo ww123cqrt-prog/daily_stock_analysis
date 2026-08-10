@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import provider_calendar_days, quant_data_root, reports_root  # noqa: E402
 from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
@@ -82,6 +82,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _provider_calendar(provider_uri: Path) -> pd.DatetimeIndex:
+    days = provider_calendar_days(provider_uri)
+    return pd.DatetimeIndex(pd.to_datetime(days, errors="coerce")).dropna()
 
 
 @contextmanager
@@ -433,16 +438,16 @@ def run_confirmation(
         payload = _failure("frozen_provider_content_mismatch", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
-    calendar_path = provider_uri / "calendars" / "day.txt"
-    if not calendar_path.is_file():
+    try:
+        calendar = _provider_calendar(provider_uri)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
         payload = _failure("provider_calendar_missing", run_id=run_id)
         _write_json(report_dir / "confirmation_latest.json", payload)
         return payload
-    calendar = pd.DatetimeIndex(
-        pd.to_datetime(
-            calendar_path.read_text(encoding="utf-8").splitlines(), errors="coerce"
-        )
-    ).dropna()
+    if calendar.empty:
+        payload = _failure("provider_calendar_missing", run_id=run_id)
+        _write_json(report_dir / "confirmation_latest.json", payload)
+        return payload
     confirmation_days = calendar[calendar >= pd.Timestamp("2026-01-01")]
     if len(confirmation_days) < 7:
         payload = _failure("confirmation_labels_unavailable", run_id=run_id)

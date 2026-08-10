@@ -245,7 +245,7 @@ def test_backend_verification_does_not_collect_embedded_quant_workflow_tests() -
     )[0]
 
     assert '"${PYTHON_BIN}" -m pytest tests -q' in backend_body
-    assert 'python -m pytest tests -m "not network"' in offline_body
+    assert 'python -m pytest tests "${pytest_args[@]}"' in offline_body
 
 
 def test_verification_script_opencode_review_fails_without_bridge() -> None:

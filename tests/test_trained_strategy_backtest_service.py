@@ -63,7 +63,7 @@ def test_default_market_loader_keeps_risk_features_free_of_future_prices(
         "sys.modules",
         {"qlib": fake_qlib, "qlib.data": fake_qlib_data},
     ):
-        # The production loader now requires a formal direct Provider
+        # The production loader now requires a formal Qlib Provider
         # descriptor.  This test isolates the look-ahead calculation, so the
         # Qlib initialization itself is stubbed.
         with patch(
@@ -398,6 +398,42 @@ def test_catalog_keeps_multiple_historical_runs_and_sanitizes_paths(
     serialized = json.dumps(catalog, ensure_ascii=False)
     assert str(tmp_path) not in serialized
     assert "provider_uri" not in serialized
+
+
+def test_catalog_rejects_invalid_qlib_provider_lineage(tmp_path: Path) -> None:
+    reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
+    latest_path = reports_root / "latest_training_result.json"
+    report = json.loads(latest_path.read_text(encoding="utf-8"))
+    report["provider_identity"] = {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "ashare-qfq-001",
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+        "descriptor_path": "/private/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": "c" * 64,
+        "cleaning_mode": "canonical",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "cn-index-001",
+        "index_content_sha256": "d" * 64,
+        "index_manifest_sha256": "e" * 64,
+    }
+    latest_path.write_text(json.dumps(report), encoding="utf-8")
+    service = TrainedStrategyBacktestService(
+        reports_root=reports_root,
+        mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
+        strategy_config_path=config_path,
+        market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-qlib-provider",
+        artifact_validator=_matching_artifact_validator(tmp_path),
+    )
+
+    row = next(item for item in service.catalog()["runs"] if item["source_type"] == "baseline")
+
+    assert row["provider_identity"] == {}
+    assert row["custom_replay_available"] is False
+    assert row["replay_capability"] == "unavailable"
 
 
 def test_catalog_skips_candidate_child_registry_and_uses_candidate_model_identity(
@@ -1138,7 +1174,7 @@ def test_rejects_legacy_report_without_immutable_provider_identity(
         artifact_validator=_matching_artifact_validator(tmp_path),
     )
 
-    with pytest.raises(ValueError, match="immutable native V2 provider"):
+    with pytest.raises(ValueError, match="immutable Qlib Provider"):
         service.run(
             run_id=RUN_ID,
             model_id="xgboost",
@@ -1333,6 +1369,71 @@ def test_rejects_artifact_from_another_provider_before_pickle_deserialization(
             run_id=RUN_ID,
             model_id="xgboost",
             strategy_id="low_turnover_weekly",
+            start_date="2026-01-02",
+            end_date="2026-01-13",
+            topk=2,
+            cost_bps=20.0,
+        )
+
+    read_pickle.assert_not_called()
+
+
+def test_rejects_artifact_with_mismatched_qlib_provider_lineage_metadata(
+    tmp_path: Path,
+) -> None:
+    reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
+    latest_path = reports_root / "latest_training_result.json"
+    report = json.loads(latest_path.read_text(encoding="utf-8"))
+    expected_identity = {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "ashare-qfq-001",
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+        "descriptor_path": "runtime/qlib/providers/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": "c" * 64,
+        "cleaning_mode": "canonical",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "cn-index-001",
+        "index_content_sha256": "d" * 64,
+        "index_manifest_sha256": "e" * 64,
+    }
+    report["provider_identity"] = expected_identity
+    latest_path.write_text(json.dumps(report), encoding="utf-8")
+
+    def mismatched_artifact(**kwargs):
+        artifact = Path(kwargs["artifact_path"])
+        return {
+            "provider_identity": {
+                **expected_identity,
+                "descriptor_sha256": "f" * 64,
+            },
+            "provider_path": str(tmp_path / "resolved-qlib-provider"),
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        }
+
+    service = TrainedStrategyBacktestService(
+        reports_root=reports_root,
+        mlruns_root=mlruns_root,
+        quant_data_root=tmp_path,
+        strategy_config_path=config_path,
+        market_loader=lambda *_: market,
+        provider_resolver=lambda identity, root: root / "resolved-qlib-provider",
+        artifact_validator=mismatched_artifact,
+    )
+
+    with (
+        patch.object(
+            pd,
+            "read_pickle",
+            side_effect=AssertionError("mismatched-provider pickle was read"),
+        ) as read_pickle,
+        pytest.raises(ValueError, match="does not match the training report provider"),
+    ):
+        service.run(
+            run_id=RUN_ID,
+            model_id="latest",
+            strategy_id="baseline_daily",
             start_date="2026-01-02",
             end_date="2026-01-13",
             topk=2,

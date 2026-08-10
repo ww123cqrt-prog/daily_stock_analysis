@@ -113,7 +113,7 @@ def write_direct_descriptor(
 
 
 class ReportDataQualityTest(unittest.TestCase):
-    def test_default_quality_report_fails_closed_when_direct_provider_is_unavailable(self):
+    def test_default_quality_report_fails_closed_when_qlib_provider_is_unavailable(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -133,12 +133,12 @@ class ReportDataQualityTest(unittest.TestCase):
                 patch.object(module, "resolve_dataset", side_effect=resolve_only_formal_bars),
                 patch.object(
                     module,
-                    "qlib_workflow_provider_descriptor",
-                    side_effect=RuntimeError("direct Provider unavailable"),
+                    "qlib_workflow_provider_uri",
+                    side_effect=RuntimeError("Qlib Provider unavailable"),
                 ),
                 patch.dict(os.environ, {}, clear=True),
             ):
-                with self.assertRaisesRegex(RuntimeError, "direct Provider unavailable"):
+                with self.assertRaisesRegex(RuntimeError, "Qlib Provider unavailable"):
                     module.main(["--out-dir", str(root / "reports")])
 
         self.assertEqual(resolved_ids, ["ashare_daily_qfq"])
@@ -188,6 +188,55 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertEqual(
             contract["qlib_provider"], contract["qlib_providers"]["canonical"]
         )
+
+    def test_provider_quality_preserves_validated_lineage_without_contract_branching(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "historical-snapshot",
+            "manifest_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+        }
+
+        record = module.build_provider_quality_record(
+            provider_key="canonical",
+            identity=identity,
+            qlib_stats={"calendar_days": 0, "instruments": 0},
+            merged_success=set(),
+            issue_counts={},
+            min_calendar_days=252,
+            min_instruments=100,
+            min_merged_instruments=100,
+            scan_mode="full",
+            verification_status="unverified",
+            verification_block_reason="not verified",
+        )
+
+        self.assertEqual(record["provider_contract"], "immutable_snapshot_v2")
+
+    def test_changed_provider_lineage_invalidates_quality_contract(self):
+        module = load_module()
+        expected = {
+            "provider_contract": "immutable_snapshot_v2",
+            "dataset_id": "qlib_ashare_v2",
+            "snapshot_id": "snapshot-a",
+            "manifest_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+        }
+        refreshed = {**expected, "snapshot_id": "snapshot-b"}
+        contract = {"status": "verified", "reason": "stable"}
+
+        module.bind_provider_lineage_state(
+            contract,
+            expected={"canonical": expected},
+            refreshed={"canonical": refreshed},
+        )
+
+        self.assertEqual(contract["status"], "unverified")
+        self.assertFalse(contract["provider_lineage_state"]["stable"])
+        self.assertIn("Qlib Provider", contract["reason"])
+        self.assertNotIn("direct", contract["reason"].lower())
 
     def test_sampled_scan_skips_second_full_content_revalidation(self):
         module = load_module()
@@ -327,7 +376,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 }
             )
 
-            def provider_stats(path: Path) -> dict:
+            def provider_stats(path: Path, **_kwargs) -> dict:
                 is_cleaned = Path(path) == cleaned_snapshot
                 return {
                     "calendar_valid": True,
@@ -376,8 +425,8 @@ class ReportDataQualityTest(unittest.TestCase):
                 patch.object(module, "QUANT_DATA", root),
                 patch.object(
                     module,
-                    "qlib_workflow_provider_descriptor",
-                    side_effect=lambda provider: descriptors[provider],
+                    "qlib_workflow_provider_uri",
+                    side_effect=lambda provider: descriptors[provider].parent,
                 ),
                 patch.object(
                     module,
@@ -553,8 +602,8 @@ class ReportDataQualityTest(unittest.TestCase):
                 patch.object(module, "QUANT_DATA", root),
                 patch.object(
                     module,
-                    "qlib_workflow_provider_descriptor",
-                    side_effect=lambda provider: descriptors[provider],
+                    "qlib_workflow_provider_uri",
+                    side_effect=lambda provider: descriptors[provider].parent,
                 ),
                 patch.object(
                     module,
@@ -732,8 +781,8 @@ class ReportDataQualityTest(unittest.TestCase):
                 patch.object(module, "QUANT_DATA", root),
                 patch.object(
                     module,
-                    "qlib_workflow_provider_descriptor",
-                    side_effect=lambda provider: descriptors[provider],
+                    "qlib_workflow_provider_uri",
+                    side_effect=lambda provider: descriptors[provider].parent,
                 ),
                 patch.object(
                     module,
@@ -789,6 +838,17 @@ class ReportDataQualityTest(unittest.TestCase):
 
         self.assertEqual(symbols, {"600000", "000001", "830001"})
 
+    def test_formal_provider_stats_do_not_silently_fallback_to_legacy_bins(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = Path(temp_dir) / "qlib"
+            calendar = provider / "calendars" / "day.txt"
+            calendar.parent.mkdir(parents=True)
+            calendar.write_text("2026-07-17\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Qlib Provider"):
+                module.qlib_provider_stats(provider)
+
     def test_incomplete_benchmark_is_a_training_readiness_blocker(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -803,7 +863,7 @@ class ReportDataQualityTest(unittest.TestCase):
             feature.parent.mkdir(parents=True)
             feature.write_bytes(np.array([0.0, 3900.0], dtype="<f4").tobytes())
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
             ready, detail = module.build_training_readiness(
                 stats,
                 {f"{index:06d}" for index in range(100)},
@@ -904,7 +964,7 @@ class ReportDataQualityTest(unittest.TestCase):
             write_benchmark_features(provider)
             (provider / "features" / "sz000001" / "factor.day.bin").unlink()
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
             ready, detail = module.build_training_readiness(
                 stats,
                 {"000001"},
@@ -957,7 +1017,7 @@ class ReportDataQualityTest(unittest.TestCase):
             for label, payload in invalid_payloads.items():
                 with self.subTest(label=label):
                     factor_path.write_bytes(payload)
-                    stats = module.qlib_provider_stats(provider)
+                    stats = module.qlib_provider_stats(provider, compatibility=True)
                     ready, detail = module.build_training_readiness(
                         stats,
                         {"000001"},
@@ -1022,7 +1082,7 @@ class ReportDataQualityTest(unittest.TestCase):
                         / f"{field}.day.bin"
                     )
 
-                    stats = module.qlib_provider_stats(provider)
+                    stats = module.qlib_provider_stats(provider, compatibility=True)
 
                     self.assertEqual(stats["complete_instrument_feature_dirs"], 0)
                     self.assertEqual(stats["incomplete_instrument_feature_dirs"], 1)
@@ -1050,7 +1110,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 provider / "features" / "sz000001" / "high.day.bin"
             )
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertEqual(stats["complete_instrument_feature_dirs"], 0)
         self.assertEqual(stats["incomplete_instrument_feature_dirs"], 1)
@@ -1083,7 +1143,7 @@ class ReportDataQualityTest(unittest.TestCase):
                     / f"{field}.day.bin"
                 )
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertEqual(stats["complete_instrument_feature_dirs"], 1)
         self.assertEqual(stats["invalid_instrument_feature_files"], 0)
@@ -1112,7 +1172,7 @@ class ReportDataQualityTest(unittest.TestCase):
                     [0.0, value, np.nan, np.nan, np.nan], dtype="<f4"
                 ).tofile(feature_dir / f"{field}.day.bin")
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertEqual(stats["complete_instrument_feature_dirs"], 0)
         self.assertEqual(stats["incomplete_instrument_feature_dirs"], 1)
@@ -1145,7 +1205,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 )
             write_benchmark_features(provider)
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertEqual(stats["complete_instrument_feature_dirs"], 0)
         self.assertEqual(stats["incomplete_instrument_feature_dirs"], 1)
@@ -1173,7 +1233,7 @@ class ReportDataQualityTest(unittest.TestCase):
                     "SZ000001\t2026-07-17\t2026-07-20\n", encoding="utf-8"
                 )
 
-                stats = module.qlib_provider_stats(provider)
+                stats = module.qlib_provider_stats(provider, compatibility=True)
                 ready, detail = module.build_training_readiness(
                     stats,
                     {f"{index:06d}" for index in range(100)},
@@ -1218,7 +1278,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 instruments.parent.mkdir(parents=True)
                 instruments.write_text(instrument_text, encoding="utf-8")
 
-                stats = module.qlib_provider_stats(provider)
+                stats = module.qlib_provider_stats(provider, compatibility=True)
                 ready, detail = module.build_training_readiness(
                     stats,
                     {f"{index:06d}" for index in range(100)},
@@ -1254,9 +1314,9 @@ class ReportDataQualityTest(unittest.TestCase):
             )
             write_benchmark_features(provider)
 
-            complete = module.qlib_provider_stats(provider)
+            complete = module.qlib_provider_stats(provider, compatibility=True)
             (provider / "features" / "sh000906" / "volume.day.bin").unlink()
-            incomplete = module.qlib_provider_stats(provider)
+            incomplete = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertTrue(complete["benchmark_complete"])
         self.assertEqual(complete["benchmark_feature_dirs"], 3)
@@ -1284,7 +1344,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 provider / "features" / "sh000300" / "high.day.bin"
             )
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
             ready, readiness = module.build_training_readiness(
                 stats,
                 {"000001"},
@@ -1332,7 +1392,7 @@ class ReportDataQualityTest(unittest.TestCase):
                 provider / "features" / "sh000300" / "factor.day.bin"
             )
 
-            stats = module.qlib_provider_stats(provider)
+            stats = module.qlib_provider_stats(provider, compatibility=True)
 
         self.assertFalse(stats["benchmark_complete"])
         self.assertEqual(stats["benchmark_details"]["SH000300"]["missing_days"], 1)
@@ -1563,6 +1623,8 @@ class ReportDataQualityTest(unittest.TestCase):
 
         self.assertIn("A-Share Data Quality Report", text)
         self.assertIn("Qlib Provider", text)
+        self.assertNotIn("Direct Provider", text)
+        self.assertNotIn("Direct Qlib Provider", text)
         self.assertIn("Stock universe: 0", text)
         self.assertEqual(pointer["schema_version"], 3)
         self.assertEqual(
@@ -1800,7 +1862,10 @@ class ReportDataQualityTest(unittest.TestCase):
             index_snapshot = root / "index-snapshot"
             index_snapshot.mkdir()
             (index_snapshot / "stable.parquet").write_bytes(b"stable")
-            provider_stats = module.qlib_provider_stats(qlib_snapshot)
+            provider_stats = module.qlib_provider_stats(
+                qlib_snapshot,
+                compatibility=True,
+            )
             module.STOCK_LIST = root / "missing_stock_lists.json"
             module.EMPTY_CODES = root / "missing_empty_codes.json"
             module.TIMEOUT_CODES = root / "missing_timeout_codes.json"
@@ -1857,8 +1922,8 @@ class ReportDataQualityTest(unittest.TestCase):
                 patch.object(module, "QUANT_DATA", root),
                 patch.object(
                     module,
-                    "qlib_workflow_provider_descriptor",
-                    side_effect=lambda provider: descriptors[provider],
+                    "qlib_workflow_provider_uri",
+                    side_effect=lambda provider: descriptors[provider].parent,
                 ),
                 patch.object(
                     module,

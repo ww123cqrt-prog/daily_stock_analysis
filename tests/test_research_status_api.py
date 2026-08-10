@@ -25,6 +25,7 @@ from quant_workflow.scripts.quant_data_contract import (
     atomic_write_json,
     filesystem_state_fingerprint,
     finalize_qlib_snapshot,
+    resolve_dataset,
 )
 from quant_workflow.scripts.robust_signal_data_contract import (
     ACCEPTANCE_CONTRACT,
@@ -186,6 +187,213 @@ def write_native_ashare_fixture(
 
 
 class ResearchStatusApiTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        from api.v1.endpoints import research_status
+
+        def resolve_test_provider(provider: str = "canonical") -> Path:
+            dataset_id = (
+                "qlib_ashare_cleaned_v2"
+                if str(provider).strip().lower() == "cleaned"
+                else "qlib_ashare_v2"
+            )
+            resolution = resolve_dataset(
+                dataset_id,
+                quant_data_root=research_status.QUANT_DATA_ROOT,
+                require_basis="qfq",
+            )
+            return Path(resolution.snapshot_path)
+
+        self._provider_facade_patch = patch.object(
+            research_status,
+            "qlib_workflow_provider_uri",
+            side_effect=resolve_test_provider,
+        )
+        self._provider_facade_patch.start()
+        self.addCleanup(self._provider_facade_patch.stop)
+
+    def test_qlib_status_resolution_uses_provider_facade(self) -> None:
+        from api.v1.endpoints import research_status
+
+        provider = Path("/quant_data/runtime/qlib/provider")
+        lineage = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-001",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+        ranges = {
+            "SH600000": ("2020-01-02", "2026-08-07"),
+            "SZ000001": ("2020-01-02", "2026-08-07"),
+        }
+
+        with (
+            patch.object(
+                research_status,
+                "qlib_workflow_provider_uri",
+                return_value=provider,
+                create=True,
+            ) as provider_uri,
+            patch.object(
+                research_status,
+                "provider_calendar_days",
+                return_value=["2026-08-06", "2026-08-07"],
+                create=True,
+            ) as calendar_days,
+            patch.object(
+                research_status,
+                "provider_instrument_ranges",
+                return_value=ranges,
+                create=True,
+            ) as instrument_ranges,
+            patch.object(
+                research_status,
+                "provider_has_instrument_pool",
+                return_value=True,
+                create=True,
+            ) as has_pool,
+            patch.object(
+                research_status,
+                "provider_identity",
+                return_value=lineage,
+                create=True,
+            ) as identity_reader,
+        ):
+            resolution = research_status._resolve_native_qlib_provider(
+                provider="canonical"
+            )
+
+        self.assertEqual(resolution.path, provider)
+        self.assertEqual(resolution.lineage, lineage)
+        self.assertEqual(resolution.calendar_end, "2026-08-07")
+        self.assertEqual(resolution.instrument_count, 2)
+        self.assertTrue(resolution.benchmark_complete)
+        provider_uri.assert_called_once_with("canonical")
+        calendar_days.assert_called_once_with(provider)
+        instrument_ranges.assert_called_once_with(provider)
+        has_pool.assert_called_once_with(provider, "csi300")
+        identity_reader.assert_called_once_with(
+            provider,
+            quant_data_root=research_status.QUANT_DATA_ROOT,
+        )
+
+    def test_saved_provider_lineage_is_compared_without_storage_branching(self) -> None:
+        from api.v1.endpoints import research_status
+
+        lineage = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-001",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+        resolution = research_status._NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/quant_data/runtime/qlib/provider"),
+            lineage=lineage,
+            provider_name="canonical",
+        )
+        payload = {"provider": "canonical", "provider_identity": dict(lineage)}
+
+        research_status._annotate_saved_provider(
+            payload,
+            resolution,
+            artifact_label="训练结果",
+        )
+
+        self.assertTrue(payload["provider_current"])
+        self.assertEqual(payload["provider_status"], "current")
+        self.assertNotIn("provider_warning", payload)
+
+    def test_public_qlib_provider_status_hides_storage_implementation_terms(self) -> None:
+        from api.v1.endpoints import research_status
+
+        lineage = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-001",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+        resolution = research_status._NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/quant_data/runtime/qlib/provider"),
+            lineage=lineage,
+            provider_name="canonical",
+            calendar_end="2026-08-07",
+            instrument_count=5000,
+            benchmark_complete=True,
+        )
+
+        with (
+            patch.object(
+                research_status,
+                "_resolve_native_qlib_provider",
+                return_value=resolution,
+            ),
+            patch.object(
+                research_status,
+                "_qlib_provider_from_path",
+                return_value={
+                    "path": "/quant_data/runtime/qlib/provider",
+                    "calendar_days": 1000,
+                    "instruments": 5000,
+                    "benchmark_complete": True,
+                },
+            ),
+        ):
+            payload = research_status._missing_status_payload()
+
+        public_text = json.dumps(
+            {
+                "qlib_provider": payload["qlib_provider"],
+                "training_readiness": payload["training_readiness"],
+            },
+            ensure_ascii=False,
+        ).lower()
+        for forbidden in ("direct", "直读", "native v2", "原生 v2"):
+            self.assertNotIn(forbidden, public_text)
+
+    def test_blocked_qlib_provider_hides_storage_implementation_error(self) -> None:
+        from api.v1.endpoints import research_status
+
+        with patch.object(
+            research_status,
+            "qlib_workflow_provider_uri",
+            side_effect=RuntimeError(
+                "direct_parquet_v1 descriptor rejected a legacy .bin provider"
+            ),
+        ):
+            resolution = research_status._resolve_native_qlib_provider()
+
+        self.assertTrue(resolution.authoritative)
+        self.assertIsNone(resolution.path)
+        self.assertIn("Qlib Provider", str(resolution.error))
+        public_error = str(resolution.error).lower()
+        for forbidden in ("direct", "direct_parquet_v1", ".bin", "legacy"):
+            self.assertNotIn(forbidden, public_error)
+
     def test_approved_ashare_snapshot_requires_matching_full_quality_evidence(
         self,
     ) -> None:
@@ -677,7 +885,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             payload = self._build_status_for_roots(root / "reports", data_root)
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
-        self.assertIn("根清单", payload["qlib_provider"]["provider_error"])
+        self.assertIn("Qlib Provider", payload["qlib_provider"]["provider_error"])
 
     def test_status_rejects_latest_pointer_without_v2_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -692,7 +900,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             payload = self._build_status_for_roots(root / "reports", data_root)
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
-        self.assertIn("LATEST", payload["qlib_provider"]["provider_error"])
+        self.assertIn("Qlib Provider", payload["qlib_provider"]["provider_error"])
 
     def test_saved_cleaned_v2_result_is_current_against_cleaned_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -747,7 +955,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertTrue(payload["latest_training"]["provider_current"])
         self.assertEqual(
             payload["latest_training"]["provider_status"],
-            "current_native_v2",
+            "current",
         )
         self.assertTrue(payload["latest_training_provider"]["provider_current"])
         self.assertEqual(
@@ -977,6 +1185,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 encoding="utf-8",
             )
             cleaned_identity = {
+                "provider_contract": "immutable_snapshot_v2",
                 "dataset_id": "qlib_ashare_cleaned_v2",
                 "snapshot_id": "cleaned-snapshot-v2",
                 "manifest_sha256": "d" * 64,
@@ -2384,16 +2593,14 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["latest_training"]["run_id"], "new-cleaned-run")
         self.assertEqual(body["latest_training"]["provider"], "cleaned")
         self.assertEqual(body["qlib_provider"]["path"], "/tmp/stale-cn-data")
-        self.assertEqual(
-            body["latest_training_provider"]["path"], str(cleaned_provider)
-        )
-        self.assertEqual(
-            body["latest_training_provider"]["calendar_range"],
-            "2008-01-02 ~ 2026-07-03",
-        )
-        self.assertEqual(body["latest_training_provider"]["calendar_days"], 2)
-        self.assertEqual(body["latest_training_provider"]["instruments"], 2)
+        self.assertEqual(body["latest_training_provider"]["status"], "blocked")
+        self.assertNotIn("path", body["latest_training_provider"])
         self.assertFalse(body["latest_training_provider"]["provider_current"])
+        self.assertFalse(body["latest_training_provider"]["provider_trusted"])
+        self.assertIn(
+            "完整的 Qlib Provider 血缘",
+            body["qlib_provider"]["provider_uri_warning"],
+        )
 
     def test_status_does_not_present_legacy_training_provider_as_current_native_v2(
         self,
@@ -2464,13 +2671,16 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             Path(payload["qlib_provider"]["path"]).resolve(), provider.resolve()
         )
         self.assertEqual(payload["qlib_provider"]["dataset_id"], "qlib_ashare_v2")
-        self.assertEqual(payload["qlib_provider"]["provider_source"], "native_v2_catalog")
+        self.assertEqual(payload["qlib_provider"]["provider_source"], "Qlib Provider")
         self.assertFalse(payload["qlib_provider"]["latest_training_provider_current"])
         self.assertEqual(payload["latest_training"]["provider_status"], "stale")
         self.assertFalse(payload["latest_training"]["provider_current"])
         self.assertEqual(payload["candidate_pipeline"]["provider_status"], "stale")
         self.assertFalse(payload["candidate_pipeline"]["provider_current"])
-        self.assertIn("历史结果", payload["qlib_provider"]["provider_uri_warning"])
+        self.assertIn(
+            "完整的 Qlib Provider 血缘",
+            payload["qlib_provider"]["provider_uri_warning"],
+        )
 
     def test_status_fails_closed_when_native_v2_catalog_hash_is_invalid(self) -> None:
         from api.v1.endpoints.research_status import build_research_status_payload
@@ -2532,10 +2742,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertFalse(payload["trainable"])
         self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertEqual(
-            payload["qlib_provider"]["provider_source"],
-            "native_v2_catalog",
-        )
+        self.assertEqual(payload["qlib_provider"]["provider_source"], "Qlib Provider")
         self.assertNotEqual(payload["qlib_provider"].get("path"), str(legacy_provider))
         self.assertEqual(
             payload["latest_training"]["provider_status"], "catalog_invalid"
@@ -2562,7 +2769,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertFalse(payload["trainable"])
-        self.assertIn("内容哈希", payload["qlib_provider"]["provider_error"])
+        self.assertIn("Qlib Provider", payload["qlib_provider"]["provider_error"])
 
     def test_status_describes_the_historical_snapshot_used_by_latest_training(
         self,
@@ -2603,7 +2810,11 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            payload = self._build_status_for_roots(reports_dir, data_root)
+            with patch(
+                "api.v1.endpoints.research_status.resolve_immutable_provider_identity",
+                return_value=historical,
+            ):
+                payload = self._build_status_for_roots(reports_dir, data_root)
 
         self.assertEqual(Path(payload["qlib_provider"]["path"]).resolve(), current.resolve())
         self.assertFalse(payload["latest_training"]["provider_current"])
@@ -2665,7 +2876,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertNotEqual(payload["qlib_provider"].get("path"), str(legacy_provider))
-        self.assertIn("V2", payload["qlib_provider"]["provider_error"])
+        self.assertIn("Qlib Provider", payload["qlib_provider"]["provider_error"])
 
     def test_status_blocks_native_snapshot_when_an_indexed_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2761,106 +2972,35 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertFalse(payload["trainable"])
 
-    def test_status_blocks_manifest_swapped_between_hash_and_json_reads(self) -> None:
+    def test_status_blocks_when_provider_facade_rejects_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_root = root / "quant_data"
-            provider = self._write_native_qlib_fixture(data_root)
-            dataset_manifest_path = provider / "DATASET_MANIFEST.json"
-            original_read_bytes = Path.read_bytes
-            swapped = False
+            self._write_native_qlib_fixture(data_root)
 
-            def swapping_read_bytes(path: Path) -> bytes:
-                nonlocal swapped
-                content = original_read_bytes(path)
-                if path.resolve() == dataset_manifest_path.resolve() and not swapped:
-                    swapped = True
-                    manifest = json.loads(content.decode("utf-8"))
-                    manifest["producer"]["version"] = "tampered"
-                    path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-                return content
-
-            with patch.object(Path, "read_bytes", new=swapping_read_bytes):
+            with patch(
+                "api.v1.endpoints.research_status.qlib_workflow_provider_uri",
+                side_effect=RuntimeError("provider integrity changed"),
+            ):
                 payload = self._build_status_for_roots(root / "reports", data_root)
 
-        self.assertTrue(swapped)
         self.assertEqual(payload["qlib_provider"]["status"], "blocked")
         self.assertFalse(payload["trainable"])
 
-    def test_native_snapshot_full_hash_validation_is_reused_until_ttl(self) -> None:
+    def test_status_leaves_physical_snapshot_validation_to_provider_facade(self) -> None:
         from api.v1.endpoints import research_status
 
-        research_status._clear_native_qlib_validation_cache()
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                data_root = root / "quant_data"
-                self._write_native_qlib_fixture(data_root)
-                real_validator = research_status.validate_qlib_snapshot
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "quant_data"
+            self._write_native_qlib_fixture(data_root)
 
-                with patch.object(
-                    research_status,
-                    "validate_qlib_snapshot",
-                    wraps=real_validator,
-                ) as validator:
-                    with patch.object(research_status.time, "monotonic", return_value=0.0):
-                        first = self._build_status_for_roots(root / "reports", data_root)
-                    with patch.object(research_status.time, "monotonic", return_value=10.0):
-                        cached = self._build_status_for_roots(root / "reports", data_root)
-                    with patch.object(research_status.time, "monotonic", return_value=61.0):
-                        refreshed = self._build_status_for_roots(root / "reports", data_root)
+            self.assertFalse(
+                hasattr(research_status, "_validate_native_qlib_snapshot_cached")
+            )
+            payload = self._build_status_for_roots(root / "reports", data_root)
 
-            self.assertEqual(first["qlib_provider"]["status"], "ready")
-            self.assertEqual(cached["qlib_provider"]["status"], "ready")
-            self.assertEqual(refreshed["qlib_provider"]["status"], "ready")
-            self.assertEqual(validator.call_count, 2)
-        finally:
-            research_status._clear_native_qlib_validation_cache()
-
-    def test_native_snapshot_validation_cache_retains_distinct_snapshots(self) -> None:
-        from api.v1.endpoints import research_status
-
-        research_status._clear_native_qlib_validation_cache()
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                first_provider = root / "first"
-                second_provider = root / "second"
-                first_provider.mkdir()
-                second_provider.mkdir()
-                first_manifest = {"snapshot_id": "first"}
-                second_manifest = {"snapshot_id": "second"}
-
-                with patch.object(
-                    research_status,
-                    "validate_qlib_snapshot",
-                    side_effect=[first_manifest, second_manifest],
-                ) as validator:
-                    with patch.object(research_status.time, "monotonic", return_value=0.0):
-                        first = research_status._validate_native_qlib_snapshot_cached(
-                            first_provider,
-                            manifest_sha256="a" * 64,
-                            evidence_root=root,
-                        )
-                    with patch.object(research_status.time, "monotonic", return_value=1.0):
-                        second = research_status._validate_native_qlib_snapshot_cached(
-                            second_provider,
-                            manifest_sha256="b" * 64,
-                            evidence_root=root,
-                        )
-                    with patch.object(research_status.time, "monotonic", return_value=2.0):
-                        first_again = research_status._validate_native_qlib_snapshot_cached(
-                            first_provider,
-                            manifest_sha256="a" * 64,
-                            evidence_root=root,
-                        )
-
-            self.assertEqual(first, first_manifest)
-            self.assertEqual(second, second_manifest)
-            self.assertEqual(first_again, first_manifest)
-            self.assertEqual(validator.call_count, 2)
-        finally:
-            research_status._clear_native_qlib_validation_cache()
+        self.assertEqual(payload["qlib_provider"]["status"], "ready")
 
     def test_directory_size_cache_avoids_repeated_provider_scans_until_ttl(
         self,
@@ -4043,6 +4183,30 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                             }
                         },
                     },
+                    "provider_quality": {
+                        "canonical": {
+                            "dataset_id": "qlib_ashare_v2",
+                            "snapshot_id": "old-snapshot",
+                            "manifest_sha256": old_hash,
+                            "content_sha256": old_hash,
+                            **valid_provider_semantic_metrics(),
+                            "calendar_days": 252,
+                            "instruments": 100,
+                            "instrument_feature_dirs": 100,
+                            "missing_instrument_feature_dirs": 0,
+                            "complete_instrument_feature_dirs": 100,
+                            "incomplete_instrument_feature_dirs": 0,
+                            "missing_instrument_feature_files": 0,
+                            "invalid_instrument_feature_files": 0,
+                            "benchmark_complete": True,
+                            "trainable": True,
+                            "failure_reasons": [],
+                            "training_readiness": {
+                                "status": "trainable",
+                                "summary": "Provider passed.",
+                            },
+                        }
+                    },
                 },
             )
             status_path = reports_dir / "research_status_latest.json"
@@ -4113,7 +4277,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertFalse(payload["trainable"])
         self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("native V2 snapshot", payload["training_readiness"]["summary"])
+        self.assertIn("Qlib Provider", payload["training_readiness"]["summary"])
         self.assertEqual(
             payload["current_provider_identities"]["canonical"]["snapshot_id"],
             "current-snapshot",
@@ -4462,6 +4626,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             native = _NativeQlibProviderResolution(
                 authoritative=True,
                 path=reports_dir / "cleaned-provider",
+                provider_name="cleaned",
                 dataset_id="qlib_ashare_cleaned_v2",
                 snapshot_id="cleaned-snapshot",
                 manifest_sha256=cleaned_hash,
@@ -4486,12 +4651,23 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 ),
             ):
                 payload = build_research_status_payload(
-                    provider_dataset_id="qlib_ashare_cleaned_v2"
+                    provider_dataset_id="qlib_ashare_cleaned_v2",
+                    provider="cleaned",
                 )
 
+        self.assertEqual(resolve_native.call_count, 2)
         self.assertEqual(
-            [item.args[0] for item in resolve_native.call_args_list],
-            ["qlib_ashare_cleaned_v2", "qlib_ashare_v2"],
+            resolve_native.call_args_list[0].args,
+            ("qlib_ashare_cleaned_v2",),
+        )
+        self.assertEqual(
+            resolve_native.call_args_list[0].kwargs,
+            {"provider": "cleaned"},
+        )
+        self.assertEqual(resolve_native.call_args_list[1].args, ())
+        self.assertEqual(
+            resolve_native.call_args_list[1].kwargs,
+            {"provider": "canonical"},
         )
         self.assertTrue(payload["trainable"])
         self.assertEqual(
@@ -4898,7 +5074,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["qlib_provider"]["path"], "/tmp/stale-cn-data")
         self.assertFalse(body["qlib_provider"]["latest_training_provider_trusted"])
         self.assertIn(
-            "outside configured Qlib provider root",
+            "完整的 Qlib Provider 血缘",
             body["qlib_provider"]["provider_uri_warning"],
         )
 
@@ -4964,7 +5140,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(body["latest_training"]["run_id"], "root-provider-run")
         self.assertFalse(body["qlib_provider"]["latest_training_provider_trusted"])
         self.assertIn(
-            "not a concrete Qlib provider",
+            "完整的 Qlib Provider 血缘",
             body["qlib_provider"]["provider_uri_warning"],
         )
 

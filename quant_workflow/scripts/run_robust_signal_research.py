@@ -292,8 +292,8 @@ def _resolve_provider(
     status = consume_accepted_robust_signal_data(
         artifact_path=readiness_artifact_path,
         artifact_sha256=readiness_artifact_sha256,
-        # Direct descriptors live below quant_data/runtime/qlib_direct, while
-        # the legacy copied provider lived below runtime/robust_strategy.
+        # Formal and explicitly retained compatibility Providers are both
+        # constrained to the quant_data runtime tree.
         provider_root=Path(quant_data_dir) / "runtime",
         reports_dir=report_root,
     )

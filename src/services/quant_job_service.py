@@ -36,6 +36,10 @@ from src.services.quant_workflow_paths import (
     reports_root,
     workflow_root,
 )
+from quant_workflow.scripts._mlflow_run_provenance import (
+    RunProvenanceError,
+    normalize_provider_lineage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -150,31 +154,6 @@ ROBUST_SIGNAL_DATA_PINNED_JOB_TYPES = {
     "run_robust_signal_research",
     "resume_robust_signal_research",
 }
-TRAINING_PROVIDER_DATASET_IDS = {
-    "canonical": "ashare_daily_qfq",
-    "cleaned": "ashare_daily_qfq",
-}
-PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-)
-DIRECT_PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-    "descriptor_path",
-    "descriptor_sha256",
-    "cleaning_mode",
-    "index_dataset_id",
-    "index_snapshot_id",
-    "index_content_sha256",
-    "index_manifest_sha256",
-)
 MARKET_DATA_PINNED_JOB_TYPES = {
     "report_market_regime",
     "report_cash_control_backtest",
@@ -788,57 +767,11 @@ def _safe_provider(value: Any) -> str:
     return raw
 
 
-def _approved_provider_identity_json(
-    provider: str,
-    identity: Mapping[str, Any],
-) -> str:
-    expected_dataset_id = TRAINING_PROVIDER_DATASET_IDS[provider]
-    payload = {field: identity.get(field) for field in PROVIDER_IDENTITY_FIELDS}
-    if identity.get("provider_contract") == "direct_parquet_v1":
-        payload = {
-            field: identity.get(field) for field in DIRECT_PROVIDER_IDENTITY_FIELDS
-        }
-        descriptor_path = str(payload.get("descriptor_path") or "")
-        if (
-            payload.get("dataset_id") != expected_dataset_id
-            or payload.get("cleaning_mode") != provider
-            or not descriptor_path
-            or Path(descriptor_path).is_absolute()
-            or ".." in Path(descriptor_path).parts
-            or payload.get("index_dataset_id") != "cn_index_daily"
-            or not isinstance(payload.get("index_snapshot_id"), str)
-            or Path(str(payload.get("index_snapshot_id"))).name
-            != payload.get("index_snapshot_id")
-            or any(
-                not isinstance(payload.get(field), str)
-                or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
-                for field in (
-                    "manifest_sha256",
-                    "content_sha256",
-                    "descriptor_sha256",
-                    "index_content_sha256",
-                    "index_manifest_sha256",
-                )
-            )
-        ):
-            raise ValueError("Approved direct Provider identity is invalid or mismatched.")
-        return _json_dumps(payload)
-    snapshot_id = payload.get("snapshot_id")
-    if (
-        payload.get("provider_contract") != "immutable_snapshot_v2"
-        or payload.get("dataset_id") != expected_dataset_id
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
-        or Path(snapshot_id).name != snapshot_id
-        or snapshot_id in {".", ".."}
-        or any(
-            not isinstance(payload.get(field), str)
-            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
-            for field in ("manifest_sha256", "content_sha256")
-        )
-    ):
-        raise ValueError("Approved provider identity is invalid or mismatched.")
-    return _json_dumps(payload)
+def _approved_provider_identity_json(identity: Mapping[str, Any]) -> str:
+    try:
+        return _json_dumps(normalize_provider_lineage(identity))
+    except RunProvenanceError as exc:
+        raise ValueError("Approved Qlib Provider lineage is invalid.") from exc
 
 
 def _approved_market_data_bars_path(identity: Mapping[str, Any]) -> Path:
@@ -1541,7 +1474,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "run_daily_update": {
-            "label": "运行每日数据更新与 V2 校验",
+            "label": "运行每日 quant_data 更新与校验",
             "command": run_daily_update,
             "allowed_params": {
                 "skip_download",
@@ -1697,12 +1630,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
         "merge_to_qlib": {
-            "label": "生成正式 Qlib 直读 Provider",
+            "label": "生成正式 Qlib Provider",
             "command": merge_to_qlib,
             "allowed_params": {"no_overwrite", "smoke"},
         },
         "apply_data_cleaning": {
-            "label": "生成正式 cleaned 直读 Qlib Provider",
+            "label": "生成正式 cleaned Qlib Provider",
             "command": apply_data_cleaning,
             "allowed_params": {"dry_run"},
             "artifact_patterns": [
@@ -2177,13 +2110,11 @@ class QuantJobService:
                 raise ValueError(
                     "Approved provider identity is only valid for provider-pinned training jobs."
                 )
-            provider = _safe_provider(params_dict.get("provider"))
+            _safe_provider(params_dict.get("provider"))
             command.extend(
                 [
                     "--provider-identity-json",
-                    _approved_provider_identity_json(
-                        provider, approved_provider_identity
-                    ),
+                    _approved_provider_identity_json(approved_provider_identity),
                 ]
             )
         if approved_market_data_identity is not None:

@@ -29,7 +29,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from _paths import (  # noqa: E402
     mlruns_root,
     provider_calendar_days,
-    qlib_init_config_for_uri,
+    qlib_workflow_init_config,
     qlib_workflow_provider_uri,
     init_qlib_workflow,
     quant_data_root,
@@ -38,8 +38,9 @@ from _paths import (  # noqa: E402
 )
 from _mlflow_run_provenance import (  # noqa: E402
     RunProvenanceError,
+    provider_lineage_is_complete,
+    provider_lineages_match,
     provider_identity,
-    resolve_approved_provider_identity,
     validate_file_store_run_artifact,
 )
 from _optimized_strategy_core import OptimizedStrategy  # noqa: E402
@@ -65,13 +66,10 @@ def resolve_pipeline_provider(
     provider: str,
     expected_provider_identity: Mapping[str, Any] | None = None,
 ) -> Path:
-    if expected_provider_identity is not None:
-        return resolve_approved_provider_identity(
-            provider,
-            expected_provider_identity,
-            quant_data_root=QUANT_DATA,
-        )
-    return qlib_workflow_provider_uri(provider)
+    return qlib_workflow_provider_uri(
+        provider,
+        expected_provider_identity=expected_provider_identity,
+    )
 
 
 REQUIRED_MODEL_IDS = ["linear_ols", "linear_ridge", "lightgbm", "xgboost", "catboost"]
@@ -575,16 +573,7 @@ def _require_provider_identity(
     actual: Any,
     expected: dict[str, Any],
 ) -> None:
-    required = (
-        "provider_contract",
-        "dataset_id",
-        "snapshot_id",
-        "content_sha256",
-        "manifest_sha256",
-    )
-    if not isinstance(actual, dict) or any(
-        actual.get(field) != expected.get(field) for field in required
-    ):
+    if not provider_lineages_match(actual, expected):
         raise RuntimeError(
             "Candidate model used a different immutable provider than the batch snapshot"
         )
@@ -609,51 +598,7 @@ def _backtest_eligibility(
         for name in ("pred.pkl", "label.pkl")
     ):
         missing.append("replayable_predictions")
-    provider_contract = provider.get("provider_contract")
-    if provider_contract == "direct_parquet_v1":
-        direct_required = (
-            "dataset_id",
-            "snapshot_id",
-            "manifest_sha256",
-            "content_sha256",
-            "descriptor_path",
-            "descriptor_sha256",
-            "cleaning_mode",
-            "index_dataset_id",
-            "index_snapshot_id",
-            "index_content_sha256",
-            "index_manifest_sha256",
-        )
-        direct_valid = (
-            provider.get("dataset_id") == "ashare_daily_qfq"
-            and provider.get("index_dataset_id") == "cn_index_daily"
-            and provider.get("cleaning_mode") in {"canonical", "cleaned"}
-            and isinstance(provider.get("descriptor_path"), str)
-            and not Path(str(provider.get("descriptor_path"))).is_absolute()
-            and ".." not in Path(str(provider.get("descriptor_path"))).parts
-            and all(provider.get(field) for field in direct_required)
-            and all(
-                SHA256_RE.fullmatch(str(provider.get(field) or ""))
-                for field in (
-                    "manifest_sha256",
-                    "content_sha256",
-                    "descriptor_sha256",
-                    "index_content_sha256",
-                    "index_manifest_sha256",
-                )
-            )
-        )
-        if not direct_valid:
-            missing.append("provider_snapshot")
-    elif (
-        provider_contract != "immutable_snapshot_v2"
-        or not provider.get("dataset_id")
-        or not provider.get("snapshot_id")
-        or any(
-            not SHA256_RE.fullmatch(str(provider.get(field) or ""))
-            for field in ("manifest_sha256", "content_sha256")
-        )
-    ):
+    if not provider_lineage_is_complete(provider):
         missing.append("provider_snapshot")
     return {"eligible": not missing, "missing": missing}
 
@@ -675,9 +620,9 @@ def _run_model_training(
     candidate_config = build_candidate_config(base, model)
     qlib_init = dict(candidate_config.get("qlib_init") or {})
     qlib_init.update(
-        qlib_init_config_for_uri(
-            provider_uri,
+        qlib_workflow_init_config(
             provider=provider,
+            provider_uri=provider_uri,
         )
     )
     candidate_config["qlib_init"] = qlib_init
@@ -1017,6 +962,11 @@ def run_pipeline(
             provider_uri
         )
         locked_provider_identity = provider_identity(provider_uri)
+        if expected_provider_identity is not None:
+            _require_provider_identity(
+                locked_provider_identity,
+                dict(expected_provider_identity),
+            )
         provider_state = {
             "provider_latest_day": provider_latest_day,
             "latest_prediction_day": latest_prediction_day,

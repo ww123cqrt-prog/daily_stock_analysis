@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { BarChart3, Bell, BriefcaseBusiness, Compass, FlaskConical, Home, LogOut, MessageSquareQuote, Search, Settings2, Workflow } from 'lucide-react';
+import { Activity, BarChart3, Bell, BriefcaseBusiness, Compass, FlaskConical, Gauge, Home, LogOut, MessageSquareQuote, Search, Settings2, Workflow } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
-import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
+import { SCREENING_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, screeningApi } from '../../api/screening';
 import { useAuth } from '../../contexts/AuthContext';
 import { useAgentChatStore } from '../../stores/agentChatStore';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
@@ -34,9 +34,11 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'chat', labelKey: 'layout.nav.chat', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
   { key: 'screening', labelKey: 'layout.nav.screening', to: '/screening', icon: Search },
   { key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
+  { key: 'decision-signals', labelKey: 'layout.nav.decisionSignals', to: '/decision-signals', icon: Activity },
   { key: 'backtest', labelKey: 'layout.nav.backtest', to: '/backtest', icon: BarChart3 },
   { key: 'experiments', labelKey: 'layout.nav.experiments', to: '/experiments/', icon: FlaskConical },
   { key: 'alerts', labelKey: 'layout.nav.alerts', to: '/alerts', icon: Bell },
+  { key: 'usage', labelKey: 'layout.nav.usage', to: '/usage', icon: Gauge },
   { key: 'settings', labelKey: 'layout.nav.settings', to: '/settings', icon: Settings2 },
 ];
 
@@ -46,36 +48,36 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
   const location = useLocation();
   const completionBadge = useAgentChatStore((state) => state.completionBadge);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-  const [showAlphaSiftNav, setShowAlphaSiftNav] = useState(false);
+  const [showScreeningNav, setShowScreeningNav] = useState(false);
 
   useEffect(() => {
     let active = true;
 
-    const refreshAlphaSiftStatus = async () => {
+    const refreshScreeningStatus = async () => {
       try {
-        const status = await alphasiftApi.getStatus();
+        const status = await screeningApi.getStatus();
         if (active) {
-          setShowAlphaSiftNav(status.enabled);
+          setShowScreeningNav(status.enabled);
         }
       } catch {
         if (active) {
-          setShowAlphaSiftNav(false);
+          setShowScreeningNav(false);
         }
       }
     };
 
-    void refreshAlphaSiftStatus();
-    window.addEventListener(ALPHASIFT_CONFIG_CHANGED_EVENT, refreshAlphaSiftStatus);
-    window.addEventListener(SYSTEM_CONFIG_CHANGED_EVENT, refreshAlphaSiftStatus);
+    void refreshScreeningStatus();
+    window.addEventListener(SCREENING_CONFIG_CHANGED_EVENT, refreshScreeningStatus);
+    window.addEventListener(SYSTEM_CONFIG_CHANGED_EVENT, refreshScreeningStatus);
 
     return () => {
       active = false;
-      window.removeEventListener(ALPHASIFT_CONFIG_CHANGED_EVENT, refreshAlphaSiftStatus);
-      window.removeEventListener(SYSTEM_CONFIG_CHANGED_EVENT, refreshAlphaSiftStatus);
+      window.removeEventListener(SCREENING_CONFIG_CHANGED_EVENT, refreshScreeningStatus);
+      window.removeEventListener(SYSTEM_CONFIG_CHANGED_EVENT, refreshScreeningStatus);
     };
   }, []);
 
-  const navItems = showAlphaSiftNav ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.key !== 'screening');
+  const navItems = showScreeningNav ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.key !== 'screening');
   const isRail = variant === 'rail';
   const itemBaseClass = cn(
     'group relative flex h-[var(--nav-item-height)] w-full items-center overflow-hidden rounded-2xl border border-transparent text-sm leading-none text-secondary-text transition-all',

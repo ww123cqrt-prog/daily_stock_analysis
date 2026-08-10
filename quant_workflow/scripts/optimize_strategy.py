@@ -34,7 +34,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from _paths import (  # noqa: E402
     init_qlib_workflow,
     mlruns_root,
-    qlib_init_config_for_uri,
+    qlib_workflow_init_config,
     qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
@@ -56,7 +56,7 @@ REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
 MLFLOW_TRACKING_URI = f"file://{MLRUNS_DIR}"
 QUANT_DATA = quant_data_root()
-DATA_DIR = qlib_workflow_provider_uri()
+DATA_DIR: Path | None = None
 
 os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
 os.environ["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
@@ -80,10 +80,14 @@ def _experiment_by_name(client, experiment_name: str):
     )
 
 
-def init_qlib(data_dir: Path = DATA_DIR):
+def resolve_data_dir(data_dir: Path | None = None) -> Path:
+    return Path(data_dir) if data_dir is not None else qlib_workflow_provider_uri()
+
+
+def init_qlib(data_dir: Path | None = None):
     """Initialize Qlib lazily so browser-safe dry-runs can import this module."""
     configure_mlflow_env()
-    init_qlib_workflow(provider_uri=data_dir)
+    init_qlib_workflow(provider_uri=resolve_data_dir(data_dir))
     import qlib
 
     return qlib
@@ -102,10 +106,7 @@ def write_training_config_with_provider(
     config_path = Path(config_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
-    if Path(provider_uri).exists():
-        qlib_init.update(qlib_init_config_for_uri(provider_uri))
-    else:
-        qlib_init["provider_uri"] = str(Path(provider_uri))
+    qlib_init.update(qlib_workflow_init_config(provider_uri=provider_uri))
     payload["qlib_init"] = qlib_init
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -127,10 +128,11 @@ def write_training_config_with_provider(
 def train_and_predict(
     config_path: str,
     experiment_name: str,
-    provider_uri: Path = DATA_DIR,
+    provider_uri: Path | None = None,
 ):
     """训练选股模型并返回预测结果。"""
     configure_mlflow_env()
+    provider_uri = resolve_data_dir(provider_uri)
     from qlib.cli.run import workflow
     import mlflow
 
@@ -178,10 +180,11 @@ def train_and_predict(
 
 def load_existing_predictions(
     experiment_name: str = "baseline_lgb_alpha158",
-    provider_uri: Path = DATA_DIR,
+    provider_uri: Path | None = None,
 ):
     """从已有MLflow run加载预测，不重新训练。"""
     configure_mlflow_env()
+    provider_uri = resolve_data_dir(provider_uri)
     import mlflow
 
     client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)

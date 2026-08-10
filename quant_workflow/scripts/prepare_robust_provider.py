@@ -377,10 +377,10 @@ class RuntimeProviderIdentityCache:
 
     def __call__(self, provider: Path, key: str) -> dict[str, str] | None:
         provider = Path(provider)
-        descriptor = _direct_descriptor_path(provider)
+        descriptor = _provider_descriptor_path(provider)
         if descriptor is not None:
             digest = file_sha256(descriptor)
-            if str(key) != digest or _read_direct_provider_context(provider) is None:
+            if str(key) != digest or _read_provider_context(provider) is None:
                 return None
             return {"provider_key": digest, "provider_tree_sha256": digest}
         identity = (os.path.abspath(os.fspath(provider)), str(key))
@@ -406,7 +406,7 @@ class RuntimeProviderIdentityCache:
             return {"provider_key": key, "provider_tree_sha256": tree_hash}
 
 
-def _direct_descriptor_path(provider: Path) -> Path | None:
+def _provider_descriptor_path(provider: Path) -> Path | None:
     try:
         for child in Path(provider).iterdir():
             if child.name == "PROVIDER_DESCRIPTOR.json":
@@ -416,8 +416,8 @@ def _direct_descriptor_path(provider: Path) -> Path | None:
     return None
 
 
-def _read_direct_provider_context(provider: Path) -> Any | None:
-    descriptor = _direct_descriptor_path(provider)
+def _read_provider_context(provider: Path) -> Any | None:
+    descriptor = _provider_descriptor_path(provider)
     if descriptor is None or descriptor.is_symlink():
         return None
     try:
@@ -435,12 +435,12 @@ def _read_direct_provider_context(provider: Path) -> Any | None:
 
 def runtime_provider_identity(provider: Path, key: str) -> dict[str, str] | None:
     provider = Path(provider)
-    descriptor = _direct_descriptor_path(provider)
+    descriptor = _provider_descriptor_path(provider)
     if descriptor is not None:
         digest = file_sha256(descriptor)
         if str(key) != digest:
             return None
-        if _read_direct_provider_context(provider) is None:
+        if _read_provider_context(provider) is None:
             return None
         return {"provider_key": digest, "provider_tree_sha256": digest}
     if not _snapshot_is_reusable(provider, key):
@@ -468,15 +468,15 @@ def prepare_runtime_provider(
     intervals_path = Path(intervals_path).expanduser().resolve()
     runtime_root = Path(runtime_root).expanduser().resolve()
     data_manifest_path = Path(data_manifest_path).expanduser().resolve()
-    descriptor = _direct_descriptor_path(canonical_provider)
+    descriptor = _provider_descriptor_path(canonical_provider)
     if descriptor is not None:
         if not intervals_path.is_file():
             raise FileNotFoundError(f"membership intervals are missing: {intervals_path}")
         if not data_manifest_path.is_file():
             raise FileNotFoundError(f"data manifest is missing: {data_manifest_path}")
-        context = _read_direct_provider_context(canonical_provider)
+        context = _read_provider_context(canonical_provider)
         if context is None:
-            raise ValueError("direct provider descriptor is unavailable or invalid")
+            raise ValueError("Qlib Provider descriptor is unavailable or invalid")
         days = pd.DatetimeIndex(context.calendar).normalize()
         raw_intervals = pd.read_parquet(intervals_path)
         intervals = normalize_union_intervals(raw_intervals, days)
@@ -494,7 +494,7 @@ def prepare_runtime_provider(
             "data_manifest": str(data_manifest_path),
             "data_manifest_sha256": file_sha256(data_manifest_path),
             "reused": True,
-            "direct_provider": True,
+            "provider_backend": "quant_data",
             "snapshot_id": str(
                 (context.descriptor.get("dataset") or {}).get("snapshot_id") or ""
             ),

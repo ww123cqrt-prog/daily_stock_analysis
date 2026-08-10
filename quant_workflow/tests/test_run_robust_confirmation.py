@@ -31,6 +31,24 @@ def load_module():
     return module
 
 
+def test_provider_calendar_is_loaded_through_the_provider_adapter(tmp_path: Path) -> None:
+    module = load_module()
+    provider = tmp_path / "provider"
+    requested: list[Path] = []
+    module.provider_calendar_days = lambda uri: (
+        requested.append(Path(uri))
+        or ["2026-07-14", "2026-07-15"]
+    )
+
+    calendar = module._provider_calendar(provider)
+
+    assert requested == [provider]
+    assert [value.date().isoformat() for value in calendar] == [
+        "2026-07-14",
+        "2026-07-15",
+    ]
+
+
 def seal_provider(provider: Path, key: str = "provider-v1") -> str:
     from prepare_robust_provider import (
         PROVIDER_CONTENT_FILENAME,

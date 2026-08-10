@@ -50,10 +50,10 @@ class TradingCalendar:
 
 
 def load_trading_calendar(path: Path | None = None) -> TradingCalendar:
-    provider_path = Path(path) if path is not None else qlib_workflow_provider_uri()
-    calendar_path = provider_path
     days: list[date] = []
     try:
+        provider_path = Path(path) if path is not None else qlib_workflow_provider_uri()
+        calendar_path = provider_path
         if (
             provider_path.name != "PROVIDER_DESCRIPTOR.json"
             and (provider_path.is_file() or (path is not None and provider_path.suffix))
@@ -65,7 +65,8 @@ def load_trading_calendar(path: Path | None = None) -> TradingCalendar:
             )
         else:
             raw_days = provider_calendar_days(provider_path)
-    except (FileNotFoundError, OSError, UnicodeError):
+    except (FileNotFoundError, OSError, RuntimeError, UnicodeError, ValueError):
+        calendar_path = Path(path) if path is not None else Path()
         raw_days = []
     for raw in raw_days:
         try:

@@ -94,6 +94,8 @@ describe('ResearchPage', () => {
         calendarDays: 1316,
         calendarRange: '2020-01-02 ~ 2025-06-11',
         instruments: 5340,
+        status: 'ready',
+        providerSource: 'Qlib Provider',
       },
       latestTraining: {
         status: 'completed',
@@ -476,7 +478,8 @@ describe('ResearchPage', () => {
 
     expect(await screen.findByText('数据状态')).toBeInTheDocument();
     expect(screen.getByText('可训练')).toBeInTheDocument();
-    expect(screen.getByText('quant_data 原生 V2')).toBeInTheDocument();
+    expect(screen.getAllByText('Qlib Provider').length).toBeGreaterThan(0);
+    expect(screen.getByText('当前正式入口：Qlib Provider')).toBeInTheDocument();
     expect(screen.getByText('akshare')).toBeInTheDocument();
     expect(screen.getByText('jqdata')).toBeInTheDocument();
     expect(screen.getAllByText('审计来源')).toHaveLength(2);
@@ -491,8 +494,8 @@ describe('ResearchPage', () => {
     expect(screen.getByText('最近 2 次实验')).toBeInTheDocument();
     expect(screen.getByText('清洗对比')).toBeInTheDocument();
     expect(screen.getByText('清洗后数据')).toBeInTheDocument();
-    expect(screen.getByText('原生 V2 数据')).toBeInTheDocument();
-    const canonicalCard = screen.getByText('原生 V2 数据').parentElement;
+    expect(screen.getByText('canonical Qlib Provider')).toBeInTheDocument();
+    const canonicalCard = screen.getByText('canonical Qlib Provider').parentElement;
     expect(canonicalCard).toHaveTextContent('baseline_lgb_alpha158');
     expect(canonicalCard).not.toHaveTextContent('legacy_lgb_alpha158');
     expect(screen.getByText('+0.1647')).toBeInTheDocument();
@@ -561,6 +564,7 @@ describe('ResearchPage', () => {
     expect(screen.getAllByRole('link', { name: '工作流 / 今日流程' }).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/不读取账号密码/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/不连接券商交易接口/).length).toBeGreaterThan(0);
+    expect(document.body).not.toHaveTextContent('原生 V2');
   }, 10_000);
 
   it('hides cleanup actions unless the cleanup plan is available', async () => {
@@ -616,15 +620,16 @@ describe('ResearchPage', () => {
     expect(screen.getAllByText('opencode review').length).toBeGreaterThan(0);
     expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument();
     expect(screen.queryByText(/research\./)).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(/native V2/i);
   });
 
-  it('shows native V2 as blocked instead of a healthy official entry', async () => {
+  it('uses Provider status instead of storage identity for the blocked badge', async () => {
     getResearchStatus.mockResolvedValueOnce({
       generatedAt: '2026-07-28T20:00:00+08:00',
       trainable: false,
       trainingReadiness: {
         status: 'blocked',
-        summary: '原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。',
+        summary: 'Qlib Provider 完整性校验失败，正式训练已阻止。',
       },
       dataSources: [],
       qlibProvider: {
@@ -632,18 +637,18 @@ describe('ResearchPage', () => {
         role: 'canonical',
         status: 'blocked',
         priceBasis: 'qfq',
-        providerSource: 'native_v2_catalog',
-        providerError: '原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。',
+        providerSource: 'Qlib Provider',
+        providerError: 'Qlib Provider 完整性校验失败，正式训练已阻止。',
       },
     });
 
     renderResearchPage('zh');
 
-    expect(await screen.findByText('原生 V2 已阻断')).toBeInTheDocument();
+    expect(await screen.findByText('Qlib Provider 已阻断')).toBeInTheDocument();
     expect(
-      screen.getAllByText('原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。').length,
+      screen.getAllByText('Qlib Provider 完整性校验失败，正式训练已阻止。').length,
     ).toBeGreaterThan(0);
-    expect(screen.queryByText('当前正式入口：原生 V2')).not.toBeInTheDocument();
+    expect(screen.queryByText('当前正式入口：Qlib Provider')).not.toBeInTheDocument();
   });
 
   it('treats a non-boolean trainable value as not trainable', async () => {
@@ -663,7 +668,7 @@ describe('ResearchPage', () => {
     expect(screen.queryByText('Trainable')).not.toBeInTheDocument();
   });
 
-  it('describes a stale immutable V2 run as historical instead of legacy compatibility data', async () => {
+  it('describes a stale Provider run as historical instead of legacy compatibility data', async () => {
     const initialStatus = await getResearchStatus();
     getResearchStatus.mockReset();
     getResearchStatus.mockResolvedValueOnce({
@@ -680,7 +685,7 @@ describe('ResearchPage', () => {
 
     expect(
       await screen.findByText(
-        'Training result is historical only and does not represent the current native V2 dataset.',
+        'Training result is historical only and does not represent the current Qlib Provider.',
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/used legacy compatibility data/)).not.toBeInTheDocument();

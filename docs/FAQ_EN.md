@@ -86,6 +86,8 @@ This document compiles common issues encountered by users and their solutions.
    - `GEMINI_MODEL`
    - `REPORT_TYPE`
 
+> Compatibility note: the daily analysis workflow also binds the `STOCK_LIST` environment, so a `STOCK_LIST` value mistakenly added under that Environment's variables can still be read. Repository variables remain the recommended location. Unless you want the daily job to wait for manual approval, do not add required reviewers, wait timers, or deployment branch restrictions to this Environment.
+
 ---
 
 ### Q6: Configuration not taking effect after modifying .env file?
@@ -95,12 +97,12 @@ This document compiles common issues encountered by users and their solutions.
 2. **Docker deployment / WebUI Settings**:
    - `--env-file .env` / Compose `env_file` only injects the host `.env` as startup environment variables; it does not create or write back to `/app/.env` inside the container
    - When the active `.env` file does not contain a key, the WebUI Settings page falls back to showing the same key from startup-injected environment variables; the raw `.env` export still contains only the active config file content
-   - WebUI saves `STOCK_LIST`, `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, `SCHEDULE_RUN_IMMEDIATELY`, and `RUN_IMMEDIATELY` back into the container's `.env`
+   - WebUI saves `STOCK_LIST`, `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, `SCHEDULE_TIMES`, `SCHEDULE_RUN_IMMEDIATELY`, and `RUN_IMMEDIATELY` back into the container's `.env`
    - Saving from WebUI triggers a config reload for the current process, and runtime reads continue from the latest persisted `.env`; for example, scheduled runs keep hot-reading the saved `STOCK_LIST`
    - If you pass the same keys as startup env vars (`--env-file .env`, `docker run -e ...`, or Compose `environment:`), those startup values can still win on later restarts; update or remove the same-name overrides if you want the WebUI-saved `.env` values to take over
    - To persist WebUI-saved config, point `ENV_FILE` at a writable data-volume file such as `/app/data/runtime.env`; do not bind-mount the host `.env` as a single file over `/app/.env`
-   - `SCHEDULE_*` and `RUN_IMMEDIATELY` are still **startup-time scheduling settings**: saving them does not immediately trigger an analysis run and does not hot-rebuild the scheduler inside the current process
-   - To make schedule changes take over the current container, restart it and make sure the process is started in schedule mode
+   - Saving `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, or `SCHEDULE_TIMES` starts, stops, or rebuilds the runtime scheduler in long-running WebUI/API/Desktop processes
+   - `SCHEDULE_RUN_IMMEDIATELY` and `RUN_IMMEDIATELY` remain startup/one-shot settings; saving them does not immediately trigger an analysis run
 3. **Manual `.env` edits in Docker**: Restart the container after changes
    ```bash
    docker-compose down && docker-compose up -d
@@ -318,9 +320,32 @@ Work through the following 5 checkpoints in order:
 
 ---
 
+## Desktop App
+
+### Q15: macOS says the desktop app is damaged or cannot be opened?
+
+**Cause**: The current macOS DMG is not signed and notarized with an Apple Developer certificate. After a browser download, macOS Gatekeeper may attach the quarantine attribute and block startup.
+
+**Solution**:
+
+1. Download only from the project's [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases), and select the package matching your Mac architecture. Do not bypass Gatekeeper for third-party copies or files from an untrusted source.
+2. Drag `Daily Stock Analysis` into Applications, then first try **System Settings → Privacy & Security → Open Anyway**.
+3. If it still does not start and you have verified that it came from the official project Release, remove quarantine only from this app and launch it:
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/Daily Stock Analysis.app"
+   open "/Applications/Daily Stock Analysis.app"
+   ```
+
+Replace the path if the app is not in `/Applications`. Never run `xattr` against the entire `/Applications` directory. This is a temporary way to allow a trusted unsigned app; it is not a substitute for signing or notarization. See the [desktop packaging guide](desktop-package.md#macos-提示应用已损坏无法打开) for the complete troubleshooting notes.
+
+> Related Issue: [#2113](https://github.com/ZhuLinsen/daily_stock_analysis/issues/2113)
+
+---
+
 ## Other Issues
 
-### Q15: How to run only market review, without stock analysis?
+### Q16: How to run only market review, without stock analysis?
 
 **Method**:
 ```bash
@@ -333,7 +358,7 @@ python main.py --market-only
 
 ---
 
-### Q16: Buy/Hold/Sell counts in analysis results are incorrect?
+### Q17: Buy/Hold/Sell counts in analysis results are incorrect?
 
 **Cause**: Earlier versions used regex matching for statistics, may not match actual recommendations.
 
@@ -350,4 +375,4 @@ If the above content doesn't solve your issue, welcome to:
 
 ---
 
-*Last updated: 2026-04-20*
+*Last updated: 2026-08-03*

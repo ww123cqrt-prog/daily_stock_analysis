@@ -37,7 +37,7 @@ from _paths import (  # noqa: E402
 WORKFLOW = workflow_root()
 REPORT_DIR = reports_root()
 MLRUNS_DIR = mlruns_root()
-CANONICAL_PROVIDER = qlib_workflow_provider_uri()
+CANONICAL_PROVIDER: Path | None = None
 LATEST_TRAINING_RESULT = REPORT_DIR / "latest_training_result.json"
 DEFAULT_MAX_RUNS = 8
 DEFAULT_TOPK = 20
@@ -627,7 +627,12 @@ def factor_analysis(run_dir: Path, *, topk: int = DEFAULT_TOPK) -> dict[str, Any
     }
 
 
-def _calendar(provider_uri: Path = CANONICAL_PROVIDER) -> pd.DatetimeIndex:
+def _resolve_provider_uri(provider_uri: Path | None = None) -> Path:
+    return Path(provider_uri) if provider_uri is not None else qlib_workflow_provider_uri()
+
+
+def _calendar(provider_uri: Path | None = None) -> pd.DatetimeIndex:
+    provider_uri = _resolve_provider_uri(provider_uri)
     try:
         dates = provider_calendar_days(provider_uri)
     except (FileNotFoundError, OSError, ValueError):
@@ -647,7 +652,7 @@ def _nearest_on_or_after(calendar: pd.DatetimeIndex, date: pd.Timestamp) -> pd.T
 
 def rolling_training_plan(
     *,
-    provider_uri: Path = CANONICAL_PROVIDER,
+    provider_uri: Path | None = None,
     config_path: Path = WORKFLOW / "configs" / "baseline_lgb_alpha158.yaml",
     windows: int = 6,
     train_years: int = 3,
@@ -655,6 +660,7 @@ def rolling_training_plan(
     test_months: int = 1,
     step_months: int = 1,
 ) -> dict[str, Any]:
+    provider_uri = _resolve_provider_uri(provider_uri)
     calendar = _calendar(provider_uri)
     config = _read_yaml_object(config_path) or {}
     if calendar.empty:
@@ -895,7 +901,7 @@ def main() -> int:
     parser.add_argument("--latest-training", type=Path, default=LATEST_TRAINING_RESULT)
     parser.add_argument("--mlruns-dir", type=Path, default=MLRUNS_DIR)
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
-    parser.add_argument("--provider-uri", type=Path, default=CANONICAL_PROVIDER)
+    parser.add_argument("--provider-uri", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=WORKFLOW / "configs" / "baseline_lgb_alpha158.yaml")
     parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
     parser.add_argument("--max-runs", type=int, default=DEFAULT_MAX_RUNS)

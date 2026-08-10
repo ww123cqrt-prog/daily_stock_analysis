@@ -196,6 +196,7 @@ def make_run_fixture(
         "current_provider": current_provider,
         "frozen_provider": frozen_provider,
         "frozen": frozen,
+        "dates": dates,
     }
 
 
@@ -246,12 +247,13 @@ def run_kwargs(
         "confirmation_path": fixture["confirmation_path"],
         "provider_state_path": fixture["provider_state_path"],
         "as_of_date": as_of_date,
-        "provider_preparer": lambda **kwargs: {
-            "status": "completed",
-            "provider_uri": str(fixture["current_provider"]),
-            "provider_key": "current-provider",
-            "canonical_provider": str(fixture["current_provider"]),
-        },
+        "provider_resolver": lambda provider, *, append_only_from: (
+            observed.setdefault(
+                "provider_resolution", (provider, Path(append_only_from))
+            )
+            and fixture["current_provider"]
+        ),
+        "calendar_loader": lambda _provider: list(fixture["dates"]),
         "inference_runner": inference_runner
         or (lambda **kwargs: prediction(as_of_date)),
         "market_loader": market_loader,
@@ -272,15 +274,15 @@ def run_kwargs(
 def test_provider_prefix_change_is_blocked_before_inference(tmp_path: Path) -> None:
     module = load_module()
     fixture = make_run_fixture(module, tmp_path, dates=["2026-07-15", "2026-07-16"])
-    (
-        fixture["current_provider"] / "features" / "sh600000" / "close.day.bin"
-    ).write_bytes(b"xbcdef")
     calls = []
     kwargs, _ = run_kwargs(
         module,
         fixture,
         as_of_date="2026-07-16",
         inference_runner=lambda **kwargs: calls.append(kwargs),
+    )
+    kwargs["provider_resolver"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        module.QlibProviderHistoryError("historical bars changed")
     )
 
     result = module.run_shadow_day(**kwargs)
@@ -328,39 +330,41 @@ def test_runtime_environment_mismatch_blocks_before_inference(tmp_path: Path) ->
     assert calls == []
 
 
-def test_verify_provider_requires_calendar_and_every_frozen_feature_to_be_prefix(
-    tmp_path: Path,
-) -> None:
+def test_current_provider_is_resolved_through_the_workflow_adapter(tmp_path: Path) -> None:
     module = load_module()
-    frozen = write_provider(tmp_path / "frozen", ["2026-07-15"], b"abc")
-    current = write_provider(
-        tmp_path / "current", ["2026-07-15", "2026-07-16"], b"abcdef"
+    fixture = make_run_fixture(
+        module, tmp_path, dates=["2026-07-15", "2026-07-16"]
+    )
+    kwargs, observed = run_kwargs(module, fixture, as_of_date="2026-07-16")
+
+    result = module.run_shadow_day(**kwargs)
+
+    assert result["status"] == "shadow_observation"
+    assert observed["provider_resolution"] == (
+        "cleaned",
+        fixture["frozen_provider"],
     )
 
-    module.verify_provider_is_append_only(frozen, current)
 
-    (current / "calendars" / "day.txt").write_text(
-        "2026-07-14\n2026-07-16\n", encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="calendar"):
-        module.verify_provider_is_append_only(frozen, current)
-
-
-def test_current_provider_from_a_different_canonical_source_is_blocked(
+def test_unavailable_current_provider_is_reported_without_starting_inference(
     tmp_path: Path,
 ) -> None:
     module = load_module()
     fixture = make_run_fixture(module, tmp_path, dates=["2026-07-15", "2026-07-16"])
-    metadata_path = fixture["current_provider"] / "ROBUST_PROVIDER.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["canonical_provider"] = str(tmp_path / "different-canonical")
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    kwargs, _ = run_kwargs(module, fixture, as_of_date="2026-07-16")
+    calls = []
+    kwargs, _ = run_kwargs(
+        module,
+        fixture,
+        as_of_date="2026-07-16",
+        inference_runner=lambda **values: calls.append(values),
+    )
+    kwargs["provider_resolver"] = lambda *_args, **_kwargs: tmp_path / "missing"
 
     result = module.run_shadow_day(**kwargs)
 
     assert result["status"] == "development_failed"
-    assert result["reason_code"] == "provider_identity_mismatch"
+    assert result["reason_code"] == "provider_prepare_failed"
+    assert calls == []
 
 
 def test_default_inference_loads_models_without_fit_and_only_predicts_as_of(

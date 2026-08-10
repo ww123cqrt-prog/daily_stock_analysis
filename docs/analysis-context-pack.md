@@ -103,6 +103,21 @@ Agent 路径同样只传 summary。`AgentExecutor._build_user_message()` 在 mar
 
 P3 当时不持久化完整 pack，不新增 API/Web/Bot/Desktop 字段，不改变报告 JSON schema，不把 summary 写入 `analysis_history.context_snapshot`、task status 或 report metadata；history snapshot 和 diagnostic snapshot 会剥离 `market_phase_context`、`analysis_context_pack`、`analysis_context_pack_summary` 等 runtime prompt key。P4 在此基础上新增低敏 overview，可见性只覆盖历史详情、同步分析响应、completed task status 和 Web 报告页；P5 继续复用 summary 消费路径，不改 LLM 输出 JSON schema。Agent 工具级 pack cache 复用仍是后续工作。
 
+## #1381 Daily Market Context
+
+#1381 在 AnalysisContextPack 之外新增一个小型每日大盘环境摘要通道，避免把 `market_review` / `market_light` 直接 pack 化。`DAILY_MARKET_CONTEXT_ENABLED` 默认开启；当 `MARKET_REVIEW_ENABLED=true` 且 `DAILY_MARKET_CONTEXT_ENABLED=true` 时，`StockAnalysisPipeline` 会按个股市场（`cn` / `hk` / `us`）加载当日大盘上下文：优先复用 `analysis_history(code=MARKET, report_type=market_review)` 中同日同市场记录；没有同日记录时才调用 `run_market_review(..., return_structured=True, send_notification=False)` 生成本次上下文，且通过进程内 cache 避免同一 Pipeline 重复生成，并在 CLI/定时任务并发路径上通过 market review lock 串行化生成。`DAILY_MARKET_CONTEXT_ENABLED=false` 只关闭个股分析的低敏摘要注入与保守护栏，不关闭大盘复盘本身。
+
+**Background：**`#1381` 聚焦单股分析的当日大盘上下文复用与回退控制，不改变现有日内阶段、日报或状态建模架构。该段与 `docs/CHANGELOG.md` [Unreleased] 的 #1381 条目保持一致，可作为本轮变更说明的收敛边界。
+**Scope（本轮实现范围）：**`#1381` 仅覆盖后端 runtime 的大盘上下文注入、当日/目标交易日复用控制与保守护栏；不包含独立 API、Web 阶段结果独立展示、四阶段日报结构化持久化或新增日报状态表。涉及主要入口为 `main.py`（调度与 `--no-market-review`）、`src/core/pipeline.py`、`src/core/market_review.py`、`src/services/daily_market_context.py`、`src/analyzer.py`、`src/analysis_context_pack_overview.py`、`src/agent/executor.py`、`src/agent/orchestrator.py`、`src/agent/agents/base_agent.py`、`src/daily_market_context_guardrail.py`；Web 侧仅同步 `DAILY_MARKET_CONTEXT_ENABLED` 设置项文案/帮助，不新增阶段结果展示。
+**验收闭环边界：**本 PR 仅对应 `#1381` 的 runtime 接入与护栏子目标；除非独立 API、Web 阶段展示、四阶段日报持久化和日报状态表已在后续变更中落地并验证，否则不得把 Issue #1381 标记为完整验收通过。
+**Acceptance Criteria（验收边界）：**本轮仅按 runtime 与配置入口验收，不纳入 PR 过程中的 API/Web UI 独立阶段展示验收。当前验收路径限制为 `tests/test_main_schedule_mode.py`、`tests/test_pipeline_daily_market_context.py`、`tests/test_daily_market_context.py`、`tests/test_daily_market_context_guardrail.py`、`tests/test_agent_executor.py`、`tests/test_config_env_compat.py`、`tests/test_config_registry.py` 和 `apps/dsa-web/tests/system_config_i18n.test.ts`。重点覆盖项为：`--no-market-review` 禁止触发大盘复盘生成、`DAILY_MARKET_CONTEXT_ENABLED=false` 关闭个股上下文注入但保留大盘复盘、单次 schedule 复用同一 `target_date`、多市场上下文加载（`cn,us`）、`daily_market_context` 只在同一次分析主链路注入一次、普通分析与 Agent 路径应用护栏且不泄漏原始 `market_review_payload`。
+**Compatibility/Risk（兼容与风险）：**`#1381` 不改变 `provider/model/base_url`、默认模型或配置清理/回填/迁移语义；不新增数据库或运行时配置表变更。`main.py::_bootstrap_environment`、`src/core/pipeline.py`、`src/analyzer.py`、`src/agent/executor.py`、`src/agent/orchestrator.py`、`src/agent/agents/base_agent.py`、`src/services/daily_market_context.py`、`src/daily_market_context_guardrail.py` 只在既有读取链路消费 LLM 与市场复盘上下文，不新增 `SystemConfig` 保存或回写分支。官方兼容依据沿用 `LiteLLM OpenAI-compatible` 与 `OpenAI Chat Completion`（见后文“兼容性证据与核验边界”）；回滚方式为常规发布回滚（撤销相关提交），如必要可配合重启并清理 `env_file` / `--env-file` / 进程级同名环境覆盖项，恢复用户历史持久化配置。
+**兼容性证据与核验边界：**本轮仅复用既有 LLM 配置链路读取配置，不新增 `.env` 写入分支，不新增配置迁移/清理/回写入口。官方依据沿用：`LiteLLM OpenAI-compatible` <https://docs.litellm.ai/docs/providers/openai_compatible>、`OpenAI Chat Completion` <https://platform.openai.com/docs/api-reference/chat/create>；版本约束见 `requirements.txt`（`litellm`、`openai`）当前窗口。可回溯代码路径：`main.py::_bootstrap_environment`、`src/analyzer.py::_init_litellm`、`src/agent/agents/base_agent.py::_get_analyzer_config`（仅读取）、`src/agent/executor.py`、`src/agent/orchestrator.py`、`src/core/pipeline.py`、`src/services/daily_market_context.py`、`src/daily_market_context_guardrail.py`。回归核验点为 `tests/test_config_env_compat.py`、`tests/test_config_registry.py`、`tests/test_system_config_service.py`、`tests/test_system_config_api.py`、`tests/test_llm_channel_config.py`、`tests/test_market_review_runtime.py`。
+
+普通分析与 Agent 分析只接收低敏字段：`daily_market_context`（region、trade_date、summary、risk_tags、source、可选 position_cap）和 `daily_market_context_summary` Prompt 段，不传递完整 `market_review_payload`、原始新闻、密钥或通知配置。普通分析 Prompt 在市场阶段段落后、技术面数据前插入大盘摘要；Agent 单体与多 Agent 路径在 market phase 后、pre-fetched 数据前插入同一摘要。Agent 自由聊天只在调用方已经提供 `daily_market_context` / `daily_market_context_summary` 时注入，不为每次聊天自动触发大盘复盘。
+
+结果后处理新增保守大盘环境护栏：当摘要或标签显示 `high_risk`、`market_cooling`、`conservative`、`low_position_cap`，且处于保守/高风险语境下时，模型给出 `buy` 决策（含“立即买入/追高/激进加仓”等买入类建议）会被软化为观望或小仓等待确认，并把高置信度降为中等。该护栏只修改当次 `AnalysisResult` 与 dashboard 中的低敏限制说明，不新增数据库表或 API 字段。回滚方式为撤销 #1381 相关服务、Prompt 注入和 guardrail 代码，既有大盘复盘历史记录保持兼容。
+
 ## P4 历史记录、任务状态与 Web 可见性
 
 P4 把 P3 已构建的 `AnalysisContextPack` 投影为公共低敏 `analysis_context_pack_overview`。该 overview 由专用 renderer 生成，公共 API 不允许直接返回 `AnalysisContextPack.to_safe_dict()` 或完整 pack dump。renderer 只输出白名单字段：`pack_version`、`created_at`、`subject.code` / `stock_name` / `market`、数据块 `key` / `label` / `status` / `source` / `warnings` / `missing_reasons`、按 block status 计数的 `counts`、顶层 `data_quality.warnings` 和 `metadata.trigger_source` / `metadata.news_result_count`。P5 在同一 overview 上追加 `data_quality` 低敏对象，不重复顶层 `warnings`。
@@ -119,7 +134,7 @@ P4 持久化面只在 `analysis_history.context_snapshot` 顶层写入 `analysis
 
 API 返回给 Web 的 `details.context_snapshot` 会通过 `sanitize_context_snapshot_for_api()` 剥离顶层 `analysis_context_pack_overview`，避免 raw snapshot 面板重复展示或被当作完整上下文导出；overview 只从 `extract_analysis_context_pack_overview()` 单独取出。Agent 路径与普通分析路径写入同一 overview 形状，Agent 无新闻计数时 `metadata.news_result_count` 可为空。
 
-P4 Web 展示只在报告详情页渲染 `AnalysisContextSummary`，位置在策略点位和资讯之后、运行诊断之前；该区域默认折叠，折叠头部展示可用数、缺失数、非零的其他状态计数和触发来源，展开后展示数据块状态 badge、来源、warning、missing reason、状态计数和新闻结果数。P5 后折叠头部还会展示质量分/等级，展开后展示 `limitations` 和 `fetch_failed` 状态。无 overview 时不渲染占位。在 #1386 P4b 中，Web 会在同一报告详情页展示 `report.meta.market_phase_summary` 阶段标签，并继续复用该低敏数据质量摘要；不扩大完整 pack、Prompt summary、raw payload 或 snapshot 内部字段的公开面。P4/P5 不覆盖 pending/processing TaskPanel 的 AnalysisContextPack 数据质量摘要或 SSE 进行中 overview 可见性，不改通知摘要、Bot/Desktop 专属展示或 `market_review` overview。
+P4 Web 展示只在报告详情页渲染 `AnalysisContextSummary`，位置在策略点位和资讯之后、运行诊断之前；该区域默认折叠，折叠头部展示可用数、缺失数、非零的其他状态计数和触发来源，展开后的每个数据块只展示状态、来源、告警和说明。来源为空时显示“未记录输入来源”；说明行把已知缺失原因翻译为原因、对本次分析的影响和简短处理建议，并在括号中保留诊断码，未知原因则按 block 状态提供通用建议。`fallback`、`stale`、`estimated`、`partial` 等没有缺失原因的降级状态也在同一说明行解释，不新增处理、范围或证据字段。报告页相关资讯由独立接口加载，其有无不能通过 overview 的 `metadata.news_result_count` 推断；资讯区只说明自身是报告页补充资讯，输入数据块只说明新闻是否进入本次 LLM 分析，避免把两套数据范围混为同一结果集。展开区仍展示状态计数和新闻结果数。P5 后折叠头部还会展示质量分/等级，展开后展示 `limitations` 和 `fetch_failed` 状态。无 overview 时不渲染占位。在 #1386 P4b 中，Web 会在同一报告详情页展示 `report.meta.market_phase_summary` 阶段标签，并继续复用该低敏数据质量摘要；不扩大完整 pack、Prompt summary、raw payload 或 snapshot 内部字段的公开面。P4/P5 不覆盖 pending/processing TaskPanel 的 AnalysisContextPack 数据质量摘要或 SSE 进行中 overview 可见性，不改通知摘要、Bot/Desktop 专属展示或 `market_review` overview。
 
 ## P5 数据质量评分与 Prompt 数据限制
 
@@ -177,7 +192,7 @@ P6 不改变 P1-P5 的运行时行为，只把已经落地的契约、可见性�
 | `GET /api/v1/history/{record_id}` | `report.details.analysis_context_pack_overview` | 完整 pack、Prompt summary、raw `analysis_context_pack_overview` duplicate |
 | 同步 `POST /api/v1/analysis/analyze` | `report.details.analysis_context_pack_overview`，前提是本次历史已持久化 `analysis_history.context_snapshot` | 完整 pack、Prompt summary |
 | completed `GET /api/v1/analysis/status/{task_id}` | `status.result.report.details.analysis_context_pack_overview` | 完整 pack、Prompt summary |
-| Web 报告页 | 默认折叠的 `AnalysisContextSummary`，展示 block 状态、来源、缺失原因、质量分和限制 | 完整 pack、raw payload、Prompt summary |
+| Web 报告页 | 默认折叠的 `AnalysisContextSummary`，展示 block 状态、来源、告警、包含影响/建议/诊断码的说明、质量分和限制 | 完整 pack、raw payload、Prompt summary、报告页独立加载的资讯结果状态 |
 | raw `details.context_snapshot` | 剥离后的历史快照 | 顶层 `analysis_context_pack_overview`、`market_phase_summary` |
 | 通知、Bot、Desktop 专属展示 | P6 不新增专属展示 | 完整 pack、Prompt summary、raw payload |
 

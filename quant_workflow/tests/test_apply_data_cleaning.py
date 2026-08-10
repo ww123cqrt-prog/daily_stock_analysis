@@ -18,6 +18,34 @@ def load_script(name: str):
 
 
 class ApplyDataCleaningTest(unittest.TestCase):
+    def test_cli_publish_errors_use_public_provider_terminology(self):
+        module = load_script("apply_data_cleaning")
+        cases = (
+            [],
+            ["--cleaned-merged-dir", "/tmp/legacy-cleaned"],
+        )
+
+        for args in cases:
+            with self.subTest(args=args), patch.object(
+                module.sys, "argv", ["apply_data_cleaning.py", *args]
+            ), patch.object(
+                module, "ashare_qfq_bars_dir", return_value=Path("/quant_data/bars")
+            ), patch.object(
+                module,
+                "qlib_native_snapshot_uri",
+                return_value=Path("/quant_data/qlib/provider"),
+            ), patch.object(
+                module.argparse.ArgumentParser,
+                "error",
+                side_effect=RuntimeError("parser stopped"),
+            ) as parser_error:
+                with self.assertRaisesRegex(RuntimeError, "parser stopped"):
+                    module.main()
+
+                message = parser_error.call_args.args[0]
+                self.assertIn("Qlib Provider", message)
+                self.assertNotRegex(message, r"(?i)direct provider|native V2")
+
     def test_rejects_immutable_v2_snapshot_as_mutable_output(self):
         module = load_script("apply_data_cleaning")
         with TemporaryDirectory() as temp_dir:

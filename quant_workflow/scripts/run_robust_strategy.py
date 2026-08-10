@@ -24,10 +24,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
-from quant_workflow.quant_data_qlib_provider import (  # noqa: E402
-    DirectProviderError,
-    build_direct_provider_descriptor,
+from _paths import (  # noqa: E402
+    qlib_workflow_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
 )
 from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
@@ -406,24 +407,12 @@ def build_stages(
     )
     price_dir = _resolved_data_path(quant_data_dir, paths["price_parquet"])
     configured_provider_dir = _resolved_data_path(quant_data_dir, paths["qlib_provider"])
-    try:
-        direct_descriptor = build_direct_provider_descriptor(
-            quant_data_root=quant_data_dir,
-            cleaning_mode="cleaned",
-        )
-        provider_dir = direct_descriptor.parent
-        direct_provider = True
-    except (DirectProviderError, OSError, ValueError) as exc:
-        if not allow_legacy_compatibility:
-            raise RuntimeError(
-                "formal direct Provider is unavailable; refusing to fall back "
-                "to the old physical Qlib compatibility provider"
-            ) from exc
-        # An explicitly requested compatibility plan may still point at the
-        # old immutable tree for replaying a historical run.  This branch is
-        # never used by the normal robust strategy pipeline.
-        provider_dir = configured_provider_dir
-        direct_provider = False
+    legacy_compatibility = bool(allow_legacy_compatibility)
+    provider_dir = (
+        configured_provider_dir
+        if legacy_compatibility
+        else qlib_workflow_provider_uri("cleaned")
+    )
     runtime_root = quant_data_dir / "runtime" / "robust_strategy"
     stage_report_root = (
         report_dir / "runs" / run_id / "stage_reports" if run_id else report_dir
@@ -485,7 +474,7 @@ def build_stages(
     ]
     if universe.get("benchmark_mode", "download") == "reuse_existing":
         benchmark_argv.append("--reuse-existing")
-    if not direct_provider:
+    if legacy_compatibility:
         stages.append(Stage("add_robust_benchmarks", benchmark_argv))
     stages.append(
         Stage(
@@ -1493,8 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-legacy-compatibility",
         action="store_true",
         help=(
-            "explicitly replay an old physical Qlib provider when the formal "
-            "direct Provider is unavailable; never use for a normal live run"
+            "explicitly replay a historical Qlib Provider; never use for a normal live run"
         ),
     )
     args = parser.parse_args(argv)

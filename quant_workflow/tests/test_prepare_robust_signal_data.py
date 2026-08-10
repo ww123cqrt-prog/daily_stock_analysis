@@ -1,10 +1,28 @@
 import json
 import hashlib
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from prepare_robust_signal_data import prepare_robust_signal_data
+
+
+def _cleaned_provider_lineage(
+    *, snapshot_id: str = "snapshot-v2"
+) -> dict[str, str]:
+    return {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": "c" * 64,
+        "content_sha256": "d" * 64,
+        "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": "e" * 64,
+        "cleaning_mode": "cleaned",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "index-snapshot-v2",
+        "index_content_sha256": "f" * 64,
+        "index_manifest_sha256": "a" * 64,
+    }
 
 
 def _write_quality_evidence(
@@ -14,12 +32,7 @@ def _write_quality_evidence(
     snapshot_id: str = "snapshot-v2",
 ) -> tuple[Path, dict[str, str]]:
     reports_dir.mkdir(parents=True, exist_ok=True)
-    identity = {
-        "dataset_id": "qlib_ashare_cleaned_v2",
-        "snapshot_id": snapshot_id,
-        "manifest_sha256": "c" * 64,
-        "content_sha256": "d" * 64,
-    }
+    identity = _cleaned_provider_lineage(snapshot_id=snapshot_id)
     state = {
         "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
         "file_count": 10,
@@ -121,20 +134,15 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
 
     with (
         patch(
-            "prepare_robust_signal_data.resolve_dataset",
-            return_value=SimpleNamespace(
-                snapshot_path=canonical,
-                dataset_id=quality_identity["dataset_id"],
-                manifest={
-                    "snapshot_id": quality_identity["snapshot_id"],
-                    "content_sha256": quality_identity["content_sha256"],
-                },
-                catalog_entry={
-                    "snapshot_manifest_sha256": quality_identity[
-                        "manifest_sha256"
-                    ]
-                },
-            ),
+            "prepare_robust_signal_data.qlib_workflow_provider_uri",
+            return_value=canonical,
+        ),
+        patch(
+            "prepare_robust_signal_data.provider_identity",
+            return_value={
+                **quality_identity,
+                "provider_uri": str(canonical),
+            },
         ),
         patch(
             "prepare_robust_signal_data.prepare_runtime_provider",
@@ -156,6 +164,7 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
     )
     assert len(payload["quality_evidence_sha256"]) == 64
     assert payload["cleaned_provider_identity"] == quality_identity
+    assert "provider_uri" not in payload["cleaned_provider_identity"]
     assert payload["acceptance_owner"] == "data_module"
     assert (
         payload["acceptance_contract"]
@@ -175,6 +184,7 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
         == pointer["artifact_sha256"]
     )
     artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert "provider_uri" not in artifact_payload["cleaned_provider_identity"]
     assert artifact_payload["provider_key"] == payload["provider_key"]
     assert (
         artifact_payload["quality_evidence_artifact_name"]
@@ -223,20 +233,12 @@ def test_prepare_records_sanitized_bounded_provider_build_error(tmp_path: Path) 
 
     with (
         patch(
-            "prepare_robust_signal_data.resolve_dataset",
-            return_value=SimpleNamespace(
-                snapshot_path=canonical,
-                dataset_id=quality_identity["dataset_id"],
-                manifest={
-                    "snapshot_id": quality_identity["snapshot_id"],
-                    "content_sha256": quality_identity["content_sha256"],
-                },
-                catalog_entry={
-                    "snapshot_manifest_sha256": quality_identity[
-                        "manifest_sha256"
-                    ]
-                },
-            ),
+            "prepare_robust_signal_data.qlib_workflow_provider_uri",
+            return_value=canonical,
+        ),
+        patch(
+            "prepare_robust_signal_data.provider_identity",
+            return_value=quality_identity,
         ),
         patch(
             "prepare_robust_signal_data.prepare_runtime_provider",

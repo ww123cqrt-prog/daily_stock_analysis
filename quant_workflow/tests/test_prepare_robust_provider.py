@@ -97,7 +97,7 @@ def test_prepare_runtime_provider_keeps_canonical_provider_untouched(
     ) == "2023-01-02\n2023-01-03\n"
 
 
-def test_prepare_runtime_provider_uses_direct_descriptor_without_copying_market_data(
+def test_prepare_runtime_provider_uses_qlib_descriptor_without_copying_market_data(
     tmp_path: Path,
 ) -> None:
     module = load_module()
@@ -136,7 +136,7 @@ def test_prepare_runtime_provider_uses_direct_descriptor_without_copying_market_
             ),
         },
     )()
-    module._read_direct_provider_context = lambda *_args, **_kwargs: context
+    module._read_provider_context = lambda *_args, **_kwargs: context
 
     result = module.prepare_runtime_provider(
         canonical_provider=canonical,
@@ -146,7 +146,7 @@ def test_prepare_runtime_provider_uses_direct_descriptor_without_copying_market_
     )
 
     assert Path(result["provider_uri"]) == canonical.resolve()
-    assert result["direct_provider"] is True
+    assert result["provider_backend"] == "quant_data"
     assert not (tmp_path / "runtime" / "providers").exists()
     latest = json.loads(
         (tmp_path / "runtime" / "latest_provider.json").read_text(encoding="utf-8")

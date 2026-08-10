@@ -3,11 +3,12 @@ from __future__ import annotations
 import importlib.util
 import fcntl
 import json
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -17,11 +18,60 @@ SCRIPT_PATH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def restore_qlib_modules():
+    previous = {
+        name: sys.modules.get(name)
+        for name in ("qlib", "qlib.data")
+    }
+    yield
+    for name, module in previous.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
 def load_module():
     spec = importlib.util.spec_from_file_location("preflight_robust_data", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+
+    state: dict[str, Path] = {}
+
+    def init_qlib_workflow(*, provider_uri: Path) -> None:
+        state["provider"] = Path(provider_uri)
+
+    class FakeDataApi:
+        @staticmethod
+        def features(instruments, fields, **_kwargs):
+            provider = state["provider"]
+            source = provider / "benchmark_features.parquet"
+            columns = [str(field).lstrip("$") for field in fields]
+            if source.is_file():
+                frame = pd.read_parquet(source)
+                frame = frame[frame["symbol"].isin([str(item) for item in instruments])]
+            else:
+                frame = pd.DataFrame(columns=["date", "symbol", *columns])
+            if frame.empty:
+                index = pd.MultiIndex.from_arrays(
+                    [[], []], names=["instrument", "datetime"]
+                )
+                return pd.DataFrame(columns=list(fields), index=index)
+            frame = frame.set_index(["symbol", "date"])
+            frame.index.names = ["instrument", "datetime"]
+            return frame.loc[:, columns].rename(
+                columns={column: f"${column}" for column in columns}
+            )
+
+    qlib_module = ModuleType("qlib")
+    qlib_data_module = ModuleType("qlib.data")
+    qlib_data_module.D = FakeDataApi
+    qlib_module.data = qlib_data_module
+    sys.modules["qlib"] = qlib_module
+    sys.modules["qlib.data"] = qlib_data_module
+    module.init_qlib_workflow = init_qlib_workflow
     return module
 
 
@@ -88,11 +138,24 @@ def write_reference_tables(root: Path, dates: list[str], symbols: list[str]) -> 
 
 
 def write_qlib_benchmark(provider: Path, symbol: str, periods: int) -> None:
-    feature_dir = provider / "features" / symbol.lower()
-    feature_dir.mkdir(parents=True, exist_ok=True)
-    for field in ["open", "high", "low", "close", "volume"]:
-        values = [1000.0] * periods if field == "volume" else [100.0] * periods
-        np.asarray([0.0, *values], dtype="<f4").tofile(feature_dir / f"{field}.day.bin")
+    dates = pd.to_datetime(
+        (provider / "calendars" / "day.txt").read_text(encoding="utf-8").splitlines()
+    )[:periods]
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": symbol,
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    path = provider / "benchmark_features.parquet"
+    if path.is_file():
+        frame = pd.concat([pd.read_parquet(path), frame], ignore_index=True)
+    frame.to_parquet(path, index=False)
 
 
 def build_small_valid_fixture(root: Path) -> tuple[Path, Path, Path]:
@@ -640,9 +703,10 @@ def test_preflight_blocks_when_benchmark_and_metadata_are_missing(
 ) -> None:
     module = load_module()
     pit_dir, price_dir, provider = build_small_valid_fixture(tmp_path)
-    for path in (provider / "features" / "sh000905").iterdir():
-        path.unlink()
-    (provider / "features" / "sh000905").rmdir()
+    benchmark_path = provider / "benchmark_features.parquet"
+    benchmarks = pd.read_parquet(benchmark_path)
+    benchmarks = benchmarks[benchmarks["symbol"] != "SH000905"]
+    benchmarks.to_parquet(benchmark_path, index=False)
     (tmp_path / "reference" / "st_status.parquet").unlink()
 
     result = module.run_preflight(
@@ -1046,9 +1110,10 @@ def test_preflight_rechecks_reference_snapshot_before_return(
 def test_preflight_writes_machine_readable_blocked_report(tmp_path: Path) -> None:
     module = load_module()
     pit_dir, price_dir, provider = build_small_valid_fixture(tmp_path)
-    for path in (provider / "features" / "sh000906").iterdir():
-        path.unlink()
-    (provider / "features" / "sh000906").rmdir()
+    benchmark_path = provider / "benchmark_features.parquet"
+    benchmarks = pd.read_parquet(benchmark_path)
+    benchmarks = benchmarks[benchmarks["symbol"] != "SH000906"]
+    benchmarks.to_parquet(benchmark_path, index=False)
     out_dir = tmp_path / "reports" / "robust_strategy"
 
     return_code = module.main(

@@ -15,14 +15,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
-from prepare_robust_provider import file_sha256, prepare_runtime_provider  # noqa: E402
-from quant_workflow.quant_data_qlib_provider import (  # noqa: E402
-    DirectProviderError,
-    _load_descriptor,
-    build_direct_provider_descriptor,
+from _paths import qlib_workflow_provider_uri, quant_data_root, reports_root  # noqa: E402
+from _mlflow_run_provenance import (  # noqa: E402
+    RunProvenanceError,
+    normalize_provider_lineage,
+    provider_identity,
+    provider_lineages_match,
 )
-from quant_data_contract import DataContractError, resolve_dataset  # noqa: E402
+from prepare_robust_provider import file_sha256, prepare_runtime_provider  # noqa: E402
 from robust_signal_data_contract import (  # noqa: E402
     ACCEPTANCE_CONTRACT,
     ACCEPTANCE_OWNER,
@@ -50,8 +50,8 @@ DEFAULT_STATUS_PATH = (
 def _blocked_payload(reason_code: str) -> dict[str, Any]:
     messages = {
         "cleaned_provider_unavailable": (
-            "The current cleaned Qlib V2 snapshot is unavailable.",
-            "当前 cleaned Qlib V2 快照不可用，请先完成原生 V2 构建和数据质量验收。",
+            "The current cleaned Qlib Provider is unavailable.",
+            "当前 cleaned Qlib Provider 不可用，请先完成 quant_data 数据后端验收。",
         ),
         "membership_intervals_missing": (
             "Historical CSI800 membership intervals are unavailable.",
@@ -81,27 +81,6 @@ def _blocked_payload(reason_code: str) -> dict[str, Any]:
         "summary": summary,
         "summary_zh": summary_zh,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
-
-
-def _direct_cleaned_identity(descriptor: Path, quant_data_dir: Path) -> dict[str, str]:
-    context = _load_descriptor(descriptor, quant_data_dir)
-    dataset = context.descriptor.get("dataset") or {}
-    index = context.descriptor.get("index_dataset") or {}
-    cleaning = context.descriptor.get("cleaning") or {}
-    return {
-        "provider_contract": "direct_parquet_v1",
-        "dataset_id": str(dataset.get("dataset_id") or ""),
-        "snapshot_id": str(dataset.get("snapshot_id") or ""),
-        "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
-        "content_sha256": str(dataset.get("content_sha256") or ""),
-        "descriptor_path": descriptor.relative_to(quant_data_dir).as_posix(),
-        "descriptor_sha256": file_sha256(descriptor),
-        "cleaning_mode": str(cleaning.get("mode") or ""),
-        "index_dataset_id": str(index.get("dataset_id") or ""),
-        "index_snapshot_id": str(index.get("snapshot_id") or ""),
-        "index_content_sha256": str(index.get("content_sha256") or ""),
-        "index_manifest_sha256": str(index.get("manifest_sha256") or ""),
     }
 
 
@@ -150,43 +129,23 @@ def prepare_robust_signal_data(
             pointer_path=status_path, payload=payload
         )
 
-    quality_identity = quality.get("cleaned_provider_identity") or {}
-    direct_mode = (
-        quality_identity.get("provider_contract") == "direct_parquet_v1"
-        and quality_identity.get("dataset_id") == "ashare_daily_qfq"
-    )
     try:
-        if direct_mode:
-            descriptor = build_direct_provider_descriptor(
+        canonical_provider = qlib_workflow_provider_uri("cleaned")
+        resolved_identity = normalize_provider_lineage(
+            provider_identity(
+                canonical_provider,
                 quant_data_root=quant_data_dir,
-                cleaning_mode="cleaned",
             )
-            canonical_provider = descriptor.parent
-            resolved_identity = _direct_cleaned_identity(
-                descriptor,
-                quant_data_dir,
-            )
-        else:
-            resolved = resolve_dataset(
-                "qlib_ashare_cleaned_v2",
-                quant_data_root=quant_data_dir,
-                require_basis="qfq",
-            )
-            canonical_provider = Path(resolved.snapshot_path)
-            resolved_identity = {
-                "dataset_id": str(resolved.dataset_id),
-                "snapshot_id": str(resolved.manifest.get("snapshot_id") or ""),
-                "manifest_sha256": str(
-                    resolved.catalog_entry.get("snapshot_manifest_sha256") or ""
-                ),
-                "content_sha256": str(resolved.manifest.get("content_sha256") or ""),
-            }
-    except (DataContractError, DirectProviderError, OSError, RuntimeError, ValueError):
+        )
+    except (RunProvenanceError, OSError, RuntimeError, ValueError):
         payload = _blocked_payload("cleaned_provider_unavailable")
         return publish_robust_signal_data_readiness(
             pointer_path=status_path, payload=payload
         )
-    if resolved_identity != quality.get("cleaned_provider_identity"):
+    if not provider_lineages_match(
+        resolved_identity,
+        quality.get("cleaned_provider_identity"),
+    ):
         payload = _blocked_payload("cleaned_provider_quality_mismatch")
         return publish_robust_signal_data_readiness(
             pointer_path=status_path, payload=payload
@@ -228,7 +187,9 @@ def prepare_robust_signal_data(
         ],
         "quality_evidence_sha256": quality["quality_evidence_sha256"],
         "cleaned_provider_identity": resolved_identity,
-        "canonical_snapshot_id": resolved_identity.get("snapshot_id") or canonical_provider.name,
+        "canonical_snapshot_id": (
+            resolved_identity.get("snapshot_id") or canonical_provider.name
+        ),
         "symbols": result["symbols"],
         "intervals": result["intervals"],
         "reused": result["reused"],

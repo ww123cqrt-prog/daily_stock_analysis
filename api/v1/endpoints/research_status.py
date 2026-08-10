@@ -27,15 +27,23 @@ from quant_workflow.scripts.quant_data_contract import (
     DataContractError,
     filesystem_state_fingerprint,
     validate_latest_pointer,
-    validate_qlib_snapshot,
 )
 from quant_workflow.scripts._file_lock import lock_file, unlock_file
-from quant_workflow.scripts.prepare_robust_provider import RuntimeProviderIdentityCache
-from quant_workflow.quant_data_qlib_provider import (
-    DirectProviderError,
-    _load_descriptor,
-    build_direct_provider_descriptor,
+from quant_workflow.scripts._mlflow_run_provenance import (
+    RunProvenanceError,
+    normalize_provider_lineage,
+    provider_identity,
+    provider_lineage_is_complete,
+    provider_lineages_match,
+    resolve_immutable_provider_identity,
 )
+from quant_workflow.scripts._paths import (
+    provider_calendar_days,
+    provider_has_instrument_pool,
+    provider_instrument_ranges,
+    qlib_workflow_provider_uri,
+)
+from quant_workflow.scripts.prepare_robust_provider import RuntimeProviderIdentityCache
 from quant_workflow.scripts.robust_signal_data_contract import (
     RobustSignalDataBlocked,
     consume_accepted_robust_signal_data,
@@ -77,34 +85,7 @@ CANDIDATE_PIPELINE_FILENAME = "candidate_pipeline_latest.json"
 DATA_MANIFEST_FILENAME = "DATA_MANIFEST.json"
 ASHARE_DAILY_QFQ_DATASET_ID = "ashare_daily_qfq"
 ASHARE_DAILY_QFQ_DATASET_ROOT = Path("parquet/ashare_1d/ashare_daily_qfq")
-DIRECT_PROVIDER_CONTRACT = "direct_parquet_v1"
-DIRECT_PROVIDER_INDEX_DATASET_ID = "cn_index_daily"
-DIRECT_PROVIDER_KEYS = ("canonical", "cleaned")
-DIRECT_PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-    "descriptor_path",
-    "descriptor_sha256",
-    "cleaning_mode",
-    "index_dataset_id",
-    "index_snapshot_id",
-    "index_content_sha256",
-    "index_manifest_sha256",
-)
-NATIVE_QLIB_DATASET_ID = "qlib_ashare_v2"
-NATIVE_QLIB_DATASET_ROOT = Path("qlib/cn_data_ashare_v2")
-NATIVE_QLIB_LATEST_POINTER = NATIVE_QLIB_DATASET_ROOT / "LATEST.json"
-NATIVE_QLIB_DATASET_ROOTS = {
-    NATIVE_QLIB_DATASET_ID: NATIVE_QLIB_DATASET_ROOT,
-    "qlib_ashare_cleaned_v2": Path("qlib/cn_data_ashare_cleaned_v2"),
-}
-NATIVE_QLIB_DATA_CONTRACT_KEYS = {
-    "qlib_ashare_v2": "canonical",
-    "qlib_ashare_cleaned_v2": "cleaned",
-}
+QLIB_PROVIDER_NAMES = ("canonical", "cleaned")
 NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE = 0.50
 ROBUST_STRATEGY_DIRNAME = "robust_strategy"
 ROBUST_SIGNAL_DIRNAME = "robust_signal"
@@ -122,8 +103,6 @@ QLIB_RESEARCH_REPORTS = {
 EXPERIMENT_FILE_LOCK = threading.RLock()
 DEFAULT_MLFLOW_URL = "http://127.0.0.1:6006/"
 DIRECTORY_SIZE_CACHE_TTL_SECONDS = 60.0
-NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS = 60.0
-NATIVE_QLIB_VALIDATION_CACHE_MAX_ENTRIES = 8
 DATA_HYGIENE_STATE_SCAN_MAX_ENTRIES = 200_000
 DATA_HYGIENE_STATE_SCAN_MAX_SECONDS = 5.0
 DATA_HYGIENE_POINTER_MAX_BYTES = 64 * 1024
@@ -158,19 +137,15 @@ class _NativeQlibProviderResolution:
     authoritative: bool
     path: Optional[Path] = None
     error: Optional[str] = None
+    lineage: Optional[Dict[str, str]] = None
+    provider_name: str = "canonical"
     dataset_id: Optional[str] = None
     snapshot_id: Optional[str] = None
     manifest_sha256: Optional[str] = None
     content_sha256: Optional[str] = None
     calendar_end: Optional[str] = None
-    provider_contract: Optional[str] = None
-    descriptor_path: Optional[Path] = None
-    descriptor_sha256: Optional[str] = None
-    cleaning_mode: Optional[str] = None
-    index_dataset_id: Optional[str] = None
-    index_snapshot_id: Optional[str] = None
-    index_content_sha256: Optional[str] = None
-    index_manifest_sha256: Optional[str] = None
+    instrument_count: int = 0
+    benchmark_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,16 +162,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 _DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
 _DIRECTORY_SIZE_CACHE: Dict[str, Tuple[float, float]] = {}
-_NATIVE_QLIB_VALIDATION_CACHE_LOCK = threading.Lock()
-_NATIVE_QLIB_VALIDATION_CACHE: Dict[
-    Tuple[str, str, str], Tuple[float, Dict[str, Any]]
-] = {}
 _DATA_HYGIENE_STATE_SCAN_LOCK = threading.Lock()
-
-
-def _clear_native_qlib_validation_cache() -> None:
-    with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
-        _NATIVE_QLIB_VALIDATION_CACHE.clear()
 
 
 def _filesystem_state_fingerprint_live(path: Path) -> Dict[str, Any]:
@@ -283,46 +249,6 @@ def _annotate_provider_quality_freshness(
             "calendar_age_days": calendar_age_days,
             "blocks_training": False,
         }
-
-
-def _validate_native_qlib_snapshot_cached(
-    provider_path: Path,
-    *,
-    manifest_sha256: str,
-    evidence_root: Path,
-) -> Dict[str, Any]:
-    """Reuse expensive file hashes briefly; catalog and manifest checks stay live."""
-
-    key = (
-        str(provider_path.resolve()),
-        manifest_sha256,
-        str(evidence_root.resolve()),
-    )
-    now = time.monotonic()
-    with _NATIVE_QLIB_VALIDATION_CACHE_LOCK:
-        expired_keys = [
-            cached_key
-            for cached_key, (cached_at, _) in _NATIVE_QLIB_VALIDATION_CACHE.items()
-            if now - cached_at >= NATIVE_QLIB_VALIDATION_CACHE_TTL_SECONDS
-        ]
-        for expired_key in expired_keys:
-            _NATIVE_QLIB_VALIDATION_CACHE.pop(expired_key, None)
-        cached = _NATIVE_QLIB_VALIDATION_CACHE.get(key)
-        if cached is not None:
-            return dict(cached[1])
-        validated = validate_qlib_snapshot(
-            provider_path,
-            verify_hashes=True,
-            evidence_root=evidence_root,
-        )
-        if len(_NATIVE_QLIB_VALIDATION_CACHE) >= NATIVE_QLIB_VALIDATION_CACHE_MAX_ENTRIES:
-            oldest_key = min(
-                _NATIVE_QLIB_VALIDATION_CACHE,
-                key=lambda cached_key: _NATIVE_QLIB_VALIDATION_CACHE[cached_key][0],
-            )
-            _NATIVE_QLIB_VALIDATION_CACHE.pop(oldest_key, None)
-        _NATIVE_QLIB_VALIDATION_CACHE[key] = (time.monotonic(), dict(validated))
-        return dict(validated)
 
 
 def _lock_experiment_handle(lock_handle) -> None:
@@ -1619,6 +1545,66 @@ def _data_quality_summary_from_json(
     return _data_quality_summary_from_markdown_bytes(publication.markdown_bytes)
 
 
+def _quality_identity_matches_resolution(
+    identity: Any,
+    resolution: _NativeQlibProviderResolution,
+) -> bool:
+    if not isinstance(identity, Mapping):
+        return False
+    lineage = _resolution_lineage(resolution)
+    if lineage is not None:
+        return bool(identity.get("provider_contract")) and provider_lineages_match(
+            identity,
+            lineage,
+        )
+    expected = _resolution_common_identity(resolution)
+    return len(expected) == 4 and all(
+        identity.get(field) == value for field, value in expected.items()
+    )
+
+
+def _provider_quality_metrics_valid(
+    quality_record: Any,
+) -> bool:
+    if not isinstance(quality_record, Mapping):
+        return False
+    integer_fields = (
+        "invalid_calendar_entries",
+        "invalid_instrument_records",
+        "calendar_days",
+        "instruments",
+        "instrument_feature_dirs",
+        "missing_instrument_feature_dirs",
+        "complete_instrument_feature_dirs",
+        "incomplete_instrument_feature_dirs",
+        "missing_instrument_feature_files",
+        "invalid_instrument_feature_files",
+        "misaligned_instrument_feature_dirs",
+    )
+    failure_reasons = quality_record.get("failure_reasons")
+    readiness = quality_record.get("training_readiness")
+    minimum_coverage = quality_record.get("minimum_valid_instrument_feature_coverage")
+    required_coverage = quality_record.get("required_feature_min_coverage")
+    return bool(
+        isinstance(quality_record.get("calendar_valid"), bool)
+        and isinstance(quality_record.get("instrument_records_valid"), bool)
+        and all(_is_nonnegative_int(quality_record.get(field)) for field in integer_fields)
+        and quality_record.get("complete_instrument_feature_dirs")
+        + quality_record.get("incomplete_instrument_feature_dirs")
+        == quality_record.get("instruments")
+        and _is_finite_number(required_coverage)
+        and float(required_coverage) == NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
+        and _is_finite_number(minimum_coverage)
+        and 0.0 <= float(minimum_coverage) <= 1.0
+        and isinstance(quality_record.get("benchmark_complete"), bool)
+        and isinstance(quality_record.get("trainable"), bool)
+        and isinstance(failure_reasons, list)
+        and all(isinstance(reason, str) for reason in failure_reasons)
+        and isinstance(readiness, Mapping)
+        and isinstance(readiness.get("status"), str)
+    )
+
+
 def _apply_data_quality_training_gate(
     payload: Dict[str, Any],
     reports_dir: Path,
@@ -1635,6 +1621,7 @@ def _apply_data_quality_training_gate(
             ),
         }
         return
+
     provider_specific_gate = (
         native_resolution.authoritative and native_resolution.path is not None
     )
@@ -1642,9 +1629,9 @@ def _apply_data_quality_training_gate(
         payload["trainable"] = False
         return
 
-    pointer_path = reports_dir / "data_quality_report_latest.json"
-    status_report_id = payload.get("quality_report_id")
-    publication = _data_quality_publication_from_json(pointer_path)
+    publication = _data_quality_publication_from_json(
+        reports_dir / "data_quality_report_latest.json"
+    )
     if publication is None:
         payload["trainable"] = False
         payload["training_readiness"] = {
@@ -1657,7 +1644,6 @@ def _apply_data_quality_training_gate(
         return
 
     quality_payload = publication.payload
-    current_report_id = publication.report_id
     payload["quality_scan"] = {
         "mode": quality_payload.get("scan_mode"),
         "coverage": quality_payload.get("coverage_status"),
@@ -1665,7 +1651,7 @@ def _apply_data_quality_training_gate(
         "requested_sample": quality_payload.get("requested_sample", 0),
         "scanned_instruments": quality_payload.get("scanned_instruments"),
     }
-    if status_report_id != current_report_id:
+    if payload.get("quality_report_id") != publication.report_id:
         payload["trainable"] = False
         payload["training_readiness"] = {
             "status": "blocked",
@@ -1693,8 +1679,8 @@ def _apply_data_quality_training_gate(
         return
 
     thresholds = quality_payload.get("training_thresholds")
-    thresholds_verified = (
-        isinstance(thresholds, dict)
+    thresholds_verified = bool(
+        isinstance(thresholds, Mapping)
         and thresholds.get("authoritative") is True
         and all(
             isinstance(thresholds.get(field), int)
@@ -1713,7 +1699,7 @@ def _apply_data_quality_training_gate(
             )
         )
     )
-    fully_verified = (
+    fully_verified = bool(
         quality_payload.get("scan_mode") == "full"
         and quality_payload.get("coverage_status") == "full"
         and quality_payload.get("verification_status") == "verified"
@@ -1734,370 +1720,195 @@ def _apply_data_quality_training_gate(
         }
         return
 
-    if native_resolution.provider_contract == DIRECT_PROVIDER_CONTRACT:
-        provider_key = native_resolution.cleaning_mode or "canonical"
-        expected_identity = _direct_resolution_identity(native_resolution)
-        data_contract = quality_payload.get("data_contract")
-        provider_identities = (
-            data_contract.get("qlib_providers")
-            if isinstance(data_contract, dict)
-            else None
-        )
-        qlib_identity = (
-            provider_identities.get(provider_key)
-            if isinstance(provider_identities, dict)
-            else None
-        )
-        quality_records = quality_payload.get("provider_quality")
-        quality_record = (
-            quality_records.get(provider_key)
-            if isinstance(quality_records, dict)
-            else None
-        )
-        identity_fields = tuple(DIRECT_PROVIDER_IDENTITY_FIELDS)
-        identity_matches = (
-            isinstance(expected_identity, dict)
-            and isinstance(qlib_identity, dict)
-            and isinstance(quality_record, dict)
-            and all(
-                qlib_identity.get(field) == expected_identity.get(field)
-                and quality_record.get(field) == expected_identity.get(field)
-                for field in identity_fields
-            )
-        )
-        metrics_valid = (
-            isinstance(quality_record, dict)
-            and quality_record.get("provider") == provider_key
-            and quality_record.get("calendar_valid") is True
-            and quality_record.get("invalid_calendar_entries") == 0
-            and quality_record.get("instrument_records_valid") is True
-            and quality_record.get("invalid_instrument_records") == 0
-            and isinstance(quality_record.get("calendar_days"), int)
-            and not isinstance(quality_record.get("calendar_days"), bool)
-            and isinstance(quality_record.get("instruments"), int)
-            and not isinstance(quality_record.get("instruments"), bool)
-            and quality_record.get("calendar_days") >= thresholds["min_calendar_days"]
-            and quality_record.get("instruments") >= thresholds["min_instruments"]
-            and quality_record.get("complete_instrument_feature_dirs")
-            == quality_record.get("instruments")
-            and quality_record.get("incomplete_instrument_feature_dirs") == 0
-            and quality_record.get("missing_instrument_feature_files") == 0
-            and quality_record.get("invalid_instrument_feature_files") == 0
-            and quality_record.get("benchmark_complete") is True
-            and quality_record.get("misaligned_instrument_feature_dirs") == 0
-            and quality_record.get("trainable") is True
-            and isinstance(quality_record.get("training_readiness"), dict)
-            and quality_record["training_readiness"].get("status") == "trainable"
-        )
-        try:
-            approved_ashare_qfq_snapshot_identity()
-        except DataContractError:
-            identity_matches = False
-        if not identity_matches or not metrics_valid:
-            payload["trainable"] = False
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "最新数据质量报告还没有绑定当前直读 Parquet Provider 的完整身份；"
-                    "请重新运行完整数据质量报告后再训练。"
-                ),
-            }
-            return
-        payload["trainable"] = True
-        payload["training_readiness"] = dict(quality_record["training_readiness"])
+    if not provider_specific_gate:
+        payload["trainable"] = bool(quality_payload.get("trainable") is True)
         return
 
-    if native_resolution.authoritative and native_resolution.path is not None:
-        data_contract = quality_payload.get("data_contract")
-        provider_key = NATIVE_QLIB_DATA_CONTRACT_KEYS.get(
-            str(native_resolution.dataset_id or "")
-        )
-        provider_identities = (
-            data_contract.get("qlib_providers")
-            if isinstance(data_contract, dict)
+    provider_name = _provider_name_for_request(
+        str(native_resolution.dataset_id or ""),
+        native_resolution.provider_name,
+    )
+    data_contract = quality_payload.get("data_contract")
+    provider_identities = (
+        data_contract.get("qlib_providers")
+        if isinstance(data_contract, Mapping)
+        else None
+    )
+    quality_identity = (
+        provider_identities.get(provider_name)
+        if isinstance(provider_identities, Mapping)
+        else None
+    )
+    if quality_identity is None and provider_name == "canonical":
+        quality_identity = (
+            data_contract.get("qlib_provider")
+            if isinstance(data_contract, Mapping)
             else None
         )
-        qlib_identity = (
-            provider_identities.get(provider_key)
-            if isinstance(provider_identities, dict) and provider_key is not None
-            else None
+    quality_records = quality_payload.get("provider_quality")
+    quality_record = (
+        quality_records.get(provider_name)
+        if isinstance(quality_records, Mapping)
+        else None
+    )
+    payload["provider_quality"] = (
+        dict(quality_records) if isinstance(quality_records, Mapping) else {}
+    )
+
+    identity_matches = bool(
+        isinstance(data_contract, Mapping)
+        and data_contract.get("status") == "verified"
+        and _quality_identity_matches_resolution(
+            quality_identity,
+            native_resolution,
         )
-        if qlib_identity is None and provider_key == "canonical":
-            qlib_identity = (
-                data_contract.get("qlib_provider")
-                if isinstance(data_contract, dict)
-                else None
-            )
-        expected_identity = {
-            "dataset_id": native_resolution.dataset_id,
-            "snapshot_id": native_resolution.snapshot_id,
-            "manifest_sha256": native_resolution.manifest_sha256,
-            "content_sha256": native_resolution.content_sha256,
+        and _quality_identity_matches_resolution(
+            quality_record,
+            native_resolution,
+        )
+    )
+    metrics_valid = _provider_quality_metrics_valid(quality_record)
+    if not identity_matches or not metrics_valid:
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "Latest data quality evidence does not contain valid "
+                "provider-specific quality for the requested Qlib Provider; "
+                "rerun the full report before training."
+            ),
         }
-        identity_matches = (
-            isinstance(data_contract, dict)
-            and data_contract.get("status") == "verified"
-            and isinstance(qlib_identity, dict)
-            and all(
-                isinstance(expected, str)
-                and expected
-                and qlib_identity.get(field) == expected
-                for field, expected in expected_identity.items()
-            )
-        )
-        if not identity_matches:
-            payload["trainable"] = False
+        return
+
+    readiness = quality_record.get("training_readiness")
+    if quality_record.get("trainable") is not True:
+        payload["trainable"] = False
+        if (
+            isinstance(readiness, Mapping)
+            and readiness.get("status") != "trainable"
+            and isinstance(readiness.get("summary"), str)
+        ):
+            payload["training_readiness"] = dict(readiness)
+        else:
             payload["training_readiness"] = {
                 "status": "blocked",
                 "summary": (
-                    "Latest data quality evidence does not match the current "
-                    "native V2 snapshot; rerun the full data quality report before training."
+                    "The requested Qlib Provider did not pass its own quality "
+                    "checks; rerun the full report after repair."
                 ),
             }
-            return
+        return
 
-        provider_quality = quality_payload.get("provider_quality")
-        quality_record = (
-            provider_quality.get(provider_key)
-            if isinstance(provider_quality, dict) and provider_key is not None
-            else None
-        )
-        payload["provider_quality"] = (
-            provider_quality if isinstance(provider_quality, dict) else {}
-        )
-        record_identity_matches = isinstance(quality_record, dict) and all(
-            quality_record.get(field) == expected
-            for field, expected in expected_identity.items()
-        )
-        record_metrics_valid = (
-            isinstance(quality_record, dict)
-            and isinstance(quality_record.get("calendar_valid"), bool)
-            and _is_nonnegative_int(
-                quality_record.get("invalid_calendar_entries")
-            )
-            and isinstance(quality_record.get("instrument_records_valid"), bool)
-            and _is_nonnegative_int(
-                quality_record.get("invalid_instrument_records")
-            )
-            and isinstance(quality_record.get("calendar_days"), int)
-            and not isinstance(quality_record.get("calendar_days"), bool)
-            and isinstance(quality_record.get("instruments"), int)
-            and not isinstance(quality_record.get("instruments"), bool)
-            and isinstance(quality_record.get("instrument_feature_dirs"), int)
-            and not isinstance(
-                quality_record.get("instrument_feature_dirs"), bool
-            )
-            and isinstance(
-                quality_record.get("missing_instrument_feature_dirs"), int
-            )
-            and not isinstance(
-                quality_record.get("missing_instrument_feature_dirs"), bool
-            )
-            and isinstance(
-                quality_record.get("complete_instrument_feature_dirs"), int
-            )
-            and not isinstance(
-                quality_record.get("complete_instrument_feature_dirs"), bool
-            )
-            and quality_record.get("complete_instrument_feature_dirs") >= 0
-            and isinstance(
-                quality_record.get("incomplete_instrument_feature_dirs"), int
-            )
-            and not isinstance(
-                quality_record.get("incomplete_instrument_feature_dirs"), bool
-            )
-            and quality_record.get("incomplete_instrument_feature_dirs") >= 0
-            and isinstance(
-                quality_record.get("missing_instrument_feature_files"), int
-            )
-            and not isinstance(
-                quality_record.get("missing_instrument_feature_files"), bool
-            )
-            and quality_record.get("missing_instrument_feature_files") >= 0
-            and isinstance(
-                quality_record.get("invalid_instrument_feature_files"), int
-            )
-            and not isinstance(
-                quality_record.get("invalid_instrument_feature_files"), bool
-            )
-            and quality_record.get("invalid_instrument_feature_files") >= 0
-            and _is_finite_number(
-                quality_record.get("required_feature_min_coverage")
-            )
-            and float(quality_record.get("required_feature_min_coverage"))
-            == NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
-            and _is_finite_number(
-                quality_record.get("minimum_valid_instrument_feature_coverage")
-            )
-            and 0.0
-            <= float(
-                quality_record.get("minimum_valid_instrument_feature_coverage")
-            )
-            <= 1.0
-            and _is_nonnegative_int(
-                quality_record.get("misaligned_instrument_feature_dirs")
-            )
-            and quality_record.get("complete_instrument_feature_dirs")
-            + quality_record.get("incomplete_instrument_feature_dirs")
-            == quality_record.get("instruments")
-            and isinstance(quality_record.get("benchmark_complete"), bool)
-            and isinstance(quality_record.get("failure_reasons"), list)
-            and all(
-                isinstance(reason, str)
-                for reason in quality_record.get("failure_reasons", [])
-            )
-            and isinstance(quality_record.get("trainable"), bool)
-            and (
-                quality_record.get("trainable") is not True
-                or (
-                    quality_record.get("complete_instrument_feature_dirs")
-                    >= thresholds["min_instruments"]
-                    and quality_record.get("incomplete_instrument_feature_dirs")
-                    == 0
-                    and quality_record.get("missing_instrument_feature_files")
-                    == 0
-                    and quality_record.get("invalid_instrument_feature_files")
-                    == 0
-                    and quality_record.get("calendar_valid") is True
-                    and quality_record.get("invalid_calendar_entries") == 0
-                    and quality_record.get("instrument_records_valid") is True
-                    and quality_record.get("invalid_instrument_records") == 0
-                    and float(
-                        quality_record.get(
-                            "minimum_valid_instrument_feature_coverage"
-                        )
-                    )
-                    >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
-                    and quality_record.get("misaligned_instrument_feature_dirs")
-                    == 0
+    expected_lineage = _resolution_lineage(native_resolution)
+    if expected_lineage is not None:
+        try:
+            actual_lineage = normalize_provider_lineage(
+                provider_identity(
+                    native_resolution.path,
+                    quant_data_root=QUANT_DATA_ROOT,
                 )
             )
-        )
-        if not record_identity_matches or not record_metrics_valid:
+        except (
+            FileNotFoundError,
+            OSError,
+            RunProvenanceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            actual_lineage = None
+        if not provider_lineages_match(actual_lineage, expected_lineage):
             payload["trainable"] = False
             payload["training_readiness"] = {
                 "status": "blocked",
                 "summary": (
-                    "Latest data quality evidence does not contain valid "
-                    "provider-specific quality for the requested native V2 snapshot; "
-                    "rerun the full data quality report before training."
+                    "The Qlib Provider changed after the latest data quality "
+                    "report; rerun the full report before training."
                 ),
             }
             return
-
-        if quality_record.get("trainable") is not True:
-            readiness = quality_record.get("training_readiness")
-            payload["trainable"] = False
-            if (
-                isinstance(readiness, dict)
-                and isinstance(readiness.get("status"), str)
-                and readiness.get("status") != "trainable"
-                and isinstance(readiness.get("summary"), str)
-            ):
-                payload["training_readiness"] = dict(readiness)
-            else:
-                payload["training_readiness"] = {
-                    "status": "blocked",
-                    "summary": (
-                        "The requested native V2 provider did not pass its own "
-                        "quality checks; rerun the full data quality report after repair."
-                    ),
-                }
-            return
-
-        snapshot_state = data_contract.get("snapshot_state")
-        snapshot_stages = (
-            "before",
-            "after_scan",
-            "after_revalidation",
-            "after",
+    else:
+        snapshot_state = (
+            data_contract.get("snapshot_state")
+            if isinstance(data_contract, Mapping)
+            else None
         )
-        provider_states = []
-        for stage in snapshot_stages:
-            stage_states = (
-                snapshot_state.get(stage)
-                if isinstance(snapshot_state, dict)
-                else None
-            )
-            provider_states.append(
-                stage_states.get(native_resolution.dataset_id)
-                if isinstance(stage_states, dict)
-                else None
-            )
-        expected_before = provider_states[0]
-        expected_after = provider_states[-1]
-        stable_state_is_valid = (
-            isinstance(snapshot_state, dict)
+        snapshot_stages = ("before", "after_scan", "after_revalidation", "after")
+        provider_states = [
+            snapshot_state.get(stage, {}).get(native_resolution.dataset_id)
+            if isinstance(snapshot_state, Mapping)
+            and isinstance(snapshot_state.get(stage), Mapping)
+            else None
+            for stage in snapshot_stages
+        ]
+        expected_state = provider_states[0]
+        stable_state_is_valid = bool(
+            isinstance(snapshot_state, Mapping)
             and snapshot_state.get("stable") is True
             and snapshot_state.get("content_revalidated") is True
             and all(
                 _valid_filesystem_state_fingerprint(state)
                 for state in provider_states
             )
-            and all(state == expected_before for state in provider_states[1:])
+            and all(state == expected_state for state in provider_states[1:])
         )
         if not stable_state_is_valid:
             payload["trainable"] = False
             payload["training_readiness"] = {
                 "status": "blocked",
                 "summary": (
-                    "Latest data quality evidence does not contain a stable provider "
-                    "snapshot state; rerun the full data quality report before training."
+                    "Latest data quality evidence does not contain a stable "
+                    "Provider snapshot state; rerun the full report before training."
                 ),
             }
             return
         try:
-            current_state = _filesystem_state_fingerprint_live(
-                native_resolution.path
-            )
+            current_state = _filesystem_state_fingerprint_live(native_resolution.path)
         except (DataContractError, OSError):
             current_state = None
-        if current_state != expected_after:
+        if current_state != expected_state:
             payload["trainable"] = False
             payload["training_readiness"] = {
                 "status": "blocked",
                 "summary": (
-                    "The native V2 provider changed after the latest data quality "
+                    "The Qlib Provider changed after the latest data quality "
                     "report; rerun the full report before training."
                 ),
             }
             return
 
-        provider_thresholds_pass = (
-            quality_record["calendar_days"] >= thresholds["min_calendar_days"]
-            and quality_record["instruments"] >= thresholds["min_instruments"]
-            and quality_record["instrument_feature_dirs"]
-            >= thresholds["min_instruments"]
-            and quality_record["missing_instrument_feature_dirs"] == 0
-            and quality_record["benchmark_complete"] is True
-            and quality_record["invalid_instrument_feature_files"] == 0
-            and quality_record["calendar_valid"] is True
-            and quality_record["invalid_calendar_entries"] == 0
-            and quality_record["instrument_records_valid"] is True
-            and quality_record["invalid_instrument_records"] == 0
-            and quality_record["minimum_valid_instrument_feature_coverage"]
-            >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
-            and quality_record["misaligned_instrument_feature_dirs"] == 0
-            and not quality_record["failure_reasons"]
-        )
-        readiness = quality_record.get("training_readiness")
-        if (
-            not provider_thresholds_pass
-            or not isinstance(readiness, dict)
-            or readiness.get("status") != "trainable"
-        ):
-            payload["trainable"] = False
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "The requested native V2 provider has inconsistent quality "
-                    "evidence; rerun the full data quality report before training."
-                ),
-            }
-            return
-
-        payload["trainable"] = True
-        payload["training_readiness"] = dict(readiness)
+    provider_thresholds_pass = bool(
+        quality_record["calendar_days"] >= thresholds["min_calendar_days"]
+        and quality_record["instruments"] >= thresholds["min_instruments"]
+        and quality_record["instrument_feature_dirs"] >= thresholds["min_instruments"]
+        and quality_record["complete_instrument_feature_dirs"]
+        >= thresholds["min_instruments"]
+        and quality_record["incomplete_instrument_feature_dirs"] == 0
+        and quality_record["missing_instrument_feature_dirs"] == 0
+        and quality_record["missing_instrument_feature_files"] == 0
+        and quality_record["invalid_instrument_feature_files"] == 0
+        and quality_record["calendar_valid"] is True
+        and quality_record["invalid_calendar_entries"] == 0
+        and quality_record["instrument_records_valid"] is True
+        and quality_record["invalid_instrument_records"] == 0
+        and quality_record["minimum_valid_instrument_feature_coverage"]
+        >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
+        and quality_record["misaligned_instrument_feature_dirs"] == 0
+        and quality_record["benchmark_complete"] is True
+        and not quality_record["failure_reasons"]
+    )
+    if not provider_thresholds_pass or readiness.get("status") != "trainable":
+        payload["trainable"] = False
+        payload["training_readiness"] = {
+            "status": "blocked",
+            "summary": (
+                "The requested Qlib Provider has inconsistent quality evidence; "
+                "rerun the full report before training."
+            ),
+        }
+        return
+    payload["trainable"] = True
+    payload["training_readiness"] = dict(readiness)
 
 
 def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
@@ -2411,313 +2222,120 @@ def approved_ashare_qfq_snapshot_identity() -> Dict[str, Any]:
     }
 
 
-def _is_trusted_qlib_provider_path(path: Path) -> bool:
-    provider_path = _resolve_for_boundary(path)
-    provider_root = _resolve_for_boundary(QLIB_PROVIDER_ROOT)
-    if provider_path == provider_root or not _is_relative_to(
-        provider_path, provider_root
-    ):
-        return False
-    required_children = ("calendars", "instruments", "features")
-    return all((provider_path / child).is_dir() for child in required_children)
+def _provider_name_for_request(dataset_id: str, provider: str) -> str:
+    requested = str(provider or "canonical").strip().lower()
+    if requested == "canonical" and str(dataset_id or "").endswith("_cleaned_v2"):
+        requested = "cleaned"
+    if requested not in QLIB_PROVIDER_NAMES:
+        raise ValueError("Qlib Provider must be one of: canonical, cleaned.")
+    return requested
 
 
-def _resolve_direct_qlib_provider(
-    provider: str = "canonical",
-) -> _NativeQlibProviderResolution:
-    """Resolve the formal Qlib view backed by the current Parquet snapshots.
-
-    The descriptor contains metadata and frozen hashes only.  It is not a
-    second market-data store.  Building a missing descriptor is safe here
-    because the operation only writes this small metadata view; it never
-    downloads or rewrites bars.
-    """
-
-    provider = str(provider or "canonical").strip().lower()
-    if provider not in DIRECT_PROVIDER_KEYS:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            cleaning_mode=provider,
-            error="直读 Provider 类型不受支持。",
-        )
-    if _resolve_for_boundary(RESEARCH_STATUS_PATH.parent) != _resolve_for_boundary(
-        QUANT_WORKFLOW_REPORTS_ROOT
-    ):
-        return _NativeQlibProviderResolution(authoritative=False)
-
-    root = _resolve_for_boundary(QUANT_DATA_ROOT)
+def _resolution_lineage(
+    resolution: _NativeQlibProviderResolution,
+) -> Optional[Dict[str, str]]:
+    if not isinstance(resolution.lineage, Mapping):
+        return None
     try:
-        descriptor = build_direct_provider_descriptor(
-            quant_data_root=root,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            index_dataset_id=DIRECT_PROVIDER_INDEX_DATASET_ID,
-            cleaning_mode=provider,
-        )
-        descriptor = descriptor.resolve()
-        context = _load_descriptor(descriptor, root)
-        dataset = context.descriptor.get("dataset") or {}
-        index = context.descriptor.get("index_dataset") or {}
-        descriptor_bytes = descriptor.read_bytes()
-        descriptor_sha256 = hashlib.sha256(descriptor_bytes).hexdigest()
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            path=descriptor.parent,
-            dataset_id=str(dataset.get("dataset_id") or ""),
-            snapshot_id=str(dataset.get("snapshot_id") or ""),
-            manifest_sha256=str(dataset.get("manifest_sha256") or ""),
-            content_sha256=str(dataset.get("content_sha256") or ""),
-            calendar_end=(
-                context.calendar[-1].date().isoformat()
-                if len(context.calendar)
-                else None
-            ),
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            descriptor_path=descriptor,
-            descriptor_sha256=descriptor_sha256,
-            cleaning_mode=provider,
-            index_dataset_id=str(index.get("dataset_id") or ""),
-            index_snapshot_id=str(index.get("snapshot_id") or ""),
-            index_content_sha256=str(index.get("content_sha256") or ""),
-            index_manifest_sha256=str(index.get("manifest_sha256") or ""),
-        )
-    except (DirectProviderError, DataContractError, OSError, UnicodeError, ValueError, KeyError) as exc:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            cleaning_mode=provider,
-            error=f"正式直读 Provider 不可用：{exc}",
-        )
+        return normalize_provider_lineage(resolution.lineage)
+    except RunProvenanceError:
+        return None
+
+
+def _resolution_common_identity(
+    resolution: _NativeQlibProviderResolution,
+) -> Dict[str, str]:
+    lineage = _resolution_lineage(resolution)
+    if lineage is not None:
+        return {
+            field: lineage[field]
+            for field in (
+                "dataset_id",
+                "snapshot_id",
+                "manifest_sha256",
+                "content_sha256",
+            )
+        }
+    values = {
+        "dataset_id": resolution.dataset_id,
+        "snapshot_id": resolution.snapshot_id,
+        "manifest_sha256": resolution.manifest_sha256,
+        "content_sha256": resolution.content_sha256,
+    }
+    return {
+        field: str(value)
+        for field, value in values.items()
+        if isinstance(value, str) and value
+    }
+
+
+def _resolution_from_provider_uri(
+    provider_uri: Path,
+    *,
+    provider_name: str,
+) -> _NativeQlibProviderResolution:
+    provider_uri = Path(provider_uri).expanduser()
+    lineage = normalize_provider_lineage(
+        provider_identity(provider_uri, quant_data_root=QUANT_DATA_ROOT)
+    )
+    calendar = provider_calendar_days(provider_uri)
+    if not calendar or calendar != sorted(set(calendar)):
+        raise ValueError("Qlib Provider calendar is invalid.")
+    instruments = provider_instrument_ranges(provider_uri)
+    if not instruments:
+        raise ValueError("Qlib Provider instruments are unavailable.")
+    benchmark_complete = provider_has_instrument_pool(provider_uri, "csi300")
+    return _NativeQlibProviderResolution(
+        authoritative=True,
+        path=provider_uri,
+        lineage=lineage,
+        provider_name=provider_name,
+        dataset_id=lineage["dataset_id"],
+        snapshot_id=lineage["snapshot_id"],
+        manifest_sha256=lineage["manifest_sha256"],
+        content_sha256=lineage["content_sha256"],
+        calendar_end=calendar[-1],
+        instrument_count=len(instruments),
+        benchmark_complete=benchmark_complete,
+    )
 
 
 def _resolve_native_qlib_provider(
-    dataset_id: str = NATIVE_QLIB_DATASET_ID,
+    dataset_id: str = ASHARE_DAILY_QFQ_DATASET_ID,
     *,
     provider: str = "canonical",
 ) -> _NativeQlibProviderResolution:
-    """Resolve the provider selected by the live v2 catalog.
-
-    A saved training report is historical evidence. It must not decide which
-    provider the current status page calls canonical. The catalog and its
-    immutable LATEST pointer are the source of truth for that decision.
-    """
-
-    if dataset_id == ASHARE_DAILY_QFQ_DATASET_ID:
-        return _resolve_direct_qlib_provider(provider)
-
-    # Tests and callers may inspect an isolated report artifact. Do not mix it
-    # with the process-wide live catalog unless it is the configured report
-    # location; this also prevents an arbitrary report path from selecting a
-    # real local provider during diagnostics.
     if _resolve_for_boundary(RESEARCH_STATUS_PATH.parent) != _resolve_for_boundary(
         QUANT_WORKFLOW_REPORTS_ROOT
     ):
         return _NativeQlibProviderResolution(authoritative=False)
 
-    dataset_root = NATIVE_QLIB_DATASET_ROOTS.get(dataset_id)
-    if dataset_root is None:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="训练结果记录了不受支持的原生 V2 数据集。",
-        )
-    latest_pointer = dataset_root / "LATEST.json"
-    root = _resolve_for_boundary(QUANT_DATA_ROOT)
-    catalog_path = root / DATA_MANIFEST_FILENAME
-    if catalog_path.is_symlink():
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 根清单路径不安全，已阻止回退到旧兼容数据。",
-        )
-    catalog = _read_json_object(catalog_path)
-    if catalog is None:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 根清单缺失或损坏，已阻止回退到旧兼容数据。",
-        )
-    if (
-        catalog.get("schema_version") != 2
-        or catalog.get("path_format") != "relative_to_quant_data_root"
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 根清单契约无效，已阻止回退到旧兼容数据。",
-        )
-    datasets = catalog.get("datasets") if isinstance(catalog, dict) else None
-    entry = (
-        datasets.get(dataset_id)
-        if isinstance(datasets, dict)
-        else None
-    )
-    if not isinstance(entry, dict):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 数据集未在根清单中登记，已阻止回退到旧兼容数据。",
-        )
-    if (
-        entry.get("dataset_id") != dataset_id
-        or entry.get("dataset_root") != dataset_root.as_posix()
-        or entry.get("role") != "canonical"
-        or entry.get("status") != "ready"
-        or entry.get("price_basis") != "qfq"
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 根清单口径无效，已阻止回退到旧兼容数据。",
-        )
-
-    if entry.get("latest_pointer") != latest_pointer.as_posix():
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 的 LATEST 指针位置无效，已阻止回退到旧兼容数据。",
-        )
-    pointer_path = _safe_manifest_path(root, latest_pointer.as_posix())
-    if pointer_path is None or _manifest_path_contains_symlink(
-        root, latest_pointer
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 的 LATEST 指针不安全，已阻止回退到旧兼容数据。",
-        )
-    pointer = _read_json_object(pointer_path)
-    if (
-        not isinstance(pointer, dict)
-        or pointer.get("schema_version") != 2
-        or pointer.get("dataset_id") != dataset_id
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 的 LATEST 指针缺失或损坏，已阻止回退到旧兼容数据。",
-        )
-
-    snapshot_id = entry.get("snapshot_id")
-    manifest_sha256 = entry.get("snapshot_manifest_sha256")
-    if (
-        not isinstance(snapshot_id, str)
-        or not snapshot_id
-        or Path(snapshot_id).name != snapshot_id
-        or snapshot_id in {".", ".."}
-        or not isinstance(manifest_sha256, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
-        or snapshot_id != pointer.get("snapshot_id")
-        or manifest_sha256 != pointer.get("manifest_sha256")
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照标识或清单哈希不一致，已阻止回退到旧兼容数据。",
-        )
-
-    expected_snapshot_path = dataset_root / "snapshots" / snapshot_id
-    if pointer.get("snapshot_path") != expected_snapshot_path.as_posix():
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照指针指向了错误的数据集目录，已阻止使用。",
-        )
-    provider_path = _safe_manifest_path(root, expected_snapshot_path.as_posix())
-    if provider_path is None or _manifest_path_contains_symlink(
-        root, expected_snapshot_path
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照路径不安全，已阻止使用。",
-        )
-    if not _is_trusted_qlib_provider_path(provider_path):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照目录不完整，已阻止使用。",
-        )
-
-    dataset_manifest_path = provider_path / "DATASET_MANIFEST.json"
-    if dataset_manifest_path.is_symlink() or not dataset_manifest_path.is_file():
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照缺少可信的数据集清单，已阻止使用。",
-        )
-    dataset_manifest, dataset_manifest_bytes = _read_json_object_bytes(
-        dataset_manifest_path
-    )
-    actual_manifest_sha256 = (
-        hashlib.sha256(dataset_manifest_bytes).hexdigest()
-        if dataset_manifest_bytes is not None
-        else None
-    )
-    if actual_manifest_sha256 != manifest_sha256:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。",
-        )
     try:
-        validated_manifest = _validate_native_qlib_snapshot_cached(
-            provider_path,
-            manifest_sha256=manifest_sha256,
-            evidence_root=root,
+        provider_name = _provider_name_for_request(dataset_id, provider)
+        provider_uri = qlib_workflow_provider_uri(provider_name)
+        return _resolution_from_provider_uri(
+            provider_uri,
+            provider_name=provider_name,
         )
-    except (DataContractError, OSError, UnicodeError, TypeError, ValueError):
+    except (
+        FileNotFoundError,
+        OSError,
+        RunProvenanceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        provider_name = (
+            str(provider or "canonical").strip().lower()
+            if str(provider or "canonical").strip().lower() in QLIB_PROVIDER_NAMES
+            else "canonical"
+        )
+        logger.warning("Qlib Provider resolution failed: %s", exc)
         return _NativeQlibProviderResolution(
             authoritative=True,
-            error="原生 V2 快照完整性校验失败，已阻止回退到旧兼容数据。",
+            provider_name=provider_name,
+            error="Qlib Provider 不可用：quant_data 数据后端未通过完整性校验。",
         )
-    if entry.get("content_sha256") != dataset_manifest.get("content_sha256"):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 根清单与快照的内容哈希不一致，已阻止使用。",
-        )
-    if (
-        not isinstance(dataset_manifest, dict)
-        or dataset_manifest != validated_manifest
-        or dataset_manifest.get("dataset_id") != dataset_id
-        or dataset_manifest.get("snapshot_id") != snapshot_id
-        or dataset_manifest.get("role") != "canonical"
-        or dataset_manifest.get("status") != "ready"
-        or dataset_manifest.get("price_basis") != "qfq"
-        or entry.get("upstream_snapshots", [])
-        != dataset_manifest.get("upstream_snapshots", [])
-        or entry.get("dependency_snapshots", [])
-        != dataset_manifest.get("dependency_snapshots", [])
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            error="原生 V2 快照清单校验失败，已阻止回退到旧兼容数据。",
-        )
-    lineage = [
-        *dataset_manifest.get("upstream_snapshots", []),
-        *dataset_manifest.get("dependency_snapshots", []),
-    ]
-    for upstream in lineage:
-        upstream_entry = (
-            datasets.get(upstream.get("dataset_id"))
-            if isinstance(upstream, dict) and isinstance(datasets, dict)
-            else None
-        )
-        if not isinstance(upstream_entry, dict) or upstream_entry.get(
-            "status"
-        ) != "ready":
-            return _NativeQlibProviderResolution(
-                authoritative=True,
-                error="原生 V2 上游数据已失效，当前训练入口已阻断。",
-            )
-        if any(
-            upstream.get(field) != upstream_entry.get(field)
-            for field in ("snapshot_id", "content_sha256", "price_basis")
-        ):
-            return _NativeQlibProviderResolution(
-                authoritative=True,
-                error="原生 V2 上游快照已变化，当前训练入口已阻断。",
-            )
-    return _NativeQlibProviderResolution(
-        authoritative=True,
-        path=provider_path,
-        dataset_id=dataset_id,
-        snapshot_id=snapshot_id,
-        manifest_sha256=manifest_sha256,
-        content_sha256=str(dataset_manifest.get("content_sha256") or ""),
-        calendar_end=(
-            str(dataset_manifest["latest_trade_date"])
-            if isinstance(dataset_manifest.get("latest_trade_date"), str)
-            else None
-        ),
-    )
 
 
 def _current_native_provider_identities(
@@ -2726,76 +2344,40 @@ def _current_native_provider_identities(
     requested_resolution: _NativeQlibProviderResolution,
     requested_provider: str = "canonical",
 ) -> Dict[str, Dict[str, Any]]:
+    requested_name = _provider_name_for_request(
+        requested_dataset_id,
+        requested_provider,
+    )
     identities: Dict[str, Dict[str, Any]] = {}
-    if requested_dataset_id == ASHARE_DAILY_QFQ_DATASET_ID:
-        for provider_key in DIRECT_PROVIDER_KEYS:
-            resolution = (
-                requested_resolution
-                if provider_key == requested_provider
-                else _resolve_native_qlib_provider(
-                    ASHARE_DAILY_QFQ_DATASET_ID,
-                    provider=provider_key,
-                )
-            )
-            identity: Dict[str, Any] = {
-                "provider": provider_key,
-                "provider_contract": DIRECT_PROVIDER_CONTRACT,
-                "dataset_id": ASHARE_DAILY_QFQ_DATASET_ID,
-                "status": "ready" if resolution.path is not None else "blocked",
-                "cleaning_mode": provider_key,
-            }
-            for field in (
-                "snapshot_id",
-                "manifest_sha256",
-                "content_sha256",
-                "calendar_end",
-                "descriptor_sha256",
-                "index_dataset_id",
-                "index_snapshot_id",
-                "index_content_sha256",
-                "index_manifest_sha256",
-            ):
-                value = getattr(resolution, field)
-                if isinstance(value, str) and value:
-                    identity[field] = value
-            if resolution.descriptor_path is not None:
-                try:
-                    identity["descriptor_path"] = resolution.descriptor_path.resolve().relative_to(
-                        _resolve_for_boundary(QUANT_DATA_ROOT)
-                    ).as_posix()
-                except ValueError:
-                    identity["descriptor_path"] = ""
-            if resolution.error:
-                identity["error"] = resolution.error
-            identities[provider_key] = identity
-        return identities
-
-    for dataset_id, provider_key in NATIVE_QLIB_DATA_CONTRACT_KEYS.items():
+    for provider_name in QLIB_PROVIDER_NAMES:
         resolution = (
             requested_resolution
-            if dataset_id == requested_dataset_id
-            else _resolve_native_qlib_provider(dataset_id)
+            if provider_name == requested_name
+            else _resolve_native_qlib_provider(provider=provider_name)
         )
-        if not resolution.authoritative:
-            continue
         identity: Dict[str, Any] = {
-            "provider": provider_key,
-            "dataset_id": dataset_id,
+            "provider": provider_name,
             "status": "ready" if resolution.path is not None else "blocked",
+            "calendar_end": resolution.calendar_end,
+            "instruments": resolution.instrument_count,
+            "benchmark_complete": resolution.benchmark_complete,
         }
-        if resolution.dataset_id == dataset_id:
-            for field in (
-                "snapshot_id",
-                "manifest_sha256",
-                "content_sha256",
-                "calendar_end",
-            ):
-                value = getattr(resolution, field)
-                if isinstance(value, str) and value:
-                    identity[field] = value
+        identity.update(_resolution_common_identity(resolution))
+        lineage = _resolution_lineage(resolution)
+        if lineage is not None:
+            identity["lineage_sha256"] = hashlib.sha256(
+                json.dumps(
+                    lineage,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
         if resolution.error:
             identity["error"] = resolution.error
-        identities[provider_key] = identity
+        identities[provider_name] = {
+            key: value for key, value in identity.items() if value is not None
+        }
     return identities
 
 
@@ -2826,107 +2408,29 @@ def _annotate_provider_quality_evidence_current(
         )
 
 
-def _direct_resolution_identity(
-    resolution: _NativeQlibProviderResolution,
-) -> Optional[Dict[str, str]]:
-    if resolution.provider_contract != DIRECT_PROVIDER_CONTRACT:
-        return None
-    if resolution.descriptor_path is None:
+def _saved_provider_lineage(payload: Mapping[str, Any]) -> Optional[Dict[str, str]]:
+    raw_identity = payload.get("provider_identity")
+    if not isinstance(raw_identity, Mapping):
         return None
     try:
-        descriptor_path = resolution.descriptor_path.resolve().relative_to(
-            _resolve_for_boundary(QUANT_DATA_ROOT)
-        ).as_posix()
-    except ValueError:
+        return normalize_provider_lineage(raw_identity)
+    except RunProvenanceError:
         return None
-    values = {
-        "provider_contract": DIRECT_PROVIDER_CONTRACT,
-        "dataset_id": resolution.dataset_id or "",
-        "snapshot_id": resolution.snapshot_id or "",
-        "manifest_sha256": resolution.manifest_sha256 or "",
-        "content_sha256": resolution.content_sha256 or "",
-        "descriptor_path": descriptor_path,
-        "descriptor_sha256": resolution.descriptor_sha256 or "",
-        "cleaning_mode": resolution.cleaning_mode or "",
-        "index_dataset_id": resolution.index_dataset_id or "",
-        "index_snapshot_id": resolution.index_snapshot_id or "",
-        "index_content_sha256": resolution.index_content_sha256 or "",
-        "index_manifest_sha256": resolution.index_manifest_sha256 or "",
-    }
-    if any(not value for value in values.values()):
-        return None
-    return values
 
 
-def _saved_direct_provider_identity(
-    payload: Dict[str, Any],
-) -> Optional[Dict[str, str]]:
-    raw_identity = payload.get("provider_identity")
-    if not isinstance(raw_identity, dict):
-        return None
-    if raw_identity.get("provider_contract") != DIRECT_PROVIDER_CONTRACT:
-        return None
-    identity = {field: raw_identity.get(field) for field in DIRECT_PROVIDER_IDENTITY_FIELDS}
-    descriptor_path = identity.get("descriptor_path")
-    index_snapshot_id = identity.get("index_snapshot_id")
-    if (
-        identity.get("dataset_id") != ASHARE_DAILY_QFQ_DATASET_ID
-        or identity.get("index_dataset_id") != DIRECT_PROVIDER_INDEX_DATASET_ID
-        or not isinstance(descriptor_path, str)
-        or not descriptor_path
-        or Path(descriptor_path).is_absolute()
-        or ".." in Path(descriptor_path).parts
-        or not isinstance(index_snapshot_id, str)
-        or Path(index_snapshot_id).name != index_snapshot_id
-        or index_snapshot_id in {".", ".."}
-        or identity.get("cleaning_mode") not in DIRECT_PROVIDER_KEYS
-        or any(
-            not isinstance(identity.get(field), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", str(identity.get(field)))
-            for field in (
-                "manifest_sha256",
-                "content_sha256",
-                "descriptor_sha256",
-                "index_content_sha256",
-                "index_manifest_sha256",
-            )
-        )
-        or not isinstance(identity.get("snapshot_id"), str)
-        or not identity.get("snapshot_id")
-        or Path(str(identity.get("snapshot_id"))).name
-        != identity.get("snapshot_id")
-    ):
-        return None
-    return {field: str(identity[field]) for field in DIRECT_PROVIDER_IDENTITY_FIELDS}
-
-
-def _saved_provider_identity(
-    payload: Dict[str, Any],
-) -> Optional[tuple[str, str, str, str]]:
-    raw_identity = payload.get("provider_identity")
-    if not isinstance(raw_identity, dict):
-        return None
-    identity = raw_identity
-    provider_contract = identity.get("provider_contract")
-    dataset_id = identity.get("dataset_id")
-    snapshot_id = identity.get("snapshot_id")
-    content_sha256 = identity.get("content_sha256")
-    manifest_sha256 = identity.get("manifest_sha256") or identity.get(
-        "snapshot_manifest_sha256"
+def _lineage_matches_resolution(
+    lineage: Mapping[str, Any] | None,
+    resolution: _NativeQlibProviderResolution,
+) -> bool:
+    current = _resolution_lineage(resolution)
+    if current is not None:
+        return provider_lineages_match(lineage, current)
+    if not isinstance(lineage, Mapping):
+        return False
+    expected = _resolution_common_identity(resolution)
+    return len(expected) == 4 and all(
+        lineage.get(field) == value for field, value in expected.items()
     )
-    if (
-        provider_contract != "immutable_snapshot_v2"
-        or not isinstance(dataset_id, str)
-        or not dataset_id
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
-        or not isinstance(manifest_sha256, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
-        or not isinstance(content_sha256, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", content_sha256)
-    ):
-        return None
-    return dataset_id, snapshot_id, content_sha256, manifest_sha256
 
 
 def _annotate_saved_provider(
@@ -2938,276 +2442,92 @@ def _annotate_saved_provider(
     if not resolution.authoritative:
         return
 
-    if resolution.provider_contract == DIRECT_PROVIDER_CONTRACT:
-        direct_identity = _saved_direct_provider_identity(payload)
-        target_resolution = _current_provider_resolution_for_payload(payload, resolution)
-        if target_resolution.path is None:
-            payload["provider_current"] = False
-            payload["provider_status"] = "catalog_invalid"
-            payload["provider_warning"] = target_resolution.error
-            return
-        expected_identity = _direct_resolution_identity(target_resolution)
-        if direct_identity is not None and expected_identity is not None:
-            current = direct_identity == expected_identity
-            payload["provider_current"] = current
-            payload["provider_status"] = "current_direct_parquet" if current else "stale"
-            if not current:
-                payload["provider_warning"] = (
-                    f"{artifact_label}记录的直读 Parquet 快照身份与当前正式 Provider 不一致，"
-                    "只能作为历史结果。"
-                )
-            return
-        provider_uri = payload.get("provider_uri") or payload.get("qlib_provider")
-        path_points_to_current = False
-        if isinstance(provider_uri, str) and provider_uri.strip():
-            path_points_to_current = (
-                _resolve_for_boundary(Path(provider_uri).expanduser())
-                == _resolve_for_boundary(target_resolution.path)
-            )
-        payload["provider_current"] = False
-        payload["provider_status"] = "unknown" if path_points_to_current else "stale"
-        payload["provider_warning"] = (
-            f"{artifact_label}没有完整记录直读 Provider 身份，无法证明它使用了当前正式 Parquet 快照。"
-        )
-        return
-
-    identity = _saved_provider_identity(payload)
     target_resolution = _current_provider_resolution_for_payload(payload, resolution)
-
     if target_resolution.path is None:
         payload["provider_current"] = False
         payload["provider_status"] = "catalog_invalid"
-        payload["provider_warning"] = target_resolution.error
+        payload["provider_warning"] = (
+            target_resolution.error or "当前 Qlib Provider 无法验证。"
+        )
         return
 
-    expected_identity = (
-        target_resolution.dataset_id,
-        target_resolution.snapshot_id,
-        target_resolution.content_sha256,
-        target_resolution.manifest_sha256,
-    )
-    if identity is not None:
-        current = identity == expected_identity
+    lineage = _saved_provider_lineage(payload)
+    if lineage is not None:
+        current = _lineage_matches_resolution(lineage, target_resolution)
         payload["provider_current"] = current
-        payload["provider_status"] = "current_native_v2" if current else "stale"
+        payload["provider_status"] = "current" if current else "stale"
         if not current:
             payload["provider_warning"] = (
-                f"{artifact_label}记录的不可变快照身份与当前原生 V2 不一致，"
+                f"{artifact_label}记录的 Qlib Provider 血缘与当前数据后端不一致，"
                 "只能作为历史结果。"
             )
+        else:
+            payload.pop("provider_warning", None)
         return
 
     provider_uri = payload.get("provider_uri") or payload.get("qlib_provider")
-    path_points_to_current = False
-    if isinstance(provider_uri, str) and provider_uri.strip():
-        path_points_to_current = (
-            _resolve_for_boundary(Path(provider_uri).expanduser())
-            == _resolve_for_boundary(target_resolution.path)
-        )
+    path_points_to_current = bool(
+        isinstance(provider_uri, str)
+        and provider_uri.strip()
+        and _resolve_for_boundary(Path(provider_uri).expanduser())
+        == _resolve_for_boundary(target_resolution.path)
+    )
     payload["provider_current"] = False
     payload["provider_status"] = "unknown" if path_points_to_current else "stale"
-    if path_points_to_current:
-        payload["provider_warning"] = (
-            f"{artifact_label}只记录了可变路径，没有记录数据集、快照和清单哈希，"
-            "无法证明它使用了当前原生 V2 数据。"
-        )
-    else:
-        payload["provider_warning"] = (
-            f"{artifact_label}使用的 provider 不是当前原生 V2 数据，"
-            "只能作为历史结果。"
-        )
+    payload["provider_warning"] = (
+        f"{artifact_label}没有记录完整的 Qlib Provider 血缘，"
+        "无法证明它使用了当前 quant_data 数据后端。"
+    )
 
 
 def _current_provider_resolution_for_payload(
-    payload: Dict[str, Any],
+    payload: Mapping[str, Any],
     fallback: _NativeQlibProviderResolution,
 ) -> _NativeQlibProviderResolution:
-    direct_identity = _saved_direct_provider_identity(payload)
-    if direct_identity is not None:
-        provider = direct_identity.get("cleaning_mode") or "canonical"
-        if (
-            fallback.provider_contract == DIRECT_PROVIDER_CONTRACT
-            and fallback.cleaning_mode == provider
-        ):
-            return fallback
-        return _resolve_native_qlib_provider(
-            ASHARE_DAILY_QFQ_DATASET_ID,
-            provider=provider,
-        )
-
-    identity = _saved_provider_identity(payload)
-    if identity is None or identity[0] not in NATIVE_QLIB_DATASET_ROOTS:
+    raw_provider = str(payload.get("provider") or fallback.provider_name or "canonical")
+    provider_name = raw_provider.strip().lower()
+    if provider_name not in QLIB_PROVIDER_NAMES:
+        provider_name = fallback.provider_name
+    if provider_name == fallback.provider_name:
         return fallback
-    if identity[0] == fallback.dataset_id:
-        return fallback
-    return _resolve_native_qlib_provider(identity[0])
+    return _resolve_native_qlib_provider(provider=provider_name)
 
 
-def _resolve_saved_native_qlib_snapshot(
-    identity: tuple[str, str, str, str],
+def _resolve_saved_provider(
+    lineage: Mapping[str, Any],
+    *,
+    provider_name: str,
 ) -> _NativeQlibProviderResolution:
-    dataset_id, snapshot_id, content_sha256, manifest_sha256 = identity
-    dataset_root = NATIVE_QLIB_DATASET_ROOTS.get(dataset_id)
-    if dataset_root is None:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练结果记录了不受支持的原生 V2 数据集。",
+    try:
+        normalized = normalize_provider_lineage(lineage)
+        provider_uri = resolve_immutable_provider_identity(
+            normalized,
+            quant_data_root=QUANT_DATA_ROOT,
         )
-    root = _resolve_for_boundary(QUANT_DATA_ROOT)
-    relative_snapshot = dataset_root / "snapshots" / snapshot_id
-    provider_path = _safe_manifest_path(root, relative_snapshot.as_posix())
-    if provider_path is None or _manifest_path_contains_symlink(
-        root, relative_snapshot
+        resolution = _resolution_from_provider_uri(
+            provider_uri,
+            provider_name=provider_name,
+        )
+        if not provider_lineages_match(normalized, resolution.lineage):
+            raise RunProvenanceError("Qlib Provider lineage changed.")
+        return resolution
+    except (
+        FileNotFoundError,
+        OSError,
+        RunProvenanceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
     ):
         return _NativeQlibProviderResolution(
             authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练结果记录的原生 V2 历史快照路径不安全。",
-        )
-    if not _is_trusted_qlib_provider_path(provider_path):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练使用的原生 V2 历史快照已不存在或目录不完整。",
-        )
-    manifest_path = provider_path / "DATASET_MANIFEST.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练使用的原生 V2 历史快照缺少可信清单。",
-        )
-    manifest, manifest_bytes = _read_json_object_bytes(manifest_path)
-    actual_manifest_sha256 = (
-        hashlib.sha256(manifest_bytes).hexdigest()
-        if manifest_bytes is not None
-        else None
-    )
-    if actual_manifest_sha256 != manifest_sha256:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练使用的原生 V2 历史快照清单哈希不一致。",
-        )
-    try:
-        validated_manifest = _validate_native_qlib_snapshot_cached(
-            provider_path,
-            manifest_sha256=manifest_sha256,
-            evidence_root=root,
-        )
-    except (DataContractError, OSError, UnicodeError, TypeError, ValueError):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练使用的原生 V2 历史快照完整性校验失败。",
-        )
-    if (
-        not isinstance(manifest, dict)
-        or manifest != validated_manifest
-        or manifest.get("dataset_id") != dataset_id
-        or manifest.get("snapshot_id") != snapshot_id
-        or manifest.get("content_sha256") != content_sha256
-        or manifest.get("role") != "canonical"
-        or manifest.get("status") != "ready"
-        or manifest.get("price_basis") != "qfq"
-    ):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=dataset_id,
-            snapshot_id=snapshot_id,
-            error="训练使用的原生 V2 历史快照身份校验失败。",
-        )
-    return _NativeQlibProviderResolution(
-        authoritative=True,
-        path=provider_path,
-        dataset_id=dataset_id,
-        snapshot_id=snapshot_id,
-        content_sha256=content_sha256,
-        manifest_sha256=manifest_sha256,
-    )
-
-
-def _resolve_saved_direct_provider(
-    identity: Mapping[str, str],
-) -> _NativeQlibProviderResolution:
-    root = _resolve_for_boundary(QUANT_DATA_ROOT)
-    relative_descriptor = Path(str(identity.get("descriptor_path") or ""))
-    descriptor_path = _safe_manifest_path(root, relative_descriptor)
-    if descriptor_path is None or _manifest_path_contains_symlink(root, relative_descriptor):
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            snapshot_id=identity.get("snapshot_id"),
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            cleaning_mode=identity.get("cleaning_mode"),
-            error="训练使用的直读 Provider 描述文件路径不安全。",
-        )
-    if not descriptor_path.is_file() or descriptor_path.name != "PROVIDER_DESCRIPTOR.json":
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            snapshot_id=identity.get("snapshot_id"),
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            cleaning_mode=identity.get("cleaning_mode"),
-            error="训练使用的直读 Provider 描述文件不存在。",
-        )
-    try:
-        context = _load_descriptor(descriptor_path, root)
-        descriptor_sha256 = hashlib.sha256(descriptor_path.read_bytes()).hexdigest()
-        dataset = context.descriptor.get("dataset") or {}
-        index = context.descriptor.get("index_dataset") or {}
-        actual = {
-            "provider_contract": DIRECT_PROVIDER_CONTRACT,
-            "dataset_id": str(dataset.get("dataset_id") or ""),
-            "snapshot_id": str(dataset.get("snapshot_id") or ""),
-            "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
-            "content_sha256": str(dataset.get("content_sha256") or ""),
-            "descriptor_path": relative_descriptor.as_posix(),
-            "descriptor_sha256": descriptor_sha256,
-            "cleaning_mode": str((context.cleaning or {}).get("mode") or ""),
-            "index_dataset_id": str(index.get("dataset_id") or ""),
-            "index_snapshot_id": str(index.get("snapshot_id") or ""),
-            "index_content_sha256": str(index.get("content_sha256") or ""),
-            "index_manifest_sha256": str(index.get("manifest_sha256") or ""),
-        }
-        if any(actual.get(field) != identity.get(field) for field in DIRECT_PROVIDER_IDENTITY_FIELDS):
-            raise DirectProviderError("直读 Provider 身份哈希与描述文件不一致")
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            path=descriptor_path.parent,
-            dataset_id=actual["dataset_id"],
-            snapshot_id=actual["snapshot_id"],
-            manifest_sha256=actual["manifest_sha256"],
-            content_sha256=actual["content_sha256"],
-            calendar_end=(
-                context.calendar[-1].date().isoformat()
-                if len(context.calendar)
+            provider_name=provider_name,
+            lineage=(
+                dict(lineage)
+                if provider_lineage_is_complete(lineage)
                 else None
             ),
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            descriptor_path=descriptor_path,
-            descriptor_sha256=actual["descriptor_sha256"],
-            cleaning_mode=actual["cleaning_mode"],
-            index_dataset_id=actual["index_dataset_id"],
-            index_snapshot_id=actual["index_snapshot_id"],
-            index_content_sha256=actual["index_content_sha256"],
-            index_manifest_sha256=actual["index_manifest_sha256"],
-        )
-    except (DirectProviderError, OSError, UnicodeError, ValueError, KeyError) as exc:
-        return _NativeQlibProviderResolution(
-            authoritative=True,
-            dataset_id=ASHARE_DAILY_QFQ_DATASET_ID,
-            snapshot_id=identity.get("snapshot_id"),
-            provider_contract=DIRECT_PROVIDER_CONTRACT,
-            cleaning_mode=identity.get("cleaning_mode"),
-            error=f"训练使用的直读 Provider 无法校验：{exc}",
+            error="历史 Qlib Provider 血缘无法验证。",
         )
 
 
@@ -3215,127 +2535,71 @@ def _saved_provider_resolution_for_payload(
     payload: Dict[str, Any],
     fallback: _NativeQlibProviderResolution,
 ) -> _NativeQlibProviderResolution:
-    direct_identity = _saved_direct_provider_identity(payload)
-    if direct_identity is not None:
-        current = _current_provider_resolution_for_payload(payload, fallback)
-        current_identity = _direct_resolution_identity(current)
-        if current.path is not None and current_identity == direct_identity:
-            return current
-        return _resolve_saved_direct_provider(direct_identity)
-
-    identity = _saved_provider_identity(payload)
-    if identity is None:
-        return _current_provider_resolution_for_payload(payload, fallback)
     current = _current_provider_resolution_for_payload(payload, fallback)
-    current_identity = (
-        current.dataset_id,
-        current.snapshot_id,
-        current.content_sha256,
-        current.manifest_sha256,
-    )
-    if current.path is not None and identity == current_identity:
+    lineage = _saved_provider_lineage(payload)
+    if lineage is None:
+        return _NativeQlibProviderResolution(
+            authoritative=True,
+            provider_name=current.provider_name,
+            error="历史结果没有完整的 Qlib Provider 血缘。",
+        )
+    if current.path is not None and _lineage_matches_resolution(lineage, current):
         return current
-    return _resolve_saved_native_qlib_snapshot(identity)
+    return _resolve_saved_provider(
+        lineage,
+        provider_name=current.provider_name,
+    )
 
 
 def _annotate_provider_payload(
     payload: Dict[str, Any],
     native_resolution: Optional[_NativeQlibProviderResolution] = None,
 ) -> None:
-    """Describe whether a saved report used the current native provider."""
-
     resolution = native_resolution or _resolve_native_qlib_provider(
-        ASHARE_DAILY_QFQ_DATASET_ID,
-        provider="canonical",
+        provider="canonical"
     )
     _annotate_saved_provider(payload, resolution, artifact_label="候选报告")
 
 
 def _qlib_provider_from_path(path: Path) -> Dict[str, Any]:
-    direct_descriptor = (
-        path if path.name == "PROVIDER_DESCRIPTOR.json" else path / "PROVIDER_DESCRIPTOR.json"
-    )
-    if direct_descriptor.is_file():
-        try:
-            context = _load_descriptor(direct_descriptor, QUANT_DATA_ROOT)
-            dataset = context.descriptor.get("dataset") or {}
-            index = context.descriptor.get("index_dataset") or {}
-            cleaning = context.descriptor.get("cleaning") or {}
-            symbols = context.file_index["symbol"].astype(str)
-            descriptor_sha256 = hashlib.sha256(direct_descriptor.read_bytes()).hexdigest()
-            try:
-                descriptor_display_path = direct_descriptor.resolve().relative_to(
-                    _resolve_for_boundary(QUANT_DATA_ROOT)
-                ).as_posix()
-            except ValueError:
-                descriptor_display_path = ""
-            provider: Dict[str, Any] = {
-                "path": str(direct_descriptor.parent),
-                "descriptor_path": descriptor_display_path,
-                "storage_mode": "direct_parquet",
-                "provider_contract": DIRECT_PROVIDER_CONTRACT,
-                "dataset_id": dataset.get("dataset_id"),
-                "snapshot_id": dataset.get("snapshot_id"),
-                "manifest_sha256": dataset.get("manifest_sha256"),
-                "content_sha256": dataset.get("content_sha256"),
-                "descriptor_sha256": descriptor_sha256,
-                "cleaning_mode": cleaning.get("mode") or "canonical",
-                "index_dataset_id": index.get("dataset_id"),
-                "index_snapshot_id": index.get("snapshot_id"),
-                "index_content_sha256": index.get("content_sha256"),
-                "index_manifest_sha256": index.get("manifest_sha256"),
-                "calendar_days": len(context.calendar),
-                "instruments": int(symbols.nunique()),
-                "feature_dirs": int(symbols.nunique()),
-                "benchmark_complete": set(
-                    context.index_file_index["symbol"].astype(str)
-                )
-                >= set((index.get("required_symbols") or []))
-                if context.index_file_index is not None
-                else False,
-                "calendar_range": (
-                    f"{context.calendar[0].date().isoformat()} ~ "
-                    f"{context.calendar[-1].date().isoformat()}"
-                    if len(context.calendar)
-                    else ""
-                ),
-                "size_mb": _directory_size_mb(context.snapshot_path),
-            }
-            return {key: value for key, value in provider.items() if value is not None}
-        except (DirectProviderError, OSError, UnicodeError, ValueError, KeyError):
-            return {"path": str(direct_descriptor.parent), "storage_mode": "direct_parquet"}
-
-    provider: Dict[str, Any] = {"path": str(path)}
-    calendar_path = path / "calendars" / "day.txt"
-    instruments_path = path / "instruments" / "all.txt"
-    features_path = path / "features"
-
+    provider_uri = Path(path).expanduser()
+    provider: Dict[str, Any] = {"path": str(provider_uri)}
     try:
-        if calendar_path.exists():
-            calendar_days = [
-                line.strip()
-                for line in calendar_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            provider["calendar_days"] = len(calendar_days)
-            if calendar_days:
-                provider["calendar_range"] = f"{calendar_days[0]} ~ {calendar_days[-1]}"
-        if instruments_path.exists():
-            provider["instruments"] = sum(
-                1
-                for line in instruments_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            )
-        if features_path.exists():
-            provider["feature_dirs"] = sum(
-                1 for item in features_path.iterdir() if item.is_dir()
-            )
-    except OSError:
-        return provider
-
-    size_mb = _directory_size_mb(path)
-    if size_mb is not None:
-        provider["size_mb"] = size_mb
+        calendar = provider_calendar_days(provider_uri)
+        instruments = provider_instrument_ranges(provider_uri)
+        lineage = normalize_provider_lineage(
+            provider_identity(provider_uri, quant_data_root=QUANT_DATA_ROOT)
+        )
+        provider.update(
+            {
+                "dataset_id": lineage["dataset_id"],
+                "snapshot_id": lineage["snapshot_id"],
+                "manifest_sha256": lineage["manifest_sha256"],
+                "content_sha256": lineage["content_sha256"],
+                "calendar_days": len(calendar),
+                "instruments": len(instruments),
+                "feature_dirs": len(instruments),
+                "benchmark_complete": provider_has_instrument_pool(
+                    provider_uri,
+                    "csi300",
+                ),
+                "calendar_range": (
+                    f"{calendar[0]} ~ {calendar[-1]}" if calendar else ""
+                ),
+            }
+        )
+    except (
+        FileNotFoundError,
+        OSError,
+        RunProvenanceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        provider["status"] = "blocked"
+        provider["provider_error"] = (
+            sanitize_public_error(str(exc)) or "Qlib Provider 无法验证。"
+        )
     return provider
 
 
@@ -3343,8 +2607,6 @@ def _annotate_latest_training_provider(
     latest_training: Dict[str, Any],
     native_resolution: _NativeQlibProviderResolution,
 ) -> None:
-    """Mark historical training evidence relative to the live native provider."""
-
     _annotate_saved_provider(
         latest_training,
         native_resolution,
@@ -3358,190 +2620,77 @@ def _sync_qlib_provider_with_latest_training(
     *,
     native_resolution: _NativeQlibProviderResolution,
 ) -> None:
-    provider_uri = latest_training.get("provider_uri") or latest_training.get("qlib_provider")
     existing = payload.get("qlib_provider")
     provider = dict(existing) if isinstance(existing, dict) else {}
     target_resolution = _saved_provider_resolution_for_payload(
         latest_training,
         native_resolution,
     )
+    saved_lineage = _saved_provider_lineage(latest_training)
 
-    if target_resolution.authoritative:
-        if target_resolution.provider_contract == DIRECT_PROVIDER_CONTRACT:
-            dataset_id = target_resolution.dataset_id or ASHARE_DAILY_QFQ_DATASET_ID
-            if target_resolution.path is None:
-                payload["latest_training_provider"] = {
-                    "dataset_id": dataset_id,
-                    "role": "canonical",
-                    "status": "blocked",
-                    "price_basis": "qfq",
-                    "provider_source": DIRECT_PROVIDER_CONTRACT,
-                    "provider_error": target_resolution.error,
-                    "provider_current": False,
-                    "provider_trusted": False,
-                }
-                provider["latest_training_provider_trusted"] = False
-                provider["latest_training_provider_current"] = False
-                payload["qlib_provider"] = provider
-                return
-
-            saved_identity = _saved_direct_provider_identity(latest_training)
-            resolved_identity = _direct_resolution_identity(target_resolution)
-            identity_trusted = (
-                saved_identity is not None
-                and resolved_identity is not None
-                and saved_identity == resolved_identity
-            )
-            training_provider = _qlib_provider_from_path(target_resolution.path)
-            training_provider.update(
-                {
-                    "dataset_id": dataset_id,
-                    "role": "canonical",
-                    "status": "ready",
-                    "price_basis": "qfq",
-                    "provider_source": (
-                        DIRECT_PROVIDER_CONTRACT
-                        if latest_training.get("provider_current") is True
-                        else "saved_direct_parquet_identity"
-                    ),
-                    "snapshot_id": target_resolution.snapshot_id,
-                    "manifest_sha256": target_resolution.manifest_sha256,
-                    "content_sha256": target_resolution.content_sha256,
-                    "provider_current": latest_training.get("provider_current") is True,
-                    "provider_trusted": identity_trusted,
-                    "cleaning_mode": target_resolution.cleaning_mode,
-                }
-            )
-            if latest_training.get("provider_current") is True:
-                provider["latest_training_provider_trusted"] = True
-                provider["latest_training_provider_current"] = True
-                provider.pop("latest_training_provider_uri", None)
-                provider.pop("provider_uri_warning", None)
-            elif identity_trusted:
-                provider["latest_training_provider_trusted"] = True
-                provider["latest_training_provider_current"] = False
-                warning = latest_training.get("provider_warning") or (
-                    "latest_training 使用的是已验证的直读 Parquet 历史快照；"
-                    "它不是当前训练入口，但可用于复现当时结果。"
-                )
-                provider["provider_uri_warning"] = warning
-                training_provider["provider_warning"] = warning
-            else:
-                provider["latest_training_provider_trusted"] = False
-                provider["latest_training_provider_current"] = False
-                warning = latest_training.get("provider_warning") or (
-                    "latest_training 无法证明使用了当前直读 Parquet Provider，"
-                    "请重新运行训练后再把该结果作为当前结果使用。"
-                )
-                provider["provider_uri_warning"] = warning
-                training_provider["provider_warning"] = warning
-            payload["latest_training_provider"] = training_provider
-            payload["qlib_provider"] = provider
-            return
-
-        dataset_id = target_resolution.dataset_id or NATIVE_QLIB_DATASET_ID
-        if target_resolution.path is None:
-            payload["latest_training_provider"] = {
-                "dataset_id": dataset_id,
-                "role": "canonical",
-                "status": "blocked",
-                "price_basis": "qfq",
-                "provider_source": "native_v2_catalog",
-                "provider_error": target_resolution.error,
-                "provider_current": False,
-                "provider_trusted": False,
-            }
-            provider["latest_training_provider_trusted"] = False
-            provider["latest_training_provider_current"] = False
-            payload["qlib_provider"] = provider
-            return
-
-        native_provider_path = target_resolution.path
-        saved_identity = _saved_provider_identity(latest_training)
-        resolved_identity = (
-            target_resolution.dataset_id,
-            target_resolution.snapshot_id,
-            target_resolution.content_sha256,
-            target_resolution.manifest_sha256,
-        )
-        identity_trusted = saved_identity is not None and saved_identity == resolved_identity
-        training_provider = _qlib_provider_from_path(native_provider_path)
-        training_provider.update(
-            {
-                "dataset_id": dataset_id,
-                "role": "canonical",
-                "status": "ready",
-                "price_basis": "qfq",
-                "provider_source": (
-                    "native_v2_catalog"
-                    if latest_training.get("provider_current") is True
-                    else "saved_immutable_v2_identity"
-                ),
-                "snapshot_id": target_resolution.snapshot_id,
-                "manifest_sha256": target_resolution.manifest_sha256,
-                "content_sha256": target_resolution.content_sha256,
-                "provider_current": latest_training.get("provider_current") is True,
-                "provider_trusted": identity_trusted,
-            }
-        )
-        if latest_training.get("provider_current") is True:
-            provider["latest_training_provider_trusted"] = True
-            provider["latest_training_provider_current"] = True
-            provider.pop("latest_training_provider_uri", None)
-            provider.pop("provider_uri_warning", None)
-        elif identity_trusted:
-            provider["latest_training_provider_trusted"] = True
-            provider["latest_training_provider_current"] = False
-            warning = latest_training.get("provider_warning") or (
-                "latest_training 使用的是已验证的原生 V2 历史快照；"
-                "它不是当前训练入口，但可用于复现当时结果。"
-            )
-            provider["provider_uri_warning"] = warning
-            training_provider["provider_warning"] = warning
-        else:
-            if isinstance(provider_uri, str) and provider_uri.strip():
-                provider["latest_training_provider_uri"] = str(
-                    Path(provider_uri).expanduser()
-                )
-            provider["latest_training_provider_trusted"] = False
-            provider["latest_training_provider_current"] = False
-            warning = latest_training.get(
-                "provider_warning"
-            ) or (
-                f"latest_training 无法证明使用了当前原生 {dataset_id}，"
-                "请重新运行训练后再把该结果作为当前结果使用。"
-            )
-            provider["provider_uri_warning"] = warning
-            training_provider["provider_warning"] = warning
-        payload["latest_training_provider"] = training_provider
-        payload["qlib_provider"] = provider
-        return
-
-    if not isinstance(provider_uri, str) or not provider_uri.strip():
-        return
-
-    provider_path = Path(provider_uri).expanduser()
-    if not _is_trusted_qlib_provider_path(provider_path):
-        provider["latest_training_provider_uri"] = str(provider_path)
-        provider["latest_training_provider_trusted"] = False
-        provider["provider_uri_warning"] = (
-            "latest_training provider_uri is outside configured Qlib provider root "
-            "or is not a concrete Qlib provider; skipped provider scan."
+    if target_resolution.path is None:
+        warning = latest_training.get("provider_warning") or (
+            target_resolution.error
+            or "latest_training 没有记录完整的 Qlib Provider 血缘，无法安全复现。"
         )
         payload["latest_training_provider"] = {
-            "path": str(provider_path),
+            "status": "blocked",
+            "provider_source": "Qlib Provider",
+            "provider_error": target_resolution.error,
             "provider_current": False,
             "provider_trusted": False,
-            "provider_warning": provider["provider_uri_warning"],
+            "provider_warning": warning,
         }
+        provider["latest_training_provider_trusted"] = False
+        provider["latest_training_provider_current"] = False
+        provider["provider_uri_warning"] = warning
         payload["qlib_provider"] = provider
         return
 
-    training_provider = _qlib_provider_from_path(provider_path)
-    training_provider["provider_current"] = False
-    training_provider["provider_trusted"] = True
-    provider["latest_training_provider_trusted"] = True
-    provider["latest_training_provider_current"] = False
+    training_provider = _qlib_provider_from_path(target_resolution.path)
+    identity_trusted = bool(
+        saved_lineage is not None
+        and _lineage_matches_resolution(saved_lineage, target_resolution)
+    )
+    provider_current = bool(
+        latest_training.get("provider_current") is True
+        and _lineage_matches_resolution(saved_lineage, target_resolution)
+    )
+    training_provider.update(
+        {
+            "role": "canonical",
+            "status": "ready",
+            "price_basis": "qfq",
+            "provider_source": (
+                "Qlib Provider"
+                if provider_current
+                else "historical Qlib Provider"
+            ),
+            "provider_current": provider_current,
+            "provider_trusted": identity_trusted,
+        }
+    )
+    provider["latest_training_provider_trusted"] = identity_trusted
+    provider["latest_training_provider_current"] = provider_current
+
+    if provider_current:
+        provider.pop("latest_training_provider_uri", None)
+        provider.pop("provider_uri_warning", None)
+    elif identity_trusted:
+        warning = latest_training.get("provider_warning") or (
+            "latest_training 使用的是已验证的历史 Qlib Provider 血缘；"
+            "它不是当前训练入口，但可用于复现当时结果。"
+        )
+        provider["provider_uri_warning"] = warning
+        training_provider["provider_warning"] = warning
+    else:
+        warning = latest_training.get("provider_warning") or (
+            "latest_training 无法证明使用了当前 Qlib Provider，"
+            "请重新运行训练后再把该结果作为当前结果使用。"
+        )
+        provider["provider_uri_warning"] = warning
+        training_provider["provider_warning"] = warning
+
     payload["latest_training_provider"] = training_provider
     payload["qlib_provider"] = provider
 
@@ -4555,6 +3704,30 @@ def _acceptance_checklist_payload() -> list[Dict[str, Any]]:
     ]
 
 
+def _provider_status_payload(
+    resolution: _NativeQlibProviderResolution,
+) -> Dict[str, Any]:
+    if resolution.path is None:
+        return {
+            "provider": resolution.provider_name,
+            "role": "canonical",
+            "status": "blocked",
+            "price_basis": "qfq",
+            "provider_source": "Qlib Provider",
+            "provider_error": resolution.error,
+        }
+    payload = {
+        **_qlib_provider_from_path(resolution.path),
+        "provider": resolution.provider_name,
+        "role": "canonical",
+        "status": "ready",
+        "price_basis": "qfq",
+        "provider_source": "Qlib Provider",
+    }
+    payload.update(_resolution_common_identity(resolution))
+    return payload
+
+
 def _missing_status_payload(
     provider_dataset_id: str = ASHARE_DAILY_QFQ_DATASET_ID,
     provider: str = "canonical",
@@ -4570,27 +3743,7 @@ def _missing_status_payload(
         _annotate_latest_training_provider(latest_training, native_resolution)
     qlib_provider = None
     if native_resolution.authoritative:
-        if native_resolution.path is not None:
-            qlib_provider = {
-                **_qlib_provider_from_path(native_resolution.path),
-                "dataset_id": provider_dataset_id,
-                "role": "canonical",
-                "status": "ready",
-                "price_basis": "qfq",
-                "provider_source": DIRECT_PROVIDER_CONTRACT,
-                "snapshot_id": native_resolution.snapshot_id,
-                "manifest_sha256": native_resolution.manifest_sha256,
-                "content_sha256": native_resolution.content_sha256,
-            }
-        else:
-            qlib_provider = {
-                "dataset_id": provider_dataset_id,
-                "role": "canonical",
-                "status": "blocked",
-                "price_basis": "qfq",
-                "provider_source": DIRECT_PROVIDER_CONTRACT,
-                "provider_error": native_resolution.error,
-            }
+        qlib_provider = _provider_status_payload(native_resolution)
     training_readiness = {
         "status": "missing",
         "summary": "Research status artifact is not available yet. Run quant_workflow/scripts/report_data_quality.py first.",
@@ -4837,46 +3990,9 @@ def build_research_status_payload(
     reports_dir = RESEARCH_STATUS_PATH.parent
     _apply_data_quality_training_gate(payload, reports_dir, native_resolution)
     if native_resolution.path is not None:
-        provider_payload = {
-            **_qlib_provider_from_path(native_resolution.path),
-            "dataset_id": native_resolution.dataset_id or provider_dataset_id,
-            "role": "canonical",
-            "status": "ready",
-            "price_basis": "qfq",
-            "snapshot_id": native_resolution.snapshot_id,
-            "manifest_sha256": native_resolution.manifest_sha256,
-            "content_sha256": native_resolution.content_sha256,
-        }
-        if native_resolution.provider_contract == DIRECT_PROVIDER_CONTRACT:
-            provider_payload.update(
-                {
-                    "provider_contract": DIRECT_PROVIDER_CONTRACT,
-                    "provider": provider,
-                    "provider_source": DIRECT_PROVIDER_CONTRACT,
-                    "cleaning_mode": native_resolution.cleaning_mode,
-                }
-            )
-        else:
-            provider_payload.update(
-                {
-                    "provider_contract": "immutable_snapshot_v2",
-                    "provider_source": "native_v2_catalog",
-                }
-            )
-        payload["qlib_provider"] = provider_payload
+        payload["qlib_provider"] = _provider_status_payload(native_resolution)
     elif native_resolution.authoritative:
-        payload["qlib_provider"] = {
-            "dataset_id": provider_dataset_id,
-            "role": "canonical",
-            "status": "blocked",
-            "price_basis": "qfq",
-            "provider_source": (
-                DIRECT_PROVIDER_CONTRACT
-                if native_resolution.provider_contract == DIRECT_PROVIDER_CONTRACT
-                else "native_v2_catalog"
-            ),
-            "provider_error": native_resolution.error,
-        }
+        payload["qlib_provider"] = _provider_status_payload(native_resolution)
         payload["trainable"] = False
         payload["training_readiness"] = {
             "status": "blocked",

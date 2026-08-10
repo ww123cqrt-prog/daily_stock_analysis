@@ -27,9 +27,9 @@ from _paths import (  # noqa: E402
     china_astock_root,
     mlruns_root,
     provider_calendar_days,
+    provider_has_instrument_pool,
     provider_instrument_ranges,
-    qlib_init_config_for_uri,
-    qlib_native_snapshot_uri,
+    qlib_workflow_init_config,
     qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
@@ -37,9 +37,9 @@ from _paths import (  # noqa: E402
 )
 from _mlflow_run_provenance import (  # noqa: E402
     experiment_run_ids,
+    provider_lineages_match,
     provider_identity,
     revalidate_provider_identity,
-    resolve_approved_provider_identity,
     select_new_prediction_run,
     tag_run_artifact_hashes,
     tag_run_with_provider,
@@ -100,14 +100,14 @@ def resolve_provider_uri(
             raise ValueError(
                 "snapshot_override and expected_provider_identity are mutually exclusive"
             )
-        return resolve_approved_provider_identity(
+        return qlib_workflow_provider_uri(
             name,
-            expected_provider_identity,
-            quant_data_root=QUANT_DATA,
+            expected_provider_identity=expected_provider_identity,
         )
     if snapshot_override is not None:
-        # An explicit old snapshot is retained only for replay/compatibility.
-        return qlib_native_snapshot_uri(name, snapshot_override=snapshot_override)
+        pinned = Path(snapshot_override).expanduser().resolve()
+        qlib_workflow_init_config(provider=name, provider_uri=pinned)
+        return pinned
     return qlib_workflow_provider_uri(name)
 
 
@@ -142,19 +142,13 @@ def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
 
 def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):
     """Require the immutable provider to contain its CSI300 pool."""
-    if (provider_uri / "PROVIDER_DESCRIPTOR.json").is_file():
-        ranges = load_provider_instrument_ranges(provider_uri)
-        if not ranges:
-            raise FileNotFoundError("Direct Provider has no instruments")
+    if provider_has_instrument_pool(provider_uri, "csi300"):
         del csi300_symbols
-        return
-    instruments_path = provider_uri / "instruments" / "csi300.txt"
-    if instruments_path.exists():
         return
     del csi300_symbols
     raise FileNotFoundError(
-        "Explicit legacy Provider is missing instruments/csi300.txt; use the formal "
-        "direct Parquet Provider, or rebuild legacy data only for an approved replay"
+        "The formal Qlib Provider has no CSI300 instruments; republish and validate "
+        "the quant_data backend before training"
     )
 
 
@@ -170,17 +164,12 @@ def write_runtime_config_with_provider(
 
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
-    if provider_uri.exists():
-        qlib_init.update(
-            qlib_init_config_for_uri(
-                provider_uri,
-                provider=provider_name,
-            )
+    qlib_init.update(
+        qlib_workflow_init_config(
+            provider=provider_name,
+            provider_uri=provider_uri,
         )
-    else:
-        # Keep unit-test and dry-run placeholders readable; real existing
-        # legacy paths fail closed through qlib_init_config_for_uri above.
-        qlib_init["provider_uri"] = str(provider_uri)
+    )
     payload["qlib_init"] = qlib_init
     if extend_dates_to_provider_latest:
         calendar_tail = provider_calendar_tail(provider_uri)
@@ -988,7 +977,7 @@ def main():
         "--provider-uri",
         type=Path,
         default=None,
-        help="Pin one already selected immutable native V2 snapshot for this run",
+        help="Pin one already selected Qlib Provider for this run",
     )
     parser.add_argument(
         "--provider-identity-json",
@@ -1067,11 +1056,17 @@ def main():
         )
         if not provider_uri.exists():
             raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
-        training_provider_identity = (
-            dict(expected_provider_identity)
-            if expected_provider_identity is not None
-            else provider_identity(provider_uri, quant_data_root=QUANT_DATA)
+        training_provider_identity = provider_identity(
+            provider_uri,
+            quant_data_root=QUANT_DATA,
         )
+        if expected_provider_identity is not None and not provider_lineages_match(
+            training_provider_identity,
+            expected_provider_identity,
+        ):
+            raise RuntimeError(
+                "The selected Qlib Provider no longer matches the approved lineage."
+            )
     except Exception as exc:
         print(f"[error] {exc}")
         sys.exit(1)

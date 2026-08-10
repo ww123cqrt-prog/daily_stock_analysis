@@ -548,13 +548,13 @@ def main() -> int:
 
     if not args.dry_run and args.cleaned_merged_dir is None:
         parser.error(
-            "--cleaned-merged-dir is required for mutable legacy output; "
-            "use build_cleaned_qlib_v2.py --publish for native V2"
+            "--cleaned-merged-dir is required for mutable compatibility output; "
+            "use the governed quant_data Qlib Provider publishing workflow"
         )
     if not args.dry_run and not args.skip_qlib_convert and args.qlib_dir is None:
         parser.error(
-            "--qlib-dir is required for mutable legacy output; "
-            "use build_cleaned_qlib_v2.py --publish for native V2"
+            "--qlib-dir is required for mutable compatibility output; "
+            "use the governed quant_data Qlib Provider publishing workflow"
         )
 
     overwrite = not args.no_overwrite

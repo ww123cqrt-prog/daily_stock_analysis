@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
-import numpy as np
 import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -21,6 +19,7 @@ from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
 )
+from _paths import init_qlib_workflow, provider_calendar_days  # noqa: E402
 
 
 def _symbol_file(price_dir: Path, symbol: str) -> Path | None:
@@ -292,24 +291,36 @@ def load_market_panel(
 
 def read_qlib_feature(provider: Path, symbol: str, field: str) -> pd.Series:
     provider = Path(provider)
-    calendar_path = provider / "calendars" / "day.txt"
-    feature_path = provider / "features" / str(symbol).lower() / f"{field}.day.bin"
-    if not calendar_path.is_file() or not feature_path.is_file():
-        raise FileNotFoundError(f"Qlib feature is missing: {feature_path}")
-    calendar = pd.DatetimeIndex(
-        pd.to_datetime(
-            calendar_path.read_text(encoding="utf-8").splitlines(), errors="coerce"
-        )
+    calendar = provider_calendar_days(provider)
+    if not calendar:
+        raise FileNotFoundError("Qlib Provider calendar is unavailable")
+    init_qlib_workflow(provider_uri=provider)
+
+    from qlib.data import D
+
+    qlib_field = f"${str(field).lstrip('$')}"
+    frame = D.features(
+        [str(symbol).upper()],
+        [qlib_field],
+        start_time=calendar[0],
+        end_time=calendar[-1],
+        freq="day",
     )
-    raw = np.fromfile(feature_path, dtype="<f4")
-    if len(raw) < 2 or not math.isfinite(float(raw[0])):
-        raise ValueError(f"invalid Qlib binary feature: {feature_path}")
-    start = int(raw[0])
-    values = raw[1:]
-    end = start + len(values)
-    if start < 0 or end > len(calendar):
-        raise ValueError(f"Qlib feature offset is outside calendar: {feature_path}")
-    return pd.Series(values.astype(float), index=calendar[start:end], name=field)
+    if not isinstance(frame, pd.DataFrame) or qlib_field not in frame.columns:
+        raise FileNotFoundError(
+            f"Qlib Provider feature is unavailable: {symbol} {qlib_field}"
+        )
+    if isinstance(frame.index, pd.MultiIndex):
+        level = "datetime" if "datetime" in frame.index.names else frame.index.nlevels - 1
+        dates = pd.DatetimeIndex(
+            pd.to_datetime(frame.index.get_level_values(level), errors="coerce")
+        )
+    else:
+        dates = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
+    if dates.hasnans or dates.duplicated().any():
+        raise ValueError(f"Qlib Provider feature dates are invalid: {symbol} {qlib_field}")
+    values = pd.to_numeric(frame[qlib_field], errors="coerce").to_numpy(dtype=float)
+    return pd.Series(values, index=dates, name=str(field).lstrip("$"))
 
 
 def load_benchmark_frame(

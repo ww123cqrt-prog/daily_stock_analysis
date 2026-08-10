@@ -207,13 +207,13 @@ class AppCorsConfigTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"], "csrf_forbidden")
 
-    def test_cross_origin_alphasift_mutation_is_rejected_even_when_cors_is_open(self):
+    def test_cross_origin_screening_mutation_is_rejected_even_when_cors_is_open(self):
         with patch.dict(os.environ, {"CORS_ALLOW_ALL": "true", "DSA_BIND_HOST": "127.0.0.1"}, clear=False), \
              patch("api.app.is_auth_enabled", return_value=False), \
              patch("api.middlewares.auth.is_auth_enabled", return_value=False):
             client = TestClient(self._build_app())
             resp = client.post(
-                "/api/v1/alphasift/screen",
+                "/api/v1/screening/screen",
                 headers={"Origin": "https://evil.example"},
                 json={"strategy": "dual_low", "market": "cn", "maxResults": 10},
             )

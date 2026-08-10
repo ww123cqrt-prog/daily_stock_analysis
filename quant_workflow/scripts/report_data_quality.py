@@ -24,11 +24,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import (  # noqa: E402
-    qlib_workflow_provider_descriptor,
     qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
     workflow_root,
+)
+from _mlflow_run_provenance import (  # noqa: E402
+    normalize_provider_lineage,
+    provider_identity,
+    provider_lineages_match,
 )
 from _symbols import normalize_symbol  # noqa: E402
 from quant_data_contract import (  # noqa: E402
@@ -122,29 +126,6 @@ def native_dataset_identity(resolved) -> dict[str, str]:
     }
 
 
-def direct_provider_identity(descriptor: Path, quant_data_root_path: Path) -> dict[str, str]:
-    payload = json.loads(Path(descriptor).read_text(encoding="utf-8"))
-    dataset = payload.get("dataset") or {}
-    index = payload.get("index_dataset") or {}
-    cleaning = payload.get("cleaning") or {}
-    descriptor = Path(descriptor).resolve()
-    root = Path(quant_data_root_path).resolve()
-    return {
-        "provider_contract": "direct_parquet_v1",
-        "dataset_id": str(dataset.get("dataset_id") or ""),
-        "snapshot_id": str(dataset.get("snapshot_id") or ""),
-        "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
-        "content_sha256": str(dataset.get("content_sha256") or ""),
-        "descriptor_path": descriptor.relative_to(root).as_posix(),
-        "descriptor_sha256": hashlib.sha256(descriptor.read_bytes()).hexdigest(),
-        "cleaning_mode": str(cleaning.get("mode") or ""),
-        "index_dataset_id": str(index.get("dataset_id") or ""),
-        "index_snapshot_id": str(index.get("snapshot_id") or ""),
-        "index_content_sha256": str(index.get("content_sha256") or ""),
-        "index_manifest_sha256": str(index.get("manifest_sha256") or ""),
-    }
-
-
 def build_quality_data_contract(
     *,
     ashare_resolution,
@@ -157,9 +138,9 @@ def build_quality_data_contract(
     contract = {
         "status": "unverified" if has_path_override else "verified",
         "reason": (
-            "Explicit data path overrides are diagnostic only and are not proof of the current formal Parquet/direct Provider snapshot."
+            "Explicit data path overrides are diagnostic only and are not proof of the current quant_data/Qlib Provider snapshots."
             if has_path_override
-            else "Resolved from the current formal Parquet snapshots and immutable LATEST pointers; Qlib reads them through the direct Provider descriptor."
+            else "Resolved from the current immutable quant_data snapshots through the Qlib Provider."
         ),
     }
     if ashare_resolution is not None:
@@ -262,12 +243,12 @@ def bind_snapshot_state(
     data_contract["status"] = "unverified"
     if content_revalidation_status == "failed":
         data_contract["reason"] = (
-            "Formal Parquet/direct Provider snapshot content could not be revalidated after the "
+            "The quant_data snapshot content could not be revalidated after the "
             "data-quality scan."
         )
     elif fingerprint_failed:
         data_contract["reason"] = (
-            "Formal Parquet/direct Provider snapshot filesystem state could not be verified across the "
+            "The quant_data snapshot filesystem state could not be verified across the "
             "data-quality scan."
         )
     elif content_revalidation_status == "skipped_sampled":
@@ -277,8 +258,27 @@ def bind_snapshot_state(
         )
     else:
         data_contract["reason"] = (
-            "Formal Parquet/direct Provider snapshot filesystem state changed during the data-quality scan."
+            "The quant_data snapshot filesystem state changed during the data-quality scan."
         )
+
+
+def bind_provider_lineage_state(
+    data_contract: dict,
+    *,
+    expected: dict[str, dict[str, str]],
+    refreshed: dict[str, dict[str, str]],
+) -> None:
+    stable = set(expected) == set(refreshed) and all(
+        provider_lineages_match(refreshed.get(provider), identity)
+        for provider, identity in expected.items()
+    )
+    data_contract["provider_lineage_state"] = {"stable": stable}
+    if stable:
+        return
+    data_contract["status"] = "unverified"
+    data_contract["reason"] = (
+        "Qlib Provider lineage changed or could not be revalidated during the data-quality scan."
+    )
 
 
 def read_json_list(path: Path) -> list[str]:
@@ -831,15 +831,20 @@ def benchmark_feature_stats(provider_dir: Path, calendar: list[str]) -> dict:
     }
 
 
-def qlib_provider_stats(provider_dir: Path | None = None) -> dict:
+def qlib_provider_stats(
+    provider_dir: Path | None = None,
+    *,
+    compatibility: bool = False,
+) -> dict:
     provider_dir = Path(provider_dir or qlib_workflow_provider_uri())
-    descriptor = (
-        provider_dir
-        if provider_dir.name == "PROVIDER_DESCRIPTOR.json"
-        else provider_dir / "PROVIDER_DESCRIPTOR.json"
-    )
-    if descriptor.is_file():
-        return direct_qlib_provider_stats(provider_dir)
+    if compatibility:
+        return legacy_qlib_provider_stats(provider_dir)
+    return formal_qlib_provider_stats(provider_dir)
+
+
+def legacy_qlib_provider_stats(provider_dir: Path) -> dict:
+    """Audit an explicitly requested historical binary Provider."""
+
     cal = provider_dir / "calendars" / "day.txt"
     inst = provider_dir / "instruments" / "all.txt"
     calendar_lines, calendar_issues = _read_qlib_calendar(cal)
@@ -980,14 +985,8 @@ def qlib_provider_stats(provider_dir: Path | None = None) -> dict:
     }
 
 
-def direct_qlib_provider_stats(provider_dir: Path) -> dict:
-    """Validate the metadata and frozen Parquet view used by the direct Provider.
-
-    Direct mode has no per-field ``.bin`` files.  The descriptor and its frozen
-    file indexes prove the storage identity; the existing full bar scan proves
-    row-level quality.  The returned keys intentionally match the old report
-    shape so the readiness rules remain shared.
-    """
+def formal_qlib_provider_stats(provider_dir: Path) -> dict:
+    """Validate the formal Qlib Provider selected by the workflow facade."""
 
     from quant_workflow.quant_data_qlib_provider import (
         _load_descriptor,
@@ -1000,8 +999,13 @@ def direct_qlib_provider_stats(provider_dir: Path) -> dict:
         if provider_dir.name == "PROVIDER_DESCRIPTOR.json"
         else provider_dir / "PROVIDER_DESCRIPTOR.json"
     )
-    root = discover_quant_data_root(descriptor)
-    context = _load_descriptor(descriptor, root)
+    try:
+        root = discover_quant_data_root(descriptor)
+        context = _load_descriptor(descriptor, root)
+    except Exception as exc:
+        raise RuntimeError(
+            "Qlib Provider is unavailable or failed its integrity check"
+        ) from exc
     cleaning = context.cleaning
     excluded = set(cleaning.get("plan", {}).get("excluded_symbols", []))
     instrument_index = context.file_index[
@@ -1009,7 +1013,7 @@ def direct_qlib_provider_stats(provider_dir: Path) -> dict:
     ].copy()
     calendar = [value.date().isoformat() for value in context.calendar]
     instrument_names = set(instrument_index["symbol"].astype(str))
-    benchmark_stats = direct_benchmark_feature_stats(context, calendar)
+    benchmark_stats = provider_benchmark_feature_stats(context, calendar)
     complete = len(instrument_names)
     return {
         "calendar_valid": True,
@@ -1046,7 +1050,7 @@ def direct_qlib_provider_stats(provider_dir: Path) -> dict:
     }
 
 
-def direct_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
+def provider_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
     required = tuple(
         context.descriptor.get("index_dataset", {}).get("required_symbols")
         or BENCHMARK_SYMBOLS
@@ -1054,7 +1058,7 @@ def direct_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
     details: dict[str, dict[str, Any]] = {}
     first_observations: list[str] = []
     total_missing_days = 0
-    direct_fields = ("open", "high", "low", "close", "volume")
+    provider_fields = ("open", "high", "low", "close", "volume")
     index_frame = context.index_file_index
     index_snapshot = context.index_snapshot_path
     for symbol in required:
@@ -1071,7 +1075,7 @@ def direct_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
             if len(matches) == 1:
                 row = matches.iloc[0]
         if row is None or index_snapshot is None:
-            detail["missing_fields"] = list(direct_fields)
+            detail["missing_fields"] = list(provider_fields)
             details[symbol] = detail
             continue
         path = index_snapshot / str(row["relative_path"])
@@ -1080,16 +1084,18 @@ def direct_benchmark_feature_stats(context: Any, calendar: list[str]) -> dict:
             frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
             frame = frame.dropna(subset=["date"]).drop_duplicates("date").sort_values("date")
         except Exception:
-            detail["missing_fields"] = list(direct_fields)
+            detail["missing_fields"] = list(provider_fields)
             details[symbol] = detail
             continue
         if frame.empty:
-            detail["missing_fields"] = list(direct_fields)
+            detail["missing_fields"] = list(provider_fields)
             details[symbol] = detail
             continue
         detail["first_observation"] = frame["date"].iloc[0].date().isoformat()
         first_observations.append(detail["first_observation"])
-        missing_fields = [field for field in direct_fields if field not in frame.columns]
+        missing_fields = [
+            field for field in provider_fields if field not in frame.columns
+        ]
         detail["missing_fields"] = missing_fields
         if not missing_fields:
             tolerance = np.maximum(
@@ -1408,6 +1414,7 @@ def build_provider_quality_record(
     verification_status: str,
     verification_block_reason: str,
 ) -> dict:
+    normalized_identity = normalize_provider_lineage(identity) if identity else {}
     trainable, training_readiness = build_training_readiness(
         qlib_stats=qlib_stats,
         merged_success=merged_success,
@@ -1435,10 +1442,10 @@ def build_provider_quality_record(
 
     record = {
         "provider": provider_key,
-        "dataset_id": identity.get("dataset_id"),
-        "snapshot_id": identity.get("snapshot_id"),
-        "manifest_sha256": identity.get("manifest_sha256"),
-        "content_sha256": identity.get("content_sha256"),
+        "dataset_id": normalized_identity.get("dataset_id"),
+        "snapshot_id": normalized_identity.get("snapshot_id"),
+        "manifest_sha256": normalized_identity.get("manifest_sha256"),
+        "content_sha256": normalized_identity.get("content_sha256"),
         "calendar_valid": qlib_stats.get("calendar_valid") is True,
         "invalid_calendar_entries": int(
             qlib_stats.get("invalid_calendar_entries", 0)
@@ -1506,18 +1513,7 @@ def build_provider_quality_record(
         ),
         "training_readiness": training_readiness,
     }
-    if identity.get("provider_contract") == "direct_parquet_v1":
-        for field in (
-            "provider_contract",
-            "descriptor_path",
-            "descriptor_sha256",
-            "cleaning_mode",
-            "index_dataset_id",
-            "index_snapshot_id",
-            "index_content_sha256",
-            "index_manifest_sha256",
-        ):
-            record[field] = identity.get(field)
+    record.update(normalized_identity)
     return record
 
 
@@ -1561,7 +1557,7 @@ def write_research_status(
             training_readiness = {
                 "status": "blocked",
                 "summary": (
-                    "Data quality evidence is not bound to the current formal Parquet/direct Provider "
+                    "Data quality evidence is not bound to the current quant_data/Qlib Provider "
                     "snapshot; rerun without path overrides before training."
                 ),
             }
@@ -1715,28 +1711,34 @@ def main(argv: list[str] | None = None) -> int:
 
     qlib_resolution = None
     cleaned_qlib_resolution = None
-    direct_canonical_identity = None
-    direct_cleaned_identity = None
-    direct_index_resolution = None
+    canonical_provider_uri = None
+    cleaned_provider_uri = None
+    canonical_provider_identity = None
+    cleaned_provider_identity = None
+    index_resolution = None
     if configured_qlib_dir is not None:
         args.qlib_dir = Path(configured_qlib_dir)
     else:
-        canonical_descriptor = qlib_workflow_provider_descriptor("canonical")
-        cleaned_descriptor = qlib_workflow_provider_descriptor("cleaned")
-        direct_canonical_identity = direct_provider_identity(
-            canonical_descriptor,
-            QUANT_DATA,
+        canonical_provider_uri = qlib_workflow_provider_uri("canonical")
+        cleaned_provider_uri = qlib_workflow_provider_uri("cleaned")
+        canonical_provider_identity = normalize_provider_lineage(
+            provider_identity(
+                canonical_provider_uri,
+                quant_data_root=QUANT_DATA,
+            )
         )
-        direct_cleaned_identity = direct_provider_identity(
-            cleaned_descriptor,
-            QUANT_DATA,
+        cleaned_provider_identity = normalize_provider_lineage(
+            provider_identity(
+                cleaned_provider_uri,
+                quant_data_root=QUANT_DATA,
+            )
         )
-        direct_index_resolution = resolve_dataset(
+        index_resolution = resolve_dataset(
             "cn_index_daily",
             quant_data_root=QUANT_DATA,
             require_basis="derived",
         )
-        args.qlib_dir = canonical_descriptor.parent
+        args.qlib_dir = canonical_provider_uri
 
     bars_source_name = "merged" if configured_legacy_dir else "ashare_daily_qfq"
     data_contract = build_quality_data_contract(
@@ -1744,14 +1746,14 @@ def main(argv: list[str] | None = None) -> int:
         canonical_qlib_resolution=qlib_resolution,
         cleaned_qlib_resolution=cleaned_qlib_resolution,
         has_path_override=has_path_override,
-        canonical_qlib_identity=direct_canonical_identity,
-        cleaned_qlib_identity=direct_cleaned_identity,
+        canonical_qlib_identity=canonical_provider_identity,
+        cleaned_qlib_identity=cleaned_provider_identity,
     )
     snapshot_resolutions = native_snapshot_resolutions(
         ashare_resolution,
         qlib_resolution,
         cleaned_qlib_resolution,
-        direct_index_resolution,
+        index_resolution,
     )
     snapshot_state_before: dict[str, dict] = {}
     snapshot_fingerprint_failed = False
@@ -1802,13 +1804,16 @@ def main(argv: list[str] | None = None) -> int:
     overlap.to_csv(overlap_csv, index=False)
 
     qlib_stats_by_provider = {
-        "canonical": qlib_provider_stats(args.qlib_dir),
+        "canonical": qlib_provider_stats(
+            args.qlib_dir,
+            compatibility=configured_qlib_dir is not None,
+        ),
     }
-    if cleaned_qlib_resolution is not None or direct_cleaned_identity is not None:
+    if cleaned_qlib_resolution is not None or cleaned_provider_identity is not None:
         qlib_stats_by_provider["cleaned"] = qlib_provider_stats(
             cleaned_qlib_resolution.snapshot_path
             if cleaned_qlib_resolution is not None
-            else qlib_workflow_provider_descriptor("cleaned").parent
+            else cleaned_provider_uri
         )
     qlib_stats = qlib_stats_by_provider["canonical"]
     bs_success = load_source_index(BAOSTOCK_DIR)
@@ -1846,6 +1851,28 @@ def main(argv: list[str] | None = None) -> int:
             after_revalidation=snapshot_state_after_revalidation,
             fingerprint_failed=snapshot_fingerprint_failed,
             content_revalidation_status=snapshot_content_revalidation_status,
+        )
+        expected_provider_identities = dict(
+            data_contract.get("qlib_providers") or {}
+        )
+        refreshed_provider_identities: dict[str, dict[str, str]] = {}
+        try:
+            for provider_key in expected_provider_identities:
+                refreshed_uri = qlib_workflow_provider_uri(provider_key)
+                refreshed_provider_identities[provider_key] = (
+                    normalize_provider_lineage(
+                        provider_identity(
+                            refreshed_uri,
+                            quant_data_root=QUANT_DATA,
+                        )
+                    )
+                )
+        except (RuntimeError, OSError, TypeError, ValueError):
+            refreshed_provider_identities = {}
+        bind_provider_lineage_state(
+            data_contract,
+            expected=expected_provider_identities,
+            refreshed=refreshed_provider_identities,
         )
 
     missing_success = sorted(stock_set - merged_success)
@@ -1909,11 +1936,11 @@ def main(argv: list[str] | None = None) -> int:
     elif data_contract["status"] != "verified":
         verification_block_reason = (
             f"{data_contract['reason']} Rerun the full data quality report after "
-            "the formal Parquet/direct Provider snapshots are stable."
+            "the quant_data snapshots and Qlib Provider are stable."
         )
     else:
         verification_block_reason = (
-            "Data quality evidence is not bound to the current formal Parquet/direct Provider "
+            "Data quality evidence is not bound to the current quant_data/Qlib Provider "
             "snapshot; rerun without path overrides before training."
         )
     provider_identities = data_contract.get("qlib_providers") or {}
@@ -2000,7 +2027,7 @@ Generated: {generated_at.strftime("%Y-%m-%d %H:%M:%S")}
 - Minimum instruments used: {training_thresholds["min_instruments"]}
 - Thresholds authoritative: {training_thresholds["authoritative"]}
 
-## Formal Parquet / Direct Qlib Provider Contract
+## quant_data / Qlib Provider Contract
 
 - Contract status: {data_contract["status"]}
 - Contract reason: {data_contract["reason"]}
@@ -2019,9 +2046,9 @@ Generated: {generated_at.strftime("%Y-%m-%d %H:%M:%S")}
 
 ## Source Coverage
 
-`ashare_daily_qfq` is the canonical immutable Parquet input. Qlib reads it through
-the metadata-only direct Provider; rows marked `audit` are retained for source
-comparison only, and `legacy` is a compatibility output.
+`ashare_daily_qfq` is the canonical immutable Parquet input exposed through the
+Qlib Provider. Rows marked `audit` are retained for source comparison only, and
+`legacy` is a compatibility output.
 
 {markdown_table(rows, ["source", "role", "files", "rows", "date_range", "size_mb"])}
 
