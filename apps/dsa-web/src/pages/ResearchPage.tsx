@@ -165,7 +165,7 @@ const RESEARCH_TEXT = {
     backHome: '回到首页',
     statusTitle: '服务状态',
     dataStatusTitle: '数据状态',
-    dataStatusDescription: '正式训练和回测读取 quant_data 原生 V2 快照；旧采集目录只保留作审计或兼容。',
+    dataStatusDescription: '正式训练和回测读取 quant_data 数据后端提供的 Qlib Provider；旧采集目录只保留作审计或兼容。',
     canonicalSourceLabel: '正式快照',
     auditSourceLabel: '审计来源',
     legacySourceLabel: '兼容输出',
@@ -213,9 +213,9 @@ const RESEARCH_TEXT = {
     notTrainable: '暂不可训练',
     generatedAt: '生成时间',
     qlibProviderTitle: 'Qlib 数据集',
-    qlibNativeV2Label: '当前正式入口：原生 V2',
-    qlibNativeV2BlockedLabel: '原生 V2 已阻断',
-    qlibNativeV2BlockedFallback: '原生 V2 数据清单未通过校验，当前不能训练。',
+    qlibProviderLabel: '当前正式入口：Qlib Provider',
+    qlibProviderBlockedLabel: 'Qlib Provider 已阻断',
+    qlibProviderBlockedFallback: 'Qlib Provider 完整性校验未通过，当前不能训练。',
     latestTrainingTitle: '最近训练结果',
     noTrainingResult: '还没有训练结果',
     experimentNotebookTitle: '实验记录本',
@@ -255,9 +255,9 @@ const RESEARCH_TEXT = {
     developmentActionLabel: '下一步动作',
     developmentVerificationLabel: '验收口径',
     experimentComparisonTitle: '清洗对比',
-    experimentComparisonDescription: '同一 baseline 在原生 canonical V2 和原生 cleaned V2 上的核心回测指标。',
+    experimentComparisonDescription: '同一 baseline 在 canonical 和 cleaned Qlib Provider 上的核心回测指标。',
     cleanedDataLabel: '清洗后数据',
-    canonicalDataLabel: '原生 V2 数据',
+    canonicalDataLabel: 'canonical Qlib Provider',
     comparisonMetricLabel: '扣成本年化超额收益',
     comparisonDeltaLabel: '差值',
     comparisonNoData: '需要至少一条 cleaned 和一条 canonical 实验记录后才能生成对比。',
@@ -300,7 +300,7 @@ const RESEARCH_TEXT = {
     portNote: 'DSA 跟随当前访问地址；本机 8000 可能被其他服务占用。',
     statusItems: [
       { label: 'DSA 服务', value: '当前页面', detail: '本地 WebUI', tone: 'success' },
-      { label: '数据源', value: 'quant_data 原生 V2', detail: '清单解析的不可变正式快照', tone: 'success' },
+      { label: '数据源', value: 'Qlib Provider', detail: 'quant_data 数据后端提供的不可变血缘', tone: 'success' },
       { label: 'MLflow', value: '实验记录', detail: '/experiments/（状态见工作流页）', tone: 'info' },
       { label: '端口', value: '跟随当前访问地址', detail: '不硬编码 8000', tone: 'warning' },
     ] satisfies StatusItem[],
@@ -431,7 +431,7 @@ const RESEARCH_TEXT = {
     backHome: 'Back home',
     statusTitle: 'Service Status',
     dataStatusTitle: 'Data Status',
-    dataStatusDescription: 'Training and backtests use native V2 snapshots from quant_data; legacy source directories remain audit or compatibility inputs only.',
+    dataStatusDescription: 'Training and backtests use the Qlib Provider from the quant_data backend; legacy source directories remain audit or compatibility inputs only.',
     canonicalSourceLabel: 'Canonical snapshot',
     auditSourceLabel: 'Audit source',
     legacySourceLabel: 'Compatibility output',
@@ -479,9 +479,9 @@ const RESEARCH_TEXT = {
     notTrainable: 'Not trainable yet',
     generatedAt: 'Generated',
     qlibProviderTitle: 'Qlib Provider',
-    qlibNativeV2Label: 'Current official entry: Native V2',
-    qlibNativeV2BlockedLabel: 'Native V2 blocked',
-    qlibNativeV2BlockedFallback: 'The native V2 data catalog failed validation, so training is blocked.',
+    qlibProviderLabel: 'Current official entry: Qlib Provider',
+    qlibProviderBlockedLabel: 'Qlib Provider blocked',
+    qlibProviderBlockedFallback: 'Qlib Provider integrity validation failed, so training is blocked.',
     latestTrainingTitle: 'Latest Training Result',
     noTrainingResult: 'No training result yet',
     experimentNotebookTitle: 'Experiment Notebook',
@@ -521,9 +521,9 @@ const RESEARCH_TEXT = {
     developmentActionLabel: 'Next action',
     developmentVerificationLabel: 'Verification',
     experimentComparisonTitle: 'Cleaned vs Canonical',
-    experimentComparisonDescription: 'Core backtest metric for the same baseline on native canonical V2 versus native cleaned V2.',
+    experimentComparisonDescription: 'Core backtest metric for the same baseline on canonical versus cleaned Qlib Provider.',
     cleanedDataLabel: 'Cleaned data',
-    canonicalDataLabel: 'Native V2 data',
+    canonicalDataLabel: 'canonical Qlib Provider',
     comparisonMetricLabel: 'Annualized excess return with cost',
     comparisonDeltaLabel: 'Delta',
     comparisonNoData: 'At least one cleaned run and one canonical run are required for comparison.',
@@ -566,7 +566,7 @@ const RESEARCH_TEXT = {
     portNote: 'DSA follows the current browser address; local port 8000 may belong to another service.',
     statusItems: [
       { label: 'DSA service', value: 'Current page', detail: 'Local WebUI', tone: 'success' },
-      { label: 'Data source', value: 'quant_data native V2', detail: 'Immutable snapshot resolved from the catalog', tone: 'success' },
+      { label: 'Data source', value: 'Qlib Provider', detail: 'Immutable lineage supplied by the quant_data backend', tone: 'success' },
       { label: 'MLflow', value: 'Experiment tracking', detail: '/experiments/ (status on Workflow)', tone: 'info' },
       { label: 'Port', value: 'Current browser address', detail: 'No hard-coded 8000', tone: 'warning' },
     ] satisfies StatusItem[],
@@ -1306,16 +1306,14 @@ const ResearchPage: React.FC = () => {
 
             <div className="rounded-xl border border-border/70 bg-surface/60 p-3">
               <h3 className="text-sm font-semibold text-foreground">{text.qlibProviderTitle}</h3>
-              {researchStatus?.qlibProvider?.providerSource === 'native_v2_catalog'
-              && researchStatus.qlibProvider.status === 'ready' ? (
+              {researchStatus?.qlibProvider?.status === 'ready' ? (
                 <Badge variant="success" size="sm" className="mt-2 w-fit">
-                  {text.qlibNativeV2Label}
+                  {text.qlibProviderLabel}
                 </Badge>
               ) : null}
-              {researchStatus?.qlibProvider?.providerSource === 'native_v2_catalog'
-              && researchStatus.qlibProvider.status === 'blocked' ? (
+              {researchStatus?.qlibProvider?.status === 'blocked' ? (
                 <Badge variant="warning" size="sm" className="mt-2 w-fit">
-                  {text.qlibNativeV2BlockedLabel}
+                  {text.qlibProviderBlockedLabel}
                 </Badge>
               ) : null}
               <dl className="mt-3 space-y-2 text-xs text-secondary-text">
@@ -1332,8 +1330,8 @@ const ResearchPage: React.FC = () => {
               {researchStatus?.qlibProvider?.status === 'blocked' ? (
                 <p className="mt-3 rounded-lg border border-warning/30 bg-warning/10 p-2 text-xs leading-5 text-warning">
                   {language === 'zh'
-                    ? (researchStatus.qlibProvider.providerError ?? text.qlibNativeV2BlockedFallback)
-                    : text.qlibNativeV2BlockedFallback}
+                    ? (researchStatus.qlibProvider.providerError ?? text.qlibProviderBlockedFallback)
+                    : text.qlibProviderBlockedFallback}
                 </p>
               ) : null}
             </div>

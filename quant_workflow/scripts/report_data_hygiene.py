@@ -780,9 +780,9 @@ def generate_data_hygiene_reports(
             snapshot,
             "official",
             (
-                f"原生 V2 正式快照 {entry['dataset_id']}"
+                f"正式 Qlib Provider 快照 {entry['dataset_id']}"
                 if immutable
-                else f"原生 V2 正式参考数据 {entry['dataset_id']}"
+                else f"正式 quant_data 参考数据 {entry['dataset_id']}"
             ),
             (
                 "由 DATA_MANIFEST.json 和 LATEST.json 锁定的 canonical ready 不可变快照。"
@@ -812,7 +812,7 @@ def generate_data_hygiene_reports(
             continue
         if registered and registered["role"] == "legacy":
             category = "legacy"
-            reason = "原生 V2 清单登记的兼容输出，不是正式训练入口。"
+            reason = "quant_data 清单登记的兼容输出，不是正式训练入口。"
         elif registered and registered["role"] == "audit":
             category = "candidate"
             reason = "旧采集审计来源，只用于核对，不是正式训练入口。"
@@ -838,7 +838,7 @@ def generate_data_hygiene_reports(
             continue
         if registered and registered["role"] == "legacy":
             category = "legacy"
-            reason = "原生 V2 清单登记的兼容 provider，不是正式训练入口。"
+            reason = "quant_data 清单登记的兼容 Qlib Provider，不是正式训练入口。"
         elif registered and registered["role"] == "audit":
             category = "candidate"
             reason = "旧审计 provider，只用于核对，不是正式训练入口。"
@@ -862,7 +862,7 @@ def generate_data_hygiene_reports(
                 items,
                 path,
                 "do_not_touch",
-                "原生 V2 数据目录说明/清单",
+                "quant_data 数据目录说明/清单",
                 "解析正式快照和维护数据契约所需，不能归档或移动。",
             )
             continue
@@ -897,7 +897,7 @@ def generate_data_hygiene_reports(
         "keep",
         quant_data / "DATA_MANIFEST.json",
         None,
-        "原生 V2 根清单，保持原路径。",
+        "quant_data 根清单，保持原路径。",
         "移动会使所有按清单解析的消费者停止工作。",
         False,
     )
@@ -909,9 +909,9 @@ def generate_data_hygiene_reports(
             entry["snapshot_path"],
             None,
             (
-                f"原生 V2 正式快照 {entry['dataset_id']}，保持不可变。"
+                f"正式 Qlib Provider 快照 {entry['dataset_id']}，保持不可变。"
                 if immutable
-                else f"原生 V2 正式参考数据 {entry['dataset_id']}，保持原路径。"
+                else f"正式 quant_data 参考数据 {entry['dataset_id']}，保持原路径。"
             ),
             (
                 "移动或修改会使 LATEST 指针和清单哈希失效。"

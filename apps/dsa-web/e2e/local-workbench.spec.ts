@@ -935,7 +935,7 @@ test('data page can launch a Qlib provider repair dry run from the browser', asy
     await openWorkbench(page, '/data');
     await expect(page.getByRole('heading', { name: '数据更新与检查' })).toBeVisible();
     await expect(page.getByRole('heading', { name: '预演旧兼容 Qlib 修复' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('只检查保留的旧兼容目录；网页端固定 dry-run，不影响原生 V2。')).toBeVisible();
+    await expect(page.getByText('只检查保留的旧兼容目录；网页端固定 dry-run，不影响正式 Qlib Provider。')).toBeVisible();
 
     const responsePromise = page.waitForResponse(
       (response) => response.url().includes('/api/v1/quant/jobs') && response.request().method() === 'POST',

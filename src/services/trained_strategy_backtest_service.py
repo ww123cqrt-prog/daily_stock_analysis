@@ -17,8 +17,12 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from quant_workflow.scripts._optimized_strategy_core import OptimizedStrategy
+from quant_workflow.scripts._paths import init_qlib_workflow
 from quant_workflow.scripts._mlflow_run_provenance import (
     RunProvenanceError,
+    normalize_provider_lineage,
+    provider_lineage_is_complete,
+    provider_lineages_match,
     resolve_immutable_provider_identity,
     validate_file_store_run_artifact,
 )
@@ -53,13 +57,6 @@ MarketLoader = Callable[[Path, str, str], pd.DataFrame]
 ProviderResolver = Callable[[dict[str, Any], Path], Path]
 ArtifactValidator = Callable[..., dict[str, Any]]
 QlibBacktestRunner = Callable[[Path, dict[str, Any], pd.DataFrame], pd.DataFrame]
-PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "content_sha256",
-    "manifest_sha256",
-)
 LEGACY_BASELINE_STRATEGY = {
     "id": "baseline_daily",
     "label": "每日 TopK 等权基线（旧版）",
@@ -110,10 +107,9 @@ def _default_market_loader(provider_uri: Path, start: str, end: str) -> pd.DataF
     if not provider_uri.is_dir():
         raise FileNotFoundError("The Qlib data provider used by this training run is unavailable")
 
-    import qlib
     from qlib.data import D
 
-    qlib.init(provider_uri=str(provider_uri), region="cn")
+    init_qlib_workflow(provider_uri=provider_uri)
     buffered_end = (pd.Timestamp(end) + pd.Timedelta(days=14)).date().isoformat()
     raw = D.features(["SH000300"], ["$close"], start_time=start, end_time=buffered_end)
     if raw.empty:
@@ -138,10 +134,9 @@ def _default_qlib_backtest_runner(
 ) -> pd.DataFrame:
     """Run the frozen Qlib portfolio configuration against saved predictions."""
 
-    import qlib
     from qlib.backtest import backtest as qlib_backtest
 
-    qlib.init(provider_uri=str(provider_uri), region="cn")
+    init_qlib_workflow(provider_uri=provider_uri)
     config = copy.deepcopy(portana_config)
     strategy = config["strategy"]
     strategy["kwargs"]["signal"] = pred
@@ -208,11 +203,10 @@ def _contract_hash(payload: dict[str, Any]) -> str:
 def _sanitized_provider_identity(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    return {
-        field: str(value[field])
-        for field in PROVIDER_IDENTITY_FIELDS
-        if isinstance(value.get(field), str) and value.get(field)
-    }
+    try:
+        return normalize_provider_lineage(value)
+    except RunProvenanceError:
+        return {}
 
 
 def _safe_periods(value: Any) -> dict[str, list[str]]:
@@ -881,7 +875,7 @@ class TrainedStrategyBacktestService:
         original_parameters: dict[str, Any],
     ) -> dict[str, Any]:
         identity = _sanitized_provider_identity(report.get("provider_identity"))
-        provider_complete = all(identity.get(field) for field in PROVIDER_IDENTITY_FIELDS)
+        provider_complete = provider_lineage_is_complete(identity)
         artifact_hashes_complete = self._artifact_hashes_complete(
             artifact_sha256,
             CUSTOM_REPLAY_ARTIFACTS,
@@ -1369,11 +1363,14 @@ class TrainedStrategyBacktestService:
         identity = report.get("provider_identity")
         if not isinstance(identity, dict):
             raise ValueError(
-                "Training result does not record an immutable native V2 provider; "
+                "Training result does not record an immutable Qlib Provider; "
                 "rerun training before recalculating this strategy"
             )
         try:
-            return Path(self.provider_resolver(identity, self.quant_data_root)).resolve()
+            lineage = normalize_provider_lineage(identity)
+            return Path(
+                self.provider_resolver(lineage, self.quant_data_root)
+            ).resolve()
         except RunProvenanceError as exc:
             raise ValueError(
                 "Training result provider identity cannot be verified; "
@@ -1454,10 +1451,7 @@ class TrainedStrategyBacktestService:
                 f"Saved training artifact provenance cannot be verified: {filename}"
             ) from exc
         actual_identity = provenance.get("provider_identity")
-        if not isinstance(actual_identity, dict) or any(
-            actual_identity.get(field) != expected_provider_identity.get(field)
-            for field in PROVIDER_IDENTITY_FIELDS
-        ):
+        if not provider_lineages_match(actual_identity, expected_provider_identity):
             raise ValueError(
                 f"Saved training artifact does not match the training report provider: {filename}"
             )

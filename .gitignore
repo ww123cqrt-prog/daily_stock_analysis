@@ -15,6 +15,7 @@
 /.codex
 /.omo/
 /.playwright-cli/
+/.tmp
 /review.md
 /litellm_config.yaml
 /litellm_config.*.yaml
@@ -66,6 +67,8 @@ env/
 # 数据和日志
 /data/
 /quant_data/
+/.llm_usage_hmac_secret
+**/.llm_usage_hmac_secret
 logs/
 reports/
 *.db
@@ -97,4 +100,5 @@ verify_*.py
 static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
+/node_modules/
 docs/specs/

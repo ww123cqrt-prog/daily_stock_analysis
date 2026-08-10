@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -41,7 +42,7 @@ class OptimizeStrategyTest(unittest.TestCase):
                         "spec=importlib.util.spec_from_file_location('optimize_strategy', path); "
                         "module=importlib.util.module_from_spec(spec); "
                         "spec.loader.exec_module(module); "
-                        "print(json.dumps({'data_dir': str(module.DATA_DIR)}))"
+                        "print(json.dumps({'data_dir': str(module.resolve_data_dir())}))"
                     ),
                 ],
                 env=env,
@@ -65,11 +66,16 @@ class OptimizeStrategyTest(unittest.TestCase):
             )
             provider = root / "native-snapshot"
 
-            runtime = module.write_training_config_with_provider(
-                source,
-                provider,
-                output_dir=root / "runtime-configs",
-            )
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value={"provider_uri": str(provider)},
+            ):
+                runtime = module.write_training_config_with_provider(
+                    source,
+                    provider,
+                    output_dir=root / "runtime-configs",
+                )
 
             payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
             self.assertEqual(payload["qlib_init"]["provider_uri"], str(provider))

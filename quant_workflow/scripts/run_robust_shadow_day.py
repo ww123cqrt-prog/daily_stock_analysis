@@ -20,10 +20,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
-from prepare_robust_provider import (  # noqa: E402
-    PROVIDER_FORMAT_VERSION,
-    prepare_runtime_provider,
+from _paths import (  # noqa: E402
+    QlibProviderHistoryError,
+    init_qlib_workflow,
+    qlib_workflow_provider_uri,
+    quant_data_root,
+    reports_root,
 )
 from robust_backtest import simulate_strategy  # noqa: E402
 from robust_market_data import (  # noqa: E402
@@ -131,15 +133,6 @@ def _write_daily(report_dir: Path, payload: Mapping[str, Any]) -> dict[str, Any]
     result = dict(payload)
     _write_json(report_dir / "shadow_daily_latest.json", result)
     return result
-
-
-def _read_provider_metadata(provider: Path) -> dict[str, Any]:
-    metadata = _read_json(Path(provider) / "ROBUST_PROVIDER.json")
-    if metadata.get("format_version") != PROVIDER_FORMAT_VERSION or not metadata.get(
-        "canonical_provider"
-    ):
-        raise ShadowBlocked("frozen_provider_metadata_invalid")
-    return metadata
 
 
 def _expected_artifact_keys(
@@ -300,63 +293,6 @@ def _validate_frozen_inputs(
     return normalized_artifacts, ensemble_path, frozen_provider
 
 
-def _file_is_prefix(prefix_path: Path, current_path: Path) -> bool:
-    try:
-        if prefix_path.stat().st_size > current_path.stat().st_size:
-            return False
-        with prefix_path.open("rb") as prefix, current_path.open("rb") as current:
-            while True:
-                expected = prefix.read(1024 * 1024)
-                if not expected:
-                    return True
-                if current.read(len(expected)) != expected:
-                    return False
-    except OSError:
-        return False
-
-
-def verify_provider_is_append_only(
-    frozen_provider: Path, current_provider: Path
-) -> None:
-    frozen_provider = Path(frozen_provider)
-    current_provider = Path(current_provider)
-    frozen_calendar = frozen_provider / "calendars" / "day.txt"
-    current_calendar = current_provider / "calendars" / "day.txt"
-    if (
-        frozen_calendar.is_symlink()
-        or current_calendar.is_symlink()
-        or not frozen_calendar.is_file()
-        or not current_calendar.is_file()
-        or not _file_is_prefix(frozen_calendar, current_calendar)
-    ):
-        raise ValueError(
-            "frozen provider calendar is not a byte prefix of the current calendar"
-        )
-    frozen_features = frozen_provider / "features"
-    current_features = current_provider / "features"
-    if (
-        frozen_features.is_symlink()
-        or current_features.is_symlink()
-        or not frozen_features.is_dir()
-    ):
-        raise ValueError("provider features are missing or unsafe")
-    for frozen_path in sorted(frozen_features.rglob("*")):
-        if frozen_path.is_symlink():
-            raise ValueError("frozen provider features contain a symlink")
-        if not frozen_path.is_file():
-            continue
-        relative = frozen_path.relative_to(frozen_features)
-        current_path = current_features / relative
-        if (
-            current_path.is_symlink()
-            or not current_path.is_file()
-            or not _file_is_prefix(frozen_path, current_path)
-        ):
-            raise ValueError(
-                "a frozen provider feature is not a byte prefix of the current feature"
-            )
-
-
 def _normalize_prediction_frame(frame: pd.DataFrame, name: str) -> pd.DataFrame:
     if {"datetime", "instrument", "score"}.issubset(frame.columns):
         result = frame.loc[:, ["datetime", "instrument", "score"]].copy()
@@ -445,9 +381,14 @@ def _split_for_inference(record: Mapping[str, Any], as_of_date: str) -> RollingS
 
 
 def _default_qlib_initializer(provider_uri: Path) -> None:
-    import qlib
+    init_qlib_workflow(provider_uri=provider_uri, kernels=8)
 
-    qlib.init(provider_uri=str(provider_uri), region="cn", kernels=8)
+
+def _default_calendar_loader(provider_uri: Path) -> list[Any]:
+    init_qlib_workflow(provider_uri=provider_uri, kernels=1)
+    from qlib.data import D
+
+    return list(D.calendar(freq="day"))
 
 
 def _default_dataset_factory(
@@ -633,7 +574,8 @@ def run_shadow_day(
     confirmation_path: Path,
     provider_state_path: Path,
     as_of_date: str,
-    provider_preparer: Any = prepare_runtime_provider,
+    provider_resolver: Any = qlib_workflow_provider_uri,
+    calendar_loader: Any = _default_calendar_loader,
     inference_runner: Any = infer_frozen_models,
     market_loader: Any = load_market_panel,
     benchmark_loader: Any = load_benchmark_frame,
@@ -664,7 +606,6 @@ def run_shadow_day(
                 provider_state=provider_state,
                 git_state=dict(git_state_provider()),
             )
-            provider_metadata = _read_provider_metadata(frozen_provider)
         except ShadowBlocked as exc:
             return _write_daily(
                 report_dir,
@@ -691,57 +632,26 @@ def run_shadow_day(
                 ),
             )
 
-        intervals_path = (
-            quant_data_dir
-            / config["paths"]["pit_membership"]
-            / "membership_intervals.parquet"
-        )
-        manifest_path = quant_data_dir / "DATA_MANIFEST.json"
         try:
-            current_provider_state = provider_preparer(
-                canonical_provider=Path(str(provider_metadata["canonical_provider"])),
-                intervals_path=intervals_path,
-                runtime_root=quant_data_dir / "runtime" / "robust_strategy" / "shadow",
-                data_manifest_path=manifest_path,
-            )
             current_provider = Path(
-                str(current_provider_state.get("provider_uri") or "")
+                provider_resolver(
+                    "cleaned",
+                    append_only_from=frozen_provider,
+                )
             )
-            if (
-                current_provider_state.get("status") != "completed"
-                or not current_provider.is_dir()
-            ):
-                raise ValueError("current provider snapshot is unavailable")
-            current_metadata = _read_provider_metadata(current_provider)
-            if (
-                Path(str(current_metadata["canonical_provider"])).resolve()
-                != Path(str(provider_metadata["canonical_provider"])).resolve()
-            ):
-                raise ShadowBlocked("provider_identity_mismatch")
-            verify_provider_is_append_only(frozen_provider, current_provider)
-        except ShadowBlocked as exc:
+            if not current_provider.is_dir():
+                raise FileNotFoundError("current Qlib Provider is unavailable")
+            calendar = pd.DatetimeIndex(
+                pd.to_datetime(calendar_loader(current_provider), errors="coerce")
+            ).dropna().normalize()
+            if calendar.empty or calendar.has_duplicates or not calendar.is_monotonic_increasing:
+                raise ValueError("current Qlib Provider calendar is invalid")
+        except QlibProviderHistoryError as exc:
             return _write_daily(
                 report_dir,
                 _daily_payload(
                     status="development_failed",
-                    reason_code=exc.reason_code,
-                    as_of_date=as_of,
-                    inference_success=False,
-                    appended_days=0,
-                    state=None,
-                ),
-            )
-        except ValueError as exc:
-            reason = (
-                "provider_history_changed"
-                if "prefix" in str(exc)
-                else "provider_prepare_failed"
-            )
-            return _write_daily(
-                report_dir,
-                _daily_payload(
-                    status="development_failed",
-                    reason_code=reason,
+                    reason_code="provider_history_changed",
                     as_of_date=as_of,
                     inference_success=False,
                     appended_days=0,
@@ -763,17 +673,6 @@ def run_shadow_day(
                 ),
             )
 
-        calendar_path = current_provider / "calendars" / "day.txt"
-        calendar = (
-            pd.DatetimeIndex(
-                pd.to_datetime(
-                    calendar_path.read_text(encoding="utf-8").splitlines(),
-                    errors="coerce",
-                )
-            )
-            .dropna()
-            .normalize()
-        )
         if pd.Timestamp(as_of) not in calendar:
             return _write_daily(
                 report_dir,

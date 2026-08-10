@@ -26,14 +26,15 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
   isMarketReview = false,
 }) => {
   const { language, t } = useUiLanguage();
-  const sentimentColor = item.sentimentScore !== undefined ? getSentimentColor(item.sentimentScore) : null;
+  const sentimentScore = typeof item.sentimentScore === 'number' ? item.sentimentScore : null;
+  const sentimentColor = sentimentScore !== null ? getSentimentColor(sentimentScore) : null;
   const stockName = item.stockName || item.stockCode;
   const actionLabels = buildDecisionActionLabelMap(t);
   const operationLabel = getDecisionActionLabel(
     item.action,
     item.actionLabel,
     item.operationAdvice,
-    null,
+    t('history.sentiment'),
     actionLabels,
   );
   const phaseLabel = getMarketPhaseSummaryLabel(item.marketPhaseSummary, language)
@@ -95,7 +96,7 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
                 >
                   {t('stockBar.market')}
                 </Badge>
-              ) : operationLabel && sentimentColor ? (
+              ) : sentimentColor ? (
                 <Badge
                   variant="default"
                   size="sm"
@@ -106,7 +107,7 @@ export const StockBarItemComponent: React.FC<StockBarItemProps> = ({
                     backgroundColor: `${sentimentColor}10`,
                   }}
                 >
-                  {operationLabel} {item.sentimentScore}
+                  {operationLabel} {sentimentScore}
                 </Badge>
               ) : null}
               {onDelete && (

@@ -11,12 +11,22 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 try:
-    from ._paths import reports_root
+    from ._mlflow_run_provenance import (
+        normalize_provider_lineage,
+        provider_lineage_is_complete,
+        provider_lineages_match,
+    )
+    from ._paths import provider_has_instrument_pool, reports_root
     from .prepare_robust_provider import (
         runtime_provider_identity,
     )
 except ImportError:  # Direct script execution and quant_workflow test mode.
-    from _paths import reports_root
+    from _mlflow_run_provenance import (
+        normalize_provider_lineage,
+        provider_lineage_is_complete,
+        provider_lineages_match,
+    )
+    from _paths import provider_has_instrument_pool, reports_root
     from prepare_robust_provider import (
         runtime_provider_identity,
     )
@@ -38,15 +48,6 @@ QUALITY_REPORT_ID_RE = re.compile(r"^data-quality-[0-9a-f]{16}$")
 QUALITY_EVIDENCE_NAME_RE = re.compile(
     r"^data_quality_report_\d{8}_\d{6}_[0-9a-f]{16}\.json$"
 )
-CLEANED_PROVIDER_DATASET_ID = "qlib_ashare_cleaned_v2"
-CLEANED_PROVIDER_IDENTITY_FIELDS = (
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-)
-
-
 class RobustSignalDataBlocked(ValueError):
     """A structured, user-actionable robust-data readiness failure."""
 
@@ -72,6 +73,33 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cleaned_identity_is_valid(identity: Mapping[str, Any] | None) -> bool:
+    """Keep Provider lineage opaque outside the shared provenance adapter."""
+
+    return provider_lineage_is_complete(identity)
+
+
+def _cleaned_identities_match(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+) -> bool:
+    return provider_lineages_match(left, right)
+
+
+def _cleaned_identity_for_output(identity: Mapping[str, Any]) -> dict[str, str]:
+    if not _cleaned_identity_is_valid(identity):
+        raise _blocked("quality_evidence_invalid")
+    return normalize_provider_lineage(identity)
+
+
+def _provider_is_under(provider: Path, root: Path) -> bool:
+    try:
+        provider.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _blocked(reason_code: str) -> RobustSignalDataBlocked:
@@ -117,8 +145,8 @@ def _blocked(reason_code: str) -> RobustSignalDataBlocked:
             "已准备的 provider 缺少历史时点 CSI800 股票池，请重新构建。",
         ),
         "cleaned_provider_unavailable": (
-            "The current cleaned Qlib V2 snapshot is unavailable.",
-            "当前 cleaned Qlib V2 快照不可用，请先完成原生 V2 构建和数据质量验收。",
+            "The current cleaned Qlib Provider is unavailable.",
+            "当前 cleaned Qlib Provider 不可用，请先完成 quant_data 数据后端验收。",
         ),
         "membership_intervals_missing": (
             "Historical CSI800 membership intervals are unavailable.",
@@ -145,8 +173,8 @@ def _blocked(reason_code: str) -> RobustSignalDataBlocked:
             "鲁棒数据准备后，数据质量证据已经变化，请重新验收并准备。",
         ),
         "cleaned_provider_quality_mismatch": (
-            "The cleaned provider does not match the approved quality evidence.",
-            "当前 cleaned provider 与完整数据质量证据不一致，请重新验收数据。",
+            "The cleaned Qlib Provider does not match the approved quality evidence.",
+            "当前 cleaned Qlib Provider 与完整数据质量证据不一致，请重新验收数据。",
         ),
     }
     summary, summary_zh = messages[reason_code]
@@ -400,17 +428,7 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
     if (
         not isinstance(data_contract, Mapping)
         or data_contract.get("status") != "verified"
-        or not isinstance(cleaned_identity, Mapping)
-        or cleaned_identity.get("dataset_id") != CLEANED_PROVIDER_DATASET_ID
-        or not isinstance(cleaned_identity.get("snapshot_id"), str)
-        or not cleaned_identity.get("snapshot_id")
-        or Path(str(cleaned_identity.get("snapshot_id"))).name
-        != cleaned_identity.get("snapshot_id")
-        or any(
-            not isinstance(cleaned_identity.get(field), str)
-            or not SHA256_RE.fullmatch(str(cleaned_identity[field]))
-            for field in ("manifest_sha256", "content_sha256")
-        )
+        or not _cleaned_identity_is_valid(cleaned_identity)
         or not isinstance(snapshot_state, Mapping)
         or snapshot_state.get("stable") is not True
         or snapshot_state.get("content_revalidated") is not True
@@ -425,10 +443,7 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
     )
     if not isinstance(cleaned_quality, Mapping):
         raise _blocked("quality_evidence_invalid")
-    if any(
-        cleaned_quality.get(field) != cleaned_identity.get(field)
-        for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-    ):
+    if not _cleaned_identities_match(cleaned_quality, cleaned_identity):
         raise _blocked("cleaned_provider_quality_mismatch")
 
     cleaned_readiness = cleaned_quality.get("training_readiness")
@@ -449,27 +464,11 @@ def load_verified_cleaned_quality_evidence(pointer_path: Path) -> dict[str, Any]
     ):
         raise _blocked("quality_evidence_not_trainable")
 
-    stage_names = ("before", "after_scan", "after_revalidation", "after")
-    stage_states = [
-        snapshot_state.get(stage, {}).get(CLEANED_PROVIDER_DATASET_ID)
-        if isinstance(snapshot_state.get(stage), Mapping)
-        else None
-        for stage in stage_names
-    ]
-    if (
-        not all(_valid_snapshot_fingerprint(state) for state in stage_states)
-        or any(state != stage_states[0] for state in stage_states[1:])
-    ):
-        raise _blocked("quality_evidence_invalid")
-
     return {
         "quality_report_id": report_id,
         "quality_evidence_artifact_name": evidence_artifact,
         "quality_evidence_sha256": evidence_sha256,
-        "cleaned_provider_identity": {
-            field: str(cleaned_identity[field])
-            for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-        },
+        "cleaned_provider_identity": _cleaned_identity_for_output(cleaned_identity),
     }
 
 
@@ -546,8 +545,9 @@ def evaluate_robust_signal_data(
         != current_quality.get("quality_evidence_sha256")
     ):
         raise _blocked("quality_evidence_changed")
-    if status.get("cleaned_provider_identity") != current_quality.get(
-        "cleaned_provider_identity"
+    if not _cleaned_identities_match(
+        status.get("cleaned_provider_identity"),
+        current_quality.get("cleaned_provider_identity"),
     ):
         raise _blocked("cleaned_provider_quality_mismatch")
 
@@ -559,7 +559,7 @@ def evaluate_robust_signal_data(
         provider = provider.resolve(strict=False)
     except OSError as exc:
         raise _blocked("provider_unavailable") from exc
-    if provider.parent != provider_root or provider.is_symlink():
+    if provider.is_symlink() or not _provider_is_under(provider, provider_root):
         raise _blocked("provider_outside_runtime")
     if not provider.is_dir():
         raise _blocked("provider_unavailable")
@@ -569,18 +569,8 @@ def evaluate_robust_signal_data(
     if (
         not isinstance(provider_key, str)
         or not SHA256_RE.fullmatch(provider_key)
-        or provider.name != provider_key[:16]
         or not isinstance(provider_tree_sha256, str)
         or not SHA256_RE.fullmatch(provider_tree_sha256)
-    ):
-        raise _blocked("provider_identity_mismatch")
-    metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
-    if (
-        metadata is None
-        or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
-        or metadata.get("provider_key") != provider_key
-        or metadata.get("provider_tree_sha256") != provider_tree_sha256
-        or metadata.get("data_manifest_sha256") != current_manifest_sha256
     ):
         raise _blocked("provider_identity_mismatch")
     runtime_identity = provider_identity(provider, provider_key)
@@ -590,7 +580,11 @@ def evaluate_robust_signal_data(
         or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
     ):
         raise _blocked("provider_identity_mismatch")
-    if not (provider / "instruments" / "csi800.txt").is_file():
+    try:
+        has_csi800 = provider_has_instrument_pool(provider, "csi800")
+    except (OSError, RuntimeError, ValueError):
+        has_csi800 = False
+    if not has_csi800:
         raise _blocked("csi800_instruments_missing")
 
     return {
@@ -606,9 +600,7 @@ def evaluate_robust_signal_data(
         "provider_key": provider_key,
         "provider_tree_sha256": provider_tree_sha256,
         "data_manifest_sha256": current_manifest_sha256,
-        "membership_intervals_sha256": metadata.get(
-            "membership_intervals_sha256"
-        ),
+        "membership_intervals_sha256": status.get("membership_intervals_sha256"),
         "quality_report_id": current_quality.get("quality_report_id"),
         "quality_evidence_artifact_name": current_quality.get(
             "quality_evidence_artifact_name"
@@ -722,16 +714,7 @@ def consume_accepted_robust_signal_data(
         or not evidence_artifact_name.endswith(
             f"_{evidence_sha256[:16]}.json"
         )
-        or not isinstance(cleaned_identity, Mapping)
-        or cleaned_identity.get("dataset_id") != CLEANED_PROVIDER_DATASET_ID
-        or not isinstance(cleaned_identity.get("snapshot_id"), str)
-        or Path(str(cleaned_identity.get("snapshot_id"))).name
-        != cleaned_identity.get("snapshot_id")
-        or any(
-            not isinstance(cleaned_identity.get(field), str)
-            or not SHA256_RE.fullmatch(str(cleaned_identity[field]))
-            for field in ("manifest_sha256", "content_sha256")
-        )
+        or not _cleaned_identity_is_valid(cleaned_identity)
     ):
         raise _blocked("robust_readiness_invalid")
 
@@ -769,10 +752,7 @@ def consume_accepted_robust_signal_data(
         or not isinstance(evidence_cleaned_identity, Mapping)
     ):
         raise _blocked("quality_evidence_invalid")
-    if any(
-        evidence_cleaned_identity.get(field) != cleaned_identity.get(field)
-        for field in CLEANED_PROVIDER_IDENTITY_FIELDS
-    ):
+    if not _cleaned_identities_match(evidence_cleaned_identity, cleaned_identity):
         raise _blocked("cleaned_provider_quality_mismatch")
 
     provider_text = status.get("provider_uri")
@@ -783,7 +763,7 @@ def consume_accepted_robust_signal_data(
         provider = provider.resolve(strict=False)
     except OSError as exc:
         raise _blocked("provider_unavailable") from exc
-    if provider.parent != provider_root or provider.is_symlink():
+    if provider.is_symlink() or not _provider_is_under(provider, provider_root):
         raise _blocked("provider_outside_runtime")
     if not provider.is_dir():
         raise _blocked("provider_unavailable")
@@ -793,19 +773,8 @@ def consume_accepted_robust_signal_data(
     if (
         not isinstance(provider_key, str)
         or not SHA256_RE.fullmatch(provider_key)
-        or provider.name != provider_key[:16]
         or not isinstance(provider_tree_sha256, str)
         or not SHA256_RE.fullmatch(provider_tree_sha256)
-    ):
-        raise _blocked("provider_identity_mismatch")
-    metadata = _read_json_object(provider / PROVIDER_METADATA_FILENAME)
-    if (
-        metadata is None
-        or metadata.get("format_version") != PROVIDER_FORMAT_VERSION
-        or metadata.get("provider_key") != provider_key
-        or metadata.get("provider_tree_sha256") != provider_tree_sha256
-        or metadata.get("data_manifest_sha256") != recorded_manifest_sha256
-        or metadata.get("membership_intervals_sha256") != membership_intervals_sha256
     ):
         raise _blocked("provider_identity_mismatch")
     runtime_identity = provider_identity(provider, provider_key)
@@ -815,7 +784,11 @@ def consume_accepted_robust_signal_data(
         or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
     ):
         raise _blocked("provider_identity_mismatch")
-    if not (provider / "instruments" / "csi800.txt").is_file():
+    try:
+        has_csi800 = provider_has_instrument_pool(provider, "csi800")
+    except (OSError, RuntimeError, ValueError):
+        has_csi800 = False
+    if not has_csi800:
         raise _blocked("csi800_instruments_missing")
 
     return {

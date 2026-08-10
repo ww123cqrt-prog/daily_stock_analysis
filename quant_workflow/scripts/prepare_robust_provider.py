@@ -23,9 +23,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:  # noqa: E402
-    from ._paths import qlib_provider_uri, quant_data_root
+    from ._paths import provider_calendar_days, qlib_workflow_provider_uri, quant_data_root
 except ImportError:  # Direct script execution.
-    from _paths import qlib_provider_uri, quant_data_root
+    from _paths import provider_calendar_days, qlib_workflow_provider_uri, quant_data_root
 
 
 DEFAULT_CANONICAL_PROVIDER: Path | None = None
@@ -90,12 +90,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _calendar(provider: Path) -> pd.DatetimeIndex:
-    path = provider / "calendars" / "day.txt"
-    if not path.is_file():
-        raise FileNotFoundError(f"canonical provider calendar is missing: {path}")
-    values = pd.DatetimeIndex(
-        pd.to_datetime(path.read_text(encoding="utf-8").splitlines(), errors="coerce")
-    )
+    values = pd.DatetimeIndex(pd.to_datetime(provider_calendar_days(provider), errors="coerce"))
     values = values.dropna().normalize().unique().sort_values()
     if values.empty:
         raise ValueError("canonical provider calendar is empty")
@@ -173,7 +168,9 @@ def normalize_union_intervals(
 def _provider_key(
     canonical_provider: Path, intervals_path: Path, data_manifest_path: Path
 ) -> str:
-    calendar_hash = file_sha256(canonical_provider / "calendars" / "day.txt")
+    calendar_hash = hashlib.sha256(
+        "\n".join(provider_calendar_days(canonical_provider)).encode("utf-8")
+    ).hexdigest()
     payload = {
         "canonical_provider": str(canonical_provider.resolve()),
         "calendar_sha256": calendar_hash,
@@ -380,6 +377,12 @@ class RuntimeProviderIdentityCache:
 
     def __call__(self, provider: Path, key: str) -> dict[str, str] | None:
         provider = Path(provider)
+        descriptor = _provider_descriptor_path(provider)
+        if descriptor is not None:
+            digest = file_sha256(descriptor)
+            if str(key) != digest or _read_provider_context(provider) is None:
+                return None
+            return {"provider_key": digest, "provider_tree_sha256": digest}
         identity = (os.path.abspath(os.fspath(provider)), str(key))
         with self._lock:
             if self._provider_identity != identity:
@@ -403,8 +406,43 @@ class RuntimeProviderIdentityCache:
             return {"provider_key": key, "provider_tree_sha256": tree_hash}
 
 
+def _provider_descriptor_path(provider: Path) -> Path | None:
+    try:
+        for child in Path(provider).iterdir():
+            if child.name == "PROVIDER_DESCRIPTOR.json":
+                return child
+    except OSError:
+        return None
+    return None
+
+
+def _read_provider_context(provider: Path) -> Any | None:
+    descriptor = _provider_descriptor_path(provider)
+    if descriptor is None or descriptor.is_symlink():
+        return None
+    try:
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        root = Path(provider)
+        for parent in [root, *root.parents]:
+            if parent.name == "quant_data":
+                root = parent
+                break
+        return _load_descriptor(descriptor, root)
+    except Exception:
+        return None
+
+
 def runtime_provider_identity(provider: Path, key: str) -> dict[str, str] | None:
     provider = Path(provider)
+    descriptor = _provider_descriptor_path(provider)
+    if descriptor is not None:
+        digest = file_sha256(descriptor)
+        if str(key) != digest:
+            return None
+        if _read_provider_context(provider) is None:
+            return None
+        return {"provider_key": digest, "provider_tree_sha256": digest}
     if not _snapshot_is_reusable(provider, key):
         return None
     try:
@@ -430,6 +468,47 @@ def prepare_runtime_provider(
     intervals_path = Path(intervals_path).expanduser().resolve()
     runtime_root = Path(runtime_root).expanduser().resolve()
     data_manifest_path = Path(data_manifest_path).expanduser().resolve()
+    descriptor = _provider_descriptor_path(canonical_provider)
+    if descriptor is not None:
+        if not intervals_path.is_file():
+            raise FileNotFoundError(f"membership intervals are missing: {intervals_path}")
+        if not data_manifest_path.is_file():
+            raise FileNotFoundError(f"data manifest is missing: {data_manifest_path}")
+        context = _read_provider_context(canonical_provider)
+        if context is None:
+            raise ValueError("Qlib Provider descriptor is unavailable or invalid")
+        days = pd.DatetimeIndex(context.calendar).normalize()
+        raw_intervals = pd.read_parquet(intervals_path)
+        intervals = normalize_union_intervals(raw_intervals, days)
+        if intervals.empty:
+            raise ValueError("membership intervals are empty")
+        descriptor_hash = file_sha256(descriptor)
+        result = {
+            "status": "completed",
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "provider_uri": str(canonical_provider),
+            "canonical_provider": str(canonical_provider),
+            "membership_intervals": str(intervals_path),
+            "provider_key": descriptor_hash,
+            "provider_tree_sha256": descriptor_hash,
+            "data_manifest": str(data_manifest_path),
+            "data_manifest_sha256": file_sha256(data_manifest_path),
+            "reused": True,
+            "provider_backend": "quant_data",
+            "snapshot_id": str(
+                (context.descriptor.get("dataset") or {}).get("snapshot_id") or ""
+            ),
+            "cleaning_mode": str(
+                (context.descriptor.get("cleaning") or {}).get("mode") or "canonical"
+            ),
+            "symbols": int(intervals["symbol"].nunique()),
+            "intervals": int(len(intervals)),
+        }
+        _atomic_write(
+            runtime_root / "latest_provider.json",
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        return result
     if not (canonical_provider / "features").is_dir():
         raise FileNotFoundError(
             f"canonical provider features are missing: {canonical_provider / 'features'}"
@@ -558,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-out-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     result = prepare_runtime_provider(
-        canonical_provider=args.canonical_provider or qlib_provider_uri("cleaned"),
+        canonical_provider=args.canonical_provider or qlib_workflow_provider_uri("cleaned"),
         intervals_path=args.intervals,
         runtime_root=args.runtime_root,
         data_manifest_path=args.data_manifest,

@@ -9,6 +9,8 @@ interface ConfirmDialogProps {
   message: string;
   confirmText?: string;
   cancelText?: string;
+  confirmDisabled?: boolean;
+  cancelDisabled?: boolean;
   isDanger?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -24,6 +26,8 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   message,
   confirmText,
   cancelText,
+  confirmDisabled = false,
+  cancelDisabled = false,
   isDanger = false,
   onConfirm,
   onCancel,
@@ -36,7 +40,11 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   const dialog = (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-all"
-      onClick={onCancel}
+      onClick={() => {
+        if (!cancelDisabled) {
+          onCancel();
+        }
+      }}
     >
       <div
         role="dialog"
@@ -53,18 +61,20 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
           <button
             type="button"
             onClick={onCancel}
-            className="rounded-lg border border-border/70 px-4 py-2 text-sm font-medium text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+            disabled={cancelDisabled}
+            className="rounded-lg border border-border/70 px-4 py-2 text-sm font-medium text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
           >
             {cancelText ?? t('common.cancel')}
           </button>
           <button
             type="button"
             onClick={onConfirm}
+            disabled={confirmDisabled}
             className={`rounded-lg px-4 py-2 text-sm font-medium text-foreground transition-colors ${
               isDanger
                 ? 'bg-red-500/80 hover:bg-red-500 shadow-lg shadow-red-500/20'
                 : 'bg-cyan/80 hover:bg-cyan shadow-lg shadow-cyan/20'
-            }`}
+            } disabled:cursor-not-allowed disabled:opacity-60`}
           >
             {confirmText ?? t('common.confirm')}
           </button>

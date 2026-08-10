@@ -22,7 +22,11 @@ from api.v1.endpoints import (
     alerts,
     alphasift,
     research_status,
+    etf_momentum_strategy,
     quant_jobs,
+    decision_signals,
+    intelligence,
+    screening,
 )
 __all__ = [
     "health",
@@ -38,5 +42,9 @@ __all__ = [
     "alerts",
     "alphasift",
     "research_status",
+    "etf_momentum_strategy",
     "quant_jobs",
+    "decision_signals",
+    "intelligence",
+    "screening",
 ]

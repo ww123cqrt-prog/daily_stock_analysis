@@ -677,6 +677,14 @@ class ReportDataHygieneTest(unittest.TestCase):
             canonical_snapshots_still_exist = all(
                 path.exists() for path in canonical_snapshots.values()
             )
+            public_report_text = "\n".join(
+                (
+                    paths.inventory_md.read_text(encoding="utf-8"),
+                    paths.cleanup_plan_md.read_text(encoding="utf-8"),
+                    json.dumps(inventory, ensure_ascii=False),
+                    json.dumps(plan, ensure_ascii=False),
+                )
+            )
 
         self.assertRegex(
             paths.inventory_md.name,
@@ -765,6 +773,11 @@ class ReportDataHygieneTest(unittest.TestCase):
         )
         self.assertNotIn(str(legacy_parquet), keep_sources)
         self.assertNotIn(str(legacy_qlib), keep_sources)
+        self.assertIn("Qlib Provider", public_report_text)
+        self.assertNotRegex(
+            public_report_text,
+            r"(?i)direct provider|native V2|原生\s*V2",
+        )
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,50 @@ def _three_asset_data(periods: int = 80) -> dict[str, pd.DataFrame]:
             "SH512890", 1.0 + np.sin(x / 8.0) * 0.03 + x * 0.001
         ),
     }
+
+
+def _install_fake_qlib(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    values_by_symbol: dict[str, list[float]],
+) -> tuple[list[Path], list[str]]:
+    dates = pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"])
+    calls: list[str] = []
+
+    class FakeDataApi:
+        @staticmethod
+        def features(instruments, fields, **_kwargs):
+            symbol = str(instruments[0])
+            calls.append(symbol)
+            values = values_by_symbol.get(symbol)
+            index = pd.MultiIndex.from_arrays(
+                [[symbol] * (len(values) if values is not None else 0), dates[: len(values or [])]],
+                names=["instrument", "datetime"],
+            )
+            return pd.DataFrame(
+                {fields[0]: values or []},
+                index=index,
+            )
+
+    qlib_module = ModuleType("qlib")
+    qlib_data_module = ModuleType("qlib.data")
+    qlib_data_module.D = FakeDataApi
+    qlib_module.data = qlib_data_module
+    monkeypatch.setitem(sys.modules, "qlib", qlib_module)
+    monkeypatch.setitem(sys.modules, "qlib.data", qlib_data_module)
+    initialized: list[Path] = []
+    monkeypatch.setattr(
+        module,
+        "init_qlib_workflow",
+        lambda *, provider_uri: initialized.append(Path(provider_uri)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "provider_calendar_days",
+        lambda _provider: [value.date().isoformat() for value in dates],
+    )
+    return initialized, calls
 
 
 def test_config_freezes_the_three_etf_rule_without_parameter_search() -> None:
@@ -234,59 +279,68 @@ def test_unaccepted_data_can_never_emit_a_formal_candidate_label() -> None:
     }
 
 
-def test_missing_chinext_index_is_reported_without_etf_substitution(tmp_path: Path) -> None:
+def test_missing_chinext_index_is_reported_without_etf_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = load_module()
     provider = tmp_path / "provider"
-    (provider / "calendars").mkdir(parents=True)
-    (provider / "calendars/day.txt").write_text(
-        "2026-01-05\n2026-01-06\n2026-01-07\n", encoding="utf-8"
+    provider.mkdir()
+    initialized, calls = _install_fake_qlib(
+        module,
+        monkeypatch,
+        {
+            "SH000300": [100.0, 101.0, 102.0],
+            "SH000905": [100.0, 101.0, 102.0],
+        },
     )
-    for symbol in ("SH000300", "SH000905"):
-        feature_dir = provider / "features" / symbol.lower()
-        feature_dir.mkdir(parents=True)
-        np.asarray([0.0, 100.0, 101.0, 102.0], dtype="<f4").tofile(
-            feature_dir / "open.day.bin"
-        )
 
     result = module.load_index_benchmarks_from_provider(provider)
 
+    assert initialized == [provider.resolve()]
+    assert calls == list(module.INDEX_NAMES)
     assert set(result["available"]) == {"SH000300", "SH000905"}
     assert result["missing"] == ["SH000906", "SZ399006", "SH000688"]
     assert "SZ159915" not in result["available"]
     assert "SZ159915" not in result["missing"]
 
 
-def test_resolved_legacy_evidence_ignores_stray_new_index_files(
+def test_formal_provider_reads_the_declared_index_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = load_module()
     provider = tmp_path / "provider"
-    (provider / "calendars").mkdir(parents=True)
-    (provider / "calendars/day.txt").write_text(
-        "2026-01-05\n2026-01-06\n2026-01-07\n", encoding="utf-8"
+    provider.mkdir()
+    initialized, calls = _install_fake_qlib(
+        module,
+        monkeypatch,
+        {symbol: [100.0, 101.0, 102.0] for symbol in module.INDEX_NAMES},
     )
-    for symbol in module.INDEX_NAMES:
-        feature_dir = provider / "features" / symbol.lower()
-        feature_dir.mkdir(parents=True)
-        np.asarray([0.0, 100.0, 101.0, 102.0], dtype="<f4").tofile(
-            feature_dir / "open.day.bin"
-        )
-    legacy_symbols = ("SH000300", "SH000905", "SH000906")
     resolved = SimpleNamespace(
-        dataset_id="qlib_ashare_v2",
+        dataset_id="cn_index_daily",
         snapshot_path=provider,
         manifest={
-            "snapshot_id": "legacy-snapshot",
+            "snapshot_id": "index-snapshot",
             "content_sha256": "a" * 64,
             "benchmarks": {"symbols": {}, "source": {}},
         },
     )
     monkeypatch.setattr(module, "resolve_dataset", lambda *args, **kwargs: resolved)
+    import _paths as paths_module
+
+    monkeypatch.setattr(paths_module, "qlib_workflow_provider_uri", lambda *_args: provider)
+    monkeypatch.setattr(
+        module,
+        "qlib_workflow_provider_uri",
+        lambda *_args: provider,
+        raising=False,
+    )
 
     result = module.resolve_index_benchmarks(tmp_path)
 
-    assert set(result["available"]) == set(legacy_symbols)
-    assert result["missing"] == ["SZ399006", "SH000688"]
+    assert initialized == [provider.resolve()]
+    assert calls == list(module.INDEX_NAMES)
+    assert set(result["available"]) == set(module.INDEX_NAMES)
+    assert result["missing"] == []
 
 
 def test_benchmark_without_overlapping_etf_dates_is_only_reported_as_missing(

@@ -361,13 +361,21 @@ def _is_us_code(stock_code: str) -> bool:
 
 
 def _is_hk_code(stock_code: str) -> bool:
+    """
+    判定是否为港股代码，与 ``data_provider.base._is_hk_market`` 的市场契约一致：
+    支持 ``.HK`` 后缀、``HK00700`` 前缀形式，以及 4-5 位纯数字裸码（港股
+    普通股为 4 位如 ``0001`` 长和、``0941`` 中国移动；最多 5 位）。
+
+    Note: 4 位裸数字与 A 股不冲突——A 股 ETF/股票均为 6 位。
+    """
     normalized = (stock_code or "").strip().upper()
     if normalized.startswith("HK"):
         digits = normalized[2:]
         return digits.isdigit() and 1 <= len(digits) <= 5
     if normalized.endswith(".HK"):
-        return True
-    if normalized.isdigit() and len(normalized) == 5:
+        base = normalized[:-3]
+        return base.isdigit() and 1 <= len(base) <= 5
+    if normalized.isdigit() and 4 <= len(normalized) <= 5:
         return True
     return False
 
@@ -693,15 +701,21 @@ class LongbridgeFetcher(BaseFetcher):
         try:
             from longbridge.openapi import Period, AdjustType
 
+            # history_candlesticks_by_offset 使用 keyword args 确保跨 SDK 版本兼容:
+            # 0.2.74 (Linux) 与 4.x (Windows/macOS/Python>=3.12) 的
+            # positional 签名存在差异 (0.2.74: forward, time, count; 4.x: forward, count, time)，
+            # keyword args 不受顺序影响。
+            # forward=False → 从 time 起向过去取; time 为基准时间; count 为根数。
             candles = ctx.history_candlesticks_by_offset(
-                symbol,
-                Period.Day,
-                AdjustType.NoAdjust,
-                False,
-                6,
-                datetime.now(),
+                symbol=symbol,
+                period=Period.Day,
+                adjust_type=AdjustType.NoAdjust,
+                forward=False,
+                time=datetime.now(),
+                count=6,
             )
             if not candles or len(candles) < 2:
+                logger.warning("[Longbridge] 计算量比失败(%s): 历史K线不足 (%s)", symbol, len(candles or []))
                 return None
 
             ordered = sorted(candles, key=self._ts_sort_key, reverse=True)
@@ -712,15 +726,17 @@ class LongbridgeFetcher(BaseFetcher):
                     past_vols.append(vol)
 
             if not past_vols:
+                logger.warning("[Longbridge] 计算量比失败(%s): 近5日成交量为空", symbol)
                 return None
 
             avg_vol = sum(past_vols) / len(past_vols)
             if avg_vol <= 0:
+                logger.warning("[Longbridge] 计算量比失败(%s): 近5日均量无效", symbol)
                 return None
 
             return round(today_volume / avg_vol, 2)
         except Exception as e:
-            logger.debug(f"[Longbridge] 计算量比失败({symbol}): {e}")
+            logger.warning("[Longbridge] 计算量比失败(%s): %s", symbol, e)
             return None
 
     # ------------------------------------------------------------------

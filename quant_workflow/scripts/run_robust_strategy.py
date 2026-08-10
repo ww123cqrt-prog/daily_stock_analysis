@@ -24,7 +24,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root, workflow_root  # noqa: E402
+from _paths import (  # noqa: E402
+    qlib_workflow_provider_uri,
+    quant_data_root,
+    reports_root,
+    workflow_root,
+)
 from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
     membership_read_lock,
@@ -391,6 +396,7 @@ def build_stages(
     skip_membership_build: bool = False,
     run_id: str | None = None,
     resume: bool = False,
+    allow_legacy_compatibility: bool = False,
 ) -> list[Stage]:
     paths = config["paths"]
     universe = config["universe"]
@@ -400,7 +406,13 @@ def build_stages(
         quant_data_dir, str(Path(paths["security_master"]).parent)
     )
     price_dir = _resolved_data_path(quant_data_dir, paths["price_parquet"])
-    provider_dir = _resolved_data_path(quant_data_dir, paths["qlib_provider"])
+    configured_provider_dir = _resolved_data_path(quant_data_dir, paths["qlib_provider"])
+    legacy_compatibility = bool(allow_legacy_compatibility)
+    provider_dir = (
+        configured_provider_dir
+        if legacy_compatibility
+        else qlib_workflow_provider_uri("cleaned")
+    )
     runtime_root = quant_data_dir / "runtime" / "robust_strategy"
     stage_report_root = (
         report_dir / "runs" / run_id / "stage_reports" if run_id else report_dir
@@ -462,7 +474,8 @@ def build_stages(
     ]
     if universe.get("benchmark_mode", "download") == "reuse_existing":
         benchmark_argv.append("--reuse-existing")
-    stages.append(Stage("add_robust_benchmarks", benchmark_argv))
+    if legacy_compatibility:
+        stages.append(Stage("add_robust_benchmarks", benchmark_argv))
     stages.append(
         Stage(
             "preflight_robust_data",
@@ -1004,6 +1017,7 @@ def _run_pipeline_claimed(
     run_id: str | None = None,
     skip_membership_build: bool = False,
     resume: bool = False,
+    allow_legacy_compatibility: bool = False,
     stage_runner: Callable[[Stage], int] | None = None,
     git_state_provider: Callable[[], dict[str, Any]] = git_worktree_state,
 ) -> dict[str, Any]:
@@ -1174,6 +1188,7 @@ def _run_pipeline_claimed(
         skip_membership_build=skip_membership_build,
         run_id=run_id,
         resume=resume,
+        allow_legacy_compatibility=allow_legacy_compatibility,
     )
     if resume:
         provider_stage = next(
@@ -1429,6 +1444,7 @@ def run_pipeline(
     run_id: str | None = None,
     skip_membership_build: bool = False,
     resume: bool = False,
+    allow_legacy_compatibility: bool = False,
     stage_runner: Callable[[Stage], int] | None = None,
     git_state_provider: Callable[[], dict[str, Any]] = git_worktree_state,
 ) -> dict[str, Any]:
@@ -1445,6 +1461,7 @@ def run_pipeline(
             run_id=claimed_run_id,
             skip_membership_build=skip_membership_build,
             resume=resume,
+            allow_legacy_compatibility=allow_legacy_compatibility,
             stage_runner=stage_runner,
             git_state_provider=git_state_provider,
         )
@@ -1461,6 +1478,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--skip-membership-build", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-legacy-compatibility",
+        action="store_true",
+        help=(
+            "explicitly replay a historical Qlib Provider; never use for a normal live run"
+        ),
+    )
     args = parser.parse_args(argv)
     result = run_pipeline(
         args.config,
@@ -1470,6 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         skip_membership_build=args.skip_membership_build,
         resume=args.resume,
+        allow_legacy_compatibility=args.allow_legacy_compatibility,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return (

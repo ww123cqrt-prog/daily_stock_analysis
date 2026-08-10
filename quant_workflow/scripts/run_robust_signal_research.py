@@ -28,7 +28,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import mlruns_root, quant_data_root, reports_root  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    mlruns_root,
+    provider_calendar_days,
+    quant_data_root,
+    reports_root,
+)
 from robust_dataset import board_from_symbol  # noqa: E402
 from robust_evaluation import (  # noqa: E402
     aggregate_prediction_frames,
@@ -286,17 +292,16 @@ def _resolve_provider(
     status = consume_accepted_robust_signal_data(
         artifact_path=readiness_artifact_path,
         artifact_sha256=readiness_artifact_sha256,
-        provider_root=(
-            Path(quant_data_dir) / "runtime" / "robust_strategy" / "providers"
-        ),
+        # Formal and explicitly retained compatibility Providers are both
+        # constrained to the quant_data runtime tree.
+        provider_root=Path(quant_data_dir) / "runtime",
         reports_dir=report_root,
     )
     return Path(str(status["provider_uri"])), status
 
 
 def _calendar(provider: Path) -> pd.DatetimeIndex:
-    path = provider / "calendars" / "day.txt"
-    values = pd.to_datetime(path.read_text(encoding="utf-8").splitlines(), errors="coerce")
+    values = pd.to_datetime(provider_calendar_days(provider), errors="coerce")
     calendar = pd.DatetimeIndex(values).dropna().normalize().sort_values().unique()
     if calendar.empty:
         raise ValueError("Qlib provider calendar is empty")
@@ -1110,9 +1115,7 @@ class QlibJobRunner:
         context_hash: str,
         mlflow_enabled: bool,
     ) -> None:
-        import qlib
-
-        qlib.init(provider_uri=str(provider), region="cn", kernels=8)
+        init_qlib_workflow(provider_uri=provider, kernels=8)
         self.config = config
         self.provider = provider
         self.quant_data_dir = quant_data_dir

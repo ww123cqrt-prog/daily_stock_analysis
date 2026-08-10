@@ -24,7 +24,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    provider_calendar_days,
+    qlib_workflow_provider_uri,
+    quant_data_root,
+    reports_root,
+)
 from etf_momentum_rotation import (  # noqa: E402
     CASH,
     build_signal_table,
@@ -401,14 +407,10 @@ def classify_incremental_value(
 
 
 def _qlib_calendar(provider: Path) -> tuple[str, ...]:
-    path = provider / "calendars/day.txt"
-    if path.is_symlink() or not path.is_file():
-        raise DataContractError("Qlib benchmark calendar is unavailable")
-    values = tuple(
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    )
+    try:
+        values = tuple(provider_calendar_days(provider))
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise DataContractError("Qlib benchmark calendar is unavailable") from exc
     if not values or values != tuple(sorted(values)) or len(values) != len(set(values)):
         raise DataContractError("Qlib benchmark calendar is invalid")
     return values
@@ -417,24 +419,54 @@ def _qlib_calendar(provider: Path) -> tuple[str, ...]:
 def _qlib_open_series(
     provider: Path, calendar: tuple[str, ...], symbol: str
 ) -> pd.DataFrame | None:
-    path = provider / "features" / symbol.lower() / "open.day.bin"
-    if not path.exists():
+    try:
+        from qlib.data import D
+
+        values = D.features(
+            [symbol],
+            ["$open"],
+            start_time=calendar[0],
+            end_time=calendar[-1],
+            freq="day",
+        )
+    except (FileNotFoundError, KeyError):
         return None
-    if path.is_symlink() or not path.is_file():
-        raise DataContractError(f"Qlib benchmark feature is invalid: {symbol}")
-    values = np.fromfile(path, dtype="<f4")
-    if len(values) < 2 or not np.isfinite(values[0]) or values[0] != int(values[0]):
-        raise DataContractError(f"Qlib benchmark feature header is invalid: {symbol}")
-    start = int(values[0])
-    data = values[1:]
-    if start < 0 or start + len(data) > len(calendar):
-        raise DataContractError(f"Qlib benchmark feature range is invalid: {symbol}")
-    dates = pd.to_datetime(calendar[start : start + len(data)], errors="coerce")
-    frame = pd.DataFrame({"date": dates, "open": data.astype(float)})
+    except Exception as exc:
+        raise DataContractError(
+            f"Qlib Provider benchmark feature is invalid: {symbol}"
+        ) from exc
+    if not isinstance(values, pd.DataFrame) or values.empty:
+        return None
+    if "$open" not in values.columns:
+        raise DataContractError(
+            f"Qlib Provider benchmark feature is invalid: {symbol}"
+        )
+    if isinstance(values.index, pd.MultiIndex):
+        level = (
+            "datetime"
+            if "datetime" in values.index.names
+            else values.index.nlevels - 1
+        )
+        dates = pd.to_datetime(
+            values.index.get_level_values(level),
+            errors="coerce",
+        )
+    else:
+        dates = pd.to_datetime(values.index, errors="coerce")
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": pd.to_numeric(values["$open"], errors="coerce").to_numpy(),
+        }
+    )
     frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
-    if frame.empty or frame["date"].isna().any() or frame["date"].duplicated().any():
-        raise DataContractError(f"Qlib benchmark feature values are invalid: {symbol}")
-    return frame.reset_index(drop=True)
+    if frame.empty:
+        return None
+    if frame["date"].isna().any() or frame["date"].duplicated().any():
+        raise DataContractError(
+            f"Qlib Provider benchmark feature dates are invalid: {symbol}"
+        )
+    return frame.sort_values("date").reset_index(drop=True)
 
 
 def load_index_benchmarks_from_provider(
@@ -450,6 +482,7 @@ def load_index_benchmarks_from_provider(
         raise DataContractError("Qlib benchmark required symbols are invalid")
     resolved = raw.resolve(strict=True)
     calendar = _qlib_calendar(resolved)
+    init_qlib_workflow(provider_uri=resolved)
     available: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
     for symbol in INDEX_NAMES:
@@ -467,26 +500,13 @@ def load_index_benchmarks_from_provider(
 def resolve_index_benchmarks(root: Path) -> dict[str, Any]:
     try:
         resolved = resolve_dataset(
-            "qlib_ashare_v2",
+            "cn_index_daily",
             quant_data_root=root,
-            require_basis="qfq",
+            require_basis="derived",
         )
-        evidence = resolved.manifest.get("benchmarks")
-        if not isinstance(evidence, Mapping):
-            raise DataContractError("Qlib benchmark evidence is unavailable")
-        declared_required = evidence.get("required_symbols")
-        if declared_required is None:
-            required_symbols = QLIB_LEGACY_BENCHMARK_SYMBOLS
-        elif (
-            isinstance(declared_required, list)
-            and tuple(declared_required) == QLIB_BENCHMARK_SYMBOLS
-        ):
-            required_symbols = QLIB_BENCHMARK_SYMBOLS
-        else:
-            raise DataContractError("Qlib benchmark required symbols are invalid")
         result = load_index_benchmarks_from_provider(
-            resolved.snapshot_path,
-            required_symbols=required_symbols,
+            qlib_workflow_provider_uri("canonical"),
+            required_symbols=QLIB_BENCHMARK_SYMBOLS,
         )
         result["data_identity"] = {
             "dataset_id": resolved.dataset_id,

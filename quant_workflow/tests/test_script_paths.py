@@ -1,10 +1,13 @@
 import importlib.util
+import hashlib
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pandas as pd
 
 
 def load_module():
@@ -210,6 +213,252 @@ class ScriptPathsTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "legacy compatibility"):
                     module.qlib_provider_uri("cleaned")
+
+    def test_workflow_provider_errors_use_public_provider_terminology(self):
+        module = load_module()
+        with patch.dict(
+            os.environ,
+            {
+                "QLIB_PROVIDER_URI": "/legacy/provider",
+                "QLIB_CLEANED_PROVIDER_URI": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError) as override_error:
+                module.qlib_direct_provider_descriptor()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(RuntimeError) as workflow_error:
+                module.qlib_workflow_init_config(provider_uri=Path(temp_dir))
+
+        for message in (str(override_error.exception), str(workflow_error.exception)):
+            self.assertIn("Qlib Provider", message)
+            self.assertNotRegex(message, r"(?i)direct provider|native V2|\.bin")
+
+    def test_workflow_provider_resolves_an_approved_opaque_lineage(self):
+        module = load_module()
+        pinned = Path("/quant_data/runtime/qlib_provider/canonical")
+        identity = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+
+        with patch.object(
+            module,
+            "_resolve_approved_workflow_provider_uri",
+            return_value=pinned,
+            create=True,
+        ) as resolver:
+            resolved = module.qlib_workflow_provider_uri(
+                "canonical",
+                expected_provider_identity=identity,
+            )
+
+        self.assertEqual(resolved, pinned)
+        resolver.assert_called_once_with("canonical", identity)
+
+    def test_workflow_provider_accepts_an_append_only_successor(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            frozen_provider = root / "providers" / "frozen"
+            current_provider = root / "providers" / "current"
+            frozen_snapshot = root / "snapshots" / "frozen"
+            current_snapshot = root / "snapshots" / "current"
+            for provider in (frozen_provider, current_provider):
+                provider.mkdir(parents=True)
+                (provider / "PROVIDER_DESCRIPTOR.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+            for snapshot in (frozen_snapshot, current_snapshot):
+                (snapshot / "bars").mkdir(parents=True)
+
+            frozen_bar = frozen_snapshot / "bars" / "SH600000.parquet"
+            current_bar = current_snapshot / "bars" / "SH600000.parquet"
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-08-07", "2026-08-08"]),
+                    "close": [10.0, 10.5],
+                }
+            ).to_parquet(frozen_bar, index=False)
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(
+                        ["2026-08-07", "2026-08-08", "2026-08-10"]
+                    ),
+                    "close": [10.0, 10.5, 10.8],
+                }
+            ).to_parquet(current_bar, index=False)
+
+            def digest(path: Path) -> str:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            frozen_context = SimpleNamespace(
+                snapshot_path=frozen_snapshot,
+                file_index=pd.DataFrame(
+                    [
+                        {
+                            "symbol": "SH600000",
+                            "relative_path": "bars/SH600000.parquet",
+                            "row_count": 2,
+                            "first_date": "2026-08-07",
+                            "last_date": "2026-08-08",
+                            "sha256": digest(frozen_bar),
+                        }
+                    ]
+                ),
+                index_snapshot_path=None,
+                index_file_index=None,
+                calendar=pd.DatetimeIndex(pd.to_datetime(["2026-08-07", "2026-08-08"])),
+                membership=pd.DataFrame(
+                    {
+                        "symbol": ["SH600000"],
+                        "index_code": ["000300.XSHG"],
+                        "start_date": pd.to_datetime(["2026-08-07"]),
+                        "end_date": pd.to_datetime(["2026-08-08"]),
+                    }
+                ),
+                cleaning={"mode": "canonical"},
+            )
+            current_context = SimpleNamespace(
+                snapshot_path=current_snapshot,
+                file_index=pd.DataFrame(
+                    [
+                        {
+                            "symbol": "SH600000",
+                            "relative_path": "bars/SH600000.parquet",
+                            "row_count": 3,
+                            "first_date": "2026-08-07",
+                            "last_date": "2026-08-10",
+                            "sha256": digest(current_bar),
+                        }
+                    ]
+                ),
+                index_snapshot_path=None,
+                index_file_index=None,
+                calendar=pd.DatetimeIndex(
+                    pd.to_datetime(["2026-08-07", "2026-08-08", "2026-08-10"])
+                ),
+                membership=pd.DataFrame(
+                    {
+                        "symbol": ["SH600000"],
+                        "index_code": ["000300.XSHG"],
+                        "start_date": pd.to_datetime(["2026-08-07"]),
+                        "end_date": pd.to_datetime(["2026-08-10"]),
+                    }
+                ),
+                cleaning={"mode": "canonical"},
+            )
+
+            with patch.object(module, "quant_data_root", return_value=root), patch.object(
+                module, "qlib_direct_provider_uri", return_value=current_provider
+            ), patch.object(
+                module,
+                "_load_direct_provider_context",
+                side_effect=[frozen_context, current_context],
+                create=True,
+            ):
+                resolved = module.qlib_workflow_provider_uri(
+                    "cleaned", append_only_from=frozen_provider
+                )
+
+            self.assertEqual(resolved, current_provider)
+
+    def test_workflow_provider_rejects_a_rewritten_historical_row(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "quant_data"
+            frozen_provider = root / "providers" / "frozen"
+            current_provider = root / "providers" / "current"
+            frozen_snapshot = root / "snapshots" / "frozen"
+            current_snapshot = root / "snapshots" / "current"
+            for provider in (frozen_provider, current_provider):
+                provider.mkdir(parents=True)
+                (provider / "PROVIDER_DESCRIPTOR.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+            for snapshot in (frozen_snapshot, current_snapshot):
+                (snapshot / "bars").mkdir(parents=True)
+
+            frozen_bar = frozen_snapshot / "bars" / "SH600000.parquet"
+            current_bar = current_snapshot / "bars" / "SH600000.parquet"
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-08-07", "2026-08-08"]),
+                    "close": [10.0, 10.5],
+                }
+            ).to_parquet(frozen_bar, index=False)
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(
+                        ["2026-08-07", "2026-08-08", "2026-08-10"]
+                    ),
+                    "close": [9.9, 10.5, 10.8],
+                }
+            ).to_parquet(current_bar, index=False)
+
+            def context(snapshot: Path, path: Path, rows: int, last: str):
+                return SimpleNamespace(
+                    snapshot_path=snapshot,
+                    file_index=pd.DataFrame(
+                        [
+                            {
+                                "symbol": "SH600000",
+                                "relative_path": "bars/SH600000.parquet",
+                                "row_count": rows,
+                                "first_date": "2026-08-07",
+                                "last_date": last,
+                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            }
+                        ]
+                    ),
+                    index_snapshot_path=None,
+                    index_file_index=None,
+                    calendar=pd.DatetimeIndex(
+                        pd.to_datetime(
+                            ["2026-08-07", "2026-08-08"]
+                            if rows == 2
+                            else ["2026-08-07", "2026-08-08", "2026-08-10"]
+                        )
+                    ),
+                    membership=pd.DataFrame(
+                        {
+                            "symbol": ["SH600000"],
+                            "index_code": ["000300.XSHG"],
+                            "start_date": pd.to_datetime(["2026-08-07"]),
+                            "end_date": pd.to_datetime([last]),
+                        }
+                    ),
+                    cleaning={"mode": "canonical"},
+                )
+
+            with patch.object(module, "quant_data_root", return_value=root), patch.object(
+                module, "qlib_direct_provider_uri", return_value=current_provider
+            ), patch.object(
+                module,
+                "_load_direct_provider_context",
+                side_effect=[
+                    context(frozen_snapshot, frozen_bar, 2, "2026-08-08"),
+                    context(current_snapshot, current_bar, 3, "2026-08-10"),
+                ],
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    module.QlibProviderHistoryError, "historical bars changed"
+                ):
+                    module.qlib_workflow_provider_uri(
+                        "cleaned", append_only_from=frozen_provider
+                    )
 
     def test_native_provider_override_accepts_validated_snapshot_path(self):
         module = load_module()

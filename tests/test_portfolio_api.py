@@ -179,6 +179,254 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertAlmostEqual(account_snapshot["total_market_value"], 11000.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_equity"], 11000.0, places=6)
 
+    def test_snapshot_include_realtime_false_skips_realtime_quote(self) -> None:
+        today = date.today()
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Fast", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": today.isoformat(),
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
+        self._save_close("600519", today, 118.0)
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            side_effect=AssertionError("include_realtime=false should not fetch realtime quote"),
+        ):
+            snapshot_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={
+                    "account_id": account_id,
+                    "as_of": today.isoformat(),
+                    "include_realtime": "false",
+                },
+            )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["price_source"], "history_close")
+        self.assertAlmostEqual(position["last_price"], 118.0, places=6)
+
+    def test_snapshot_exposes_partial_quality_fields_for_mixed_position_markets(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Mixed", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "7203.T",
+                "trade_date": "2026-01-02",
+                "side": "buy",
+                "quantity": 10,
+                "price": 1000,
+                "fee": 0,
+                "tax": 0,
+                "market": "jp",
+                "currency": "JPY",
+            },
+        )
+        self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
+        self._save_close("7203.T", date(2026, 1, 3), 1200.0)
+
+        snapshot_resp = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"as_of": "2026-01-03"},
+        )
+        self.assertEqual(snapshot_resp.status_code, 200)
+        payload = snapshot_resp.json()
+        self.assertEqual(payload["data_quality"], "partial")
+        self.assertIn("fx_and_cost_basis_partial", payload["limitations"])
+        account_snapshot = payload["accounts"][0]
+        position = account_snapshot["positions"][0]
+
+        self.assertEqual(account_snapshot["market"], "cn")
+        self.assertEqual(account_snapshot["data_quality"], "partial")
+        self.assertIn("fx_and_cost_basis_partial", account_snapshot["limitations"])
+        self.assertEqual(position["market"], "jp")
+        self.assertEqual(position["data_quality"], "partial")
+        self.assertIn("realtime_quote_best_effort", position["limitations"])
+
+    def test_delete_account_deactivates_without_hard_deleting(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Mistyped", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        delete_resp = self.client.delete(f"/api/v1/portfolio/accounts/{account_id}")
+        self.assertEqual(delete_resp.status_code, 200)
+        self.assertEqual(delete_resp.json()["deleted"], 1)
+
+        active_resp = self.client.get("/api/v1/portfolio/accounts")
+        self.assertEqual(active_resp.status_code, 200)
+        self.assertEqual(active_resp.json()["accounts"], [])
+
+        inactive_resp = self.client.get(
+            "/api/v1/portfolio/accounts",
+            params={"include_inactive": True},
+        )
+        self.assertEqual(inactive_resp.status_code, 200)
+        inactive_accounts = inactive_resp.json()["accounts"]
+        self.assertEqual(len(inactive_accounts), 1)
+        self.assertEqual(inactive_accounts[0]["id"], account_id)
+        self.assertFalse(inactive_accounts[0]["is_active"])
+
+        snapshot_resp = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"account_id": account_id, "as_of": "2026-01-03"},
+        )
+        self.assertEqual(snapshot_resp.status_code, 400)
+        self.assertEqual(snapshot_resp.json()["error"], "validation_error")
+
+    def test_event_lists_hide_archived_account_rows_by_default(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Archived", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        cash_resp = self.client.post(
+            "/api/v1/portfolio/cash-ledger",
+            json={
+                "account_id": account_id,
+                "event_date": "2026-01-01",
+                "direction": "in",
+                "amount": 10000,
+                "currency": "CNY",
+            },
+        )
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": "2026-01-02",
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        corp_resp = self.client.post(
+            "/api/v1/portfolio/corporate-actions",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "effective_date": "2026-01-03",
+                "action_type": "cash_dividend",
+                "market": "cn",
+                "currency": "CNY",
+                "cash_dividend_per_share": 1.0,
+            },
+        )
+        self.assertEqual(cash_resp.status_code, 200)
+        self.assertEqual(trade_resp.status_code, 200)
+        self.assertEqual(corp_resp.status_code, 200)
+
+        delete_resp = self.client.delete(f"/api/v1/portfolio/accounts/{account_id}")
+        self.assertEqual(delete_resp.status_code, 200)
+
+        for endpoint in (
+            "/api/v1/portfolio/trades",
+            "/api/v1/portfolio/cash-ledger",
+            "/api/v1/portfolio/corporate-actions",
+        ):
+            list_resp = self.client.get(endpoint)
+            self.assertEqual(list_resp.status_code, 200, list_resp.text)
+            payload = list_resp.json()
+            self.assertEqual(payload["total"], 0)
+            self.assertEqual(payload["items"], [])
+
+    def test_default_risk_hides_archived_account_snapshot_drawdown(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Archived Risk", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        cash_resp = self.client.post(
+            "/api/v1/portfolio/cash-ledger",
+            json={
+                "account_id": account_id,
+                "event_date": "2026-01-01",
+                "direction": "in",
+                "amount": 20000,
+                "currency": "CNY",
+            },
+        )
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": "2026-01-01",
+                "side": "buy",
+                "quantity": 100,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(cash_resp.status_code, 200)
+        self.assertEqual(trade_resp.status_code, 200)
+        self._save_close("600519", date(2026, 1, 1), 100.0)
+        self._save_close("600519", date(2026, 1, 2), 70.0)
+
+        before_archive = self.client.get(
+            "/api/v1/portfolio/risk",
+            params={"as_of": "2026-01-02", "cost_method": "fifo"},
+        )
+        self.assertEqual(before_archive.status_code, 200, before_archive.text)
+        before_payload = before_archive.json()
+        self.assertGreaterEqual(before_payload["drawdown"]["series_points"], 2)
+        self.assertGreater(before_payload["drawdown"]["max_drawdown_pct"], 10.0)
+        self.assertTrue(before_payload["drawdown"]["alert"])
+
+        delete_resp = self.client.delete(f"/api/v1/portfolio/accounts/{account_id}")
+        self.assertEqual(delete_resp.status_code, 200)
+
+        after_archive = self.client.get(
+            "/api/v1/portfolio/risk",
+            params={"as_of": "2026-01-02", "cost_method": "fifo"},
+        )
+        self.assertEqual(after_archive.status_code, 200, after_archive.text)
+        after_payload = after_archive.json()
+        self.assertAlmostEqual(after_payload["concentration"]["total_market_value"], 0.0, places=6)
+        self.assertEqual(after_payload["drawdown"]["series_points"], 0)
+        self.assertAlmostEqual(after_payload["drawdown"]["max_drawdown_pct"], 0.0, places=6)
+        self.assertAlmostEqual(after_payload["drawdown"]["current_drawdown_pct"], 0.0, places=6)
+        self.assertFalse(after_payload["drawdown"]["alert"])
+
     def test_position_analysis_accepts_real_holding_and_passes_internal_context(self) -> None:
         account_id = self._create_position(quantity=10)
         accepted_task = SimpleNamespace(

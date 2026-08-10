@@ -27,6 +27,15 @@ PROVIDER_IDENTITY_FIELDS = (
     "content_sha256",
     "manifest_sha256",
 )
+PROVIDER_OPTIONAL_IDENTITY_FIELDS = (
+    "descriptor_path",
+    "descriptor_sha256",
+    "cleaning_mode",
+    "index_dataset_id",
+    "index_snapshot_id",
+    "index_content_sha256",
+    "index_manifest_sha256",
+)
 PREDICTION_ARTIFACTS = {"pred.pkl", "label.pkl"}
 ARTIFACT_SHA256_TAGS = {
     "pred.pkl": "dsa.artifact.pred_sha256",
@@ -50,6 +59,178 @@ class RunProvenanceError(RuntimeError):
     """Raised when a prediction Run cannot prove its data lineage."""
 
 
+def normalize_provider_lineage(identity: Mapping[str, Any]) -> dict[str, str]:
+    """Return a validated, path-independent Provider lineage record.
+
+    Storage-specific fields are interpreted only in this provenance adapter.
+    Business callers can treat the returned mapping as opaque content lineage.
+    """
+
+    if not isinstance(identity, Mapping):
+        raise RunProvenanceError("provider lineage must be an object")
+    contract = str(identity.get("provider_contract") or "")
+    if contract == "direct_parquet_v1":
+        fields = (*PROVIDER_IDENTITY_FIELDS, *PROVIDER_OPTIONAL_IDENTITY_FIELDS)
+    elif contract == "immutable_snapshot_v2":
+        fields = PROVIDER_IDENTITY_FIELDS
+    else:
+        raise RunProvenanceError("provider lineage contract is unsupported")
+
+    normalized = {field: str(identity.get(field) or "") for field in fields}
+    if any(not value for value in normalized.values()):
+        raise RunProvenanceError("provider lineage is incomplete")
+    snapshot_id = normalized["snapshot_id"]
+    if Path(snapshot_id).name != snapshot_id or snapshot_id in {".", ".."}:
+        raise RunProvenanceError("provider lineage snapshot id is invalid")
+    if any(
+        not SHA256_RE.fullmatch(normalized[field])
+        for field in ("content_sha256", "manifest_sha256")
+    ):
+        raise RunProvenanceError("provider lineage hashes are invalid")
+
+    if contract == "direct_parquet_v1":
+        descriptor_path = Path(normalized["descriptor_path"])
+        index_snapshot_id = normalized["index_snapshot_id"]
+        if (
+            descriptor_path.is_absolute()
+            or ".." in descriptor_path.parts
+            or descriptor_path.name != "PROVIDER_DESCRIPTOR.json"
+            or Path(index_snapshot_id).name != index_snapshot_id
+            or index_snapshot_id in {".", ".."}
+            or normalized["cleaning_mode"] not in {"canonical", "cleaned"}
+            or any(
+                not SHA256_RE.fullmatch(normalized[field])
+                for field in (
+                    "descriptor_sha256",
+                    "index_content_sha256",
+                    "index_manifest_sha256",
+                )
+            )
+        ):
+            raise RunProvenanceError("provider lineage metadata is invalid")
+    return normalized
+
+
+def provider_lineage_is_complete(identity: Mapping[str, Any] | None) -> bool:
+    """Return whether a Provider lineage record is complete and well formed."""
+
+    if not isinstance(identity, Mapping):
+        return False
+    try:
+        normalize_provider_lineage(identity)
+    except RunProvenanceError:
+        return False
+    return True
+
+
+def provider_lineages_match(
+    actual: Mapping[str, Any] | None,
+    expected: Mapping[str, Any] | None,
+) -> bool:
+    """Compare two Provider lineage records without exposing storage semantics."""
+
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return False
+    try:
+        return normalize_provider_lineage(actual) == normalize_provider_lineage(expected)
+    except RunProvenanceError:
+        return False
+
+
+def _safe_direct_descriptor_path(
+    identity: Mapping[str, Any],
+    *,
+    quant_data_root: Path,
+) -> Path:
+    raw = str(identity.get("descriptor_path") or "")
+    if not raw:
+        raise RunProvenanceError("Qlib Provider descriptor path is missing")
+    root = Path(quant_data_root).expanduser().resolve()
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise RunProvenanceError(
+                "Qlib Provider descriptor must stay under QUANT_DATA_ROOT"
+            ) from exc
+    else:
+        if ".." in candidate.parts:
+            raise RunProvenanceError("Qlib Provider descriptor path is invalid")
+        candidate = (root / candidate).resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise RunProvenanceError(
+            "Qlib Provider descriptor must stay under QUANT_DATA_ROOT"
+        ) from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RunProvenanceError("Qlib Provider descriptor cannot contain symlinks")
+    if candidate.name != "PROVIDER_DESCRIPTOR.json" or not candidate.is_file():
+        raise RunProvenanceError("Qlib Provider descriptor is unavailable")
+    return candidate
+
+
+def _load_direct_descriptor_context(
+    descriptor_path: Path,
+    quant_data_root: Path,
+) -> dict[str, str]:
+    try:
+        from quant_workflow.quant_data_qlib_provider import _load_descriptor
+
+        context = _load_descriptor(descriptor_path, quant_data_root)
+    except Exception as exc:
+        raise RunProvenanceError(
+            "Qlib Provider descriptor failed its integrity check"
+        ) from exc
+    payload = context.descriptor
+    dataset = payload.get("dataset")
+    if not isinstance(dataset, Mapping):
+        raise RunProvenanceError("Qlib Provider stock dataset identity is missing")
+    index_dataset = payload.get("index_dataset")
+    cleaning = payload.get("cleaning") or {}
+    return {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": str(dataset.get("dataset_id") or ""),
+        "snapshot_id": str(dataset.get("snapshot_id") or ""),
+        "content_sha256": str(dataset.get("content_sha256") or ""),
+        "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
+        "descriptor_sha256": _sha256_file(descriptor_path),
+        "descriptor_path": descriptor_path.relative_to(
+            Path(quant_data_root).expanduser().resolve()
+        ).as_posix(),
+        "cleaning_mode": str(cleaning.get("mode") or "canonical"),
+        "index_dataset_id": str(
+            index_dataset.get("dataset_id") or ""
+            if isinstance(index_dataset, Mapping)
+            else ""
+        ),
+        "index_snapshot_id": str(
+            index_dataset.get("snapshot_id") or ""
+            if isinstance(index_dataset, Mapping)
+            else ""
+        ),
+        "index_content_sha256": str(
+            index_dataset.get("content_sha256") or ""
+            if isinstance(index_dataset, Mapping)
+            else ""
+        ),
+        "index_manifest_sha256": str(
+            index_dataset.get("manifest_sha256") or ""
+            if isinstance(index_dataset, Mapping)
+            else ""
+        ),
+    }
+
+
+def _identity_matches(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    return provider_lineages_match(actual, expected)
+
+
 def resolve_immutable_provider_identity(
     identity: Mapping[str, Any],
     *,
@@ -62,9 +243,32 @@ def resolve_immutable_provider_identity(
     path must never regain authority merely because it is still present.
     """
 
+    if identity.get("provider_contract") == "direct_parquet_v1":
+        root = Path(quant_data_root).expanduser().resolve()
+        descriptor = _safe_direct_descriptor_path(
+            identity,
+            quant_data_root=root,
+        )
+        actual = _load_direct_descriptor_context(descriptor, root)
+        if actual.get("dataset_id") != "ashare_daily_qfq":
+            raise RunProvenanceError(
+                "Qlib Provider must use the formal ashare_daily_qfq dataset"
+            )
+        if not SHA256_RE.fullmatch(actual.get("content_sha256", "")) or not SHA256_RE.fullmatch(
+            actual.get("manifest_sha256", "")
+        ):
+            raise RunProvenanceError("Qlib Provider stock snapshot identity is incomplete")
+        if not SHA256_RE.fullmatch(actual.get("descriptor_sha256", "")):
+            raise RunProvenanceError("Qlib Provider descriptor hash is invalid")
+        if not _identity_matches(actual, identity):
+            raise RunProvenanceError(
+                "Qlib Provider descriptor does not match the MLflow provider identity"
+            )
+        return descriptor.parent
+
     if identity.get("provider_contract") != "immutable_snapshot_v2":
         raise RunProvenanceError(
-            "selected training run does not record an immutable native V2 provider"
+            "selected training run does not record a supported Qlib Provider"
         )
     dataset_id = str(identity.get("dataset_id") or "")
     snapshot_id = str(identity.get("snapshot_id") or "")
@@ -92,7 +296,7 @@ def resolve_immutable_provider_identity(
     snapshot = (dataset_root / "snapshots" / snapshot_id).resolve()
     expected_parent = (dataset_root / "snapshots").resolve()
     if snapshot.parent != expected_parent or snapshot.is_symlink():
-        raise RunProvenanceError("selected provider is not an immutable native snapshot")
+        raise RunProvenanceError("selected Qlib Provider snapshot is invalid")
     try:
         manifest = validate_qlib_snapshot(
             snapshot,
@@ -101,7 +305,7 @@ def resolve_immutable_provider_identity(
         )
     except (DataContractError, OSError, ValueError, TypeError) as exc:
         raise RunProvenanceError(
-            "selected native Qlib snapshot failed its integrity check"
+            "selected Qlib Provider snapshot failed its integrity check"
         ) from exc
     manifest_path = snapshot / "DATASET_MANIFEST.json"
     actual_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -116,7 +320,7 @@ def resolve_immutable_provider_identity(
         or actual_manifest_sha256 != manifest_sha256
     ):
         raise RunProvenanceError(
-            "selected native Qlib snapshot does not match the MLflow provider identity"
+            "selected Qlib Provider snapshot does not match the MLflow provider identity"
         )
     return snapshot
 
@@ -130,19 +334,25 @@ def resolve_approved_provider_identity(
     """Resolve one API-approved provider identity without consulting LATEST."""
 
     provider_name = str(provider or "canonical").strip().lower()
-    expected_dataset_id = PROVIDER_DATASET_IDS.get(provider_name)
-    if expected_dataset_id is None:
+    if provider_name not in PROVIDER_DATASET_IDS:
         raise RunProvenanceError("approved provider name is unsupported")
-    if identity.get("dataset_id") != expected_dataset_id:
+    normalized = normalize_provider_lineage(identity)
+    if normalized["provider_contract"] == "direct_parquet_v1":
+        selection_matches = normalized.get("cleaning_mode") == provider_name
+    else:
+        selection_matches = (
+            normalized.get("dataset_id") == PROVIDER_DATASET_IDS[provider_name]
+        )
+    if not selection_matches:
         raise RunProvenanceError(
             "approved provider identity does not match the selected provider"
         )
     snapshot = resolve_immutable_provider_identity(
-        identity,
+        normalized,
         quant_data_root=quant_data_root,
     )
-    actual = provider_identity(snapshot)
-    if any(actual.get(field) != identity.get(field) for field in PROVIDER_IDENTITY_FIELDS):
+    actual = provider_identity(snapshot, quant_data_root=quant_data_root)
+    if not _identity_matches(actual, normalized):
         raise RunProvenanceError(
             "approved provider identity changed before training started"
         )
@@ -170,7 +380,11 @@ def _file_store_provider_identity(run_dir: Path) -> dict[str, str]:
     if not tags_dir.is_dir() or tags_dir.is_symlink():
         raise RunProvenanceError("MLflow run provider identity tags are unavailable")
     identity: dict[str, str] = {}
-    for field in (*PROVIDER_IDENTITY_FIELDS, "provider_uri"):
+    for field in (
+        *PROVIDER_IDENTITY_FIELDS,
+        *PROVIDER_OPTIONAL_IDENTITY_FIELDS,
+        "provider_uri",
+    ):
         tag_path = tags_dir / f"{TAG_PREFIX}{field}"
         if not tag_path.is_file() or tag_path.is_symlink():
             if field in PROVIDER_IDENTITY_FIELDS:
@@ -301,8 +515,62 @@ def validate_file_store_run_artifact(
     }
 
 
-def provider_identity(provider_uri: Path) -> dict[str, str]:
+def provider_identity(
+    provider_uri: Path,
+    *,
+    quant_data_root: Path | None = None,
+) -> dict[str, str]:
     provider = Path(provider_uri).expanduser().resolve()
+    descriptor = (
+        provider
+        if provider.name == "PROVIDER_DESCRIPTOR.json"
+        else provider / "PROVIDER_DESCRIPTOR.json"
+    )
+    if descriptor.is_file():
+        try:
+            payload = json.loads(descriptor.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RunProvenanceError("Qlib Provider descriptor is invalid") from exc
+        dataset = payload.get("dataset")
+        if not isinstance(dataset, Mapping):
+            raise RunProvenanceError("Qlib Provider stock dataset identity is missing")
+        index_dataset = payload.get("index_dataset")
+        cleaning = payload.get("cleaning") or {}
+        root = (
+            Path(quant_data_root).expanduser().resolve()
+            if quant_data_root is not None
+            else Path(provider)
+        )
+        if quant_data_root is None:
+            for parent in [provider, *provider.parents]:
+                if parent.name == "quant_data":
+                    root = parent
+                    break
+        try:
+            descriptor_path = descriptor.relative_to(root).as_posix()
+        except ValueError:
+            descriptor_path = descriptor.as_posix()
+        identity: dict[str, str] = {
+            "provider_uri": str(descriptor.parent),
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": str(dataset.get("dataset_id") or ""),
+            "snapshot_id": str(dataset.get("snapshot_id") or ""),
+            "content_sha256": str(dataset.get("content_sha256") or ""),
+            "manifest_sha256": str(dataset.get("manifest_sha256") or ""),
+            "descriptor_path": descriptor_path,
+            "descriptor_sha256": _sha256_file(descriptor),
+            "cleaning_mode": str(cleaning.get("mode") or "canonical"),
+        }
+        if isinstance(index_dataset, Mapping):
+            identity.update(
+                {
+                    "index_dataset_id": str(index_dataset.get("dataset_id") or ""),
+                    "index_snapshot_id": str(index_dataset.get("snapshot_id") or ""),
+                    "index_content_sha256": str(index_dataset.get("content_sha256") or ""),
+                    "index_manifest_sha256": str(index_dataset.get("manifest_sha256") or ""),
+                }
+            )
+        return identity
     identity = {
         "provider_uri": str(provider),
         "provider_contract": "path_only_override",
@@ -356,11 +624,8 @@ def revalidate_provider_identity(
         raise RunProvenanceError(
             "selected provider path changed after training approval"
         )
-    actual_identity = provider_identity(provider)
-    if any(
-        actual_identity.get(field) != expected_identity.get(field)
-        for field in PROVIDER_IDENTITY_FIELDS
-    ):
+    actual_identity = provider_identity(provider, quant_data_root=quant_data_root)
+    if not _identity_matches(actual_identity, expected_identity):
         raise RunProvenanceError(
             "selected provider identity changed during training"
         )

@@ -401,9 +401,7 @@ def test_resolve_provider_consumes_only_the_frozen_readiness_artifact(
     consume.assert_called_once_with(
         artifact_path=artifact,
         artifact_sha256="a" * 64,
-        provider_root=(
-            tmp_path / "quant_data" / "runtime" / "robust_strategy" / "providers"
-        ),
+        provider_root=tmp_path / "quant_data" / "runtime",
         reports_dir=tmp_path / "reports",
     )
 

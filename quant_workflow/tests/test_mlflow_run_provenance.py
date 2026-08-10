@@ -76,6 +76,150 @@ def test_provider_identity_records_native_snapshot(tmp_path: Path) -> None:
     }
 
 
+def test_provider_identity_records_direct_descriptor_lineage(tmp_path: Path) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    provider = quant_data / "runtime" / "qlib_direct" / "provider"
+    provider.mkdir(parents=True)
+    descriptor = {
+        "schema_version": 1,
+        "adapter": "quant_data_qlib_provider",
+        "storage_mode": "direct_parquet",
+        "dataset": {
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        },
+        "index_dataset": {
+            "dataset_id": "cn_index_daily",
+            "snapshot_id": "index-001",
+            "content_sha256": "c" * 64,
+            "manifest_sha256": "d" * 64,
+        },
+        "cleaning": {"mode": "cleaned"},
+    }
+    descriptor_path = provider / "PROVIDER_DESCRIPTOR.json"
+    descriptor_path.write_text(json.dumps(descriptor), encoding="utf-8")
+
+    identity = module.provider_identity(provider, quant_data_root=quant_data)
+
+    assert identity["provider_contract"] == "direct_parquet_v1"
+    assert identity["dataset_id"] == "ashare_daily_qfq"
+    assert identity["snapshot_id"] == "qfq-001"
+    assert identity["descriptor_path"] == "runtime/qlib_direct/provider/PROVIDER_DESCRIPTOR.json"
+    assert identity["descriptor_sha256"] == hashlib.sha256(
+        descriptor_path.read_bytes()
+    ).hexdigest()
+    assert identity["cleaning_mode"] == "cleaned"
+    assert identity["index_snapshot_id"] == "index-001"
+
+
+def test_provider_lineage_helpers_hide_storage_contract_from_callers() -> None:
+    module = load_module()
+    lineage = {
+        "provider_uri": "/quant_data/runtime/provider",
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-001",
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+        "descriptor_path": "runtime/provider/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": "c" * 64,
+        "cleaning_mode": "cleaned",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "index-001",
+        "index_content_sha256": "d" * 64,
+        "index_manifest_sha256": "e" * 64,
+    }
+
+    normalized = module.normalize_provider_lineage(lineage)
+
+    assert "provider_uri" not in normalized
+    assert module.provider_lineage_is_complete(lineage) is True
+    assert module.provider_lineages_match(normalized, lineage) is True
+    assert module.provider_lineages_match(
+        {**normalized, "snapshot_id": "qfq-002"}, lineage
+    ) is False
+
+
+def test_provider_lineage_helpers_reject_path_only_overrides() -> None:
+    module = load_module()
+
+    assert module.provider_lineage_is_complete(
+        {"provider_contract": "path_only_override", "provider_uri": "/mutable"}
+    ) is False
+    with pytest.raises(module.RunProvenanceError, match="provider lineage"):
+        module.normalize_provider_lineage(
+            {"provider_contract": "path_only_override", "provider_uri": "/mutable"}
+        )
+
+
+def test_direct_provider_identity_resolves_descriptor_without_saved_absolute_path(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    provider = quant_data / "runtime" / "qlib_direct" / "provider"
+    provider.mkdir(parents=True)
+    descriptor_path = provider / "PROVIDER_DESCRIPTOR.json"
+    descriptor_path.write_text("{}", encoding="utf-8")
+    identity = {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "qfq-001",
+        "content_sha256": "a" * 64,
+        "manifest_sha256": "b" * 64,
+        "descriptor_path": "runtime/qlib_direct/provider/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": hashlib.sha256(descriptor_path.read_bytes()).hexdigest(),
+        "cleaning_mode": "canonical",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "index-001",
+        "index_content_sha256": "c" * 64,
+        "index_manifest_sha256": "d" * 64,
+    }
+
+    with patch.object(module, "_load_direct_descriptor_context") as load_context:
+        load_context.return_value = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "qfq-001",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_sha256": identity["descriptor_sha256"],
+            "descriptor_path": identity["descriptor_path"],
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-001",
+            "index_content_sha256": "c" * 64,
+            "index_manifest_sha256": "d" * 64,
+        }
+        resolved = module.resolve_immutable_provider_identity(
+            identity,
+            quant_data_root=quant_data,
+        )
+
+    assert resolved == provider
+    load_context.assert_called_once()
+
+
+def test_descriptor_errors_use_public_provider_terminology(tmp_path: Path) -> None:
+    module = load_module()
+
+    with pytest.raises(module.RunProvenanceError, match="Qlib Provider") as caught:
+        module.resolve_immutable_provider_identity(
+            {
+                "provider_contract": "direct_parquet_v1",
+                "dataset_id": "ashare_daily_qfq",
+            },
+            quant_data_root=tmp_path,
+        )
+
+    message = str(caught.value)
+    assert "direct provider" not in message.lower()
+    assert "native v2" not in message.lower()
+
+
 def test_approved_provider_identity_is_rechecked_before_training(
     tmp_path: Path,
 ) -> None:
@@ -207,7 +351,7 @@ def test_resolve_identity_rejects_path_only_compatibility_report(
 ) -> None:
     module = load_module()
 
-    with pytest.raises(module.RunProvenanceError, match="immutable native V2"):
+    with pytest.raises(module.RunProvenanceError, match="Qlib Provider") as caught:
         module.resolve_immutable_provider_identity(
             {
                 "provider_uri": str(
@@ -217,6 +361,8 @@ def test_resolve_identity_rejects_path_only_compatibility_report(
             },
             quant_data_root=tmp_path,
         )
+
+    assert "native v2" not in str(caught.value).lower()
 
 
 def test_resolve_identity_rejects_dataset_root_symlink_outside_quant_data(

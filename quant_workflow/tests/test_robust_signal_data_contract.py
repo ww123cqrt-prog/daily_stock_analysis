@@ -22,6 +22,25 @@ from robust_signal_data_contract import (
 )
 
 
+def _cleaned_provider_lineage(
+    *, snapshot_id: str = "cleaned-snapshot-v2"
+) -> dict[str, str]:
+    return {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": "c" * 64,
+        "content_sha256": "d" * 64,
+        "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+        "descriptor_sha256": "e" * 64,
+        "cleaning_mode": "cleaned",
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "index-snapshot-v2",
+        "index_content_sha256": "f" * 64,
+        "index_manifest_sha256": "a" * 64,
+    }
+
+
 def _write_quality_evidence(
     reports_dir: Path,
     *,
@@ -30,12 +49,7 @@ def _write_quality_evidence(
     cleaned_quality_overrides: dict[str, object] | None = None,
 ) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
-    cleaned_identity = {
-        "dataset_id": "qlib_ashare_cleaned_v2",
-        "snapshot_id": "cleaned-snapshot-v2",
-        "manifest_sha256": "c" * 64,
-        "content_sha256": "d" * 64,
-    }
+    cleaned_identity = _cleaned_provider_lineage()
     snapshot_state = {
         "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
         "file_count": 10,
@@ -160,12 +174,7 @@ def _write_accepted_consumer_fixture(
 
     quality_pointer = _write_quality_evidence(reports_dir)
     quality_publication = json.loads(quality_pointer.read_text(encoding="utf-8"))
-    cleaned_identity = {
-        "dataset_id": "qlib_ashare_cleaned_v2",
-        "snapshot_id": "cleaned-snapshot-v2",
-        "manifest_sha256": "c" * 64,
-        "content_sha256": "d" * 64,
-    }
+    cleaned_identity = _cleaned_provider_lineage()
     readiness_payload = {
         "contract_version": CONTRACT_VERSION,
         "acceptance_owner": ACCEPTANCE_OWNER,
@@ -230,12 +239,7 @@ def test_quality_evidence_accepts_trainable_cleaned_provider(
 
     loaded = load_verified_cleaned_quality_evidence(pointer_path)
 
-    assert loaded["cleaned_provider_identity"] == {
-        "dataset_id": "qlib_ashare_cleaned_v2",
-        "snapshot_id": "cleaned-snapshot-v2",
-        "manifest_sha256": "c" * 64,
-        "content_sha256": "d" * 64,
-    }
+    assert loaded["cleaned_provider_identity"] == _cleaned_provider_lineage()
 
 
 def test_quality_evidence_requires_cleaned_provider_quality(
@@ -339,12 +343,9 @@ def test_readiness_rejects_provider_content_changed_after_attestation(
     quality = {
         "quality_report_id": "data-quality-" + "a" * 16,
         "quality_evidence_sha256": "a" * 64,
-        "cleaned_provider_identity": {
-            "dataset_id": "qlib_ashare_cleaned_v2",
-            "snapshot_id": "cleaned-v2",
-            "manifest_sha256": "b" * 64,
-            "content_sha256": "c" * 64,
-        },
+        "cleaned_provider_identity": _cleaned_provider_lineage(
+            snapshot_id="cleaned-v2"
+        ),
     }
     status_path = tmp_path / "readiness.json"
     status_path.write_text(
@@ -412,12 +413,9 @@ def test_readiness_rejects_when_latest_quality_evidence_no_longer_matches(
         "data_manifest_sha256": file_sha256(manifest),
         "quality_report_id": "data-quality-" + "1" * 16,
         "quality_evidence_sha256": "1" * 64,
-        "cleaned_provider_identity": {
-            "dataset_id": "qlib_ashare_cleaned_v2",
-            "snapshot_id": "cleaned-v1",
-            "manifest_sha256": "2" * 64,
-            "content_sha256": "3" * 64,
-        },
+        "cleaned_provider_identity": _cleaned_provider_lineage(
+            snapshot_id="cleaned-v1"
+        ),
     }
     status_path = tmp_path / "readiness.json"
     status_path.write_text(json.dumps(status), encoding="utf-8")

@@ -12,7 +12,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
 import pandas as pd
 from pandas.api.types import is_bool_dtype
 
@@ -20,7 +19,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import quant_data_root, reports_root  # noqa: E402
+from _paths import (  # noqa: E402
+    init_qlib_workflow,
+    provider_calendar_days,
+    quant_data_root,
+    reports_root,
+)
 from _robust_reference_integrity import (  # noqa: E402
     ReferenceIntegrityError,
     reference_read_lock,
@@ -85,10 +89,10 @@ def _to_dates(values: Iterable[Any]) -> pd.Series:
 def _read_calendar(
     provider_dir: Path, start: pd.Timestamp, end: pd.Timestamp
 ) -> tuple[list[pd.Timestamp], str | None]:
-    path = provider_dir / "calendars" / "day.txt"
-    if not path.is_file():
-        return [], f"calendar file is missing: {path}"
-    days = _to_dates(path.read_text(encoding="utf-8").splitlines()).dropna()
+    try:
+        days = _to_dates(provider_calendar_days(provider_dir)).dropna()
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        return [], f"calendar is unavailable: {type(exc).__name__}"
     selected = days[(days >= start) & (days <= end)].drop_duplicates().sort_values()
     if selected.empty:
         return [], f"calendar has no trading days in {start.date()} to {end.date()}"
@@ -184,50 +188,75 @@ def _find_symbol_file(directory: Path, symbol: str) -> Path | None:
 def _benchmark_gaps(
     provider_dir: Path, expected_dates: pd.DatetimeIndex
 ) -> dict[str, list[str]]:
-    calendar_path = provider_dir / "calendars" / "day.txt"
-    if not calendar_path.is_file():
+    if expected_dates.empty:
         return {symbol: ["calendar_missing"] for symbol in REQUIRED_BENCHMARKS}
-    full_calendar = (
-        _to_dates(calendar_path.read_text(encoding="utf-8").splitlines())
-        .dropna()
-        .drop_duplicates()
-        .sort_values()
-    )
-    calendar_positions = {day: index for index, day in enumerate(full_calendar)}
+    try:
+        init_qlib_workflow(provider_uri=Path(provider_dir))
+        from qlib.data import D
+    except Exception:
+        return {
+            symbol: ["qlib_provider_unavailable"]
+            for symbol in REQUIRED_BENCHMARKS
+        }
+
+    qlib_fields = [f"${field}" for field in OHLCV_COLUMNS]
     gaps: dict[str, list[str]] = {}
     for symbol in REQUIRED_BENCHMARKS:
-        feature_dir = provider_dir / "features" / symbol.lower()
+        try:
+            values = D.features(
+                [symbol],
+                qlib_fields,
+                start_time=str(expected_dates[0].date()),
+                end_time=str(expected_dates[-1].date()),
+                freq="day",
+            )
+        except Exception:
+            gaps[symbol] = ["provider_read_error"]
+            continue
+        if not isinstance(values, pd.DataFrame) or values.empty:
+            gaps[symbol] = ["missing_provider_data"]
+            continue
+        missing_fields = [field for field in qlib_fields if field not in values.columns]
+        if missing_fields:
+            gaps[symbol] = [
+                f"{field.lstrip('$')}:missing_field" for field in missing_fields
+            ]
+            continue
+        if isinstance(values.index, pd.MultiIndex):
+            level = (
+                "datetime"
+                if "datetime" in values.index.names
+                else values.index.nlevels - 1
+            )
+            dates = pd.to_datetime(
+                values.index.get_level_values(level),
+                errors="coerce",
+            )
+        else:
+            dates = pd.to_datetime(values.index, errors="coerce")
+        if dates.isna().any() or dates.duplicated().any():
+            gaps[symbol] = ["invalid_provider_dates"]
+            continue
+        frame = values.copy()
+        frame.index = pd.DatetimeIndex(dates).normalize()
         symbol_gaps: list[str] = []
-        for field in OHLCV_COLUMNS:
-            path = feature_dir / f"{field}.day.bin"
-            if not path.is_file():
-                symbol_gaps.append(f"{field}:missing_file")
+        for day in expected_dates:
+            normalized_day = pd.Timestamp(day).normalize()
+            if normalized_day not in frame.index:
+                symbol_gaps.append(str(normalized_day.date()))
                 continue
-            try:
-                raw = np.fromfile(path, dtype="<f4")
-            except OSError:
-                symbol_gaps.append(f"{field}:unreadable")
-                continue
-            if len(raw) < 2 or not math.isfinite(float(raw[0])):
-                symbol_gaps.append(f"{field}:invalid_binary")
-                continue
-            start_index = int(raw[0])
-            values = raw[1:]
-            for day in expected_dates:
-                absolute = calendar_positions.get(day)
-                offset = None if absolute is None else absolute - start_index
-                value = (
-                    float("nan")
-                    if offset is None or offset < 0 or offset >= len(values)
-                    else float(values[offset])
-                )
+            current = frame.loc[normalized_day]
+            for field in OHLCV_COLUMNS:
+                value = pd.to_numeric(current.get(f"${field}"), errors="coerce")
                 valid = math.isfinite(value) and (
                     value >= 0 if field == "volume" else value > 0
                 )
                 if not valid:
-                    symbol_gaps.append(f"{field}:{day.date()}")
+                    symbol_gaps.append(f"{field}:{normalized_day.date()}")
                     if len(symbol_gaps) >= 20:
                         break
+            if len(symbol_gaps) >= 20:
+                break
         if symbol_gaps:
             gaps[symbol] = symbol_gaps[:20]
     return gaps

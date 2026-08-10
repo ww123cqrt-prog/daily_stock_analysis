@@ -22,7 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _paths import (  # noqa: E402
     ashare_qfq_bars_dir,
-    qlib_provider_uri,
+    qlib_native_snapshot_uri,
     quant_data_root,
     reports_root,
     workflow_root,
@@ -534,7 +534,7 @@ def main() -> int:
     parser.add_argument(
         "--benchmark-provider-dir",
         type=Path,
-        default=CANONICAL_QLIB_DIR or qlib_provider_uri(),
+        default=CANONICAL_QLIB_DIR or qlib_native_snapshot_uri(),
     )
     parser.add_argument("--out-dir", type=Path, default=REPORT_DIR)
     parser.add_argument("--no-overwrite", action="store_true")
@@ -548,13 +548,13 @@ def main() -> int:
 
     if not args.dry_run and args.cleaned_merged_dir is None:
         parser.error(
-            "--cleaned-merged-dir is required for mutable legacy output; "
-            "use build_cleaned_qlib_v2.py --publish for native V2"
+            "--cleaned-merged-dir is required for mutable compatibility output; "
+            "use the governed quant_data Qlib Provider publishing workflow"
         )
     if not args.dry_run and not args.skip_qlib_convert and args.qlib_dir is None:
         parser.error(
-            "--qlib-dir is required for mutable legacy output; "
-            "use build_cleaned_qlib_v2.py --publish for native V2"
+            "--qlib-dir is required for mutable compatibility output; "
+            "use the governed quant_data Qlib Provider publishing workflow"
         )
 
     overwrite = not args.no_overwrite

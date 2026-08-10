@@ -168,52 +168,54 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(contract["qlib_backtest_assumptions"]["close_cost"], 0.0015)
         self.assertRegex(contract["config_hash"], r"^[0-9a-f]{64}$")
 
-    def test_approved_identity_resolves_exact_snapshot_without_reading_latest(self):
+    def test_approved_identity_is_passed_to_the_qlib_workflow_provider(self):
         module = load_module()
-        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+        pinned = Path("/quant_data/runtime/qlib_provider/canonical")
         identity = {
-            "provider_contract": "immutable_snapshot_v2",
-            "dataset_id": "qlib_ashare_v2",
-            "snapshot_id": "native-v2",
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
             "content_sha256": "a" * 64,
             "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
         }
 
-        with (
-            patch.object(
-                module,
-                "resolve_approved_provider_identity",
-                return_value=pinned,
-                create=True,
-            ) as approved_resolver,
-            patch.object(
-                module,
-                "qlib_provider_uri",
-                side_effect=AssertionError("LATEST was resolved"),
-            ),
-        ):
+        with patch.object(
+            module,
+            "qlib_workflow_provider_uri",
+            return_value=pinned,
+        ) as provider_resolver:
             resolved = module.resolve_provider_uri(
                 "canonical", expected_provider_identity=identity
             )
 
         self.assertEqual(resolved, pinned)
-        approved_resolver.assert_called_once_with(
+        provider_resolver.assert_called_once_with(
             "canonical",
-            identity,
-            quant_data_root=module.QUANT_DATA,
+            expected_provider_identity=identity,
         )
 
     def test_explicit_provider_uri_is_validated_and_used_without_reresolving_latest(self):
         module = load_module()
         pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
 
-        with patch.object(module, "qlib_provider_uri", return_value=pinned) as resolver:
+        with patch.object(
+            module,
+            "qlib_workflow_init_config",
+            return_value={"provider_uri": str(pinned)},
+        ) as resolver:
             resolved = module.resolve_provider_uri("canonical", pinned)
 
         self.assertEqual(resolved, pinned)
         resolver.assert_called_once_with(
-            "canonical",
-            snapshot_override=pinned,
+            provider="canonical",
+            provider_uri=pinned,
         )
 
     def test_rejects_legacy_provider_environment_overrides(self):
@@ -257,20 +259,23 @@ class TrainBaselineLgbTest(unittest.TestCase):
 
     def test_resolves_canonical_and_cleaned_provider_uris(self):
         module = load_module()
+        canonical_provider = Path("/quant_data/providers/canonical")
+        cleaned_provider = Path("/quant_data/providers/cleaned")
 
-        canonical = module.resolve_provider_uri("canonical")
-        cleaned = module.resolve_provider_uri("cleaned")
+        with patch.object(
+            module,
+            "qlib_workflow_provider_uri",
+            side_effect=[canonical_provider, cleaned_provider],
+        ) as resolver:
+            canonical = module.resolve_provider_uri("canonical")
+            cleaned = module.resolve_provider_uri("cleaned")
 
-        manifest = json.loads(
-            (canonical / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        self.assertEqual(canonical, canonical_provider)
+        self.assertEqual(cleaned, cleaned_provider)
+        self.assertEqual(
+            resolver.call_args_list,
+            [unittest.mock.call("canonical"), unittest.mock.call("cleaned")],
         )
-        self.assertEqual(manifest["dataset_id"], "qlib_ashare_v2")
-        self.assertTrue(manifest["benchmark_complete"])
-        cleaned_manifest = json.loads(
-            (cleaned / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(cleaned_manifest["dataset_id"], "qlib_ashare_cleaned_v2")
-        self.assertTrue(cleaned_manifest["benchmark_complete"])
 
     def test_rejects_unknown_provider_name(self):
         module = load_module()
@@ -293,13 +298,17 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-
-            runtime = module.write_runtime_config_with_provider(
-                source,
-                Path("/new/provider"),
-                "cleaned",
-                base / "runtime",
-            )
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value={"provider_uri": "/new/provider", "region": "cn"},
+            ):
+                runtime = module.write_runtime_config_with_provider(
+                    source,
+                    Path("/new/provider"),
+                    "cleaned",
+                    base / "runtime",
+                )
 
             source_payload = yaml.safe_load(source.read_text(encoding="utf-8"))
             runtime_payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
@@ -307,6 +316,48 @@ class TrainBaselineLgbTest(unittest.TestCase):
         self.assertEqual(source_payload["qlib_init"]["provider_uri"], "/old/provider")
         self.assertEqual(runtime_payload["qlib_init"]["provider_uri"], "/new/provider")
         self.assertIn("cleaned", runtime.name)
+
+    def test_runtime_config_contains_direct_provider_components(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source = base / "baseline.yaml"
+            source.write_text(
+                yaml.safe_dump({"qlib_init": {"provider_uri": "/old/provider"}}),
+                encoding="utf-8",
+            )
+            direct_provider = base / "direct" / "provider"
+            direct_provider.mkdir(parents=True)
+            (direct_provider / "PROVIDER_DESCRIPTOR.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            direct_config = {
+                "provider_uri": "/direct/provider",
+                "calendar_provider": {"class": "QuantDataCalendarProvider"},
+                "instrument_provider": {"class": "QuantDataInstrumentProvider"},
+                "feature_provider": {"class": "QuantDataFeatureProvider"},
+                "provider": {"class": "QuantDataProvider"},
+            }
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value=direct_config,
+            ):
+                runtime = module.write_runtime_config_with_provider(
+                    source,
+                    direct_provider,
+                    "canonical",
+                    base / "runtime",
+                    extend_dates_to_provider_latest=False,
+                )
+
+            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["qlib_init"]["provider_uri"], "/direct/provider")
+        self.assertEqual(
+            payload["qlib_init"]["feature_provider"]["class"],
+            "QuantDataFeatureProvider",
+        )
 
     def test_runtime_config_extends_dates_to_provider_latest_calendar_day(self):
         module = load_module()
@@ -344,7 +395,14 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            runtime = module.write_runtime_config_with_provider(source, provider, "cleaned", base / "runtime")
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value={"provider_uri": str(provider), "region": "cn"},
+            ):
+                runtime = module.write_runtime_config_with_provider(
+                    source, provider, "cleaned", base / "runtime"
+                )
 
             runtime_payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
             source_payload = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -399,13 +457,18 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            runtime = module.write_runtime_config_with_provider(
-                source,
-                provider,
-                "canonical",
-                base / "runtime",
-                extend_dates_to_provider_latest=False,
-            )
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value={"provider_uri": str(provider), "region": "cn"},
+            ):
+                runtime = module.write_runtime_config_with_provider(
+                    source,
+                    provider,
+                    "canonical",
+                    base / "runtime",
+                    extend_dates_to_provider_latest=False,
+                )
             payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
 
         dataset = payload["task"]["dataset"]["kwargs"]
@@ -623,7 +686,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(FileNotFoundError, "rebuild qlib_ashare_v2"):
+            with self.assertRaisesRegex(FileNotFoundError, "formal Qlib Provider"):
                 module.ensure_csi300_instruments(
                     provider, csi300_symbols=["000001", "600000"]
                 )

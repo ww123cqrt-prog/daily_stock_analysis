@@ -84,20 +84,22 @@ class BuildStagesTest(unittest.TestCase):
         self.assertIn("validate_cn_etf_daily_release", names)
         self.assertIn("generate_etf_momentum_report", names)
         self.assertIn("validate_ashare_daily_qfq", names)
-        self.assertIn("validate_qlib_ashare_v2", names)
-        self.assertIn("validate_qlib_ashare_cleaned_v2", names)
-        self.assertIn("check_qlib_data", names)
-        self.assertIn("check_qlib_cleaned_data", names)
+        self.assertIn("validate_cn_index_daily", names)
+        self.assertIn("check_qlib_direct_data", names)
+        self.assertIn("check_qlib_direct_cleaned_data", names)
+        self.assertNotIn("validate_qlib_ashare_v2", names)
+        self.assertNotIn("validate_qlib_ashare_cleaned_v2", names)
+        self.assertNotIn("qlib_ashare_v2", " ".join(" ".join(s.argv) for s in stages))
         self.assertIn("report_data_quality", names)
         self.assertIn("sync_data_manifest_check", names)
         self.assertNotIn("merge_to_qlib", names)
         self.assertNotIn("publish_official", names)
         self.assertLess(
-            names.index("validate_qlib_ashare_v2"),
-            names.index("check_qlib_data"),
+            names.index("validate_cn_index_daily"),
+            names.index("check_qlib_direct_data"),
         )
         cleaned_check = next(
-            stage for stage in stages if stage.name == "check_qlib_cleaned_data"
+            stage for stage in stages if stage.name == "check_qlib_direct_cleaned_data"
         )
         self.assertEqual(
             cleaned_check.argv[-2:], ["--provider", "cleaned"]
@@ -155,8 +157,9 @@ class BuildStagesTest(unittest.TestCase):
         self.assertFalse(set(names) & self.module.ASHARE_DOWNLOAD_STAGE_NAMES)
         self.assertNotIn("download_ashare_news", names)
         self.assertNotIn("update_ashare_v2_bundle", names)
-        self.assertIn("validate_qlib_ashare_v2", names)
-        self.assertIn("validate_qlib_ashare_cleaned_v2", names)
+        self.assertIn("validate_cn_index_daily", names)
+        self.assertIn("check_qlib_direct_data", names)
+        self.assertIn("check_qlib_direct_cleaned_data", names)
 
     def test_etf_momentum_update_and_report_are_isolated_nonfatal_stages(self):
         stages = self.module.build_stages(_args())
@@ -188,6 +191,17 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("validate_cn_etf_daily_release", names)
         self.assertNotIn("generate_etf_momentum_report", names)
 
+    def test_formal_index_update_stage_uses_cn_index_daily_updater(self):
+        stages = self.module.build_stages(_args())
+        names = [stage.name for stage in stages]
+        update = next(stage for stage in stages if stage.name == "update_cn_index_daily")
+
+        self.assertTrue(update.required)
+        self.assertIn("quant_data_cli.py", update.argv[1])
+        self.assertEqual(update.argv[update.argv.index("update") + 1], "cn_index_daily")
+        self.assertIn("--through", update.argv)
+        self.assertLess(names.index("update_cn_index_daily"), names.index("validate_cn_index_daily"))
+
     def test_verified_bundle_uses_contract_updater_before_native_validation(self):
         bundle = Path("/verified/bundle")
         stages = self.module.build_stages(_args(ashare_v2_bundle_dir=bundle))
@@ -213,7 +227,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertNotIn("download_baostock", names)
         self.assertNotIn("download_eastmoney", names)
         self.assertNotIn("download_akshare", names)
-        self.assertIn("validate_qlib_ashare_v2", names)
+        self.assertIn("validate_cn_index_daily", names)
 
     def test_system_proxy_flag_only_applies_to_public_sources(self):
         baostock_stages = self.module.build_stages(_args(ashare_source="baostock", use_system_proxy=True))
@@ -381,7 +395,7 @@ class DryRunMainTest(unittest.TestCase):
             self.assertEqual(summary["status"], "planned")
             self.assertTrue(all(s["status"] == "planned" for s in summary["stages"]))
             self.assertTrue(
-                any(s["name"] == "validate_qlib_ashare_v2" for s in summary["stages"])
+                any(s["name"] == "validate_cn_index_daily" for s in summary["stages"])
             )
             self.assertFalse(
                 any(s["name"] == "publish_official" for s in summary["stages"])
@@ -570,7 +584,7 @@ class DryRunMainTest(unittest.TestCase):
 
         def fake_run_stage(stage, dry_run):
             called.append(stage.name)
-            failed = stage.name == "validate_qlib_ashare_v2"
+            failed = stage.name == "validate_cn_index_daily"
             return module.StageResult(stage.name, "failed" if failed else "ok", 0.0, 1 if failed else 0, required=stage.required)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,8 +603,8 @@ class DryRunMainTest(unittest.TestCase):
                 rc = module.main()
 
         self.assertEqual(rc, 1)
-        self.assertIn("validate_qlib_ashare_v2", called)
-        self.assertNotIn("check_qlib_data", called)
+        self.assertIn("validate_cn_index_daily", called)
+        self.assertNotIn("check_qlib_direct_data", called)
 
     def test_failed_audit_download_never_triggers_legacy_rebuild(self):
         module = self.module
@@ -628,7 +642,7 @@ class DryRunMainTest(unittest.TestCase):
         ))
         self.assertNotIn("merge_to_qlib", [s["name"] for s in summary["stages"]])
         self.assertTrue(
-            any(s["name"] == "validate_qlib_ashare_v2" and s["status"] == "ok" for s in summary["stages"])
+            any(s["name"] == "validate_cn_index_daily" and s["status"] == "ok" for s in summary["stages"])
         )
 
     def test_all_source_downloads_failing_without_rebuild_fails_daily_update(self):

@@ -222,8 +222,8 @@ describe('WorkflowPage', () => {
         generate_etf_momentum_report: { label: '生成 ETF 完整策略报告', allowedParams: [] },
         validate_latest_snapshot: { label: '校验新浪最新快照', allowedParams: ['limit', 'timeout', 'use_system_proxy'] },
         download_jqdata: { label: '验证 JQData 连接（dry-run）', allowedParams: ['universe', 'start', 'end', 'limit', 'sleep', 'dry_run'] },
-        merge_to_qlib: { label: '构建并发布原生 Qlib V2', allowedParams: ['no_overwrite', 'smoke'] },
-        apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
+        merge_to_qlib: { label: '生成正式 Qlib Provider', allowedParams: ['no_overwrite', 'smoke'] },
+        apply_data_cleaning: { label: '生成正式 cleaned Qlib Provider', allowedParams: ['dry_run'] },
         repair_qlib_provider: { label: '预演旧兼容 Qlib 修复', allowedParams: [] },
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
         report_data_quality: { label: '生成数据质量报告', allowedParams: ['overlap_sample', 'merged_sample'] },
@@ -1215,21 +1215,21 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。')).toBeInTheDocument();
     expect(screen.getByText('下载 AkShare 日线')).toBeInTheDocument();
     expect(screen.getByText('调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。')).toBeInTheDocument();
-    expect(screen.getByText('原生 Qlib V2')).toBeInTheDocument();
+    expect(screen.getAllByText('Qlib Provider').length).toBeGreaterThan(0);
     expect(screen.getByText('校验新浪最新快照')).toBeInTheDocument();
     expect(screen.getByText('抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。')).toBeInTheDocument();
     expect(screen.getByText('预演旧兼容 CSI300 股票池')).toBeInTheDocument();
     expect(screen.getByText('预演旧兼容 benchmark')).toBeInTheDocument();
     expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
-    expect(screen.getByText('构建原生 cleaned Qlib V2 快照')).toBeInTheDocument();
+    expect(screen.getByText('生成正式 cleaned Qlib Provider')).toBeInTheDocument();
     expect(screen.getAllByText('质量报告').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('选股模型训练与交易策略验证')).toBeInTheDocument();
     expect(screen.getByText('运行五个选股模型候选流程')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五个选股模型候选流程');
     expect(screen.getByLabelText('运行五个选股模型候选流程 数据版本')).toBeInTheDocument();
-    expect(screen.getAllByRole('option', { name: '原生 V2（正式）' })).toHaveLength(2);
-    expect(screen.getAllByRole('option', { name: '原生 cleaned V2' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'Qlib Provider（canonical）' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'Qlib Provider（cleaned）' })).toHaveLength(2);
     expect(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演')).toBeInTheDocument();
     expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
     expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
@@ -1250,7 +1250,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
     expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
     expect(screen.getByText('生成 china-astock 技术指标报告')).toBeInTheDocument();
-    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取原生 V2 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
+    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取 Qlib Provider 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
     expect(screen.getByLabelText('生成 china-astock 技术指标报告 股票代码')).toBeInTheDocument();
     expect(screen.getByText('生成数据治理盘点和清理预案')).toBeInTheDocument();
     expect(screen.getByTestId('workflow-job-report_data_hygiene')).toBeInTheDocument();
@@ -1263,6 +1263,7 @@ describe('WorkflowPage', () => {
     expect(screen.getByText('质量和异常')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '今日流程 清洗预演 预演' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '实验记录' })).toHaveAttribute('href', '/research');
+    expect(document.body).not.toHaveTextContent('原生 V2');
     expect(screen.getByRole('link', { name: '回测页' })).toHaveAttribute('href', '/backtest');
     expect(screen.getByText('检查 Qlib 数据')).toBeInTheDocument();
     expect(screen.getAllByText('训练 Qlib LightGBM 选股模型基线')).toHaveLength(2);
@@ -1372,9 +1373,10 @@ describe('WorkflowPage', () => {
       </UiLanguageProvider>,
     );
 
-    expect(await screen.findByText('Native V2 catalog invalid')).toBeInTheDocument();
+    expect(await screen.findByText('Qlib Provider identity invalid')).toBeInTheDocument();
     expect(screen.getByText(/current canonical dataset cannot be verified/i)).toBeInTheDocument();
     expect(screen.queryByText(/old compatibility data/i)).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(/native V2/i);
   });
 
   it('localizes the MLflow status card in English mode', async () => {
@@ -1496,7 +1498,7 @@ describe('WorkflowPage', () => {
       trainable: false,
       trainingReadiness: {
         status: 'blocked',
-        summary: 'Latest data quality evidence does not match the current native V2 snapshot; rerun the full data quality report before training.',
+        summary: 'Latest data quality evidence does not match the current Qlib Provider; rerun the full data quality report before training.',
       },
       currentProviderIdentities: {
         canonical: {
@@ -1602,14 +1604,14 @@ describe('WorkflowPage', () => {
     expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
   });
 
-  it('does not present the previous accepted snapshot as the current snapshot when native data is unavailable', async () => {
+  it('does not present the previous accepted snapshot as current when the Qlib Provider is unavailable', async () => {
     const status = readyResearchStatus();
     getResearchStatus.mockResolvedValue({
       ...status,
       trainable: false,
       trainingReadiness: {
         status: 'blocked',
-        summary: 'The current native V2 provider is unavailable.',
+        summary: 'The current Qlib Provider is unavailable.',
       },
       currentProviderIdentities: {
         canonical: {
@@ -1768,7 +1770,7 @@ describe('WorkflowPage', () => {
     await act(async () => {
       resolveStatus({
         availableJobTypes: {
-          apply_data_cleaning: { label: '构建原生 cleaned Qlib V2 快照', allowedParams: ['dry_run'] },
+          apply_data_cleaning: { label: '生成正式 cleaned Qlib Provider', allowedParams: ['dry_run'] },
         },
         apiContract: {
           version: 'quant-workbench-v2',
@@ -2019,8 +2021,8 @@ describe('WorkflowPage', () => {
   it('submits the isolated smoke fixture flag for Qlib merge jobs', async () => {
     renderWorkflowPage();
 
-    fireEvent.click(await screen.findByLabelText('构建并发布原生 Qlib V2 使用隔离小样本演练'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 构建并发布原生 Qlib V2' }));
+    fireEvent.click(await screen.findByLabelText('生成正式 Qlib Provider 使用隔离小样本演练'));
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成正式 Qlib Provider' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('merge_to_qlib', {
@@ -2140,8 +2142,8 @@ describe('WorkflowPage', () => {
   it('submits the cleaned Qlib provider task from the workflow page', async () => {
     renderWorkflowPage();
 
-    fireEvent.click(await screen.findByLabelText('构建原生 cleaned Qlib V2 快照 只预演不写入'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 构建原生 cleaned Qlib V2 快照' }));
+    fireEvent.click(await screen.findByLabelText('生成正式 cleaned Qlib Provider 只预演不写入'));
+    fireEvent.click(screen.getByRole('button', { name: '运行 生成正式 cleaned Qlib Provider' }));
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('apply_data_cleaning', {

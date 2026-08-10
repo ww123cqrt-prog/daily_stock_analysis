@@ -23,6 +23,15 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    # These fixtures intentionally exercise the historical compatibility tree;
+    # production calls use run_pipeline's default fail-closed mode.
+    live_runner = module.run_pipeline
+
+    def compatibility_runner(*args, **kwargs):
+        kwargs.setdefault("allow_legacy_compatibility", True)
+        return live_runner(*args, **kwargs)
+
+    module.run_pipeline = compatibility_runner
     return module
 
 
@@ -255,6 +264,7 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
         skip_membership_build=False,
         run_id="resume-me",
         resume=True,
+        allow_legacy_compatibility=True,
     )
 
     assert [stage.name for stage in stages] == [
@@ -352,6 +362,35 @@ def test_stage_commands_are_isolated_under_robust_namespace(tmp_path: Path) -> N
     )
     assert "candidate_pipeline_latest" not in joined
     assert "latest_training_result" not in joined
+
+
+def test_live_stage_plan_uses_the_qlib_provider_facade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_module()
+    config = module.load_config(CONFIG_PATH)
+    provider = tmp_path / "quant_data" / "runtime" / "qlib_provider" / "cleaned"
+    provider.mkdir(parents=True)
+    monkeypatch.setattr(
+        module,
+        "qlib_workflow_provider_uri",
+        lambda name: provider if name == "cleaned" else None,
+        raising=False,
+    )
+
+    stages = module.build_stages(
+        config,
+        config_path=CONFIG_PATH,
+        quant_data_dir=tmp_path / "quant_data",
+        report_dir=tmp_path / "reports" / "robust_strategy",
+        as_of_date="2026-07-15",
+        skip_membership_build=True,
+        run_id="live-provider-required",
+    )
+
+    assert "add_robust_benchmarks" not in [stage.name for stage in stages]
+    preflight = next(stage for stage in stages if stage.name == "preflight_robust_data")
+    assert preflight.argv[preflight.argv.index("--provider-dir") + 1] == str(provider)
 
 
 def test_stage_evidence_rejects_shared_latest_from_other_or_unidentified_run(

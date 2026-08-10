@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build an immutable cleaned parquet and Qlib product for robust research."""
+"""Build the legacy robust-strategy compatibility product.
+
+The formal robust workflow uses ``quant_data``'s direct Parquet Provider. This
+script is retained only for an explicitly identified old frozen run and may
+therefore create a physical ``.bin`` tree under its isolated compatibility
+product directory.
+"""
 
 from __future__ import annotations
 

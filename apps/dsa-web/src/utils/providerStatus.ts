@@ -25,8 +25,8 @@ export function providerStatusNotice(
 
   if (input.providerStatus === 'catalog_invalid') {
     return {
-      badge: zh ? '原生 V2 已阻断' : 'Native V2 blocked',
-      title: zh ? '原生 V2 清单无效' : 'Native V2 catalog invalid',
+      badge: zh ? 'Qlib Provider 已阻断' : 'Qlib Provider blocked',
+      title: zh ? 'Qlib Provider 身份无效' : 'Qlib Provider identity invalid',
       message: zh
         ? (input.providerWarning || '当前正式数据清单无法通过校验，因此不能把该结果当作当前结果。')
         : 'The current canonical dataset cannot be verified, so this result cannot be treated as current.',
@@ -38,8 +38,8 @@ export function providerStatusNotice(
       badge: zh ? '数据身份未证实' : 'Data identity unverified',
       title: zh ? `${subjectZh}的数据身份未证实` : `${subjectEn} data identity unverified`,
       message: zh
-        ? (input.providerWarning || `${subjectZh}没有记录完整的不可变快照身份，无法证明它使用了当前原生 V2 数据。`)
-        : `${subjectEn} does not record a complete immutable snapshot identity, so it cannot be verified against the current native V2 dataset.`,
+        ? (input.providerWarning || `${subjectZh}没有记录完整的不可变 Provider 血缘，无法证明它使用了当前 Qlib Provider。`)
+        : `${subjectEn} does not record complete immutable Provider lineage, so it cannot be verified against the current Qlib Provider.`,
     };
   }
 
@@ -49,7 +49,7 @@ export function providerStatusNotice(
       : (zh ? '历史候选结果已加载' : 'Historical candidate result loaded'),
     title: zh ? `${subjectZh}来自旧数据` : `${subjectEn} uses historical data`,
     message: zh
-      ? (input.providerWarning || `${subjectZh}只能作为历史参考，不能代表当前原生 V2 数据。`)
-      : `${subjectEn} is historical only and does not represent the current native V2 dataset.`,
+      ? (input.providerWarning || `${subjectZh}只能作为历史参考，不能代表当前 Qlib Provider。`)
+      : `${subjectEn} is historical only and does not represent the current Qlib Provider.`,
   };
 }

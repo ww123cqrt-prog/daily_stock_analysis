@@ -110,14 +110,14 @@ const WORKFLOW_INPUT_CLASS =
 const WORKFLOW_STEPS: WorkflowStep[] = [
   {
     title: '每日更新与校验',
-    description: '更新独立数据源，并直接校验当前 A 股 qfq 与原生 Qlib V2 快照。',
+    description: '更新独立数据源，并校验当前 A 股 qfq 与 quant_data 数据后端的 Qlib Provider。',
     icon: RefreshCw,
     jobs: [
       {
         type: 'run_daily_update',
-        label: '运行每日数据更新与 V2 校验',
+        label: '运行每日 quant_data 更新与校验',
         description:
-          'A 股历史源默认关闭；手动启用时只更新审计缓存，不会发布正式行情。正式 A 股更新必须使用已核验的 V2 bundle；本任务随后直接校验 ashare_daily_qfq 与 qlib_ashare_v2。',
+          'A 股历史源默认关闭；手动启用时只更新审计缓存，不会发布正式行情。正式 A 股更新必须使用已核验的 quant_data 快照；本任务随后校验 A 股 qfq 数据与 Qlib Provider。',
         defaultParams: {
           ashare_source: 'none',
           overlap_days: '7',
@@ -138,7 +138,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
               { value: 'akshare', label: 'AkShare（使用东财接口）' },
             ],
           },
-          { key: 'skip_download', label: '跳过下载，只校验 V2', kind: 'checkbox' },
+          { key: 'skip_download', label: '跳过下载，只校验 Qlib Provider', kind: 'checkbox' },
           { key: 'dry_run', label: '仅预演不执行', kind: 'checkbox' },
           { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
           { key: 'skip_global_daily', label: '跳过全球日线', kind: 'checkbox' },
@@ -287,13 +287,13 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     ],
   },
   {
-    title: '原生 Qlib V2',
-    description: '从正式前复权快照构建不可变 Qlib provider，并通过清单原子发布。',
+    title: 'Qlib Provider',
+    description: '从正式前复权快照生成不可变 Qlib Provider，并通过清单原子发布。',
     icon: RotateCw,
     jobs: [
       {
         type: 'merge_to_qlib',
-        label: '构建并发布原生 Qlib V2',
+        label: '生成正式 Qlib Provider',
         description: '正式运行会生成新的不可变 canonical 快照；隔离演练不会写入正式数据。',
         params: [
           { key: 'smoke', label: '使用隔离小样本演练', kind: 'checkbox' },
@@ -302,23 +302,23 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'repair_qlib_provider',
         label: '预演旧兼容 Qlib 修复',
-        description: '只检查保留的旧兼容目录；网页端固定 dry-run，不影响原生 V2。',
+        description: '只检查保留的旧兼容目录；网页端固定 dry-run，不影响正式 Qlib Provider。',
       },
       {
         type: 'generate_csi300',
         label: '预演旧兼容 CSI300 股票池',
-        description: '只检查保留的旧兼容目录；原生 V2 股票池由快照构建器生成。',
+        description: '只检查保留的旧兼容目录；正式 Qlib Provider 的股票池由底层适配层提供。',
       },
       {
         type: 'add_index_benchmark',
         label: '预演旧兼容 benchmark',
-        description: '只检查保留的旧兼容目录；原生 V2 已在构建时包含三个指数。',
+        description: '只检查保留的旧兼容目录；正式 Qlib Provider 已包含所需指数。',
       },
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
       {
         type: 'prepare_robust_signal_data',
         label: '验收并准备鲁棒 CSI800 数据',
-        description: '用当前 cleaned Qlib V2、历史时点 CSI800 成员区间和当前数据清单构建不可变研究 provider；数据清单变化后必须重新运行。',
+        description: '用当前 cleaned Qlib Provider、历史时点 CSI800 成员区间和当前数据血缘构建不可变研究 Provider；数据血缘变化后必须重新运行。',
       },
     ],
   },
@@ -370,7 +370,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'report_china_astock_indicators',
         label: '生成 china-astock 技术指标报告',
-        description: '复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取原生 V2 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。',
+        description: '复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取 Qlib Provider 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。',
         params: [
           { key: 'symbols', label: '股票代码', kind: 'text', placeholder: '000001,600519；留空按数量上限抽样' },
           { key: 'lookback_days', label: '回看交易日', kind: 'number', min: 20, placeholder: '120' },
@@ -379,8 +379,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'apply_data_cleaning',
-        label: '构建原生 cleaned Qlib V2 快照',
-        description: '正式运行从当前 canonical V2 构建并发布不可变 cleaned V2；勾选预演时只检查清洗计划，不发布数据。',
+        label: '生成正式 cleaned Qlib Provider',
+        description: '正式运行从当前 canonical Qlib Provider 生成 cleaned Qlib Provider；勾选预演时只检查清洗计划，不发布数据。',
         params: [
           { key: 'dry_run', label: '只预演不写入', kind: 'checkbox' },
         ],
@@ -403,8 +403,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: '原生 V2（正式）' },
-              { value: 'cleaned', label: '原生 cleaned V2' },
+              { value: 'canonical', label: 'Qlib Provider（canonical）' },
+              { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
             ],
           },
           { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
@@ -423,8 +423,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: '原生 V2（正式数据快照）' },
-              { value: 'cleaned', label: '原生 cleaned V2（验收数据快照）' },
+              { value: 'canonical', label: 'Qlib Provider（canonical，验收）' },
+              { value: 'cleaned', label: 'Qlib Provider（cleaned，验收）' },
             ],
           },
         ],
@@ -440,8 +440,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: '原生 V2（正式）' },
-              { value: 'cleaned', label: '原生 cleaned V2' },
+              { value: 'canonical', label: 'Qlib Provider（canonical）' },
+              { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
             ],
           },
           { key: 'dry_run', label: '只做小样本预演', kind: 'checkbox' },
@@ -672,7 +672,7 @@ function providerEvidenceSummary(
 ): string {
   return currentSnapshotReady
     ? `The current ${provider} snapshot has not completed full data quality acceptance; the previous report cannot authorize formal training.`
-    : `The current ${provider} native V2 snapshot is unavailable; formal training is blocked.`;
+    : `The current ${provider} Qlib Provider is unavailable; formal training is blocked.`;
 }
 
 function providerTrainingState(
@@ -804,8 +804,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
       eyebrow: 'Quant Data',
       title: zh ? '数据更新与检查' : 'Data Updates and Checks',
       description: zh
-        ? '更新独立行情与参考数据，并校验正式 A 股 qfq 和原生 Qlib V2 快照。'
-        : 'Update independent market and reference data, then validate the canonical A-share qfq and native Qlib V2 snapshots.',
+        ? '更新独立行情与参考数据，并校验正式 A 股 qfq 和 Qlib Provider。'
+        : 'Update independent market and reference data, then validate the canonical A-share qfq data and Qlib Provider.',
     };
   }
   if (surface === 'training') {
@@ -1319,8 +1319,11 @@ function localizedTrainingReadinessSummary(
 ): string {
   if (!summary || language === 'en') return summary || '';
 
-  if (summary.startsWith('Latest data quality evidence does not match the current native V2 snapshot')) {
-    return '已检测到新的原生 V2 数据快照，但当前完整质量报告仍绑定上一版快照。重新运行正式全量数据验收后才能启动正式训练；下方“上次验收”记录不代表当前快照。';
+  if (
+    summary.startsWith('Latest data quality evidence does not match the current Qlib Provider')
+    || summary.startsWith('Latest data quality evidence does not match the current native V2 snapshot')
+  ) {
+    return '已检测到新的 Qlib Provider 数据血缘，但当前完整质量报告仍绑定上一版快照。重新运行正式全量数据验收后才能启动正式训练；下方“上次验收”记录不代表当前 Provider。';
   }
 
   const pendingProviderMatch = summary.match(
@@ -1331,10 +1334,10 @@ function localizedTrainingReadinessSummary(
   }
 
   const unavailableProviderMatch = summary.match(
-    /^The current (canonical|cleaned) native V2 snapshot is unavailable; formal training is blocked\.$/,
+    /^The current (canonical|cleaned) (?:Qlib Provider|native V2 snapshot) is unavailable; formal training is blocked\.$/,
   );
   if (unavailableProviderMatch) {
-    return `当前 ${unavailableProviderMatch[1]} 原生 V2 快照不可用；正式训练已阻止。`;
+    return `当前 Qlib Provider（${unavailableProviderMatch[1]}）不可用；正式训练已阻止。`;
   }
 
   const readyPrefix = 'Qlib provider has enough calendar/instrument coverage for the baseline run.';

@@ -36,6 +36,10 @@ from src.services.quant_workflow_paths import (
     reports_root,
     workflow_root,
 )
+from quant_workflow.scripts._mlflow_run_provenance import (
+    RunProvenanceError,
+    normalize_provider_lineage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -150,17 +154,6 @@ ROBUST_SIGNAL_DATA_PINNED_JOB_TYPES = {
     "run_robust_signal_research",
     "resume_robust_signal_research",
 }
-TRAINING_PROVIDER_DATASET_IDS = {
-    "canonical": "qlib_ashare_v2",
-    "cleaned": "qlib_ashare_cleaned_v2",
-}
-PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-)
 MARKET_DATA_PINNED_JOB_TYPES = {
     "report_market_regime",
     "report_cash_control_backtest",
@@ -774,28 +767,11 @@ def _safe_provider(value: Any) -> str:
     return raw
 
 
-def _approved_provider_identity_json(
-    provider: str,
-    identity: Mapping[str, Any],
-) -> str:
-    expected_dataset_id = TRAINING_PROVIDER_DATASET_IDS[provider]
-    payload = {field: identity.get(field) for field in PROVIDER_IDENTITY_FIELDS}
-    snapshot_id = payload.get("snapshot_id")
-    if (
-        payload.get("provider_contract") != "immutable_snapshot_v2"
-        or payload.get("dataset_id") != expected_dataset_id
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
-        or Path(snapshot_id).name != snapshot_id
-        or snapshot_id in {".", ".."}
-        or any(
-            not isinstance(payload.get(field), str)
-            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None
-            for field in ("manifest_sha256", "content_sha256")
-        )
-    ):
-        raise ValueError("Approved provider identity is invalid or mismatched.")
-    return _json_dumps(payload)
+def _approved_provider_identity_json(identity: Mapping[str, Any]) -> str:
+    try:
+        return _json_dumps(normalize_provider_lineage(identity))
+    except RunProvenanceError as exc:
+        raise ValueError("Approved Qlib Provider lineage is invalid.") from exc
 
 
 def _approved_market_data_bars_path(identity: Mapping[str, Any]) -> Path:
@@ -1143,7 +1119,10 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             return command
         if _as_bool(params.get("no_overwrite")):
             raise ValueError("no_overwrite is only supported by the isolated smoke fixture")
-        return _script_command("build_qlib_v2.py") + ["--publish"]
+        return _script_command("build_qlib_direct_provider.py") + [
+            "--cleaning-mode",
+            "canonical",
+        ]
 
     def apply_data_cleaning(params: Mapping[str, Any]) -> List[str]:
         if _as_bool(params.get("dry_run")):
@@ -1151,7 +1130,10 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_reports_out_dir(command)
             command.append("--dry-run")
             return command
-        return _script_command("build_cleaned_qlib_v2.py") + ["--publish"]
+        return _script_command("build_qlib_direct_provider.py") + [
+            "--cleaning-mode",
+            "cleaned",
+        ]
 
     def repair_qlib_provider(_params: Mapping[str, Any]) -> List[str]:
         return _script_command("repair_qlib_provider.py") + ["--dry-run"]
@@ -1492,7 +1474,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             ],
         },
         "run_daily_update": {
-            "label": "运行每日数据更新与 V2 校验",
+            "label": "运行每日 quant_data 更新与校验",
             "command": run_daily_update,
             "allowed_params": {
                 "skip_download",
@@ -1648,12 +1630,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
         "merge_to_qlib": {
-            "label": "构建并发布原生 Qlib V2",
+            "label": "生成正式 Qlib Provider",
             "command": merge_to_qlib,
             "allowed_params": {"no_overwrite", "smoke"},
         },
         "apply_data_cleaning": {
-            "label": "构建原生 cleaned Qlib V2 快照",
+            "label": "生成正式 cleaned Qlib Provider",
             "command": apply_data_cleaning,
             "allowed_params": {"dry_run"},
             "artifact_patterns": [
@@ -2128,13 +2110,11 @@ class QuantJobService:
                 raise ValueError(
                     "Approved provider identity is only valid for provider-pinned training jobs."
                 )
-            provider = _safe_provider(params_dict.get("provider"))
+            _safe_provider(params_dict.get("provider"))
             command.extend(
                 [
                     "--provider-identity-json",
-                    _approved_provider_identity_json(
-                        provider, approved_provider_identity
-                    ),
+                    _approved_provider_identity_json(approved_provider_identity),
                 ]
             )
         if approved_market_data_identity is not None:

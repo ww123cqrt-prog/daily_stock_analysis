@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import fcntl
 import json
+import sys
 import threading
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import pandas as pd
@@ -390,24 +392,63 @@ def test_market_panel_rechecks_snapshots_before_return(
         )
 
 
-def test_qlib_binary_reader_uses_calendar_start_offset(tmp_path: Path) -> None:
+def test_qlib_feature_reader_uses_the_initialized_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = load_module()
     provider = tmp_path / "provider"
-    (provider / "calendars").mkdir(parents=True)
-    (provider / "features" / "sh000300").mkdir(parents=True)
-    (provider / "calendars" / "day.txt").write_text(
-        "2025-01-02\n2025-01-03\n2025-01-06\n2025-01-07\n",
-        encoding="utf-8",
+    provider.mkdir()
+    dates = pd.to_datetime(["2025-01-03", "2025-01-06", "2025-01-07"])
+    feature_index = pd.MultiIndex.from_arrays(
+        [["SH000300"] * len(dates), dates],
+        names=["instrument", "datetime"],
     )
-    np.asarray([1.0, 100.0, 101.0, 102.0], dtype="<f4").tofile(
-        provider / "features" / "sh000300" / "open.day.bin"
+    feature_frame = pd.DataFrame(
+        {"$open": [100.0, 101.0, 102.0]},
+        index=feature_index,
+    )
+    calls: list[tuple[object, ...]] = []
+
+    class FakeDataApi:
+        @staticmethod
+        def features(*args, **kwargs):
+            calls.append((args, kwargs))
+            return feature_frame
+
+    qlib_module = ModuleType("qlib")
+    qlib_data_module = ModuleType("qlib.data")
+    qlib_data_module.D = FakeDataApi
+    qlib_module.data = qlib_data_module
+    monkeypatch.setitem(sys.modules, "qlib", qlib_module)
+    monkeypatch.setitem(sys.modules, "qlib.data", qlib_data_module)
+    initialized: list[Path] = []
+    monkeypatch.setattr(
+        module,
+        "init_qlib_workflow",
+        lambda *, provider_uri: initialized.append(Path(provider_uri)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "provider_calendar_days",
+        lambda _provider: [value.date().isoformat() for value in dates],
+        raising=False,
     )
 
     series = module.read_qlib_feature(provider, "SH000300", "open")
 
-    assert list(series.index) == list(
-        pd.to_datetime(["2025-01-03", "2025-01-06", "2025-01-07"])
-    )
+    assert initialized == [provider]
+    assert calls == [
+        (
+            (["SH000300"], ["$open"]),
+            {
+                "start_time": "2025-01-03",
+                "end_time": "2025-01-07",
+                "freq": "day",
+            },
+        )
+    ]
+    assert list(series.index) == list(dates)
     assert series.tolist() == [100.0, 101.0, 102.0]
 
 

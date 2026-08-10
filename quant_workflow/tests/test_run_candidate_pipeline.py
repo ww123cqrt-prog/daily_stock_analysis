@@ -43,6 +43,46 @@ def benchmark_frame(dates: pd.DatetimeIndex, close: list[float]) -> pd.DataFrame
 
 
 class CandidatePipelineTest(unittest.TestCase):
+    def test_default_pipeline_provider_uses_the_qlib_workflow_provider(self):
+        module = load_module()
+        direct = Path("/quant_data/runtime/qlib_direct/provider")
+
+        with (
+            patch.object(module, "qlib_workflow_provider_uri", return_value=direct),
+        ):
+            self.assertEqual(module.resolve_pipeline_provider("canonical"), direct)
+
+    def test_complete_provider_lineage_is_eligible_for_candidate_backtest(self):
+        module = load_module()
+        identity = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
+            "content_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_direct/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
+        }
+        eligibility = module._backtest_eligibility(
+            {
+                "run_id": "candidate-run",
+                "experiment_id": "candidate-experiment",
+                "artifact_sha256": {
+                    "pred.pkl": "f" * 64,
+                    "label.pkl": "0" * 64,
+                },
+            },
+            identity,
+            dry_run=False,
+        )
+        self.assertTrue(eligibility["eligible"])
+        self.assertEqual(eligibility["missing"], [])
+
     def test_atomic_write_fsyncs_file_and_parent_directory(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -58,39 +98,37 @@ class CandidatePipelineTest(unittest.TestCase):
         fsync.assert_called_once()
         fsync_directory.assert_called_once_with(target.parent)
 
-    def test_approved_identity_resolves_pipeline_snapshot_without_reading_latest(self):
+    def test_approved_identity_is_passed_to_the_qlib_workflow_provider(self):
         module = load_module()
-        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
+        pinned = Path("/quant_data/runtime/qlib_provider/canonical")
         identity = {
-            "provider_contract": "immutable_snapshot_v2",
-            "dataset_id": "qlib_ashare_v2",
-            "snapshot_id": "native-v2",
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
             "content_sha256": "a" * 64,
             "manifest_sha256": "b" * 64,
+            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "c" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "d" * 64,
+            "index_manifest_sha256": "e" * 64,
         }
 
-        with (
-            patch.object(
-                module,
-                "resolve_approved_provider_identity",
-                return_value=pinned,
-                create=True,
-            ) as approved_resolver,
-            patch.object(
-                module,
-                "qlib_provider_uri",
-                side_effect=AssertionError("LATEST was resolved"),
-            ),
-        ):
+        with patch.object(
+            module,
+            "qlib_workflow_provider_uri",
+            return_value=pinned,
+        ) as provider_resolver:
             resolved = module.resolve_pipeline_provider(
                 "canonical", expected_provider_identity=identity
             )
 
         self.assertEqual(resolved, pinned)
-        approved_resolver.assert_called_once_with(
+        provider_resolver.assert_called_once_with(
             "canonical",
-            identity,
-            quant_data_root=module.QUANT_DATA,
+            expected_provider_identity=identity,
         )
 
     def test_model_training_command_pins_the_parent_snapshot(self):
@@ -176,6 +214,11 @@ class CandidatePipelineTest(unittest.TestCase):
                     module,
                     "build_candidate_config",
                     return_value={"qlib_init": {}},
+                ),
+                patch.object(
+                    module,
+                    "qlib_workflow_init_config",
+                    return_value={"provider_uri": str(root / "provider")},
                 ),
                 patch.object(module, "apply_common_periods"),
                 patch.object(module.subprocess, "run", side_effect=fake_training),
@@ -543,16 +586,17 @@ class CandidatePipelineTest(unittest.TestCase):
             "sys.modules",
             {"qlib": fake_qlib, "qlib.data": fake_qlib_data},
         ):
-            original = module.load_market_data(
-                Path("/unused/provider"),
-                str(dates[0].date()),
-                str(dates[-1].date()),
-            )
-            altered = module.load_market_data(
-                Path("/unused/provider"),
-                str(dates[0].date()),
-                str(dates[-1].date()),
-            )
+            with patch.object(module, "init_qlib_workflow", return_value=Path("/unused/provider")):
+                original = module.load_market_data(
+                    Path("/unused/provider"),
+                    str(dates[0].date()),
+                    str(dates[-1].date()),
+                )
+                altered = module.load_market_data(
+                    Path("/unused/provider"),
+                    str(dates[0].date()),
+                    str(dates[-1].date()),
+                )
 
         decision_day = dates[-3]
         self.assertNotAlmostEqual(

@@ -523,8 +523,8 @@ describe('BacktestPage', () => {
 
     renderPage('/backtest?tab=trained&runId=latest-run&modelId=latest&strategyId=baseline_daily');
 
-    expect(await screen.findByText('Native V2 blocked')).toBeInTheDocument();
-    expect(screen.getByText('Native V2 catalog invalid')).toBeInTheDocument();
+    expect(await screen.findByText('Qlib Provider blocked')).toBeInTheDocument();
+    expect(screen.getByText('Qlib Provider identity invalid')).toBeInTheDocument();
     expect(screen.getByText(/current canonical dataset cannot be verified/i)).toBeInTheDocument();
     expect(screen.queryByText(/old compatibility data/i)).not.toBeInTheDocument();
   });

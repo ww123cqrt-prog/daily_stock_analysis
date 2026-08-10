@@ -26,16 +26,20 @@ from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
     china_astock_root,
     mlruns_root,
-    qlib_provider_uri,
+    provider_calendar_days,
+    provider_has_instrument_pool,
+    provider_instrument_ranges,
+    qlib_workflow_init_config,
+    qlib_workflow_provider_uri,
     quant_data_root,
     reports_root,
     workflow_root,
 )
 from _mlflow_run_provenance import (  # noqa: E402
     experiment_run_ids,
+    provider_lineages_match,
     provider_identity,
     revalidate_provider_identity,
-    resolve_approved_provider_identity,
     select_new_prediction_run,
     tag_run_artifact_hashes,
     tag_run_with_provider,
@@ -96,12 +100,15 @@ def resolve_provider_uri(
             raise ValueError(
                 "snapshot_override and expected_provider_identity are mutually exclusive"
             )
-        return resolve_approved_provider_identity(
+        return qlib_workflow_provider_uri(
             name,
-            expected_provider_identity,
-            quant_data_root=QUANT_DATA,
+            expected_provider_identity=expected_provider_identity,
         )
-    return qlib_provider_uri(name, snapshot_override=snapshot_override)
+    if snapshot_override is not None:
+        pinned = Path(snapshot_override).expanduser().resolve()
+        qlib_workflow_init_config(provider=name, provider_uri=pinned)
+        return pinned
+    return qlib_workflow_provider_uri(name)
 
 
 def to_qlib_name(sym: str) -> str:
@@ -109,16 +116,7 @@ def to_qlib_name(sym: str) -> str:
 
 
 def load_provider_instrument_ranges(provider_uri: Path) -> dict[str, tuple[str, str]]:
-    all_path = provider_uri / "instruments" / "all.txt"
-    if not all_path.exists():
-        raise FileNotFoundError(f"Missing provider instruments file: {all_path}")
-    ranges: dict[str, tuple[str, str]] = {}
-    for line in all_path.read_text(encoding="utf-8").splitlines():
-        parts = line.strip().split()
-        if len(parts) < 3:
-            continue
-        ranges[parts[0].upper()] = (parts[1], parts[2])
-    return ranges
+    return provider_instrument_ranges(provider_uri)
 
 
 def build_csi300_lines(symbols: Iterable[str], ranges: dict[str, tuple[str, str]]) -> list[str]:
@@ -144,13 +142,13 @@ def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
 
 def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):
     """Require the immutable provider to contain its CSI300 pool."""
-    instruments_path = provider_uri / "instruments" / "csi300.txt"
-    if instruments_path.exists():
+    if provider_has_instrument_pool(provider_uri, "csi300"):
+        del csi300_symbols
         return
     del csi300_symbols
     raise FileNotFoundError(
-        "Provider is missing instruments/csi300.txt; rebuild qlib_ashare_v2 "
-        "instead of modifying an immutable snapshot at training time"
+        "The formal Qlib Provider has no CSI300 instruments; republish and validate "
+        "the quant_data backend before training"
     )
 
 
@@ -166,7 +164,12 @@ def write_runtime_config_with_provider(
 
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
-    qlib_init["provider_uri"] = str(provider_uri)
+    qlib_init.update(
+        qlib_workflow_init_config(
+            provider=provider_name,
+            provider_uri=provider_uri,
+        )
+    )
     payload["qlib_init"] = qlib_init
     if extend_dates_to_provider_latest:
         calendar_tail = provider_calendar_tail(provider_uri)
@@ -188,11 +191,10 @@ def write_runtime_config_with_provider(
 
 
 def provider_calendar_tail(provider_uri: Path, count: int = 2) -> list[str]:
-    calendar = provider_uri / "calendars" / "day.txt"
-    if not calendar.exists():
+    try:
+        return provider_calendar_days(provider_uri)[-count:]
+    except (FileNotFoundError, RuntimeError, ValueError):
         return []
-    values = [line.strip() for line in calendar.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    return values[-count:]
 
 
 def _portana_record_config(record: dict) -> dict | None:
@@ -975,7 +977,7 @@ def main():
         "--provider-uri",
         type=Path,
         default=None,
-        help="Pin one already selected immutable native V2 snapshot for this run",
+        help="Pin one already selected Qlib Provider for this run",
     )
     parser.add_argument(
         "--provider-identity-json",
@@ -1054,11 +1056,17 @@ def main():
         )
         if not provider_uri.exists():
             raise FileNotFoundError(f"Provider does not exist: {provider_uri}")
-        training_provider_identity = (
-            dict(expected_provider_identity)
-            if expected_provider_identity is not None
-            else provider_identity(provider_uri)
+        training_provider_identity = provider_identity(
+            provider_uri,
+            quant_data_root=QUANT_DATA,
         )
+        if expected_provider_identity is not None and not provider_lineages_match(
+            training_provider_identity,
+            expected_provider_identity,
+        ):
+            raise RuntimeError(
+                "The selected Qlib Provider no longer matches the approved lineage."
+            )
     except Exception as exc:
         print(f"[error] {exc}")
         sys.exit(1)

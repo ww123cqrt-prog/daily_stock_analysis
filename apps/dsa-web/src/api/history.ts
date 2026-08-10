@@ -10,6 +10,7 @@ import type {
   RunDiagnosticSummary,
   StockBarResponse,
 } from '../types/analysis';
+import type { RunFlowSnapshot } from '../types/runFlow';
 
 // ============ API 接口 ============
 
@@ -18,12 +19,19 @@ export interface GetHistoryListParams extends HistoryFilters {
   limit?: number;
 }
 
+export interface GetHistoryListOptions {
+  signal?: AbortSignal;
+}
+
 export const historyApi = {
   /**
    * 获取历史分析列表
    * @param params 筛选和分页参数
    */
-  getList: async (params: GetHistoryListParams = {}): Promise<HistoryListResponse> => {
+  getList: async (
+    params: GetHistoryListParams = {},
+    options: GetHistoryListOptions = {},
+  ): Promise<HistoryListResponse> => {
     const { stockCode, reportType, startDate, endDate, page = 1, limit = 20 } = params;
 
     const queryParams: Record<string, string | number> = { page, limit };
@@ -34,6 +42,7 @@ export const historyApi = {
 
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/history', {
       params: queryParams,
+      signal: options.signal,
     });
 
     const data = toCamelCase<{ total: number; page: number; limit: number; items: HistoryItem[] }>(response.data);
@@ -82,12 +91,32 @@ export const historyApi = {
   },
 
   /**
+   * 生成历史报告分享图片
+   * @param recordId 分析历史记录主键 ID
+   */
+  getShareImage: async (recordId: number): Promise<Blob> => {
+    const response = await apiClient.get<Blob>(`/api/v1/history/${recordId}/share-image`, {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+
+  /**
    * 获取历史报告运行诊断摘要
    * @param recordId 分析历史记录主键 ID
    */
   getDiagnostics: async (recordId: number): Promise<RunDiagnosticSummary> => {
     const response = await apiClient.get<Record<string, unknown>>(`/api/v1/history/${recordId}/diagnostics`);
     return toCamelCase<RunDiagnosticSummary>(response.data);
+  },
+
+  /**
+   * 获取历史报告运行流快照
+   * @param recordId 分析历史记录主键 ID
+   */
+  getRecordFlow: async (recordId: number): Promise<RunFlowSnapshot> => {
+    const response = await apiClient.get<Record<string, unknown>>(`/api/v1/history/${recordId}/flow`);
+    return toCamelCase<RunFlowSnapshot>(response.data);
   },
 
   /**

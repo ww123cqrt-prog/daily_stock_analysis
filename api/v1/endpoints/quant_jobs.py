@@ -38,6 +38,10 @@ from api.v1.endpoints.research_status import (
     build_research_status_payload,
 )
 from quant_workflow.scripts.quant_data_contract import DataContractError
+from quant_workflow.scripts._mlflow_run_provenance import (
+    RunProvenanceError,
+    normalize_provider_lineage,
+)
 from quant_workflow.scripts.robust_signal_data_contract import (
     RobustSignalDataBlocked,
     readiness_artifact_path_for_sha,
@@ -73,16 +77,9 @@ MARKET_DATA_PINNED_JOB_TYPES = {
     "report_cash_control_backtest",
 }
 TRAINING_PROVIDER_DATASET_IDS = {
-    "canonical": "qlib_ashare_v2",
-    "cleaned": "qlib_ashare_cleaned_v2",
+    "canonical": "ashare_daily_qfq",
+    "cleaned": "ashare_daily_qfq",
 }
-PROVIDER_IDENTITY_FIELDS = (
-    "provider_contract",
-    "dataset_id",
-    "snapshot_id",
-    "manifest_sha256",
-    "content_sha256",
-)
 LOCAL_CATDESK_HEALTH_PORTS = {8765}
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -443,31 +440,23 @@ def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
     return dataset_id
 
 
+def _training_provider_name(params: Dict[str, Any]) -> str:
+    provider = str(params.get("provider") or "canonical").strip().lower()
+    if provider not in TRAINING_PROVIDER_DATASET_IDS:
+        raise ValueError("Provider must be one of: canonical, cleaned.")
+    return provider
+
+
 def _approved_provider_identity_from_status(
     research_status: Dict[str, Any],
-    *,
-    expected_dataset_id: str,
 ) -> Dict[str, str]:
     provider = research_status.get("qlib_provider")
     if not isinstance(provider, dict):
-        raise ValueError("Training status does not expose an approved Qlib snapshot.")
-    identity = {field: provider.get(field) for field in PROVIDER_IDENTITY_FIELDS}
-    snapshot_id = identity.get("snapshot_id")
-    if (
-        identity.get("provider_contract") != "immutable_snapshot_v2"
-        or identity.get("dataset_id") != expected_dataset_id
-        or not isinstance(snapshot_id, str)
-        or not snapshot_id
-        or Path(snapshot_id).name != snapshot_id
-        or snapshot_id in {".", ".."}
-        or any(
-            not isinstance(identity.get(field), str)
-            or re.fullmatch(r"[0-9a-f]{64}", str(identity.get(field))) is None
-            for field in ("manifest_sha256", "content_sha256")
-        )
-    ):
-        raise ValueError("Training status has an invalid approved Qlib snapshot identity.")
-    return {field: str(identity[field]) for field in PROVIDER_IDENTITY_FIELDS}
+        raise ValueError("Training status does not expose an approved Qlib Provider.")
+    try:
+        return normalize_provider_lineage(provider)
+    except RunProvenanceError as exc:
+        raise ValueError("Training status has an invalid Qlib Provider lineage.") from exc
 
 
 def _resolved_allowed_artifact_path(path: Path, service: QuantJobService) -> _ArtifactPathResolution:
@@ -594,6 +583,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
             research_status = await asyncio.to_thread(
                 build_research_status_payload,
                 provider_dataset_id=provider_dataset_id,
+                provider=_training_provider_name(request.params),
             )
             if research_status.get("trainable") is not True:
                 readiness = research_status.get("training_readiness")
@@ -614,7 +604,6 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                 try:
                     approved_provider_identity = _approved_provider_identity_from_status(
                         research_status,
-                        expected_dataset_id=provider_dataset_id,
                     )
                 except ValueError as exc:
                     raise api_error(
