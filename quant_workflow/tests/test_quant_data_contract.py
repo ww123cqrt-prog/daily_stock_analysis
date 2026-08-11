@@ -103,6 +103,38 @@ def write_artifact_snapshot(
     return snapshot
 
 
+def test_artifact_contract_accepts_governed_qlib_cleaning_plan(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    snapshot = tmp_path / "quant_data" / "staging" / "cleaning-plan-001"
+    snapshot.mkdir(parents=True)
+    (snapshot / "CLEANING_PLAN.json").write_text(
+        json.dumps({"schema_version": 1, "event_dates": {}}),
+        encoding="utf-8",
+    )
+
+    module.finalize_artifact_snapshot(
+        snapshot,
+        dataset_id="qlib_cleaning_plan",
+        snapshot_id=snapshot.name,
+        data_kind="qlib_cleaning_plan",
+        role="canonical",
+        status="ready",
+        source={"provider": "quant_workflow", "interface": "frozen_cleaning_rules"},
+        price_basis="not_applicable",
+        producer={"script": "test_quant_data_contract.py", "version": "1"},
+        source_retrieved_at="2026-08-10T10:00:00+08:00",
+        date_range={"start": "1990-12-19", "end": "2026-08-04"},
+        components={"plan": {"path": "CLEANING_PLAN.json", "kind": "json"}},
+    )
+
+    manifest = module.validate_dataset_snapshot(snapshot)
+
+    assert manifest["data_kind"] == "qlib_cleaning_plan"
+    assert manifest["components"]["plan"]["path"] == "CLEANING_PLAN.json"
+
+
 @pytest.mark.parametrize("column", ["open", "high", "low", "close"])
 def test_validate_bar_frame_rejects_non_positive_prices(column: str) -> None:
     module = load_module()

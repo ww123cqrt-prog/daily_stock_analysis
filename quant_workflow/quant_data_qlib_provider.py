@@ -31,26 +31,24 @@ from qlib.data.data import (
 from quant_workflow.scripts.quant_data_contract import (
     DataContractError,
     ResolvedDataset,
+    ResolvedDatasetArtifact,
     resolve_dataset,
+    resolve_dataset_artifact,
     sha256_file,
-)
-from quant_workflow.scripts._robust_membership_integrity import (
-    MembershipIntegrityError,
-    membership_read_lock,
 )
 
 
 DESCRIPTOR_NAME = "PROVIDER_DESCRIPTOR.json"
 CALENDAR_NAME = "CALENDAR.parquet"
 MEMBERSHIP_NAME = "MEMBERSHIP_INTERVALS.parquet"
-DESCRIPTOR_SCHEMA_VERSION = 1
-ADAPTER_VERSION = "1"
+DESCRIPTOR_SCHEMA_VERSION = 2
+ADAPTER_VERSION = "2"
 DEFAULT_DATASET_ID = "ashare_daily_qfq"
 DEFAULT_INDEX_DATASET_ID = "cn_index_daily"
-DEFAULT_MEMBERSHIP_PATH = Path(
-    "reference/pit_csi800/membership_intervals.parquet"
-)
-PIT_MEMBERSHIP_ROOT = DEFAULT_MEMBERSHIP_PATH.parent
+MEMBERSHIP_DATASET_ID = "pit_csi800"
+MEMBERSHIP_COMPONENT_NAME = "membership_intervals"
+CLEANING_DATASET_ID = "qlib_cleaning_plan"
+CLEANING_COMPONENT_NAME = "plan"
 SUPPORTED_FIELDS = {
     "open": "open",
     "high": "high",
@@ -86,10 +84,18 @@ CLEANING_EVENT_FIELDS = (
     "turn",
     "pctChg",
 )
+QLIB_REQUIRED_FIELDS = ("open", "close", "high", "low", "volume")
 
 
 class DirectProviderError(RuntimeError):
     """Raised when a direct provider cannot prove or read its frozen input."""
+
+
+@dataclass(frozen=True)
+class _ResolvedArtifactInput:
+    payload: bytes
+    value: Any
+    identity: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -336,77 +342,182 @@ def _read_membership(path: Path) -> pd.DataFrame:
     return _read_membership_bytes(payload)
 
 
-def _validated_membership_input(
-    root: Path,
-    membership_path: str | Path | None,
-) -> tuple[bytes, pd.DataFrame, str, str]:
-    root = Path(root).expanduser().resolve()
-    pit_dir = _safe_child(root, PIT_MEMBERSHIP_ROOT.as_posix(), "membership root")
-    expected_file = _safe_snapshot_child(
-        pit_dir,
-        DEFAULT_MEMBERSHIP_PATH.name,
-        "membership path",
-    )
-    requested_file = _path_under_root(
-        root,
-        membership_path or DEFAULT_MEMBERSHIP_PATH,
-        "membership path",
-    )
-    if requested_file != expected_file:
-        raise DirectProviderError("membership path is not the official pit_csi800 input")
+def _artifact_index_sha256(
+    snapshot: Path,
+    manifest: Mapping[str, Any],
+    artifact_path: Path,
+    label: str,
+) -> str:
+    """Return the published hash for one component without validating all artifacts."""
 
-    catalog_path = _safe_child(root, "DATA_MANIFEST.json", "quant_data catalog")
-    catalog = _read_json(catalog_path, "quant_data catalog")
-    official_entries = catalog.get("official_entries")
-    entry = (
-        official_entries.get("pit_csi800")
-        if isinstance(official_entries, dict)
-        else None
+    index_path = _safe_snapshot_child(
+        snapshot,
+        manifest.get("artifact_index_path"),
+        f"{label} artifact index",
     )
-    if not isinstance(entry, dict):
-        raise DirectProviderError("official pit_csi800 membership is not registered")
-    if (
-        entry.get("path") != PIT_MEMBERSHIP_ROOT.as_posix()
-        or entry.get("status") != "do_not_move"
-    ):
-        raise DirectProviderError("official pit_csi800 membership entry is invalid")
-    expected_snapshot_hash = _validate_sha256(
-        entry.get("membership_snapshot_hash"),
-        "membership snapshot hash",
-    )
-    date_range = entry.get("date_range")
-    if not isinstance(date_range, dict):
-        raise DirectProviderError("official pit_csi800 membership date range is invalid")
-
     try:
-        with membership_read_lock(pit_dir) as locked:
-            locked.ensure_transaction_clean()
-            source = locked.validate_source(
-                start_date=str(date_range.get("start_date") or ""),
-                end_date=str(date_range.get("end_date") or ""),
-            )
-            actual_snapshot_hash = locked.fingerprint()
-            if actual_snapshot_hash != expected_snapshot_hash:
-                raise DirectProviderError(
-                    "official pit_csi800 membership fingerprint is stale"
-                )
-            if entry.get("selected_source") != source.get("selected"):
-                raise DirectProviderError(
-                    "official pit_csi800 membership source is stale"
-                )
-            payload = expected_file.read_bytes()
-    except MembershipIntegrityError as exc:
-        raise DirectProviderError(
-            f"official pit_csi800 membership is unavailable: {exc.reason_code}"
-        ) from exc
-    except OSError as exc:
-        raise DirectProviderError(
-            "official pit_csi800 membership is unavailable"
-        ) from exc
+        index = pd.read_parquet(index_path, columns=["relative_path", "sha256"])
+    except Exception as exc:
+        raise DirectProviderError(f"{label} artifact index is unavailable") from exc
+    relative = artifact_path.relative_to(snapshot).as_posix()
+    rows = index[index["relative_path"].astype(str) == relative]
+    if len(rows) != 1:
+        raise DirectProviderError(f"{label} is not registered in the artifact index")
+    return _validate_sha256(rows.iloc[0]["sha256"], f"{label} source hash")
 
-    membership = _read_membership_bytes(payload)
-    file_hash = hashlib.sha256(payload).hexdigest()
-    return payload, membership, file_hash, actual_snapshot_hash
+
+def _artifact_identity(
+    root: Path,
+    artifact: ResolvedDatasetArtifact,
+    payload: bytes,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    dataset = artifact.dataset
+    manifest_path = dataset.snapshot_path / "DATASET_MANIFEST.json"
+    source_path = artifact.artifact_path
+    if source_path.is_symlink() or not source_path.is_file():
+        raise DirectProviderError(f"{label} source artifact is unavailable")
+    source_hash = hashlib.sha256(payload).hexdigest()
+    indexed_hash = _artifact_index_sha256(
+        dataset.snapshot_path,
+        dataset.manifest,
+        source_path,
+        label,
+    )
+    if source_hash != indexed_hash:
+        raise DirectProviderError(f"{label} source artifact hash mismatch")
+    return {
+        "dataset_id": dataset.dataset_id,
+        "snapshot_id": dataset.manifest.get("snapshot_id"),
+        "snapshot_path": _relative_path(
+            dataset.snapshot_path,
+            root,
+            f"{label} snapshot path",
+        ),
+        "content_sha256": _validate_sha256(
+            dataset.manifest.get("content_sha256"),
+            f"{label} content hash",
+        ),
+        "manifest_sha256": sha256_file(manifest_path),
+        "component_name": artifact.component_name,
+        "component_path": source_path.relative_to(dataset.snapshot_path).as_posix(),
+        "source_path": _relative_path(source_path, root, f"{label} source path"),
+        "source_sha256": source_hash,
+    }
+
+
+def _resolve_artifact_input(
+    root: Path,
+    dataset_id: str,
+    component_name: str,
+    override_path: str | Path | None,
+    *,
+    label: str,
+    expected_kind: str,
+    parser: Any,
+) -> _ResolvedArtifactInput:
+    if override_path is not None:
+        raise DirectProviderError(
+            f"formal {dataset_id} {label} does not accept a path override; "
+            "resolve the governed component by dataset identity"
+        )
+    try:
+        artifact = resolve_dataset_artifact(
+            dataset_id,
+            component_name,
+            quant_data_root=root,
+        )
+    except DataContractError as exc:
+        raise DirectProviderError(
+            f"formal {dataset_id} {label} is unavailable: {exc}"
+        ) from exc
+    manifest = artifact.dataset.manifest
+    if manifest.get("data_kind") != expected_kind:
+        raise DirectProviderError(
+            f"formal {dataset_id} {label} has an unsupported data kind"
+        )
+    try:
+        payload = artifact.artifact_path.read_bytes()
+    except OSError as exc:
+        raise DirectProviderError(f"formal {dataset_id} {label} is unavailable") from exc
+    identity = _artifact_identity(root, artifact, payload, label=label)
+    try:
+        value = parser(payload)
+    except DirectProviderError:
+        raise
+    except Exception as exc:
+        raise DirectProviderError(f"formal {dataset_id} {label} is invalid") from exc
+    return _ResolvedArtifactInput(payload, value, identity)
+
+
+def _load_frozen_artifact(
+    root: Path,
+    spec: Mapping[str, Any],
+    *,
+    label: str,
+    expected_dataset_id: str,
+    expected_component_name: str,
+    expected_kind: str,
+) -> tuple[dict[str, Any], Path]:
+    """Validate a descriptor's source component without following ``LATEST``."""
+
+    required = (
+        "dataset_id",
+        "snapshot_id",
+        "snapshot_path",
+        "content_sha256",
+        "manifest_sha256",
+        "component_name",
+        "component_path",
+        "source_path",
+        "source_sha256",
+    )
+    if any(not spec.get(field) for field in required):
+        raise DirectProviderError(f"frozen {label} identity is incomplete")
+    if spec.get("dataset_id") != expected_dataset_id:
+        raise DirectProviderError(f"frozen {label} dataset identity is invalid")
+    if spec.get("component_name") != expected_component_name:
+        raise DirectProviderError(f"frozen {label} component identity is invalid")
+    snapshot = _safe_child(root, spec.get("snapshot_path"), f"{label} snapshot path")
+    if snapshot.name != str(spec.get("snapshot_id")) or not snapshot.is_dir():
+        raise DirectProviderError(f"frozen {label} snapshot is unavailable")
+    manifest_path = _safe_snapshot_child(
+        snapshot,
+        "DATASET_MANIFEST.json",
+        f"{label} snapshot manifest",
+    )
+    _validate_file_hash(
+        manifest_path,
+        spec.get("manifest_sha256"),
+        f"frozen {label} snapshot manifest",
+    )
+    manifest = _read_json(manifest_path, f"frozen {label} snapshot manifest")
+    for field in ("dataset_id", "snapshot_id", "content_sha256"):
+        if manifest.get(field) != spec.get(field):
+            raise DirectProviderError(f"frozen {label} {field} mismatch")
+    if manifest.get("status") != "ready" or manifest.get("data_kind") != expected_kind:
+        raise DirectProviderError(f"frozen {label} snapshot is not ready")
+    components = manifest.get("components")
+    component = components.get(expected_component_name) if isinstance(components, Mapping) else None
+    if not isinstance(component, Mapping) or component.get("path") != spec.get("component_path"):
+        raise DirectProviderError(f"frozen {label} component path mismatch")
+    artifact_path = _safe_snapshot_child(
+        snapshot,
+        spec.get("component_path"),
+        f"{label} source artifact",
+    )
+    if _relative_path(artifact_path, root, f"{label} source path") != spec.get("source_path"):
+        raise DirectProviderError(f"frozen {label} source path mismatch")
+    expected_source_hash = _validate_sha256(
+        spec.get("source_sha256"),
+        f"frozen {label} source hash",
+    )
+    indexed_hash = _artifact_index_sha256(snapshot, manifest, artifact_path, label)
+    if indexed_hash != expected_source_hash:
+        raise DirectProviderError(f"frozen {label} artifact index mismatch")
+    _validate_file_hash(artifact_path, expected_source_hash, f"frozen {label} source artifact")
+    return manifest, artifact_path
 
 
 def _load_frozen_bar_dataset(
@@ -511,6 +622,14 @@ def _load_descriptor(
     membership_spec = payload.get("membership")
     if not isinstance(membership_spec, dict):
         raise DirectProviderError("historical membership descriptor is missing")
+    _load_frozen_artifact(
+        root,
+        membership_spec,
+        label="historical membership",
+        expected_dataset_id=MEMBERSHIP_DATASET_ID,
+        expected_component_name=MEMBERSHIP_COMPONENT_NAME,
+        expected_kind="point_in_time_membership",
+    )
     membership_path = _safe_snapshot_child(
         descriptor_file.parent,
         membership_spec.get("path"),
@@ -524,10 +643,8 @@ def _load_descriptor(
     membership = _read_membership(membership_path)
     if int(membership_spec.get("row_count") or -1) != len(membership):
         raise DirectProviderError("historical membership descriptor is stale")
-    _validate_sha256(
-        membership_spec.get("snapshot_hash"),
-        "membership snapshot hash",
-    )
+    if membership_spec.get("sha256") != membership_spec.get("source_sha256"):
+        raise DirectProviderError("historical membership source and frozen copy differ")
 
     cleaning_spec = payload.get("cleaning") or {"mode": "canonical"}
     if not isinstance(cleaning_spec, dict):
@@ -536,6 +653,25 @@ def _load_descriptor(
     if cleaning_mode == "canonical":
         cleaning = {"mode": "canonical"}
     elif cleaning_mode == "cleaned":
+        cleaning_manifest, _ = _load_frozen_artifact(
+            root,
+            cleaning_spec,
+            label="cleaning plan",
+            expected_dataset_id=CLEANING_DATASET_ID,
+            expected_component_name=CLEANING_COMPONENT_NAME,
+            expected_kind="qlib_cleaning_plan",
+        )
+        upstream = cleaning_manifest.get("upstream_snapshots")
+        if not isinstance(upstream, list) or len(upstream) != 1:
+            raise DirectProviderError("cleaning plan upstream identity is invalid")
+        expected_upstream = {
+            "dataset_id": dataset.get("dataset_id"),
+            "snapshot_id": dataset.get("snapshot_id"),
+            "content_sha256": dataset.get("content_sha256"),
+            "price_basis": dataset.get("price_basis"),
+        }
+        if any(upstream[0].get(field) != value for field, value in expected_upstream.items()):
+            raise DirectProviderError("cleaning plan belongs to another stock snapshot")
         cleaning_path = _safe_child(
             descriptor_file.parent,
             cleaning_spec.get("path"),
@@ -548,6 +684,8 @@ def _load_descriptor(
                 cleaning_spec.get("plan_sha256") or cleaning_spec.get("sha256"),
             ),
         }
+        if cleaning_spec.get("plan_sha256") != cleaning_spec.get("source_sha256"):
+            raise DirectProviderError("cleaning plan source and frozen copy differ")
     else:
         raise DirectProviderError("cleaning mode is unsupported")
 
@@ -696,8 +834,7 @@ def _descriptor_payload(
     calendar: pd.DatetimeIndex,
     membership_path: Path,
     membership: pd.DataFrame,
-    membership_snapshot_hash: str,
-    membership_source_path: str,
+    membership_identity: Mapping[str, Any],
     index_resolved: ResolvedDataset | None,
     index_file_index_path: Path | None,
     cleaning: Mapping[str, Any],
@@ -739,11 +876,10 @@ def _descriptor_payload(
         },
         "membership": {
             "path": membership_path.name,
-            "source_path": membership_source_path,
             "sha256": sha256_file(membership_path),
-            "snapshot_hash": membership_snapshot_hash,
             "row_count": int(len(membership)),
             "pools": _membership_summary(membership),
+            **dict(membership_identity),
         },
         "field_contract": {
             "price_input": "already_qfq",
@@ -789,12 +925,16 @@ def build_direct_provider_descriptor(
     """Freeze a metadata-only Qlib view of the current formal Parquet snapshot."""
 
     root = Path(quant_data_root).expanduser().resolve()
-    (
-        membership_bytes,
-        membership,
-        membership_file_hash,
-        membership_snapshot_hash,
-    ) = _validated_membership_input(root, membership_path)
+    if membership_path is not None:
+        raise DirectProviderError(
+            "formal pit_csi800 membership does not accept a path override"
+        )
+    if cleaning_plan_path is not None:
+        raise DirectProviderError(
+            "formal qlib_cleaning_plan does not accept a path override"
+        )
+    if cleaning_mode not in {"canonical", "cleaned"}:
+        raise DirectProviderError("cleaning mode is unsupported")
 
     base = _path_under_root(
         root,
@@ -806,6 +946,11 @@ def build_direct_provider_descriptor(
         root,
         dataset_id,
         expected_price_basis="qfq",
+    )
+    membership_entry, membership_snapshot = _current_dataset_identity(
+        root,
+        MEMBERSHIP_DATASET_ID,
+        expected_price_basis="not_applicable",
     )
     index_entry: dict[str, Any] | None = None
     index_snapshot: Path | None = None
@@ -819,24 +964,13 @@ def build_direct_provider_descriptor(
             expected_price_basis="derived",
         )
 
-    if cleaning_mode not in {"canonical", "cleaned"}:
-        raise DirectProviderError("cleaning mode is unsupported")
-    cleaning_bytes: bytes | None = None
-    cleaning_plan: dict[str, Any] | None = None
-    cleaning_hash: str | None = None
+    cleaning_entry: dict[str, Any] | None = None
+    cleaning_snapshot: Path | None = None
     if cleaning_mode == "cleaned":
-        requested_plan = _path_under_root(
+        cleaning_entry, cleaning_snapshot = _current_dataset_identity(
             root,
-            cleaning_plan_path or Path("reference/qlib_cleaning/CLEANING_PLAN.json"),
-            "cleaning plan",
-        )
-        try:
-            cleaning_bytes = requested_plan.read_bytes()
-        except OSError as exc:
-            raise DirectProviderError("cleaning plan is unavailable") from exc
-        cleaning_hash = hashlib.sha256(cleaning_bytes).hexdigest()
-        cleaning_plan = _normalize_cleaning_plan(
-            _read_json(requested_plan, "cleaning plan")
+            CLEANING_DATASET_ID,
+            expected_price_basis="not_applicable",
         )
 
     index_identity = (
@@ -844,16 +978,21 @@ def build_direct_provider_descriptor(
         if index_entry is not None
         else "no-index"
     )
+    membership_identity = (
+        f"{membership_entry['snapshot_id']}-"
+        f"{str(membership_entry['content_sha256'])[:12]}"
+    )
     cleaning_identity = (
-        f"cleaned-{cleaning_hash[:12]}"
-        if cleaning_hash
+        f"cleaned-{cleaning_entry['snapshot_id']}-"
+        f"{str(cleaning_entry['content_sha256'])[:12]}"
+        if cleaning_entry is not None
         else "canonical"
     )
     provider_dir = (
         base
         / dataset_id
         / str(current_entry["snapshot_id"])
-        / membership_snapshot_hash
+        / membership_identity
         / index_identity
         / cleaning_identity
     )
@@ -864,21 +1003,75 @@ def build_direct_provider_descriptor(
             context.snapshot_path != current_snapshot
             or context.manifest["content_sha256"]
             != current_entry["content_sha256"]
-            or context.descriptor["membership"]["snapshot_hash"]
-            != membership_snapshot_hash
-            or context.descriptor["membership"]["sha256"]
-            != membership_file_hash
+            or context.descriptor["membership"].get("snapshot_id")
+            != membership_entry["snapshot_id"]
+            or context.descriptor["membership"].get("content_sha256")
+            != membership_entry["content_sha256"]
             or (
                 index_entry is not None
                 and context.descriptor.get("index_dataset", {}).get("snapshot_id")
                 != index_entry["snapshot_id"]
             )
             or context.descriptor.get("cleaning", {}).get("mode") != cleaning_mode
+            or (
+                cleaning_entry is not None
+                and context.descriptor.get("cleaning", {}).get("snapshot_id")
+                != cleaning_entry["snapshot_id"]
+            )
+            or (
+                cleaning_entry is not None
+                and context.descriptor.get("cleaning", {}).get("content_sha256")
+                != cleaning_entry["content_sha256"]
+            )
         ):
             raise DirectProviderError(
                 "existing direct provider descriptor has a conflicting identity"
             )
         return descriptor_path
+
+    membership_input = _resolve_artifact_input(
+        root,
+        MEMBERSHIP_DATASET_ID,
+        MEMBERSHIP_COMPONENT_NAME,
+        membership_path,
+        label="historical membership",
+        expected_kind="point_in_time_membership",
+        parser=_read_membership_bytes,
+    )
+    if (
+        membership_input.identity["snapshot_id"] != membership_entry["snapshot_id"]
+        or membership_input.identity["content_sha256"]
+        != membership_entry["content_sha256"]
+        or Path(membership_input.identity["snapshot_path"]).name
+        != membership_snapshot.name
+    ):
+        raise DirectProviderError(
+            "formal pit_csi800 membership changed during descriptor creation"
+        )
+
+    cleaning_input: _ResolvedArtifactInput | None = None
+    if cleaning_mode == "cleaned":
+        cleaning_input = _resolve_artifact_input(
+            root,
+            CLEANING_DATASET_ID,
+            CLEANING_COMPONENT_NAME,
+            cleaning_plan_path,
+            label="cleaning plan",
+            expected_kind="qlib_cleaning_plan",
+            parser=lambda payload: _normalize_cleaning_plan(
+                json.loads(payload.decode("utf-8"))
+            ),
+        )
+        if (
+            cleaning_input.identity["snapshot_id"] != cleaning_entry["snapshot_id"]
+            or cleaning_input.identity["content_sha256"]
+            != cleaning_entry["content_sha256"]
+            or Path(cleaning_input.identity["snapshot_path"]).name
+            != cleaning_snapshot.name
+        ):
+            raise DirectProviderError(
+                "formal qlib_cleaning_plan changed during descriptor creation"
+            )
 
     if index_dataset_id:
         try:
@@ -946,15 +1139,16 @@ def build_direct_provider_descriptor(
         calendar_path = staging / CALENDAR_NAME
         pd.DataFrame({"date": calendar}).to_parquet(calendar_path, index=False)
         frozen_membership_path = staging / MEMBERSHIP_NAME
-        frozen_membership_path.write_bytes(membership_bytes)
-        if cleaning_bytes is not None:
-            (staging / CLEANING_PLAN_NAME).write_bytes(cleaning_bytes)
+        frozen_membership_path.write_bytes(membership_input.payload)
+        if cleaning_input is not None:
+            (staging / CLEANING_PLAN_NAME).write_bytes(cleaning_input.payload)
         cleaning_descriptor: dict[str, Any] = {"mode": "canonical"}
-        if cleaning_bytes is not None and cleaning_plan is not None:
+        if cleaning_input is not None:
             cleaning_descriptor = {
                 "mode": "cleaned",
                 "path": CLEANING_PLAN_NAME,
-                "plan_sha256": hashlib.sha256(cleaning_bytes).hexdigest(),
+                "plan_sha256": hashlib.sha256(cleaning_input.payload).hexdigest(),
+                **cleaning_input.identity,
             }
         payload = _descriptor_payload(
             root=root,
@@ -963,9 +1157,8 @@ def build_direct_provider_descriptor(
             calendar_path=calendar_path,
             calendar=calendar,
             membership_path=frozen_membership_path,
-            membership=membership,
-            membership_snapshot_hash=membership_snapshot_hash,
-            membership_source_path=DEFAULT_MEMBERSHIP_PATH.as_posix(),
+            membership=membership_input.value,
+            membership_identity=membership_input.identity,
             index_resolved=index_resolved,
             index_file_index_path=index_file_index_path,
             cleaning=cleaning_descriptor,
@@ -981,16 +1174,26 @@ def build_direct_provider_descriptor(
             context.snapshot_path != current_snapshot
             or context.manifest["content_sha256"]
             != current_entry["content_sha256"]
-            or context.descriptor["membership"]["snapshot_hash"]
-            != membership_snapshot_hash
-            or context.descriptor["membership"]["sha256"]
-            != membership_file_hash
+            or context.descriptor["membership"].get("snapshot_id")
+            != membership_entry["snapshot_id"]
+            or context.descriptor["membership"].get("content_sha256")
+            != membership_entry["content_sha256"]
             or (
                 index_entry is not None
                 and context.descriptor.get("index_dataset", {}).get("snapshot_id")
                 != index_entry["snapshot_id"]
             )
             or context.descriptor.get("cleaning", {}).get("mode") != cleaning_mode
+            or (
+                cleaning_entry is not None
+                and context.descriptor.get("cleaning", {}).get("snapshot_id")
+                != cleaning_entry["snapshot_id"]
+            )
+            or (
+                cleaning_entry is not None
+                and context.descriptor.get("cleaning", {}).get("content_sha256")
+                != cleaning_entry["content_sha256"]
+            )
         ):
             raise DirectProviderError(
                 "direct provider race produced a conflicting identity"
@@ -1277,6 +1480,9 @@ class QuantDataFeatureProvider(FeatureProvider):
                 if field in cleaned.columns
             ]
             cleaned.loc[mask, fields] = np.nan
+        missing_required = cleaned.loc[:, list(QLIB_REQUIRED_FIELDS)].isna().any(axis=1)
+        if bool(missing_required.any()):
+            cleaned = cleaned.loc[~missing_required].copy()
         return cleaned
 
     def _load_frame(self, symbol: str) -> pd.DataFrame:

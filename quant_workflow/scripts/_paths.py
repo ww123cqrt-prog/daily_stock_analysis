@@ -226,10 +226,8 @@ def qlib_provider_uri(
 
 def _resolve_direct_qlib_descriptor(
     root_text: str,
-    membership_text: str,
     index_dataset_id: str = "cn_index_daily",
     cleaning_mode: str = "canonical",
-    cleaning_plan_text: str = "",
 ) -> Path:
     from quant_workflow.quant_data_qlib_provider import (
         build_direct_provider_descriptor,
@@ -237,10 +235,8 @@ def _resolve_direct_qlib_descriptor(
 
     return build_direct_provider_descriptor(
         quant_data_root=Path(root_text),
-        membership_path=Path(membership_text),
         index_dataset_id=index_dataset_id,
         cleaning_mode=cleaning_mode,
-        cleaning_plan_path=Path(cleaning_plan_text) if cleaning_plan_text else None,
     )
 
 
@@ -256,20 +252,10 @@ def qlib_direct_provider_descriptor(provider: str = "canonical") -> Path:
             "QLIB_CLEANED_PROVIDER_URI and use the governed Qlib Provider"
         )
     root = quant_data_root().expanduser().resolve()
-    membership = _env_path(
-        "QLIB_DIRECT_MEMBERSHIP_PATH",
-        root / "reference" / "pit_csi800" / "membership_intervals.parquet",
-    ).expanduser()
-    plan = _env_path(
-        "QLIB_DIRECT_CLEANING_PLAN_PATH",
-        root / "reference" / "qlib_cleaning" / "CLEANING_PLAN.json",
-    ).expanduser()
     return _resolve_direct_qlib_descriptor(
         str(root),
-        str(membership),
         "cn_index_daily",
         provider,
-        str(plan) if provider == "cleaned" else "",
     )
 
 

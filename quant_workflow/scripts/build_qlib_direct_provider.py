@@ -62,7 +62,7 @@ def _sample_dates(
     return [dates.iloc[int(position)].date().isoformat() for position in sorted(set(positions))]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a Qlib Provider descriptor that reads quant_data Parquet "
@@ -77,8 +77,6 @@ def parse_args() -> argparse.Namespace:
         choices=("canonical", "cleaned"),
         default="canonical",
     )
-    parser.add_argument("--cleaning-plan-path", type=Path)
-    parser.add_argument("--membership-path", type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--smoke-symbol", default="SH600000")
     parser.add_argument("--smoke-start")
@@ -90,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         help="Deterministic historical dates per symbol when no explicit range is supplied.",
     )
     parser.add_argument("--skip-smoke", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -99,11 +97,9 @@ def main() -> int:
     descriptor = build_direct_provider_descriptor(
         quant_data_root=root,
         dataset_id=args.dataset_id,
-        membership_path=args.membership_path,
         output_root=args.output_root,
         index_dataset_id=getattr(args, "index_dataset_id", "cn_index_daily"),
         cleaning_mode=getattr(args, "cleaning_mode", "canonical"),
-        cleaning_plan_path=getattr(args, "cleaning_plan_path", None),
     )
     payload = json.loads(descriptor.read_text(encoding="utf-8"))
     result = {

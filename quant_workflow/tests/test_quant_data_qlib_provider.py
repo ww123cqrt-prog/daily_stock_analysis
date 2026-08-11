@@ -11,7 +11,6 @@ import pytest
 import yaml
 
 from quant_workflow import quant_data_qlib_provider as direct
-from quant_workflow.scripts import _robust_membership_integrity as membership_integrity
 from quant_workflow.scripts import quant_data_contract as contract
 
 
@@ -20,9 +19,14 @@ def _write_symbol(
     symbol: str,
     dates: list[str],
     closes: list[float],
+    volumes: list[float] | None = None,
 ) -> None:
     close = np.asarray(closes, dtype=float)
-    volume = np.arange(1, len(dates) + 1, dtype=float) * 100.0
+    volume = (
+        np.asarray(volumes, dtype=float)
+        if volumes is not None
+        else np.arange(1, len(dates) + 1, dtype=float) * 100.0
+    )
     bars = pd.DataFrame(
         {
             "date": pd.to_datetime(dates),
@@ -59,6 +63,7 @@ def _stage_qfq_snapshot(
     snapshot_id: str,
     *,
     sh_close: float,
+    sh_volumes: list[float] | None = None,
 ) -> Path:
     snapshot = quant_data_root / "staging" / snapshot_id / snapshot_id
     _write_symbol(
@@ -66,6 +71,7 @@ def _stage_qfq_snapshot(
         "SH600000",
         ["2026-01-02", "2026-01-06"],
         [sh_close, sh_close + 1.0],
+        sh_volumes,
     )
     _write_symbol(
         snapshot,
@@ -111,6 +117,7 @@ def _publish_qfq(
     *,
     sh_close: float,
     update_catalog: bool,
+    sh_volumes: list[float] | None = None,
 ) -> Path:
     dataset_root = (
         quant_data_root / "parquet" / "ashare_1d" / "ashare_daily_qfq"
@@ -119,6 +126,7 @@ def _publish_qfq(
         quant_data_root,
         snapshot_id,
         sh_close=sh_close,
+        sh_volumes=sh_volumes,
     )
     if update_catalog:
         return contract.publish_snapshot_group(
@@ -221,7 +229,8 @@ def _publish_membership(
     *,
     swapped: bool = False,
 ) -> tuple[Path, str]:
-    pit_dir = quant_data_root / "reference" / "pit_csi800"
+    snapshot_id = "pit-csi800-002" if swapped else "pit-csi800-001"
+    pit_dir = quant_data_root / "staging" / snapshot_id / snapshot_id
     membership = _membership_frame(swapped=swapped)
     intervals = pit_dir / "membership_intervals.parquet"
     daily = pit_dir / "daily" / "2026.parquet"
@@ -248,29 +257,106 @@ def _publish_membership(
         json.dumps(source),
         encoding="utf-8",
     )
-    with membership_integrity.membership_read_lock(pit_dir) as locked:
-        locked.ensure_transaction_clean()
-        snapshot_hash = locked.fingerprint()
-
-    manifest_path = quant_data_root / "DATA_MANIFEST.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    official_entries = dict(manifest.get("official_entries") or {})
-    official_entries["pit_csi800"] = {
-        "path": "reference/pit_csi800",
-        "role": "Official point-in-time CSI800 membership snapshot.",
-        "status": "do_not_move",
-        "date_range": source["date_range"],
-        "requested_source": source["requested"],
-        "selected_source": source["selected"],
-        "membership_snapshot_hash": snapshot_hash,
-    }
-    manifest["official_entries"] = official_entries
-    contract.write_root_manifest(
-        quant_data_root,
-        manifest["datasets"],
-        existing=manifest,
+    contract.finalize_artifact_snapshot(
+        pit_dir,
+        dataset_id="pit_csi800",
+        snapshot_id=snapshot_id,
+        data_kind="point_in_time_membership",
+        role="canonical",
+        status="ready",
+        source={"provider": "fixture", "interface": "membership_builder"},
+        price_basis="not_applicable",
+        producer={"script": "test_quant_data_qlib_provider.py", "version": "1"},
+        source_retrieved_at="2026-01-07T08:00:00+08:00",
+        date_range={"start": "2026-01-02", "end": "2026-01-06"},
+        components={
+            "daily": {"kind": "partitioned_parquet", "path": "daily"},
+            "membership_intervals": {
+                "kind": "parquet",
+                "path": "membership_intervals.parquet",
+            },
+            "source_manifest": {"kind": "json", "path": "MEMBERSHIP_SOURCE.json"},
+        },
     )
-    return intervals, snapshot_hash
+    published = contract.publish_snapshot_group(
+        [(pit_dir, quant_data_root / "reference" / "pit_csi800")],
+        quant_data_root=quant_data_root,
+        update_root_catalog=True,
+    )[0]
+    manifest = contract.validate_dataset_snapshot(published)
+    return published / intervals.relative_to(pit_dir), str(manifest["content_sha256"])
+
+
+def _publish_cleaning_plan(
+    quant_data_root: Path,
+    *,
+    volume_mask_symbols: list[str] | None = None,
+    event_dates: dict[str, list[str]] | None = None,
+) -> Path:
+    snapshot_id = "qlib-cleaning-plan-001"
+    staged = quant_data_root / "staging" / snapshot_id / snapshot_id
+    staged.mkdir(parents=True)
+    plan_path = staged / "CLEANING_PLAN.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "fixture.cleaning",
+                "volume_mask_symbols": volume_mask_symbols or [],
+                "excluded_symbols": [],
+                "event_dates": (
+                    {"SH600000": ["2026-01-06"]}
+                    if event_dates is None
+                    else event_dates
+                ),
+                "event_mask_fields": [
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                    "turn",
+                    "pctChg",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = contract.resolve_dataset(
+        "ashare_daily_qfq", quant_data_root=quant_data_root, require_basis="qfq"
+    )
+    contract.finalize_artifact_snapshot(
+        staged,
+        dataset_id="qlib_cleaning_plan",
+        snapshot_id=snapshot_id,
+        data_kind="qlib_cleaning_plan",
+        role="canonical",
+        status="ready",
+        source={"provider": "fixture", "interface": "cleaning_plan_builder"},
+        price_basis="not_applicable",
+        producer={"script": "test_quant_data_qlib_provider.py", "version": "1"},
+        source_retrieved_at="2026-01-07T08:00:00+08:00",
+        date_range={"start": "2026-01-02", "end": "2026-01-06"},
+        components={"plan": {"kind": "json", "path": "CLEANING_PLAN.json"}},
+        upstream_snapshots=[
+            {
+                field: upstream.manifest[field]
+                for field in (
+                    "dataset_id",
+                    "snapshot_id",
+                    "content_sha256",
+                    "price_basis",
+                )
+            }
+        ],
+    )
+    published = contract.publish_snapshot_group(
+        [(staged, quant_data_root / "reference" / "qlib_cleaning_plan")],
+        quant_data_root=quant_data_root,
+        update_root_catalog=True,
+    )[0]
+    return published / "CLEANING_PLAN.json"
 
 
 @pytest.fixture()
@@ -286,7 +372,6 @@ def direct_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     membership, _ = _publish_membership(quant_data_root)
     descriptor = direct.build_direct_provider_descriptor(
         quant_data_root=quant_data_root,
-        membership_path=membership,
         index_dataset_id="cn_index_daily",
     )
     return quant_data_root, snapshot, descriptor
@@ -314,6 +399,10 @@ def test_descriptor_contains_metadata_and_calendar_but_no_market_copy(
     assert payload["storage_mode"] == "direct_parquet"
     assert payload["dataset"]["dataset_id"] == "ashare_daily_qfq"
     assert payload["dataset"]["snapshot_id"] == "qfq-001"
+    assert payload["membership"]["dataset_id"] == "pit_csi800"
+    assert payload["membership"]["snapshot_id"] == "pit-csi800-001"
+    assert payload["membership"]["content_sha256"]
+    assert payload["membership"]["manifest_sha256"]
 
 
 def test_discovers_governed_root_without_requiring_quant_data_directory_name(
@@ -343,7 +432,7 @@ def test_direct_qlib_config_is_yaml_serializable_and_names_custom_provider(
     assert config["provider_uri"] == str(descriptor.parent)
 
 
-def test_build_rejects_membership_missing_from_official_manifest(
+def test_build_rejects_membership_missing_from_governed_catalog(
     tmp_path: Path,
 ) -> None:
     quant_data_root = tmp_path / "quant_data"
@@ -357,14 +446,14 @@ def test_build_rejects_membership_missing_from_official_manifest(
     membership.parent.mkdir(parents=True, exist_ok=True)
     _membership_frame().to_parquet(membership, index=False)
 
-    with pytest.raises(direct.DirectProviderError, match="official|registered"):
+    with pytest.raises(direct.DirectProviderError, match="formal|registered"):
         direct.build_direct_provider_descriptor(
             quant_data_root=quant_data_root,
             membership_path=membership,
         )
 
 
-def test_build_rejects_membership_while_writer_is_in_progress(
+def test_build_ignores_legacy_writer_marker_outside_immutable_snapshot(
     direct_fixture: tuple[Path, Path, Path],
 ) -> None:
     quant_data_root, _, _ = direct_fixture
@@ -376,8 +465,7 @@ def test_build_rejects_membership_while_writer_is_in_progress(
     )
     marker.write_text("{}", encoding="utf-8")
 
-    with pytest.raises(direct.DirectProviderError, match="build_in_progress"):
-        direct.build_direct_provider_descriptor(quant_data_root=quant_data_root)
+    assert direct.build_direct_provider_descriptor(quant_data_root=quant_data_root)
 
 
 def test_existing_descriptor_does_not_revalidate_every_bar_file(
@@ -392,9 +480,6 @@ def test_existing_descriptor_does_not_revalidate_every_bar_file(
     monkeypatch.setattr(direct, "resolve_dataset", unexpected_full_validation)
     reused = direct.build_direct_provider_descriptor(
         quant_data_root=quant_data_root,
-        membership_path=(
-            quant_data_root / "reference" / "pit_csi800" / "membership_intervals.parquet"
-        ),
     )
 
     assert reused == descriptor
@@ -462,35 +547,11 @@ def test_cleaned_direct_provider_applies_frozen_cleaning_plan(
     direct_fixture: tuple[Path, Path, Path],
 ) -> None:
     quant_data_root, _, _ = direct_fixture
-    plan_path = quant_data_root / "reference" / "qlib_cleaning" / "CLEANING_PLAN.json"
-    plan_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source": "fixture.cleaning",
-                "volume_mask_symbols": [],
-                "excluded_symbols": [],
-                "event_dates": {"SH600000": ["2026-01-06"]},
-                "event_mask_fields": [
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "amount",
-                    "turn",
-                    "pctChg",
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _publish_cleaning_plan(quant_data_root)
     descriptor = direct.build_direct_provider_descriptor(
         quant_data_root=quant_data_root,
         index_dataset_id="cn_index_daily",
         cleaning_mode="cleaned",
-        cleaning_plan_path=plan_path,
     )
     feature = direct.QuantDataFeatureProvider(
         descriptor_path=descriptor,
@@ -506,6 +567,50 @@ def test_cleaned_direct_provider_applies_frozen_cleaning_plan(
     payload = json.loads(descriptor.read_text(encoding="utf-8"))
     assert payload["cleaning"]["mode"] == "cleaned"
     assert payload["cleaning"]["plan_sha256"]
+    assert payload["cleaning"]["dataset_id"] == "qlib_cleaning_plan"
+    assert payload["cleaning"]["snapshot_id"] == "qlib-cleaning-plan-001"
+    assert payload["cleaning"]["content_sha256"]
+    assert payload["cleaning"]["manifest_sha256"]
+
+
+def test_cleaned_direct_provider_excludes_rows_with_masked_required_fields(
+    tmp_path: Path,
+) -> None:
+    quant_data_root = tmp_path / "quant_data"
+    _publish_qfq(
+        quant_data_root,
+        "qfq-zero-volume",
+        sh_close=10.0,
+        sh_volumes=[0.0, 200.0],
+        update_catalog=False,
+    )
+    _publish_index(quant_data_root)
+    _publish_membership(quant_data_root)
+    _publish_cleaning_plan(
+        quant_data_root,
+        volume_mask_symbols=["SH600000"],
+        event_dates={},
+    )
+    descriptor = direct.build_direct_provider_descriptor(
+        quant_data_root=quant_data_root,
+        index_dataset_id="cn_index_daily",
+        cleaning_mode="cleaned",
+    )
+    feature = direct.QuantDataFeatureProvider(
+        descriptor_path=descriptor,
+        quant_data_root=quant_data_root,
+    )
+
+    close = feature.feature("SH600000", "$close", 0, 2, "day")
+    volume = feature.feature("SH600000", "$volume", 0, 2, "day")
+    factor = feature.feature("SH600000", "$factor", 0, 2, "day")
+
+    assert np.isnan(close.iloc[0])
+    assert np.isnan(volume.iloc[0])
+    assert np.isnan(factor.iloc[0])
+    assert close.iloc[2] == pytest.approx(11.0)
+    assert volume.iloc[2] == pytest.approx(200.0)
+    assert factor.iloc[2] == pytest.approx(1.0)
 
 
 def test_all_and_csi_pools_keep_historical_membership_intervals(
@@ -596,9 +701,6 @@ def test_provider_locks_snapshot_even_after_latest_pointer_advances(
 
     new_descriptor = direct.build_direct_provider_descriptor(
         quant_data_root=quant_data_root,
-        membership_path=(
-            quant_data_root / "reference" / "pit_csi800" / "membership_intervals.parquet"
-        ),
     )
     current = direct.QuantDataFeatureProvider(
         descriptor_path=new_descriptor,
@@ -717,6 +819,42 @@ def test_membership_versions_get_distinct_frozen_descriptors(
         end_time="2026-01-06",
         as_list=True,
     ) == ["SZ000001"]
+
+
+def test_descriptor_rejects_frozen_membership_manifest_tamper(
+    direct_fixture: tuple[Path, Path, Path],
+) -> None:
+    quant_data_root, _, descriptor = direct_fixture
+    payload = json.loads(descriptor.read_text(encoding="utf-8"))
+    manifest_path = (
+        quant_data_root
+        / payload["membership"]["snapshot_path"]
+        / "DATASET_MANIFEST.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["latest_trade_date"] = "2026-01-05"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(direct.DirectProviderError, match="manifest.*hash mismatch"):
+        direct.QuantDataInstrumentProvider(
+            descriptor_path=descriptor,
+            quant_data_root=quant_data_root,
+        )
+
+
+def test_descriptor_rejects_frozen_membership_component_tamper(
+    direct_fixture: tuple[Path, Path, Path],
+) -> None:
+    quant_data_root, _, descriptor = direct_fixture
+    payload = json.loads(descriptor.read_text(encoding="utf-8"))
+    source_path = quant_data_root / payload["membership"]["source_path"]
+    _membership_frame(swapped=True).to_parquet(source_path, index=False)
+
+    with pytest.raises(direct.DirectProviderError, match="source artifact hash mismatch"):
+        direct.QuantDataInstrumentProvider(
+            descriptor_path=descriptor,
+            quant_data_root=quant_data_root,
+        )
 
 
 def test_descriptor_path_rejects_symlinked_directory(
@@ -858,6 +996,19 @@ def test_cli_smoke_empty_returns_failure(
     assert return_code == 1
     assert result["status"] == "smoke_failed"
     assert result["smoke_test"] == "empty"
+
+
+def test_cli_does_not_expose_legacy_snapshot_path_overrides() -> None:
+    from quant_workflow.scripts import build_qlib_direct_provider as cli
+
+    args = cli.parse_args([])
+    assert not hasattr(args, "membership_path")
+    assert not hasattr(args, "cleaning_plan_path")
+
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--membership-path", "/tmp/legacy.parquet"])
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--cleaning-plan-path", "/tmp/legacy.json"])
 
 
 def test_cli_smoke_samples_multiple_historical_dates(

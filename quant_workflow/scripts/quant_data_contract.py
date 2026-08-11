@@ -899,6 +899,7 @@ ARTIFACT_DATA_KINDS = {
     "point_in_time_membership",
     "point_in_time_reference",
     "point_in_time_fundamentals",
+    "qlib_cleaning_plan",
 }
 
 
