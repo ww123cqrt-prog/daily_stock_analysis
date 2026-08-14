@@ -385,3 +385,55 @@ PYTHONPATH=quant_workflow/scripts .venv/bin/python -m pytest quant_workflow/test
 - `china-astock-quant` 的复用能力已列账，交易相关能力保持禁区。
 - 同花顺只作为只读观察方向，手机连接暂不做。
 - 后端 pytest、前端 test/lint/build 和浏览器 smoke 通过后，交给 Agent C 按网页步骤复测；除非明确要求，不运行 complete/OpenCode 验收。
+
+## Agent 持续运行机制（goal 模式）
+
+### 状态文件协议
+
+长期 agent 每轮启动先读 `quant_workflow/reports/state/agent_state.json`，
+按状态判断该做什么；每轮结束回写。不存在则初始化，损坏则本轮【阻塞】。
+
+```json
+{
+  "last_data_identity": {
+    "etf_snapshot_id": "cn-etf-...-2c219d19",
+    "etf_content_sha256": "2f22...",
+    "etf_latest_trade_date": "2026-08-07"
+  },
+  "last_signal_date": "2026-08-07",
+  "last_weekly_roll": "2026-08-07",
+  "last_monthly_check": "2026-07",
+  "alerts": []
+}
+```
+
+### 任务指纹与幂等
+
+周期任务落库前查 `backtest_runs.params_json` 中是否已存在相同指纹：
+`策略名 + 数据版本(snapshot_id) + 任务类型(rolling-update | data-republish) + 最新交易日`。
+存在则跳过，禁止重复落库。
+
+### 每日信号报告格式
+
+存 `quant_workflow/reports/daily/YYYY-MM-DD.md`（信号日期 T），两个策略分开输出：
+
+```
+# 每日信号 T（执行日 = 下一交易日）
+
+## 3ETF趋势动量（满仓/空仓）
+| 标的 | 20日动量排名 | 收盘价 | MA20 | 站上均线 | 信号 | 建议仓位 |
+| 159915 | 1 | ... | ... | 是 | 持有 | 100% |
+
+## 3ETF趋势动量-广度分档（0/⅓/⅔/满仓）
+同上表，仓位 = 站上 MA20 的标的数 ÷ 3
+```
+
+### 周度维护与月度漂移检测
+
+- **周度**（幂等触发）：两个固化策略各做一次全历史滚动回测并落库
+  （params 含 `rolling-update` 与数据版本）。
+- **月度**（幂等触发）：计算滚动 1 年（最近 252 个交易日）的年化收益与最大回撤：
+  - 一级预警：滚动 1 年年化 < 历史全部滚动 1 年年化的 P25，或滚动 1 年最大回撤
+    超过历史全样本最大回撤；
+  - 二级升级【策略恶化】：连续两个检测周期触发，或同一周期两个指标同时触发。
+  - 预警不等于策略失效，不得据此自动修改参数或策略。

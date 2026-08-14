@@ -68,3 +68,30 @@
 
 - 后端：`tests/test_strategy_assets_repo.py`、`tests/test_backtest_assets_api.py`
 - 前端：`apps/dsa-web/src/api/__tests__/backtest.test.ts`
+
+## 固化策略与实验隔离（goal 模式）
+
+### 固化策略清单（只读）
+
+`strategy_assets` 表中以下策略为**已定版固化策略**，脚本视为只读资产：
+
+- 「3ETF趋势动量」：满仓/空仓两档（20 日动量 Top1 + 收盘价 > MA20）。
+- 「3ETF趋势动量-广度分档」：仓位 = 站上 MA20 的标的数 ÷ 3（0/⅓/⅔/满仓）。
+
+非用户明确要求，禁止对这些资产执行更新或删除；实验必须复制脚本到
+`quant_workflow/reports/experiments/` 或 `/tmp` 后再修改。
+
+### 落库规范（params 约定）
+
+正式结果落库时 `params_json` 必须携带以下字段，供幂等检查与前端核对：
+
+- `note`：`rolling-update`（周度滚动）或 `data-republish`（数据重发布重算）；
+- `data_version`：当前 ETF 快照 `snapshot_id`；
+- `start_date` / `end_date`：回测区间；
+- 实验性回测**不落库**；若实验必须产生 run 供讨论，存 `reports/experiments/`，
+  不得写入 `backtest_runs` 表。
+
+### 历史运行表卫生
+
+`backtest_runs` 是用户的正式记录，禁止写入实验中间产物；同一任务指纹
+（策略名 + 数据版本 + 任务类型 + 最新交易日）只允许存在一条 run。
