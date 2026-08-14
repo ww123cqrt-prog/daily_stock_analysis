@@ -3,11 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, call
 
 import pandas as pd
 import pytest
 
 from prepare_robust_provider import prepare_runtime_provider
+from quant_data_service_client import (
+    QuantDataDatasetResult,
+    QuantDataIdentity,
+    QuantDataSnapshotChanged,
+)
 from robust_signal_data_contract import (
     ACCEPTANCE_CONTRACT,
     ACCEPTANCE_OWNER,
@@ -18,6 +24,7 @@ from robust_signal_data_contract import (
     evaluate_robust_signal_data,
     file_sha256,
     load_verified_cleaned_quality_evidence,
+    public_readiness_payload,
     publish_robust_signal_data_readiness,
 )
 
@@ -39,6 +46,128 @@ def _cleaned_provider_lineage(
         "index_content_sha256": "f" * 64,
         "index_manifest_sha256": "a" * 64,
     }
+
+
+def _formal_data_identities() -> dict[str, dict[str, str]]:
+    specs = {
+        "ashare_daily_qfq": ("qfq", "daily_bars"),
+        "cn_index_daily": ("derived", "daily_bars"),
+        "pit_csi800": ("not_applicable", "point_in_time_membership"),
+        "robust_reference": ("not_applicable", "point_in_time_reference"),
+        "ashare_fundamentals_pit": (
+            "not_applicable",
+            "point_in_time_fundamentals",
+        ),
+        "qlib_cleaning_plan": ("not_applicable", "qlib_cleaning_plan"),
+    }
+    return {
+        dataset_id: {
+            "dataset_id": dataset_id,
+            "snapshot_id": f"{dataset_id}-snapshot",
+            "manifest_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+            "latest_trade_date": "2026-08-07",
+            "price_basis": basis,
+            "data_kind": data_kind,
+        }
+        for dataset_id, (basis, data_kind) in specs.items()
+    }
+
+
+def test_consumer_locks_service_snapshots_and_resolves_the_formal_provider(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    identities = _formal_data_identities()
+    identity_sha256 = hashlib.sha256(
+        json.dumps(identities, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    provider = tmp_path / "formal-provider"
+    provider.mkdir()
+    lineage = _cleaned_provider_lineage()
+    payload = {
+        "contract_version": CONTRACT_VERSION,
+        "acceptance_owner": ACCEPTANCE_OWNER,
+        "acceptance_contract": ACCEPTANCE_CONTRACT,
+        "status": "ready",
+        "trainable": True,
+        "provider_uri": str(provider),
+        "provider_key": lineage["descriptor_sha256"],
+        "provider_tree_sha256": lineage["descriptor_sha256"],
+        "data_identity_sha256": identity_sha256,
+        "data_identities": identities,
+        "cleaned_provider_identity": lineage,
+    }
+    readiness = publish_robust_signal_data_readiness(
+        pointer_path=(
+            reports_dir
+            / "robust_signal"
+            / "robust_signal_data_readiness_latest.json"
+        ),
+        payload=payload,
+    )
+    artifact = (
+        reports_dir
+        / "robust_signal"
+        / "readiness_artifacts"
+        / readiness["readiness_artifact_name"]
+    )
+    client = MagicMock()
+    client.resolve_dataset.side_effect = lambda dataset_id, **_kwargs: (
+        QuantDataDatasetResult(
+            identity=QuantDataIdentity.from_mapping(identities[dataset_id]),
+            metadata=identities[dataset_id],
+            payload={"status": "ready"},
+        )
+    )
+    provider_resolver = MagicMock(return_value=provider)
+
+    consumed = consume_accepted_robust_signal_data(
+        artifact_path=artifact,
+        artifact_sha256=readiness["readiness_artifact_sha256"],
+        reports_dir=reports_dir,
+        client=client,
+        provider_resolver=provider_resolver,
+    )
+
+    assert consumed["data_identities"] == identities
+    assert client.resolve_dataset.call_args_list == [
+        call(
+            dataset_id,
+            basis=identity["price_basis"],
+            expected_identity=QuantDataIdentity.from_mapping(identity),
+        )
+        for dataset_id, identity in identities.items()
+    ]
+    provider_resolver.assert_called_once_with(
+        "cleaned", expected_provider_identity=lineage
+    )
+
+
+def test_public_readiness_exposes_opaque_service_lineage_only() -> None:
+    identities = _formal_data_identities()
+    payload = public_readiness_payload(
+        {
+            "status": "ready",
+            "trainable": True,
+            "provider_name": "direct_parquet_v1",
+            "provider_key": "a" * 64,
+            "data_identity_sha256": "b" * 64,
+            "data_identities": identities,
+            "cleaned_provider_identity": _cleaned_provider_lineage(),
+            "data_manifest_sha256": "c" * 64,
+            "quality_report_id": "data-quality-" + "d" * 16,
+        }
+    )
+
+    assert payload["provider_name"] == "Qlib Provider"
+    assert payload["data_identity_sha256"] == "b" * 64
+    assert payload["data_identities"] == identities
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "direct_parquet_v1" not in serialized
+    assert "cleaned_provider_identity" not in payload
+    assert "data_manifest_sha256" not in payload
+    assert "quality_report_id" not in payload
 
 
 def _write_quality_evidence(
@@ -441,32 +570,55 @@ def test_readiness_rejects_when_latest_quality_evidence_no_longer_matches(
     assert caught.value.reason_code == "quality_evidence_changed"
 
 
-def test_consumer_uses_frozen_publication_without_reading_latest_or_manifest(
+def test_consumer_rejects_when_service_no_longer_serves_the_frozen_snapshot(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reports_dir = tmp_path / "reports"
-    monkeypatch.setenv("QUANT_WORKFLOW_REPORTS_ROOT", str(reports_dir))
-    artifact, artifact_sha256, provider_root, _identity, _evidence = (
-        _write_accepted_consumer_fixture(tmp_path, reports_dir=reports_dir)
+    identities = _formal_data_identities()
+    aggregate = hashlib.sha256(
+        json.dumps(identities, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    provider = tmp_path / "formal-provider"
+    provider.mkdir()
+    lineage = _cleaned_provider_lineage()
+    readiness = publish_robust_signal_data_readiness(
+        pointer_path=(
+            reports_dir
+            / "robust_signal"
+            / "robust_signal_data_readiness_latest.json"
+        ),
+        payload={
+            "contract_version": CONTRACT_VERSION,
+            "acceptance_owner": ACCEPTANCE_OWNER,
+            "acceptance_contract": ACCEPTANCE_CONTRACT,
+            "status": "ready",
+            "trainable": True,
+            "data_identity_sha256": aggregate,
+            "data_identities": identities,
+            "cleaned_provider_identity": lineage,
+        },
     )
-    manifest = tmp_path / "quant_data" / "DATA_MANIFEST.json"
-    manifest_hash = file_sha256(manifest)
-    manifest.unlink()
-    (reports_dir / "data_quality_report_latest.json").unlink()
+    artifact = (
+        reports_dir
+        / "robust_signal"
+        / "readiness_artifacts"
+        / readiness["readiness_artifact_name"]
+    )
+    client = MagicMock()
+    client.resolve_dataset.side_effect = QuantDataSnapshotChanged(
+        "snapshot changed", code="snapshot_changed", status_code=503
+    )
 
-    consumed = consume_accepted_robust_signal_data(
-        artifact_path=artifact,
-        artifact_sha256=artifact_sha256,
-        provider_root=provider_root,
-    )
+    with pytest.raises(RobustSignalDataBlocked) as caught:
+        consume_accepted_robust_signal_data(
+            artifact_path=artifact,
+            artifact_sha256=readiness["readiness_artifact_sha256"],
+            reports_dir=reports_dir,
+            client=client,
+            provider_resolver=MagicMock(return_value=provider),
+        )
 
-    assert consumed["provider_uri"] == str(Path(consumed["provider_uri"]).resolve())
-    assert consumed["data_manifest_sha256"] == manifest_hash
-    assert consumed["quality_evidence_artifact_name"].startswith(
-        "data_quality_report_"
-    )
-    assert consumed["readiness_artifact_sha256"] == artifact_sha256
+    assert caught.value.reason_code == "quant_data_service_unavailable"
 
 
 def test_consumer_rejects_readiness_artifact_outside_controlled_reports_root(
@@ -491,73 +643,6 @@ def test_consumer_rejects_readiness_artifact_outside_controlled_reports_root(
         )
 
     assert caught.value.reason_code == "robust_readiness_invalid"
-
-
-@pytest.mark.parametrize(
-    ("mutation", "expected_reason"),
-    [
-        ("missing", "quality_evidence_missing"),
-        ("changed", "quality_evidence_changed"),
-        ("identity", "cleaned_provider_quality_mismatch"),
-    ],
-)
-def test_consumer_rejects_invalid_frozen_quality_provenance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mutation: str,
-    expected_reason: str,
-) -> None:
-    reports_dir = tmp_path / "reports"
-    monkeypatch.setenv("QUANT_WORKFLOW_REPORTS_ROOT", str(reports_dir))
-    artifact, artifact_sha256, provider_root, _identity, evidence = (
-        _write_accepted_consumer_fixture(tmp_path, reports_dir=reports_dir)
-    )
-    if mutation == "missing":
-        evidence.unlink()
-    elif mutation == "changed":
-        evidence.write_text("{}\n", encoding="utf-8")
-    else:
-        payload = json.loads(evidence.read_text(encoding="utf-8"))
-        payload["data_contract"]["qlib_providers"]["cleaned"]["snapshot_id"] = (
-            "different-cleaned-snapshot"
-        )
-        mutated_bytes = (
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        evidence.write_bytes(mutated_bytes)
-        readiness = json.loads(artifact.read_text(encoding="utf-8"))
-        readiness["quality_evidence_sha256"] = hashlib.sha256(
-            mutated_bytes
-        ).hexdigest()
-        readiness["quality_report_id"] = (
-            "data-quality-" + readiness["quality_evidence_sha256"][:16]
-        )
-        renamed_evidence = evidence.with_name(
-            "data_quality_report_20260805_120000_"
-            + readiness["quality_evidence_sha256"][:16]
-            + ".json"
-        )
-        evidence.rename(renamed_evidence)
-        readiness["quality_evidence_artifact_name"] = renamed_evidence.name
-        readiness_bytes = (
-            json.dumps(readiness, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        new_artifact_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
-        new_artifact = artifact.with_name(
-            f"robust_signal_data_readiness_{new_artifact_sha256}.json"
-        )
-        new_artifact.write_bytes(readiness_bytes)
-        artifact = new_artifact
-        artifact_sha256 = new_artifact_sha256
-
-    with pytest.raises(RobustSignalDataBlocked) as caught:
-        consume_accepted_robust_signal_data(
-            artifact_path=artifact,
-            artifact_sha256=artifact_sha256,
-            provider_root=provider_root,
-        )
-
-    assert caught.value.reason_code == expected_reason
 
 
 def test_latest_consumer_rejects_direct_manually_relabelled_readiness(

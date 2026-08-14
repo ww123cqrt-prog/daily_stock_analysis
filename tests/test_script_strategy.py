@@ -6,7 +6,9 @@ from datetime import date
 import pytest
 
 from src.core.script_strategy import (
+    ScriptExecutionError,
     ScriptValidationError,
+    _StrategyContext,
     execute_strategy_script,
     validate_strategy_script,
 )
@@ -77,4 +79,107 @@ def on_bar(context, data):
             source,
             bars=_bars("600519", [10, 11, 12]),
             symbols=("600519",),
+        )
+
+
+import numpy as np
+
+from src.core.script_market import MarketView
+from src.core.script_strategy import _StrategyData
+
+
+def _data_view(closes: list[float | None]) -> _StrategyData:
+    close_matrix = np.array(
+        [[value if value is not None else np.nan] for value in closes],
+        dtype=np.float64,
+    )
+    view = MarketView(
+        dates=np.array(
+            [date(2026, 1, day).toordinal() for day in range(1, len(closes) + 1)],
+            dtype=np.int32,
+        ),
+        symbols=np.array(["SZ000001"], dtype=object),
+        open_matrix=close_matrix.copy(),
+        close_matrix=close_matrix,
+        members=~np.isnan(close_matrix),
+        meta={},
+    )
+    data = _StrategyData(view)
+    data._index = len(closes) - 1
+    return data
+
+
+def test_sma_requires_a_full_window_of_valid_closes() -> None:
+    """C-5: 2 valid closes must not fabricate a "3-day average"."""
+    data = _data_view([10.0, None, 12.0])
+    assert data.sma("SZ000001", 3) is None
+    full = _data_view([10.0, 11.0, 12.0])
+    assert full.sma("SZ000001", 3) == pytest.approx(11.0)
+
+
+def test_sma_returns_none_when_history_shorter_than_window() -> None:
+    data = _data_view([10.0, 11.0])
+    assert data.sma("SZ000001", 3) is None
+
+
+def _pit_view() -> MarketView:
+    close_matrix = np.array(
+        [[10.0, 10.0], [11.0, 11.0]],
+        dtype=np.float64,
+    )
+    return MarketView(
+        dates=np.array(
+            [date(2026, 1, day).toordinal() for day in range(1, 3)],
+            dtype=np.int32,
+        ),
+        symbols=np.array(["OLD", "FUTURE"], dtype=object),
+        open_matrix=close_matrix.copy(),
+        close_matrix=close_matrix,
+        members=np.array(
+            [[True, False], [True, True]], dtype=bool
+        ),  # FUTURE enters the pool on day 2
+        meta={"pool": "csi800"},
+    )
+
+
+def test_pit_pool_blocks_access_to_non_member_on_current_date() -> None:
+    """P1: a script must not read or target a symbol before it enters the
+    PIT pool (look-ahead bias guard)."""
+    view = _pit_view()
+    data = _StrategyData(view)
+    data._index = 0  # day 1: FUTURE not yet a member
+    with pytest.raises(ValueError, match="not a tradable member"):
+        data.close("FUTURE")
+    context = _StrategyContext(("OLD", "FUTURE"), [])
+    context._begin_bar(date(2026, 1, 1), {}, {"OLD"})
+    with pytest.raises(ValueError, match="not a tradable member"):
+        context.target_equal(["FUTURE"])
+    with pytest.raises(ValueError, match="not a tradable member"):
+        context.target_percent("FUTURE", 1.0)
+    # Day 2: FUTURE is a member — access works.
+    data._index = 1
+    assert data.close("FUTURE") == pytest.approx(11.0)
+
+
+def test_pit_pool_guards_only_apply_to_pit_pools() -> None:
+    """ETF/custom pools keep their permissive behavior (suspended symbols
+    stay targetable; the engine defers execution instead)."""
+    view = _pit_view()
+    view.meta = {"pool": "etf"}
+    data = _StrategyData(view)
+    data._index = 0
+    assert data.close("FUTURE") == pytest.approx(10.0)
+
+
+def test_statistics_facade_does_not_expose_sys_module() -> None:
+    """P1: statistics.sys must not be a route to builtins.open."""
+    view = _data_view([10.0, 11.0])._view
+    with pytest.raises(ScriptExecutionError, match="AttributeError"):
+        execute_strategy_script(
+            "def initialize(context):\n"
+            "    pass\n"
+            "\n"
+            "def on_bar(context, data):\n"
+            "    context.log(str(statistics.sys))\n",
+            view=view,
         )

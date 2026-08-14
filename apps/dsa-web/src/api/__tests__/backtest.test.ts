@@ -1,15 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { backtestApi } from '../backtest';
 
-const { get, post } = vi.hoisted(() => ({
+const { get, post, patch, delete: del } = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
+  patch: vi.fn(),
+  delete: vi.fn(),
 }));
 
 vi.mock('../index', () => ({
   default: {
     get,
     post,
+    patch,
+    delete: del,
     defaults: { baseURL: '' },
   },
 }));
@@ -18,6 +22,8 @@ describe('backtestApi', () => {
   beforeEach(() => {
     get.mockReset();
     post.mockReset();
+    patch.mockReset();
+    del.mockReset();
   });
 
   it('requests overall performance with empty_ok and treats null as empty metrics', async () => {
@@ -161,7 +167,7 @@ describe('backtestApi', () => {
 
     const result = await backtestApi.runScriptStrategy({
       script,
-      symbols: ['159915'],
+      pool: 'csi800',
       initialCapital: 50000,
       sideCostPct: 0,
       lotSize: 100,
@@ -170,13 +176,18 @@ describe('backtestApi', () => {
     expect(result.scriptCheck.status).toBe('passed');
     expect(post).toHaveBeenCalledWith('/api/v1/backtest/strategy/script', {
       script,
-      symbols: ['159915'],
+      pool: 'csi800',
+      symbols: [],
+      benchmarks: [],
+      comparison_strategy_ids: [],
+      comparison_presets: [],
       start_date: undefined,
       end_date: undefined,
       initial_capital: 50000,
       side_cost_pct: 0,
       lot_size: 100,
-    });
+      strategy_asset_id: undefined,
+    }, { timeout: 600000 });
   });
 
   it('reruns a selected trained model and strategy with the visible parameters', async () => {
@@ -272,5 +283,75 @@ describe('backtestApi', () => {
       },
       { timeout: 120000 },
     );
+  });
+
+  it('lists strategy assets without script bodies', async () => {
+    get.mockResolvedValueOnce({
+      data: [
+        { id: 's1', name: 'Alpha', description: '', script_sha256: 'x'.repeat(64), api_version: 'dsa-script-v1', created_at: 't', updated_at: 't' },
+      ],
+    });
+
+    const result = await backtestApi.listStrategyAssets();
+
+    expect(result[0].id).toBe('s1');
+    expect(result[0].scriptSha256).toBe('x'.repeat(64));
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/strategies');
+  });
+
+  it('saves a named strategy asset', async () => {
+    post.mockResolvedValueOnce({
+      data: { id: 's1', name: 'Alpha', script: 'def on_bar(c, d):\n    c.target_cash()', script_sha256: 'y'.repeat(64) },
+    });
+
+    const result = await backtestApi.saveStrategyAsset({
+      name: 'Alpha',
+      script: 'def on_bar(c, d):\n    c.target_cash()',
+    });
+
+    expect(result.id).toBe('s1');
+    expect(post).toHaveBeenCalledWith('/api/v1/backtest/strategies', {
+      name: 'Alpha',
+      description: '',
+      script: 'def on_bar(c, d):\n    c.target_cash()',
+    });
+  });
+
+  it('updates and deletes a strategy asset', async () => {
+    patch.mockResolvedValueOnce({ data: { id: 's1', name: 'Beta' } });
+    await backtestApi.updateStrategyAsset('s1', { name: 'Beta' });
+    expect(patch).toHaveBeenCalledWith('/api/v1/backtest/strategies/s1', {
+      name: 'Beta',
+      description: undefined,
+      script: undefined,
+    });
+
+    del.mockResolvedValueOnce({ data: null });
+    await backtestApi.deleteStrategyAsset('s1');
+    expect(del).toHaveBeenCalledWith('/api/v1/backtest/strategies/s1');
+  });
+
+  it('lists backtest runs with filters and loads a full detail', async () => {
+    get.mockResolvedValueOnce({
+      data: [{ id: 'r1', metrics: { total_return_pct: 8.5 }, data_quality: { dataset_id: 'cn_etf_daily' } }],
+    });
+
+    const runs = await backtestApi.listBacktestRuns({ limit: 20, scriptSha256: 'z'.repeat(64) });
+
+    expect(runs[0].metrics.totalReturnPct).toBe(8.5);
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/runs', {
+      params: { limit: 20, script_sha256: 'z'.repeat(64) },
+    });
+
+    get.mockResolvedValueOnce({
+      data: { id: 'r1', report: { status: 'completed', metrics: { total_return_pct: 8.5 } } },
+    });
+    const detail = await backtestApi.getBacktestRun('r1');
+    expect(detail.report.status).toBe('completed');
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/runs/r1');
+
+    del.mockResolvedValueOnce({ data: null });
+    await backtestApi.deleteBacktestRun('r1');
+    expect(del).toHaveBeenCalledWith('/api/v1/backtest/runs/r1');
   });
 });

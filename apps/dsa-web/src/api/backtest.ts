@@ -7,6 +7,8 @@ import type {
   BacktestResultItem,
   PerformanceMetrics,
   BacktestPhaseFilter,
+  StabilityTestRequest,
+  StabilityTestResponse,
   StrategyBacktestResponse,
   StrategyBacktestRunRequest,
   FormStrategyBacktestRunRequest,
@@ -14,6 +16,12 @@ import type {
   TrainedStrategyBacktestResponse,
   TrainedStrategyBacktestRunRequest,
   TrainedStrategyCatalogResponse,
+  StrategyAssetSummary,
+  StrategyAssetDetail,
+  StrategyAssetCreateRequest,
+  StrategyAssetUpdateRequest,
+  BacktestRunSummary,
+  BacktestRunDetail,
 } from '../types/backtest';
 
 // ============ API ============
@@ -81,13 +89,19 @@ export const backtestApi = {
       '/api/v1/backtest/strategy/script',
       {
         script: params.script,
-        symbols: params.symbols,
+        pool: params.pool || 'etf',
+        symbols: params.symbols || [],
+        benchmarks: params.benchmarks || [],
+        comparison_strategy_ids: params.comparisonStrategyIds || [],
+        comparison_presets: params.comparisonPresets || [],
         start_date: params.startDate || undefined,
         end_date: params.endDate || undefined,
         initial_capital: params.initialCapital,
         side_cost_pct: params.sideCostPct,
         lot_size: params.lotSize,
+        strategy_asset_id: params.strategyAssetId || undefined,
       },
+      { timeout: 600_000 },
     );
     return toCamelCase<StrategyBacktestResponse>(response.data);
   },
@@ -224,5 +238,106 @@ export const backtestApi = {
       }
       throw err;
     }
+  },
+
+  listStrategyAssets: async (): Promise<StrategyAssetSummary[]> => {
+    const response = await apiClient.get<Record<string, unknown>[]>(
+      '/api/v1/backtest/strategies',
+    );
+    return response.data.map((item) => toCamelCase<StrategyAssetSummary>(item));
+  },
+
+  getStrategyAsset: async (strategyId: string): Promise<StrategyAssetDetail> => {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/backtest/strategies/${encodeURIComponent(strategyId)}`,
+    );
+    return toCamelCase<StrategyAssetDetail>(response.data);
+  },
+
+  saveStrategyAsset: async (
+    request: StrategyAssetCreateRequest,
+  ): Promise<StrategyAssetDetail> => {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategies',
+      {
+        name: request.name,
+        description: request.description || '',
+        script: request.script,
+      },
+    );
+    return toCamelCase<StrategyAssetDetail>(response.data);
+  },
+
+  updateStrategyAsset: async (
+    strategyId: string,
+    request: StrategyAssetUpdateRequest,
+  ): Promise<StrategyAssetDetail> => {
+    const response = await apiClient.patch<Record<string, unknown>>(
+      `/api/v1/backtest/strategies/${encodeURIComponent(strategyId)}`,
+      {
+        name: request.name,
+        description: request.description,
+        script: request.script,
+      },
+    );
+    return toCamelCase<StrategyAssetDetail>(response.data);
+  },
+
+  deleteStrategyAsset: async (strategyId: string): Promise<void> => {
+    await apiClient.delete(`/api/v1/backtest/strategies/${encodeURIComponent(strategyId)}`);
+  },
+
+  listBacktestRuns: async (
+    params: {
+      limit?: number;
+      offset?: number;
+      strategyId?: string;
+      scriptSha256?: string;
+    } = {},
+  ): Promise<BacktestRunSummary[]> => {
+    const queryParams: Record<string, string | number> = {};
+    if (params.limit) queryParams.limit = params.limit;
+    if (params.offset) queryParams.offset = params.offset;
+    if (params.strategyId) queryParams.strategy_id = params.strategyId;
+    if (params.scriptSha256) queryParams.script_sha256 = params.scriptSha256;
+    const response = await apiClient.get<Record<string, unknown>[]>(
+      '/api/v1/backtest/runs',
+      { params: queryParams },
+    );
+    return response.data.map((item) => toCamelCase<BacktestRunSummary>(item));
+  },
+
+  getBacktestRun: async (runId: string): Promise<BacktestRunDetail> => {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/backtest/runs/${encodeURIComponent(runId)}`,
+    );
+    return toCamelCase<BacktestRunDetail>(response.data);
+  },
+
+  deleteBacktestRun: async (runId: string): Promise<void> => {
+    await apiClient.delete(`/api/v1/backtest/runs/${encodeURIComponent(runId)}`);
+  },
+
+  runStabilityTest: async (
+    params: StabilityTestRequest,
+  ): Promise<StabilityTestResponse> => {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/backtest/strategy/script/stability',
+      {
+        script: params.script,
+        pool: params.pool || 'etf',
+        symbols: params.symbols || [],
+        start_date: params.startDate || undefined,
+        end_date: params.endDate || undefined,
+        initial_capital: params.initialCapital,
+        side_cost_pct: params.sideCostPct,
+        lot_size: params.lotSize,
+        min_window_days: params.minWindowDays ?? 252,
+        iterations: params.iterations ?? 20,
+        seed: params.seed ?? null,
+      },
+      { timeout: 600_000 },
+    );
+    return toCamelCase<StabilityTestResponse>(response.data);
   },
 };

@@ -58,12 +58,17 @@ export interface FormStrategyBacktestRunRequest {
 
 export interface ScriptStrategyBacktestRunRequest {
   script: string;
-  symbols: string[];
+  pool?: 'etf' | 'csi800' | 'all_a' | 'custom';
+  symbols?: string[];
+  benchmarks?: string[];
+  comparisonStrategyIds?: string[];
+  comparisonPresets?: Array<{ name: string; script: string }>;
   startDate?: string;
   endDate?: string;
   initialCapital: number;
   sideCostPct: number;
   lotSize: number;
+  strategyAssetId?: string;
 }
 
 export interface TrainedStrategyBacktestRunRequest {
@@ -184,6 +189,7 @@ export interface TrainedStrategyBacktestResponse {
 
 export interface StrategyBacktestMetrics {
   initialCapital: number;
+  openingEquity: number;
   finalEquity: number;
   totalReturnPct: number;
   annualizedReturnPct: number;
@@ -198,6 +204,7 @@ export interface StrategyBacktestMetrics {
   signalCount: number;
   executedSignalCount: number;
   skippedSignalCount: number;
+  blockedSignalCount: number;
   tradingDays: number;
   annualizedVolatilityPct: number;
   sharpeRatio?: number | null;
@@ -230,10 +237,27 @@ export interface StrategyBacktestTrade {
   reason?: string;
 }
 
+export interface ComparisonSeries {
+  symbol: string;
+  name?: string;
+  equity: Array<number | null>;
+  totalReturnPct: number;
+  maxDrawdownPct: number;
+  firstValidDate: string;
+}
+
+export interface ComparisonFailureItem {
+  name: string;
+  error: string;
+}
+
 export interface StrategyBacktestResponse {
   status: string;
   strategyName: string;
+  runId?: string;
   symbols: string[];
+  comparisons?: Record<string, ComparisonSeries>;
+  comparisonFailures?: ComparisonFailureItem[];
   period?: { startDate: string; endDate: string };
   strategy: Record<string, unknown>;
   dataQuality: Record<string, unknown>;
@@ -332,4 +356,84 @@ export interface PerformanceMetrics {
 
   adviceBreakdown: Record<string, unknown>;
   diagnostics: Record<string, unknown>;
+}
+
+// === Strategy assets and backtest run history ===
+
+export interface StrategyAssetSummary {
+  id: string;
+  name: string;
+  description: string;
+  scriptSha256: string;
+  apiVersion: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StrategyAssetDetail extends StrategyAssetSummary {
+  script: string;
+}
+
+export interface StrategyAssetCreateRequest {
+  name: string;
+  description?: string;
+  script: string;
+}
+
+export interface StrategyAssetUpdateRequest {
+  name?: string;
+  description?: string;
+  script?: string;
+}
+
+export interface StabilityTestRequest {
+  script: string;
+  pool?: 'etf' | 'csi800' | 'all_a' | 'custom';
+  symbols?: string[];
+  startDate?: string;
+  endDate?: string;
+  initialCapital: number;
+  sideCostPct: number;
+  lotSize: number;
+  minWindowDays?: number;
+  iterations?: number;
+  seed?: number;
+}
+
+export interface StabilitySample {
+  startDate: string;
+  endDate: string;
+  tradingDays: number;
+  totalReturnPct: number;
+  maxDrawdownPct: number;
+  benchmarkReturnPct: number;
+  tradeCount: number;
+  exposurePct: number;
+}
+
+export interface StabilityTestResponse {
+  status: string;
+  summary: Record<string, unknown>;
+  samples: StabilitySample[];
+  dataQuality: Record<string, unknown>;
+  scriptCheck: Record<string, unknown>;
+  logs: string[];
+}
+
+export interface BacktestRunSummary {
+  id: string;
+  strategyId?: string;
+  strategyName: string;
+  scriptSha256: string;
+  symbols: string[];
+  params: Record<string, unknown>;
+  dataQuality: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  status: string;
+  errorMessage?: string;
+  createdAt: string;
+}
+
+export interface BacktestRunDetail extends BacktestRunSummary {
+  report: StrategyBacktestResponse;
 }

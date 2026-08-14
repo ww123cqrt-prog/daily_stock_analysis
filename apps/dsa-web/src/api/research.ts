@@ -21,6 +21,25 @@ export type ResearchTrainingReadiness = {
   failureReasons?: string[];
 };
 
+export type ResearchTrainingPreflight = {
+  status: 'passed' | 'blocked' | string;
+  provider?: 'canonical' | 'cleaned' | string;
+  requiredDatasets?: string[];
+  availableDatasets?: string[];
+  datasetIdentities?: Record<string, {
+    datasetId?: string;
+    snapshotId?: string;
+    manifestSha256?: string;
+    contentSha256?: string;
+    latestTradeDate?: string;
+    priceBasis?: string;
+    dataKind?: string;
+  }>;
+  providerIdentity?: ResearchProviderIdentity;
+  checkedAt?: string;
+  summary?: string;
+};
+
 export type ResearchProviderQuality = {
   provider?: string;
   datasetId?: string;
@@ -673,6 +692,8 @@ export type ResearchStatus = {
   generatedAt?: string;
   trainable: boolean;
   trainingReadiness: ResearchTrainingReadiness;
+  trainingPreflight?: ResearchTrainingPreflight;
+  trainingPreflights?: Record<string, ResearchTrainingPreflight>;
   qualityScan?: ResearchQualityScan;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;

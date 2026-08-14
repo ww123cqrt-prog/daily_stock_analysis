@@ -28,13 +28,14 @@ def test_env_example_documents_quant_workflow_path_overrides() -> None:
     assert "迁移时复制旧 reports/mlruns 到仓内" in env_example
 
 
-def test_changelog_mentions_web_quant_workflow_entry() -> None:
+def test_changelog_mentions_consolidated_quant_research_entry() -> None:
     changelog = (ROOT_DIR / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
     unreleased = changelog.split("## [3.21.0]", 1)[0]
 
-    assert "/workflow" in unreleased
-    assert "量化任务中心" in unreleased
-    assert "Qlib" in unreleased
+    assert "首页、数据、量化研究、个股分析、持仓和设置" in unreleased
+    assert "/research" in unreleased
+    assert "/api/v1/data/status" in unreleased
+    assert "quant_data" in unreleased
 
 
 def test_quant_data_docs_mark_ashare_v2_datasets_as_canonical_ready() -> None:
@@ -57,69 +58,33 @@ def test_quant_data_docs_mark_ashare_v2_datasets_as_canonical_ready() -> None:
     assert "until full raw/factor evidence is published" not in readme
 
 
-def test_local_quant_workbench_manual_covers_self_service_checklist() -> None:
+def test_local_quant_workbench_manual_covers_consolidated_entry_contract() -> None:
     manual_path = ROOT_DIR / "docs" / "local-quant-workbench.md"
 
     manual = manual_path.read_text(encoding="utf-8")
 
     for phrase in (
         "本地统一量化研究与回测工作台",
-        "http://127.0.0.1:8010/",
-        "/workflow",
-        "/research",
-        "/backtest",
-        "quant_workflow",
-        "Qlib",
-        "china-astock-quant",
-        "唯一 Python 虚拟环境",
-        "QUANT_DATA_ROOT",
-        "MLFLOW_URL",
-        "交易策略优化预演",
-        "china-astock 技术指标报告",
-        "report_china_astock_indicators.py",
-        "Qlib 预测摘要",
-        "qlib_predictions_latest",
-        "Qlib 研究增强",
-        "report_qlib_research.py",
-        "qlib_research_model_explainability_latest",
-        "实验复现与产物",
-        "pred.pkl",
-        "runtime config",
-        "quant_workflow 脚本覆盖盘点",
-        "旧同级 reports/mlruns 不再自动读取或写入",
-        "迁移旧历史应复制到仓内目录",
-        "report_data_hygiene.py",
-        "data_hygiene_inventory_latest",
-        "data_hygiene_cleanup_plan_latest",
-        "不包含真实删除动作",
-        "report_workbench_capabilities.py",
-        "workbench_capability_inventory_latest",
-        "add_index_benchmark.py",
-        "generate_csi300.py",
-        "repair_qlib_provider.py",
-        "缓存缺失时直接失败，不走 AkShare fallback",
-        "supervise_baostock.py",
-        "provider 维护脚本",
+        "| 首页 | `/` |",
+        "| 数据 | `/data` |",
+        "| 量化研究 | `/research` |",
+        "| 个股分析 | `/stock-analysis` |",
+        "| 持仓 | `/portfolio` |",
+        "| 设置 | `/settings` |",
+        "九点猫研",
         "MLflow",
-        "CHILD_ENV_EXACT_NAMES",
-        "CHILD_ENV_PREFIXES",
+        "`quant_data` 数据服务",
+        "不下载、不清洗、不发布数据",
+        "不提供下载、构建或发布按钮",
+        "选股研究",
+        "交易策略研究",
+        "CSI800 选股信号稳定性检验",
+        "/workflow",
+        "/backtest",
+        "/other",
+        "旧地址继续兼容",
         "不自动下单",
         "不读取账号密码",
-        "pytest tests/test_quant_jobs_api.py",
-        "npm run lint",
-        "npm run build",
-        "npm run test:smoke:fake-analysis",
-        "npm run test:smoke:local",
-        "apps/dsa-web/test-results/managed-smoke",
-        "git status --short",
-        "未跟踪正式文件",
-        "鲁棒策略生命周期",
-        "历史时点 CSI800",
-        "blocked_data",
-        "research_candidate_ready",
-        "shadow_observation",
-        "robust_strategy_qualified",
-        "60 个交易日",
     ):
         assert phrase in manual
 

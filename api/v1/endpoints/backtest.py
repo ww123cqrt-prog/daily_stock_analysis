@@ -19,6 +19,8 @@ from api.v1.schemas.backtest import (
     FormStrategyBacktestRunRequest,
     PerformanceMetrics,
     ScriptStrategyBacktestRunRequest,
+    StabilityTestRequest,
+    StabilityTestResponse,
     StrategyBacktestResponse,
     StrategyBacktestRunRequest,
     TrainedStrategyCatalogResponse,
@@ -26,6 +28,7 @@ from api.v1.schemas.backtest import (
     TrainedStrategyBacktestRunRequest,
 )
 from api.v1.schemas.common import ErrorResponse
+from src.repositories.strategy_assets_repo import get_strategy_assets_repo
 from src.services.backtest_service import BacktestService
 from src.services.trained_strategy_backtest_service import TrainedStrategyBacktestService
 from src.storage import DatabaseManager
@@ -228,13 +231,28 @@ def run_script_strategy_backtest(
         _validate_analysis_date_range(request.start_date, request.end_date)
         report = BacktestService(db_manager).run_script_strategy(
             script=request.script,
+            pool=request.pool,
             symbols=request.symbols,
+            benchmarks=request.benchmarks,
+            comparison_strategy_ids=request.comparison_strategy_ids,
+            comparison_presets=[
+                {"name": item.name, "script": item.script}
+                for item in request.comparison_presets
+            ],
             start_date=request.start_date,
             end_date=request.end_date,
             initial_capital=request.initial_capital,
             side_cost_pct=request.side_cost_pct,
             lot_size=request.lot_size,
         )
+        try:
+            run_id = _persist_script_backtest_run(request, report)
+            if run_id:
+                report["run_id"] = run_id
+        except Exception:
+            # Persistence is best-effort: a store failure must never break a
+            # completed backtest or its response.
+            logger.warning("脚本回测结果落库失败（不影响本次回测）", exc_info=True)
         return StrategyBacktestResponse(**report)
     except ValueError as exc:
         raise HTTPException(
@@ -248,6 +266,97 @@ def run_script_strategy_backtest(
         raise HTTPException(
             status_code=500,
             detail={"error": "internal_error", "message": "脚本交易策略回测失败"},
+        )
+
+
+def _persist_script_backtest_run(
+    request: ScriptStrategyBacktestRunRequest,
+    report: dict,
+) -> Optional[str]:
+    """Persist a completed script backtest as a durable run record.
+
+    A missing strategy asset id degrades to an ad-hoc run (``strategy_id``
+    NULL) so the history still groups by ``script_sha256``.
+    """
+    repo = get_strategy_assets_repo()
+    strategy_id = request.strategy_asset_id
+    if strategy_id is not None and repo.get_strategy(strategy_id) is None:
+        strategy_id = None
+    strategy_meta = report.get("strategy") or {}
+    run = repo.create_run(
+        strategy_id=strategy_id,
+        strategy_name=str(report.get("strategy_name") or "python_script"),
+        script_sha256=str(strategy_meta.get("script_sha256") or ""),
+        script=request.script or "",
+        symbols=list(report.get("symbols") or []),
+        params={
+            "pool": request.pool,
+            "symbols": list(request.symbols or []),
+            "start_date": request.start_date.isoformat() if request.start_date else None,
+            "end_date": request.end_date.isoformat() if request.end_date else None,
+            "initial_capital": request.initial_capital,
+            "side_cost_pct": request.side_cost_pct,
+            "lot_size": request.lot_size,
+            # Freeze the comparison experiment so a historical run can be
+            # replayed exactly: benchmark selection and compared strategies.
+            "benchmarks": list(request.benchmarks or []),
+            "comparison_strategy_ids": list(request.comparison_strategy_ids or []),
+            "comparison_presets": [
+                {"name": item.name, "script": item.script}
+                for item in request.comparison_presets
+            ],
+        },
+        data_quality=report.get("data_quality") or {},
+        metrics=report.get("metrics") or {},
+        report=report,
+        status=str(report.get("status") or "completed"),
+    )
+    return run["id"]
+
+
+@router.post(
+    "/strategy/script/stability",
+    response_model=StabilityTestResponse,
+    responses={
+        200: {"description": "时间均匀性/稳定性测试完成"},
+        400: {"description": "脚本、参数或数据错误", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="运行DSA Python脚本的时间均匀性测试",
+    description="跑一次全区间沙箱后，按随机抽样的多个子时间段分别回测，统计收益与回撤的均匀性。",
+)
+def run_script_stability_test(
+    request: StabilityTestRequest,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> StabilityTestResponse:
+    try:
+        _validate_analysis_date_range(request.start_date, request.end_date)
+        report = BacktestService(db_manager).run_script_stability_test(
+            script=request.script,
+            pool=request.pool,
+            symbols=request.symbols,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            initial_capital=request.initial_capital,
+            side_cost_pct=request.side_cost_pct,
+            lot_size=request.lot_size,
+            min_window_days=request.min_window_days,
+            iterations=request.iterations,
+            seed=request.seed,
+        )
+        return StabilityTestResponse(**report)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_script_or_params", "message": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("脚本时间均匀性测试失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "脚本时间均匀性测试失败"},
         )
 
 

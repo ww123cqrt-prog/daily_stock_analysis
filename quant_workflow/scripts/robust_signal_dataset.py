@@ -46,7 +46,10 @@ def select_feature_family(
 
 @lru_cache(maxsize=24)
 def _read_external_feature_year(path: str) -> pd.DataFrame:
-    frame = pd.read_parquet(path)
+    return _normalize_external_features(pd.read_parquet(path))
+
+
+def _normalize_external_features(frame: pd.DataFrame) -> pd.DataFrame:
     required = {"datetime", "instrument"}
     if not required.issubset(frame.columns):
         raise ValueError("external features are missing datetime or instrument")
@@ -64,7 +67,7 @@ def _read_external_feature_year(path: str) -> pd.DataFrame:
 
 def align_external_features(
     index: pd.MultiIndex,
-    root: Path,
+    source_data: Path | pd.DataFrame,
     *,
     prefixes: Sequence[str],
 ) -> pd.DataFrame:
@@ -77,31 +80,47 @@ def align_external_features(
     if (dates >= LOCKED_CONFIRMATION_START).any():
         raise ValueError("Goal 1 external feature alignment attempted to access 2026")
 
-    daily_dir = Path(root) / "daily"
-    files = sorted(daily_dir.glob("*.parquet"))
-    if not files:
-        raise ValueError("external daily features are unavailable")
-    years_by_path: dict[int, Path] = {}
-    for path in files:
-        try:
-            year = int(path.stem)
-        except ValueError as exc:
-            raise ValueError(f"external feature filename is not a year: {path.name}") from exc
-        if year >= LOCKED_CONFIRMATION_START.year:
-            raise ValueError("Goal 1 external features attempted to expose 2026 data")
-        years_by_path[year] = path
-
     requested_years = sorted(set(int(value) for value in dates.year))
-    missing_years = [year for year in requested_years if year not in years_by_path]
+    if isinstance(source_data, pd.DataFrame):
+        source = _normalize_external_features(source_data)
+        available_years = set(
+            int(value)
+            for value in source.index.get_level_values("datetime").year
+        )
+        source = source[
+            source.index.get_level_values("datetime").year.isin(requested_years)
+        ]
+    else:
+        daily_dir = Path(source_data) / "daily"
+        files = sorted(daily_dir.glob("*.parquet"))
+        if not files:
+            raise ValueError("external daily features are unavailable")
+        years_by_path: dict[int, Path] = {}
+        for path in files:
+            try:
+                year = int(path.stem)
+            except ValueError as exc:
+                raise ValueError(
+                    f"external feature filename is not a year: {path.name}"
+                ) from exc
+            if year >= LOCKED_CONFIRMATION_START.year:
+                raise ValueError("Goal 1 external features attempted to expose 2026 data")
+            years_by_path[year] = path
+        available_years = set(years_by_path)
+        source = pd.concat(
+            [
+                _read_external_feature_year(str(years_by_path[year].resolve()))
+                for year in requested_years
+                if year in years_by_path
+            ],
+            axis=0,
+        )
+    missing_years = [year for year in requested_years if year not in available_years]
     if missing_years:
         raise ValueError(
             "external daily features are missing years: "
             + ", ".join(str(value) for value in missing_years)
         )
-    source = pd.concat(
-        [_read_external_feature_year(str(years_by_path[year].resolve())) for year in requested_years],
-        axis=0,
-    )
     normalized_prefixes = tuple(str(value).upper() for value in prefixes)
     selected = (
         [
@@ -174,7 +193,10 @@ def add_market_regime_features(
 
 @lru_cache(maxsize=8)
 def _read_industry_intervals(path: str) -> pd.DataFrame:
-    frame = pd.read_parquet(path)
+    return _normalize_industry_intervals(pd.read_parquet(path))
+
+
+def _normalize_industry_intervals(frame: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "industry_code", "start_date", "end_date"}
     if not required.issubset(frame.columns):
         raise ValueError("industry intervals are missing required columns")
@@ -187,12 +209,18 @@ def _read_industry_intervals(path: str) -> pd.DataFrame:
     return result.sort_values(["symbol", "start_date"], kind="stable")
 
 
-def match_industry_intervals(index: pd.MultiIndex, path: Path) -> pd.Index:
+def match_industry_intervals(
+    index: pd.MultiIndex, source: Path | pd.DataFrame
+) -> pd.Index:
     if not {"datetime", "instrument"}.issubset(index.names):
         raise ValueError("industry matching requires datetime and instrument levels")
     dates = pd.to_datetime(index.get_level_values("datetime"), errors="coerce").normalize()
     symbols = index.get_level_values("instrument").astype(str).str.upper()
-    intervals = _read_industry_intervals(str(Path(path).resolve()))
+    intervals = (
+        _normalize_industry_intervals(source)
+        if isinstance(source, pd.DataFrame)
+        else _read_industry_intervals(str(Path(source).resolve()))
+    )
     output = np.full(len(index), "unknown", dtype=object)
     positions_by_symbol: dict[str, list[int]] = {}
     for position, symbol in enumerate(symbols):
@@ -231,11 +259,13 @@ def build_signal_dataset_config(
     split: RollingSplit,
     signal: Mapping[str, Any],
     feature_prefixes: Sequence[str],
-    industry_intervals_path: Path,
     benchmark_returns: Mapping[str, float],
     market_states: Mapping[str, str],
+    industry_intervals_path: Path | None = None,
+    industry_intervals: pd.DataFrame | None = None,
     include_handler_features: bool = True,
     external_features_path: Path | None = None,
+    external_features: pd.DataFrame | None = None,
     external_feature_prefixes: Sequence[str] = (),
     handler: Any | None = None,
 ) -> dict[str, Any]:
@@ -271,9 +301,15 @@ def build_signal_dataset_config(
                 if external_features_path is not None
                 else None
             ),
+            "external_features": external_features,
             "external_feature_prefixes": list(external_feature_prefixes),
             "normalization_scope": str(signal["normalization_scope"]),
-            "industry_intervals_path": str(Path(industry_intervals_path).resolve()),
+            "industry_intervals_path": (
+                str(Path(industry_intervals_path).resolve())
+                if industry_intervals_path is not None
+                else None
+            ),
+            "industry_intervals": industry_intervals,
             "target": str(signal["target"]),
             "benchmark_returns": dict(benchmark_returns),
             "market_states": dict(market_states),
@@ -362,9 +398,11 @@ class SignalResearchDataset(DatasetH):
         feature_prefixes: Sequence[str] = (),
         include_handler_features: bool = True,
         external_features_path: str | None = None,
+        external_features: pd.DataFrame | None = None,
         external_feature_prefixes: Sequence[str] = (),
         normalization_scope: str = "board",
         industry_intervals_path: str | None = None,
+        industry_intervals: pd.DataFrame | None = None,
         target: str = "raw_return",
         benchmark_returns: Mapping[str, float] | None = None,
         market_states: Mapping[str, str] | None = None,
@@ -375,6 +413,7 @@ class SignalResearchDataset(DatasetH):
         self.external_features_path = (
             Path(external_features_path) if external_features_path else None
         )
+        self.external_features = external_features
         self.external_feature_prefixes = tuple(
             str(value) for value in external_feature_prefixes
         )
@@ -382,6 +421,7 @@ class SignalResearchDataset(DatasetH):
         self.industry_intervals_path = (
             Path(industry_intervals_path) if industry_intervals_path else None
         )
+        self.industry_intervals = industry_intervals
         self.target = str(target)
         self.benchmark_returns = pd.Series(dict(benchmark_returns or {}), dtype=float)
         self.benchmark_returns.index = pd.to_datetime(
@@ -402,7 +442,16 @@ class SignalResearchDataset(DatasetH):
         if getattr(self, "include_handler_features", True):
             blocks.append(select_feature_family(frame, prefixes=self.feature_prefixes))
         external_path = getattr(self, "external_features_path", None)
-        if external_path is not None:
+        external_features = getattr(self, "external_features", None)
+        if external_features is not None:
+            blocks.append(
+                align_external_features(
+                    frame.index,
+                    external_features,
+                    prefixes=getattr(self, "external_feature_prefixes", ()),
+                )
+            )
+        elif external_path is not None:
             blocks.append(
                 align_external_features(
                     frame.index,
@@ -421,9 +470,15 @@ class SignalResearchDataset(DatasetH):
         selected = self._select_features(frame)
         instruments = selected.index.get_level_values("instrument").astype(str)
         if self.normalization_scope == "industry":
-            if self.industry_intervals_path is None:
+            industry_intervals = getattr(self, "industry_intervals", None)
+            if industry_intervals is not None:
+                groups = match_industry_intervals(selected.index, industry_intervals)
+            elif self.industry_intervals_path is not None:
+                groups = match_industry_intervals(
+                    selected.index, self.industry_intervals_path
+                )
+            else:
                 raise ValueError("industry normalization requires interval metadata")
-            groups = match_industry_intervals(selected.index, self.industry_intervals_path)
         elif self.normalization_scope == "board":
             groups = pd.Index([board_from_symbol(value) for value in instruments])
         else:

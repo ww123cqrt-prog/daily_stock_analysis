@@ -15,13 +15,13 @@ import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Literal, NamedTuple, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-from fastapi import APIRouter, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from api.v1.errors import api_error
 from api.v1.schemas.quant_jobs import (
@@ -47,6 +47,8 @@ from quant_workflow.scripts.robust_signal_data_contract import (
     readiness_artifact_path_for_sha,
 )
 from src.safe_errors import sanitize_public_error
+from src.services.catdesk_service import start_local_catdesk_service
+from src.services.mlflow_service import start_local_mlflow_service
 from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
 from src.safe_urls import public_http_url
 
@@ -81,6 +83,7 @@ TRAINING_PROVIDER_DATASET_IDS = {
     "cleaned": "ashare_daily_qfq",
 }
 LOCAL_CATDESK_HEALTH_PORTS = {8765}
+LocalServiceName = Literal["catdesk", "mlflow"]
 _MLFLOW_STATUS_CACHE_LOCK = threading.Lock()
 _MLFLOW_STATUS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _QUANT_JOB_STREAM_LOCK = threading.Lock()
@@ -509,6 +512,8 @@ async def get_quant_status(
         generated_at=research_status.get("generated_at"),
         trainable=bool(research_status.get("trainable")),
         training_readiness=research_status.get("training_readiness") or {},
+        training_preflight=research_status.get("training_preflight") or {},
+        training_preflights=research_status.get("training_preflights") or {},
         data_sources=research_status.get("data_sources") or [],
         qlib_provider=research_status.get("qlib_provider"),
         provider_quality=research_status.get("provider_quality") or {},
@@ -526,6 +531,62 @@ async def get_quant_status(
         mlflow=mlflow_payload,
         external_services=_external_services_payload(mlflow_payload),
     )
+
+
+def _local_service_open_url(service: LocalServiceName) -> str:
+    return "/experiments/" if service == "mlflow" else _public_catdesk_url(_catdesk_url())
+
+
+def _local_service_status_payload(service: LocalServiceName) -> Dict[str, Any]:
+    # Bypass the quant-status negative cache so a just-started service is
+    # observed immediately by the landing page poller.
+    raw_payload = (
+        _probe_mlflow_status_payload(_mlflow_url())
+        if service == "mlflow"
+        else _catdesk_status_payload()
+    )
+    payload: Dict[str, Any] = {
+        "service": service,
+        "status": raw_payload.get("status", "unavailable"),
+        "url": raw_payload.get("url", ""),
+        "open_url": _local_service_open_url(service),
+    }
+    if raw_payload.get("error"):
+        payload["error"] = raw_payload["error"]
+    return payload
+
+
+@router.get("/services/{service}")
+async def get_local_service_status(service: LocalServiceName) -> Dict[str, Any]:
+    """Probe one of the two fixed local services used by the landing page."""
+    return await asyncio.to_thread(_local_service_status_payload, service)
+
+
+@router.post("/services/{service}/start")
+async def start_local_service(service: LocalServiceName) -> JSONResponse:
+    """Start only the fixed CatDesk or MLflow process, never user commands."""
+    try:
+        raw_result = await asyncio.to_thread(
+            start_local_mlflow_service if service == "mlflow" else start_local_catdesk_service
+        )
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail="本地服务启动失败，请检查 DSA 日志。") from exc
+
+    payload: Dict[str, Any] = {
+        "service": service,
+        "status": raw_result.get("status", "failed"),
+        "open_url": _local_service_open_url(service),
+    }
+    for key in ("pid", "port", "message"):
+        if key in raw_result:
+            payload[key] = raw_result[key]
+    if service == "mlflow":
+        _clear_mlflow_status_cache()
+
+    status = payload["status"]
+    if status == "failed":
+        raise HTTPException(status_code=503, detail=payload)
+    return JSONResponse(payload, status_code=202 if status == "starting" else 200)
 
 
 @router.get("/job-types", response_model=QuantJobTypesResponse)
@@ -557,7 +618,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                 raise api_error(
                     409,
                     "market_data_blocked",
-                    "A股日线数据尚未通过完整验收，或验收后的快照已经变化。请先在数据页重新运行完整数据质量报告。",
+                    "该报告绑定的 A 股数据证据不可用，或绑定后的快照已经变化；请由数据维护流程处理后再试。",
                 ) from exc
         if request.job_type in ROBUST_SIGNAL_READINESS_GATED_JOB_TYPES:
             try:
@@ -597,7 +658,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                     "training_blocked",
                     str(
                         summary
-                        or "Current data quality evidence does not allow formal training."
+                        or "The live quant_data and Qlib Provider checks did not pass."
                     ),
                 )
             if request.job_type in PROVIDER_PINNED_TRAINING_JOB_TYPES:
@@ -609,7 +670,7 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                     raise api_error(
                         409,
                         "training_blocked",
-                        "Current data quality evidence cannot pin an approved Qlib snapshot.",
+                        "The current Qlib Provider does not expose complete immutable lineage.",
                     ) from exc
         submit_kwargs = {}
         if approved_provider_identity is not None:

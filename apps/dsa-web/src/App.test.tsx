@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
@@ -7,15 +7,15 @@ import { UI_LANGUAGE_STORAGE_KEY } from './utils/uiLanguage';
 
 type AuthState = ReturnType<typeof AuthContext.useAuth>;
 
-const { chatPageShouldThrow, setCurrentRoute, useAgentChatStoreMock } = vi.hoisted(() => {
+const { stockPageShouldThrow, setCurrentRoute, useAgentChatStoreMock } = vi.hoisted(() => {
   const setCurrentRoute = vi.fn();
-  const chatPageShouldThrow = { value: false };
+  const stockPageShouldThrow = { value: false };
   const state = { completionBadge: false };
   const useAgentChatStoreMock = Object.assign(
     vi.fn((selector?: (value: typeof state) => unknown) => (selector ? selector(state) : state)),
     { getState: () => ({ setCurrentRoute }) },
   );
-  return { chatPageShouldThrow, setCurrentRoute, useAgentChatStoreMock };
+  return { stockPageShouldThrow, setCurrentRoute, useAgentChatStoreMock };
 });
 
 vi.mock('./contexts/AuthContext', () => ({
@@ -28,7 +28,12 @@ vi.mock('./stores/agentChatStore', () => ({
 }));
 
 vi.mock('./pages/HomePage', () => ({
-  default: () => <div data-testid="home-page">Home</div>,
+  default: () => {
+    if (stockPageShouldThrow.value) {
+      throw new Error('chunk load failed');
+    }
+    return <div data-testid="home-page">Stock analysis</div>;
+  },
 }));
 
 vi.mock('./pages/ResearchPage', () => ({
@@ -48,12 +53,7 @@ vi.mock('./pages/OtherPage', () => ({
 }));
 
 vi.mock('./pages/ChatPage', () => ({
-  default: () => {
-    if (chatPageShouldThrow.value) {
-      throw new Error('chunk load failed');
-    }
-    return <div data-testid="chat-page">Chat</div>;
-  },
+  default: () => <div data-testid="chat-page">Chat</div>,
 }));
 
 vi.mock('./pages/PortfolioPage', () => ({
@@ -111,13 +111,39 @@ function makeAuthState(overrides: Partial<AuthState> = {}): AuthState {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  chatPageShouldThrow.value = false;
+  stockPageShouldThrow.value = false;
   window.history.pushState({}, '', '/');
   localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
   vi.mocked(AuthContext.useAuth).mockReturnValue(makeAuthState());
 });
 
 describe('App routing behavior', () => {
+  it('renders the lightweight landing page at the root route', async () => {
+    render(<App />);
+
+    expect(await screen.findByTestId('landing-page')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Daily Stock Analysis' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /九点猫研/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /MLflow/ })).toBeInTheDocument();
+
+    const projectRelationship = screen.getByTestId('project-relationship');
+    expect(within(projectRelationship).getByText('daily_stock_analysis')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('quant_data')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('quant_workflow + Qlib')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('MLflow')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('china-astock-quant')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('独立数据项目与服务')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('DSA 仓内量化研究执行层')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('实验记录与产物存储')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('独立可选策略参考库')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('提供已验收数据快照')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('记录 Run、参数、指标与产物')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('DSA 聚合展示研究与结果')).toBeInTheDocument();
+    expect(within(projectRelationship).getByText('可选参考')).toBeInTheDocument();
+    expect(within(projectRelationship).queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
+  });
+
   it('shows loading fallback while auth status is initializing', () => {
     vi.mocked(AuthContext.useAuth).mockReturnValue(makeAuthState({ isLoading: true }));
 
@@ -141,15 +167,15 @@ describe('App routing behavior', () => {
     expect(window.location.search).toBe('?redirect=%2Fportfolio');
   });
 
-  it('renders the current route page after auth is ready', async () => {
-    window.history.pushState({}, '', '/chat');
+  it('renders stock analysis on its dedicated route after auth is ready', async () => {
+    window.history.pushState({}, '', '/stock-analysis');
 
     render(<App />);
 
-    expect(await screen.findByTestId('chat-page')).toBeInTheDocument();
-    expect(setCurrentRoute).toHaveBeenCalledWith('/chat');
+    expect(await screen.findByTestId('home-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/stock-analysis');
     expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('landing-page')).not.toBeInTheDocument();
   });
 
   it('renders the research workspace route after auth is ready', async () => {
@@ -192,24 +218,16 @@ describe('App routing behavior', () => {
     expect(setCurrentRoute).toHaveBeenCalledWith('/backtest/etf-momentum');
   });
 
-  it('routes /usage to the token usage page after auth is ready', async () => {
-    window.history.pushState({}, '', '/usage');
+  it.each(['/chat', '/decision-signals', '/usage'])('redirects retired route %s to the landing page', async (path) => {
+    window.history.pushState({}, '', path);
 
     render(<App />);
 
-    expect(await screen.findByTestId('token-usage-page')).toBeInTheDocument();
-    expect(setCurrentRoute).toHaveBeenCalledWith('/usage');
-    expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
-  });
-
-  it('routes /decision-signals to the AI signals page after auth is ready', async () => {
-    window.history.pushState({}, '', '/decision-signals');
-
-    render(<App />);
-
-    expect(await screen.findByTestId('decision-signals-page')).toBeInTheDocument();
-    expect(setCurrentRoute).toHaveBeenCalledWith('/decision-signals');
-    expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('landing-page')).toBeInTheDocument();
+    expect(window.location.pathname).toBe('/');
+    expect(screen.queryByTestId('chat-page')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('decision-signals-page')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('token-usage-page')).not.toBeInTheDocument();
   });
 
   it('redirects authenticated login visits back to the home page', async () => {
@@ -222,14 +240,14 @@ describe('App routing behavior', () => {
 
     render(<App />);
 
-    expect(await screen.findByTestId('home-page')).toBeInTheDocument();
+    expect(await screen.findByTestId('landing-page')).toBeInTheDocument();
     expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
   });
 
   it('keeps the shell mounted and resets the route boundary after page render errors', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    chatPageShouldThrow.value = true;
-    window.history.pushState({}, '', '/chat');
+    stockPageShouldThrow.value = true;
+    window.history.pushState({}, '', '/stock-analysis');
 
     try {
       render(<App />);
@@ -239,7 +257,7 @@ describe('App routing behavior', () => {
       expect(screen.getByRole('button', { name: '重新加载页面' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: '返回首页' })).toBeInTheDocument();
 
-      chatPageShouldThrow.value = false;
+      stockPageShouldThrow.value = false;
       fireEvent.click(screen.getByRole('link', { name: '持仓' }));
 
       expect(await screen.findByTestId('portfolio-page')).toBeInTheDocument();

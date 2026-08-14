@@ -9,7 +9,6 @@ import {
   CircleStop,
   Database,
   Eye,
-  FileText,
   FlaskConical,
   History,
   ListChecks,
@@ -153,8 +152,6 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
           { key: 'news_limit', label: '新闻下载股票数', kind: 'number', min: 1, placeholder: '50' },
-          { key: 'overlap_sample', label: '交叉验证重叠样本', kind: 'number', min: 1, placeholder: '留空为全部' },
-          { key: 'merged_sample', label: '质量报告合并样本', kind: 'number', min: 1, placeholder: '留空为全部' },
         ],
       },
     ],
@@ -317,25 +314,16 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
       {
         type: 'prepare_robust_signal_data',
-        label: '验收并准备鲁棒 CSI800 数据',
+        label: '准备冻结的鲁棒 CSI800 数据',
         description: '用当前 cleaned Qlib Provider、历史时点 CSI800 成员区间和当前数据血缘构建不可变研究 Provider；数据血缘变化后必须重新运行。',
       },
     ],
   },
   {
-    title: '质量报告',
-    description: '生成数据质量、异常股票和清洗策略报告。',
-    icon: FileText,
+    title: '辅助报告',
+    description: '生成异常清单、数据治理盘点和其他只读辅助报告。',
+    icon: ListChecks,
     jobs: [
-      {
-        type: 'report_data_quality',
-        label: '生成数据质量报告',
-        description: '汇总覆盖率、日期范围、来源重叠和可训练状态。',
-        params: [
-          { key: 'overlap_sample', label: '重叠样本数', kind: 'number', min: 1 },
-          { key: 'merged_sample', label: '合并样本数', kind: 'number', min: 1 },
-        ],
-      },
       { type: 'report_data_anomalies', label: '生成异常股票和清洗策略', description: '输出异常股票清单，并给出后续清洗策略。' },
       {
         type: 'validate_latest_snapshot',
@@ -423,8 +411,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: 'Qlib Provider（canonical，验收）' },
-              { value: 'cleaned', label: 'Qlib Provider（cleaned，验收）' },
+              { value: 'canonical', label: 'Qlib Provider（canonical）' },
+              { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
             ],
           },
         ],
@@ -593,7 +581,6 @@ const DATA_JOB_TYPES = new Set([
   'generate_csi300',
   'add_index_benchmark',
   'check_qlib_data',
-  'report_data_quality',
   'report_data_anomalies',
   'validate_latest_snapshot',
   'report_data_hygiene',
@@ -622,12 +609,12 @@ const TRAINING_JOB_TYPES = new Set([
 const ROBUST_SIGNAL_JOBS: WorkflowJob[] = [
   {
     type: 'preview_robust_signal_plan',
-    label: '预览鲁棒选股信号研究计划',
+    label: '预览 CSI800 选股信号稳定性检验计划',
     description: '只生成任务数量、时间范围和配置指纹，不启动训练。',
   },
   {
     type: 'run_robust_signal_research',
-    label: '启动鲁棒选股信号研究',
+    label: '启动 CSI800 选股信号稳定性检验',
     description: '运行单季度测试或正式鲁棒信号研究。',
   },
   {
@@ -637,7 +624,7 @@ const ROBUST_SIGNAL_JOBS: WorkflowJob[] = [
   },
   {
     type: 'resume_robust_signal_research',
-    label: '恢复鲁棒选股信号研究',
+    label: '恢复 CSI800 选股信号稳定性检验',
     description: '校验原检查点上下文后恢复同一个研究 Run。',
   },
 ];
@@ -666,15 +653,6 @@ function selectedProvider(params: Record<string, unknown>): 'canonical' | 'clean
   return params.provider === 'cleaned' ? 'cleaned' : 'canonical';
 }
 
-function providerEvidenceSummary(
-  provider: 'canonical' | 'cleaned',
-  currentSnapshotReady: boolean,
-): string {
-  return currentSnapshotReady
-    ? `The current ${provider} snapshot has not completed full data quality acceptance; the previous report cannot authorize formal training.`
-    : `The current ${provider} Qlib Provider is unavailable; formal training is blocked.`;
-}
-
 function providerTrainingState(
   status: ResearchStatus | null,
   params: Record<string, unknown>,
@@ -682,89 +660,24 @@ function providerTrainingState(
   provider: 'canonical' | 'cleaned';
   trainable: boolean;
   snapshotId?: string;
-  structuralStatus: 'accepted' | 'blocked' | string;
   calendarEnd?: string;
-  freshnessStatus?: string;
-  calendarAgeDays?: number | null;
-  evidenceCurrent: boolean;
-  currentSnapshotReady: boolean;
-  qualitySnapshotId?: string;
   summary: string;
 } {
   const provider = selectedProvider(params);
-  const quality = status?.providerQuality?.[provider];
   const currentIdentity = status?.currentProviderIdentities?.[provider];
-  if (quality) {
-    const identityMismatch = Boolean(
-      currentIdentity?.snapshotId
-      && quality.snapshotId
-      && currentIdentity.snapshotId !== quality.snapshotId,
-    );
-    const evidenceCurrent = quality.evidenceCurrent !== false && !identityMismatch;
-    if (!evidenceCurrent) {
-      const currentSnapshotReady = currentIdentity?.status === 'ready'
-        && Boolean(currentIdentity.snapshotId);
-      return {
-        provider,
-        trainable: false,
-        snapshotId: currentSnapshotReady ? currentIdentity?.snapshotId : undefined,
-        qualitySnapshotId: quality.snapshotId,
-        structuralStatus: currentSnapshotReady ? 'pending' : 'blocked',
-        calendarEnd: currentIdentity?.calendarEnd,
-        freshnessStatus: 'unknown',
-        calendarAgeDays: null,
-        evidenceCurrent: false,
-        currentSnapshotReady,
-        summary: providerEvidenceSummary(provider, currentSnapshotReady),
-      };
-    }
-    return {
-      provider,
-      trainable: quality.trainable === true,
-      snapshotId: quality.snapshotId,
-      structuralStatus: quality.structuralStatus || (quality.trainable ? 'accepted' : 'blocked'),
-      calendarEnd: quality.freshness?.calendarEnd || quality.calendarEnd,
-      freshnessStatus: quality.freshness?.status,
-      calendarAgeDays: quality.freshness?.calendarAgeDays,
-      evidenceCurrent: true,
-      currentSnapshotReady: true,
-      summary: quality.trainingReadiness?.summary || (quality.trainable ? 'ready' : 'blocked'),
-    };
-  }
-  if (currentIdentity) {
-    const currentSnapshotReady = currentIdentity.status === 'ready'
-      && Boolean(currentIdentity.snapshotId);
-    return {
-      provider,
-      trainable: false,
-      snapshotId: currentIdentity.snapshotId,
-      structuralStatus: currentSnapshotReady ? 'pending' : 'blocked',
-      calendarEnd: currentIdentity.calendarEnd,
-      freshnessStatus: 'unknown',
-      calendarAgeDays: null,
-      evidenceCurrent: false,
-      currentSnapshotReady,
-      summary: providerEvidenceSummary(provider, currentSnapshotReady),
-    };
-  }
-  if (provider === 'canonical') {
-    return {
-      provider,
-      trainable: status?.trainable === true,
-      snapshotId: status?.qlibProvider?.snapshotId,
-      structuralStatus: status?.trainable === true ? 'accepted' : 'blocked',
-      evidenceCurrent: status?.trainable === true,
-      currentSnapshotReady: status?.trainable === true,
-      summary: status?.trainingReadiness?.summary || '未找到 canonical 数据验收结果。',
-    };
-  }
+  const preflight = status?.trainingPreflights?.[provider]
+    || (status?.trainingPreflight?.provider === provider ? status.trainingPreflight : undefined);
+  const currentSnapshotReady = currentIdentity?.status === 'ready'
+    && Boolean(currentIdentity.snapshotId);
+  const trainable = currentSnapshotReady && preflight?.status === 'passed';
   return {
     provider,
-    trainable: false,
-    structuralStatus: 'blocked',
-    evidenceCurrent: false,
-    currentSnapshotReady: false,
-    summary: '未找到 cleaned 数据验收结果。请先运行正式全量数据质量报告。',
+    trainable,
+    snapshotId: currentSnapshotReady ? currentIdentity?.snapshotId : undefined,
+    calendarEnd: currentIdentity?.calendarEnd,
+    summary: !currentSnapshotReady
+      ? currentIdentity?.error || '当前 Qlib Provider 不可用。'
+      : preflight?.summary || '当前实时检查状态不可用。',
   };
 }
 
@@ -787,7 +700,7 @@ function stepsForSurface(surface: QuantTaskSurface): WorkflowStep[] {
         jobs,
       }];
     }
-    if (surface === 'other' && step.title === '质量报告') {
+    if (surface === 'other' && step.title === '辅助报告') {
       return [{ ...step, title: '工作台与外部项目报告', description: '集中查看尚未归入数据、训练和正式回测页面的辅助能力。', jobs }];
     }
     if (surface === 'other' && step.title === '选股模型训练与交易策略验证') {
@@ -830,8 +743,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
     eyebrow: 'Quant Workflow',
     title: zh ? '量化任务中心' : 'Quant Workflow',
     description: zh
-      ? '在网页端完成数据更新、Qlib 转换、质量检查、选股模型训练、实验追踪和交易策略回测查看；后台只执行白名单脚本。'
-      : 'Run data, Qlib, quality, training, experiment and backtest tasks through a browser-safe whitelist.',
+      ? '在网页端查看 quant_data 实时状态，并运行 Qlib 转换、选股模型训练、实验追踪和交易策略回测；后台只执行白名单脚本。'
+      : 'View live quant_data status and run Qlib conversion, training, experiment, and backtest tasks through a browser-safe whitelist.',
   };
 }
 
@@ -1115,7 +1028,6 @@ function buildDailyGuideSteps(
     'download_ashare_news',
     'download_jqdata',
   ]);
-  const qualityJob = latestJobs.report_data_quality;
   const anomalyJob = latestJobs.report_data_anomalies;
   const cleaningJob = latestJobs.apply_data_cleaning;
   const reviewJob = latestJobForTypes(latestJobs, ['report_market_regime', 'report_cash_control_backtest', 'train_baseline_lgb', 'run_dsa_backtest']);
@@ -1131,19 +1043,7 @@ function buildDailyGuideSteps(
 
   const updateStatus = jobDrivenStatus(updateJob, 'waiting', '按需更新');
 
-  const qualityStatus = (() => {
-    const running = [qualityJob, anomalyJob].find(isActiveJob);
-    if (running) return jobDrivenStatus(running, 'todo', '待检查');
-    const failed = [qualityJob, anomalyJob].find((job) => job?.status === 'failed');
-    if (failed) return jobDrivenStatus(failed, 'todo', '待检查');
-    if (isDoneJob(qualityJob) && isDoneJob(anomalyJob)) {
-      return { status: 'done' as const, statusLabel: '报告齐全', statusTone: 'success' as const, meta: formatTime(anomalyJob?.updatedAt || qualityJob?.updatedAt) };
-    }
-    if (isDoneJob(qualityJob) || isDoneJob(anomalyJob)) {
-      return { status: 'waiting' as const, statusLabel: '部分完成', statusTone: 'warning' as const, meta: formatTime((qualityJob || anomalyJob)?.updatedAt) };
-    }
-    return { status: 'todo' as const, statusLabel: '待生成', statusTone: 'info' as const };
-  })();
+  const anomalyStatus = jobDrivenStatus(anomalyJob, 'todo', '待生成');
 
   const cleaningStatus = (() => {
     const base = jobDrivenStatus(cleaningJob, 'waiting', '建议先预演');
@@ -1202,12 +1102,11 @@ function buildDailyGuideSteps(
       ],
     },
     {
-      id: 'quality',
-      title: '质量和异常',
-      detail: '生成覆盖率、来源重叠、异常股票清单和清洗策略报告。',
-      ...qualityStatus,
+      id: 'anomalies',
+      title: '异常清单',
+      detail: '生成异常股票清单和清洗策略报告。',
+      ...anomalyStatus,
       actions: [
-        { kind: 'job', label: '质量报告', jobType: 'report_data_quality' },
         { kind: 'job', label: '异常清单', jobType: 'report_data_anomalies' },
       ],
     },
@@ -1281,36 +1180,18 @@ function providerFreshnessText(
   state: ReturnType<typeof providerTrainingState>,
   language: 'zh' | 'en',
 ): string {
-  if (!state.evidenceCurrent) {
-    if (!state.currentSnapshotReady) {
-      return language === 'zh'
-        ? '当前数据快照不可用'
-        : 'current data snapshot unavailable';
-    }
+  if (!state.trainable) {
     return language === 'zh'
-      ? `待完整质量验收${state.calendarEnd ? ` · 行情截止 ${state.calendarEnd}` : ''}`
-      : `full quality acceptance pending${state.calendarEnd ? ` · market calendar through ${state.calendarEnd}` : ''}`;
+      ? `实时检查未通过${state.calendarEnd ? ` · Provider 日历截止 ${state.calendarEnd}` : ''}`
+      : `live checks failed${state.calendarEnd ? ` · Provider calendar through ${state.calendarEnd}` : ''}`;
   }
-  const structural = state.structuralStatus === 'accepted'
-    ? (language === 'zh' ? '通过' : 'accepted')
-    : (language === 'zh' ? '阻塞' : 'blocked');
-  const prefix = language === 'zh' ? `结构验收：${structural}` : `Structural acceptance: ${structural}`;
+  const prefix = language === 'zh' ? '实时检查：通过' : 'Live checks: passed';
   if (!state.calendarEnd) {
-    return `${prefix} · ${language === 'zh' ? '行情截止日期未知' : 'market calendar cutoff unknown'}`;
-  }
-  if (state.freshnessStatus === 'stale' && typeof state.calendarAgeDays === 'number') {
-    return `${prefix} · ${language === 'zh'
-      ? `行情截止 ${state.calendarEnd} · 已落后 ${state.calendarAgeDays} 天，建议更新，不阻断训练`
-      : `market calendar through ${state.calendarEnd} · ${state.calendarAgeDays} days old; update recommended, training remains allowed`}`;
-  }
-  if (state.freshnessStatus === 'future') {
-    return `${prefix} · ${language === 'zh'
-      ? `行情截止 ${state.calendarEnd} · 日期晚于本机日期，请核对数据和时钟`
-      : `market calendar through ${state.calendarEnd} · date is ahead of this machine`}`;
+    return `${prefix} · ${language === 'zh' ? 'Provider 日历截止日期未知' : 'Provider calendar cutoff unknown'}`;
   }
   return `${prefix} · ${language === 'zh'
-    ? `行情截止 ${state.calendarEnd}`
-    : `market calendar through ${state.calendarEnd}`}`;
+    ? `Provider 日历截止 ${state.calendarEnd}`
+    : `Provider calendar through ${state.calendarEnd}`}`;
 }
 
 function localizedTrainingReadinessSummary(
@@ -1318,20 +1199,6 @@ function localizedTrainingReadinessSummary(
   language: 'zh' | 'en',
 ): string {
   if (!summary || language === 'en') return summary || '';
-
-  if (
-    summary.startsWith('Latest data quality evidence does not match the current Qlib Provider')
-    || summary.startsWith('Latest data quality evidence does not match the current native V2 snapshot')
-  ) {
-    return '已检测到新的 Qlib Provider 数据血缘，但当前完整质量报告仍绑定上一版快照。重新运行正式全量数据验收后才能启动正式训练；下方“上次验收”记录不代表当前 Provider。';
-  }
-
-  const pendingProviderMatch = summary.match(
-    /^The current (canonical|cleaned) snapshot has not completed full data quality acceptance; the previous report cannot authorize formal training\.$/,
-  );
-  if (pendingProviderMatch) {
-    return `当前 ${pendingProviderMatch[1]} 快照尚未完成正式全量数据验收；上一版报告不能授权当前快照启动正式训练。`;
-  }
 
   const unavailableProviderMatch = summary.match(
     /^The current (canonical|cleaned) (?:Qlib Provider|native V2 snapshot) is unavailable; formal training is blocked\.$/,
@@ -1510,7 +1377,10 @@ const WorkflowParamControls: React.FC<{
   );
 };
 
-export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surface = 'all' }) => {
+export const QuantTaskPage: React.FC<{
+  surface?: QuantTaskSurface;
+  embedded?: boolean;
+}> = ({ surface = 'all', embedded = false }) => {
   const { language, t } = useUiLanguage();
   const [researchStatus, setResearchStatus] = useState<ResearchStatus | null>(null);
   const [quantStatus, setQuantStatus] = useState<QuantStatus | null>(null);
@@ -1660,6 +1530,8 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
       generatedAt: quantStatus.generatedAt,
       trainable: quantStatus.trainable,
       trainingReadiness: quantStatus.trainingReadiness || { status: 'unknown', summary: '' },
+      trainingPreflight: quantStatus.trainingPreflight,
+      trainingPreflights: quantStatus.trainingPreflights,
       dataSources: quantStatus.dataSources,
       qlibProvider: quantStatus.qlibProvider,
       providerQuality: quantStatus.providerQuality,
@@ -2115,73 +1987,39 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
     { label: language === 'zh' ? '协作暂停' : 'cooperative pause', info: robustPauseJobInfo },
     { label: language === 'zh' ? '恢复研究' : 'resume research', info: robustResumeJobInfo },
   ].filter(({ info }) => info.catalogLoaded && !info.isEnabled);
-  const providerQualityRows = (['canonical', 'cleaned'] as const)
+  const providerStates = (['canonical', 'cleaned'] as const)
     .filter((provider) => Boolean(
-      workflowStatus?.providerQuality?.[provider]
-      || workflowStatus?.currentProviderIdentities?.[provider],
+      workflowStatus?.currentProviderIdentities?.[provider]
+      || workflowStatus?.trainingPreflights?.[provider],
     ))
     .map((provider) => providerTrainingState(workflowStatus, { provider }));
-  const hasPendingProviderAcceptance = providerQualityRows.some(
-    (providerState) => !providerState.evidenceCurrent && providerState.currentSnapshotReady,
-  );
-  const hasOutdatedQualityEvidence = providerQualityRows.some(
-    (providerState) => !providerState.evidenceCurrent && Boolean(providerState.qualitySnapshotId),
-  );
-  const allProvidersTrainable = providerQualityRows.length
-    ? providerQualityRows.every((providerState) => providerState.trainable)
+  const allProvidersTrainable = providerStates.length
+    ? providerStates.every((providerState) => providerState.trainable)
     : trainable;
-  const hasTrainableProvider = providerQualityRows.length
-    ? providerQualityRows.some((providerState) => providerState.trainable)
+  const hasTrainableProvider = providerStates.length
+    ? providerStates.some((providerState) => providerState.trainable)
     : trainable;
-  const hasNonTrainableProvider = providerQualityRows.some(
+  const hasNonTrainableProvider = providerStates.some(
     (providerState) => !providerState.trainable,
   );
   const hasMixedProviderReadiness = hasTrainableProvider && hasNonTrainableProvider;
-  const acceptedProviderNames = providerQualityRows
+  const readyProviderNames = providerStates
     .filter((providerState) => providerState.trainable)
     .map((providerState) => providerState.provider);
-  const pendingProviderNames = providerQualityRows
-    .filter((providerState) => !providerState.evidenceCurrent && providerState.currentSnapshotReady)
-    .map((providerState) => providerState.provider);
-  const blockedProviderNames = providerQualityRows
-    .filter((providerState) => !providerState.trainable && !pendingProviderNames.includes(providerState.provider))
+  const blockedProviderNames = providerStates
+    .filter((providerState) => !providerState.trainable)
     .map((providerState) => providerState.provider);
   const mixedReadinessSummary = hasMixedProviderReadiness
     ? language === 'zh'
-      ? pendingProviderNames.length
-        ? `${acceptedProviderNames.join('、')} 已通过；${pendingProviderNames.join('、')} 的当前快照待完整质量验收。已通过的数据版本仍可训练，待验收版本不能用于正式训练。`
-        : `${acceptedProviderNames.join('、')} 已通过；${blockedProviderNames.join('、')} 当前不能用于正式训练。请查看对应数据行的阻断原因。`
-      : pendingProviderNames.length
-        ? `${acceptedProviderNames.join(', ')} accepted; the current ${pendingProviderNames.join(', ')} snapshot awaits full quality acceptance. Accepted providers remain trainable; pending providers cannot run formal training.`
-        : `${acceptedProviderNames.join(', ')} accepted; ${blockedProviderNames.join(', ')} cannot currently run formal training. See the provider row for details.`
+      ? `${readyProviderNames.join('、')} 实时检查通过；${blockedProviderNames.join('、')} 当前不能用于正式训练。请在对应训练任务中查看原因。`
+      : `${readyProviderNames.join(', ')} passed live checks; ${blockedProviderNames.join(', ')} cannot currently run formal training. See the selected training task for details.`
     : null;
-  const qualityJob = latestJobs.report_data_quality;
-  const qualityJobInfo = getBackendJobInfo(compatibleJobTypes, 'report_data_quality');
-  const qualityTaskLabel = isActiveJob(qualityJob)
-    ? (qualityJob?.status === 'running' || qualityJob?.status === 'pending'
-        ? (language === 'zh' ? '运行中' : 'running')
-        : (language === 'zh' ? '后台仍运行' : 'runner active'))
-    : qualityJob?.status === 'completed'
-    ? (hasOutdatedQualityEvidence
-        ? (providerQualityRows.some((providerState) => providerState.evidenceCurrent)
-            ? (language === 'zh' ? '已完成（部分为上一快照）' : 'completed (some evidence is for a previous snapshot)')
-            : (language === 'zh' ? '已完成（上一快照）' : 'completed (previous snapshot)'))
-        : (language === 'zh' ? '已完成' : 'completed'))
-    : qualityJob?.status === 'failed'
-        ? (language === 'zh' ? '失败' : 'failed')
-        : qualityJob?.status === 'cancelled'
-          ? (language === 'zh' ? '已取消' : 'cancelled')
-          : (language === 'zh' ? '未运行' : 'not run');
-  const acceptanceLabel = loading
+  const preflightLabel = loading
     ? (language === 'zh' ? '读取中' : 'loading')
     : allProvidersTrainable
-      ? (language === 'zh' ? '通过' : 'accepted')
+      ? (language === 'zh' ? '通过' : 'passed')
       : hasMixedProviderReadiness
-        ? hasPendingProviderAcceptance
-          ? (language === 'zh' ? '部分通过，部分待验收' : 'partly accepted, partly pending')
-          : (language === 'zh' ? '部分通过，部分阻塞' : 'partly accepted, partly blocked')
-      : hasPendingProviderAcceptance
-        ? (language === 'zh' ? '待重新验收' : 're-acceptance pending')
+        ? (language === 'zh' ? '部分通过，部分阻塞' : 'partly passed, partly blocked')
         : (language === 'zh' ? '阻塞' : 'blocked');
   const dailyGuideSteps = useMemo(
     () => buildDailyGuideSteps(workflowStatus, latestJobs, mlflowUrl),
@@ -2190,7 +2028,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
   return (
     <main className="min-h-screen bg-base px-4 py-6 sm:px-6 lg:px-8">
       <div className="mx-auto flex max-w-7xl flex-col gap-5">
-        <header className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        {!embedded ? <header className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <span className="label-uppercase">{copy.eyebrow}</span>
             <h1 className="mt-2 text-2xl font-semibold tracking-normal text-foreground sm:text-3xl">
@@ -2214,9 +2052,9 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
               刷新
             </button>
           </div>
-        </header>
+        </header> : null}
 
-        {surface !== 'all' ? (
+        {!embedded && surface !== 'all' ? (
           <nav className="flex flex-wrap border-b border-border/70" aria-label={language === 'zh' ? '量化任务分类' : 'Quant task sections'}>
             {[
               { to: '/data', label: language === 'zh' ? '数据更新与检查' : 'Data' , key: 'data' },
@@ -2255,84 +2093,28 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
         <section className={`grid gap-3 md:grid-cols-2 ${surface === 'training' ? 'xl:grid-cols-2' : 'xl:grid-cols-3'}`}>
           {surface === 'all' || surface === 'data' || surface === 'training' ? (
           <Card variant="bordered" padding="md" className="min-h-[132px]">
-            <div className="flex items-center justify-between gap-3">
-              <span className="label-uppercase">Data</span>
-              <JobStatusBadge job={qualityJob} />
-            </div>
+            <span className="label-uppercase">Data</span>
             <p className="mt-3 text-lg font-semibold text-foreground">
               {allProvidersTrainable
-                ? (language === 'zh' ? '当前数据可训练' : 'Data ready for training')
+                ? (language === 'zh' ? '实时检查通过' : 'Live checks passed')
                 : loading
                   ? (language === 'zh' ? '正在读取数据状态' : 'Loading data status')
                   : hasMixedProviderReadiness
-                    ? (language === 'zh' ? '部分数据可训练' : 'Some data providers are trainable')
-                  : hasPendingProviderAcceptance
-                    ? (language === 'zh' ? '新快照待验收' : 'New snapshot awaiting acceptance')
+                    ? (language === 'zh' ? '部分 Provider 实时检查通过' : 'Some Providers passed live checks')
                     : (language === 'zh' ? '数据暂不可训练' : 'Data not ready for training')}
             </p>
             <p className="mt-2 text-sm leading-5 text-secondary-text">
               {mixedReadinessSummary
                 || localizedTrainingReadinessSummary(workflowStatus?.trainingReadiness?.summary, language)
                 || (language === 'zh'
-                  ? '运行质量报告后，这里会显示训练准备状态。'
-                  : 'Run a data quality report to see training readiness here.')}
+                  ? '正在检查 quant_data 与当前 Qlib Provider。'
+                  : 'Checking quant_data and the current Qlib Provider.')}
             </p>
-            <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary-text">
-              <span>{language === 'zh' ? '质量报告任务' : 'Quality-report job'}：{qualityTaskLabel}</span>
-              <span className={loading ? 'text-muted-text' : allProvidersTrainable ? 'text-success' : 'text-warning'}>
-                {language === 'zh' ? '数据验收' : 'Data acceptance'}：{acceptanceLabel}
-              </span>
-            </div>
-            {providerQualityRows.length ? (
-              <div className="mt-3 divide-y divide-subtle border-y border-subtle text-xs">
-                {providerQualityRows.map((providerState) => (
-                  <div
-                    key={providerState.provider}
-                    data-testid={`provider-quality-${providerState.provider}`}
-                    className="grid gap-1 py-2 sm:grid-cols-[7rem_minmax(0,1fr)]"
-                  >
-                    <span className="font-medium text-foreground">{providerState.provider}</span>
-                    <span className={providerState.trainable && providerState.freshnessStatus !== 'stale' ? 'text-secondary-text' : 'text-warning'}>
-                      <span className="block">
-                        {providerState.evidenceCurrent
-                          ? (language === 'zh' ? '快照' : 'snapshot')
-                          : (language === 'zh' ? '当前快照' : 'current snapshot')}{' '}
-                        {providerState.snapshotId || '-'}
-                        {' · '}{providerFreshnessText(providerState, language)}
-                      </span>
-                      {!providerState.evidenceCurrent && providerState.qualitySnapshotId ? (
-                        <span className="mt-1 block text-muted-text">
-                          {language === 'zh' ? '上次已验收快照' : 'last accepted snapshot'}{' '}
-                          {providerState.qualitySnapshotId}
-                          {language === 'zh'
-                            ? '（不能作为当前训练授权）'
-                            : ' (does not authorize training on the current snapshot)'}
-                        </span>
-                      ) : null}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : null}
+            <p className={`mt-3 text-xs ${loading ? 'text-muted-text' : allProvidersTrainable ? 'text-success' : 'text-warning'}`}>
+              {language === 'zh' ? '实时检查' : 'Live checks'}：{preflightLabel}
+            </p>
             {surface === 'training' ? (
               <div className="mt-3 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  className="btn-secondary h-8 gap-2 px-2.5 text-xs"
-                  aria-label={language === 'zh' ? '运行正式全量数据验收' : 'Run full data acceptance'}
-                  onClick={() => void submitGuideJob('report_data_quality')}
-                  disabled={
-                    submittingTypes.report_data_quality === true
-                    || isActiveJob(qualityJob)
-                    || !qualityJobInfo.catalogLoaded
-                    || !qualityJobInfo.isEnabled
-                  }
-                >
-                  {submittingTypes.report_data_quality === true || isActiveJob(qualityJob)
-                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    : <FileText className="h-3.5 w-3.5" />}
-                  {language === 'zh' ? '重新验收数据' : 'Re-run acceptance'}
-                </button>
                 <Link to="/data" className="inline-flex h-8 items-center gap-1 text-xs font-medium text-cyan">
                   {language === 'zh' ? '查看数据页' : 'Open data page'}
                   <ArrowRight className="h-3.5 w-3.5" />
@@ -2463,7 +2245,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                   <div className="flex flex-wrap items-center gap-2">
                     <FlaskConical className="h-5 w-5 text-cyan" />
                     <h2 className="text-base font-semibold text-foreground">
-                      {language === 'zh' ? '鲁棒选股信号研究' : 'Robust Stock-Selection Signal Research'}
+                      {language === 'zh' ? 'CSI800 选股信号稳定性检验' : 'CSI800 Stock-Selection Signal Stability Test'}
                     </h2>
                     <Badge
                       variant={robustRunning || robustLaunchActive ? 'info' : robustPaused ? 'warning' : 'default'}
@@ -2743,7 +2525,7 @@ export const QuantTaskPage: React.FC<{ surface?: QuantTaskSurface }> = ({ surfac
                             </div>
                             <p className="mt-1 text-sm leading-5 text-secondary-text">{job.description}</p>
                             {TRAINING_JOB_TYPES.has(job.type) ? (
-                              <p className={`mt-1 text-xs ${providerState.trainable && providerState.freshnessStatus !== 'stale' ? 'text-success' : 'text-warning'}`}>
+                              <p className={`mt-1 text-xs ${providerState.trainable ? 'text-success' : 'text-warning'}`}>
                                 {language === 'zh' ? '当前数据' : 'Current data'}：{providerState.provider}
                                 {' · '}{language === 'zh' ? '快照' : 'snapshot'} {providerState.snapshotId || '-'}
                                 {' · '}{providerFreshnessText(providerState, language)}

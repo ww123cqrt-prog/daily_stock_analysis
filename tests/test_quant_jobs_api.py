@@ -646,6 +646,15 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertNotIn("cwd", body)
         self.assertNotIn("log_path", body)
 
+    def test_default_specs_exclude_historical_quality_report_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs", command_specs=None
+            )
+            available = service.available_job_types()
+
+        self.assertNotIn("report_data_quality", available)
+
     def test_default_specs_include_provider_maintenance_dry_run_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
@@ -910,6 +919,83 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("Unsupported params", str(legacy_ctx.exception))
 
     def test_status_includes_research_snapshot_for_workflow_header(self) -> None:
+        from api.v1.endpoints.research_status import _NativeQlibProviderResolution
+        from quant_workflow.scripts.quant_data_service_client import (
+            QuantDataIdentity,
+            QuantDataReadyResult,
+        )
+
+        identities = tuple(
+            QuantDataIdentity(
+                dataset_id=dataset_id,
+                snapshot_id=f"{dataset_id}-snapshot",
+                manifest_sha256=marker * 64,
+                content_sha256=marker * 64,
+                latest_trade_date="2026-08-07",
+                price_basis=price_basis,
+                data_kind=data_kind,
+            )
+            for dataset_id, marker, price_basis, data_kind in (
+                ("ashare_daily_qfq", "a", "qfq", "daily_bars"),
+                ("cn_index_daily", "b", "raw", "daily_bars"),
+                (
+                    "pit_csi800",
+                    "c",
+                    "not_applicable",
+                    "point_in_time_membership",
+                ),
+                (
+                    "qlib_cleaning_plan",
+                    "d",
+                    "not_applicable",
+                    "qlib_cleaning_plan",
+                ),
+            )
+        )
+        readiness = QuantDataReadyResult(
+            status="ready",
+            validated_datasets=len(identities),
+            identities=identities,
+            datasets=(),
+        )
+
+        def resolve_provider(
+            _dataset_id: str = "ashare_daily_qfq",
+            *,
+            provider: str = "canonical",
+        ) -> _NativeQlibProviderResolution:
+            provider_name = "cleaned" if provider == "cleaned" else "canonical"
+            lineage = {
+                "provider_contract": "direct_parquet_v1",
+                "dataset_id": "ashare_daily_qfq",
+                "snapshot_id": "ashare-daily-qfq-snapshot",
+                "manifest_sha256": "e" * 64,
+                "content_sha256": "f" * 64,
+                "descriptor_path": (
+                    f"runtime/qlib/provider/{provider_name}/PROVIDER_DESCRIPTOR.json"
+                ),
+                "descriptor_sha256": ("1" if provider_name == "canonical" else "2")
+                * 64,
+                "cleaning_mode": provider_name,
+                "index_dataset_id": "cn_index_daily",
+                "index_snapshot_id": "cn-index-snapshot",
+                "index_content_sha256": "3" * 64,
+                "index_manifest_sha256": "4" * 64,
+            }
+            return _NativeQlibProviderResolution(
+                authoritative=True,
+                path=Path(f"/tmp/{provider_name}-provider"),
+                lineage=lineage,
+                provider_name=provider_name,
+                dataset_id=lineage["dataset_id"],
+                snapshot_id=lineage["snapshot_id"],
+                manifest_sha256=lineage["manifest_sha256"],
+                content_sha256=lineage["content_sha256"],
+                calendar_end="2026-08-07",
+                instrument_count=5340,
+                benchmark_complete=True,
+            )
+
         with tempfile.TemporaryDirectory() as temp_dir:
             reports_dir = Path(temp_dir) / "reports"
             reports_dir.mkdir()
@@ -1031,8 +1117,27 @@ class QuantJobsApiTestCase(unittest.TestCase):
             )
             client = self._make_client(service)
 
-            with patch(
-                "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", status_path
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    side_effect=resolve_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=readiness,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={
+                        "calendar_days": 4492,
+                        "calendar_range": "2008-01-02 ~ 2026-07-03",
+                        "instruments": 5340,
+                    },
+                ),
             ):
                 resp = client.get("/api/v1/quant/status")
 
@@ -1040,7 +1145,12 @@ class QuantJobsApiTestCase(unittest.TestCase):
         body = resp.json()
         self.assertTrue(body["trainable"])
         self.assertEqual(body["training_readiness"]["status"], "trainable")
-        self.assertEqual(body["data_sources"][0]["name"], "merged")
+        self.assertEqual(body["training_preflight"]["status"], "passed")
+        self.assertEqual(body["data_sources"], [])
+        self.assertEqual(body["provider_quality"], {})
+        self.assertNotIn("quality_report_id", body)
+        self.assertNotIn("quality_evidence_sha256", body)
+        self.assertNotIn("quality_scan", body)
         self.assertEqual(
             body["qlib_provider"]["calendar_range"], "2008-01-02 ~ 2026-07-03"
         )
@@ -1077,8 +1187,25 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "api.v1.endpoints.quant_jobs.build_research_status_payload",
                     return_value={
                         "generated_at": "2026-07-31T12:00:00+08:00",
-                        "trainable": False,
-                        "training_readiness": {},
+                        "trainable": True,
+                        "training_readiness": {
+                            "status": "trainable",
+                            "summary": "Current Provider preflight passed.",
+                        },
+                        "training_preflight": {
+                            "status": "passed",
+                            "provider": "canonical",
+                        },
+                        "training_preflights": {
+                            "canonical": {
+                                "status": "passed",
+                                "provider": "canonical",
+                            },
+                            "cleaned": {
+                                "status": "blocked",
+                                "provider": "cleaned",
+                            },
+                        },
                     },
                 ) as build_status,
                 patch(
@@ -1096,6 +1223,15 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn(build_status, offloaded)
         self.assertIn(get_snapshot, offloaded)
+        body = resp.json()
+        self.assertTrue(body["trainable"])
+        self.assertEqual(body["training_preflight"]["provider"], "canonical")
+        self.assertEqual(
+            body["training_preflights"]["canonical"]["status"], "passed"
+        )
+        self.assertEqual(
+            body["training_preflights"]["cleaned"]["status"], "blocked"
+        )
 
     def test_status_can_skip_research_snapshot_for_job_monitoring(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1189,7 +1325,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 "trainable": False,
                 "training_readiness": {
                     "status": "blocked",
-                    "summary": "Latest quality report is unverified.",
+                    "summary": "The live quant_data and Qlib Provider checks failed.",
                 },
                 "robust_signal": {
                     "data_readiness": {
@@ -4560,26 +4696,19 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("artifact output", errors[0].lower())
         self.assertEqual(len(jobs), 1)
 
-    def test_daily_update_claims_data_quality_outputs_before_launch(self) -> None:
+    def test_daily_update_does_not_publish_historical_quality_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
                 jobs_root=Path(temp_dir) / "jobs",
                 command_specs=None,
             )
+            artifact_patterns = service.command_specs["run_daily_update"][
+                "artifact_patterns"
+            ]
 
-            with patch.object(service, "_start_job"):
-                daily = service.submit_job(
-                    "run_daily_update",
-                    {"dry_run": True, "skip_download": True},
-                )
-                with self.assertRaises(ValueError) as raised:
-                    service.submit_job("report_data_quality")
-
-            jobs = service.list_jobs()
-
-        self.assertEqual(daily.status, "pending")
-        self.assertIn("artifact output", str(raised.exception).lower())
-        self.assertEqual([job.job_type for job in jobs], ["run_daily_update"])
+        self.assertFalse(
+            any("data_quality" in Path(pattern).name for pattern in artifact_patterns)
+        )
 
     def test_artifact_download_rejects_symlink_that_resolves_outside_reports_root(
         self,
@@ -5080,7 +5209,6 @@ class QuantJobsApiTestCase(unittest.TestCase):
                         "'reports_root': str(q.REPORTS_ROOT), "
                         "'jobs_root': str(q.DEFAULT_JOBS_ROOT), "
                         "'check_command': specs['check_qlib_data']['command'], "
-                        "'quality_command': specs['report_data_quality']['command']({}), "
                         "'train_command': specs['train_baseline_lgb']['command']({'config': 'custom.yaml'}), "
                         "'dsa_backtest_command': specs['run_dsa_backtest']['command']({})"
                         "}))"
@@ -5103,12 +5231,6 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(
             payload["check_command"][1],
             str(workflow_root / "scripts" / "check_qlib_data.py"),
-        )
-        self.assertEqual(
-            payload["quality_command"][
-                payload["quality_command"].index("--out-dir") + 1
-            ],
-            str(reports_root),
         )
         self.assertEqual(
             payload["train_command"][3],
@@ -5846,48 +5968,6 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(response.json()["error"], "market_data_blocked")
         submit.assert_not_called()
 
-    def test_data_quality_report_job_supports_browser_safe_samples(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-
-            command = service._build_command(
-                "report_data_quality",
-                {"overlap_sample": 5, "merged_sample": 5},
-            )
-            status = service.available_job_types()
-            spec = service.command_specs["report_data_quality"]
-
-        self.assertIn("report_data_quality.py", command[1])
-        self._assert_reports_dir_arg(command)
-        self.assertIn("--overlap-sample", command)
-        self.assertIn("5", command)
-        self.assertIn("--merged-sample", command)
-        self.assertCountEqual(
-            status["report_data_quality"]["allowed_params"],
-            ["merged_sample", "overlap_sample"],
-        )
-        artifact_names = [Path(pattern).name for pattern in spec["artifact_patterns"]]
-        self.assertIn("data_quality_report_latest.json", artifact_names)
-        self.assertIn("data_quality_report_*.json", artifact_names)
-        self.assertIn("data_quality_ashare_qfq_summary_*.csv", artifact_names)
-        self.assertNotIn("data_quality_merged_summary_*.csv", artifact_names)
-        self.assertTrue(
-            any(
-                "test_runs/data_quality/data_quality_report_sampled_latest.json"
-                in pattern
-                for pattern in spec["artifact_patterns"]
-            )
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-            with self.assertRaises(ValueError) as zero_ctx:
-                service._build_command("report_data_quality", {"merged_sample": 0})
-            with self.assertRaises(ValueError) as text_ctx:
-                service._build_command("report_data_quality", {"merged_sample": "abc"})
-        self.assertIn("Param merged_sample must be >= 1", str(zero_ctx.exception))
-        self.assertIn("Param merged_sample must be an integer", str(text_ctx.exception))
-
     def test_browser_numeric_params_have_upper_bounds_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
@@ -5900,12 +5980,12 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "Param max_consecutive_failures must be <=",
                 ),
                 (
-                    "report_data_quality",
+                    "run_daily_update",
                     {"overlap_sample": 100001},
                     "Param overlap_sample must be <=",
                 ),
                 (
-                    "report_data_quality",
+                    "run_daily_update",
                     {"merged_sample": 100001},
                     "Param merged_sample must be <=",
                 ),

@@ -13,6 +13,7 @@ import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
 
 const HomePage = lazy(() => import('./pages/HomePage'));
+const LandingPage = lazy(() => import('./pages/LandingPage'));
 const ResearchPage = lazy(() => import('./pages/ResearchPage'));
 const WorkflowPage = lazy(() => import('./pages/WorkflowPage'));
 const DataPage = lazy(() => import('./pages/DataPage'));
@@ -22,11 +23,8 @@ const EtfMomentumReportPage = lazy(() => import('./pages/EtfMomentumReportPage')
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const LoginPage = lazy(() => import('./pages/LoginPage'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
-const ChatPage = lazy(() => import('./pages/ChatPage'));
 const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
-const DecisionSignalsPage = lazy(() => import('./pages/DecisionSignalsPage'));
 const AlertsPage = lazy(() => import('./pages/AlertsPage'));
-const TokenUsagePage = lazy(() => import('./pages/TokenUsagePage'));
 const StockScreeningPage = lazy(() => import('./pages/StockScreeningPage'));
 
 const AppContent: React.FC = () => {
@@ -84,19 +82,20 @@ const AppContent: React.FC = () => {
           </Shell>
         )}
       >
-        <Route path="/" element={<HomePage />} />
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/stock-analysis" element={<HomePage />} />
         <Route path="/research" element={<ResearchPage />} />
         <Route path="/data" element={<DataPage />} />
         <Route path="/workflow" element={<WorkflowPage />} />
         <Route path="/other" element={<OtherPage />} />
-        <Route path="/chat" element={<ChatPage />} />
+        <Route path="/chat" element={<Navigate to="/" replace />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
-        <Route path="/decision-signals" element={<DecisionSignalsPage />} />
+        <Route path="/decision-signals" element={<Navigate to="/" replace />} />
         <Route path="/screening" element={<StockScreeningPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/backtest/etf-momentum" element={<EtfMomentumReportPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
-        <Route path="/usage" element={<TokenUsagePage />} />
+        <Route path="/usage" element={<Navigate to="/" replace />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

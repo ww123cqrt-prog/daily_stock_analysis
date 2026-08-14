@@ -12,11 +12,25 @@ import {
   type ResearchRobustSignal,
   type ResearchRobustStrategy,
   type ResearchTrainingReadiness,
+  type ResearchTrainingPreflight,
   type ResearchTrainingResult,
 } from './research';
 import { toCamelCase } from './utils';
 
 export type QuantJobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string;
+
+export type LocalServiceName = 'catdesk' | 'mlflow';
+
+export interface LocalServiceStatus {
+  service: LocalServiceName;
+  status: string;
+  url: string;
+  openUrl: string;
+  error?: string | null;
+  pid?: number | null;
+  port?: number | null;
+  message?: string | null;
+}
 
 export interface QuantJob {
   jobId: string;
@@ -92,6 +106,8 @@ export interface QuantStatus {
   generatedAt?: string;
   trainable: boolean;
   trainingReadiness?: ResearchTrainingReadiness;
+  trainingPreflight?: ResearchTrainingPreflight;
+  trainingPreflights?: Record<string, ResearchTrainingPreflight>;
   dataSources: ResearchDataSource[];
   qlibProvider?: ResearchQlibProvider | null;
   providerQuality?: Record<string, ResearchProviderQuality>;
@@ -114,6 +130,25 @@ export interface QuantJobListResponse {
 
 export interface QuantStatusOptions {
   includeResearch?: boolean;
+}
+
+export interface QuantDataStatusDataset {
+  datasetId: string;
+  snapshotId: string;
+  manifestSha256: string;
+  contentSha256: string;
+  latestTradeDate: string;
+  priceBasis: string;
+  dataKind: string;
+  role: string;
+  status: string;
+}
+
+export interface QuantDataStatus {
+  status: string;
+  validatedDatasets: number;
+  checkedAt: string;
+  datasets: QuantDataStatusDataset[];
 }
 
 export interface QuantJobLog {
@@ -152,6 +187,23 @@ function convertRecordValues<T>(data: unknown, converter: (value: unknown) => T)
   );
 }
 
+function convertLocalService(data: Record<string, unknown>): LocalServiceStatus {
+  const converted = toCamelCase<Partial<LocalServiceStatus>>(data);
+  const service = converted.service === 'catdesk' || converted.service === 'mlflow'
+    ? converted.service
+    : 'mlflow';
+  return {
+    service,
+    status: typeof converted.status === 'string' ? converted.status : 'unavailable',
+    url: typeof converted.url === 'string' ? converted.url : '',
+    openUrl: typeof converted.openUrl === 'string' ? converted.openUrl : '',
+    error: typeof converted.error === 'string' ? converted.error : null,
+    pid: typeof converted.pid === 'number' ? converted.pid : null,
+    port: typeof converted.port === 'number' ? converted.port : null,
+    message: typeof converted.message === 'string' ? converted.message : null,
+  };
+}
+
 function convertStatus(data: Record<string, unknown>): QuantStatus {
   const camel = toCamelCase<Partial<QuantStatus>>(data);
   return {
@@ -163,6 +215,8 @@ function convertStatus(data: Record<string, unknown>): QuantStatus {
     generatedAt: camel.generatedAt,
     trainable: Boolean(camel.trainable),
     trainingReadiness: camel.trainingReadiness,
+    trainingPreflight: camel.trainingPreflight,
+    trainingPreflights: camel.trainingPreflights ?? {},
     dataSources: Array.isArray(camel.dataSources) ? camel.dataSources : [],
     qlibProvider: camel.qlibProvider ?? null,
     providerQuality: camel.providerQuality ?? {},
@@ -194,6 +248,17 @@ export function parseQuantJobStreamEvent(data: string): QuantJob[] {
 }
 
 export const quantApi = {
+  async getDataStatus(): Promise<QuantDataStatus> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/data/status');
+    const converted = toCamelCase<Partial<QuantDataStatus>>(response.data);
+    return {
+      status: typeof converted.status === 'string' ? converted.status : 'unknown',
+      validatedDatasets: Number(converted.validatedDatasets || 0),
+      checkedAt: typeof converted.checkedAt === 'string' ? converted.checkedAt : '',
+      datasets: Array.isArray(converted.datasets) ? converted.datasets : [],
+    };
+  },
+
   async getJobTypes(): Promise<QuantJobTypesCatalog> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/quant/job-types');
     return {
@@ -211,6 +276,20 @@ export const quantApi = {
       requestConfig,
     );
     return convertStatus(response.data);
+  },
+
+  async getLocalServiceStatus(service: LocalServiceName): Promise<LocalServiceStatus> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/quant/services/${encodeURIComponent(service)}`,
+    );
+    return convertLocalService(response.data);
+  },
+
+  async startLocalService(service: LocalServiceName): Promise<LocalServiceStatus> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/quant/services/${encodeURIComponent(service)}/start`,
+    );
+    return convertLocalService(response.data);
   },
 
   async submitJob(jobType: string, params: Record<string, unknown> = {}): Promise<QuantJob> {

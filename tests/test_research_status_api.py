@@ -13,9 +13,9 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -26,6 +26,11 @@ from quant_workflow.scripts.quant_data_contract import (
     filesystem_state_fingerprint,
     finalize_qlib_snapshot,
     resolve_dataset,
+)
+from quant_workflow.scripts.quant_data_service_client import (
+    QuantDataClientError,
+    QuantDataIdentity,
+    QuantDataReadyResult,
 )
 from quant_workflow.scripts.robust_signal_data_contract import (
     ACCEPTANCE_CONTRACT,
@@ -120,6 +125,95 @@ def stable_snapshot_state(dataset_id: str, state: dict) -> dict:
         "after_revalidation": {dataset_id: state},
         "after": {dataset_id: state},
     }
+
+
+def ready_training_data() -> QuantDataReadyResult:
+    identities = tuple(
+        QuantDataIdentity(
+            dataset_id=dataset_id,
+            snapshot_id=f"{dataset_id}-snapshot",
+            manifest_sha256=marker * 64,
+            content_sha256=marker * 64,
+            latest_trade_date="2026-08-07",
+            price_basis=price_basis,
+            data_kind=data_kind,
+        )
+        for dataset_id, marker, price_basis, data_kind in (
+            ("ashare_daily_qfq", "a", "qfq", "daily_bars"),
+            ("cn_index_daily", "b", "raw", "daily_bars"),
+            (
+                "pit_csi800",
+                "c",
+                "not_applicable",
+                "point_in_time_membership",
+            ),
+            (
+                "qlib_cleaning_plan",
+                "d",
+                "not_applicable",
+                "qlib_cleaning_plan",
+            ),
+        )
+    )
+    return QuantDataReadyResult(
+        status="ready",
+        validated_datasets=len(identities),
+        identities=identities,
+        datasets=tuple(
+            {**identity.as_dict(), "role": "canonical", "status": "ready"}
+            for identity in identities
+        ),
+    )
+
+
+def ready_provider_resolution(provider: str = "canonical"):
+    from api.v1.endpoints.research_status import _NativeQlibProviderResolution
+
+    provider_name = "cleaned" if provider == "cleaned" else "canonical"
+    marker = "e" if provider_name == "canonical" else "f"
+    lineage = {
+        "provider_contract": "direct_parquet_v1",
+        "dataset_id": "ashare_daily_qfq",
+        "snapshot_id": "ashare-daily-qfq-snapshot",
+        "manifest_sha256": marker * 64,
+        "content_sha256": marker * 64,
+        "descriptor_path": (
+            f"runtime/qlib/provider/{provider_name}/PROVIDER_DESCRIPTOR.json"
+        ),
+        "descriptor_sha256": ("1" if provider_name == "canonical" else "2")
+        * 64,
+        "cleaning_mode": provider_name,
+        "index_dataset_id": "cn_index_daily",
+        "index_snapshot_id": "cn-index-snapshot",
+        "index_content_sha256": "3" * 64,
+        "index_manifest_sha256": "4" * 64,
+    }
+    return _NativeQlibProviderResolution(
+        authoritative=True,
+        path=Path(f"/tmp/{provider_name}-provider"),
+        lineage=lineage,
+        provider_name=provider_name,
+        dataset_id=lineage["dataset_id"],
+        snapshot_id=lineage["snapshot_id"],
+        manifest_sha256=lineage["manifest_sha256"],
+        content_sha256=lineage["content_sha256"],
+        calendar_end="2026-08-07",
+        instrument_count=5516,
+        benchmark_complete=True,
+    )
+
+
+def resolve_ready_provider(
+    dataset_id: str = "ashare_daily_qfq",
+    *,
+    provider: str = "canonical",
+):
+    provider_name = (
+        "cleaned"
+        if provider == "cleaned" or str(dataset_id).endswith("_cleaned_v2")
+        else "canonical"
+    )
+    return ready_provider_resolution(provider_name)
 
 
 def write_native_ashare_fixture(
@@ -581,38 +675,6 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 self.assertRaises(DataContractError),
             ):
                 approved_ashare_qfq_snapshot_identity()
-
-    def test_provider_freshness_is_reported_separately_from_structural_acceptance(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import (
-            _annotate_provider_quality_freshness,
-        )
-
-        quality = {
-            "canonical": {
-                "trainable": True,
-                "calendar_end": "2026-07-24",
-            },
-            "cleaned": {
-                "trainable": False,
-                "calendar_end": "2026-07-31",
-            },
-        }
-
-        _annotate_provider_quality_freshness(
-            quality,
-            as_of_date=date(2026, 8, 2),
-        )
-
-        self.assertTrue(quality["canonical"]["trainable"])
-        self.assertEqual(quality["canonical"]["structural_status"], "accepted")
-        self.assertEqual(quality["canonical"]["freshness"]["status"], "stale")
-        self.assertEqual(quality["canonical"]["freshness"]["calendar_age_days"], 9)
-        self.assertFalse(quality["canonical"]["freshness"]["blocks_training"])
-        self.assertFalse(quality["cleaned"]["trainable"])
-        self.assertEqual(quality["cleaned"]["structural_status"], "blocked")
-        self.assertEqual(quality["cleaned"]["freshness"]["status"], "current")
 
     def _write_native_qlib_fixture(
         self,
@@ -1153,74 +1215,54 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             reports_dir = root / "reports"
-            data_root = root / "quant_data"
             signal_dir = reports_dir / "robust_signal"
             signal_dir.mkdir(parents=True)
-            manifest = data_root / "DATA_MANIFEST.json"
-            manifest.parent.mkdir(parents=True)
-            manifest.write_text('{"version": 2}\n', encoding="utf-8")
-            manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
-            provider_key = "a" * 64
-            provider = (
-                data_root
-                / "runtime"
-                / "robust_strategy"
-                / "providers"
-                / provider_key[:16]
-            )
-            (provider / "instruments").mkdir(parents=True)
-            (provider / "instruments" / "csi800.txt").write_text(
-                "SH600000\t2020-01-02\t2025-12-31\n", encoding="utf-8"
-            )
-            (provider / "ROBUST_PROVIDER.json").write_text(
-                json.dumps(
-                    {
-                        "format_version": 3,
-                        "provider_key": provider_key,
-                        "provider_tree_sha256": "b" * 64,
-                        "data_manifest_sha256": manifest_hash,
-                        "membership_intervals_sha256": "c" * 64,
-                    }
+            provider = root / "qlib-provider"
+            provider.mkdir()
+            identity_specs = {
+                "ashare_daily_qfq": ("qfq", "daily_bars"),
+                "cn_index_daily": ("derived", "daily_bars"),
+                "pit_csi800": ("not_applicable", "point_in_time_membership"),
+                "robust_reference": ("not_applicable", "point_in_time_reference"),
+                "ashare_fundamentals_pit": (
+                    "not_applicable",
+                    "point_in_time_fundamentals",
                 ),
-                encoding="utf-8",
-            )
+                "qlib_cleaning_plan": ("not_applicable", "qlib_cleaning_plan"),
+            }
+            data_identities = {
+                dataset_id: {
+                    "dataset_id": dataset_id,
+                    "snapshot_id": f"{dataset_id}-snapshot",
+                    "manifest_sha256": "a" * 64,
+                    "content_sha256": "b" * 64,
+                    "latest_trade_date": "2026-08-07",
+                    "price_basis": basis,
+                    "data_kind": data_kind,
+                }
+                for dataset_id, (basis, data_kind) in identity_specs.items()
+            }
+            data_identity_sha256 = hashlib.sha256(
+                json.dumps(
+                    data_identities,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
             cleaned_identity = {
-                "provider_contract": "immutable_snapshot_v2",
-                "dataset_id": "qlib_ashare_cleaned_v2",
+                "provider_contract": "direct_parquet_v1",
+                "dataset_id": "ashare_daily_qfq",
                 "snapshot_id": "cleaned-snapshot-v2",
                 "manifest_sha256": "d" * 64,
                 "content_sha256": "e" * 64,
+                "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+                "descriptor_sha256": "f" * 64,
+                "cleaning_mode": "cleaned",
+                "index_dataset_id": "cn_index_daily",
+                "index_snapshot_id": "index-snapshot-v2",
+                "index_content_sha256": "1" * 64,
+                "index_manifest_sha256": "2" * 64,
             }
-            quality_report_id, quality_evidence_sha256 = write_quality_evidence(
-                reports_dir,
-                {
-                    "scan_mode": "full",
-                    "coverage_status": "full",
-                    "verification_status": "verified",
-                    "requested_sample": 0,
-                    "scanned_instruments": 100,
-                    "data_contract": {
-                        "status": "verified",
-                        "qlib_providers": {"cleaned": cleaned_identity},
-                        "snapshot_state": stable_snapshot_state(
-                            "qlib_ashare_cleaned_v2",
-                            stable_state_fingerprint("9"),
-                        ),
-                    },
-                    "provider_quality": {
-                        "cleaned": {
-                            **cleaned_identity,
-                            "provider": "cleaned",
-                            "trainable": True,
-                            "failure_reasons": [],
-                            "training_readiness": {
-                                "status": "trainable",
-                                "failure_reasons": [],
-                            },
-                        }
-                    },
-                },
-            )
             publish_robust_signal_data_readiness(
                 pointer_path=(signal_dir / "robust_signal_data_readiness_latest.json"),
                 payload={
@@ -1231,47 +1273,55 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     "trainable": True,
                     "generated_at": "2026-08-02T16:00:00+08:00",
                     "provider_uri": str(provider),
-                    "provider_key": provider_key,
-                    "provider_tree_sha256": "b" * 64,
-                    "data_manifest_sha256": manifest_hash,
-                    "membership_intervals_sha256": "c" * 64,
-                    "quality_report_id": quality_report_id,
-                    "quality_evidence_artifact_name": (
-                        "data_quality_report_20260731_110000_"
-                        f"{quality_evidence_sha256[:16]}.json"
-                    ),
-                    "quality_evidence_sha256": quality_evidence_sha256,
+                    "provider_key": cleaned_identity["descriptor_sha256"],
+                    "provider_tree_sha256": cleaned_identity["descriptor_sha256"],
+                    "data_identity_sha256": data_identity_sha256,
+                    "data_identities": data_identities,
                     "cleaned_provider_identity": cleaned_identity,
                     "canonical_snapshot_id": "cleaned-snapshot-v2",
                     "symbols": 1633,
                     "intervals": 2058,
                 },
             )
+            service = MagicMock()
 
             with (
-                patch("api.v1.endpoints.research_status.QUANT_DATA_ROOT", data_root),
                 patch(
-                    "api.v1.endpoints.research_status._ROBUST_PROVIDER_IDENTITY",
-                    return_value={
-                        "provider_key": provider_key,
-                        "provider_tree_sha256": "b" * 64,
-                    },
+                    "quant_workflow.scripts.robust_signal_data_contract."
+                    "QuantDataServiceClient",
+                    return_value=service,
                 ),
+                patch(
+                    "api.v1.endpoints.research_status.qlib_workflow_provider_uri",
+                    return_value=provider,
+                ) as provider_resolver,
             ):
                 payload = _robust_signal_payload(reports_dir)
 
         readiness = payload["data_readiness"]
         self.assertEqual(readiness["status"], "ready")
         self.assertTrue(readiness["trainable"])
-        self.assertEqual(readiness["provider_name"], provider_key[:16])
-        self.assertEqual(readiness["canonical_snapshot_id"], "cleaned-snapshot-v2")
+        self.assertEqual(readiness["provider_name"], "Qlib Provider")
+        self.assertEqual(readiness["data_identity_sha256"], data_identity_sha256)
+        self.assertEqual(readiness["data_identities"], data_identities)
+        self.assertEqual(
+            readiness["canonical_snapshot_id"], "ashare_daily_qfq-snapshot"
+        )
         self.assertTrue(readiness["readiness_artifact_name"].startswith(
             "robust_signal_data_readiness_"
         ))
         self.assertEqual(len(readiness["readiness_artifact_sha256"]), 64)
-        self.assertTrue(readiness["quality_evidence_artifact_name"].startswith(
-            "data_quality_report_"
-        ))
+        self.assertNotIn("cleaned_provider_identity", readiness)
+        self.assertNotIn("data_manifest_sha256", readiness)
+        service.ready.assert_called_once_with()
+        self.assertEqual(
+            service.resolve_dataset.call_args_list,
+            [
+                call(dataset_id, basis=identity["price_basis"], expected_identity=ANY)
+                for dataset_id, identity in data_identities.items()
+            ],
+        )
+        provider_resolver.assert_called_once()
         self.assertNotIn(str(root), json.dumps(payload))
 
     def test_robust_signal_status_keeps_smoke_run_separate_and_reads_live_progress(
@@ -2260,6 +2310,18 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     "api.v1.endpoints.research_status.QUANT_DATA_ROOT", quant_data_root
                 ),
                 patch("api.v1.endpoints.research_status.PROJECTS_ROOT", projects_root),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    side_effect=resolve_ready_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=ready_training_data(),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
                 patch.dict(
                     os.environ, {"MLFLOW_URL": "http://127.0.0.1:6106/"}, clear=False
                 ),
@@ -2274,7 +2336,12 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         body = resp.json()
         self.assertTrue(body["trainable"])
         self.assertEqual(body["training_readiness"]["status"], "trainable")
-        self.assertEqual(body["data_sources"][0]["name"], "akshare")
+        self.assertEqual(body["training_preflight"]["status"], "passed")
+        self.assertEqual(body["data_sources"], [])
+        self.assertEqual(body["provider_quality"], {})
+        self.assertIsNone(body["quality_report_id"])
+        self.assertIsNone(body["quality_evidence_sha256"])
+        self.assertEqual(body["quality_scan"], {})
         self.assertEqual(body["latest_training"]["run_id"], "abc123")
         self.assertEqual(body["experiment_notebook"]["status"], "available")
         self.assertEqual(body["mlflow"]["url"], "http://127.0.0.1:6106/")
@@ -2319,15 +2386,12 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             body["data_hygiene"]["cleanup_plan"]["actions"][1]["destination"]
         )
         self.assertEqual(
-            body["data_hygiene"]["quality_report"]["summary"]["date_range"],
-            "2020-01-03 ~ 2026-07-06",
-        )
-        self.assertEqual(
-            body["data_hygiene"]["quality_report"]["summary"]["stock_universe"], "5510"
-        )
-        self.assertEqual(
-            body["data_hygiene"]["quality_report"]["summary"]["usable_instruments"],
-            "5341",
+            body["data_hygiene"]["quality_report"],
+            {
+                "status": "deprecated",
+                "path": None,
+                "summary": None,
+            },
         )
         self.assertEqual(
             body["data_hygiene"]["cleaning_strategy"]["status"], "available"
@@ -3681,215 +3745,342 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0], results[1])
 
-    def test_data_quality_summary_fails_closed_when_latest_pointer_is_invalid(self) -> None:
-        from api.v1.endpoints.research_status import _data_quality_summary_payload
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir)
-            current_markdown = (
-                "# A-Share Data Quality Report\n\n"
-                "- Stock universe: 5509\n"
-                "- Canonical qfq usable instruments: 5340\n"
-                "- Canonical qfq rows: 7,580,087\n"
-                "- Canonical qfq date range: 2020-01-02 ~ 2026-07-03\n"
-            )
-            old_markdown = current_markdown.replace("5509", "1").replace("5340", "1")
-            (reports_dir / "data_quality_report_latest.md").write_text(
-                current_markdown,
-                encoding="utf-8",
-            )
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "report_id": "old-report",
-                        "markdown_sha256": hashlib.sha256(
-                            old_markdown.encode("utf-8")
-                        ).hexdigest(),
-                        "summary": {
-                            "stock_universe": 1,
-                            "usable_instruments": 1,
-                            "total_rows": 1,
-                            "date_range": "1990-01-01 ~ 1990-01-02",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            summary = _data_quality_summary_payload(reports_dir)
-
-        self.assertIsNone(summary)
-
-    def test_data_hygiene_marks_quality_report_invalid_when_pointer_is_invalid(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import _data_hygiene_payload
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            reports_dir = root / "reports"
-            reports_dir.mkdir()
-            quant_data_root = root / "quant_data"
-            quant_data_root.mkdir()
-            (reports_dir / "data_quality_report_latest.md").write_text(
-                "# stale compatibility report\n\n- Stock universe: 5509\n",
-                encoding="utf-8",
-            )
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                '{"schema_version":1}',
-                encoding="utf-8",
-            )
-
-            with patch(
-                "api.v1.endpoints.research_status.QUANT_DATA_ROOT",
-                quant_data_root,
-            ):
-                payload = _data_hygiene_payload(reports_dir)
-
-        self.assertEqual(payload["quality_report"]["status"], "invalid")
-        self.assertIsNone(payload["quality_report"]["summary"])
-
-    def test_data_quality_summary_is_derived_from_markdown_not_json_claims(self) -> None:
-        from api.v1.endpoints.research_status import _data_quality_summary_payload
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir)
-            markdown = (
-                "# A-Share Data Quality Report\n\n"
-                "- Stock universe: 5509\n"
-                "- Canonical qfq usable instruments: 5340\n"
-                "- Canonical qfq rows: 7,580,087\n"
-                "- Canonical qfq date range: 2020-01-02 ~ 2026-07-03\n"
-            )
-            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
-            artifact.write_text(markdown, encoding="utf-8")
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "report_id": f"data-quality-{digest[:16]}",
-                        "publication_contract": (
-                            "atomic_json_pointer_to_immutable_markdown_v1"
-                        ),
-                        "markdown_artifact": artifact.name,
-                        "markdown_sha256": digest,
-                        "summary": {
-                            "stock_universe": 1,
-                            "usable_instruments": 1,
-                            "total_rows": 1,
-                            "date_range": "1990-01-01 ~ 1990-01-02",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            summary = _data_quality_summary_payload(reports_dir)
-
-        self.assertEqual(summary["stock_universe"], "5509")
-        self.assertEqual(summary["total_rows"], "7,580,087")
-
-    def test_data_quality_summary_hashes_and_parses_the_same_markdown_bytes(
-        self,
-    ) -> None:
-        import api.v1.endpoints.research_status as module
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir)
-            original = "# Report\n\n- Stock universe: 5509\n"
-            replacement = "# Report\n\n- Stock universe: 1\n"
-            digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
-            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
-            artifact.write_text(original, encoding="utf-8")
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "report_id": f"data-quality-{digest[:16]}",
-                        "publication_contract": (
-                            "atomic_json_pointer_to_immutable_markdown_v1"
-                        ),
-                        "markdown_artifact": artifact.name,
-                        "markdown_sha256": digest,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            real_sha256 = hashlib.sha256
-            swapped = False
-
-            def swapping_sha256(data: bytes = b""):
-                nonlocal swapped
-                if data == original.encode("utf-8") and not swapped:
-                    artifact.write_text(replacement, encoding="utf-8")
-                    swapped = True
-                return real_sha256(data)
-
-            with patch.object(module.hashlib, "sha256", side_effect=swapping_sha256):
-                summary = module._data_quality_summary_payload(reports_dir)
-
-        self.assertTrue(swapped)
-        self.assertEqual(summary, {"stock_universe": "5509"})
-
-    def test_data_quality_summary_open_does_not_follow_markdown_symlink(self) -> None:
-        import api.v1.endpoints.research_status as module
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            reports_dir = root / "reports"
-            reports_dir.mkdir()
-            markdown = "# Report\n\n- Stock universe: 5509\n"
-            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-            outside = root / "outside.md"
-            outside.write_text(markdown, encoding="utf-8")
-            artifact = reports_dir / f"data_quality_report_20260730_120000_{digest[:16]}.md"
-            try:
-                artifact.symlink_to(outside)
-            except (NotImplementedError, OSError) as exc:
-                self.skipTest(f"symlink not supported on this filesystem: {exc}")
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "report_id": f"data-quality-{digest[:16]}",
-                        "publication_contract": (
-                            "atomic_json_pointer_to_immutable_markdown_v1"
-                        ),
-                        "markdown_artifact": artifact.name,
-                        "markdown_sha256": digest,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            real_is_symlink = Path.is_symlink
-
-            def stale_symlink_check(path: Path) -> bool:
-                if path == artifact:
-                    return False
-                return real_is_symlink(path)
-
-            with patch.object(
-                Path,
-                "is_symlink",
-                autospec=True,
-                side_effect=stale_symlink_check,
-            ):
-                summary = module._data_quality_summary_payload(reports_dir)
-
-        self.assertIsNone(summary)
 
     def test_research_status_route_is_sync_for_fastapi_threadpool(self) -> None:
         from api.v1.endpoints.research_status import get_research_status
 
         self.assertFalse(inspect.iscoroutinefunction(get_research_status))
 
-    def test_status_blocks_training_when_quality_publication_id_is_newer(self) -> None:
+    def test_status_uses_lightweight_training_preflight_without_quality_report(
+        self,
+    ) -> None:
         from api.v1.endpoints.research_status import (
             _NativeQlibProviderResolution,
             build_research_status_payload,
         )
+
+        identities = tuple(
+            QuantDataIdentity(
+                dataset_id=dataset_id,
+                snapshot_id=f"{dataset_id}-snapshot",
+                manifest_sha256=marker * 64,
+                content_sha256=marker.upper().lower() * 64,
+                latest_trade_date="2026-08-07",
+                price_basis=price_basis,
+                data_kind=data_kind,
+            )
+            for dataset_id, marker, price_basis, data_kind in (
+                ("ashare_daily_qfq", "a", "qfq", "daily_bars"),
+                ("cn_index_daily", "b", "raw", "daily_bars"),
+                (
+                    "pit_csi800",
+                    "c",
+                    "not_applicable",
+                    "point_in_time_membership",
+                ),
+            )
+        )
+        readiness = QuantDataReadyResult(
+            status="ready",
+            validated_datasets=len(identities),
+            identities=identities,
+            datasets=tuple(
+                {**identity.as_dict(), "role": "canonical", "status": "ready"}
+                for identity in identities
+            ),
+        )
+        lineage = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "provider-snapshot",
+            "manifest_sha256": "d" * 64,
+            "content_sha256": "e" * 64,
+            "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "f" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "1" * 64,
+            "index_manifest_sha256": "2" * 64,
+        }
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/current-provider"),
+            lineage=lineage,
+            provider_name="canonical",
+            dataset_id="ashare_daily_qfq",
+            snapshot_id="provider-snapshot",
+            manifest_sha256="d" * 64,
+            content_sha256="e" * 64,
+            calendar_end="2026-08-07",
+            instrument_count=5516,
+            benchmark_complete=True,
+        )
+        service = MagicMock()
+        service.__enter__.return_value = service
+        service.ready.return_value = readiness
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-08-08T10:00:00+08:00",
+                        "trainable": False,
+                        "training_readiness": {
+                            "status": "blocked",
+                            "summary": "Old DSA quality evidence is stale.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    return_value=native,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient",
+                    return_value=service,
+                ) as service_client,
+                patch.dict(
+                    os.environ,
+                    {"QUANT_DATA_SERVICE_URL": "http://localhost:8766"},
+                    clear=False,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertTrue(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "trainable")
+        self.assertEqual(payload["training_preflight"]["status"], "passed")
+        self.assertEqual(
+            set(payload["training_preflight"]["required_datasets"]),
+            {"ashare_daily_qfq", "cn_index_daily", "pit_csi800"},
+        )
+        self.assertEqual(payload["qlib_provider"]["snapshot_id"], "provider-snapshot")
+        service_client.assert_called_once_with(base_url="http://localhost:8766")
+        service.__enter__.assert_called_once_with()
+        service.__exit__.assert_called_once()
+
+    def test_status_blocks_training_when_required_quant_data_dataset_is_missing(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            _apply_training_preflight,
+        )
+
+        identities = tuple(
+            QuantDataIdentity(
+                dataset_id=dataset_id,
+                snapshot_id=f"{dataset_id}-snapshot",
+                manifest_sha256=marker * 64,
+                content_sha256=marker * 64,
+                latest_trade_date="2026-08-07",
+                price_basis=price_basis,
+                data_kind="daily_bars",
+            )
+            for dataset_id, marker, price_basis in (
+                ("ashare_daily_qfq", "a", "qfq"),
+                ("cn_index_daily", "b", "raw"),
+            )
+        )
+        readiness = QuantDataReadyResult(
+            status="ready",
+            validated_datasets=len(identities),
+            identities=identities,
+            datasets=tuple(
+                {**identity.as_dict(), "role": "canonical", "status": "ready"}
+                for identity in identities
+            ),
+        )
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/current-provider"),
+            provider_name="canonical",
+        )
+        status = {"trainable": True}
+
+        with patch(
+            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+            return_value=readiness,
+        ):
+            _apply_training_preflight(status, native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_preflight"]["status"], "blocked")
+        self.assertIn("pit_csi800", status["training_readiness"]["summary"])
+
+    def test_status_blocks_training_when_quant_data_service_is_unavailable(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            _apply_training_preflight,
+        )
+
+        status = {"trainable": True}
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            path=Path("/tmp/current-provider"),
+            provider_name="canonical",
+        )
+
+        with patch(
+            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+            side_effect=QuantDataClientError("private service detail"),
+        ):
+            _apply_training_preflight(status, native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_preflight"]["status"], "blocked")
+        self.assertIn("quant_data", status["training_readiness"]["summary"])
+        self.assertNotIn("private service detail", status["training_readiness"]["summary"])
+
+    def test_status_blocks_training_when_qlib_provider_is_unreadable(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            _apply_training_preflight,
+        )
+
+        status = {"trainable": True}
+        native = _NativeQlibProviderResolution(
+            authoritative=True,
+            provider_name="canonical",
+            error="Qlib Provider 不可用：quant_data 数据后端未通过完整性校验。",
+        )
+
+        _apply_training_preflight(status, native)
+
+        self.assertFalse(status["trainable"])
+        self.assertEqual(status["training_preflight"]["status"], "blocked")
+        self.assertIn("Qlib Provider", status["training_readiness"]["summary"])
+
+    def test_status_reports_independent_preflight_for_each_provider(self) -> None:
+        from api.v1.endpoints.research_status import (
+            _NativeQlibProviderResolution,
+            build_research_status_payload,
+        )
+
+        readiness = QuantDataReadyResult(
+            status="ready",
+            validated_datasets=4,
+            identities=tuple(
+                QuantDataIdentity(
+                    dataset_id=dataset_id,
+                    snapshot_id=f"{dataset_id}-snapshot",
+                    manifest_sha256=marker * 64,
+                    content_sha256=marker * 64,
+                    latest_trade_date="2026-08-07",
+                    price_basis=price_basis,
+                    data_kind=data_kind,
+                )
+                for dataset_id, marker, price_basis, data_kind in (
+                    ("ashare_daily_qfq", "a", "qfq", "daily_bars"),
+                    ("cn_index_daily", "b", "raw", "daily_bars"),
+                    (
+                        "pit_csi800",
+                        "c",
+                        "not_applicable",
+                        "point_in_time_membership",
+                    ),
+                    (
+                        "qlib_cleaning_plan",
+                        "d",
+                        "not_applicable",
+                        "qlib_cleaning_plan",
+                    ),
+                )
+            ),
+            datasets=(),
+        )
+        canonical_lineage = {
+            "provider_contract": "direct_parquet_v1",
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "canonical-snapshot",
+            "manifest_sha256": "e" * 64,
+            "content_sha256": "f" * 64,
+            "descriptor_path": "runtime/qlib/provider/PROVIDER_DESCRIPTOR.json",
+            "descriptor_sha256": "1" * 64,
+            "cleaning_mode": "canonical",
+            "index_dataset_id": "cn_index_daily",
+            "index_snapshot_id": "index-snapshot",
+            "index_content_sha256": "2" * 64,
+            "index_manifest_sha256": "3" * 64,
+        }
+        resolutions = {
+            "canonical": _NativeQlibProviderResolution(
+                authoritative=True,
+                path=Path("/tmp/canonical-provider"),
+                lineage=canonical_lineage,
+                provider_name="canonical",
+                calendar_end="2026-08-07",
+            ),
+            "cleaned": _NativeQlibProviderResolution(
+                authoritative=True,
+                path=Path("/tmp/cleaned-provider"),
+                provider_name="cleaned",
+                calendar_end="2026-08-07",
+            ),
+        }
+
+        def resolve_provider(
+            _dataset_id: str = "ashare_daily_qfq",
+            *,
+            provider: str = "canonical",
+        ) -> _NativeQlibProviderResolution:
+            return resolutions[provider]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "research_status_latest.json"
+            status_path.write_text("{}\n", encoding="utf-8")
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    status_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    side_effect=resolve_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=readiness,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
+            ):
+                payload = build_research_status_payload()
+
+        self.assertTrue(payload["trainable"])
+        self.assertEqual(payload["training_preflight"]["provider"], "canonical")
+        self.assertEqual(
+            payload["training_preflights"]["canonical"]["status"], "passed"
+        )
+        self.assertEqual(
+            payload["training_preflights"]["cleaned"]["status"], "blocked"
+        )
+        self.assertIn(
+            "不可变数据血缘",
+            payload["training_preflights"]["cleaned"]["summary"],
+        )
+
+    def test_status_discards_historical_quality_fields_and_uses_live_preflight(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
             reports_dir = Path(temp_dir) / "reports"
@@ -3940,143 +4131,34 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 ),
                 patch(
                     "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                    side_effect=resolve_ready_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=ready_training_data(),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
                 ),
             ):
                 payload = build_research_status_payload()
 
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("does not match", payload["training_readiness"]["summary"])
+        self.assertTrue(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "trainable")
+        self.assertEqual(payload["training_preflight"]["status"], "passed")
+        self.assertIsNone(payload["quality_report_id"])
+        self.assertIsNone(payload["quality_evidence_sha256"])
+        self.assertEqual(payload["quality_scan"], {})
+        self.assertEqual(payload["provider_quality"], {})
+        self.assertEqual(payload["data_sources"], [])
 
-    def test_status_blocks_training_for_matching_sampled_quality_report(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            markdown = "# Quality\n\n- Stock universe: 1\n"
-            digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-            report_id = f"data-quality-{digest[:16]}"
-            status_path = reports_dir / "research_status_latest.json"
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-31T10:00:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": report_id,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Stale optimistic state.",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            artifact = reports_dir / (
-                f"data_quality_report_20260731_110000_{digest[:16]}.md"
-            )
-            artifact.write_text(markdown, encoding="utf-8")
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "report_id": report_id,
-                        "publication_contract": (
-                            "atomic_json_pointer_to_immutable_markdown_v1"
-                        ),
-                        "markdown_artifact": artifact.name,
-                        "markdown_sha256": digest,
-                        "scan_mode": "sampled",
-                        "verification_status": "unverified",
-                        "trainable": False,
-                    }
-                ),
-                encoding="utf-8",
-            )
 
-            with (
-                patch(
-                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
-                    status_path,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=_NativeQlibProviderResolution(authoritative=False),
-                ),
-            ):
-                payload = build_research_status_payload()
-
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("not fully verified", payload["training_readiness"]["summary"])
-
-    def test_status_blocks_verified_evidence_with_lowered_thresholds(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            report_id, evidence_sha256 = write_quality_evidence(
-                reports_dir,
-                {
-                    "scan_mode": "full",
-                    "coverage_status": "full",
-                    "verification_status": "verified",
-                    "trainable": True,
-                    "training_thresholds": {
-                        "min_calendar_days": 0,
-                        "min_instruments": 0,
-                        "min_merged_instruments": 0,
-                        "authoritative_min_calendar_days": 252,
-                        "authoritative_min_instruments": 100,
-                        "authoritative": False,
-                    },
-                },
-            )
-            status_path = reports_dir / "research_status_latest.json"
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-31T10:00:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": report_id,
-                        "quality_evidence_sha256": evidence_sha256,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Lowered thresholds passed.",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with (
-                patch(
-                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
-                    status_path,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=_NativeQlibProviderResolution(authoritative=False),
-                ),
-            ):
-                payload = build_research_status_payload()
-
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("not fully verified", payload["training_readiness"]["summary"])
-
-    def test_status_blocks_training_without_quality_publication(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
+    def test_status_allows_training_without_historical_quality_publication(
+        self,
+    ) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
             status_path = Path(temp_dir) / "research_status_latest.json"
@@ -4100,20 +4182,25 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 ),
                 patch(
                     "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=_NativeQlibProviderResolution(authoritative=False),
+                    side_effect=resolve_ready_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=ready_training_data(),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
                 ),
             ):
                 payload = build_research_status_payload()
 
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("missing or invalid", payload["training_readiness"]["summary"])
+        self.assertTrue(payload["trainable"])
+        self.assertEqual(payload["training_readiness"]["status"], "trainable")
+        self.assertEqual(payload["training_preflight"]["status"], "passed")
 
-    def test_status_normalizes_non_boolean_trainable_values_to_false(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
+    def test_status_replaces_legacy_trainable_values_with_live_preflight(self) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
             status_path = Path(temp_dir) / "research_status_latest.json"
@@ -4139,125 +4226,40 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                         ),
                         patch(
                             "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                            return_value=_NativeQlibProviderResolution(
-                                authoritative=False
-                            ),
+                            side_effect=resolve_ready_provider,
+                        ),
+                        patch(
+                            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                            return_value=ready_training_data(),
+                        ),
+                        patch(
+                            "api.v1.endpoints.research_status._qlib_provider_from_path",
+                            return_value={},
                         ),
                     ):
                         payload = build_research_status_payload()
 
-                    self.assertIs(payload["trainable"], False)
-                    self.assertEqual(
-                        payload["training_readiness"]["status"], "blocked"
-                    )
-                    self.assertIn(
-                        "invalid trainable flag",
-                        payload["training_readiness"]["summary"],
-                    )
+                    self.assertIs(payload["trainable"], True)
+                    self.assertEqual(payload["training_preflight"]["status"], "passed")
 
-    def test_status_blocks_quality_evidence_from_another_native_snapshot(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
+
+
+
+
+    def test_status_allows_cleaned_provider_when_live_preflight_passes(self) -> None:
+        from api.v1.endpoints.research_status import build_research_status_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            old_hash = "1" * 64
-            report_id, evidence_sha256 = write_quality_evidence(
-                reports_dir,
-                {
-                    "scan_mode": "full",
-                    "coverage_status": "full",
-                    "verification_status": "verified",
-                    "trainable": True,
-                    "data_contract": {
-                        "status": "verified",
-                        "qlib_providers": {
-                            "canonical": {
-                                "dataset_id": "qlib_ashare_v2",
-                                "snapshot_id": "old-snapshot",
-                                "manifest_sha256": old_hash,
-                                "content_sha256": old_hash,
-                            }
-                        },
-                    },
-                    "provider_quality": {
-                        "canonical": {
-                            "dataset_id": "qlib_ashare_v2",
-                            "snapshot_id": "old-snapshot",
-                            "manifest_sha256": old_hash,
-                            "content_sha256": old_hash,
-                            **valid_provider_semantic_metrics(),
-                            "calendar_days": 252,
-                            "instruments": 100,
-                            "instrument_feature_dirs": 100,
-                            "missing_instrument_feature_dirs": 0,
-                            "complete_instrument_feature_dirs": 100,
-                            "incomplete_instrument_feature_dirs": 0,
-                            "missing_instrument_feature_files": 0,
-                            "invalid_instrument_feature_files": 0,
-                            "benchmark_complete": True,
-                            "trainable": True,
-                            "failure_reasons": [],
-                            "training_readiness": {
-                                "status": "trainable",
-                                "summary": "Provider passed.",
-                            },
-                        }
-                    },
-                },
-            )
-            status_path = reports_dir / "research_status_latest.json"
+            status_path = Path(temp_dir) / "research_status_latest.json"
             status_path.write_text(
                 json.dumps(
                     {
                         "generated_at": "2026-07-31T10:00:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": report_id,
-                        "quality_evidence_sha256": evidence_sha256,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Full scan passed.",
-                        },
-                        "provider_quality": {
-                            "canonical": {
-                                "dataset_id": "qlib_ashare_v2",
-                                "snapshot_id": "old-snapshot",
-                                "manifest_sha256": old_hash,
-                                "content_sha256": old_hash,
-                                "trainable": True,
-                                "structural_status": "accepted",
-                                "calendar_end": "2026-07-24",
-                            }
-                        },
+                        "trainable": False,
+                        "training_readiness": {"status": "blocked"},
                     }
                 ),
                 encoding="utf-8",
-            )
-            current_hash = "2" * 64
-            pointer_path = reports_dir / "data_quality_report_latest.json"
-            forged_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-            forged_pointer["data_contract"] = {
-                "status": "verified",
-                "qlib_providers": {
-                    "canonical": {
-                        "dataset_id": "qlib_ashare_v2",
-                        "snapshot_id": "current-snapshot",
-                        "manifest_sha256": current_hash,
-                        "content_sha256": current_hash,
-                    }
-                },
-            }
-            pointer_path.write_text(json.dumps(forged_pointer), encoding="utf-8")
-            native = _NativeQlibProviderResolution(
-                authoritative=True,
-                path=reports_dir / "provider",
-                dataset_id="qlib_ashare_v2",
-                snapshot_id="current-snapshot",
-                manifest_sha256=current_hash,
-                content_sha256=current_hash,
             )
             with (
                 patch(
@@ -4266,388 +4268,15 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 ),
                 patch(
                     "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=native,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._qlib_provider_from_path",
-                    return_value={},
-                ),
-            ):
-                payload = build_research_status_payload()
-
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "blocked")
-        self.assertIn("Qlib Provider", payload["training_readiness"]["summary"])
-        self.assertEqual(
-            payload["current_provider_identities"]["canonical"]["snapshot_id"],
-            "current-snapshot",
-        )
-        self.assertFalse(
-            payload["provider_quality"]["canonical"]["evidence_current"]
-        )
-
-    def test_status_blocks_native_snapshot_without_provider_quality_record(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import (
-            _DataQualityPublication,
-            _NativeQlibProviderResolution,
-            _apply_data_quality_training_gate,
-        )
-
-        snapshot_hash = "4" * 64
-        report_id = "data-quality-1234567890abcdef"
-        evidence_sha256 = "5" * 64
-        status = {
-            "trainable": True,
-            "quality_report_id": report_id,
-            "quality_evidence_sha256": evidence_sha256,
-            "training_readiness": {
-                "status": "trainable",
-                "summary": "Legacy provider-agnostic result.",
-            },
-        }
-        evidence = {
-            "scan_mode": "full",
-            "coverage_status": "full",
-            "verification_status": "verified",
-            "trainable": True,
-            "training_thresholds": {
-                "min_calendar_days": 252,
-                "min_instruments": 100,
-                "min_merged_instruments": 100,
-                "authoritative": True,
-            },
-            "data_contract": {
-                "status": "verified",
-                "qlib_providers": {
-                    "cleaned": {
-                        "dataset_id": "qlib_ashare_cleaned_v2",
-                        "snapshot_id": "cleaned-snapshot",
-                        "manifest_sha256": snapshot_hash,
-                        "content_sha256": snapshot_hash,
-                    }
-                },
-            },
-        }
-        publication = _DataQualityPublication(
-            payload=evidence,
-            markdown_bytes=b"# Quality\n",
-            report_id=report_id,
-            evidence_sha256=evidence_sha256,
-            training_authoritative=True,
-        )
-        native = _NativeQlibProviderResolution(
-            authoritative=True,
-            path=Path("/tmp/cleaned-provider"),
-            dataset_id="qlib_ashare_cleaned_v2",
-            snapshot_id="cleaned-snapshot",
-            manifest_sha256=snapshot_hash,
-            content_sha256=snapshot_hash,
-        )
-
-        with patch(
-            "api.v1.endpoints.research_status._data_quality_publication_from_json",
-            return_value=publication,
-        ):
-            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
-
-        self.assertFalse(status["trainable"])
-        self.assertEqual(status["training_readiness"]["status"], "blocked")
-        self.assertIn(
-            "provider-specific quality", status["training_readiness"]["summary"]
-        )
-
-    def test_status_blocks_provider_quality_without_semantic_contract_metrics(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import (
-            _DataQualityPublication,
-            _NativeQlibProviderResolution,
-            _apply_data_quality_training_gate,
-        )
-
-        snapshot_hash = "4" * 64
-        report_id = "data-quality-1234567890abcdef"
-        evidence_sha256 = "5" * 64
-        provider_identity = {
-            "dataset_id": "qlib_ashare_cleaned_v2",
-            "snapshot_id": "cleaned-snapshot",
-            "manifest_sha256": snapshot_hash,
-            "content_sha256": snapshot_hash,
-        }
-        status = {
-            "trainable": True,
-            "quality_report_id": report_id,
-            "quality_evidence_sha256": evidence_sha256,
-            "training_readiness": {
-                "status": "trainable",
-                "summary": "Legacy provider metrics passed.",
-            },
-        }
-        evidence = {
-            "scan_mode": "full",
-            "coverage_status": "full",
-            "verification_status": "verified",
-            "trainable": True,
-            "training_thresholds": {
-                "min_calendar_days": 252,
-                "min_instruments": 100,
-                "min_merged_instruments": 100,
-                "authoritative": True,
-            },
-            "provider_quality": {
-                "cleaned": {
-                    **provider_identity,
-                    "calendar_days": 252,
-                    "instruments": 100,
-                    "instrument_feature_dirs": 100,
-                    "missing_instrument_feature_dirs": 0,
-                    "complete_instrument_feature_dirs": 100,
-                    "incomplete_instrument_feature_dirs": 0,
-                    "missing_instrument_feature_files": 0,
-                    "invalid_instrument_feature_files": 0,
-                    "benchmark_complete": True,
-                    "trainable": True,
-                    "failure_reasons": [],
-                    "training_readiness": {
-                        "status": "trainable",
-                        "summary": "Legacy provider metrics passed.",
-                    },
-                }
-            },
-            "data_contract": {
-                "status": "verified",
-                "qlib_providers": {"cleaned": provider_identity},
-            },
-        }
-        publication = _DataQualityPublication(
-            payload=evidence,
-            markdown_bytes=b"# Quality\n",
-            report_id=report_id,
-            evidence_sha256=evidence_sha256,
-            training_authoritative=True,
-        )
-        native = _NativeQlibProviderResolution(
-            authoritative=True,
-            path=Path("/tmp/cleaned-provider"),
-            dataset_id="qlib_ashare_cleaned_v2",
-            snapshot_id="cleaned-snapshot",
-            manifest_sha256=snapshot_hash,
-            content_sha256=snapshot_hash,
-        )
-
-        with patch(
-            "api.v1.endpoints.research_status._data_quality_publication_from_json",
-            return_value=publication,
-        ):
-            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
-
-        self.assertFalse(status["trainable"])
-        self.assertEqual(status["training_readiness"]["status"], "blocked")
-        self.assertIn(
-            "provider-specific quality", status["training_readiness"]["summary"]
-        )
-
-    def test_status_blocks_when_provider_changes_after_quality_publication(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import (
-            _DataQualityPublication,
-            _NativeQlibProviderResolution,
-            _apply_data_quality_training_gate,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir) / "provider"
-            provider.mkdir()
-            feature = provider / "feature.bin"
-            feature.write_bytes(b"before")
-            published_state = filesystem_state_fingerprint(provider)
-            snapshot_hash = "4" * 64
-            report_id = "data-quality-1234567890abcdef"
-            evidence_sha256 = "5" * 64
-            provider_identity = {
-                "dataset_id": "qlib_ashare_cleaned_v2",
-                "snapshot_id": "cleaned-snapshot",
-                "manifest_sha256": snapshot_hash,
-                "content_sha256": snapshot_hash,
-            }
-            evidence = {
-                "scan_mode": "full",
-                "coverage_status": "full",
-                "verification_status": "verified",
-                "trainable": True,
-                "training_thresholds": {
-                    "min_calendar_days": 252,
-                    "min_instruments": 100,
-                    "min_merged_instruments": 100,
-                    "authoritative": True,
-                },
-                "provider_quality": {
-                    "cleaned": {
-                        **provider_identity,
-                        **valid_provider_semantic_metrics(),
-                        "calendar_days": 252,
-                        "instruments": 100,
-                        "instrument_feature_dirs": 100,
-                        "missing_instrument_feature_dirs": 0,
-                        "complete_instrument_feature_dirs": 100,
-                        "incomplete_instrument_feature_dirs": 0,
-                        "missing_instrument_feature_files": 0,
-                        "invalid_instrument_feature_files": 0,
-                        "benchmark_complete": True,
-                        "trainable": True,
-                        "failure_reasons": [],
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Provider passed.",
-                        },
-                    }
-                },
-                "data_contract": {
-                    "status": "verified",
-                    "qlib_providers": {"cleaned": provider_identity},
-                    "snapshot_state": stable_snapshot_state(
-                        "qlib_ashare_cleaned_v2", published_state
-                    ),
-                },
-            }
-            publication = _DataQualityPublication(
-                payload=evidence,
-                markdown_bytes=b"# Quality\n",
-                report_id=report_id,
-                evidence_sha256=evidence_sha256,
-                training_authoritative=True,
-            )
-            native = _NativeQlibProviderResolution(
-                authoritative=True,
-                path=provider,
-                dataset_id="qlib_ashare_cleaned_v2",
-                snapshot_id="cleaned-snapshot",
-                manifest_sha256=snapshot_hash,
-                content_sha256=snapshot_hash,
-            )
-            status = {
-                "trainable": True,
-                "quality_report_id": report_id,
-                "quality_evidence_sha256": evidence_sha256,
-                "training_readiness": {
-                    "status": "trainable",
-                    "summary": "Provider passed.",
-                },
-            }
-            feature.write_bytes(b"after")
-
-            with patch(
-                "api.v1.endpoints.research_status._data_quality_publication_from_json",
-                return_value=publication,
-            ):
-                _apply_data_quality_training_gate(status, Path(temp_dir), native)
-
-        self.assertFalse(status["trainable"])
-        self.assertEqual(status["training_readiness"]["status"], "blocked")
-        self.assertIn("changed", status["training_readiness"]["summary"].lower())
-
-    def test_status_authorizes_quality_approved_cleaned_snapshot(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            cleaned_hash = "3" * 64
-            cleaned_state = stable_state_fingerprint("6")
-            report_id, evidence_sha256 = write_quality_evidence(
-                reports_dir,
-                {
-                    "scan_mode": "full",
-                    "coverage_status": "full",
-                    "verification_status": "verified",
-                    "trainable": True,
-                    "provider_quality": {
-                        "cleaned": {
-                            "dataset_id": "qlib_ashare_cleaned_v2",
-                            "snapshot_id": "cleaned-snapshot",
-                            "manifest_sha256": cleaned_hash,
-                            "content_sha256": cleaned_hash,
-                            **valid_provider_semantic_metrics(),
-                            "calendar_days": 252,
-                            "instruments": 100,
-                            "instrument_feature_dirs": 100,
-                            "missing_instrument_feature_dirs": 0,
-                            "complete_instrument_feature_dirs": 100,
-                            "incomplete_instrument_feature_dirs": 0,
-                            "missing_instrument_feature_files": 0,
-                            "invalid_instrument_feature_files": 0,
-                            "benchmark_complete": True,
-                            "trainable": True,
-                            "failure_reasons": [],
-                            "training_readiness": {
-                                "status": "trainable",
-                                "summary": "Cleaned provider passed.",
-                            },
-                        }
-                    },
-                    "data_contract": {
-                        "status": "verified",
-                        "qlib_providers": {
-                            "cleaned": {
-                                "dataset_id": "qlib_ashare_cleaned_v2",
-                                "snapshot_id": "cleaned-snapshot",
-                                "manifest_sha256": cleaned_hash,
-                                "content_sha256": cleaned_hash,
-                            }
-                        },
-                        "snapshot_state": stable_snapshot_state(
-                            "qlib_ashare_cleaned_v2", cleaned_state
-                        ),
-                    },
-                },
-            )
-            status_path = reports_dir / "research_status_latest.json"
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-31T10:00:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": report_id,
-                        "quality_evidence_sha256": evidence_sha256,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Full scan passed.",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            native = _NativeQlibProviderResolution(
-                authoritative=True,
-                path=reports_dir / "cleaned-provider",
-                provider_name="cleaned",
-                dataset_id="qlib_ashare_cleaned_v2",
-                snapshot_id="cleaned-snapshot",
-                manifest_sha256=cleaned_hash,
-                content_sha256=cleaned_hash,
-            )
-            with (
-                patch(
-                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
-                    status_path,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=native,
+                    side_effect=resolve_ready_provider,
                 ) as resolve_native,
                 patch(
-                    "api.v1.endpoints.research_status._qlib_provider_from_path",
-                    return_value={},
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=ready_training_data(),
                 ),
                 patch(
-                    "api.v1.endpoints.research_status._filesystem_state_fingerprint_live",
-                    return_value=cleaned_state,
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
                 ),
             ):
                 payload = build_research_status_payload(
@@ -4670,268 +4299,13 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             {"provider": "canonical"},
         )
         self.assertTrue(payload["trainable"])
+        self.assertEqual(payload["training_preflight"]["provider"], "cleaned")
+        self.assertEqual(payload["training_preflight"]["status"], "passed")
         self.assertEqual(
-            payload["qlib_provider"]["dataset_id"], "qlib_ashare_cleaned_v2"
+            payload["qlib_provider"]["dataset_id"], "ashare_daily_qfq"
         )
 
-    def test_status_can_authorize_cleaned_when_canonical_quality_failed(self) -> None:
-        from api.v1.endpoints.research_status import (
-            _DataQualityPublication,
-            _NativeQlibProviderResolution,
-            _apply_data_quality_training_gate,
-        )
 
-        canonical_hash = "2" * 64
-        cleaned_hash = "3" * 64
-        cleaned_state = stable_state_fingerprint("7")
-        report_id = "data-quality-1234567890abcdef"
-        evidence_sha256 = "5" * 64
-        status = {
-            "trainable": False,
-            "quality_report_id": report_id,
-            "quality_evidence_sha256": evidence_sha256,
-            "training_readiness": {
-                "status": "limited",
-                "summary": "Canonical provider failed.",
-            },
-        }
-        evidence = {
-            "scan_mode": "full",
-            "coverage_status": "full",
-            "verification_status": "verified",
-            "trainable": False,
-            "training_thresholds": {
-                "min_calendar_days": 252,
-                "min_instruments": 100,
-                "min_merged_instruments": 100,
-                "authoritative": True,
-            },
-            "provider_quality": {
-                "canonical": {
-                    "dataset_id": "qlib_ashare_v2",
-                    "snapshot_id": "canonical-snapshot",
-                    "manifest_sha256": canonical_hash,
-                    "content_sha256": canonical_hash,
-                    **valid_provider_semantic_metrics(),
-                    "calendar_days": 251,
-                    "instruments": 100,
-                    "instrument_feature_dirs": 100,
-                    "missing_instrument_feature_dirs": 0,
-                    "complete_instrument_feature_dirs": 100,
-                    "incomplete_instrument_feature_dirs": 0,
-                    "missing_instrument_feature_files": 0,
-                    "invalid_instrument_feature_files": 0,
-                    "benchmark_complete": True,
-                    "trainable": False,
-                    "failure_reasons": ["Canonical history is incomplete."],
-                    "training_readiness": {
-                        "status": "limited",
-                        "summary": "Canonical provider failed.",
-                    },
-                },
-                "cleaned": {
-                    "dataset_id": "qlib_ashare_cleaned_v2",
-                    "snapshot_id": "cleaned-snapshot",
-                    "manifest_sha256": cleaned_hash,
-                    "content_sha256": cleaned_hash,
-                    **valid_provider_semantic_metrics(),
-                    "calendar_days": 252,
-                    "instruments": 100,
-                    "instrument_feature_dirs": 100,
-                    "missing_instrument_feature_dirs": 0,
-                    "complete_instrument_feature_dirs": 100,
-                    "incomplete_instrument_feature_dirs": 0,
-                    "missing_instrument_feature_files": 0,
-                    "invalid_instrument_feature_files": 0,
-                    "benchmark_complete": True,
-                    "trainable": True,
-                    "failure_reasons": [],
-                    "training_readiness": {
-                        "status": "trainable",
-                        "summary": "Cleaned provider passed.",
-                    },
-                },
-            },
-            "data_contract": {
-                "status": "verified",
-                "qlib_providers": {
-                    "canonical": {
-                        "dataset_id": "qlib_ashare_v2",
-                        "snapshot_id": "canonical-snapshot",
-                        "manifest_sha256": canonical_hash,
-                        "content_sha256": canonical_hash,
-                    },
-                    "cleaned": {
-                        "dataset_id": "qlib_ashare_cleaned_v2",
-                        "snapshot_id": "cleaned-snapshot",
-                        "manifest_sha256": cleaned_hash,
-                        "content_sha256": cleaned_hash,
-                    },
-                },
-                "snapshot_state": stable_snapshot_state(
-                    "qlib_ashare_cleaned_v2", cleaned_state
-                ),
-            },
-        }
-        publication = _DataQualityPublication(
-            payload=evidence,
-            markdown_bytes=b"# Quality\n",
-            report_id=report_id,
-            evidence_sha256=evidence_sha256,
-            training_authoritative=True,
-        )
-        native = _NativeQlibProviderResolution(
-            authoritative=True,
-            path=Path("/tmp/cleaned-provider"),
-            dataset_id="qlib_ashare_cleaned_v2",
-            snapshot_id="cleaned-snapshot",
-            manifest_sha256=cleaned_hash,
-            content_sha256=cleaned_hash,
-        )
-
-        with (
-            patch(
-                "api.v1.endpoints.research_status._data_quality_publication_from_json",
-                return_value=publication,
-            ),
-            patch(
-                "api.v1.endpoints.research_status._filesystem_state_fingerprint_live",
-                return_value=cleaned_state,
-            ),
-        ):
-            _apply_data_quality_training_gate(status, Path("/tmp/reports"), native)
-
-        self.assertTrue(status["trainable"])
-        self.assertEqual(status["training_readiness"]["status"], "trainable")
-
-    def test_status_blocks_cleaned_snapshot_when_only_canonical_quality_passes(
-        self,
-    ) -> None:
-        from api.v1.endpoints.research_status import (
-            _NativeQlibProviderResolution,
-            build_research_status_payload,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            canonical_hash = "2" * 64
-            cleaned_hash = "3" * 64
-            report_id, evidence_sha256 = write_quality_evidence(
-                reports_dir,
-                {
-                    "scan_mode": "full",
-                    "coverage_status": "full",
-                    "verification_status": "verified",
-                    "trainable": True,
-                    "provider_quality": {
-                        "canonical": {
-                            "dataset_id": "qlib_ashare_v2",
-                            "snapshot_id": "canonical-snapshot",
-                            "manifest_sha256": canonical_hash,
-                            "content_sha256": canonical_hash,
-                            **valid_provider_semantic_metrics(),
-                            "calendar_days": 252,
-                            "instruments": 100,
-                            "benchmark_complete": True,
-                            "trainable": True,
-                            "failure_reasons": [],
-                            "training_readiness": {
-                                "status": "trainable",
-                                "summary": "Canonical provider passed.",
-                            },
-                        },
-                        "cleaned": {
-                            "dataset_id": "qlib_ashare_cleaned_v2",
-                            "snapshot_id": "cleaned-snapshot",
-                            "manifest_sha256": cleaned_hash,
-                            "content_sha256": cleaned_hash,
-                            **valid_provider_semantic_metrics(),
-                            "calendar_days": 251,
-                            "instruments": 100,
-                            "instrument_feature_dirs": 100,
-                            "missing_instrument_feature_dirs": 0,
-                            "complete_instrument_feature_dirs": 100,
-                            "incomplete_instrument_feature_dirs": 0,
-                            "missing_instrument_feature_files": 0,
-                            "invalid_instrument_feature_files": 0,
-                            "benchmark_complete": True,
-                            "trainable": False,
-                            "failure_reasons": [
-                                "Qlib calendar has fewer than 252 trading days"
-                            ],
-                            "training_readiness": {
-                                "status": "limited",
-                                "summary": "Cleaned provider has insufficient history.",
-                            },
-                        },
-                    },
-                    "data_contract": {
-                        "status": "verified",
-                        "qlib_providers": {
-                            "canonical": {
-                                "dataset_id": "qlib_ashare_v2",
-                                "snapshot_id": "canonical-snapshot",
-                                "manifest_sha256": canonical_hash,
-                                "content_sha256": canonical_hash,
-                            },
-                            "cleaned": {
-                                "dataset_id": "qlib_ashare_cleaned_v2",
-                                "snapshot_id": "cleaned-snapshot",
-                                "manifest_sha256": cleaned_hash,
-                                "content_sha256": cleaned_hash,
-                            },
-                        },
-                    },
-                },
-            )
-            status_path = reports_dir / "research_status_latest.json"
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-31T10:00:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": report_id,
-                        "quality_evidence_sha256": evidence_sha256,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Canonical provider passed.",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            native = _NativeQlibProviderResolution(
-                authoritative=True,
-                path=reports_dir / "cleaned-provider",
-                dataset_id="qlib_ashare_cleaned_v2",
-                snapshot_id="cleaned-snapshot",
-                manifest_sha256=cleaned_hash,
-                content_sha256=cleaned_hash,
-            )
-            with (
-                patch(
-                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
-                    status_path,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    return_value=native,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._qlib_provider_from_path",
-                    return_value={},
-                ),
-            ):
-                payload = build_research_status_payload(
-                    provider_dataset_id="qlib_ashare_cleaned_v2"
-                )
-
-        self.assertFalse(payload["trainable"])
-        self.assertEqual(payload["training_readiness"]["status"], "limited")
-        self.assertIn(
-            "insufficient history", payload["training_readiness"]["summary"]
-        )
 
     def test_status_redacts_mlflow_url_credentials_query_and_fragment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5377,8 +4751,23 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             static_dir.mkdir()
             missing_path = Path(temp_dir) / "missing.json"
 
-            with patch(
-                "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH", missing_path
+            with (
+                patch(
+                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
+                    missing_path,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
+                    side_effect=resolve_ready_provider,
+                ),
+                patch(
+                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+                    return_value=ready_training_data(),
+                ),
+                patch(
+                    "api.v1.endpoints.research_status._qlib_provider_from_path",
+                    return_value={},
+                ),
             ):
                 client = TestClient(
                     create_app(static_dir=static_dir),
@@ -5388,8 +4777,9 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertFalse(body["trainable"])
-        self.assertEqual(body["training_readiness"]["status"], "missing")
+        self.assertTrue(body["trainable"])
+        self.assertEqual(body["training_readiness"]["status"], "trainable")
+        self.assertEqual(body["training_preflight"]["status"], "passed")
         self.assertEqual(body["data_sources"], [])
         self.assertEqual(body["experiment_notebook"]["status"], "missing")
         self.assertEqual(body["experiment_notebook"]["runs"], [])

@@ -282,13 +282,15 @@ class YfinanceFundamentalAdapter:
                 div_series = div_series.iloc[:, 0]
             try:
                 # Index is timezone-aware (ex-dividend date)
-                cutoff = pd.Timestamp.now(tz=div_series.index.tz) - pd.Timedelta(days=365)
+                now_date = pd.Timestamp.now(tz=div_series.index.tz).date()
+                cutoff_date = now_date - timedelta(days=365)
                 for ts, value in div_series.items():
                     per_share = _safe_float(value)
                     if per_share is None or per_share <= 0:
                         continue
                     try:
-                        event_date = pd.Timestamp(ts).date().isoformat()
+                        event_date_value = pd.Timestamp(ts).date()
+                        event_date = event_date_value.isoformat()
                     except Exception:
                         continue
                     events.append({
@@ -302,10 +304,10 @@ class YfinanceFundamentalAdapter:
                 ttm_events = []
                 for item in events:
                     try:
-                        event_ts = pd.Timestamp(item["event_date"]).tz_localize(div_series.index.tz)
+                        event_date = pd.Timestamp(item["event_date"]).date()
                     except Exception:
                         continue
-                    if event_ts >= cutoff:
+                    if cutoff_date <= event_date <= now_date:
                         ttm_events.append(item)
             except Exception as exc:
                 result["errors"].append(f"dividend_window:{type(exc).__name__}")

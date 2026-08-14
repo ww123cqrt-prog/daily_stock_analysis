@@ -58,6 +58,8 @@ class QuantStatusResponse(BaseModel):
     generated_at: Optional[str] = None
     trainable: bool = False
     training_readiness: Dict[str, Any] = Field(default_factory=dict)
+    training_preflight: Dict[str, Any] = Field(default_factory=dict)
+    training_preflights: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     data_sources: List[Dict[str, Any]] = Field(default_factory=list)
     qlib_provider: Optional[Dict[str, Any]] = None
     provider_quality: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

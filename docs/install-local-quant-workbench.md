@@ -178,8 +178,7 @@ curl -I --max-time 5 http://127.0.0.1:6006/
 | 页面 | 地址 | 用途 |
 | --- | --- | --- |
 | 首页 | `http://127.0.0.1:8010/` | 股票分析入口 |
-| 研究 | `http://127.0.0.1:8010/research` | 数据状态、能力边界、项目关系 |
-| 工作流 | `http://127.0.0.1:8010/workflow` | 数据更新、质量报告、Qlib 转换、训练、回测 |
+| 量化研究 | `http://127.0.0.1:8010/research` | 数据状态、Qlib 训练和策略研究入口 |
 | 回测 | `http://127.0.0.1:8010/backtest` | Python 脚本回测和无代码条件回测 |
 | 实验 | `http://127.0.0.1:8010/experiments/` | MLflow 3.14.0 官方页面、中文/English 切换、Run 和 artifact |
 
@@ -229,7 +228,7 @@ GitHub 仓库应只包含可复现的代码、测试、文档和示例配置。�
 3. 复制 `.env.example` 为 `.env`，填写自己的路径和 token。
 4. 准备自己的 `quant_data` 数据目录。
 5. 启动 DSA 和 MLflow。
-6. 在 `/workflow` 里运行数据检查、质量报告、转换、训练和回测。
+6. 在 DSA 查看数据状态，并在量化研究入口运行训练和回测。
 
 不要把你的 `.env`、股票全量数据、Qlib provider、MLflow `mlruns`、日志和报告推送到 GitHub。它们是本地私有运行态资产。仓库只提交 `quant_workflow` 的脚本、测试和说明文件，不提交其中的 `reports/` 与 `mlruns/` 运行数据。
 

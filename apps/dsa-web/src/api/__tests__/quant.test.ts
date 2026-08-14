@@ -20,6 +20,10 @@ describe('quantApi', () => {
     post.mockReset();
   });
 
+  it('exposes the governed quant_data readiness endpoint', () => {
+    expect(quantApi).toHaveProperty('getDataStatus');
+  });
+
   it('preserves dynamic quant job type keys when loading status', async () => {
     get.mockResolvedValueOnce({
       data: {
@@ -184,6 +188,32 @@ describe('quantApi', () => {
     expect(get).toHaveBeenCalledWith('/api/v1/quant/status', {
       params: { include_research: false },
     });
+  });
+
+  it('uses fixed local-service endpoints for status and startup', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        service: 'catdesk',
+        status: 'unavailable',
+        url: 'http://127.0.0.1:8765/',
+        open_url: 'http://127.0.0.1:8765/',
+      },
+    });
+    post.mockResolvedValueOnce({
+      data: {
+        service: 'mlflow',
+        status: 'starting',
+        open_url: '/experiments/',
+      },
+    });
+
+    const catdesk = await quantApi.getLocalServiceStatus('catdesk');
+    const mlflow = await quantApi.startLocalService('mlflow');
+
+    expect(get).toHaveBeenCalledWith('/api/v1/quant/services/catdesk');
+    expect(post).toHaveBeenCalledWith('/api/v1/quant/services/mlflow/start');
+    expect(catdesk.openUrl).toBe('http://127.0.0.1:8765/');
+    expect(mlflow.status).toBe('starting');
   });
 
   it('parses streamed job snapshots into frontend job objects', () => {

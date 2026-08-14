@@ -46,3 +46,29 @@ def test_sandbox_terminates_an_infinite_strategy() -> None:
             end_date=None,
             timeout_seconds=0.2,
         )
+
+
+def test_refuses_execution_outside_macos_sandbox(monkeypatch) -> None:
+    """B-1: non-Darwin hosts must never silently run bare subprocesses."""
+    import platform as platform_module
+
+    from src.core.script_strategy import ScriptExecutionError
+    from src.services.script_strategy_executor import run_script_in_sandbox
+
+    monkeypatch.setattr(platform_module, "system", lambda: "Linux")
+    script = (
+        "def initialize(context):\n"
+        "    pass\n"
+        "\n"
+        "def on_bar(context, data):\n"
+        "    pass\n"
+    )
+    with pytest.raises(ScriptExecutionError, match="not supported"):
+        run_script_in_sandbox(
+            script,
+            bundle_dir=None,
+            bars=list(_BARS),
+            symbols=["SZ159915"],
+            start_date=date(2026, 7, 24),
+            end_date=date(2026, 7, 24),
+        )

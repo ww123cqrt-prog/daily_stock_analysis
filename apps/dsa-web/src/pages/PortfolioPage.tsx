@@ -1,12 +1,10 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
-import { decisionSignalsApi } from '../api/decisionSignals';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
-import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
@@ -30,10 +28,6 @@ import {
   hasPositionPrice,
 } from '../utils/portfolioFormat';
 import type {
-  DecisionSignalItem,
-  DecisionSignalMarket,
-} from '../types/decisionSignals';
-import type {
   PortfolioAccountItem,
   PortfolioCashDirection,
   PortfolioCashLedgerListItem,
@@ -49,13 +43,9 @@ import type {
   PortfolioSnapshotResponse,
   PortfolioTradeListItem,
 } from '../types/portfolio';
-import { areStockCodesEquivalent, normalizeStockCode } from '../utils/stockCode';
-import { parseDecisionSignalDate } from '../utils/decisionSignalTime';
-import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/decisionAction';
 
 const PIE_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff7a45', '#7f8cff', '#ff4466'];
 const DEFAULT_PAGE_SIZE = 20;
-const PORTFOLIO_SIGNAL_LOOKUP_CONCURRENCY = 6;
 const FALLBACK_BROKERS: PortfolioImportBrokerItem[] = [
   { broker: 'huatai', aliases: [], displayName: '华泰' },
   { broker: 'citic', aliases: ['zhongxin'], displayName: '中信' },
@@ -68,16 +58,6 @@ type EventType = 'trade' | 'cash' | 'corporate';
 type FlatPosition = PortfolioPositionItem & {
   accountId: number;
   accountName: string;
-};
-
-type PortfolioSignalLookup = {
-  stockCode: string;
-  market?: DecisionSignalMarket;
-};
-
-type PortfolioSignalLookupResult = {
-  items: DecisionSignalItem[];
-  error: string | null;
 };
 
 type PortfolioPageLanguage = 'zh' | 'en';
@@ -113,71 +93,15 @@ const PORTFOLIO_SELECT_CLASS = `${PORTFOLIO_INPUT_CLASS} appearance-none pr-10`;
 const PORTFOLIO_FILE_PICKER_CLASS =
   'input-surface input-focus-glow flex h-11 w-full cursor-pointer items-center justify-center rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
-function getSignalTime(item: DecisionSignalItem): number {
-  return parseDecisionSignalDate(item.createdAt)?.getTime()
-    ?? parseDecisionSignalDate(item.updatedAt)?.getTime()
-    ?? 0;
-}
-
-function isNewerSignal(left: DecisionSignalItem | undefined, right: DecisionSignalItem): boolean {
-  if (!left) return true;
-  return getSignalTime(right) > getSignalTime(left);
-}
-
 function formatPortfolioLimitation(limitation: string, language: PortfolioPageLanguage): string {
   return PORTFOLIO_LIMITATION_LABELS[limitation]?.[language] ?? limitation;
 }
 
-const DECISION_SIGNAL_MARKETS = new Set<DecisionSignalMarket>(['cn', 'hk', 'us', 'jp', 'kr', 'tw']);
 type PortfolioAccountMarket = 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
 
-function toDecisionSignalMarket(value: string | null | undefined): DecisionSignalMarket | undefined {
-  const normalized = String(value || '').toLowerCase();
-  return DECISION_SIGNAL_MARKETS.has(normalized as DecisionSignalMarket)
-    ? normalized as DecisionSignalMarket
-    : undefined;
-}
-
-function toPositionSignalLookupKey(stockCode: string, market?: DecisionSignalMarket): string {
-  return `${market || ''}:${normalizeStockCode(stockCode).toUpperCase()}`;
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  mapper: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const workerCount = Math.min(Math.max(1, concurrency), items.length);
-
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      results[currentIndex] = await mapper(items[currentIndex]);
-    }
-  }));
-
-  return results;
-}
-
-async function loadPortfolioSignalLookup(lookup: PortfolioSignalLookup): Promise<PortfolioSignalLookupResult> {
-  try {
-    const response = await decisionSignalsApi.getLatest(lookup.stockCode, {
-      market: lookup.market,
-      limit: 1,
-    });
-    return { items: response.items, error: null };
-  } catch (err) {
-    return { items: [], error: getParsedApiError(err).message };
-  }
-}
-
 const PortfolioPage: React.FC = () => {
-  const { language, t } = useUiLanguage();
+  const { language } = useUiLanguage();
   const text = PORTFOLIO_TEXT[language];
-  const decisionActionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
 
   // Set page title
   useEffect(() => {
@@ -208,11 +132,6 @@ const PortfolioPage: React.FC = () => {
   const [error, setError] = useState<ParsedApiError | null>(null);
   const [riskWarning, setRiskWarning] = useState<string | null>(null);
   const [writeWarning, setWriteWarning] = useState<string | null>(null);
-  const [portfolioSignals, setPortfolioSignals] = useState<DecisionSignalItem[]>([]);
-  const [portfolioSignalsLoading, setPortfolioSignalsLoading] = useState(false);
-  const [portfolioSignalsWarning, setPortfolioSignalsWarning] = useState<string | null>(null);
-  const [portfolioSignalsRefreshKey, setPortfolioSignalsRefreshKey] = useState(0);
-  const portfolioSignalsRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
 
@@ -477,97 +396,6 @@ const PortfolioPage: React.FC = () => {
     rows.sort((a, b) => Number(b.marketValueBase || 0) - Number(a.marketValueBase || 0));
     return rows;
   }, [snapshot]);
-
-  const snapshotMatchesAccountScope = useMemo(() => {
-    if (!snapshot) return false;
-    const snapshotAccountIds = new Set((snapshot.accounts || []).map((account) => account.accountId));
-    if (queryAccountId !== undefined) {
-      return snapshotAccountIds.size === 1 && snapshotAccountIds.has(queryAccountId);
-    }
-    return accounts.length === 0 || Number(snapshot.accountCount || 0) === accounts.length;
-  }, [accounts.length, queryAccountId, snapshot]);
-
-  const positionSignalLookups = useMemo(() => {
-    const lookups = new Map<string, PortfolioSignalLookup>();
-    for (const row of positionRows) {
-      const stockCode = String(row.symbol || '').trim();
-      if (!stockCode) continue;
-      const market = toDecisionSignalMarket(row.market);
-      const key = toPositionSignalLookupKey(stockCode, market);
-      if (!lookups.has(key)) {
-        lookups.set(key, { stockCode, market });
-      }
-    }
-    return Array.from(lookups.values());
-  }, [positionRows]);
-
-  useEffect(() => {
-    const requestId = portfolioSignalsRequestRef.current + 1;
-    portfolioSignalsRequestRef.current = requestId;
-
-    if (positionSignalLookups.length === 0 || !snapshotMatchesAccountScope) {
-      setPortfolioSignals([]);
-      setPortfolioSignalsWarning(null);
-      setPortfolioSignalsLoading(false);
-      return;
-    }
-
-    const isActiveRequest = () => portfolioSignalsRequestRef.current === requestId;
-
-    const loadPortfolioSignals = async () => {
-      setPortfolioSignalsLoading(true);
-      setPortfolioSignalsWarning(null);
-      const results = await mapWithConcurrency(
-        positionSignalLookups,
-        PORTFOLIO_SIGNAL_LOOKUP_CONCURRENCY,
-        loadPortfolioSignalLookup,
-      );
-      if (!isActiveRequest()) return;
-      const collected = results.flatMap((result) => result.items);
-      const failures = results.flatMap((result) => (result.error ? [result.error] : []));
-      setPortfolioSignals(collected);
-      setPortfolioSignalsWarning(
-        failures.length > 0
-          ? (
-              collected.length > 0
-                ? formatUiText(t('decisionSignals.portfolioPartialWarning'), { message: failures[0] })
-                : failures[0]
-            )
-          : null,
-      );
-      if (isActiveRequest()) {
-        setPortfolioSignalsLoading(false);
-      }
-    };
-
-    void loadPortfolioSignals();
-
-    return () => {
-      portfolioSignalsRequestRef.current += 1;
-    };
-  }, [portfolioSignalsRefreshKey, positionSignalLookups, snapshotMatchesAccountScope, t]);
-
-  const signalByPositionKey = useMemo(() => {
-    const mapped = new Map<string, DecisionSignalItem>();
-    for (const row of positionRows) {
-      const rowMarket = String(row.market || '').toLowerCase();
-      for (const signal of portfolioSignals) {
-        const signalMarket = String(signal.market || '').toLowerCase();
-        if (rowMarket && signalMarket && rowMarket !== signalMarket) {
-          continue;
-        }
-        if (!areStockCodesEquivalent(row.symbol, signal.stockCode)) {
-          continue;
-        }
-        const key = `${row.accountId}-${row.symbol}-${row.market}`;
-        const existing = mapped.get(key);
-        if (isNewerSignal(existing, signal)) {
-          mapped.set(key, signal);
-        }
-      }
-    }
-    return mapped;
-  }, [portfolioSignals, positionRows]);
 
   const handleAnalyzePosition = async (row: FlatPosition) => {
     const key = `${row.accountId}-${row.symbol}-${row.market}`;
@@ -837,7 +665,6 @@ const PortfolioPage: React.FC = () => {
 
   const handleRefresh = async () => {
     await Promise.all([loadAccounts(), loadSnapshotAndRisk(), loadEvents(), loadBrokers()]);
-    setPortfolioSignalsRefreshKey((current) => current + 1);
   };
 
   const reloadSnapshotAndRiskForScope = useCallback(async (
@@ -940,16 +767,6 @@ const PortfolioPage: React.FC = () => {
     }
   };
 
-  const decisionSignalRiskPreviewItems = (risk?.decisionSignalRisk?.items ?? []).slice(0, 3);
-  const formatDecisionSignalRiskAction = (signal: Partial<DecisionSignalItem>): string => (
-    getDecisionActionLabel(
-      signal.action,
-      signal.actionLabel,
-      null,
-      text.alert,
-      decisionActionLabels,
-    ) ?? text.alert
-  );
   const snapshotQualityMessage = snapshot?.dataQuality === 'partial' && snapshot.limitations?.length
     ? snapshot.limitations
       .map((limitation) => formatPortfolioLimitation(limitation, language))
@@ -1190,14 +1007,6 @@ const PortfolioPage: React.FC = () => {
             <h2 className="text-sm font-semibold text-foreground">{text.positionsTitle}</h2>
             <span className="text-xs text-secondary">{formatUiText(text.countItems, { count: positionRows.length })}</span>
           </div>
-          {portfolioSignalsWarning ? (
-            <InlineAlert
-              variant="warning"
-              title={t('decisionSignals.portfolioWarningTitle')}
-              message={portfolioSignalsWarning}
-              className="mb-3 rounded-xl px-3 py-2 text-xs shadow-none"
-            />
-          ) : null}
           {positionRows.length === 0 ? (
             <EmptyState
               title={text.noPositionsTitle}
@@ -1206,7 +1015,7 @@ const PortfolioPage: React.FC = () => {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[860px] w-full text-sm">
+              <table className="min-w-[760px] w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
                     <th className="text-left py-2 pr-2">{text.account}</th>
@@ -1217,7 +1026,6 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-2">{text.marketValue}</th>
                     <th className="text-right py-2 pr-3">{text.unrealizedPnl}</th>
                     <th className="text-right py-2 pr-3">{text.returnPct}</th>
-                    <th className="min-w-[9rem] text-right py-2 pr-3">{t('decisionSignals.portfolioColumn')}</th>
                     <th className="w-20 text-right py-2">{text.action}</th>
                   </tr>
                 </thead>
@@ -1225,7 +1033,6 @@ const PortfolioPage: React.FC = () => {
                   {positionRows.map((row) => {
                     const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
                     const analyzing = positionAnalysisLoadingKey === rowKey;
-                    const signal = signalByPositionKey.get(rowKey);
                     return (
                     <tr key={rowKey} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
@@ -1260,9 +1067,6 @@ const PortfolioPage: React.FC = () => {
                         }`}
                       >
                         {formatSignedPct(row.unrealizedPnlPct)}
-                      </td>
-                      <td className="py-2 pr-3 text-right align-top">
-                        <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
                       </td>
                       <td className="py-2 text-right">
                         <button
@@ -1324,7 +1128,7 @@ const PortfolioPage: React.FC = () => {
         />
       ) : null}
 
-      <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+      <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
         <Card padding="md">
           <h3 className="text-sm font-semibold text-foreground mb-2">{text.drawdownMonitor}</h3>
           <div className="text-xs text-secondary space-y-1">
@@ -1347,32 +1151,6 @@ const PortfolioPage: React.FC = () => {
             <div>{text.accountCount}: {snapshot?.accountCount ?? 0}</div>
             <div>{text.currency}: {snapshot?.currency || 'CNY'}</div>
             <div>{text.costMethodShort}: {(snapshot?.costMethod || costMethod).toUpperCase()}</div>
-          </div>
-        </Card>
-        <Card padding="md">
-          <h3 className="text-sm font-semibold text-foreground mb-2">{text.aiRiskSignals}</h3>
-          <div className="text-xs text-secondary space-y-1">
-            {risk?.decisionSignalRisk?.available === false ? (
-              <div className="text-warning">{text.aiRiskUnavailable}</div>
-            ) : (
-              <>
-                <div>{text.aiRiskTotal}: {risk?.decisionSignalRisk?.total ?? 0}</div>
-                <div>
-                  {text.sellSignals}: {risk?.decisionSignalRisk?.actions?.sell ?? 0} · {text.reduceSignals}: {risk?.decisionSignalRisk?.actions?.reduce ?? 0} · {text.alertSignals}: {risk?.decisionSignalRisk?.actions?.alert ?? 0}
-                </div>
-                {decisionSignalRiskPreviewItems.length > 0 ? (
-                  <div className="space-y-1 pt-1">
-                    {decisionSignalRiskPreviewItems.map((item) => (
-                      <div key={`${item.accountId ?? 'all'}-${item.market}-${item.symbol}-${item.signal.id ?? item.signal.action}`} className="truncate text-foreground">
-                        {item.symbol} · {formatDecisionSignalRiskAction(item.signal)}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div>{text.noAiRiskSignals}</div>
-                )}
-              </>
-            )}
           </div>
         </Card>
       </section>

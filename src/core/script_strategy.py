@@ -11,6 +11,9 @@ import statistics
 from types import MappingProxyType
 from typing import Any, Sequence
 
+import numpy as np
+
+from src.core.script_market import MarketView
 from src.core.strategy_backtest import PriceBar, TargetAllocation
 
 
@@ -46,6 +49,27 @@ _FORBIDDEN_NODES = (
     ast.Nonlocal,
     ast.With,
 )
+
+
+class _SafeStatistics:
+    """Whitelisted statistics facade.
+
+    The real ``statistics`` module imports ``sys`` (``statistics.sys``), which
+    would let a script walk ``sys.modules['builtins'].open`` and read files
+    outside the sandbox. Only the public aggregation functions are exposed.
+    """
+
+    mean = staticmethod(statistics.mean)
+    median = staticmethod(statistics.median)
+    median_low = staticmethod(statistics.median_low)
+    median_high = staticmethod(statistics.median_high)
+    median_grouped = staticmethod(statistics.median_grouped)
+    mode = staticmethod(statistics.mode)
+    stdev = staticmethod(statistics.stdev)
+    pstdev = staticmethod(statistics.pstdev)
+    variance = staticmethod(statistics.variance)
+    pvariance = staticmethod(statistics.pvariance)
+    fmean = staticmethod(statistics.fmean)
 
 
 class ScriptValidationError(ValueError):
@@ -131,25 +155,32 @@ def _normalize_history(
 
 
 class _StrategyData:
-    def __init__(
-        self,
-        symbols: tuple[str, ...],
-        calendar: list[date],
-        bars: dict[str, dict[date, PriceBar]],
-    ) -> None:
-        self.symbols = symbols
-        self._calendar = calendar
-        self._bars = bars
+    """Script-facing data API backed by a vectorized MarketView."""
+
+    def __init__(self, view: MarketView) -> None:
+        self._view = view
+        self.symbols = tuple(str(symbol) for symbol in view.symbols)
+        self._symbol_set = set(self.symbols)
         self._index = 0
+        # PIT pools (csi800/all_a) enforce that a script can only touch
+        # symbols that are members on the current date — otherwise a script
+        # could buy a stock before it enters the pool (look-ahead bias).
+        self._pit_guard = str(view.meta.get("pool") or "") in ("csi800", "all_a")
 
     @property
     def current_date(self) -> date:
-        return self._calendar[self._index]
+        return date.fromordinal(int(self._view.dates[self._index]))
 
     def _symbol(self, symbol: str) -> str:
         normalized = str(symbol).strip().upper()
-        if normalized not in self.symbols:
+        if normalized not in self._symbol_set:
             raise ValueError(f"symbol is outside the requested universe: {symbol}")
+        if self._pit_guard and not bool(
+            self._view.members[self._index, self._view.symbol_index(normalized)]
+        ):
+            raise ValueError(
+                f"{normalized} is not a tradable member on this date"
+            )
         return normalized
 
     def _history_value(self, symbol: str, field: str, ago: int) -> float:
@@ -159,8 +190,12 @@ class _StrategyData:
         target = self._index - ago
         if target < 0:
             raise ValueError("requested history is not available yet")
-        bar = self._bars[normalized][self._calendar[target]]
-        return float(getattr(bar, field))
+        symbol_index = self._view.symbol_index(normalized)
+        matrix = self._view.open if field == "open" else self._view.close
+        value = matrix[target, symbol_index]
+        if bool(np.isnan(value)):
+            raise ValueError(f"{field} is not available for {normalized} on this date")
+        return float(value)
 
     def close(self, symbol: str, ago: int = 0) -> float:
         return self._history_value(symbol, "close", ago)
@@ -177,10 +212,11 @@ class _StrategyData:
         if start < 0:
             return ()
         normalized = self._symbol(symbol)
-        return tuple(
-            float(getattr(self._bars[normalized][self._calendar[index]], field))
-            for index in range(start, self._index + 1)
-        )
+        symbol_index = self._view.symbol_index(normalized)
+        matrix = self._view.open if field == "open" else self._view.close
+        values = matrix[start:self._index + 1, symbol_index]
+        values = values[~np.isnan(values)]
+        return tuple(float(value) for value in values)
 
     def returns(self, symbol: str, days: int) -> float | None:
         if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
@@ -189,20 +225,53 @@ class _StrategyData:
             return None
         current = self.close(symbol)
         previous = self.close(symbol, ago=days)
+        if previous == 0:
+            return None
         return current / previous - 1.0
 
     def sma(self, symbol: str, days: int) -> float | None:
+        """Simple moving average over the last ``days`` valid closes.
+
+        Returns ``None`` when the window does not contain ``days`` valid
+        closes yet — a suspended or newly listed symbol must not produce a
+        "20-day average" out of three surviving observations.
+        """
         values = self.history(symbol, days, "close")
-        return sum(values) / len(values) if values else None
+        if len(values) < days:
+            return None
+        return sum(values) / len(values)
 
     def rank_by_return(self, days: int, descending: bool = True) -> list[str]:
-        values = []
-        for order, symbol in enumerate(self.symbols):
-            value = self.returns(symbol, days)
-            if value is not None:
-                values.append((symbol, value, order))
-        values.sort(key=lambda item: ((-item[1]) if descending else item[1], item[2]))
-        return [symbol for symbol, _, _ in values]
+        """Rank today's tradable universe members by trailing return.
+
+        Only members eligible on the current date participate (PIT), and
+        symbols without a valid previous close are excluded.
+        """
+        if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+            raise ValueError("return days must be a positive integer")
+        if self._index < days:
+            return []
+        member_indices = np.flatnonzero(self._view.members[self._index])
+        if len(member_indices) == 0:
+            return []
+        previous = self._view.close[self._index - days, member_indices]
+        current = self._view.close[self._index, member_indices]
+        valid = ~np.isnan(previous) & ~np.isnan(current) & (previous != 0.0)
+        returns = np.full(len(member_indices), np.nan, dtype=np.float64)
+        returns[valid] = current[valid] / previous[valid] - 1.0
+        valid_indices = np.flatnonzero(valid)
+        ordered = valid_indices[np.argsort(
+            -returns[valid_indices] if descending else returns[valid_indices],
+            kind="stable",
+        )]
+        return [str(self._view.symbols[member_indices[pos]]) for pos in ordered]
+
+    def universe(self) -> list[str]:
+        """Tradable universe members on the current date (PIT)."""
+        return [
+            str(self._view.symbols[index])
+            for index in np.flatnonzero(self._view.members[self._index])
+        ]
 
 
 class _StrategyContext:
@@ -213,17 +282,30 @@ class _StrategyContext:
         self._target: dict[str, float] = {}
         self._touched = False
         self._logs = logs
+        self._tradable: set[str] | None = None
 
-    def _begin_bar(self, current_date: date, current_weights: dict[str, float]) -> None:
+    def _begin_bar(
+        self,
+        current_date: date,
+        current_weights: dict[str, float],
+        tradable: set[str] | None = None,
+    ) -> None:
         self.current_date = current_date
         self.current_weights = MappingProxyType(dict(current_weights))
         self._target = dict(current_weights)
         self._touched = False
+        # PIT pools pass the day's member set; targets must stay inside it.
+        self._tradable = tradable
+
+    def _require_tradable(self, symbol: str) -> None:
+        if self._tradable is not None and symbol not in self._tradable:
+            raise ValueError(f"{symbol} is not a tradable member on this date")
 
     def target_percent(self, symbol: str, weight: float) -> None:
         normalized = str(symbol).strip().upper()
         if normalized not in self.symbols:
             raise ValueError(f"symbol is outside the requested universe: {symbol}")
+        self._require_tradable(normalized)
         numeric_weight = float(weight)
         if not math.isfinite(numeric_weight) or numeric_weight < 0 or numeric_weight > 1:
             raise ValueError("target weight must be between 0 and 1")
@@ -242,6 +324,8 @@ class _StrategyContext:
             return
         if len(set(selected)) != len(selected) or any(symbol not in self.symbols for symbol in selected):
             raise ValueError("target_equal symbols must be unique members of the requested universe")
+        for symbol in selected:
+            self._require_tradable(symbol)
         weight = 1.0 / len(selected)
         self._target = {symbol: weight for symbol in selected}
         self._touched = True
@@ -282,20 +366,63 @@ _SAFE_BUILTINS = {
 }
 
 
+def view_from_bars(bars: Sequence[PriceBar], symbols: Sequence[str]) -> MarketView:
+    """Build a vectorized view from legacy PriceBar input (small universes only).
+
+    Used by the compatibility path for callers that already hold in-memory
+    bars; large universes must use a prebuilt MarketBundle.
+    """
+    normalized_symbols = tuple(str(symbol).strip().upper() for symbol in symbols)
+    if not normalized_symbols or len(set(normalized_symbols)) != len(normalized_symbols):
+        raise ValueError("symbols must be non-empty and unique")
+    symbol_index = {symbol: i for i, symbol in enumerate(normalized_symbols)}
+    dates_by_bar = sorted({bar.date for bar in bars})
+    dates = np.array([value.toordinal() for value in dates_by_bar], dtype=np.int32)
+    open_matrix = np.full((len(dates), len(normalized_symbols)), np.nan, dtype=np.float64)
+    close_matrix = np.full_like(open_matrix, np.nan)
+    members = np.zeros_like(open_matrix, dtype=bool)
+    date_index = {value: i for i, value in enumerate(dates_by_bar)}
+    for bar in bars:
+        symbol = str(bar.symbol).strip().upper()
+        if symbol not in symbol_index:
+            continue
+        row = date_index[bar.date]
+        col = symbol_index[symbol]
+        open_matrix[row, col] = float(bar.open)
+        close_matrix[row, col] = float(bar.close)
+        members[row, col] = True
+    if any(not members[:, col].any() for col in range(len(normalized_symbols))):
+        raise ValueError("every script symbol requires price bars")
+    return MarketView(
+        dates=dates,
+        symbols=np.array(normalized_symbols, dtype=object),
+        open_matrix=open_matrix,
+        close_matrix=close_matrix,
+        members=members,
+        meta={},
+    )
+
+
 def execute_strategy_script(
     source: str,
     *,
-    bars: Sequence[PriceBar],
-    symbols: Sequence[str],
+    view: MarketView | None = None,
+    bars: Sequence[PriceBar] | None = None,
+    symbols: Sequence[str] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
 ) -> StrategyScriptResult:
     check = validate_strategy_script(source)
-    normalized_symbols, calendar, by_symbol = _normalize_history(bars, symbols)
+    if view is None:
+        if bars is None or symbols is None:
+            raise ValueError("either a market view or bars+symbols are required")
+        view = view_from_bars(bars, symbols)
+    normalized_symbols = tuple(str(symbol) for symbol in view.symbols)
+    calendar = view.calendar
     namespace: dict[str, Any] = {
         "__builtins__": _SAFE_BUILTINS,
         "math": math,
-        "statistics": statistics,
+        "statistics": _SafeStatistics(),
     }
     try:
         exec(compile(source, "strategy.py", "exec"), namespace, namespace)
@@ -307,19 +434,21 @@ def execute_strategy_script(
             raise ScriptExecutionError("on_bar must be callable")
         logs: list[str] = []
         context = _StrategyContext(normalized_symbols, logs)
-        data = _StrategyData(normalized_symbols, calendar, by_symbol)
+        data = _StrategyData(view)
         if initialize is not None:
             initialize(context)
 
         allocations: list[TargetAllocation] = []
         current_target: dict[str, float] = {}
+        pit_pool = str(view.meta.get("pool") or "") in ("csi800", "all_a")
         for index, current_date in enumerate(calendar):
             if start_date is not None and current_date < start_date:
                 continue
             if end_date is not None and current_date > end_date:
                 break
             data._index = index
-            context._begin_bar(current_date, current_target)
+            tradable = set(view.members_on(index)) if pit_pool else None
+            context._begin_bar(current_date, current_target, tradable)
             on_bar(context, data)
             if context._touched and context._target != current_target:
                 current_target = dict(sorted(context._target.items()))

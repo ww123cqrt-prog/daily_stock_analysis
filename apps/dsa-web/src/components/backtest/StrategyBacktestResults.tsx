@@ -43,6 +43,25 @@ function recordText(record: Record<string, unknown>, key: string): string {
   return value == null || value === '' ? '--' : String(value);
 }
 
+const INDEX_LABELS: Record<string, string> = {
+  SH000300: '沪深300',
+  SH000905: '中证500',
+  SH000906: '中证800',
+  SZ399006: '创业板指',
+  SH000688: '科创50',
+};
+
+const POOL_LABELS: Record<string, { zh: string; en: string }> = {
+  etf: { zh: 'ETF 池', en: 'ETF pool' },
+  csi800: { zh: 'CSI800', en: 'CSI800' },
+  all_a: { zh: '全 A', en: 'All A-shares' },
+  custom: { zh: '自选', en: 'Custom' },
+};
+
+function comparisonLabel(symbol: string, name?: string): string {
+  return name ?? INDEX_LABELS[symbol] ?? symbol.replace(/^strategy:/, '');
+}
+
 const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle }) => {
   const zh = language === 'zh';
   if (!report) {
@@ -59,31 +78,49 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
   }
 
   const metrics = report.metrics;
-  const labels = zh
+  const primaryMetrics = zh
     ? [
         ['交易策略总收益', pct(metrics.totalReturnPct), tone(metrics.totalReturnPct)],
+        ['年化收益', pct(metrics.annualizedReturnPct), tone(metrics.annualizedReturnPct)],
+        ['最大回撤', pct(metrics.maxDrawdownPct), tone(metrics.maxDrawdownPct)],
+        ['Sharpe', number(metrics.sharpeRatio), tone(metrics.sharpeRatio)],
+      ]
+    : [
+        ['Total return', pct(metrics.totalReturnPct), tone(metrics.totalReturnPct)],
+        ['Annualized return', pct(metrics.annualizedReturnPct), tone(metrics.annualizedReturnPct)],
+        ['Max drawdown', pct(metrics.maxDrawdownPct), tone(metrics.maxDrawdownPct)],
+        ['Sharpe', number(metrics.sharpeRatio), tone(metrics.sharpeRatio)],
+      ];
+  const secondaryMetrics = zh
+    ? [
         ['基准总收益', pct(metrics.benchmarkReturnPct), tone(metrics.benchmarkReturnPct)],
         ['Alpha（年化）', pct(metrics.alphaPct), tone(metrics.alphaPct)],
         ['Beta', number(metrics.beta), 'text-foreground'],
-        ['Sharpe', number(metrics.sharpeRatio), tone(metrics.sharpeRatio)],
-        ['最大回撤', pct(metrics.maxDrawdownPct), tone(metrics.maxDrawdownPct)],
-        ['交易策略年化收益', pct(metrics.annualizedReturnPct), tone(metrics.annualizedReturnPct)],
         ['年化波动', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
         ['日胜率', pct(metrics.winRatePct), tone(metrics.winRatePct - 50)],
         ['交易次数', String(metrics.tradeCount), 'text-foreground'],
       ]
     : [
-        ['Strategy return', pct(metrics.totalReturnPct), tone(metrics.totalReturnPct)],
         ['Benchmark return', pct(metrics.benchmarkReturnPct), tone(metrics.benchmarkReturnPct)],
         ['Annualized alpha', pct(metrics.alphaPct), tone(metrics.alphaPct)],
         ['Beta', number(metrics.beta), 'text-foreground'],
-        ['Sharpe', number(metrics.sharpeRatio), tone(metrics.sharpeRatio)],
-        ['Maximum drawdown', pct(metrics.maxDrawdownPct), tone(metrics.maxDrawdownPct)],
-        ['Annualized return', pct(metrics.annualizedReturnPct), tone(metrics.annualizedReturnPct)],
         ['Annualized volatility', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
         ['Daily win rate', pct(metrics.winRatePct), tone(metrics.winRatePct - 50)],
         ['Trades', String(metrics.tradeCount), 'text-foreground'],
       ];
+  const comparisons = report.comparisons ?? {};
+  const comparisonEntries = Object.entries(comparisons);
+  const compareColors = ['#0ea5e9', '#f59e0b', '#10b981', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6'];
+  const chartData = report.equityCurve.map((point, index) => {
+    const row: Record<string, unknown> = { ...point };
+    for (const [symbol, comparison] of comparisonEntries) {
+      const equity = comparison.equity?.[index];
+      row[`cmp_${symbol}`] = equity == null || !Number.isFinite(equity)
+        ? null
+        : (equity / metrics.initialCapital - 1) * 100;
+    }
+    return row;
+  });
 
   return (
     <div className="space-y-4">
@@ -96,7 +133,14 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
             </h2>
           </div>
           <p className="mt-1 text-xs text-secondary-text">
-            {report.symbols.join(' / ')} · {report.period ? `${report.period.startDate} - ${report.period.endDate}` : '--'}
+            {(() => {
+              const poolKey = String(report.dataQuality.pool ?? '');
+              const poolLabel = POOL_LABELS[poolKey] ? (zh ? POOL_LABELS[poolKey].zh : POOL_LABELS[poolKey].en) : null;
+              const poolText = poolLabel
+                ? `${poolLabel}（${report.dataQuality.symbolCount ?? report.symbols.length} 只）`
+                : report.symbols.join(' / ');
+              return `${poolText} · ${report.period ? `${report.period.startDate} - ${report.period.endDate}` : '--'}`;
+            })()}
           </p>
         </div>
         <span className="rounded-md border border-border/70 bg-card/60 px-2 py-1 font-mono text-xs text-secondary-text">
@@ -104,23 +148,71 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
         </span>
       </div>
 
-      <section className="grid grid-cols-2 gap-px overflow-hidden border border-border/70 bg-border/70 sm:grid-cols-3 xl:grid-cols-5">
-        {labels.map(([label, value, className]) => (
-          <div key={label} className="min-h-20 bg-card px-3 py-3">
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {primaryMetrics.map(([label, value, className]) => (
+          <div key={label} className="rounded-lg border border-border/70 bg-card px-4 py-3">
             <p className="text-xs text-secondary-text">{label}</p>
-            <p className={`mt-2 text-lg font-semibold tabular-nums ${className}`}>{value}</p>
+            <p className={`mt-1.5 text-2xl font-semibold tabular-nums leading-none ${className}`}>{value}</p>
           </div>
         ))}
       </section>
 
+      <section className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-border/70 bg-border/70 sm:grid-cols-6">
+        {secondaryMetrics.map(([label, value, className]) => (
+          <div key={label} className="bg-card px-3 py-2.5">
+            <p className="text-[11px] text-secondary-text">{label}</p>
+            <p className={`mt-1 text-sm font-medium tabular-nums ${className}`}>{value}</p>
+          </div>
+        ))}
+      </section>
+
+      {comparisonEntries.length ? (
+        <section className="border border-border/70 bg-card/35 p-3">
+          <h3 className="mb-3 text-sm font-medium text-foreground">
+            {zh ? '对比基准' : 'Comparison benchmarks'}
+          </h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-left text-secondary-text">
+                <tr>
+                  <th className="py-1 pr-3 font-medium">{zh ? '基准' : 'Benchmark'}</th>
+                  <th className="py-1 pr-3 text-right font-medium">{zh ? '区间收益' : 'Return'}</th>
+                  <th className="py-1 pr-3 text-right font-medium">{zh ? '策略超额' : 'Excess'}</th>
+                  <th className="py-1 text-right font-medium">{zh ? '最大回撤' : 'Max drawdown'}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {comparisonEntries.map(([symbol, comparison]) => {
+                  const excess = metrics.totalReturnPct - comparison.totalReturnPct;
+                  return (
+                    <tr key={symbol} className="border-t border-border/50">
+                      <td className="py-2 pr-3 font-mono text-foreground">{comparisonLabel(symbol, comparison.name)}</td>
+                      <td className={`py-2 pr-3 text-right font-mono tabular-nums ${tone(comparison.totalReturnPct)}`}>
+                        {pct(comparison.totalReturnPct)}
+                      </td>
+                      <td className={`py-2 pr-3 text-right font-mono tabular-nums ${tone(excess)}`}>
+                        {excess > 0 ? '+' : ''}{pct(excess)}
+                      </td>
+                      <td className="py-2 text-right font-mono tabular-nums text-secondary-text">
+                        {pct(comparison.maxDrawdownPct)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+
       {report.equityCurve.length ? (
         <section className="border border-border/70 bg-card/35 p-3">
           <h3 className="mb-3 text-sm font-medium text-foreground">
-            {zh ? '交易策略与基准净值' : 'Trading strategy and benchmark equity'}
+            {zh ? '交易策略与对比基准净值' : 'Trading strategy and comparison equity'}
           </h3>
           <div className="h-72 min-w-0" data-testid="strategy-equity-chart">
             <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 640, height: 288 }}>
-              <LineChart data={report.equityCurve} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+              <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.18)" />
                 <XAxis dataKey="date" minTickGap={42} tick={{ fontSize: 10 }} />
                 <YAxis tickFormatter={(value: number) => `${value.toFixed(0)}%`} tick={{ fontSize: 10 }} />
@@ -128,6 +220,17 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
                 <Legend />
                 <Line type="monotone" dataKey="strategyReturnPct" name={zh ? '交易策略' : 'Trading strategy'} stroke="#dc2626" strokeWidth={2} dot={false} />
                 <Line type="monotone" dataKey="benchmarkReturnPct" name={zh ? '基准' : 'Benchmark'} stroke="#2563eb" strokeWidth={1.8} dot={false} />
+                {comparisonEntries.map(([symbol, comparison], index) => (
+                  <Line
+                    key={symbol}
+                    type="monotone"
+                    dataKey={`cmp_${symbol}`}
+                    name={comparisonLabel(symbol, comparison.name)}
+                    stroke={compareColors[index % compareColors.length]}
+                    strokeWidth={1.5}
+                    dot={false}
+                  />
+                ))}
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -152,6 +255,20 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
         </section>
       ) : null}
 
+      {(report.comparisonFailures ?? []).length ? (
+        <section className="space-y-2">
+          {(report.comparisonFailures ?? []).map(failure => (
+            <div key={failure.name} className="flex items-start gap-2 border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-xs text-rose-600">
+              <AlertTriangle className="mt-0.5 h-4 w-4 flex-none" />
+              <span>
+                {zh ? `比较策略「${failure.name}」未产出结果` : `Comparison strategy "${failure.name}" produced no result`}
+                {failure.error ? `：${failure.error}` : ''}
+              </span>
+            </div>
+          ))}
+        </section>
+      ) : null}
+
       {report.logs.length || Object.keys(report.scriptCheck).length ? (
         <section className="border border-border/70 bg-[#10151c] text-slate-200">
           <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
@@ -167,7 +284,7 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
       <section>
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-medium text-foreground">{zh ? '成交记录' : 'Trades'}</h3>
-          <span className="text-xs text-secondary-text">{zh ? `累计成本 ${money(metrics.totalCost, language)}` : `Total cost ${money(metrics.totalCost, language)}`}</span>
+          <span className="text-xs text-secondary-text">{zh ? `累计费用 ${money(metrics.totalCost, language)}` : `Total fees ${money(metrics.totalCost, language)}`}</span>
         </div>
         {report.trades.length ? (
           <div className="max-h-80 overflow-auto border border-border/70">

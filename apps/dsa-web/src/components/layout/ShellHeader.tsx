@@ -14,7 +14,9 @@ type ShellHeaderProps = {
 
 const TITLES: Record<string, { title: UiTextKey; description: UiTextKey }> = {
   '/': { title: 'layout.route.home.title', description: 'layout.route.home.description' },
+  '/data': { title: 'layout.route.data.title', description: 'layout.route.data.description' },
   '/research': { title: 'layout.route.research.title', description: 'layout.route.research.description' },
+  '/stock-analysis': { title: 'layout.route.stockAnalysis.title', description: 'layout.route.stockAnalysis.description' },
   '/workflow': { title: 'layout.route.workflow.title', description: 'layout.route.workflow.description' },
   '/chat': { title: 'layout.route.chat.title', description: 'layout.route.chat.description' },
   '/portfolio': { title: 'layout.route.portfolio.title', description: 'layout.route.portfolio.description' },

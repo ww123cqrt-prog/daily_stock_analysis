@@ -41,6 +41,11 @@ from robust_evaluation import (  # noqa: E402
     window_stability,
 )
 from robust_market_data import build_market_regimes  # noqa: E402
+from quant_data_service_client import (  # noqa: E402
+    DEFAULT_QUANT_DATA_SERVICE_URL,
+    QuantDataIdentity,
+    QuantDataServiceClient,
+)
 from robust_signal_dataset import (  # noqa: E402
     build_signal_dataset_config,
     build_signal_handler_config,
@@ -385,21 +390,12 @@ def build_context(
         "config_hash": _sha256_file(config_path),
         "git_commit": _git_commit(repo_root),
         "git_clean": _git_clean(repo_root),
-        "data_manifest_hash": provider_status.get("data_manifest_sha256"),
+        "data_identity_sha256": provider_status.get("data_identity_sha256"),
+        "data_identities": provider_status.get("data_identities"),
         "provider_uri": str(provider),
         "provider_tree_sha256": provider_status.get("provider_tree_sha256"),
         "provider_key": provider_status.get("provider_key"),
-        "membership_intervals_sha256": provider_status.get(
-            "membership_intervals_sha256"
-        ),
-        "quality_report_id": provider_status.get("quality_report_id"),
-        "quality_evidence_artifact_name": provider_status.get(
-            "quality_evidence_artifact_name"
-        ),
-        "quality_evidence_sha256": provider_status.get(
-            "quality_evidence_sha256"
-        ),
-        "cleaned_provider_identity": provider_status.get(
+        "qlib_provider_identity": provider_status.get(
             "cleaned_provider_identity"
         ),
         "robust_data_contract_version": ROBUST_DATA_CONTRACT_VERSION,
@@ -407,66 +403,101 @@ def build_context(
         "locked_confirmation_start": str(LOCKED_CONFIRMATION_START.date()),
     }
     if str(config.get("fundamentals", {}).get("research_round")) == "single_extension":
-        payload.update(_load_fundamental_source_context(config, quant_data_dir))
+        payload.update(
+            _load_fundamental_source_context(
+                config, provider_status.get("data_identities") or {}
+            )
+        )
     payload["context_hash"] = _immutable_context_hash(payload)
     return payload
 
 
 def _load_fundamental_source_context(
-    config: Mapping[str, Any], quant_data_dir: Path
+    config: Mapping[str, Any],
+    data_identities: Mapping[str, Any],
+    *,
+    client: QuantDataServiceClient | None = None,
 ) -> dict[str, Any]:
-    relative_root = config.get("paths", {}).get("fundamental_features")
-    if not relative_root:
-        raise ValueError("fundamental feature path is not configured")
-    root = (Path(quant_data_dir) / str(relative_root)).resolve()
-    source_path = root / "FUNDAMENTAL_SOURCE.json"
-    source = _read_json(source_path)
+    identity = QuantDataIdentity.from_mapping(
+        data_identities.get("ashare_fundamentals_pit")
+    )
+    if identity.dataset_id != "ashare_fundamentals_pit":
+        raise ValueError("fundamental dataset identity is invalid")
+    owns_client = client is None
+    service = client or QuantDataServiceClient(
+        base_url=os.getenv(
+            "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
+        )
+    )
+    try:
+        description = service.describe_dataset(
+            "ashare_fundamentals_pit", expected_identity=identity
+        )
+        source_artifact = service.get_artifact(
+            "ashare_fundamentals_pit",
+            "source_manifest",
+            expected_identity=identity,
+        )
+    finally:
+        if owns_client:
+            service.close()
+    try:
+        source = json.loads(source_artifact.content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("fundamental source manifest is invalid") from exc
+    if not isinstance(source, Mapping):
+        raise ValueError("fundamental source manifest must be a mapping")
     if source.get("status") != "pass":
-        raise ValueError("FUNDAMENTAL_SOURCE.json must have status=pass")
+        raise ValueError("fundamental source manifest must have status=pass")
     fundamentals = config.get("fundamentals", {})
     selected_source = str(source.get("selected_source") or "")
     if selected_source != str(fundamentals.get("selected_source") or ""):
         raise ValueError("fundamental selected source does not match the frozen config")
+    described_source = description.payload.get("source")
+    if (
+        not isinstance(described_source, Mapping)
+        or str(described_source.get("provider") or "") != selected_source
+    ):
+        raise ValueError("fundamental service source does not match the frozen config")
     mixed_sources = source.get("mixed_sources")
     if mixed_sources is not False or bool(fundamentals.get("allow_mixed_sources")):
         raise ValueError("fundamental research requires one unmixed source")
-    data_end = pd.Timestamp(source.get("data_range", {}).get("end")).normalize()
-    if pd.isna(data_end) or data_end >= LOCKED_CONFIRMATION_START:
-        raise ValueError("Goal 1 fundamental source attempted to expose 2026 data")
+    described_range = description.payload.get("date_range")
+    date_end_values = [
+        identity.latest_trade_date,
+        source.get("data_range", {}).get("end")
+        if isinstance(source.get("data_range"), Mapping)
+        else None,
+        described_range.get("end") if isinstance(described_range, Mapping) else None,
+    ]
+    for value in date_end_values:
+        data_end = pd.to_datetime(value, errors="coerce")
+        if pd.isna(data_end) or pd.Timestamp(data_end).normalize() >= LOCKED_CONFIRMATION_START:
+            raise ValueError("Goal 1 fundamental source attempted to expose 2026 data")
     artifacts = source.get("artifacts")
-    if not isinstance(artifacts, dict) or not artifacts:
+    if not isinstance(artifacts, Mapping) or not artifacts:
         raise ValueError("fundamental source does not declare artifacts")
-    verified: dict[str, str] = {}
-    for relative, expected_hash in sorted(artifacts.items()):
-        path = (root / str(relative)).resolve()
-        if not path.is_relative_to(root) or not path.is_file():
-            raise ValueError(f"fundamental artifact is unavailable: {relative}")
-        actual_hash = _sha256_file(path)
-        if actual_hash != str(expected_hash):
-            raise ValueError(f"fundamental artifact hash mismatch: {relative}")
-        verified[str(relative)] = actual_hash
+    verified = {str(name): str(digest) for name, digest in sorted(artifacts.items())}
+    if any(not _is_sha256(digest) for digest in verified.values()):
+        raise ValueError("fundamental source declares an invalid artifact hash")
     artifact_set_hash = _sha256_bytes(
         json.dumps(verified, sort_keys=True, separators=(",", ":")).encode("utf-8")
     )
     return {
-        "fundamental_features_path": str(root),
+        "fundamental_dataset_id": identity.dataset_id,
         "fundamental_source": selected_source,
-        "fundamental_source_manifest_hash": _sha256_file(source_path),
+        "fundamental_source_manifest_hash": _sha256_bytes(
+            source_artifact.content
+        ),
         "fundamental_artifacts_hash": artifact_set_hash,
     }
 
 
 def _dataset_feature_options(
-    config: Mapping[str, Any], signal: Mapping[str, Any], quant_data_dir: Path
+    config: Mapping[str, Any], signal: Mapping[str, Any]
 ) -> dict[str, Any]:
     family = config["feature_families"][str(signal["feature_family"])]
     external_prefixes = list(family.get("external_prefixes") or [])
-    external_path: Path | None = None
-    if external_prefixes:
-        configured = config.get("paths", {}).get("fundamental_features")
-        if not configured:
-            raise ValueError("external feature family requires a configured data path")
-        external_path = Path(quant_data_dir) / str(configured)
     return {
         "feature_prefixes": list(
             family.get("handler_prefixes", family.get("prefixes")) or []
@@ -474,7 +505,6 @@ def _dataset_feature_options(
         "include_handler_features": bool(
             family.get("include_handler_features", True)
         ),
-        "external_features_path": external_path,
         "external_feature_prefixes": external_prefixes,
     }
 
@@ -1113,7 +1143,10 @@ class QlibJobRunner:
         quant_data_dir: Path,
         run_dir: Path,
         context_hash: str,
+        data_identity_sha256: str,
+        data_identities: Mapping[str, Any],
         mlflow_enabled: bool,
+        quant_data_client: QuantDataServiceClient | None = None,
     ) -> None:
         init_qlib_workflow(provider_uri=provider, kernels=8)
         self.config = config
@@ -1121,7 +1154,19 @@ class QlibJobRunner:
         self.quant_data_dir = quant_data_dir
         self.run_dir = run_dir
         self.context_hash = context_hash
+        self.data_identity_sha256 = data_identity_sha256
         self.mlflow_enabled = mlflow_enabled
+        self._data_identities = {
+            dataset_id: QuantDataIdentity.from_mapping(data_identities.get(dataset_id))
+            for dataset_id in ("robust_reference", "ashare_fundamentals_pit")
+        }
+        self._quant_data_client = quant_data_client or QuantDataServiceClient(
+            base_url=os.getenv(
+                "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
+            )
+        )
+        self._industry_intervals: pd.DataFrame | None = None
+        self._fundamental_year_frames: dict[int, pd.DataFrame] = {}
         self.calendar = _calendar(provider)
         self._cached_key: tuple[str, str, int] | None = None
         self._cached_dataset: Any = None
@@ -1130,6 +1175,52 @@ class QlibJobRunner:
         self._cached_benchmark: pd.Series | None = None
         self._cached_market_states: pd.Series | None = None
         self._market_states_by_end: dict[pd.Timestamp, pd.Series] = {}
+
+    def _load_industry_intervals(self) -> pd.DataFrame:
+        if self._industry_intervals is None:
+            result = self._quant_data_client.get_artifact(
+                "robust_reference",
+                "industry_intervals",
+                expected_identity=self._data_identities["robust_reference"],
+            )
+            try:
+                self._industry_intervals = pd.read_parquet(io.BytesIO(result.content))
+            except (OSError, ValueError) as exc:
+                raise ValueError("industry interval artifact is invalid") from exc
+        return self._industry_intervals
+
+    def _load_fundamental_features(
+        self, start_date: Any, end_date: Any
+    ) -> pd.DataFrame:
+        start = pd.Timestamp(start_date).normalize()
+        end = pd.Timestamp(end_date).normalize()
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError("fundamental feature date range is invalid")
+        if end >= LOCKED_CONFIRMATION_START:
+            raise ValueError("Goal 1 fundamental features attempted to expose 2026 data")
+        identity = self._data_identities["ashare_fundamentals_pit"]
+        for year in range(start.year, end.year + 1):
+            if year in self._fundamental_year_frames:
+                continue
+            year_start = pd.Timestamp(year=year, month=1, day=1)
+            year_end = pd.Timestamp(year=year, month=12, day=31)
+            if (year_end - year_start).days > 365:
+                raise ValueError("fundamental service query exceeds 366 days")
+            result = self._quant_data_client.query_partitioned_artifact(
+                "ashare_fundamentals_pit",
+                "daily",
+                start=str(year_start.date()),
+                end=str(year_end.date()),
+                expected_identity=identity,
+            )
+            self._fundamental_year_frames[year] = result.frame.copy()
+        return pd.concat(
+            [
+                self._fundamental_year_frames[year]
+                for year in range(start.year, end.year + 1)
+            ],
+            ignore_index=True,
+        )
 
     def _signal(self, signal_id: str) -> Mapping[str, Any]:
         return next(item for item in self.config["signals"] if item["id"] == signal_id)
@@ -1193,9 +1284,7 @@ class QlibJobRunner:
                 self._cached_market_states.copy(),
                 split,
             )
-        feature_options = _dataset_feature_options(
-            self.config, signal, self.quant_data_dir
-        )
+        feature_options = _dataset_feature_options(self.config, signal)
         shared_key = (
             job.phase,
             job.quarter,
@@ -1260,11 +1349,21 @@ class QlibJobRunner:
 
         benchmark = self._cached_benchmark.copy()
         market_states = self._cached_market_states.copy()
+        industry_intervals = (
+            self._load_industry_intervals()
+            if str(signal["normalization_scope"]) == "industry"
+            else None
+        )
+        external_features = (
+            self._load_fundamental_features(split.train_start, split.test_end)
+            if feature_options["external_feature_prefixes"]
+            else None
+        )
         dataset_config = build_signal_dataset_config(
             split=split,
             signal=signal,
-            industry_intervals_path=self.quant_data_dir
-            / str(self.config["paths"]["industry_intervals"]),
+            industry_intervals=industry_intervals,
+            external_features=external_features,
             benchmark_returns={str(index.date()): float(value) for index, value in benchmark.items()},
             market_states={
                 str(index.date()): str(value)
@@ -1294,6 +1393,13 @@ class QlibJobRunner:
             uri=f"file://{mlruns_root()}",
         ):
             yield R.get_recorder()
+
+    def _log_mlflow_data_identity(self, active_run: Any) -> None:
+        context_path = self.run_dir / "context.json"
+        if not _is_sha256(self.data_identity_sha256) or not context_path.is_file():
+            raise ValueError("MLflow data identity context is unavailable")
+        active_run.log_params(data_identity_sha256=self.data_identity_sha256)
+        active_run.log_artifact(str(context_path), artifact_path="provenance")
 
     def __call__(self, job: SignalJob) -> Mapping[str, Any]:
         dataset, benchmark, market_states, split = self._dataset(job)
@@ -1343,6 +1449,7 @@ class QlibJobRunner:
             valid_rank_ics = [value for value in rank_ics.values() if value is not None]
             mlflow_run_id = None
             if active_run is not None:
+                self._log_mlflow_data_identity(active_run)
                 active_run.log_params(
                     **{
                         "phase": job.phase,
@@ -1748,14 +1855,11 @@ def _factor_contract(
         "execution_start": "T_plus_1_open",
         "normalization_scope": signal["normalization_scope"],
         "target": signal["target"],
-        "data_source": "verified_local_qlib_provider",
+        "data_source": "quant_data_backend_qlib_provider",
         "provider_tree_sha256": context.get("provider_tree_sha256"),
-        "membership_intervals_sha256": context.get(
-            "membership_intervals_sha256"
-        ),
-        "quality_report_id": context.get("quality_report_id"),
-        "quality_evidence_sha256": context.get("quality_evidence_sha256"),
-        "cleaned_provider_identity": context.get("cleaned_provider_identity"),
+        "data_identity_sha256": context.get("data_identity_sha256"),
+        "data_identities": context.get("data_identities"),
+        "qlib_provider_identity": context.get("qlib_provider_identity"),
         "fundamental_source": context.get("fundamental_source"),
         "fundamental_source_manifest_hash": context.get(
             "fundamental_source_manifest_hash"
@@ -1847,7 +1951,7 @@ def _status_payload(
         "expected_count": int(expected_count),
         "config_hash": context.get("config_hash"),
         "git_commit": context.get("git_commit"),
-        "data_manifest_hash": context.get("data_manifest_hash"),
+        "data_identity_sha256": context.get("data_identity_sha256"),
         "context_hash": context.get("context_hash"),
         "provider_tree_sha256": context.get("provider_tree_sha256"),
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1995,6 +2099,8 @@ def run_research(
         quant_data_dir=quant_data_dir,
         run_dir=run_dir,
         context_hash=str(context["context_hash"]),
+        data_identity_sha256=str(context.get("data_identity_sha256") or ""),
+        data_identities=context.get("data_identities") or {},
         mlflow_enabled=mlflow_enabled and not smoke,
     )
     pause_path = run_dir / "pause.request.json"

@@ -967,38 +967,6 @@ def _append_reports_out_dir(command: List[str]) -> None:
 
 
 def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
-    data_quality_artifact_patterns = [
-        str(REPORTS_ROOT / "data_quality_report_latest.json"),
-        str(REPORTS_ROOT / "data_quality_report_latest.md"),
-        str(REPORTS_ROOT / "data_quality_report_*.json"),
-        str(REPORTS_ROOT / "data_quality_report_*.md"),
-        str(REPORTS_ROOT / "data_quality_sources_*.csv"),
-        str(REPORTS_ROOT / "data_quality_issues_*.csv"),
-        str(REPORTS_ROOT / "data_quality_overlap_*.csv"),
-        str(REPORTS_ROOT / "data_quality_ashare_qfq_summary_*.csv"),
-        str(REPORTS_ROOT / "research_status_latest.json"),
-        str(
-            REPORTS_ROOT
-            / "test_runs"
-            / "data_quality"
-            / "data_quality_report_sampled_latest.json"
-        ),
-        str(
-            REPORTS_ROOT
-            / "test_runs"
-            / "data_quality"
-            / "data_quality_report_sampled_latest.md"
-        ),
-        str(
-            REPORTS_ROOT
-            / "test_runs"
-            / "data_quality"
-            / "research_status_sampled_latest.json"
-        ),
-        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_report_*.json"),
-        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_report_*.md"),
-        str(REPORTS_ROOT / "test_runs" / "data_quality" / "data_quality_*.csv"),
-    ]
     shared_training_artifact_patterns = [
         str(REPORTS_ROOT / ".training-runner-resource"),
         str(REPORTS_ROOT / "latest_training_result.json"),
@@ -1143,13 +1111,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def add_index_benchmark(params: Mapping[str, Any]) -> List[str]:
         return _script_command("add_index_benchmark.py") + ["--dry-run"]
-
-    def report_data_quality(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("report_data_quality.py")
-        _append_reports_out_dir(command)
-        _append_value(command, params, "overlap_sample", "--overlap-sample")
-        _append_value(command, params, "merged_sample", "--merged-sample")
-        return command
 
     def report_data_anomalies(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_data_anomalies.py")
@@ -1503,7 +1464,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "artifact_patterns": [
                 str(REPORTS_ROOT / "daily_update_summary_latest.json"),
                 str(REPORTS_ROOT / "daily_update_summary_*.json"),
-                *data_quality_artifact_patterns,
             ],
         },
         "download_eastmoney": {
@@ -1664,12 +1624,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             "label": "预演旧兼容 benchmark",
             "command": add_index_benchmark,
             "allowed_params": set(),
-        },
-        "report_data_quality": {
-            "label": "生成数据质量报告",
-            "command": report_data_quality,
-            "allowed_params": {"overlap_sample", "merged_sample"},
-            "artifact_patterns": list(data_quality_artifact_patterns),
         },
         "report_data_anomalies": {
             "label": "生成异常股票和清洗策略",

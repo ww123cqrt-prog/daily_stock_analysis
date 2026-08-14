@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import random
 import logging
 from datetime import date, datetime, timedelta
 import hashlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, select
@@ -19,7 +21,9 @@ from src.core.strategy_backtest import (
     StrategyBacktestConfig,
     TargetAllocation,
     run_portfolio_backtest,
+    run_portfolio_backtest_view,
 )
+from src.services.script_universe_loader import load_benchmark_series, load_market_view
 from src.core.strategy_signals import (
     build_buy_and_hold_allocations,
     build_dual_moving_average_allocations,
@@ -181,6 +185,8 @@ class BacktestService:
             "provider": price_data.provider,
             "latest_trade_date": price_data.latest_trade_date,
             "manifest_sha256": price_data.manifest_sha256,
+            "content_sha256": price_data.content_sha256,
+            "data_kind": price_data.data_kind,
             "price_bars": len(bars),
             "valid_signals": len(allocations),
         }
@@ -220,34 +226,56 @@ class BacktestService:
         self,
         *,
         script: str,
-        symbols: List[str],
+        pool: str = "etf",
+        symbols: Optional[List[str]] = None,
+        benchmarks: Optional[List[str]] = None,
+        comparison_strategy_ids: Optional[List[str]] = None,
+        comparison_presets: Optional[List[Dict[str, str]]] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         initial_capital: float = 1_000_000.0,
         side_cost_pct: float = 0.0,
         lot_size: int = 100,
     ) -> Dict[str, Any]:
-        """Run a browser-authored DSA Python strategy in the constrained runner."""
+        """Run a browser-authored Python strategy on a universe pool."""
 
         if start_date and end_date and start_date > end_date:
             raise ValueError("start_date cannot be after end_date")
+        if pool == "custom" and not symbols:
+            raise ValueError("custom pool requires symbols")
         config = StrategyBacktestConfig(
             initial_capital=float(initial_capital),
             side_cost_pct=float(side_cost_pct),
             lot_size=int(lot_size),
         )
-        price_data = QuantPriceRepository().load(symbols, end_date=end_date)
-        bars = list(price_data.bars)
+        view, pool_meta = load_market_view(
+            pool,
+            custom_symbols=symbols if pool == "custom" else None,
+            start=start_date.isoformat() if start_date else None,
+            end=end_date.isoformat() if end_date else None,
+        )
+        bundle_dir = Path(str(pool_meta["bundle_dir"]))
         allocations, logs, check = run_script_in_sandbox(
             script,
-            bars=bars,
-            symbols=price_data.symbols,
+            bundle_dir=bundle_dir,
+            start_date=start_date,
+            end_date=end_date,
+            timeout_seconds=30,
+        )
+        benchmark_frames = load_benchmark_series(benchmarks or [])
+        strategy_comparisons, comparison_failures = self._run_strategy_comparisons(
+            strategy_ids=comparison_strategy_ids or [],
+            presets=comparison_presets or [],
+            bundle_dir=bundle_dir,
+            view=view,
+            config=config,
             start_date=start_date,
             end_date=end_date,
         )
         metadata = {
             "strategy_id": "python_script",
             "name": "DSA Python strategy",
+            "pool": pool,
             "asset_scope": "any_symbol_in_a_ready_canonical_qfq_dataset",
             "signal_at": "trading_day_close",
             "execution": "next_common_trading_day_open",
@@ -255,19 +283,28 @@ class BacktestService:
             "script_sha256": hashlib.sha256(script.encode("utf-8")).hexdigest(),
         }
         data_quality = {
-            "dataset_id": price_data.dataset_id,
-            "snapshot_id": price_data.snapshot_id,
-            "price_basis": price_data.price_basis,
-            "provider": price_data.provider,
-            "latest_trade_date": price_data.latest_trade_date,
-            "manifest_sha256": price_data.manifest_sha256,
-            "price_bars": len(bars),
+            "dataset_id": pool_meta.get("dataset_id"),
+            "snapshot_id": pool_meta.get("snapshot_id"),
+            "manifest_sha256": pool_meta.get("manifest_sha256"),
+            "content_sha256": pool_meta.get("content_sha256"),
+            "membership_sha256": pool_meta.get("membership_sha256"),
+            "latest_trade_date": pool_meta.get("latest_trade_date") or None,
+            "etf_snapshot_id": pool_meta.get("etf_snapshot_id"),
+            "etf_manifest_sha256": pool_meta.get("etf_manifest_sha256"),
+            "etf_content_sha256": pool_meta.get("etf_content_sha256"),
+            "etf_latest_trade_date": pool_meta.get("etf_latest_trade_date") or None,
+            "price_basis": "qfq",
+            "provider": "quant_data",
+            "data_kind": "daily_bars",
+            "pool": pool,
+            "symbol_count": pool_meta.get("symbol_count"),
+            "trading_days": pool_meta.get("trading_days"),
             "valid_signals": len(allocations),
         }
         if not allocations:
             report = {
                 **self._empty_dsa_strategy_report(
-                    code=price_data.symbols[0],
+                    code=str(view.symbols[0]) if len(view.symbols) else "UNKNOWN",
                     status="no_executable_signals",
                     initial_capital=config.initial_capital,
                     side_cost_pct=config.side_cost_pct,
@@ -276,21 +313,260 @@ class BacktestService:
                     warning="The script produced no target changes in this date range.",
                 ),
                 "strategy_name": "python_script",
-                "symbols": list(price_data.symbols),
+                "symbols": [str(symbol) for symbol in view.symbols],
                 "strategy": metadata,
             }
         else:
-            report = run_portfolio_backtest(
+            report = run_portfolio_backtest_view(
                 strategy_name="python_script",
                 allocations=allocations,
-                bars=bars,
+                view=view,
                 config=config,
+                benchmarks=benchmark_frames,
+                strategy_comparisons=strategy_comparisons,
             )
             report["strategy"] = metadata
             report["data_quality"] = data_quality
         report["logs"] = logs
         report["script_check"] = check
+        report["comparison_failures"] = comparison_failures
         return report
+
+    def run_script_stability_test(
+        self,
+        *,
+        script: str,
+        pool: str = "etf",
+        symbols: Optional[List[str]] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        initial_capital: float = 1_000_000.0,
+        side_cost_pct: float = 0.0,
+        lot_size: int = 100,
+        min_window_days: int = 252,
+        iterations: int = 20,
+        seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Time-slice stability test: random sub-period backtests.
+
+        Runs the strategy sandbox once over the full range, then backtests
+        the produced signals over N randomly sampled sub-periods (each at
+        least ``min_window_days`` trading days) to measure how evenly the
+        strategy performs across time.
+        """
+        if pool == "custom" and not symbols:
+            raise ValueError("custom pool requires symbols")
+        if iterations < 1 or iterations > 100:
+            raise ValueError("iterations must be between 1 and 100")
+        if min_window_days < 20:
+            raise ValueError("min_window_days must be at least 20 trading days")
+        config = StrategyBacktestConfig(
+            initial_capital=float(initial_capital),
+            side_cost_pct=float(side_cost_pct),
+            lot_size=int(lot_size),
+        )
+        view, pool_meta = load_market_view(
+            pool,
+            custom_symbols=symbols if pool == "custom" else None,
+            start=start_date.isoformat() if start_date else None,
+            end=end_date.isoformat() if end_date else None,
+        )
+        bundle_dir = Path(str(pool_meta["bundle_dir"]))
+        allocations, logs, check = run_script_in_sandbox(
+            script,
+            bundle_dir=bundle_dir,
+            start_date=start_date,
+            end_date=end_date,
+            timeout_seconds=30,
+        )
+        if not allocations:
+            return {
+                "status": "no_executable_signals",
+                "summary": {},
+                "samples": [],
+                "data_quality": {
+                    "dataset_id": pool_meta.get("dataset_id"),
+                    "snapshot_id": pool_meta.get("snapshot_id"),
+                    "pool": pool,
+                },
+                "script_check": check,
+            }
+
+        calendar = list(view.calendar)
+        warmup = 60
+        if len(calendar) <= warmup + min_window_days:
+            raise ValueError(
+                "the universe calendar is too short for the requested window"
+            )
+        rng = random.Random(seed)
+        samples: List[Dict[str, Any]] = []
+        max_window = len(calendar) - warmup
+        for _ in range(iterations):
+            window_len = rng.randint(min_window_days, max_window)
+            start_index = rng.randint(warmup, len(calendar) - window_len)
+            period_start = calendar[start_index]
+            period_end = calendar[start_index + window_len - 1]
+            result = run_portfolio_backtest_view(
+                strategy_name="python_script",
+                allocations=allocations,
+                view=view,
+                config=config,
+                period_start=period_start,
+                period_end=period_end,
+            )
+            metrics = result.get("metrics") or {}
+            if result.get("status") != "completed":
+                continue
+            samples.append(
+                {
+                    "start_date": period_start.isoformat(),
+                    "end_date": period_end.isoformat(),
+                    "trading_days": int(metrics.get("trading_days") or 0),
+                    "total_return_pct": float(metrics.get("total_return_pct") or 0.0),
+                    "max_drawdown_pct": float(metrics.get("max_drawdown_pct") or 0.0),
+                    "benchmark_return_pct": float(metrics.get("benchmark_return_pct") or 0.0),
+                    "trade_count": int(metrics.get("trade_count") or 0),
+                    "exposure_pct": float(metrics.get("exposure_pct") or 0.0),
+                }
+            )
+        if not samples:
+            return {
+                "status": "no_executable_signals",
+                "summary": {},
+                "samples": [],
+                "data_quality": {"pool": pool},
+                "script_check": check,
+            }
+
+        returns = [sample["total_return_pct"] for sample in samples]
+        drawdowns = [sample["max_drawdown_pct"] for sample in samples]
+        returns_sorted = sorted(returns)
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / len(returns)
+        std = variance ** 0.5
+        median = (
+            returns_sorted[len(returns_sorted) // 2]
+            if len(returns_sorted) % 2 == 1
+            else (
+                returns_sorted[len(returns_sorted) // 2 - 1]
+                + returns_sorted[len(returns_sorted) // 2]
+            )
+            / 2.0
+        )
+        summary = {
+            "iterations": len(samples),
+            "win_rate_pct": sum(value > 0 for value in returns) / len(returns) * 100.0,
+            "return_mean_pct": mean,
+            "return_median_pct": median,
+            "return_std_pct": std,
+            "return_best_pct": returns_sorted[-1],
+            "return_worst_pct": returns_sorted[0],
+            "drawdown_mean_pct": sum(drawdowns) / len(drawdowns),
+            "drawdown_worst_pct": min(drawdowns),
+        }
+        return {
+            "status": "completed",
+            "summary": summary,
+            "samples": samples,
+            "data_quality": {
+                "dataset_id": pool_meta.get("dataset_id"),
+                "snapshot_id": pool_meta.get("snapshot_id"),
+                "manifest_sha256": pool_meta.get("manifest_sha256"),
+                "content_sha256": pool_meta.get("content_sha256"),
+                "membership_sha256": pool_meta.get("membership_sha256"),
+                "latest_trade_date": pool_meta.get("latest_trade_date") or None,
+                "etf_snapshot_id": pool_meta.get("etf_snapshot_id"),
+                "etf_manifest_sha256": pool_meta.get("etf_manifest_sha256"),
+                "etf_content_sha256": pool_meta.get("etf_content_sha256"),
+                "etf_latest_trade_date": pool_meta.get("etf_latest_trade_date") or None,
+                "pool": pool,
+                "symbol_count": pool_meta.get("symbol_count"),
+            },
+            "script_check": check,
+            "logs": logs,
+        }
+
+    def _run_strategy_comparisons(
+        self,
+        *,
+        strategy_ids: List[str],
+        presets: List[Dict[str, str]],
+        bundle_dir: Path,
+        view: Any,
+        config: StrategyBacktestConfig,
+        start_date: Optional[date],
+        end_date: Optional[date],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        """Backtest saved or preset strategies on the same universe.
+
+        Each comparison strategy runs in the same sandbox, on the same pool
+        and date range, with the same capital/fee/lot assumptions. Failures
+        are collected and reported (``comparison_failures``) so the UI can
+        show that a selected comparison did not run, instead of silently
+        rendering one fewer curve.
+        """
+        from src.repositories.strategy_assets_repo import get_strategy_assets_repo
+
+        entries: List[Dict[str, str]] = []
+        repo = get_strategy_assets_repo()
+        for strategy_id in strategy_ids[:3]:
+            asset = repo.get_strategy(strategy_id)
+            if asset:
+                entries.append(
+                    {
+                        "name": str(asset.get("name") or "comparison"),
+                        "script": str(asset.get("script") or ""),
+                    }
+                )
+        for preset in presets[:3]:
+            entries.append(
+                {
+                    "name": str(preset.get("name") or "comparison")[:100],
+                    "script": str(preset.get("script") or ""),
+                }
+            )
+
+        results: List[Dict[str, Any]] = []
+        failures: List[Dict[str, str]] = []
+        for entry in entries[:3]:
+            name = entry["name"]
+            script = entry["script"]
+            if not script.strip():
+                failures.append({"name": name, "error": "empty script"})
+                continue
+            try:
+                allocations, _logs, _check = run_script_in_sandbox(
+                    script,
+                    bundle_dir=bundle_dir,
+                    start_date=start_date,
+                    end_date=end_date,
+                    timeout_seconds=30,
+                )
+                if not allocations:
+                    failures.append(
+                        {"name": name, "error": "no target allocations produced"}
+                    )
+                    continue
+                comparison_report = run_portfolio_backtest_view(
+                    strategy_name=name,
+                    allocations=allocations,
+                    view=view,
+                    config=config,
+                )
+                results.append(
+                    {
+                        "name": name,
+                        "report": comparison_report,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "strategy comparison failed for %s", name, exc_info=True
+                )
+                failures.append(
+                    {"name": name, "error": str(exc) or type(exc).__name__}
+                )
+        return results, failures
 
     @staticmethod
     def _dsa_strategy_metadata() -> Dict[str, Any]:

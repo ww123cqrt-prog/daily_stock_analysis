@@ -16,7 +16,6 @@ safety:
 paths:
   report_namespace: robust_signal
   industry_intervals: reference/industry_intervals.parquet
-  fundamental_features: reference/fundamentals
   data_manifest: DATA_MANIFEST.json
   qlib_provider_status: robust_strategy/robust_strategy_status_latest.json
 

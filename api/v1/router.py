@@ -18,6 +18,8 @@ from api.v1.endpoints import (
     analysis,
     auth,
     backtest,
+    backtest_assets,
+    data_status,
     decision_signals,
     etf_momentum_strategy,
     health,
@@ -25,6 +27,7 @@ from api.v1.endpoints import (
     intelligence,
     portfolio,
     quant_jobs,
+    quant_research,
     research_status,
     screening,
     stocks,
@@ -70,6 +73,18 @@ router.include_router(
     backtest.router,
     prefix="/backtest",
     tags=["Backtest"]
+)
+
+router.include_router(
+    backtest_assets.router,
+    prefix="/backtest",
+    tags=["BacktestAssets"]
+)
+
+router.include_router(
+    data_status.router,
+    prefix="/data",
+    tags=["DataStatus"],
 )
 
 router.include_router(
@@ -136,6 +151,12 @@ router.include_router(
     quant_jobs.router,
     prefix="/quant",
     tags=["Quant"]
+)
+
+router.include_router(
+    quant_research.router,
+    prefix="/quant-research",
+    tags=["QuantResearch"]
 )
 
 router.include_router(

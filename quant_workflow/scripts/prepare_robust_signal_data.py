@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -23,6 +25,11 @@ from _mlflow_run_provenance import (  # noqa: E402
     provider_lineages_match,
 )
 from prepare_robust_provider import file_sha256, prepare_runtime_provider  # noqa: E402
+from quant_data_service_client import (  # noqa: E402
+    DEFAULT_QUANT_DATA_SERVICE_URL,
+    QuantDataClientError,
+    QuantDataServiceClient,
+)
 from robust_signal_data_contract import (  # noqa: E402
     ACCEPTANCE_CONTRACT,
     ACCEPTANCE_OWNER,
@@ -44,6 +51,14 @@ def _sanitized_error(exc: Exception) -> str:
 
 DEFAULT_STATUS_PATH = (
     reports_root() / "robust_signal" / "robust_signal_data_readiness_latest.json"
+)
+REQUIRED_DATASETS = (
+    ("ashare_daily_qfq", "qfq"),
+    ("cn_index_daily", "derived"),
+    ("pit_csi800", "not_applicable"),
+    ("robust_reference", "not_applicable"),
+    ("ashare_fundamentals_pit", "not_applicable"),
+    ("qlib_cleaning_plan", "not_applicable"),
 )
 
 
@@ -69,6 +84,10 @@ def _blocked_payload(reason_code: str) -> dict[str, Any]:
             "The cleaned provider does not match the approved quality evidence.",
             "当前 cleaned provider 与完整数据质量证据不一致，请重新验收数据。",
         ),
+        "quant_data_service_unavailable": (
+            "The quant_data data backend is unavailable or rejected a required dataset.",
+            "quant_data 数据后端不可用，或正式数据集未通过服务验收。",
+        ),
     }
     summary, summary_zh = messages[reason_code]
     return {
@@ -89,79 +108,51 @@ def prepare_robust_signal_data(
     quant_data_dir: Path,
     status_path: Path,
     quality_pointer_path: Path | None = None,
+    client: QuantDataServiceClient | None = None,
 ) -> dict[str, Any]:
-    quant_data_dir = Path(quant_data_dir).expanduser().resolve()
+    Path(quant_data_dir).expanduser().resolve()
     status_path = Path(status_path).expanduser().resolve()
-    manifest_path = quant_data_dir / "DATA_MANIFEST.json"
-    intervals_path = (
-        quant_data_dir / "reference" / "pit_csi800" / "membership_intervals.parquet"
+    del quality_pointer_path
+
+    owns_client = client is None
+    service = client or QuantDataServiceClient(
+        base_url=os.getenv(
+            "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
+        )
     )
-    runtime_root = quant_data_dir / "runtime" / "robust_strategy"
-    quality_pointer_path = Path(
-        quality_pointer_path
-        or status_path.parent.parent / "data_quality_report_latest.json"
-    ).expanduser()
-
-    if not manifest_path.is_file():
-        payload = _blocked_payload("data_manifest_missing")
-        return publish_robust_signal_data_readiness(
-            pointer_path=status_path, payload=payload
-        )
-    if not intervals_path.is_file():
-        payload = _blocked_payload("membership_intervals_missing")
-        return publish_robust_signal_data_readiness(
-            pointer_path=status_path, payload=payload
-        )
-
     try:
-        quality = load_verified_cleaned_quality_evidence(quality_pointer_path)
-    except RobustSignalDataBlocked as exc:
-        payload = {
-            "contract_version": CONTRACT_VERSION,
-            "acceptance_owner": ACCEPTANCE_OWNER,
-            "acceptance_contract": ACCEPTANCE_CONTRACT,
-            **exc.to_payload(),
-            "generated_at": datetime.now()
-            .astimezone()
-            .isoformat(timespec="seconds"),
+        service.ready()
+        data_identities = {
+            dataset_id: service.resolve_dataset(dataset_id, basis=basis)
+            .identity.as_dict()
+            for dataset_id, basis in REQUIRED_DATASETS
         }
+    except QuantDataClientError:
+        payload = _blocked_payload("quant_data_service_unavailable")
         return publish_robust_signal_data_readiness(
             pointer_path=status_path, payload=payload
         )
+    finally:
+        if owns_client:
+            service.close()
 
     try:
         canonical_provider = qlib_workflow_provider_uri("cleaned")
         resolved_identity = normalize_provider_lineage(
-            provider_identity(
-                canonical_provider,
-                quant_data_root=quant_data_dir,
-            )
+            provider_identity(canonical_provider)
         )
     except (RunProvenanceError, OSError, RuntimeError, ValueError):
         payload = _blocked_payload("cleaned_provider_unavailable")
         return publish_robust_signal_data_readiness(
             pointer_path=status_path, payload=payload
         )
-    if not provider_lineages_match(
-        resolved_identity,
-        quality.get("cleaned_provider_identity"),
-    ):
-        payload = _blocked_payload("cleaned_provider_quality_mismatch")
-        return publish_robust_signal_data_readiness(
-            pointer_path=status_path, payload=payload
-        )
-
-    try:
-        result = prepare_runtime_provider(
-            canonical_provider=canonical_provider,
-            intervals_path=intervals_path,
-            runtime_root=runtime_root,
-            data_manifest_path=manifest_path,
-        )
-    except Exception as exc:
-        payload = _blocked_payload("provider_build_failed")
-        payload["error_type"] = type(exc).__name__
-        payload["error"] = _sanitized_error(exc) or "provider build failed"
+    identity_payload = json.dumps(
+        data_identities, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    data_identity_sha256 = hashlib.sha256(identity_payload).hexdigest()
+    provider_key = str(resolved_identity.get("descriptor_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", provider_key):
+        payload = _blocked_payload("cleaned_provider_unavailable")
         return publish_robust_signal_data_readiness(
             pointer_path=status_path, payload=payload
         )
@@ -176,23 +167,15 @@ def prepare_robust_signal_data(
         "summary": "Robust CSI800 data is ready and bound to the current data manifest.",
         "summary_zh": "鲁棒 CSI800 数据已验收，并绑定当前数据清单。",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "provider_uri": result["provider_uri"],
-        "provider_key": result["provider_key"],
-        "provider_tree_sha256": result["provider_tree_sha256"],
-        "data_manifest_sha256": file_sha256(manifest_path),
-        "membership_intervals_sha256": file_sha256(intervals_path),
-        "quality_report_id": quality["quality_report_id"],
-        "quality_evidence_artifact_name": quality[
-            "quality_evidence_artifact_name"
-        ],
-        "quality_evidence_sha256": quality["quality_evidence_sha256"],
+        "provider_uri": str(canonical_provider),
+        "provider_key": provider_key,
+        "provider_tree_sha256": provider_key,
+        "data_identity_sha256": data_identity_sha256,
+        "data_identities": data_identities,
         "cleaned_provider_identity": resolved_identity,
         "canonical_snapshot_id": (
             resolved_identity.get("snapshot_id") or canonical_provider.name
         ),
-        "symbols": result["symbols"],
-        "intervals": result["intervals"],
-        "reused": result["reused"],
     }
     return publish_robust_signal_data_readiness(
         pointer_path=status_path, payload=payload

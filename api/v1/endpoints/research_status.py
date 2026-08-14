@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import stat
@@ -14,7 +13,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -42,6 +41,12 @@ from quant_workflow.scripts._paths import (
     provider_has_instrument_pool,
     provider_instrument_ranges,
     qlib_workflow_provider_uri,
+)
+from quant_workflow.scripts.quant_data_service_client import (
+    DEFAULT_QUANT_DATA_SERVICE_URL,
+    QuantDataClientError,
+    QuantDataIdentity,
+    QuantDataServiceClient,
 )
 from quant_workflow.scripts.prepare_robust_provider import RuntimeProviderIdentityCache
 from quant_workflow.scripts.robust_signal_data_contract import (
@@ -86,7 +91,12 @@ DATA_MANIFEST_FILENAME = "DATA_MANIFEST.json"
 ASHARE_DAILY_QFQ_DATASET_ID = "ashare_daily_qfq"
 ASHARE_DAILY_QFQ_DATASET_ROOT = Path("parquet/ashare_1d/ashare_daily_qfq")
 QLIB_PROVIDER_NAMES = ("canonical", "cleaned")
-NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE = 0.50
+QLIB_TRAINING_REQUIRED_DATASETS = (
+    ASHARE_DAILY_QFQ_DATASET_ID,
+    "cn_index_daily",
+    "pit_csi800",
+)
+QLIB_CLEANED_REQUIRED_DATASETS = ("qlib_cleaning_plan",)
 ROBUST_STRATEGY_DIRNAME = "robust_strategy"
 ROBUST_SIGNAL_DIRNAME = "robust_signal"
 QLIB_RESEARCH_REPORTS = {
@@ -129,7 +139,6 @@ TONGHUASHUN_CANDIDATE_PATHS = (
     Path.home() / "Applications" / "同花顺远航版.app",
     Path.home() / "Applications" / "同花顺iFinD.app",
 )
-PROVIDER_FRESHNESS_STALE_AFTER_DAYS = 4
 
 
 @dataclass(frozen=True)
@@ -191,64 +200,6 @@ def _valid_filesystem_state_fingerprint(value: Any) -> bool:
         and isinstance(value.get("sha256"), str)
         and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None
     )
-
-
-def _is_nonnegative_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def _is_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
-
-
-def _annotate_provider_quality_freshness(
-    provider_quality: Dict[str, Any],
-    *,
-    as_of_date: Optional[date] = None,
-) -> None:
-    """Add freshness metadata without changing structural training eligibility."""
-
-    effective_as_of = as_of_date or datetime.now().astimezone().date()
-    for record in provider_quality.values():
-        if not isinstance(record, dict):
-            continue
-        record["structural_status"] = (
-            "accepted" if record.get("trainable") is True else "blocked"
-        )
-        raw_calendar_end = record.get("calendar_end")
-        calendar_end = None
-        if isinstance(raw_calendar_end, str) and raw_calendar_end:
-            try:
-                calendar_end = date.fromisoformat(raw_calendar_end)
-            except ValueError:
-                calendar_end = None
-
-        calendar_age_days = (
-            (effective_as_of - calendar_end).days
-            if calendar_end is not None
-            else None
-        )
-        if calendar_age_days is None:
-            status = "unknown"
-        elif calendar_age_days < 0:
-            status = "future"
-        elif calendar_age_days > PROVIDER_FRESHNESS_STALE_AFTER_DAYS:
-            status = "stale"
-        else:
-            status = "current"
-        record["freshness"] = {
-            "status": status,
-            "calendar_end": (
-                calendar_end.isoformat() if calendar_end is not None else None
-            ),
-            "as_of_date": effective_as_of.isoformat(),
-            "calendar_age_days": calendar_age_days,
-            "blocks_training": False,
-        }
 
 
 def _lock_experiment_handle(lock_handle) -> None:
@@ -667,9 +618,8 @@ def approved_robust_signal_data_publication(
     payload = consume_accepted_robust_signal_data(
         artifact_path=artifact_path,
         artifact_sha256=artifact_sha256,
-        provider_root=(QUANT_DATA_ROOT / "runtime" / "robust_strategy" / "providers"),
         reports_dir=reports_dir,
-        provider_identity=_ROBUST_PROVIDER_IDENTITY,
+        provider_resolver=qlib_workflow_provider_uri,
     )
     return {**payload, "readiness_artifact_path": str(artifact_path)}
 
@@ -1536,428 +1486,6 @@ def _validated_quality_markdown(
     )
 
 
-def _data_quality_summary_from_json(
-    path: Path,
-) -> Optional[Dict[str, Any]]:
-    publication = _data_quality_publication_from_json(path)
-    if publication is None:
-        return None
-    return _data_quality_summary_from_markdown_bytes(publication.markdown_bytes)
-
-
-def _quality_identity_matches_resolution(
-    identity: Any,
-    resolution: _NativeQlibProviderResolution,
-) -> bool:
-    if not isinstance(identity, Mapping):
-        return False
-    lineage = _resolution_lineage(resolution)
-    if lineage is not None:
-        return bool(identity.get("provider_contract")) and provider_lineages_match(
-            identity,
-            lineage,
-        )
-    expected = _resolution_common_identity(resolution)
-    return len(expected) == 4 and all(
-        identity.get(field) == value for field, value in expected.items()
-    )
-
-
-def _provider_quality_metrics_valid(
-    quality_record: Any,
-) -> bool:
-    if not isinstance(quality_record, Mapping):
-        return False
-    integer_fields = (
-        "invalid_calendar_entries",
-        "invalid_instrument_records",
-        "calendar_days",
-        "instruments",
-        "instrument_feature_dirs",
-        "missing_instrument_feature_dirs",
-        "complete_instrument_feature_dirs",
-        "incomplete_instrument_feature_dirs",
-        "missing_instrument_feature_files",
-        "invalid_instrument_feature_files",
-        "misaligned_instrument_feature_dirs",
-    )
-    failure_reasons = quality_record.get("failure_reasons")
-    readiness = quality_record.get("training_readiness")
-    minimum_coverage = quality_record.get("minimum_valid_instrument_feature_coverage")
-    required_coverage = quality_record.get("required_feature_min_coverage")
-    return bool(
-        isinstance(quality_record.get("calendar_valid"), bool)
-        and isinstance(quality_record.get("instrument_records_valid"), bool)
-        and all(_is_nonnegative_int(quality_record.get(field)) for field in integer_fields)
-        and quality_record.get("complete_instrument_feature_dirs")
-        + quality_record.get("incomplete_instrument_feature_dirs")
-        == quality_record.get("instruments")
-        and _is_finite_number(required_coverage)
-        and float(required_coverage) == NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
-        and _is_finite_number(minimum_coverage)
-        and 0.0 <= float(minimum_coverage) <= 1.0
-        and isinstance(quality_record.get("benchmark_complete"), bool)
-        and isinstance(quality_record.get("trainable"), bool)
-        and isinstance(failure_reasons, list)
-        and all(isinstance(reason, str) for reason in failure_reasons)
-        and isinstance(readiness, Mapping)
-        and isinstance(readiness.get("status"), str)
-    )
-
-
-def _apply_data_quality_training_gate(
-    payload: Dict[str, Any],
-    reports_dir: Path,
-    native_resolution: _NativeQlibProviderResolution,
-) -> None:
-    raw_trainable = payload.get("trainable")
-    if not isinstance(raw_trainable, bool):
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Research status has an invalid trainable flag; rerun the full "
-                "data quality report before training."
-            ),
-        }
-        return
-
-    provider_specific_gate = (
-        native_resolution.authoritative and native_resolution.path is not None
-    )
-    if raw_trainable is False and not provider_specific_gate:
-        payload["trainable"] = False
-        return
-
-    publication = _data_quality_publication_from_json(
-        reports_dir / "data_quality_report_latest.json"
-    )
-    if publication is None:
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Latest data quality publication is missing or invalid; "
-                "rerun the full data quality report before training."
-            ),
-        }
-        return
-
-    quality_payload = publication.payload
-    payload["quality_scan"] = {
-        "mode": quality_payload.get("scan_mode"),
-        "coverage": quality_payload.get("coverage_status"),
-        "verification_status": quality_payload.get("verification_status"),
-        "requested_sample": quality_payload.get("requested_sample", 0),
-        "scanned_instruments": quality_payload.get("scanned_instruments"),
-    }
-    if payload.get("quality_report_id") != publication.report_id:
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Research status does not match the latest data quality report; "
-                "rerun the full data quality report before training."
-            ),
-        }
-        return
-
-    status_evidence_sha256 = payload.get("quality_evidence_sha256")
-    if (
-        not publication.training_authoritative
-        or not isinstance(status_evidence_sha256, str)
-        or status_evidence_sha256 != publication.evidence_sha256
-    ):
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Latest data quality report is not fully verified and trainable; "
-                "rerun the full data quality report before training."
-            ),
-        }
-        return
-
-    thresholds = quality_payload.get("training_thresholds")
-    thresholds_verified = bool(
-        isinstance(thresholds, Mapping)
-        and thresholds.get("authoritative") is True
-        and all(
-            isinstance(thresholds.get(field), int)
-            and not isinstance(thresholds.get(field), bool)
-            and thresholds[field] >= minimum
-            for field, minimum in (
-                (
-                    "min_calendar_days",
-                    AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS,
-                ),
-                ("min_instruments", AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS),
-                (
-                    "min_merged_instruments",
-                    AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
-                ),
-            )
-        )
-    )
-    fully_verified = bool(
-        quality_payload.get("scan_mode") == "full"
-        and quality_payload.get("coverage_status") == "full"
-        and quality_payload.get("verification_status") == "verified"
-        and thresholds_verified
-        and (
-            provider_specific_gate
-            or quality_payload.get("trainable") is True
-        )
-    )
-    if not fully_verified:
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Latest data quality report is not fully verified and trainable; "
-                "rerun the full data quality report before training."
-            ),
-        }
-        return
-
-    if not provider_specific_gate:
-        payload["trainable"] = bool(quality_payload.get("trainable") is True)
-        return
-
-    provider_name = _provider_name_for_request(
-        str(native_resolution.dataset_id or ""),
-        native_resolution.provider_name,
-    )
-    data_contract = quality_payload.get("data_contract")
-    provider_identities = (
-        data_contract.get("qlib_providers")
-        if isinstance(data_contract, Mapping)
-        else None
-    )
-    quality_identity = (
-        provider_identities.get(provider_name)
-        if isinstance(provider_identities, Mapping)
-        else None
-    )
-    if quality_identity is None and provider_name == "canonical":
-        quality_identity = (
-            data_contract.get("qlib_provider")
-            if isinstance(data_contract, Mapping)
-            else None
-        )
-    quality_records = quality_payload.get("provider_quality")
-    quality_record = (
-        quality_records.get(provider_name)
-        if isinstance(quality_records, Mapping)
-        else None
-    )
-    payload["provider_quality"] = (
-        dict(quality_records) if isinstance(quality_records, Mapping) else {}
-    )
-
-    identity_matches = bool(
-        isinstance(data_contract, Mapping)
-        and data_contract.get("status") == "verified"
-        and _quality_identity_matches_resolution(
-            quality_identity,
-            native_resolution,
-        )
-        and _quality_identity_matches_resolution(
-            quality_record,
-            native_resolution,
-        )
-    )
-    metrics_valid = _provider_quality_metrics_valid(quality_record)
-    if not identity_matches or not metrics_valid:
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "Latest data quality evidence does not contain valid "
-                "provider-specific quality for the requested Qlib Provider; "
-                "rerun the full report before training."
-            ),
-        }
-        return
-
-    readiness = quality_record.get("training_readiness")
-    if quality_record.get("trainable") is not True:
-        payload["trainable"] = False
-        if (
-            isinstance(readiness, Mapping)
-            and readiness.get("status") != "trainable"
-            and isinstance(readiness.get("summary"), str)
-        ):
-            payload["training_readiness"] = dict(readiness)
-        else:
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "The requested Qlib Provider did not pass its own quality "
-                    "checks; rerun the full report after repair."
-                ),
-            }
-        return
-
-    expected_lineage = _resolution_lineage(native_resolution)
-    if expected_lineage is not None:
-        try:
-            actual_lineage = normalize_provider_lineage(
-                provider_identity(
-                    native_resolution.path,
-                    quant_data_root=QUANT_DATA_ROOT,
-                )
-            )
-        except (
-            FileNotFoundError,
-            OSError,
-            RunProvenanceError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
-            actual_lineage = None
-        if not provider_lineages_match(actual_lineage, expected_lineage):
-            payload["trainable"] = False
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "The Qlib Provider changed after the latest data quality "
-                    "report; rerun the full report before training."
-                ),
-            }
-            return
-    else:
-        snapshot_state = (
-            data_contract.get("snapshot_state")
-            if isinstance(data_contract, Mapping)
-            else None
-        )
-        snapshot_stages = ("before", "after_scan", "after_revalidation", "after")
-        provider_states = [
-            snapshot_state.get(stage, {}).get(native_resolution.dataset_id)
-            if isinstance(snapshot_state, Mapping)
-            and isinstance(snapshot_state.get(stage), Mapping)
-            else None
-            for stage in snapshot_stages
-        ]
-        expected_state = provider_states[0]
-        stable_state_is_valid = bool(
-            isinstance(snapshot_state, Mapping)
-            and snapshot_state.get("stable") is True
-            and snapshot_state.get("content_revalidated") is True
-            and all(
-                _valid_filesystem_state_fingerprint(state)
-                for state in provider_states
-            )
-            and all(state == expected_state for state in provider_states[1:])
-        )
-        if not stable_state_is_valid:
-            payload["trainable"] = False
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "Latest data quality evidence does not contain a stable "
-                    "Provider snapshot state; rerun the full report before training."
-                ),
-            }
-            return
-        try:
-            current_state = _filesystem_state_fingerprint_live(native_resolution.path)
-        except (DataContractError, OSError):
-            current_state = None
-        if current_state != expected_state:
-            payload["trainable"] = False
-            payload["training_readiness"] = {
-                "status": "blocked",
-                "summary": (
-                    "The Qlib Provider changed after the latest data quality "
-                    "report; rerun the full report before training."
-                ),
-            }
-            return
-
-    provider_thresholds_pass = bool(
-        quality_record["calendar_days"] >= thresholds["min_calendar_days"]
-        and quality_record["instruments"] >= thresholds["min_instruments"]
-        and quality_record["instrument_feature_dirs"] >= thresholds["min_instruments"]
-        and quality_record["complete_instrument_feature_dirs"]
-        >= thresholds["min_instruments"]
-        and quality_record["incomplete_instrument_feature_dirs"] == 0
-        and quality_record["missing_instrument_feature_dirs"] == 0
-        and quality_record["missing_instrument_feature_files"] == 0
-        and quality_record["invalid_instrument_feature_files"] == 0
-        and quality_record["calendar_valid"] is True
-        and quality_record["invalid_calendar_entries"] == 0
-        and quality_record["instrument_records_valid"] is True
-        and quality_record["invalid_instrument_records"] == 0
-        and quality_record["minimum_valid_instrument_feature_coverage"]
-        >= NATIVE_QLIB_REQUIRED_FEATURE_MIN_COVERAGE
-        and quality_record["misaligned_instrument_feature_dirs"] == 0
-        and quality_record["benchmark_complete"] is True
-        and not quality_record["failure_reasons"]
-    )
-    if not provider_thresholds_pass or readiness.get("status") != "trainable":
-        payload["trainable"] = False
-        payload["training_readiness"] = {
-            "status": "blocked",
-            "summary": (
-                "The requested Qlib Provider has inconsistent quality evidence; "
-                "rerun the full report before training."
-            ),
-        }
-        return
-    payload["trainable"] = True
-    payload["training_readiness"] = dict(readiness)
-
-
-def _data_quality_summary_from_markdown(path: Path) -> Optional[Dict[str, Any]]:
-    markdown_bytes = _read_bounded_regular_file_at(
-        path.parent,
-        Path(path.name),
-        max_bytes=DATA_QUALITY_MARKDOWN_MAX_BYTES,
-    )
-    if markdown_bytes is None:
-        return None
-    return _data_quality_summary_from_markdown_bytes(markdown_bytes)
-
-
-def _data_quality_summary_from_markdown_bytes(
-    markdown_bytes: bytes,
-) -> Optional[Dict[str, Any]]:
-    try:
-        lines = markdown_bytes.decode("utf-8").splitlines()
-    except UnicodeError:
-        return None
-
-    summary: Dict[str, Any] = {}
-    prefixes = {
-        "Stock universe": "stock_universe",
-        "Canonical qfq usable instruments": "usable_instruments",
-        "Merged usable instruments": "usable_instruments",
-        "Canonical qfq rows": "total_rows",
-        "Merged rows": "total_rows",
-        "Canonical qfq date range": "date_range",
-        "Calendar range": "date_range",
-    }
-    for line in lines[:30]:
-        clean = line.strip()
-        if clean.startswith("- "):
-            clean = clean[2:].strip()
-        for prefix, key in prefixes.items():
-            marker = f"{prefix}:"
-            if clean.startswith(marker):
-                summary[key] = clean[len(marker) :].strip()
-                break
-    return summary or None
-
-
-def _data_quality_summary_payload(reports_dir: Path) -> Optional[Dict[str, Any]]:
-    return _data_quality_summary_from_json(
-        reports_dir / "data_quality_report_latest.json",
-    )
-
-
 def _directory_size_mb(path: Path) -> Optional[float]:
     if not path.exists():
         return None
@@ -2231,6 +1759,143 @@ def _provider_name_for_request(dataset_id: str, provider: str) -> str:
     return requested
 
 
+def _required_training_datasets(provider_name: str) -> Tuple[str, ...]:
+    required = list(QLIB_TRAINING_REQUIRED_DATASETS)
+    if provider_name == "cleaned":
+        required.extend(QLIB_CLEANED_REQUIRED_DATASETS)
+    return tuple(required)
+
+
+def _blocked_training_preflight(
+    payload: Dict[str, Any],
+    *,
+    summary: str,
+    provider_name: str,
+    required_datasets: Tuple[str, ...],
+) -> None:
+    checked_at = datetime.now(timezone.utc).isoformat()
+    payload["trainable"] = False
+    payload["training_readiness"] = {
+        "status": "blocked",
+        "summary": summary,
+    }
+    payload["training_preflight"] = {
+        "status": "blocked",
+        "provider": provider_name,
+        "required_datasets": list(required_datasets),
+        "checked_at": checked_at,
+        "summary": summary,
+    }
+
+
+def _training_preflight_payload(
+    native_resolution: _NativeQlibProviderResolution,
+    *,
+    identities: Optional[Mapping[str, QuantDataIdentity]] = None,
+    service_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    provider_name = native_resolution.provider_name or "canonical"
+    required_datasets = _required_training_datasets(provider_name)
+    checked_at = datetime.now(timezone.utc).isoformat()
+    if native_resolution.path is None:
+        return {
+            "status": "blocked",
+            "provider": provider_name,
+            "required_datasets": list(required_datasets),
+            "checked_at": checked_at,
+            "summary": native_resolution.error or "当前 Qlib Provider 不可用。",
+        }
+
+    if service_error is not None or identities is None:
+        return {
+            "status": "blocked",
+            "provider": provider_name,
+            "required_datasets": list(required_datasets),
+            "checked_at": checked_at,
+            "summary": service_error or "quant_data 数据后端暂不可用，正式训练已阻止。",
+        }
+
+    missing = [dataset_id for dataset_id in required_datasets if dataset_id not in identities]
+    if missing:
+        return {
+            "status": "blocked",
+            "provider": provider_name,
+            "required_datasets": list(required_datasets),
+            "available_datasets": sorted(identities),
+            "checked_at": checked_at,
+            "summary": (
+                "quant_data 缺少正式训练所需的 canonical 数据集："
+                f"{', '.join(missing)}。"
+            ),
+        }
+
+    provider_identity_payload = _resolution_lineage(native_resolution)
+    if provider_identity_payload is None:
+        return {
+            "status": "blocked",
+            "provider": provider_name,
+            "required_datasets": list(required_datasets),
+            "available_datasets": sorted(identities),
+            "checked_at": checked_at,
+            "summary": "当前 Qlib Provider 缺少完整的不可变数据血缘，正式训练已阻止。",
+        }
+
+    summary = "quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。"
+    return {
+        "status": "passed",
+        "provider": provider_name,
+        "required_datasets": list(required_datasets),
+        "available_datasets": sorted(identities),
+        "dataset_identities": {
+            dataset_id: identities[dataset_id].as_dict()
+            for dataset_id in required_datasets
+        },
+        "provider_identity": provider_identity_payload,
+        "checked_at": checked_at,
+        "summary": summary,
+    }
+
+
+def _load_training_dataset_identities() -> Tuple[
+    Optional[Dict[str, QuantDataIdentity]], Optional[str]
+]:
+    try:
+        with QuantDataServiceClient(
+            base_url=os.getenv(
+                "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
+            )
+        ) as client:
+            readiness = client.ready()
+    except (QuantDataClientError, ValueError):
+        return None, "quant_data 数据后端暂不可用，正式训练已阻止。"
+    return (
+        {identity.dataset_id: identity for identity in readiness.identities},
+        None,
+    )
+
+
+def _apply_training_preflight(
+    payload: Dict[str, Any],
+    native_resolution: _NativeQlibProviderResolution,
+    *,
+    identities: Optional[Mapping[str, QuantDataIdentity]] = None,
+    service_error: Optional[str] = None,
+) -> None:
+    if identities is None and service_error is None and native_resolution.path is not None:
+        identities, service_error = _load_training_dataset_identities()
+    preflight = _training_preflight_payload(
+        native_resolution,
+        identities=identities,
+        service_error=service_error,
+    )
+    payload["training_preflight"] = preflight
+    payload["trainable"] = preflight["status"] == "passed"
+    payload["training_readiness"] = {
+        "status": "trainable" if payload["trainable"] else "blocked",
+        "summary": preflight["summary"],
+    }
+
+
 def _resolution_lineage(
     resolution: _NativeQlibProviderResolution,
 ) -> Optional[Dict[str, str]]:
@@ -2338,23 +2003,31 @@ def _resolve_native_qlib_provider(
         )
 
 
-def _current_native_provider_identities(
+def _current_native_provider_resolutions(
     *,
     requested_dataset_id: str,
     requested_resolution: _NativeQlibProviderResolution,
     requested_provider: str = "canonical",
-) -> Dict[str, Dict[str, Any]]:
+) -> Dict[str, _NativeQlibProviderResolution]:
     requested_name = _provider_name_for_request(
         requested_dataset_id,
         requested_provider,
     )
-    identities: Dict[str, Dict[str, Any]] = {}
-    for provider_name in QLIB_PROVIDER_NAMES:
-        resolution = (
+    return {
+        provider_name: (
             requested_resolution
             if provider_name == requested_name
             else _resolve_native_qlib_provider(provider=provider_name)
         )
+        for provider_name in QLIB_PROVIDER_NAMES
+    }
+
+
+def _current_native_provider_identities(
+    resolutions: Mapping[str, _NativeQlibProviderResolution],
+) -> Dict[str, Dict[str, Any]]:
+    identities: Dict[str, Dict[str, Any]] = {}
+    for provider_name, resolution in resolutions.items():
         identity: Dict[str, Any] = {
             "provider": provider_name,
             "status": "ready" if resolution.path is not None else "blocked",
@@ -2381,31 +2054,51 @@ def _current_native_provider_identities(
     return identities
 
 
-def _annotate_provider_quality_evidence_current(
+def _attach_training_preflights(
     payload: Dict[str, Any],
-    current_identities: Mapping[str, Mapping[str, Any]],
+    *,
+    requested_dataset_id: str,
+    requested_resolution: _NativeQlibProviderResolution,
+    requested_provider: str,
 ) -> None:
-    provider_quality = payload.get("provider_quality")
-    if not isinstance(provider_quality, dict):
-        return
-    for provider_key, quality_record in provider_quality.items():
-        if not isinstance(quality_record, dict):
-            continue
-        current_identity = current_identities.get(str(provider_key))
-        quality_record["evidence_current"] = bool(
-            isinstance(current_identity, Mapping)
-            and current_identity.get("status") == "ready"
-            and all(
-                isinstance(current_identity.get(field), str)
-                and current_identity.get(field) == quality_record.get(field)
-                for field in (
-                    "dataset_id",
-                    "snapshot_id",
-                    "manifest_sha256",
-                    "content_sha256",
-                )
-            )
+    resolutions = _current_native_provider_resolutions(
+        requested_dataset_id=requested_dataset_id,
+        requested_resolution=requested_resolution,
+        requested_provider=requested_provider,
+    )
+    payload["current_provider_identities"] = _current_native_provider_identities(
+        resolutions
+    )
+    dataset_identities, service_error = _load_training_dataset_identities()
+    payload["training_preflights"] = {
+        provider_name: _training_preflight_payload(
+            resolution,
+            identities=dataset_identities,
+            service_error=service_error,
         )
+        for provider_name, resolution in resolutions.items()
+    }
+    requested_name = _provider_name_for_request(
+        requested_dataset_id,
+        requested_provider,
+    )
+    selected_preflight = payload["training_preflights"][requested_name]
+    payload["training_preflight"] = selected_preflight
+    payload["trainable"] = selected_preflight["status"] == "passed"
+    payload["training_readiness"] = {
+        "status": "trainable" if payload["trainable"] else "blocked",
+        "summary": selected_preflight["summary"],
+    }
+
+
+def _deprecate_legacy_quality_status(payload: Dict[str, Any]) -> None:
+    """Keep old response keys inert while callers migrate away from them."""
+
+    payload["quality_report_id"] = None
+    payload["quality_evidence_sha256"] = None
+    payload["quality_scan"] = {}
+    payload["provider_quality"] = {}
+    payload["data_sources"] = []
 
 
 def _saved_provider_lineage(payload: Mapping[str, Any]) -> Optional[Dict[str, str]]:
@@ -2900,7 +2593,6 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
         cleanup_plan_path,
         hygiene_publication_status,
     ) = _read_data_hygiene_bundle(reports_dir)
-    quality_report_path = reports_dir / "data_quality_report_latest.json"
     cleaning_strategy_path = reports_dir / "data_cleaning_strategy_latest.md"
     manifest_path = QUANT_DATA_ROOT / "DATA_MANIFEST.json"
     readme_path = QUANT_DATA_ROOT / "README.md"
@@ -2941,14 +2633,6 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
                 }
             )
 
-    quality_summary = _data_quality_summary_payload(reports_dir)
-    quality_report_status = (
-        "available"
-        if quality_summary is not None
-        else "invalid"
-        if quality_report_path.exists()
-        else "missing"
-    )
     inventory_counts = _data_hygiene_inventory_counts(inventory)
     manifest_evidence = _manifest_official_entry_evidence(
         manifest,
@@ -3038,11 +2722,9 @@ def _data_hygiene_payload(reports_dir: Path) -> Dict[str, Any]:
             "actions": visible_cleanup_actions,
         },
         "quality_report": {
-            "status": quality_report_status,
-            "path": _public_path_label(quality_report_path)
-            if quality_report_path.exists()
-            else None,
-            "summary": quality_summary,
+            "status": "deprecated",
+            "path": None,
+            "summary": None,
         },
         "cleaning_strategy": {
             "status": "available" if cleaning_strategy_path.exists() else "missing",
@@ -3367,7 +3049,7 @@ def _capability_matrix_payload(external_tools: Dict[str, Any]) -> list[Dict[str,
             "entry": "工作流任务中心",
             "route": "/workflow",
             "tests": "quant_workflow unittest + DSA quant API 测试",
-            "browser": "可从网页运行数据检查、质量报告、异常报告、Qlib 转换和训练入口",
+            "browser": "可从网页查看实时数据状态，并运行异常报告、Qlib 转换和训练入口",
             "review": "opencode复审通过",
             "next": "补更多产物预览、失败排查和每日研究向导。",
             "restrictions": ["只允许白名单脚本", "网页不能提交任意 shell 命令"],
@@ -3501,7 +3183,7 @@ def _function_inventory_payload() -> list[Dict[str, Any]]:
             "route": "/research",
             "owner": "quant_workflow + daily_stock_analysis",
             "coverage": (
-                "网页白名单覆盖下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、"
+                "网页白名单覆盖 Qlib 合并、清洗、实时数据检查、异常报告、"
                 "数据治理盘点和 dry-run 清理预案、市场状态、现金仓位回测、china-astock 指标报告、"
                 "china-astock 对比、交易策略优化预演和选股模型基线训练；"
                 "report_data_hygiene.py 可从网页生成 inventory 与 dry-run cleanup plan；"
@@ -3746,7 +3428,7 @@ def _missing_status_payload(
         qlib_provider = _provider_status_payload(native_resolution)
     training_readiness = {
         "status": "missing",
-        "summary": "Research status artifact is not available yet. Run quant_workflow/scripts/report_data_quality.py first.",
+        "summary": "正在实时检查 quant_data 与当前 Qlib Provider。",
     }
     if native_resolution.authoritative and native_resolution.path is None:
         training_readiness = {
@@ -3757,6 +3439,9 @@ def _missing_status_payload(
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "trainable": False,
         "training_readiness": training_readiness,
+        "quality_report_id": None,
+        "quality_evidence_sha256": None,
+        "quality_scan": {},
         "provider_quality": {},
         "data_sources": [],
         "qlib_provider": qlib_provider,
@@ -3776,6 +3461,13 @@ def _missing_status_payload(
         "china_astock_reuse": _china_astock_reuse_payload(),
         "acceptance_checklist": _acceptance_checklist_payload(),
     }
+    _attach_training_preflights(
+        payload,
+        requested_dataset_id=provider_dataset_id,
+        requested_resolution=native_resolution,
+        requested_provider=provider,
+    )
+    _deprecate_legacy_quality_status(payload)
     if latest_training is not None:
         _sync_qlib_provider_with_latest_training(
             payload,
@@ -3988,7 +3680,6 @@ def build_research_status_payload(
         provider=provider,
     )
     reports_dir = RESEARCH_STATUS_PATH.parent
-    _apply_data_quality_training_gate(payload, reports_dir, native_resolution)
     if native_resolution.path is not None:
         payload["qlib_provider"] = _provider_status_payload(native_resolution)
     elif native_resolution.authoritative:
@@ -4026,19 +3717,13 @@ def build_research_status_payload(
     payload["function_inventory"] = _function_inventory_payload()
     payload["china_astock_reuse"] = _china_astock_reuse_payload()
     payload["acceptance_checklist"] = _acceptance_checklist_payload()
-    current_provider_identities = _current_native_provider_identities(
+    _deprecate_legacy_quality_status(payload)
+    _attach_training_preflights(
+        payload,
         requested_dataset_id=provider_dataset_id,
         requested_resolution=native_resolution,
         requested_provider=provider,
     )
-    payload["current_provider_identities"] = current_provider_identities
-    _annotate_provider_quality_evidence_current(
-        payload,
-        current_provider_identities,
-    )
-    provider_quality = payload.get("provider_quality")
-    if isinstance(provider_quality, dict):
-        _annotate_provider_quality_freshness(provider_quality)
     return payload
 
 

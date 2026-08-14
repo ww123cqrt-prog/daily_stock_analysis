@@ -43,6 +43,6 @@ describe('ShellHeader', () => {
     );
 
     expect(screen.getByText('工作流')).toBeInTheDocument();
-    expect(screen.getByText('数据更新、Qlib 转换、质量检查、训练和回测任务中心')).toBeInTheDocument();
+    expect(screen.getByText('Qlib 转换、训练和回测任务中心')).toBeInTheDocument();
   });
 });

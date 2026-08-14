@@ -1,22 +1,26 @@
 # 本地统一量化研究与回测工作台核对手册
 
-本文用于核对 `daily_stock_analysis`、`quant_workflow`、`Qlib`、`china-astock-quant` 和本机只读参考工具之间的协作关系。目标是让你主要通过网页完成日常研究、数据检查、Qlib 转换、训练、回测、实验查看和历史管理，而不是依赖终端手工命令。
+本文用于核对 `daily_stock_analysis`、`quant_data`、`quant_workflow`、`Qlib`、`china-astock-quant` 和本机只读参考工具之间的协作关系。DSA 网页只保留日常入口、只读数据状态、量化研究、个股分析、持仓和设置；运行管理与历史兼容路由继续由后端保留，但不再作为一级用户功能。
 
 ## 一句话架构
 
-当前框架是：组织上统一，代码上分层，数据上外置，入口统一到 DSA。`daily_stock_analysis` 是主网页和主操作台；仓内 `quant_workflow/` 是本地量化流水线；`Qlib` 是机器学习量化引擎；`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 只保存实验原始记录，页面通过 DSA `/experiments/` 访问。唯一 Python 虚拟环境是 `daily_stock_analysis/.venv`：DSA 后端、`quant_workflow` 稳定脚本、Qlib、JQData/AkShare、MLflow 和 `china-astock-quant` 适配层都从这套环境运行。
+当前框架是：入口统一到 DSA，数据治理留在 `quant_data`，研究执行留在仓内 `quant_workflow/` 与 Qlib。DSA 通过本机数据服务读取不可变快照身份和可用状态，不下载、不清洗、不发布数据。`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 保存实验原始记录，页面通过 DSA `/experiments/` 访问。
 
 ## 本机入口
 
 | 入口 | 地址 | 用途 |
 | --- | --- | --- |
-| DSA 主网页 | `http://127.0.0.1:8010/` | 股票分析、研究、工作流、回测、问股、持仓、告警、选股 |
-| 工作流任务中心 | `/workflow` | 从网页运行白名单量化脚本、查看状态、日志和产物 |
-| 研究总览 | `/research` | 查看数据状态、项目关系、实验记录、能力边界和复用清单 |
-| 回测页 | `/backtest` | 使用 Python 脚本或无代码条件表单运行连续策略回测 |
-| 实验 | `/experiments/` | 查看 MLflow 实验、Run、参数、指标和 artifact，支持中文/English 切换 |
+| 首页 | `/` | 跳转到 DSA 功能、九点猫研和 MLflow，并以静态关系图说明各项目职责与数据流 |
+| 数据 | `/data` | 只读查看 `quant_data` 服务、正式数据集和不可变快照身份 |
+| 量化研究 | `/research` | 在“选股研究”和“交易策略研究”之间切换 |
+| 个股分析 | `/stock-analysis` | 运行个股分析并查看历史报告 |
+| 持仓 | `/portfolio` | 管理账户、持仓、估值、风险和手工交易记录 |
+| 设置 | `/settings` | 管理 DSA 本地配置 |
+| MLflow | `/experiments/` | 查看实验、Run、参数、指标和 artifact |
 
-如果 `8000` 被其他服务占用，以当前实际启动的 `8010` 为准；页面文案不应假定 `8000` 就是 DSA。
+`/workflow`、`/backtest`、`/other` 等旧地址继续兼容已有书签和测试，但不进入一级导航。实际服务端口以启动记录和监听进程为准，页面文案不得永久假定某个端口就是 DSA。
+
+数据页不直接访问文件系统。DSA 的 `GET /api/v1/data/status` 只读代理 `quant_data` 数据服务（默认 `http://127.0.0.1:8766`），服务异常时返回 503；页面只展示数据集身份、日期、价格口径和内容哈希，不提供下载、构建或发布按钮。
 
 ## 本地安全边界
 
@@ -40,15 +44,16 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 工作流页面的实时任务列表使用 SSE 长连接。直连本机通常会在浏览器关闭页面时释放连接；如果未来通过 Nginx、内网穿透或其他反向代理暴露页面，应配置合理的读超时和空闲连接回收，避免异常断线长期占用 SSE 连接槽。多 worker 部署下每个 worker 都有自己的 SSE 连接计数，因此有效上限约为 `worker 数量 × MAX_QUANT_JOB_STREAMS`；当前工作台按单机本地服务设计。
 
-实验记录本的归档、永久删除和训练脚本追加记录共用 `quant_workflow/reports/.experiment.lock`，用于避免网页删除记录和后台训练同时写 `experiment_runs.jsonl` / `experiment_log.md` 时互相覆盖。这个锁是本机协作式 advisory lock：只有走 DSA API 或按同一约定实现的 `quant_workflow` 写入流程才会遵守它；手工编辑、`echo >>` 或第三方脚本直接写文件仍可绕过锁，因此不要在训练或网页删除实验时手工改这两个文件。
+历史实验记录 API 的归档、永久删除和训练脚本追加记录共用 `quant_workflow/reports/.experiment.lock`。该 API 仅保留兼容，不再作为一级页面；正式用户入口统一查看 `/experiments/` 的 MLflow 记录。
 
 ## 项目职责
 
 | 项目 | 当前角色 | 应该放什么 | 不应该做什么 |
 | --- | --- | --- | --- |
-| `daily_stock_analysis` | 主网页、API、用户操作台 | 页面、后端 API、任务中心、实验摘要、回测展示 | 不保存真实密码/token，不直接接券商交易 |
-| `quant_workflow` | DSA 仓内稳定脚本和产物层 | 数据下载、清洗、异常报告、Qlib 转换、训练、回测、报告 | 不把一次性脚本散落到项目根目录，不提交运行产物 |
-| `Qlib` | 机器学习量化引擎 | 由 `daily_stock_analysis/.venv` 中的 PyPI 包调用，读取本地 provider，执行选股模型训练和交易策略回测 | 不改造成主网页，不随意改官方源码 |
+| `daily_stock_analysis` | 主网页、API、用户操作台 | 页面、后端 API、受控任务调用、回测和结果展示 | 不保存真实密码/token，不下载或发布正式数据，不直接接券商交易 |
+| `quant_data` | 受治理的数据仓库与本机数据服务 | 下载、清洗、质量验收、不可变快照发布和数据服务 | 不承担 DSA 页面、模型训练、策略回测或下单 |
+| `quant_workflow` | DSA 仓内研究脚本和产物层 | 消费 `quant_data` 已发布快照，执行训练、回测和报告 | 不修补或重新发布 `quant_data`，不提交运行产物 |
+| `Qlib` | 机器学习量化引擎 | 通过统一 Qlib Provider 读取 `quant_data`，执行选股模型训练和交易策略回测 | 业务层不按物理路径或存储格式决定数据是否可用 |
 | `china-astock-quant` | 参考库和复用来源 | 由共享 DSA Python 环境调用其指标、样例策略、事件回测和工程经验 | 不接入交易模块，不改造成主网页 |
 | `ashare-live-research` | 本机只读实时观察 skill/MCP | 同花顺、手机镜像、行情异动、辅助交易观察层的后续研究 | 不并入 DSA 主仓，不读取密码，不自动下单 |
 | `a-share-us-catalyst` / CatDesk（九点猫研） | 外部催化观察服务 | 美股催化 A 股题材的独立页面和状态入口；负责发现题材和候选股 | 不把其候选信号历史验证混写成 Qlib 策略回测；不直接当买入信号 |
@@ -56,46 +61,23 @@ JQData 凭据默认从 `JQDATA_ENV_FILE` 指向的文件读取；未设置时依
 
 ## 网页自助流程
 
-### 1. 检查当前状态
+### 1. 检查数据
 
-打开 `http://127.0.0.1:8010/research`。
+打开 `/data`。页面应显示数据服务状态、正式数据集数量以及每个数据集的 `dataset_id`、`snapshot_id`、`manifest_sha256`、`content_sha256`、最新交易日和价格口径。数据服务未就绪时，页面必须明确报错，不能静默回退旧文件。
 
-确认以下区域可见：
+### 2. 开展量化研究
 
-- 数据状态：是否可训练、数据源、Qlib provider 日期范围。
-- 实验记录本：最近训练、关键指标、MLflow 链接。
-- 能力验收矩阵：DSA、quant_workflow、Qlib、china-astock-quant、同花顺、交易执行禁区。
-- 功能入口盘点：每个入口的状态、缺口和下一步。
-- `china-astock-quant` 复用清单：指标、策略、事件回测、纸面交易禁区。
+打开 `/research`。默认进入“选股研究”，集中显示选股模型训练、候选比较、实验任务和 **CSI800 选股信号稳定性检验**；切换到“交易策略研究”后，集中使用脚本策略、条件策略、选股模型与交易策略组合及 ETF 回测。所有任务只能调用后端白名单脚本，网页不能提交任意 shell 命令。
 
-### 2. 运行量化流水线
-
-打开 `http://127.0.0.1:8010/workflow`。
-
-建议顺序：
-
-0. 一键更新：运行“运行每日数据更新全链路”。A 股历史源默认关闭；确认供应商访问恢复后，才手动选择 Baostock、东方财富或 AkShare 中的一个。任务不会在一次运行中同时请求三个 A 股历史源，东方财富新闻也默认关闭。
-1. 检查 Qlib 数据：运行“检查 Qlib 数据”。
-2. 更新数据：先运行“准备 Baostock 增量清单”，再按需运行“下载 Baostock 长历史”、“下载东方财富日线”、“下载 AkShare 日线”、“下载全球日线与原始证据”和“下载 A 股新闻原始证据”。东方财富和 AkShare 的 A 股日线只作为冗余源；全球日线写入独立 `global_1d`，不会混入 Qlib A 股股票池。
-3. 验证 JQData：运行“验证 JQData 连接”。网页端只允许 dry-run、小样本认证和股票池解析，不写入真实数据目录。
-4. 合并 Qlib：运行“合并并转换为 Qlib”，必要时先用小样本演练。
-5. 质量报告：运行“生成数据质量报告”、“生成异常股票和清洗策略”、“校验新浪最新快照”、“生成数据治理盘点和清理预案”和“生成工作台能力盘点”。
-6. 清洗预演：先用“只预演不写入”，确认影响范围后再考虑生成 cleaned provider。
-7. 选股模型训练与交易策略验证：日常基线可运行“训练 Qlib LightGBM 选股模型基线”；完整候选研究运行“运行五个选股模型候选流程”，依次训练 Linear OLS、Linear Ridge、LightGBM、XGBoost 和 CatBoost 五个选股模型，只用 2024-2025 选择候选选股模型及五套交易策略，再用 2026 留出期终审。随后可运行“生成 Qlib 预测摘要”、市场状态、现金仓位叠加、交易策略优化预演和 DSA 分析准确性回测。
-8. Qlib 研究增强：运行“生成 Qlib 选股模型解释报告”、“生成 Qlib 回测明细报告”、“生成 Qlib 多选股模型/多实验对比”、“生成 Qlib 因子分析报告”、“生成 Qlib 滚动训练计划”和“生成 Qlib 组合风险诊断”。
-9. 复用参考：运行“生成 china-astock 技术指标报告”和“生成 china-astock 策略对比”，只生成报告，不连接券商。
-
-每个任务只能调用后端白名单脚本；网页不能提交任意 shell 命令。
-
-### 2.1 鲁棒策略生命周期
+### 3. CSI800 选股信号稳定性检验
 
 旧的“一次完成模型、策略、成本和确认期”的鲁棒开发流程已经结案。已完成的 504 个固定参数任务和 20 组 CatBoost 调参结果继续保留，但因为没有模型通过全部稳定性门槛，只能作为第零代失败基线，不能称为合格策略。结案证据由 `report_robust_strategy_closure.py` 写入原 Run 目录，不删除或改写原模型、预测和 MLflow 记录。
 
-新的“选股信号 Goal 1”先回答一个更小但更关键的问题：价量数据里是否存在跨季度、跨 504/756/1008 日训练窗口都稳定的选股信号。正式配置是 `quant_workflow/configs/robust_signal_research.yaml`，入口是 `launch_robust_signal_research.py`，报告独立写入 `quant_workflow/reports/robust_signal/`，MLflow 实验为 `robust_csi800_signal_research`。2018-2022 只用于预注册的八组信号筛选，2023-2025 用于 12 个季度的滚动样本外验收；任何预测产物只要包含 2026 日期就立即拒绝。主验收口径固定为 Top50，不能事后换 Top20、Top30 或 Top100 冒充通过。
+“CSI800 选股信号稳定性检验”先回答一个更小但更关键的问题：价量数据里是否存在跨季度、跨 504/756/1008 日训练窗口都稳定的选股信号。正式配置是 `quant_workflow/configs/robust_signal_research.yaml`，入口是 `launch_robust_signal_research.py`，报告独立写入 `quant_workflow/reports/robust_signal/`，MLflow 实验为 `robust_csi800_signal_research`。2018-2022 只用于预注册的八组信号筛选，2023-2025 用于 12 个季度的滚动样本外验收；任何预测产物只要包含 2026 日期就立即拒绝。主验收口径固定为 Top50，不能事后换 Top20、Top30 或 Top100 冒充通过。
 
-`/workflow` 的 Goal 1 卡片可启动正式研究、请求“完成当前完整任务后暂停”，并从同一 Run 恢复。暂停不是强制杀进程：当前季度、窗口和模型必须先原子写完预测、模型、诊断和进度，然后 runner 才退出。恢复时会核对配置、Git commit、数据清单和 provider 上下文；任何一项变化都拒绝续跑。每个任务的因子诊断同时保存原始 Alpha158 数据和处理后的模型输入；后者包含板块标识与基于 CSI800 历史收盘价的四类市场状态 one-hot 特征。市场状态统一从配置冻结的 `2014-01-02` 起点连续计算，每个任务只读到自己的测试期末，并检查训练期之前至少有 60 个交易日用于预热；不能随 504/756/1008 日训练窗口改变计算起点。`/backtest` 只展示已经落盘的因子质量、标签方案、TopK 敏感性、窗口稳定性和四种市场状态归因；状态归因先在全体日期上确定统一的标签/调仓取样日，再按状态拆分，不把 smoke 结果当正式研究证据。
+`/research` 的“选股研究”中，“CSI800 选股信号稳定性检验”卡片可启动正式研究、请求“完成当前完整任务后暂停”，并从同一 Run 恢复；旧 `/workflow` 地址保留兼容。暂停不是强制杀进程：当前季度、窗口和模型必须先原子写完预测、模型、诊断和进度，然后 runner 才退出。恢复时会核对配置、Git commit、数据清单和 provider 上下文；任何一项变化都拒绝续跑。每个任务的因子诊断同时保存原始 Alpha158 数据和处理后的模型输入；后者包含板块标识与基于 CSI800 历史收盘价的四类市场状态 one-hot 特征。市场状态统一从配置冻结的 `2014-01-02` 起点连续计算，每个任务只读到自己的测试期末，并检查训练期之前至少有 60 个交易日用于预热；不能随 504/756/1008 日训练窗口改变计算起点。交易策略研究只展示已经落盘的因子质量、标签方案、TopK 敏感性、窗口稳定性和四种市场状态归因；状态归因先在全体日期上确定统一的标签/调仓取样日，再按状态拆分，不把 smoke 结果当正式研究证据。
 
-Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败，状态为 `signal_diagnosis_complete`，下一门槛明确写成 `build_historical_fundamentals`；这表示“价量阶段完成、基本面阶段尚未执行”，不等于 `signal_not_found`。只有带真实公告日期、至少延迟一个交易日生效且覆盖率达到 98% 的基本面扩展也失败后，才能输出 `signal_not_found`。LightGBM、XGBoost、CatBoost 和 MPS DNN 只允许在 OLS/Ridge 已证明确定性信号存在后作为挑战者运行，不是首轮信号存在性的前置条件。
+该检验当前先执行价量信号阶段。若价量筛选或严格验证失败，状态为 `signal_diagnosis_complete`，下一门槛明确写成 `build_historical_fundamentals`；这表示“价量阶段完成、基本面阶段尚未执行”，不等于 `signal_not_found`。只有带真实公告日期、至少延迟一个交易日生效且覆盖率达到 98% 的基本面扩展也失败后，才能输出 `signal_not_found`。LightGBM、XGBoost、CatBoost 和 MPS DNN 只允许在 OLS/Ridge 已证明确定性信号存在后作为挑战者运行，不是首轮信号存在性的前置条件。
 
 另设公开策略研究候选清单 `quant_workflow/configs/public_strategy_candidates.yaml`。用户提供的“两只 ETF 20 日动量轮动”已登记为 `etf_20d_two_asset_momentum_rotation`：它只比较 159915 和 513100，收盘计算信号、下一交易日开盘执行，不能与 CSI800 个股模型或 Qlib 选股结果混称。回测使用独立的 ETF 数据目录和报告目录；公开文章的收益数字只保留为未核验声明。该候选在基准成本口径下允许最大回撤 35%，这一放宽只适用于该 ETF 研究候选，不改变 CSI800 鲁棒策略的 20% 开发/确认门槛和 12% 纸面跟踪门槛。
 
@@ -109,7 +91,7 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 2. “运行冻结策略 2026 确认期”：只对已经冻结的配置、Git commit、数据清单哈希、模型文件哈希和预测文件哈希运行一次确认。2026 结果不能用于回头换冠军；未通过时输出 `development_failed`。
 3. “运行鲁棒策略当日纸面跟踪”：只加载冻结模型做当日推理，不重新训练，按交易日逐日记录任务成功、组合收益、基准收益、净超额和最大回撤。状态 `shadow_observation` 表示仍在观察，不等于合格；完成配置中冻结的 60 个交易日且全部门槛通过后，才允许出现 `robust_strategy_qualified`。开发期、2026 确认期和纸面跟踪的所有数值门槛均读取同一份 `robust_strategy.yaml`，判定结果会保存实际使用的门槛，不使用脚本内另一套隐藏数字。
 
-当前人工控制边界：旧的完整鲁棒策略 runner 仍只有命令行 `--resume`，没有网页安全暂停；新的 Goal 1 runner 已支持网页协作式暂停和同一 Run 恢复。两条流程不能混称为都已支持。Goal 1 的按钮只管理 `robust_signal` Run，不会停止、恢复或覆盖旧 `robust_strategy` Run。
+当前人工控制边界：旧的完整鲁棒策略 runner 仍只有命令行 `--resume`，没有网页安全暂停；CSI800 选股信号稳定性检验 runner 已支持网页协作式暂停和同一 Run 恢复。两条流程不能混称为都已支持。该检验的按钮只管理 `robust_signal` Run，不会停止、恢复或覆盖旧 `robust_strategy` Run。
 
 有界调参仍限制为每个失败模型最多 20 组、最多 3 个完整矩阵入围者。筛选阶段必须覆盖 504/756/1008 三个训练窗口，并在配置指定的 756 日参考窗口覆盖 42/2026/3407 三个随机种子；候选排序先看原有稳定性门槛，再看 RankIC。不能恢复成只跑 756 日、只按 RankIC 选前三名的旧逻辑，因为那会在评估稳定性之前淘汰可能更稳定的参数。
 
@@ -125,7 +107,7 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 
 ### 2.2 quant_workflow 脚本覆盖盘点
 
-`quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到网页按钮里。当前网页任务中心已经覆盖核心日常链路：数据下载、JQData dry-run、Qlib 合并、清洗、检查、质量报告、异常报告、数据治理盘点和 dry-run 清理预案、市场状态、现金仓位叠加、Qlib 研究增强、china-astock 技术指标报告、china-astock 对比、交易策略优化预演和选股模型基线训练。
+`quant_workflow/scripts` 里的稳定脚本不等于全部都应该直接放到正式用户页面。一级入口只在 `/research` 展示研究与回测任务；旧 `/workflow` 继续承载历史兼容和内部运行管理，但不进入一级导航。数据下载、清洗、质量验收、Provider 构建和快照发布归 `quant_data` 所有，不能重新放进 `/data` 或其他正式 DSA 入口。
 
 ### 2.3 每日数据更新与原生 V2 校验
 
@@ -134,7 +116,7 @@ Goal 1 当前先执行价量信号阶段。若价量筛选或严格验证失败�
 1. 可选 A 股来源刷新默认关闭。显式选择 Baostock、东方财富或 AkShare 时，一次只运行一个来源，并沿用至少 2 秒间隔、1 次尝试、连续失败最多 3 次和最多 7 天重叠窗口。这些结果只进入审计缓存，不能发布正式 V2；明确选择的来源失败时本轮返回非零。
 2. 全球日线、限定范围的 A 股新闻和 ETF 分别更新。ETF 通过 `quant_data_cli.py update cn_etf_daily` 整包原子发布；raw、qfq和因子位于同一个快照，失败不会切换正式指针。更新后自动运行 `quant_data_cli.py validate cn_etf_daily --release`，只用一条离线命令验收当前快照、唯一备份、根清单和策略标的，不扫描无关A股数据；只有更新和验收都成功才生成新ETF报告。任一步失败时保留上一份报告并继续A股主流程。
 3. 正式 A 股更新只能由已核验的 raw/factor/qfq bundle 触发。命令行显式传 `--ashare-v2-bundle-dir <bundle>` 后，编排器委托 `quant_data_cli.py update ashare_daily_qfq --bundle-dir <bundle>`；该事务构建新的 `ashare_daily_raw`、`ashare_daily_qfq` 和 `qlib_ashare_v2` 不可变快照，并在失败时恢复原指针。网页不接受任意本机 bundle 路径。
-4. 无论是否发布新 bundle，编排器最后直接运行 `quant_data_cli validate ashare_daily_qfq`、`quant_data_cli validate qlib_ashare_v2`、`check_qlib_data.py`、`report_data_quality.py --fail-on-not-trainable` 和 `sync_data_manifest.py --check`。ETF专项验收已在ETF更新后单独完成，不借此重复扫描整套A股数据。质量报告默认扫描原生 qfq bars 和原生 Qlib V2，不再把兼容目录当 canonical 输入。
+4. 正式数据更新、质量检查和原子发布全部由 `quant_data` 完成。DSA 不再通过 `report_data_quality.py` 重复验收或授权通用训练；只实时读取 `quant_data /ready`、检查任务所需正式数据集，并确认当前 Qlib Provider 可读且血缘完整。旧编排器和历史报告仅作兼容与既有 Run 复现，不作为新的用户操作入口。
 5. `official_published=true` 只表示本轮 V2 bundle 事务真实成功；普通审计缓存下载成功不会设置该标志。运行摘要同时记录 qfq、Qlib V2 和 ETF 更新前后的日期以及 `legacy_source_role=audit_cache_only`。
 
 `--skip-download` 表示跳过独立下载、只校验现有 V2；`--dry-run` 只列出计划且不启动子进程。固定路径兼容输出只能由 `publish_v2_compatibility.py` 维护；mutable 修复工具不得写入原生快照。
@@ -147,9 +129,18 @@ JQData 不纳入每日自动下载：其账号数据权限窗口结束于 Baosto
 
 ### 数据验收与训练消费边界
 
-数据模块负责下载、清洗、完整业务质量验收，以及发布带内容身份的不可变 provider 和
-readiness 记录。训练模块不下载数据、不清洗数据、不重新执行业务质量报告，也不读取
-当前的 `latest` 质量指针来替换正在使用的输入。数据模块把每次验收结果写为
+`quant_data` 负责下载、清洗、完整质量验收，以及发布带内容身份的不可变数据集和 Qlib
+Provider。DSA 的通用训练入口不再重复运行或读取完整质量报告来决定训练权限；提交前只做
+轻量预检：`quant_data /ready` 可用、任务所需正式数据集存在、所选 Qlib Provider 可读，
+并且 Provider 的不可变血缘完整。历史 `data_quality_report_*` 继续用于审计，但不能授权或
+阻止通用训练。训练模块不下载数据、不清洗数据，也不重新发布数据。
+
+DSA 的研究页、数据页和普通状态 API 不展示历史质量报告、上一验收快照或重新验收入口。
+旧质量字段暂时保留为空值或 `deprecated`，磁盘上的存量报告暂不删除，以免破坏既有 Run
+的冻结复现证据。数据质量检查只属于 `quant_data` 的发布过程；CSI800 已启动 Run 继续使用
+自己的冻结证据和 `robust_signal_data_v3` 专用准备契约。
+
+CSI800 选股信号稳定性检验另有专用冻结输入契约。数据模块把每次验收结果写为
 `readiness_artifacts/robust_signal_data_readiness_<sha256>.json`，再原子更新
 `robust_signal_data_readiness_latest.json` 指针。网页提交新 Run 时只解析一次 latest，
 把不可变文件路径和 SHA-256 写进持久化任务命令；训练运行器只消费这份冻结文件，并验证
@@ -160,13 +151,13 @@ readiness 必须位于受控的
 provider 身份、provider 元数据、provider 内容身份和历史 CSI800 成员区间身份。它不
 读取当前 `data_quality_report_latest.json`，也不重新计算覆盖率、质量阈值或训练资格。
 
-正式 Goal 1 只接受 `robust_signal_data_v3`、
+正式 CSI800 选股信号稳定性检验只接受 `robust_signal_data_v3`、
 `acceptance_owner=data_module` 和
 `acceptance_contract=data_module_accepted_content_addressed_snapshot_v2`。旧版 v1/v2
 正文即使手工改字段，也不能冒充 latest 指针。数据更新后由数据模块发布新验收文件；
 已经开始的 Run 继续使用自己的旧哈希，恢复任务也从原 `context.json` 取回该哈希。
 需要使用新数据时，应创建新 Run。外部网络失败本身只是环境事件；
-只有 DSA 误报成功、发布损坏或不完整数据、无限挂起、恢复失败或绕过质量门槛，才算软件缺陷。
+只有 DSA 误报成功、发布损坏或不完整数据、无限挂起、恢复失败或绕过该专用冻结数据契约，才算软件缺陷。
 
 ### 本轮已修复的四个非阻塞 P3
 
@@ -176,9 +167,9 @@ provider 身份、provider 元数据、provider 内容身份和历史 CSI800 成
 4. 研究状态刷新失败时清除旧状态，避免页面继续展示过期训练信息。
 
 独立复审进一步发现并已纳入本轮修复：候选模型目录使用模型级 MLflow
-`experiment_id` 生成 Run 深链；前端数据验收类型补齐验收所有者、验收契约、质量报告、
-质量证据、readiness 文件名/SHA-256 和 cleaned provider 身份字段；训练任务提交和直接
-CLI 运行都拒绝受控报告根之外的 readiness 文件。
+`experiment_id` 生成 Run 深链；CSI800 专用 readiness 类型保留验收所有者、验收契约、
+冻结证据、readiness 文件名/SHA-256 和 cleaned provider 身份字段；训练任务提交和直接
+CLI 运行都拒绝受控报告根之外的 readiness 文件。这些专用字段不回流为通用训练门禁。
 
 以下两项仍是明确记录的后续维护项，不阻碍当前单机训练：任务列表逐行执行
 `ps`/glob/stat 的性能优化，以及未来多 worker 部署时为通用任务更新增加 SQL 状态守卫。
@@ -215,7 +206,7 @@ scripts/launchd/install-robust-shadow.sh --uninstall
 
 ### 2.4 鲁棒选股信号长训练控制
 
-`/workflow` 已经为 Goal 1 的鲁棒选股信号研究提供受控网页入口：预览固定研究矩阵、运行隔离的单季度测试、正式启动、完成当前原子任务后暂停、按同一 Run 恢复和立即取消。网页显示 Run ID、阶段、完成数、总数、百分比、暂停状态、检查点以及配置、代码和数据身份；浏览器不能提交任意命令、输出路径或 launchd label。
+`/research` 的“选股研究”已经为 CSI800 选股信号稳定性检验提供受控网页入口：预览固定研究矩阵、运行隔离的单季度测试、正式启动、完成当前原子任务后暂停、按同一 Run 恢复和立即取消。网页显示 Run ID、阶段、完成数、总数、百分比、暂停状态、检查点以及配置、代码和数据身份；浏览器不能提交任意命令、输出路径或 launchd label。
 
 - **协作暂停**只写入暂停请求，runner 完成当前原子任务并保存检查点后进入 `paused`。这和立即终止进程不同。
 - **网页恢复**只接受原 Run ID；恢复前重新校验配置哈希、Git 提交、数据清单、provider 树和已有产物。身份变化时失败关闭，不会悄悄新建 Run 或从头训练。
@@ -230,11 +221,11 @@ scripts/launchd/install-robust-shadow.sh --uninstall
 
 ### 2.5 网页选股模型训练闭环
 
-`/workflow` 的训练主体是“选股模型训练”，不是把选股模型和交易策略混成一个概念。人类用户可以先在 `/data` 查看或生成数据质量报告，再返回训练页选择 canonical 或 cleaned provider；页面会显示实际不可变 snapshot ID、结构验收、`trainable` 状态、阻塞原因和数据新鲜度。数据质量不通过时正式训练不会启动，按钮旁必须说明缺少哪份报告或哪项数据契约，不能只显示无解释的灰色按钮。
+`/research` 的“选股研究”主体是选股模型训练，不把选股模型和交易策略混成一个概念。用户可在 `/data` 查看 `quant_data` 已发布快照，再返回选股研究；页面显示当前 Qlib Provider 身份和轻量训练预检。只有 `quant_data /ready` 不可用、必需正式数据集缺失、Provider 不可读或不可变血缘不完整时，通用正式训练才会阻止，按钮旁必须显示具体原因。页面不再要求用户重复运行“完整质量验收”。
 
-Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canonical `trainable`。不可变质量证据必须同时包含 `provider_quality.cleaned`，其 `trainable=true`、`training_readiness.status=trainable`、两层阻塞原因均为空，而且 dataset、snapshot、manifest 和 content 四项身份必须与 `data_contract.qlib_providers.cleaned` 完全一致；否则固定阻断正式信号研究。
+CSI800 选股信号稳定性检验仍使用前述专用 `robust_signal_data_v3` 冻结 readiness。它与通用训练轻量预检不是同一契约；通用 Provider 预检通过，不代表 CSI800 专用 PIT 股票池和冻结输入已经就绪。
 
-页面请求数据状态期间必须显示中性的“读取中”，不能在结果尚未返回时提前显示“阻塞”。训练结果宽表在移动视口中只允许自身容器滚动，不能撑宽整个页面或裁掉训练、暂停、恢复和回测按钮。
+页面请求数据状态期间必须显示中性的“读取中”，不能在结果尚未返回时提前显示“阻塞”。当前 DSA Web 的正式设计与验收范围仅覆盖桌面端；现有移动端自适应行为可以保留，但不作为功能目标、兼容性承诺或 Agent C 复测条件。
 
 测试式训练与正式训练使用不同的产物和实验边界：
 
@@ -250,9 +241,9 @@ Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canoni
 
 市场状态与现金仓位报告只接收最近一次正式全量质量报告批准的 A 股 qfq 快照。质量报告已经完成内容哈希验证；网页提交任务时再比较该快照的文件系统状态指纹，防止验收后、进程启动前数据被替换，同时避免每次报告都重新读取整套行情文件。
 
-当前已知边界必须如实保留：旧候选 Run 如果没有不可变数据身份或冻结策略，只能查看缺失原因；旧版但具备数据身份和策略的 Run 可能只支持自定义回测，不能称为原条件重放。Goal 1 的预览、测试、正式启动、暂停和恢复按钮都必须等待并遵从后端任务目录；后端未加载、版本不兼容或未启用时显示具体不可用状态，不发送请求。通用 LightGBM 正式训练与严格鲁棒 CSI800 研究是两套不同的数据准备契约；通用 provider 可训练不代表鲁棒 PIT 数据已就绪。旧鲁棒策略 runner、确认期和纸面跟踪仍没有 Goal 1 同等级的网页协作暂停/恢复。系统不连接券商、不自动下单。
+当前已知边界必须如实保留：旧候选 Run 如果没有不可变数据身份或冻结策略，只能查看缺失原因；旧版但具备数据身份和策略的 Run 可能只支持自定义回测，不能称为原条件重放。CSI800 选股信号稳定性检验的预览、测试、正式启动、暂停和恢复按钮都必须等待并遵从后端任务目录；后端未加载、版本不兼容或未启用时显示具体不可用状态，不发送请求。通用 LightGBM 正式训练与严格鲁棒 CSI800 研究是两套不同的数据准备契约；通用 provider 可训练不代表鲁棒 PIT 数据已就绪。旧鲁棒策略 runner、确认期和纸面跟踪仍没有同等级的网页协作暂停/恢复。系统不连接券商、不自动下单。
 
-`/research` 右侧栏提供 CatDesk 9（`a-share-us-catalyst` / 九点猫研）的本地跳转入口 `http://127.0.0.1:8765/`。当前只是网页级跳转，不共享 DSA/Qlib 数据，也不把 CatDesk 的“候选信号历史验证”归类为 Qlib 策略回测。维护口径是：九点猫研负责发现题材和候选股；DSA、AlphaSift 和 Qlib 负责进一步过滤、验证、回测和风险评估。后续若要合并模块，先单独审查重复数据源、术语和报告边界。
+首页提供 CatDesk 9（`a-share-us-catalyst` / 九点猫研）的本地服务入口。点击后由 DSA 先检查固定本机服务；未启动时只允许执行仓内约定的 CatDesk 启动程序，按钮显示启动状态，健康检查通过后再打开 `http://127.0.0.1:8765/`。该服务不共享 DSA/Qlib 数据，也不把 CatDesk 的“候选信号历史验证”归类为 Qlib 策略回测。首页的 MLflow 入口采用同样的固定服务检查与启动流程，健康后打开 DSA 的 `/experiments/` 代理页。
 
 `report_catdesk_signal_validation.py` 是 CatDesk 候选池的研究验证脚本。单日模式未填写验证日时，脚本会从 cleaned Qlib provider 的 A 股交易日历自动选择信号日后的第一个交易日；显式填写的日期不是下一交易日时会直接拒绝，避免把多日收益冒充一日验证。日历缺失或日期超出本地日历范围时才退回“只跳周末”的规则，并在 JSON 和 Markdown 报告中标记 `weekday_only`。默认严格口径下，Qlib run 必须早于验证日 09:30，脚本才会把 Qlib 分数纳入排序；晚于这个时间的模型分数会标记为不可用，避免把事后生成的分数当成事前信号。若只是做事后研究对比，可以显式传 `--allow-backfilled-qlib`，报告会记录 `qlib_backfilled_allowed=true`，意思是“用了事后补跑的 Qlib 分数做研究比较”，不是证明当时盘前已经有这个信号。
 
@@ -266,21 +257,11 @@ Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canoni
 
 研究状态 API 只会对配置的 `quant_data/qlib` provider 根目录内的 Qlib 路径补充日历、标的和体量信息。`latest_training_result.json` 如果指向根目录之外的路径，页面会保留警告，不递归扫描该目录。
 
-以下 provider 维护脚本已经进入网页，但只允许安全预演：
+`add_index_benchmark.py`、`generate_csi300.py`、`repair_qlib_provider.py`、`supervise_baostock.py` 等旧数据维护脚本只保留历史兼容，不进入正式用户页面。数据下载、清洗、Provider 构建和快照发布由 `quant_data` 项目负责；DSA 不通过其他入口重新暴露这些操作。
 
-- `add_index_benchmark.py`：在 `/workflow` 中作为“预演添加沪深300 benchmark”任务出现，后端强制 `--dry-run`，不请求 Baostock、不写 bin、不改股票池。
-- `generate_csi300.py`：在 `/workflow` 中作为“预演生成 CSI300 股票池”任务出现，后端强制 `--dry-run`，只读取缓存股票池和 Qlib 日历并打印预演结果；缓存缺失时直接失败，不走 AkShare fallback。
-- `repair_qlib_provider.py`：在 `/workflow` 中作为“预演修复 Qlib Provider”任务出现，后端强制 `--dry-run`，兼容旧客户端传入 `dry_run=true`，但拒绝 `dry_run=false`；只输出修复计划，不重命名、不写入、不删除 provider 文件。
+### 4. 查看回测和实验
 
-以下脚本暂时保留为脚本层能力：
-
-- `supervise_baostock.py`：长下载监督器，和网页任务中心自己的持久任务、日志和取消能力重叠；暂不单独暴露，优先用网页里的 Baostock 下载任务和任务日志。
-
-这三项会在 `/research` 的“功能入口盘点”中显示，避免误以为脚本被遗漏。
-
-### 3. 查看回测和实验
-
-打开 `http://127.0.0.1:8010/backtest`。
+在 `/research` 切换到“交易策略研究”。旧 `/backtest` 地址继续兼容。
 
 - `脚本回测`：直接编写 DSA Python 策略。系统先做静态安全检查，再放入有超时和资源限制的子进程；脚本只生成目标仓位，实际成交、成本、现金、净值和回撤由公共引擎计算。
 - `条件回测`：不用写代码，选择动量轮动与均线过滤、双均线择时或等权买入持有，并填写标的和参数。
@@ -289,16 +270,12 @@ Goal 1 使用 cleaned provider 时，不能只依赖质量报告顶层的 canoni
 - `Qlib 预测摘要`：读取最新 MLflow `pred.pkl`，展示最新交易日的最高/最低模型评分，并写入 `qlib_predictions_latest.{json,md}`；它是只读排行，不是自动买卖信号。
 - `Qlib 研究增强`：读取最新或指定 MLflow run 的 `pred.pkl`、`label.pkl`、`params.pkl` 和 `portfolio_analysis`，生成模型解释、回测明细、多实验对比、因子 IC、滚动训练计划和风险诊断报告。
 - `实验复现与产物`：在 `/experiments/` 核对本次训练使用的数据版本、provider、source config、runtime config、MLflow run id、参数、指标和关键 artifact，例如 `pred.pkl`、`portfolio_analysis`、`task`。
-- `交易策略优化预演`：在 `/workflow` 用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；它只读生成报告，不训练选股模型、不连接券商、不自动下单。
+- `交易策略优化预演`：在受控研究任务中用内置小样本 dry-run 验证低换手、市场择时和回撤保护实验链路；它只读生成报告，不训练选股模型、不连接券商、不自动下单。
 - `ETF 固定规则报告`：`/backtest/etf-momentum` 可在旧两 ETF 报告和三 ETF 防守轮动研究预览之间切换。三 ETF 页面只读取已有报告，不从网页触发下载或重新计算；未验收快照上的最新信号始终标记为不可用于交易。
 - “按原条件重放”会在本机重新运行冻结的组合回测，冷启动可能超过 30 秒。前端只对该本地计算使用 120 秒等待上限；若仍超时，页面会说明“本地回测等待超时”，不能把它误报成外部行情、代理或网络故障。
 - `/workflow` 的任务轮询使用 `/api/v1/quant/status?include_research=false`，避免和独立研究状态接口重复组装大数据快照。需要完整状态时，后端先完成研究数据和本地服务探测，再读取可变的任务状态；因此任务在慢查询期间完成时，响应不会继续显示请求开始时的旧“运行中”状态。
 
-打开 `http://127.0.0.1:8010/research` 查看实验记录本：
-
-- “归档”会从当前活跃实验列表移除，并写入归档 JSONL。
-- “永久删除”会真实删除 `experiment_runs.jsonl` 中对应记录，并删除带有 `<!-- experiment-run:... -->` 标记的 Markdown 实验块。
-- 永久删除需要二次确认；未标记或不完整的 Markdown 块不会被静默删除。
+从首页打开 `/experiments/` 查看 MLflow 原始实验记录。历史 DSA 实验记录管理 API 继续兼容旧调用方，但不再作为并列用户入口。
 
 ## 场内基金/ETF 边界
 
@@ -378,27 +355,20 @@ npm run test:smoke:local
 PYTHONPATH=quant_workflow/scripts .venv/bin/python -m pytest quant_workflow/tests -q
 ```
 
-浏览器验收必须至少打开：
-
-- `http://127.0.0.1:8010/research`
-- `http://127.0.0.1:8010/workflow`
-- `http://127.0.0.1:8010/backtest`
-
-并确认页面可渲染、按钮可点击、API 可调用、错误状态可显示、产物入口可访问。
+浏览器验收必须使用当前实际监听端口，至少打开 `/`、`/data`、`/research`、`/research?mode=strategy`、`/stock-analysis`、`/portfolio` 和 `/settings`。确认六项一级导航准确、首页外部链接存在、数据页只读、两个研究模式可切换，并且页面无重叠、空白或运行时错误。
 
 ## 常见异常判断
 
 | 现象 | 优先看哪里 |
 | --- | --- |
-| 页面打不开 | DSA 服务是否在 `8010`，端口是否被占用 |
-| 工作流按钮失败 | `/workflow` 任务日志抽屉、`quant_workflow/reports/jobs/<job_id>/job.log` |
+| 页面打不开 | 核对当前 DSA 监听 PID、端口和 cwd，不永久假定 `8010` |
+| 研究任务按钮失败 | `/research` 选股研究中的任务日志、`quant_workflow/reports/jobs/<job_id>/job.log` |
 | 原条件重放等待超时 | 先看 DSA 日志是否已进入 Qlib 回测；这是本地计算，不等于外部网络失败，避免连续重复点击 |
-| Qlib 不可训练 | `/research` 的数据状态和 `check_qlib_data` 任务日志 |
-| 数据质量差 | 最新数据质量报告、异常股票清单、清洗策略报告 |
-| 训练效果差 | `/backtest` 的 Qlib 指标、MLflow、cash-control 对比 |
-| 实验删不掉 | 确认 run id 存在，Markdown 实验块是否带完整标记 |
+| Qlib 不可训练 | `/data` 的快照身份、`/research` 的训练阻塞原因和任务日志 |
+| 数据服务不可用 | `quant_data` 服务的 `/health`、`/ready` 与 DSA `/api/v1/data/status` |
+| 训练效果差 | 量化研究中的回测指标和 MLflow 原始 Run |
 
-重启 8010 后必须同时用 `lsof -nP -iTCP:8010 -sTCP:LISTEN` 和进程树确认旧
+重启 DSA 后必须同时用 `lsof -nP -iTCP:<实际端口> -sTCP:LISTEN` 和进程树确认旧
 服务已经退出。关闭 screen 容器不保证其 login/Python 子进程一定随之退出；发现
 孤立服务时，只能终止已经核对过身份和进程组的旧 DSA，不能按模糊进程名批量
 结束，更不能影响 6006 的 MLflow。
@@ -406,11 +376,12 @@ PYTHONPATH=quant_workflow/scripts .venv/bin/python -m pytest quant_workflow/test
 ## 阶段验收清单
 
 - DSA 工作区无散落未跟踪源码。
-- `/research`、`/workflow`、`/backtest` 能在浏览器打开。
-- 工作流白名单任务均有网页入口；交易策略优化预演默认 dry-run，只作为安全链路验证。
-- Qlib 数据检查、转换、训练、回测摘要可以从网页触发或查看。
+- 一级导航只有首页、数据、量化研究、个股分析、持仓和设置。
+- 首页保留九点猫研、MLflow 等常用入口，并以不可点击的关系图说明项目职责与数据流；不承载研究状态。
+- `/data` 只读连接 `quant_data` 服务，不提供下载、发布或 Provider 构建操作。
+- `/research` 同时承载选股研究和交易策略研究；`/workflow`、`/backtest` 仅作兼容路由。
+- Qlib 通用训练和回测只消费 `quant_data` 已发布的不可变数据快照，并在使用前完成轻量 Provider 预检；CSI800 专用流程继续遵守自己的冻结 readiness 契约。
 - MLflow 链接存在，但不替代 DSA 主 UI。
-- 实验记录支持归档和永久删除。
 - `china-astock-quant` 的复用能力已列账，交易相关能力保持禁区。
 - 同花顺只作为只读观察方向，手机连接暂不做。
-- 后端 pytest、前端 test/lint/build、浏览器 smoke 和一个 Codex 子 Agent 只读 review 都完成后，才算阶段闭环；本项目当前不再把 OpenCode 或 Claude review 作为门槛。
+- 后端 pytest、前端 test/lint/build 和浏览器 smoke 通过后，交给 Agent C 按网页步骤复测；除非明确要求，不运行 complete/OpenCode 验收。

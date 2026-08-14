@@ -1,9 +1,14 @@
 import json
 import hashlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from prepare_robust_signal_data import prepare_robust_signal_data
+from quant_data_service_client import (
+    QuantDataClientError,
+    QuantDataDatasetResult,
+    QuantDataIdentity,
+)
 
 
 def _cleaned_provider_lineage(
@@ -25,112 +30,141 @@ def _cleaned_provider_lineage(
     }
 
 
-def _write_quality_evidence(
-    reports_dir: Path,
-    *,
-    trainable: bool = True,
-    snapshot_id: str = "snapshot-v2",
-) -> tuple[Path, dict[str, str]]:
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    identity = _cleaned_provider_lineage(snapshot_id=snapshot_id)
-    state = {
-        "algorithm": "relative-path-size-mtime-ctime-device-inode-v2",
-        "file_count": 10,
-        "total_bytes": 100,
-        "scanned_entries": 12,
-        "sha256": "e" * 64,
-    }
-    failure_reasons = [] if trainable else ["cleaned provider failed"]
-    evidence = {
-        "schema_version": 3,
-        "evidence_contract": "immutable_data_quality_evidence_v2",
-        "trainable": trainable,
-        "scan_mode": "full",
-        "coverage_status": "full",
-        "verification_status": "verified",
-        "requested_sample": 0,
-        "scanned_instruments": 100,
-        "training_thresholds": {
-            "authoritative": True,
-            "min_calendar_days": 252,
-            "min_instruments": 100,
-            "min_merged_instruments": 100,
-        },
-        "data_contract": {
-            "status": "verified",
-            "qlib_providers": {"cleaned": identity},
-            "snapshot_state": {
-                "stable": True,
-                "content_revalidated": True,
-                "before": {"qlib_ashare_cleaned_v2": state},
-                "after_scan": {"qlib_ashare_cleaned_v2": state},
-                "after_revalidation": {"qlib_ashare_cleaned_v2": state},
-                "after": {"qlib_ashare_cleaned_v2": state},
-            },
-        },
-        "provider_quality": {
-            "cleaned": {
-                **identity,
-                "provider": "cleaned",
-                "trainable": trainable,
-                "failure_reasons": failure_reasons,
-                "training_readiness": {
-                    "status": "trainable" if trainable else "limited",
-                    "failure_reasons": failure_reasons,
-                },
-            }
-        },
-    }
-    evidence_bytes = (
-        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
-    evidence_name = f"data_quality_report_20260803_120000_{evidence_sha256[:16]}.json"
-    (reports_dir / evidence_name).write_bytes(evidence_bytes)
-    pointer = reports_dir / "data_quality_report_latest.json"
-    pointer.write_text(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "publication_contract": (
-                    "atomic_json_pointer_to_immutable_quality_evidence_v2"
-                ),
-                "report_id": f"data-quality-{evidence_sha256[:16]}",
-                "evidence_artifact": evidence_name,
-                "evidence_sha256": evidence_sha256,
-            }
-        ),
-        encoding="utf-8",
+def _service_result(dataset_id: str, *, basis: str, kind: str) -> QuantDataDatasetResult:
+    identity = QuantDataIdentity(
+        dataset_id=dataset_id,
+        snapshot_id=f"{dataset_id}-snapshot",
+        manifest_sha256="a" * 64,
+        content_sha256="b" * 64,
+        latest_trade_date="2026-08-07",
+        price_basis=basis,
+        data_kind=kind,
     )
-    return pointer, identity
+    return QuantDataDatasetResult(
+        identity=identity,
+        metadata={**identity.as_dict(), "validated": True},
+        payload={
+            "status": "ready",
+            "metadata": {**identity.as_dict(), "validated": True},
+        },
+    )
 
 
-def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
+def _ready_service_client() -> MagicMock:
+    results = {
+        "ashare_daily_qfq": _service_result(
+            "ashare_daily_qfq", basis="qfq", kind="daily_bars"
+        ),
+        "cn_index_daily": _service_result(
+            "cn_index_daily", basis="derived", kind="daily_bars"
+        ),
+        "pit_csi800": _service_result(
+            "pit_csi800",
+            basis="not_applicable",
+            kind="point_in_time_membership",
+        ),
+        "robust_reference": _service_result(
+            "robust_reference",
+            basis="not_applicable",
+            kind="point_in_time_reference",
+        ),
+        "ashare_fundamentals_pit": _service_result(
+            "ashare_fundamentals_pit",
+            basis="not_applicable",
+            kind="point_in_time_fundamentals",
+        ),
+        "qlib_cleaning_plan": _service_result(
+            "qlib_cleaning_plan",
+            basis="not_applicable",
+            kind="qlib_cleaning_plan",
+        ),
+    }
+    client = MagicMock()
+    client.resolve_dataset.side_effect = lambda dataset_id, **_kwargs: results[dataset_id]
+    return client
+
+
+def test_prepare_uses_service_identity_and_does_not_build_data(tmp_path: Path) -> None:
+    provider = tmp_path / "formal-provider"
+    provider.mkdir()
+    status_path = tmp_path / "reports" / "readiness.json"
+    results = {
+        "ashare_daily_qfq": _service_result(
+            "ashare_daily_qfq", basis="qfq", kind="daily_bars"
+        ),
+        "cn_index_daily": _service_result(
+            "cn_index_daily", basis="derived", kind="daily_bars"
+        ),
+        "pit_csi800": _service_result(
+            "pit_csi800",
+            basis="not_applicable",
+            kind="point_in_time_membership",
+        ),
+        "robust_reference": _service_result(
+            "robust_reference",
+            basis="not_applicable",
+            kind="point_in_time_reference",
+        ),
+        "ashare_fundamentals_pit": _service_result(
+            "ashare_fundamentals_pit",
+            basis="not_applicable",
+            kind="point_in_time_fundamentals",
+        ),
+        "qlib_cleaning_plan": _service_result(
+            "qlib_cleaning_plan",
+            basis="not_applicable",
+            kind="qlib_cleaning_plan",
+        ),
+    }
+    client = MagicMock()
+    client.resolve_dataset.side_effect = lambda dataset_id, **_kwargs: results[dataset_id]
+
+    with (
+        patch(
+            "prepare_robust_signal_data.qlib_workflow_provider_uri",
+            return_value=provider,
+        ),
+        patch(
+            "prepare_robust_signal_data.provider_identity",
+            return_value={
+                **_cleaned_provider_lineage(),
+                "provider_uri": str(provider),
+            },
+        ),
+        patch("prepare_robust_signal_data.prepare_runtime_provider") as builder,
+        patch("prepare_robust_signal_data.load_verified_cleaned_quality_evidence") as quality,
+    ):
+        payload = prepare_robust_signal_data(
+            quant_data_dir=tmp_path / "empty-quant-data",
+            status_path=status_path,
+            client=client,
+        )
+
+    assert payload["status"] == "ready"
+    assert set(payload["data_identities"]) == set(results)
+    assert payload["data_identities"]["pit_csi800"]["snapshot_id"] == (
+        "pit_csi800-snapshot"
+    )
+    assert client.resolve_dataset.call_args_list == [
+        call("ashare_daily_qfq", basis="qfq"),
+        call("cn_index_daily", basis="derived"),
+        call("pit_csi800", basis="not_applicable"),
+        call("robust_reference", basis="not_applicable"),
+        call("ashare_fundamentals_pit", basis="not_applicable"),
+        call("qlib_cleaning_plan", basis="not_applicable"),
+    ]
+    builder.assert_not_called()
+    quality.assert_not_called()
+
+
+def test_prepare_writes_content_addressed_readiness_for_service_snapshots(
     tmp_path: Path,
 ) -> None:
-    quant_data = tmp_path / "quant_data"
-    canonical = quant_data / "qlib" / "cleaned" / "snapshots" / "snapshot-v2"
-    canonical.mkdir(parents=True)
-    (quant_data / "DATA_MANIFEST.json").write_text('{"version": 2}\n', encoding="utf-8")
-    intervals = (
-        quant_data / "reference" / "pit_csi800" / "membership_intervals.parquet"
-    )
-    intervals.parent.mkdir(parents=True)
-    intervals.write_bytes(b"membership")
+    canonical = tmp_path / "formal-provider"
+    canonical.mkdir()
     status_path = tmp_path / "reports" / "readiness.json"
-    quality_pointer, quality_identity = _write_quality_evidence(
-        tmp_path / "reports" / "quality"
-    )
-    result = {
-        "provider_uri": str(
-            quant_data / "runtime" / "robust_strategy" / "providers" / ("a" * 16)
-        ),
-        "provider_key": "a" * 64,
-        "provider_tree_sha256": "b" * 64,
-        "symbols": 1633,
-        "intervals": 2058,
-        "reused": False,
-    }
+    lineage = _cleaned_provider_lineage()
+    client = _ready_service_client()
 
     with (
         patch(
@@ -139,38 +173,22 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
         ),
         patch(
             "prepare_robust_signal_data.provider_identity",
-            return_value={
-                **quality_identity,
-                "provider_uri": str(canonical),
-            },
-        ),
-        patch(
-            "prepare_robust_signal_data.prepare_runtime_provider",
-            return_value=result,
+            return_value={**lineage, "provider_uri": str(canonical)},
         ),
     ):
         payload = prepare_robust_signal_data(
-            quant_data_dir=quant_data,
+            quant_data_dir=tmp_path / "unused-quant-data",
             status_path=status_path,
-            quality_pointer_path=quality_pointer,
+            client=client,
         )
 
     assert payload["status"] == "ready"
     assert payload["trainable"] is True
     assert payload["canonical_snapshot_id"] == "snapshot-v2"
-    assert payload["quality_report_id"].startswith("data-quality-")
-    assert payload["quality_evidence_artifact_name"].startswith(
-        "data_quality_report_"
-    )
-    assert len(payload["quality_evidence_sha256"]) == 64
-    assert payload["cleaned_provider_identity"] == quality_identity
+    assert len(payload["data_identity_sha256"]) == 64
+    assert payload["cleaned_provider_identity"] == lineage
     assert "provider_uri" not in payload["cleaned_provider_identity"]
     assert payload["acceptance_owner"] == "data_module"
-    assert (
-        payload["acceptance_contract"]
-        == "data_module_accepted_content_addressed_snapshot_v2"
-    )
-    assert payload["data_manifest_sha256"] != payload["membership_intervals_sha256"]
     assert status_path.is_file()
     pointer = json.loads(status_path.read_text(encoding="utf-8"))
     assert pointer["pointer_contract"] == "robust_signal_data_readiness_pointer_v1"
@@ -186,108 +204,75 @@ def test_prepare_writes_dedicated_readiness_bound_to_current_manifest(
     artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert "provider_uri" not in artifact_payload["cleaned_provider_identity"]
     assert artifact_payload["provider_key"] == payload["provider_key"]
-    assert (
-        artifact_payload["quality_evidence_artifact_name"]
-        == payload["quality_evidence_artifact_name"]
-    )
-    assert (
-        artifact_payload["quality_evidence_sha256"]
-        == payload["quality_evidence_sha256"]
-    )
+    assert artifact_payload["data_identities"] == payload["data_identities"]
 
 
-def test_prepare_records_blocked_data_when_pit_membership_is_missing(
+def test_prepare_records_blocked_data_when_service_rejects_a_required_dataset(
     tmp_path: Path,
 ) -> None:
-    quant_data = tmp_path / "quant_data"
-    quant_data.mkdir()
-    (quant_data / "DATA_MANIFEST.json").write_text("{}\n", encoding="utf-8")
     status_path = tmp_path / "reports" / "readiness.json"
+    client = _ready_service_client()
+    client.resolve_dataset.side_effect = QuantDataClientError(
+        "dataset unavailable", code="snapshot_not_ready", status_code=503
+    )
 
     payload = prepare_robust_signal_data(
-        quant_data_dir=quant_data,
+        quant_data_dir=tmp_path / "unused-quant-data",
         status_path=status_path,
+        client=client,
     )
 
     assert payload["status"] == "blocked_data"
     assert payload["trainable"] is False
-    assert payload["reason_code"] == "membership_intervals_missing"
+    assert payload["reason_code"] == "quant_data_service_unavailable"
     assert status_path.is_file()
 
 
-def test_prepare_records_sanitized_bounded_provider_build_error(tmp_path: Path) -> None:
-    quant_data = tmp_path / "quant_data"
-    canonical = quant_data / "qlib" / "cleaned" / "snapshots" / "snapshot-v2"
-    canonical.mkdir(parents=True)
-    (quant_data / "DATA_MANIFEST.json").write_text("{}\n", encoding="utf-8")
-    intervals = (
-        quant_data / "reference" / "pit_csi800" / "membership_intervals.parquet"
-    )
-    intervals.parent.mkdir(parents=True)
-    intervals.write_bytes(b"membership")
+def test_prepare_blocks_when_formal_qlib_provider_is_unavailable(tmp_path: Path) -> None:
     status_path = tmp_path / "reports" / "readiness.json"
-    quality_pointer, quality_identity = _write_quality_evidence(
-        tmp_path / "reports" / "quality"
-    )
-    private_path = tmp_path / "private" / "provider.bin"
+    client = _ready_service_client()
 
     with (
         patch(
             "prepare_robust_signal_data.qlib_workflow_provider_uri",
-            return_value=canonical,
-        ),
-        patch(
-            "prepare_robust_signal_data.provider_identity",
-            return_value=quality_identity,
-        ),
-        patch(
-            "prepare_robust_signal_data.prepare_runtime_provider",
-            side_effect=RuntimeError(f"provider failed at {private_path}" + "x" * 1000),
+            side_effect=RuntimeError("formal Provider unavailable"),
         ),
     ):
         payload = prepare_robust_signal_data(
-            quant_data_dir=quant_data,
+            quant_data_dir=tmp_path / "unused-quant-data",
             status_path=status_path,
-            quality_pointer_path=quality_pointer,
-        )
-
-    assert payload.get("error_type") == "RuntimeError"
-    assert isinstance(payload.get("error"), str)
-    assert len(payload["error"]) <= 500
-    assert str(tmp_path) not in payload["error"]
-    pointer = json.loads(status_path.read_text(encoding="utf-8"))
-    artifact_payload = json.loads(
-        (status_path.parent / pointer["artifact"]).read_text(encoding="utf-8")
-    )
-    assert artifact_payload["error_type"] == payload["error_type"]
-    assert artifact_payload["error"] == payload["error"]
-
-
-def test_prepare_refuses_full_verified_quality_evidence_when_not_trainable(
-    tmp_path: Path,
-) -> None:
-    quant_data = tmp_path / "quant_data"
-    quant_data.mkdir()
-    (quant_data / "DATA_MANIFEST.json").write_text("{}\n", encoding="utf-8")
-    intervals = (
-        quant_data / "reference" / "pit_csi800" / "membership_intervals.parquet"
-    )
-    intervals.parent.mkdir(parents=True)
-    intervals.write_bytes(b"membership")
-    quality_pointer, _identity = _write_quality_evidence(
-        tmp_path / "reports" / "quality",
-        trainable=False,
-    )
-    status_path = tmp_path / "reports" / "readiness.json"
-
-    with patch("prepare_robust_signal_data.prepare_runtime_provider") as build_provider:
-        payload = prepare_robust_signal_data(
-            quant_data_dir=quant_data,
-            status_path=status_path,
-            quality_pointer_path=quality_pointer,
+            client=client,
         )
 
     assert payload["status"] == "blocked_data"
-    assert payload["trainable"] is False
-    assert payload["reason_code"] == "quality_evidence_not_trainable"
-    build_provider.assert_not_called()
+    assert payload["reason_code"] == "cleaned_provider_unavailable"
+
+
+def test_prepare_does_not_consult_legacy_quality_pointer(
+    tmp_path: Path,
+) -> None:
+    provider = tmp_path / "formal-provider"
+    provider.mkdir()
+    status_path = tmp_path / "reports" / "readiness.json"
+    client = _ready_service_client()
+
+    with (
+        patch(
+            "prepare_robust_signal_data.qlib_workflow_provider_uri",
+            return_value=provider,
+        ),
+        patch(
+            "prepare_robust_signal_data.provider_identity",
+            return_value=_cleaned_provider_lineage(),
+        ),
+        patch("prepare_robust_signal_data.load_verified_cleaned_quality_evidence") as quality,
+    ):
+        payload = prepare_robust_signal_data(
+            quant_data_dir=tmp_path / "unused-quant-data",
+            status_path=status_path,
+            quality_pointer_path=tmp_path / "obsolete-quality.json",
+            client=client,
+        )
+
+    assert payload["status"] == "ready"
+    quality.assert_not_called()

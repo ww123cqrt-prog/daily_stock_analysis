@@ -182,6 +182,49 @@ def test_external_fundamental_features_align_by_date_and_instrument(
     assert aligned.iloc[:, 0].tolist() == [0.4, 0.2]
 
 
+def test_external_fundamental_features_accept_service_dataframe() -> None:
+    source = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "instrument": ["SH600000", "SZ000001"],
+            "FUND_VALUE_BOOK_TO_MARKET": [0.2, 0.4],
+        }
+    )
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2025-01-02"), "SZ000001"),
+            (pd.Timestamp("2025-01-02"), "SH600000"),
+        ],
+        names=["datetime", "instrument"],
+    )
+
+    aligned = align_external_features(index, source, prefixes=["FUND_VALUE_"])
+
+    assert aligned.iloc[:, 0].tolist() == [0.4, 0.2]
+
+
+def test_industry_interval_matching_accepts_service_dataframe() -> None:
+    intervals = pd.DataFrame(
+        {
+            "symbol": ["SH600000", "SH600000"],
+            "industry_code": ["OLD", "NEW"],
+            "start_date": ["2020-01-01", "2023-01-01"],
+            "end_date": ["2022-12-31", "2025-12-31"],
+        }
+    )
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2022-06-01"), "SH600000"),
+            (pd.Timestamp("2024-06-01"), "SH600000"),
+        ],
+        names=["datetime", "instrument"],
+    )
+
+    matched = match_industry_intervals(index, intervals)
+
+    assert matched.tolist() == ["OLD", "NEW"]
+
+
 def test_external_fundamental_features_reject_2026_rows(tmp_path: Path) -> None:
     path = tmp_path / "fundamentals"
     (path / "daily").mkdir(parents=True)
@@ -231,6 +274,53 @@ def test_signal_dataset_config_wires_external_feature_contract(tmp_path: Path) -
     assert kwargs["include_handler_features"] is False
     assert kwargs["external_features_path"] == str((tmp_path / "fundamentals").resolve())
     assert kwargs["external_feature_prefixes"] == ["FUND_QUALITY_"]
+
+
+def test_signal_dataset_config_wires_service_dataframes() -> None:
+    split = RollingSplit(
+        train_start=pd.Timestamp("2020-01-02"),
+        train_end=pd.Timestamp("2022-06-30"),
+        validation_start=pd.Timestamp("2022-07-08"),
+        validation_end=pd.Timestamp("2022-12-30"),
+        test_start=pd.Timestamp("2023-01-09"),
+        test_end=pd.Timestamp("2023-03-31"),
+    )
+    fundamentals = pd.DataFrame(
+        {
+            "datetime": [pd.Timestamp("2023-01-09")],
+            "instrument": ["SH600000"],
+            "FUND_QUALITY_ROE": [0.1],
+        }
+    )
+    industries = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "industry_code": ["BANK"],
+            "start_date": [pd.Timestamp("2020-01-01")],
+            "end_date": [pd.Timestamp("2025-12-31")],
+        }
+    )
+
+    config = build_signal_dataset_config(
+        split=split,
+        signal={
+            "horizon_days": 5,
+            "normalization_scope": "industry",
+            "target": "csi800_excess",
+        },
+        feature_prefixes=[],
+        include_handler_features=False,
+        external_features=fundamentals,
+        external_feature_prefixes=["FUND_QUALITY_"],
+        industry_intervals=industries,
+        benchmark_returns={},
+        market_states={},
+    )
+
+    assert config["kwargs"]["external_features"] is fundamentals
+    assert config["kwargs"]["industry_intervals"] is industries
+    assert config["kwargs"]["external_features_path"] is None
+    assert config["kwargs"]["industry_intervals_path"] is None
 
 
 def test_external_only_dataset_config_uses_minimal_anchor_handler(

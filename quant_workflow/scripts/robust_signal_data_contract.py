@@ -17,6 +17,13 @@ try:
         provider_lineages_match,
     )
     from ._paths import provider_has_instrument_pool, reports_root
+    from ._paths import qlib_workflow_provider_uri
+    from .quant_data_service_client import (
+        DEFAULT_QUANT_DATA_SERVICE_URL,
+        QuantDataClientError,
+        QuantDataIdentity,
+        QuantDataServiceClient,
+    )
     from .prepare_robust_provider import (
         runtime_provider_identity,
     )
@@ -27,6 +34,13 @@ except ImportError:  # Direct script execution and quant_workflow test mode.
         provider_lineages_match,
     )
     from _paths import provider_has_instrument_pool, reports_root
+    from _paths import qlib_workflow_provider_uri
+    from quant_data_service_client import (
+        DEFAULT_QUANT_DATA_SERVICE_URL,
+        QuantDataClientError,
+        QuantDataIdentity,
+        QuantDataServiceClient,
+    )
     from prepare_robust_provider import (
         runtime_provider_identity,
     )
@@ -48,6 +62,14 @@ QUALITY_REPORT_ID_RE = re.compile(r"^data-quality-[0-9a-f]{16}$")
 QUALITY_EVIDENCE_NAME_RE = re.compile(
     r"^data_quality_report_\d{8}_\d{6}_[0-9a-f]{16}\.json$"
 )
+REQUIRED_DATASET_BASIS = {
+    "ashare_daily_qfq": "qfq",
+    "cn_index_daily": "derived",
+    "pit_csi800": "not_applicable",
+    "robust_reference": "not_applicable",
+    "ashare_fundamentals_pit": "not_applicable",
+    "qlib_cleaning_plan": "not_applicable",
+}
 class RobustSignalDataBlocked(ValueError):
     """A structured, user-actionable robust-data readiness failure."""
 
@@ -175,6 +197,10 @@ def _blocked(reason_code: str) -> RobustSignalDataBlocked:
         "cleaned_provider_quality_mismatch": (
             "The cleaned Qlib Provider does not match the approved quality evidence.",
             "当前 cleaned Qlib Provider 与完整数据质量证据不一致，请重新验收数据。",
+        ),
+        "quant_data_service_unavailable": (
+            "The quant_data data backend is unavailable or no longer serves the frozen snapshots.",
+            "quant_data 数据后端不可用，或已无法提供冻结的数据快照。",
         ),
     }
     summary, summary_zh = messages[reason_code]
@@ -615,22 +641,114 @@ def evaluate_robust_signal_data(
     }
 
 
+def _consume_service_readiness(
+    status: Mapping[str, Any],
+    *,
+    client: QuantDataServiceClient | None,
+    provider_resolver: Callable[..., Path],
+) -> dict[str, Any]:
+    raw_identities = status.get("data_identities")
+    aggregate_sha256 = status.get("data_identity_sha256")
+    if (
+        not isinstance(raw_identities, Mapping)
+        or set(raw_identities) != set(REQUIRED_DATASET_BASIS)
+        or not isinstance(aggregate_sha256, str)
+        or not SHA256_RE.fullmatch(aggregate_sha256)
+    ):
+        raise _blocked("robust_readiness_invalid")
+
+    identities: dict[str, QuantDataIdentity] = {}
+    serialized: dict[str, dict[str, str]] = {}
+    try:
+        for dataset_id, basis in REQUIRED_DATASET_BASIS.items():
+            identity = QuantDataIdentity.from_mapping(raw_identities.get(dataset_id))
+            if identity.dataset_id != dataset_id or identity.price_basis != basis:
+                raise _blocked("robust_readiness_invalid")
+            identities[dataset_id] = identity
+            serialized[dataset_id] = identity.as_dict()
+    except QuantDataClientError as exc:
+        raise _blocked("robust_readiness_invalid") from exc
+    actual_aggregate = hashlib.sha256(
+        json.dumps(serialized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if actual_aggregate != aggregate_sha256:
+        raise _blocked("robust_readiness_invalid")
+
+    owns_client = client is None
+    service = client or QuantDataServiceClient(
+        base_url=os.getenv(
+            "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
+        )
+    )
+    try:
+        service.ready()
+        for dataset_id, identity in identities.items():
+            service.resolve_dataset(
+                dataset_id,
+                basis=identity.price_basis,
+                expected_identity=identity,
+            )
+    except QuantDataClientError as exc:
+        raise _blocked("quant_data_service_unavailable") from exc
+    finally:
+        if owns_client:
+            service.close()
+
+    lineage = status.get("cleaned_provider_identity")
+    if not _cleaned_identity_is_valid(lineage):
+        raise _blocked("robust_readiness_invalid")
+    normalized_lineage = normalize_provider_lineage(lineage)
+    try:
+        provider = Path(
+            provider_resolver(
+                "cleaned", expected_provider_identity=normalized_lineage
+            )
+        ).expanduser()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _blocked("provider_unavailable") from exc
+    if provider.is_symlink() or not provider.is_dir():
+        raise _blocked("provider_unavailable")
+
+    descriptor_sha256 = normalized_lineage.get("descriptor_sha256")
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "acceptance_owner": ACCEPTANCE_OWNER,
+        "acceptance_contract": ACCEPTANCE_CONTRACT,
+        "status": "ready",
+        "trainable": True,
+        "reason_code": None,
+        "summary": "The quant_data data backend serves the frozen robust CSI800 snapshots.",
+        "summary_zh": "quant_data 数据后端已提供冻结的鲁棒 CSI800 数据快照。",
+        "generated_at": status.get("generated_at"),
+        "provider_uri": str(provider.resolve()),
+        "provider_name": "Qlib Provider",
+        "provider_key": descriptor_sha256,
+        "provider_tree_sha256": descriptor_sha256,
+        "data_identity_sha256": aggregate_sha256,
+        "data_identities": serialized,
+        "cleaned_provider_identity": normalized_lineage,
+        "canonical_snapshot_id": identities["ashare_daily_qfq"].snapshot_id,
+        "symbols": status.get("symbols"),
+        "intervals": status.get("intervals"),
+    }
+
+
 def consume_accepted_robust_signal_data(
     *,
     artifact_path: Path,
     artifact_sha256: str,
-    provider_root: Path,
+    provider_root: Path | None = None,
     reports_dir: Path | None = None,
     provider_identity: Callable[[Path, str], Mapping[str, str] | None] = (
         runtime_provider_identity
     ),
+    client: QuantDataServiceClient | None = None,
+    provider_resolver: Callable[..., Path] = qlib_workflow_provider_uri,
 ) -> dict[str, Any]:
     """Consume one submission-frozen data-module readiness artifact.
 
-    The data module owns source resolution, cleaning, business-quality checks and
-    publication. Training and status consumers only verify the frozen readiness
-    record plus the provider's content identity so an updated data catalog cannot
-    silently change an existing training input.
+    The data service owns source resolution and publication. Consumers lock every
+    service response to the identities frozen in this readiness artifact.
     """
 
     controlled_reports_dir = Path(reports_dir or reports_root()).expanduser().resolve()
@@ -638,7 +756,7 @@ def consume_accepted_robust_signal_data(
         controlled_reports_dir / "robust_signal" / READINESS_ARTIFACT_DIRNAME
     ).resolve()
     artifact_path = Path(os.path.abspath(Path(artifact_path).expanduser()))
-    provider_root = Path(provider_root).expanduser().resolve()
+    del provider_root, provider_identity
     if (
         not isinstance(artifact_sha256, str)
         or not SHA256_RE.fullmatch(artifact_sha256)
@@ -690,130 +808,15 @@ def consume_accepted_robust_signal_data(
     ):
         raise _blocked("robust_readiness_invalid")
 
-    recorded_manifest_sha256 = status.get("data_manifest_sha256")
-    membership_intervals_sha256 = status.get("membership_intervals_sha256")
-    if (
-        not isinstance(recorded_manifest_sha256, str)
-        or not SHA256_RE.fullmatch(recorded_manifest_sha256)
-        or not isinstance(membership_intervals_sha256, str)
-        or not SHA256_RE.fullmatch(membership_intervals_sha256)
-    ):
+    if "data_identities" not in status:
         raise _blocked("robust_readiness_invalid")
-    report_id = status.get("quality_report_id")
-    evidence_artifact_name = status.get("quality_evidence_artifact_name")
-    evidence_sha256 = status.get("quality_evidence_sha256")
-    cleaned_identity = status.get("cleaned_provider_identity")
-    if (
-        not isinstance(report_id, str)
-        or not QUALITY_REPORT_ID_RE.fullmatch(report_id)
-        or not isinstance(evidence_artifact_name, str)
-        or not QUALITY_EVIDENCE_NAME_RE.fullmatch(evidence_artifact_name)
-        or not isinstance(evidence_sha256, str)
-        or not SHA256_RE.fullmatch(evidence_sha256)
-        or report_id != f"data-quality-{evidence_sha256[:16]}"
-        or not evidence_artifact_name.endswith(
-            f"_{evidence_sha256[:16]}.json"
-        )
-        or not _cleaned_identity_is_valid(cleaned_identity)
-    ):
-        raise _blocked("robust_readiness_invalid")
-
-    evidence_path = controlled_reports_dir / evidence_artifact_name
-    if evidence_path.parent != controlled_reports_dir:
-        raise _blocked("quality_evidence_invalid")
-    evidence_bytes = _read_regular_bytes(
-        evidence_path,
-        max_bytes=MAX_QUALITY_EVIDENCE_BYTES,
+    consumed = _consume_service_readiness(
+        status,
+        client=client,
+        provider_resolver=provider_resolver,
     )
-    if evidence_bytes is None:
-        raise _blocked("quality_evidence_missing")
-    if hashlib.sha256(evidence_bytes).hexdigest() != evidence_sha256:
-        raise _blocked("quality_evidence_changed")
-    try:
-        evidence = json.loads(evidence_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise _blocked("quality_evidence_invalid") from exc
-    data_contract = evidence.get("data_contract") if isinstance(evidence, Mapping) else None
-    provider_identities = (
-        data_contract.get("qlib_providers")
-        if isinstance(data_contract, Mapping)
-        else None
-    )
-    evidence_cleaned_identity = (
-        provider_identities.get("cleaned")
-        if isinstance(provider_identities, Mapping)
-        else None
-    )
-    if (
-        not isinstance(evidence, Mapping)
-        or evidence.get("schema_version") != 3
-        or evidence.get("evidence_contract")
-        != "immutable_data_quality_evidence_v2"
-        or not isinstance(evidence_cleaned_identity, Mapping)
-    ):
-        raise _blocked("quality_evidence_invalid")
-    if not _cleaned_identities_match(evidence_cleaned_identity, cleaned_identity):
-        raise _blocked("cleaned_provider_quality_mismatch")
-
-    provider_text = status.get("provider_uri")
-    if not isinstance(provider_text, str) or not provider_text.strip():
-        raise _blocked("provider_unavailable")
-    provider = Path(provider_text).expanduser()
-    try:
-        provider = provider.resolve(strict=False)
-    except OSError as exc:
-        raise _blocked("provider_unavailable") from exc
-    if provider.is_symlink() or not _provider_is_under(provider, provider_root):
-        raise _blocked("provider_outside_runtime")
-    if not provider.is_dir():
-        raise _blocked("provider_unavailable")
-
-    provider_key = status.get("provider_key")
-    provider_tree_sha256 = status.get("provider_tree_sha256")
-    if (
-        not isinstance(provider_key, str)
-        or not SHA256_RE.fullmatch(provider_key)
-        or not isinstance(provider_tree_sha256, str)
-        or not SHA256_RE.fullmatch(provider_tree_sha256)
-    ):
-        raise _blocked("provider_identity_mismatch")
-    runtime_identity = provider_identity(provider, provider_key)
-    if (
-        runtime_identity is None
-        or runtime_identity.get("provider_key") != provider_key
-        or runtime_identity.get("provider_tree_sha256") != provider_tree_sha256
-    ):
-        raise _blocked("provider_identity_mismatch")
-    try:
-        has_csi800 = provider_has_instrument_pool(provider, "csi800")
-    except (OSError, RuntimeError, ValueError):
-        has_csi800 = False
-    if not has_csi800:
-        raise _blocked("csi800_instruments_missing")
-
     return {
-        "contract_version": CONTRACT_VERSION,
-        "acceptance_owner": ACCEPTANCE_OWNER,
-        "acceptance_contract": ACCEPTANCE_CONTRACT,
-        "status": "ready",
-        "trainable": True,
-        "reason_code": None,
-        "summary": "The data module published an accepted immutable Robust CSI800 snapshot.",
-        "summary_zh": "数据模块已发布通过验收的不可变鲁棒 CSI800 数据快照。",
-        "generated_at": status.get("generated_at"),
-        "provider_uri": str(provider),
-        "provider_name": provider.name,
-        "provider_key": provider_key,
-        "provider_tree_sha256": provider_tree_sha256,
-        "data_manifest_sha256": recorded_manifest_sha256,
-        "membership_intervals_sha256": membership_intervals_sha256,
-        "quality_report_id": report_id,
-        "quality_evidence_artifact_name": evidence_artifact_name,
-        "quality_evidence_sha256": evidence_sha256,
-        "cleaned_provider_identity": dict(cleaned_identity),
-        "canonical_snapshot_id": status.get("canonical_snapshot_id"),
-        "symbols": status.get("symbols"),
-        "intervals": status.get("intervals"),
+        **consumed,
         "readiness_artifact_name": artifact_path.name,
         "readiness_artifact_sha256": artifact_sha256,
     }
@@ -843,9 +846,9 @@ def consume_latest_accepted_robust_signal_data(
 
 
 def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove local paths before readiness data is returned by an API."""
+    """Expose service identities without leaking storage implementation details."""
 
-    return {
+    public = {
         key: payload.get(key)
         for key in (
             "contract_version",
@@ -857,15 +860,8 @@ def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "summary",
             "summary_zh",
             "generated_at",
-            "provider_name",
-            "provider_key",
-            "provider_tree_sha256",
-            "data_manifest_sha256",
-            "membership_intervals_sha256",
-            "quality_report_id",
-            "quality_evidence_artifact_name",
-            "quality_evidence_sha256",
-            "cleaned_provider_identity",
+            "data_identity_sha256",
+            "data_identities",
             "canonical_snapshot_id",
             "symbols",
             "intervals",
@@ -874,3 +870,6 @@ def public_readiness_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
         if payload.get(key) is not None
     }
+    if payload.get("provider_name") is not None:
+        public["provider_name"] = "Qlib Provider"
+    return public

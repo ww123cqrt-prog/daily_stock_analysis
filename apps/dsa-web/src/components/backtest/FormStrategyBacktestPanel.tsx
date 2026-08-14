@@ -10,43 +10,37 @@ import StrategyBacktestResults from './StrategyBacktestResults';
 const INPUT = 'input-surface input-focus-glow h-10 w-full rounded-lg border bg-transparent px-3 text-sm focus:outline-none disabled:opacity-60';
 
 const STRATEGIES: Record<FormStrategyId, {
-  zh: { name: string; rule: string; universe: string };
-  en: { name: string; rule: string; universe: string };
+  zh: { name: string; rule: string };
+  en: { name: string; rule: string };
 }> = {
   momentum_rotation: {
     zh: {
-      name: '创业板ETF-纳指ETF 20日动量轮动交易策略',
-      rule: '默认使用 159915 创业板ETF和 513100 纳指ETF。每天收盘比较过去20个交易日涨幅，只选择涨幅第一且收盘价站上自身20日均线的ETF；持仓标的跌到第二或跌破20日均线时卖出，两者都不符合时空仓。信号在下一共同交易日开盘执行。',
-      universe: '固定规则模板：159915、513100，涨幅回看20日，均线20日，持有第一名。修改下方标的或参数后，将按修改后的自定义规则回测。',
+      name: 'ETF 动量轮动',
+      rule: '收盘比较过去 20 个交易日涨幅，持有第一名且收盘价站上自身 20 日均线的 ETF，否则空仓；信号在下一共同交易日开盘执行。',
     },
     en: {
-      name: 'ChiNext ETF-Nasdaq ETF 20-Day Momentum Rotation',
-      rule: 'By default, compare the trailing 20-day returns of 159915 and 513100 after each close. Hold only the first-ranked ETF when it closes above its own 20-day moving average. Sell when the holding falls to second place or below its moving average; hold cash when neither qualifies. Execute at the next common open.',
-      universe: 'Fixed-rule preset: 159915, 513100, 20-day return, 20-day moving average and Top 1. Editing the fields below creates a custom variant.',
+      name: 'ETF momentum rotation',
+      rule: 'After each close, hold the top-20-day-return ETF only when it closes above its own 20-day moving average, otherwise hold cash; execute at the next common open.',
     },
   },
   dual_moving_average: {
     zh: {
       name: '双均线择时',
-      rule: '每天收盘后比较一只标的的短期均线和长期均线：短期均线在长期均线上方时全仓持有，否则空仓；下一交易日开盘执行。',
-      universe: '只接受 1 个股票或 ETF。',
+      rule: '收盘后比较一只标的的短期与长期均线：短均线上穿时全仓持有，否则空仓；下一交易日开盘执行。',
     },
     en: {
       name: 'Dual moving-average timing',
       rule: 'After each close, hold the single symbol when its fast moving average is above its slow moving average; otherwise hold cash. Execute at the next open.',
-      universe: 'Exactly one stock or ETF.',
     },
   },
   buy_and_hold: {
     zh: {
       name: '等权买入持有',
       rule: '在回测区间第一个交易日开盘，将资金等权买入全部标的并一直持有，用作其他交易策略的对照。',
-      universe: '1 个或多个股票、ETF。',
     },
     en: {
       name: 'Equal-weight buy and hold',
       rule: 'Buy all symbols at equal weights on the first open and hold them for the full period.',
-      universe: 'One or more stocks or ETFs.',
     },
   },
 };
@@ -135,9 +129,7 @@ const FormStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
               </select>
             </label>
             <div className="border-l-2 border-cyan/60 pl-3">
-              <h2 className="text-sm font-semibold text-foreground">{strategy.name}</h2>
-              <p className="mt-1 text-sm leading-6 text-secondary-text">{strategy.rule}</p>
-              <p className="mt-1 text-xs text-muted-text">{strategy.universe}</p>
+              <p className="text-sm leading-6 text-secondary-text">{strategy.rule}</p>
             </div>
           </div>
 
@@ -146,10 +138,10 @@ const FormStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
               <span className="text-xs text-secondary-text">{zh ? '标的代码（逗号分隔）' : 'Symbols (comma-separated)'}</span>
               <input value={symbols} onChange={event => setSymbols(event.target.value.toUpperCase())} className={INPUT} disabled={running} />
             </label>
-            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期' : 'Start date'}</span><input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
-            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期' : 'End date'}</span><input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
+            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期（空=全部历史）' : 'Start date (empty=full)'}</span><input type="date" lang="en" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
+            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期（空=最新）' : 'End date (empty=latest)'}</span><input type="date" lang="en" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
             <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '初始资金' : 'Initial capital'}</span><input aria-label={zh ? '初始资金' : 'Initial capital'} type="number" min="1" value={initialCapital} onChange={event => setInitialCapital(event.target.value)} className={INPUT} disabled={running} /></label>
-            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '单边成本（%）' : 'Per-side cost (%)'}</span><input aria-label={zh ? '单边成本（%）' : 'Per-side cost (%)'} type="number" min="0" max="5" step="0.01" value={sideCostPct} onChange={event => setSideCostPct(event.target.value)} className={INPUT} disabled={running} /></label>
+            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '单边费率（%，佣金+滑点）' : 'Fee per side (%)'}</span><input aria-label={zh ? '单边费率（%）' : 'Fee per side (%)'} type="number" min="0" max="5" step="0.01" value={sideCostPct} onChange={event => setSideCostPct(event.target.value)} className={INPUT} disabled={running} /></label>
             <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '最小交易数量' : 'Lot size'}</span><input aria-label={zh ? '最小交易数量' : 'Lot size'} type="number" min="1" step="1" value={lotSize} onChange={event => setLotSize(event.target.value)} className={INPUT} disabled={running} /></label>
           </div>
 
@@ -167,10 +159,7 @@ const FormStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
             </div>
           ) : null}
 
-          <div className="mt-4 flex items-center justify-between gap-3 border-t border-border/60 pt-3">
-            <p className="text-xs text-secondary-text">
-              {zh ? `已输入 ${parsedSymbols.length} 个标的；0% 成本表示不扣手续费和滑点。` : `${parsedSymbols.length} symbols; 0% means fees and slippage are not deducted.`}
-            </p>
+          <div className="mt-4 flex items-center justify-end gap-3 border-t border-border/60 pt-3">
             <button type="button" onClick={() => void run()} disabled={running} className="btn-primary h-10 min-w-[112px] gap-2 whitespace-nowrap px-4">
               {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
               {running ? (zh ? '正在回测' : 'Running') : (zh ? '运行回测' : 'Run backtest')}

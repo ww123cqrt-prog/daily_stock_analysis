@@ -1,11 +1,18 @@
 from pathlib import Path
 import hashlib
+import io
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from quant_data_service_client import (
+    QuantDataArtifactResult,
+    QuantDataDatasetResult,
+    QuantDataFrameResult,
+    QuantDataIdentity,
+)
 from robust_market_data import build_market_regimes
 from robust_signal_data_contract import RobustSignalDataBlocked
 from run_robust_signal_research import (
@@ -280,15 +287,22 @@ def test_build_context_uses_versioned_readiness_provenance_fields(
     (quant_data / "DATA_MANIFEST.json").write_text("{}\n", encoding="utf-8")
     provider = tmp_path / "provider"
     provider.mkdir()
+    data_identities = {
+        "ashare_daily_qfq": {
+            "dataset_id": "ashare_daily_qfq",
+            "snapshot_id": "ashare-snapshot",
+            "manifest_sha256": "c" * 64,
+            "content_sha256": "d" * 64,
+            "latest_trade_date": "2026-08-04",
+            "price_basis": "qfq",
+            "data_kind": "daily_bars",
+        }
+    }
     provider_status = {
         "provider_tree_sha256": "a" * 64,
         "provider_key": "b" * 64,
-        "membership_intervals_sha256": "c" * 64,
-        "quality_report_id": "data-quality-" + "d" * 16,
-        "quality_evidence_artifact_name": (
-            "data_quality_report_20260805_120000_" + "d" * 16 + ".json"
-        ),
-        "quality_evidence_sha256": "d" * 64,
+        "data_identity_sha256": "e" * 64,
+        "data_identities": data_identities,
         "cleaned_provider_identity": {
             "dataset_id": "qlib_ashare_cleaned_v2",
             "snapshot_id": "cleaned-v2",
@@ -313,22 +327,17 @@ def test_build_context_uses_versioned_readiness_provenance_fields(
             **_frozen_readiness_kwargs(tmp_path),
         )
 
-    assert context["membership_intervals_sha256"] == "c" * 64
-    assert context["quality_report_id"] == "data-quality-" + "d" * 16
-    assert context["quality_evidence_artifact_name"].startswith(
-        "data_quality_report_"
-    )
-    assert context["quality_evidence_sha256"] == "d" * 64
-    assert (
-        context["cleaned_provider_identity"]
-        == provider_status["cleaned_provider_identity"]
-    )
+    assert context["data_identity_sha256"] == "e" * 64
+    assert context["data_identities"] == data_identities
+    assert context["qlib_provider_identity"] == provider_status[
+        "cleaned_provider_identity"
+    ]
     assert context["readiness_artifact_sha256"] == "9" * 64
-    assert "membership_snapshot_hash" not in context
-    assert "reference_snapshot_hash" not in context
+    assert "quality_report_id" not in context
+    assert "data_manifest_hash" not in context
 
 
-def test_build_context_consumes_frozen_manifest_hash_without_current_manifest(
+def test_build_context_consumes_frozen_service_identity_without_current_manifest(
     tmp_path: Path,
 ) -> None:
     quant_data = tmp_path / "quant_data"
@@ -338,13 +347,8 @@ def test_build_context_consumes_frozen_manifest_hash_without_current_manifest(
     provider_status = {
         "provider_tree_sha256": "a" * 64,
         "provider_key": "b" * 64,
-        "membership_intervals_sha256": "c" * 64,
-        "data_manifest_sha256": "d" * 64,
-        "quality_report_id": "data-quality-" + "e" * 16,
-        "quality_evidence_artifact_name": (
-            "data_quality_report_20260805_120000_" + "e" * 16 + ".json"
-        ),
-        "quality_evidence_sha256": "e" * 64,
+        "data_identity_sha256": "d" * 64,
+        "data_identities": {"ashare_daily_qfq": {"snapshot_id": "ashare-v2"}},
         "cleaned_provider_identity": {
             "dataset_id": "qlib_ashare_cleaned_v2",
             "snapshot_id": "cleaned-v2",
@@ -369,7 +373,7 @@ def test_build_context_consumes_frozen_manifest_hash_without_current_manifest(
             **_frozen_readiness_kwargs(tmp_path),
         )
 
-    assert context["data_manifest_hash"] == "d" * 64
+    assert context["data_identity_sha256"] == "d" * 64
 
 
 def test_resolve_provider_consumes_only_the_frozen_readiness_artifact(
@@ -1006,6 +1010,22 @@ def test_qlib_job_runner_reuses_handler_for_same_split_and_horizon(
     runner._cached_benchmark = None
     runner._cached_market_states = None
     runner._market_states_by_end = {}
+    runner._load_industry_intervals = lambda: pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "industry_code": ["bank"],
+            "start_date": ["2014-01-02"],
+            "end_date": ["2025-12-31"],
+        }
+    )
+    runner._load_fundamental_features = lambda _start, _end: pd.DataFrame(
+        {
+            "datetime": ["2019-01-02"],
+            "instrument": ["SH600000"],
+            "FUND_FIRST_VALUE": [1.0],
+            "FUND_SECOND_VALUE": [2.0],
+        }
+    )
 
     class FakeDataApi:
         @classmethod
@@ -1074,68 +1094,118 @@ def test_fundamental_extension_failure_is_terminal_signal_not_found(
 def test_fundamental_source_context_requires_pass_and_verifies_artifact_hashes(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "reference" / "fundamentals"
-    (root / "daily").mkdir(parents=True)
-    artifact = root / "daily" / "2025.parquet"
-    artifact.write_bytes(b"immutable fundamental artifact")
-    digest = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+    del tmp_path
+    identity = QuantDataIdentity(
+        dataset_id="ashare_fundamentals_pit",
+        snapshot_id="fundamentals-snapshot",
+        manifest_sha256="a" * 64,
+        content_sha256="b" * 64,
+        latest_trade_date="2025-12-31",
+        price_basis="not_applicable",
+        data_kind="point_in_time_fundamentals",
+    )
     source = {
         "status": "pass",
         "selected_source": "eastmoney_hsf10",
         "mixed_sources": False,
         "data_range": {"start": "2014-01-02", "end": "2025-12-31"},
-        "artifacts": {"daily/2025.parquet": digest},
+        "artifacts": {"daily/2025.parquet": "c" * 64},
     }
-    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
     config = {
-        "paths": {"fundamental_features": "reference/fundamentals"},
         "fundamentals": {
             "research_round": "single_extension",
             "selected_source": "eastmoney_hsf10",
             "allow_mixed_sources": False,
         },
     }
+    client = MagicMock()
+    client.describe_dataset.return_value = QuantDataDatasetResult(
+        identity=identity,
+        metadata=identity.as_dict(),
+        payload={
+            "metadata": identity.as_dict(),
+            "source": {"provider": "eastmoney_hsf10"},
+            "date_range": {"start": "2014-01-02", "end": "2025-12-31"},
+        },
+    )
+    client.get_artifact.return_value = QuantDataArtifactResult(
+        content=json.dumps(source, sort_keys=True).encode("utf-8"),
+        identity=identity,
+        metadata=identity.as_dict(),
+        media_type="application/json",
+    )
 
-    context = _load_fundamental_source_context(config, tmp_path)
+    context = _load_fundamental_source_context(
+        config,
+        {"ashare_fundamentals_pit": identity.as_dict()},
+        client=client,
+    )
 
     assert context["fundamental_source"] == "eastmoney_hsf10"
     assert context["fundamental_source_manifest_hash"]
     assert context["fundamental_artifacts_hash"]
-    source["status"] = "blocked_data"
-    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
-    with pytest.raises(ValueError, match="status=pass"):
-        _load_fundamental_source_context(config, tmp_path)
+    assert "fundamental_features_path" not in context
+    client.describe_dataset.assert_called_once_with(
+        "ashare_fundamentals_pit", expected_identity=identity
+    )
+    client.get_artifact.assert_called_once_with(
+        "ashare_fundamentals_pit",
+        "source_manifest",
+        expected_identity=identity,
+    )
 
 
-def test_fundamental_source_context_rejects_tampered_artifact(tmp_path: Path) -> None:
-    root = tmp_path / "reference" / "fundamentals"
-    root.mkdir(parents=True)
-    artifact = root / "artifact.parquet"
-    artifact.write_bytes(b"actual")
+def test_fundamental_source_context_rejects_2026_service_data() -> None:
+    identity = QuantDataIdentity(
+        dataset_id="ashare_fundamentals_pit",
+        snapshot_id="fundamentals-snapshot",
+        manifest_sha256="a" * 64,
+        content_sha256="b" * 64,
+        latest_trade_date="2026-01-02",
+        price_basis="not_applicable",
+        data_kind="point_in_time_fundamentals",
+    )
     source = {
         "status": "pass",
         "selected_source": "eastmoney_hsf10",
         "mixed_sources": False,
-        "data_range": {"start": "2014-01-02", "end": "2025-12-31"},
-        "artifacts": {"artifact.parquet": "0" * 64},
+        "data_range": {"start": "2014-01-02", "end": "2026-01-02"},
+        "artifacts": {"daily/2025.parquet": "c" * 64},
     }
-    (root / "FUNDAMENTAL_SOURCE.json").write_text(json.dumps(source))
     config = {
-        "paths": {"fundamental_features": "reference/fundamentals"},
         "fundamentals": {
             "research_round": "single_extension",
             "selected_source": "eastmoney_hsf10",
             "allow_mixed_sources": False,
         },
     }
+    client = MagicMock()
+    client.describe_dataset.return_value = QuantDataDatasetResult(
+        identity=identity,
+        metadata=identity.as_dict(),
+        payload={
+            "metadata": identity.as_dict(),
+            "source": {"provider": "eastmoney_hsf10"},
+            "date_range": {"start": "2014-01-02", "end": "2026-01-02"},
+        },
+    )
+    client.get_artifact.return_value = QuantDataArtifactResult(
+        content=json.dumps(source).encode("utf-8"),
+        identity=identity,
+        metadata=identity.as_dict(),
+        media_type="application/json",
+    )
 
-    with pytest.raises(ValueError, match="hash mismatch"):
-        _load_fundamental_source_context(config, tmp_path)
+    with pytest.raises(ValueError, match="2026"):
+        _load_fundamental_source_context(
+            config,
+            {"ashare_fundamentals_pit": identity.as_dict()},
+            client=client,
+        )
 
 
-def test_dataset_feature_options_resolve_fundamental_family(tmp_path: Path) -> None:
+def test_dataset_feature_options_require_service_fundamental_frame() -> None:
     config = {
-        "paths": {"fundamental_features": "reference/fundamentals"},
         "feature_families": {
             "quality": {
                 "include_handler_features": False,
@@ -1146,14 +1216,95 @@ def test_dataset_feature_options_resolve_fundamental_family(tmp_path: Path) -> N
     }
     signal = {"feature_family": "quality"}
 
-    options = _dataset_feature_options(config, signal, tmp_path)
+    options = _dataset_feature_options(config, signal)
 
     assert options == {
         "feature_prefixes": [],
         "include_handler_features": False,
-        "external_features_path": tmp_path / "reference" / "fundamentals",
         "external_feature_prefixes": ["FUND_QUALITY_"],
     }
+
+
+def test_qlib_job_runner_reads_reference_and_fundamentals_from_frozen_service() -> None:
+    reference_identity = QuantDataIdentity(
+        dataset_id="robust_reference",
+        snapshot_id="reference-snapshot",
+        manifest_sha256="a" * 64,
+        content_sha256="b" * 64,
+        latest_trade_date="2026-07-16",
+        price_basis="not_applicable",
+        data_kind="point_in_time_reference",
+    )
+    fundamental_identity = QuantDataIdentity(
+        dataset_id="ashare_fundamentals_pit",
+        snapshot_id="fundamental-snapshot",
+        manifest_sha256="c" * 64,
+        content_sha256="d" * 64,
+        latest_trade_date="2025-12-31",
+        price_basis="not_applicable",
+        data_kind="point_in_time_fundamentals",
+    )
+    industry = pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "industry_code": ["bank"],
+            "start_date": ["2014-01-02"],
+            "end_date": ["2025-12-31"],
+        }
+    )
+    stream = io.BytesIO()
+    industry.to_parquet(stream, index=False)
+    client = MagicMock()
+    client.get_artifact.return_value = QuantDataArtifactResult(
+        content=stream.getvalue(),
+        identity=reference_identity,
+        metadata=reference_identity.as_dict(),
+        media_type="application/octet-stream",
+    )
+
+    def query_year(_dataset_id, _component, *, start, end, **_kwargs):
+        assert (pd.Timestamp(end) - pd.Timestamp(start)).days <= 365
+        return QuantDataFrameResult(
+            frame=pd.DataFrame(
+                {
+                    "datetime": [start],
+                    "instrument": ["SH600000"],
+                    "FUND_QUALITY_ROE": [0.1],
+                }
+            ),
+            identity=fundamental_identity,
+            metadata=fundamental_identity.as_dict(),
+        )
+
+    client.query_partitioned_artifact.side_effect = query_year
+    runner = object.__new__(QlibJobRunner)
+    runner._quant_data_client = client
+    runner._data_identities = {
+        "robust_reference": reference_identity,
+        "ashare_fundamentals_pit": fundamental_identity,
+    }
+    runner._industry_intervals = None
+    runner._fundamental_year_frames = {}
+
+    loaded_industry = runner._load_industry_intervals()
+    loaded_fundamentals = runner._load_fundamental_features(
+        pd.Timestamp("2019-06-01"), pd.Timestamp("2020-03-01")
+    )
+    runner._load_industry_intervals()
+    runner._load_fundamental_features(
+        pd.Timestamp("2019-06-01"), pd.Timestamp("2020-03-01")
+    )
+
+    pd.testing.assert_frame_equal(loaded_industry, industry)
+    assert set(pd.to_datetime(loaded_fundamentals["datetime"]).dt.year) == {2019, 2020}
+    client.get_artifact.assert_called_once_with(
+        "robust_reference",
+        "industry_intervals",
+        expected_identity=reference_identity,
+    )
+    assert client.query_partitioned_artifact.call_count == 2
+    for request in client.query_partitioned_artifact.call_args_list:
+        assert request.kwargs["expected_identity"] == fundamental_identity
 
 
 def test_preregistered_price_volume_and_fundamental_configs_are_distinct() -> None:
@@ -1168,9 +1319,7 @@ def test_preregistered_price_volume_and_fundamental_configs_are_distinct() -> No
     assert fundamentals["artifacts"]["experiment_name"] == (
         "robust_csi800_signal_fundamentals"
     )
-    assert fundamentals["paths"]["fundamental_features"] == (
-        "reference/fundamentals"
-    )
+    assert "fundamental_features" not in fundamentals["paths"]
 
 
 def test_ten_day_label_uses_ten_trading_day_purge_on_both_boundaries() -> None:
@@ -1407,6 +1556,32 @@ def test_mlflow_context_yields_active_recorder_not_experiment(monkeypatch) -> No
         assert active_run is recorder
 
     assert events == ["enter", "recorder", "exit"]
+
+
+def test_mlflow_run_records_service_identity_context(tmp_path: Path) -> None:
+    context_path = tmp_path / "context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "data_identity_sha256": "a" * 64,
+                "data_identities": {
+                    "ashare_daily_qfq": {"snapshot_id": "ashare-snapshot"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = object.__new__(QlibJobRunner)
+    runner.run_dir = tmp_path
+    runner.data_identity_sha256 = "a" * 64
+    recorder = MagicMock()
+
+    runner._log_mlflow_data_identity(recorder)
+
+    recorder.log_params.assert_called_once_with(data_identity_sha256="a" * 64)
+    recorder.log_artifact.assert_called_once_with(
+        str(context_path), artifact_path="provenance"
+    )
 
 
 def test_failed_job_updates_top_level_status_before_reraising(tmp_path: Path) -> None:
@@ -1661,7 +1836,8 @@ def test_factor_contract_is_hash_stable_and_run_copy_is_immutable(
         "context_hash": "context",
         "git_commit": "commit",
         "provider_tree_sha256": "provider",
-        "membership_intervals_sha256": "membership",
+        "data_identity_sha256": "identity",
+        "data_identities": {"pit_csi800": {"snapshot_id": "pit-snapshot"}},
     }
     report = {"signal_id": "signal", "model_id": "ridge", "values": {"rank_ic": 0.02}}
     first = _factor_contract(config=config, context=context, report=report)
@@ -1672,8 +1848,8 @@ def test_factor_contract_is_hash_stable_and_run_copy_is_immutable(
 
     assert first["contract_hash"] == second["contract_hash"]
     assert first["schema_version"] == 2
-    assert first["membership_intervals_sha256"] == "membership"
-    assert "membership_snapshot_hash" not in first
+    assert first["data_identity_sha256"] == "identity"
+    assert first["data_identities"] == context["data_identities"]
     write_immutable_factor_contract(path, second)
     with pytest.raises(ValueError, match="immutable_factor_contract_mismatch"):
         write_immutable_factor_contract(path, {**second, "model_id": "ols"})
