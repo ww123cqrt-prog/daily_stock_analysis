@@ -741,8 +741,13 @@ def run_portfolio_backtest_view(
     strategy_comparisons: Sequence[Mapping[str, Any]] | None = None,
     period_start: date | None = None,
     period_end: date | None = None,
+    execution_price: str = "open",
 ) -> dict[str, Any]:
     """Vectorized portfolio backtest over a MarketView (large universes).
+
+    ``execution_price`` selects the fill price on the signal's execution day:
+    ``"open"`` (default, T+1 open) or ``"close"`` (T+1 close, avoids
+    overnight-gap noise at the cost of one day of latency).
 
     Same semantics as ``run_portfolio_backtest`` but reads prices from the
     numpy matrices instead of ``PriceBar`` lists, and computes the benchmark
@@ -755,6 +760,9 @@ def run_portfolio_backtest_view(
     symbol_index = {symbol: i for i, symbol in enumerate(symbols)}
     close_matrix = view.close
     open_matrix = view.open
+    if execution_price not in ("open", "close"):
+        raise ValueError("execution_price must be 'open' or 'close'")
+    trade_matrix = open_matrix if execution_price == "open" else close_matrix
 
     # Truncate the simulation at the last date with tradable members so a
     # stale membership window cannot poison the final benchmark value. This
@@ -879,7 +887,7 @@ def run_portfolio_backtest_view(
         t = dates.index(execution_date)
         equity_at_open = cash
         for symbol in symbols:
-            price = open_matrix[t, symbol_index[symbol]]
+            price = trade_matrix[t, symbol_index[symbol]]
             if holdings[symbol] and not np.isnan(price):
                 equity_at_open += holdings[symbol] * float(price)
         target_holdings: dict[str, int] = {}
@@ -888,7 +896,7 @@ def run_portfolio_backtest_view(
             weight = weights.get(symbol, 0.0)
             if weight <= 0:
                 continue
-            price = open_matrix[t, symbol_index[symbol]]
+            price = trade_matrix[t, symbol_index[symbol]]
             if np.isnan(price) or price <= 0:
                 blocked = True
                 continue
@@ -908,7 +916,7 @@ def run_portfolio_backtest_view(
             if weight <= 0 and holdings[symbol] <= 0:
                 continue
             if weight > 0 or holdings[symbol] != desired:
-                price = open_matrix[t, symbol_index[symbol]]
+                price = trade_matrix[t, symbol_index[symbol]]
                 if np.isnan(price) or price <= 0:
                     blocked = True
                     break
@@ -922,7 +930,7 @@ def run_portfolio_backtest_view(
             shares = holdings[symbol] - target_holdings.get(symbol, 0)
             if shares <= 0:
                 continue
-            price = open_matrix[t, symbol_index[symbol]]
+            price = trade_matrix[t, symbol_index[symbol]]
             if np.isnan(price) or price <= 0:
                 continue
             notional = shares * float(price)
@@ -950,7 +958,7 @@ def run_portfolio_backtest_view(
             shares_needed = target_holdings.get(symbol, 0) - holdings[symbol]
             if shares_needed <= 0:
                 continue
-            price = open_matrix[t, symbol_index[symbol]]
+            price = trade_matrix[t, symbol_index[symbol]]
             if np.isnan(price) or price <= 0:
                 blocked = True
                 continue
@@ -1215,7 +1223,11 @@ def run_portfolio_backtest_view(
             "entry_cost": 0.0,
         },
         "assumptions": {
-            "execution": "next_common_trading_day_open",
+            "execution": (
+                "next_common_trading_day_open"
+                if execution_price == "open"
+                else "next_common_trading_day_close"
+            ),
             "initial_capital": config.initial_capital,
             "side_cost_pct": config.side_cost_pct,
             "lot_size": config.lot_size,
