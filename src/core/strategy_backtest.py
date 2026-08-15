@@ -207,6 +207,8 @@ def _risk_metrics(
             "alpha_pct": None,
             "beta": None,
             "win_rate_pct": 0.0,
+            "benchmark_annualized_volatility_pct": 0.0,
+            "benchmark_sharpe_ratio": None,
         }
 
     strategy_mean = sum(strategy_returns) / len(strategy_returns)
@@ -227,6 +229,7 @@ def _risk_metrics(
         benchmark_variance = 0.0
         covariance = 0.0
     volatility = math.sqrt(max(strategy_variance, 0.0))
+    benchmark_volatility = math.sqrt(max(benchmark_variance, 0.0))
     beta = covariance / benchmark_variance if benchmark_variance > 0 else None
     alpha = (
         (strategy_mean - beta * benchmark_mean) * 252.0 * 100.0
@@ -243,6 +246,17 @@ def _risk_metrics(
         "alpha_pct": alpha,
         "beta": beta,
         "win_rate_pct": sum(value > 0 for value in strategy_returns) / len(strategy_returns) * 100.0,
+        # Benchmark-side risk metrics, same methodology as the strategy side
+        # (log returns, 252-day annualization, zero risk-free rate), so the
+        # two columns are directly comparable.
+        "benchmark_annualized_volatility_pct": (
+            benchmark_volatility * math.sqrt(252.0) * 100.0
+        ),
+        "benchmark_sharpe_ratio": (
+            benchmark_mean / benchmark_volatility * math.sqrt(252.0)
+            if benchmark_volatility > 0
+            else None
+        ),
     }
 
 
@@ -562,6 +576,11 @@ def run_portfolio_backtest(
                 trading_days=len(simulation_dates),
             ),
             "benchmark_return_pct": benchmark_return_pct,
+            "benchmark_annualized_return_pct": _annualized_return_pct(
+                initial_capital=config.initial_capital,
+                final_equity=benchmark_final,
+                trading_days=len(simulation_dates),
+            ),
             "excess_return_pct": total_return_pct - benchmark_return_pct,
             "max_drawdown_pct": _max_drawdown_pct(
                 [config.initial_capital, *strategy_values]
@@ -1194,6 +1213,11 @@ def run_portfolio_backtest_view(
                 trading_days=len(simulation_indices),
             ),
             "benchmark_return_pct": benchmark_return_pct,
+            "benchmark_annualized_return_pct": _annualized_return_pct(
+                initial_capital=config.initial_capital,
+                final_equity=benchmark_final,
+                trading_days=len(simulation_indices),
+            ),
             "excess_return_pct": total_return_pct - benchmark_return_pct,
             "max_drawdown_pct": _max_drawdown_pct(
                 [opening_equity, *strategy_values]

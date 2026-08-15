@@ -193,6 +193,7 @@ class StrategyBacktestMetrics(BaseModel):
     total_return_pct: float
     annualized_return_pct: float
     benchmark_return_pct: float
+    benchmark_annualized_return_pct: float = 0.0
     excess_return_pct: float
     max_drawdown_pct: float
     benchmark_max_drawdown_pct: float
@@ -206,7 +207,9 @@ class StrategyBacktestMetrics(BaseModel):
     blocked_signal_count: int = 0
     trading_days: int
     annualized_volatility_pct: float = 0.0
+    benchmark_annualized_volatility_pct: float = 0.0
     sharpe_ratio: Optional[float] = None
+    benchmark_sharpe_ratio: Optional[float] = None
     alpha_pct: Optional[float] = None
     beta: Optional[float] = None
     win_rate_pct: float = 0.0

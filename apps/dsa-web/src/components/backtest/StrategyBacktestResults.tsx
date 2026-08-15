@@ -94,17 +94,25 @@ const StrategyBacktestResults: React.FC<Props> = ({ language, report, emptyTitle
   const secondaryMetrics = zh
     ? [
         ['基准总收益', pct(metrics.benchmarkReturnPct), tone(metrics.benchmarkReturnPct)],
+        ['基准年化', pct(metrics.benchmarkAnnualizedReturnPct), tone(metrics.benchmarkAnnualizedReturnPct)],
+        ['基准最大回撤', pct(metrics.benchmarkMaxDrawdownPct), tone(metrics.benchmarkMaxDrawdownPct)],
+        ['基准Sharpe', number(metrics.benchmarkSharpeRatio), tone(metrics.benchmarkSharpeRatio)],
+        ['基准年化波动', pct(metrics.benchmarkAnnualizedVolatilityPct), 'text-foreground'],
         ['Alpha（年化）', pct(metrics.alphaPct), tone(metrics.alphaPct)],
         ['Beta', number(metrics.beta), 'text-foreground'],
-        ['年化波动', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
+        ['策略年化波动', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
         ['日胜率', pct(metrics.winRatePct), tone(metrics.winRatePct - 50)],
         ['交易次数', String(metrics.tradeCount), 'text-foreground'],
       ]
     : [
         ['Benchmark return', pct(metrics.benchmarkReturnPct), tone(metrics.benchmarkReturnPct)],
+        ['Benchmark annualized', pct(metrics.benchmarkAnnualizedReturnPct), tone(metrics.benchmarkAnnualizedReturnPct)],
+        ['Benchmark max drawdown', pct(metrics.benchmarkMaxDrawdownPct), tone(metrics.benchmarkMaxDrawdownPct)],
+        ['Benchmark Sharpe', number(metrics.benchmarkSharpeRatio), tone(metrics.benchmarkSharpeRatio)],
+        ['Benchmark volatility', pct(metrics.benchmarkAnnualizedVolatilityPct), 'text-foreground'],
         ['Annualized alpha', pct(metrics.alphaPct), tone(metrics.alphaPct)],
         ['Beta', number(metrics.beta), 'text-foreground'],
-        ['Annualized volatility', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
+        ['Strategy volatility', pct(metrics.annualizedVolatilityPct), 'text-foreground'],
         ['Daily win rate', pct(metrics.winRatePct), tone(metrics.winRatePct - 50)],
         ['Trades', String(metrics.tradeCount), 'text-foreground'],
       ];

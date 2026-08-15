@@ -194,6 +194,7 @@ export interface StrategyBacktestMetrics {
   totalReturnPct: number;
   annualizedReturnPct: number;
   benchmarkReturnPct: number;
+  benchmarkAnnualizedReturnPct: number;
   excessReturnPct: number;
   maxDrawdownPct: number;
   benchmarkMaxDrawdownPct: number;
@@ -207,7 +208,9 @@ export interface StrategyBacktestMetrics {
   blockedSignalCount: number;
   tradingDays: number;
   annualizedVolatilityPct: number;
+  benchmarkAnnualizedVolatilityPct: number;
   sharpeRatio?: number | null;
+  benchmarkSharpeRatio?: number | null;
   alphaPct?: number | null;
   beta?: number | null;
   winRatePct: number;
