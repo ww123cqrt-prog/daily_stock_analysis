@@ -435,6 +435,7 @@ def select_representative_universe(
     category_targets: dict[str, int] | None = None,
     minimum_turnover: float = 1_000_000.0,
     excluded_symbols: tuple[str, ...] = (),
+    required_symbols: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     """Retain the frozen pool and fill deterministic category quotas by liquidity."""
 
@@ -460,6 +461,13 @@ def select_representative_universe(
     normalized_exclusions = {
         str(symbol).strip().upper() for symbol in excluded_symbols if str(symbol).strip()
     }
+    normalized_required = {
+        str(symbol).strip().upper() for symbol in required_symbols if str(symbol).strip()
+    }
+    if normalized_required & normalized_exclusions:
+        raise CnEtfDownloadError(
+            "required ETF symbols cannot also be excluded"
+        )
     current_symbol_set = set(current["symbol"].astype(str))
     if normalized_exclusions & current_symbol_set:
         raise CnEtfDownloadError(
@@ -527,6 +535,31 @@ def select_representative_universe(
                 "selection_reason": "existing_snapshot",
             }
         )
+        selected_records.append(source)
+        selected_symbols.add(symbol)
+        used_keys.add(key)
+        counts[category] += 1
+
+    missing_required = sorted(normalized_required - selected_symbols)
+    for symbol in missing_required:
+        if symbol not in catalog_by_symbol.index:
+            raise CnEtfDownloadError(
+                f"required ETF is missing from the current catalog: {symbol}"
+            )
+        source = catalog_by_symbol.loc[symbol].to_dict()
+        if not bool(source.get("in_sina")) or float(source.get("sina_amount") or 0.0) < float(
+            minimum_turnover
+        ):
+            raise CnEtfDownloadError(
+                f"required ETF does not satisfy current trading evidence: {symbol}"
+            )
+        category = str(source.get("representative_category") or "")
+        if category not in targets or counts[category] >= targets[category]:
+            raise CnEtfDownloadError(
+                f"required ETF category quota is unavailable: {symbol}"
+            )
+        key = str(source.get("tracking_key") or "")
+        source["selection_reason"] = "user_required"
         selected_records.append(source)
         selected_symbols.add(symbol)
         used_keys.add(key)
@@ -1886,6 +1919,7 @@ def expand_cn_etf_universe(
     minimum_turnover: float = 1_000_000.0,
     minimum_history_rows: int = DEFAULT_MINIMUM_HISTORY_ROWS,
     excluded_symbols: tuple[str, ...] = (),
+    required_symbols: tuple[str, ...] = (),
     request_interval: float = DEFAULT_REQUEST_INTERVAL,
     request_budget: int = DEFAULT_REQUEST_BUDGET,
     retries: int = 2,
@@ -1939,6 +1973,17 @@ def expand_cn_etf_universe(
             }
         )
     )
+    normalized_required = tuple(
+        sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in required_symbols
+                if str(symbol).strip()
+            }
+        )
+    )
+    if set(normalized_required) & set(normalized_exclusions):
+        raise ValueError("required ETF symbols cannot also be excluded")
     lock_path = root / "runtime" / "locks" / "cn_etf_update.lock"
     started = time.monotonic()
 
@@ -1959,6 +2004,11 @@ def expand_cn_etf_universe(
         current_symbols = set(current_universe["symbol"].astype(str))
         if len(current_symbols) != len(current_universe):
             raise DataContractError("current ETF universe contains duplicate symbols")
+        missing_required = set(normalized_required) - current_symbols
+        if len(current_symbols) + len(missing_required) > target_size:
+            raise CnEtfDownloadError(
+                "target_size has no capacity for every missing required ETF symbol"
+            )
         if len(current_symbols) == target_size:
             return current
         if len(current_symbols) > target_size:
@@ -1983,6 +2033,7 @@ def expand_cn_etf_universe(
             "minimum_turnover": float(minimum_turnover),
             "minimum_history_rows": int(minimum_history_rows),
             "excluded_symbols": list(normalized_exclusions),
+            "required_symbols": list(normalized_required),
             "provider": "tencent",
             "producer_version": PRODUCER_VERSION,
         }
@@ -2028,6 +2079,7 @@ def expand_cn_etf_universe(
                 category_targets=targets,
                 minimum_turnover=minimum_turnover,
                 excluded_symbols=normalized_exclusions,
+                required_symbols=normalized_required,
             )
             universe_sha256 = _universe_hash(selected)
             contract = {
@@ -2269,6 +2321,7 @@ def expand_cn_etf_universe(
                 "selection_method": "frozen_existing_plus_category_quota_liquidity",
                 "selection_config_sha256": config_sha256,
                 "category_targets": targets,
+                "required_symbols": list(normalized_required),
                 "category_counts": category_counts,
                 "universe_sha256": universe_sha256,
                 "universe_file_sha256": sha256_file(stage / "ETF_UNIVERSE.parquet"),
@@ -2300,6 +2353,7 @@ def expand_cn_etf_universe(
                     "added_symbol_count": len(added_symbols),
                     "added_symbols": added_symbols,
                     "excluded_symbols": list(normalized_exclusions),
+                    "required_symbols": list(normalized_required),
                     "reused_prior_contract_symbol_count": len(
                         reused_prior_contract_symbols
                     ),

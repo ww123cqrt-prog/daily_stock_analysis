@@ -1081,6 +1081,39 @@ def test_representative_selection_does_not_add_a_duplicate_tracking_target() -> 
     assert selected["tracking_key"].nunique() == 2
 
 
+def test_representative_selection_keeps_an_explicit_duplicate_tracking_target() -> None:
+    module = load_module()
+    current = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "159516", "半导体设备ETF国泰", 100.0
+            )
+        ]
+    )
+    catalog = pd.DataFrame(
+        [
+            *current.to_dict(orient="records"),
+            _representative_catalog_row(
+                module, "159558", "半导体设备ETF易方达", 1_000.0
+            ),
+        ]
+    )
+
+    selected = module.select_representative_universe(
+        catalog,
+        current,
+        target_size=2,
+        category_targets={"sector_theme": 2},
+        minimum_turnover=0.0,
+        required_symbols=("SZ159558",),
+    )
+
+    assert set(selected["symbol"]) == {"SZ159516", "SZ159558"}
+    required = selected.set_index("symbol").loc["SZ159558"]
+    assert required["selection_reason"] == "user_required"
+    assert selected["tracking_key"].nunique() == 1
+
+
 def test_representative_selection_defaults_missing_optional_catalog_columns() -> None:
     module = load_module()
     minimal = pd.DataFrame(
@@ -1130,6 +1163,24 @@ def test_expansion_request_interval_has_a_point_three_second_floor(
             target_size=200,
             end_date="2026-08-14",
             request_interval=0.2,
+        )
+
+
+def test_expansion_rejects_missing_required_symbol_without_target_capacity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
+
+    with pytest.raises(module.CnEtfDownloadError, match="target_size has no capacity"):
+        module.expand_cn_etf_universe(
+            quant_data_dir=root,
+            target_size=len(current_universe),
+            category_targets={"core_broad": len(current_universe)},
+            end_date="2026-08-06",
+            required_symbols=("SH588200",),
+            request_interval=0.3,
         )
 
 
@@ -1193,12 +1244,17 @@ def test_expand_universe_downloads_only_new_symbols_and_preserves_old_hashes(
         request_budget=20,
         minimum_turnover=0.0,
         minimum_history_rows=3,
+        required_symbols=("SH588200",),
     )
 
     assert set(calls) == {"SH512480", "SH588200"}
     expanded_universe = pd.read_parquet(expanded / "ETF_UNIVERSE.parquet")
     assert len(expanded_universe) == 4
     assert set(current_universe["symbol"]).issubset(set(expanded_universe["symbol"]))
+    assert (
+        expanded_universe.set_index("symbol").loc["SH588200", "selection_reason"]
+        == "user_required"
+    )
     for component, hashes in old_hashes.items():
         for symbol, digest in hashes.items():
             assert module.sha256_file(expanded / component / f"{symbol}.parquet") == digest
@@ -1210,6 +1266,7 @@ def test_expand_universe_downloads_only_new_symbols_and_preserves_old_hashes(
     assert manifest["source"]["parent_snapshot_id"] == current.name
     assert manifest["source"]["retained_symbol_count"] == 2
     assert manifest["source"]["added_symbol_count"] == 2
+    assert manifest["source"]["required_symbols"] == ["SH588200"]
     assert manifest["source"]["universe_sha256"] == universe_manifest["universe_sha256"]
     assert universe_manifest["selected_count"] == 4
 
