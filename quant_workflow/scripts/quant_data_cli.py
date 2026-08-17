@@ -7,8 +7,10 @@ import argparse
 import base64
 import binascii
 import hashlib
+import importlib.util
 import json
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -31,6 +33,7 @@ from quant_data_contract import (  # noqa: E402
     atomic_write_json,
     dataset_publication_lock,
     describe_dataset,
+    finalize_artifact_snapshot,
     publish_snapshot_group,
     resolve_dataset,
     resolve_dataset_artifact,
@@ -38,6 +41,10 @@ from quant_data_contract import (  # noqa: E402
     validate_dataset_snapshot,
 )
 from quant_data_reader import build_update_universe, read_bars  # noqa: E402
+from quant_data_increment_validation import (  # noqa: E402
+    compare_snapshot_increment,
+    sample_increment_against_bundle,
+)
 from quant_workflow.quant_data_qlib_provider import (  # noqa: E402
     build_direct_provider_descriptor,
 )
@@ -47,6 +54,7 @@ ASHARE_UPDATE_POINTERS = (
     Path("DATA_MANIFEST.json"),
     Path("parquet/ashare_1d/ashare_daily_raw/LATEST.json"),
     Path("parquet/ashare_1d/ashare_daily_qfq/LATEST.json"),
+    Path("reference/qlib_cleaning_plan/LATEST.json"),
 )
 ASHARE_UPDATE_TRANSACTION_PATH = Path(
     "runtime/transactions/ashare_v2_update.json"
@@ -54,6 +62,7 @@ ASHARE_UPDATE_TRANSACTION_PATH = Path(
 ASHARE_UPDATE_TRANSACTION_SCHEMA_VERSION = 1
 ASHARE_UPDATE_TRANSACTION_MAX_BYTES = 16 * 1024 * 1024
 ASHARE_BUNDLE_MANIFEST_MAX_BYTES = 1024 * 1024
+INCREMENT_COMPARISON_REPORT_MAX_BYTES = 16 * 1024 * 1024
 
 ETF_RELEASE_DATASET_ID = "cn_etf_daily"
 ETF_RELEASE_DATASET_ROOT = Path("parquet/etf_1d/cn_etf_daily")
@@ -125,6 +134,29 @@ def _read_catalog(root: Path) -> dict[str, Any]:
 
 def _json_dump(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _read_json_object(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    if path.is_symlink() or not resolved.is_file():
+        raise DataContractError(f"{label} is unavailable")
+    try:
+        if resolved.stat().st_size > max_bytes:
+            raise DataContractError(f"{label} is too large")
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except DataContractError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DataContractError(f"{label} is invalid") from exc
+    if not isinstance(payload, dict):
+        raise DataContractError(f"{label} must be a JSON object")
+    return payload
+
+
+def _emit_json_report(payload: Mapping[str, Any], output: Path | None) -> None:
+    if output is not None:
+        atomic_write_json(output.expanduser().resolve(), dict(payload))
+    _json_dump(payload)
 
 
 def _timestamp() -> str:
@@ -1090,6 +1122,116 @@ def _build_ashare_price_snapshots(
     return raw, qfq, mode, None
 
 
+def _refresh_qlib_cleaning_plan(root: Path) -> dict[str, Any]:
+    catalog_path = root / "DATA_MANIFEST.json"
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        datasets = catalog["datasets"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise DataContractError("quant_data catalog is unavailable") from exc
+    if not isinstance(datasets, dict) or not isinstance(
+        datasets.get("qlib_cleaning_plan"), dict
+    ):
+        return {"status": "not_registered"}
+
+    qfq_entry = datasets.get("ashare_daily_qfq")
+    if not isinstance(qfq_entry, dict):
+        raise DataContractError("formal A-share qfq dataset is unavailable")
+    upstream = {
+        field: str(qfq_entry.get(field) or "")
+        for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis")
+    }
+    if (
+        upstream["dataset_id"] != "ashare_daily_qfq"
+        or upstream["price_basis"] != "qfq"
+        or not upstream["snapshot_id"]
+        or len(upstream["content_sha256"]) != 64
+    ):
+        raise DataContractError("formal A-share qfq snapshot identity is invalid")
+
+    module_path = root / "src" / "quant_data_service" / "cleaning_plan.py"
+    if module_path.is_symlink() or not module_path.is_file():
+        raise DataContractError("quant_data cleaning-plan preparer is unavailable")
+    module_name = f"_quant_data_cleaning_plan_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise DataContractError("quant_data cleaning-plan preparer cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise DataContractError("quant_data cleaning-plan preparer cannot be loaded") from exc
+    finally:
+        sys.modules.pop(module_name, None)
+    prepare = getattr(module, "prepare_cleaning_plan_staging", None)
+    if not callable(prepare):
+        raise DataContractError("quant_data cleaning-plan preparer is invalid")
+
+    source = root / "reference" / "qlib_cleaning" / "CLEANING_PLAN.json"
+    try:
+        source_payload = json.loads(source.read_text(encoding="utf-8"))
+        prepared = prepare(root, source, upstream)
+    except Exception as exc:
+        raise DataContractError("Qlib cleaning plan cannot be staged") from exc
+    try:
+        source_retrieved_at = str(
+            source_payload.get("created_at")
+            or qfq_entry.get("source_retrieved_at")
+            or ""
+        )
+        finalize_artifact_snapshot(
+            prepared.staging_path,
+            dataset_id="qlib_cleaning_plan",
+            snapshot_id=prepared.snapshot_id,
+            data_kind="qlib_cleaning_plan",
+            role="canonical",
+            status="ready",
+            source={
+                "provider": "quant_workflow",
+                "interface": "build_direct_cleaning_plan",
+            },
+            price_basis="not_applicable",
+            producer={"script": "quant_data_cli.py", "version": "1"},
+            source_retrieved_at=source_retrieved_at,
+            date_range=qfq_entry["date_range"],
+            components={
+                "plan": {"path": "CLEANING_PLAN.json", "kind": "json"},
+                "provenance": {"path": "PLAN_PROVENANCE.json", "kind": "json"},
+            },
+            upstream_snapshots=[upstream],
+            metadata={
+                "source_plan_path": prepared.source_plan_path,
+                "source_plan_sha256": prepared.source_plan_sha256,
+                "source_plan_schema_version": source_payload.get("schema_version"),
+            },
+        )
+        published = publish_snapshot_group(
+            [
+                (
+                    prepared.staging_path,
+                    root / "reference" / "qlib_cleaning_plan",
+                )
+            ],
+            quant_data_root=root,
+            update_root_catalog=True,
+            publication_lock_held=True,
+        )[0]
+        manifest = json.loads(
+            (published / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+        )
+    except BaseException:
+        if prepared.staging_path.exists():
+            shutil.rmtree(prepared.staging_path)
+        raise
+    return {
+        "status": "published",
+        "dataset_id": str(manifest["dataset_id"]),
+        "snapshot_id": str(manifest["snapshot_id"]),
+        "content_sha256": str(manifest["content_sha256"]),
+    }
+
+
 def _update_ashare_from_bundle(
     root: Path,
     dataset_id: str,
@@ -1119,6 +1261,15 @@ def _update_ashare_from_bundle(
             bundle_dir=bundle_dir,
         )
         completed_steps.append("raw_qfq_v2")
+        _write_update_transaction_progress(
+            root,
+            transaction,
+            active_step="qlib_cleaning_plan",
+            completed_steps=completed_steps,
+        )
+        failed_step = "qlib_cleaning_plan"
+        _refresh_qlib_cleaning_plan(root)
+        completed_steps.append("qlib_cleaning_plan")
         _write_update_transaction_progress(
             root,
             transaction,
@@ -1354,6 +1505,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the read-only ETF release acceptance check without network access",
     )
 
+    compare_parser = commands.add_parser("compare-snapshots")
+    compare_parser.add_argument("dataset_id")
+    compare_parser.add_argument("--base-snapshot", required=True)
+    compare_parser.add_argument("--candidate-snapshot")
+    compare_parser.add_argument("--output", type=Path)
+
+    sample_parser = commands.add_parser("sample-increment")
+    sample_parser.add_argument("dataset_id")
+    sample_parser.add_argument("--base-snapshot", required=True)
+    sample_parser.add_argument("--candidate-snapshot")
+    sample_parser.add_argument("--bundle-dir", type=Path, required=True)
+    sample_parser.add_argument("--sample-size", type=int, default=100)
+    sample_parser.add_argument("--seed", default="increment-check")
+    sample_parser.add_argument("--comparison-report", type=Path, required=True)
+    sample_parser.add_argument("--output", type=Path)
+
+    expand_etf_parser = commands.add_parser("expand-cn-etf-universe")
+    expand_etf_parser.add_argument(
+        "--target-size",
+        type=int,
+        choices=(200,),
+        default=200,
+        help="Registered representative ETF universe size (currently 200 only)",
+    )
+    expand_etf_parser.add_argument("--through", required=True)
+
     update_parser = commands.add_parser("update")
     update_parser.add_argument("dataset_id")
     update_parser.add_argument("--through")
@@ -1405,6 +1582,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "validate":
             return _validate(root, args.target, release=args.release)
+        if args.command == "compare-snapshots":
+            payload = compare_snapshot_increment(
+                args.dataset_id,
+                quant_data_root=root,
+                base_snapshot_id=args.base_snapshot,
+                candidate_snapshot_id=args.candidate_snapshot,
+            )
+            _emit_json_report(payload, args.output)
+            return 0
+        if args.command == "sample-increment":
+            comparison = (
+                _read_json_object(
+                    args.comparison_report,
+                    label="increment comparison report",
+                    max_bytes=INCREMENT_COMPARISON_REPORT_MAX_BYTES,
+                )
+                if args.comparison_report is not None
+                else None
+            )
+            payload = sample_increment_against_bundle(
+                args.dataset_id,
+                quant_data_root=root,
+                base_snapshot_id=args.base_snapshot,
+                candidate_snapshot_id=args.candidate_snapshot,
+                bundle_dir=args.bundle_dir.expanduser().resolve(),
+                sample_size=args.sample_size,
+                seed=args.seed,
+                comparison_result=comparison,
+            )
+            _emit_json_report(payload, args.output)
+            return 0
+        if args.command == "expand-cn-etf-universe":
+            from download_cn_etf_data import (
+                CnEtfDownloadError,
+                expand_cn_etf_universe,
+            )
+
+            try:
+                published = expand_cn_etf_universe(
+                    quant_data_dir=root,
+                    target_size=args.target_size,
+                    end_date=args.through,
+                )
+            except CnEtfDownloadError as exc:
+                raise DataContractError(str(exc)) from exc
+            print(published)
+            return 0
         if args.command == "update":
             return _update(
                 root,

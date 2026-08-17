@@ -168,6 +168,17 @@ def test_expand_daily_factors_uses_factor_effective_on_event_date() -> None:
     assert factors["factor_source"].eq("baostock_foreAdjustFactor").all()
 
 
+def test_expand_daily_factors_accepts_parquet_microsecond_dates() -> None:
+    module = load_module()
+    raw = raw_frame()
+    raw["date"] = raw["date"].astype("datetime64[us]")
+
+    factors = module.expand_daily_factors(raw, factor_events())
+
+    assert factors["date"].tolist() == raw["date"].tolist()
+    assert factors["factor"].tolist() == [0.95, 0.95, 0.95, 1.0]
+
+
 def test_expand_daily_factors_rejects_uncovered_early_bars() -> None:
     module = load_module()
     events = factor_events().iloc[1:].copy()
@@ -231,6 +242,26 @@ def test_expand_daily_factors_normalizes_provider_verified_non_unit_terminal_fac
     )
 
     assert factors["factor"].tolist() == pytest.approx(expected_factors.tolist())
+    assert factors["factor_source"].eq(
+        "baostock_foreAdjustFactor_terminal_normalized"
+    ).all()
+    assert factors["factor_terminal_normalized"].all()
+
+
+def test_expand_daily_factors_uses_last_traded_factor_before_future_event() -> None:
+    module = load_module()
+    raw = raw_frame().iloc[:3].copy()
+    provider_qfq = raw.copy()
+    for column in module.PRICE_COLUMNS:
+        provider_qfq[column] = provider_qfq[column] * 0.95
+
+    factors = module.expand_daily_factors(
+        raw,
+        factor_events(),
+        provider_qfq=provider_qfq,
+    )
+
+    assert factors["factor"].tolist() == pytest.approx([1.0, 1.0, 1.0])
     assert factors["factor_source"].eq(
         "baostock_foreAdjustFactor_terminal_normalized"
     ).all()

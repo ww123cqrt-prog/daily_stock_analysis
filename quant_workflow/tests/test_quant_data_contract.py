@@ -1371,6 +1371,32 @@ def test_publish_snapshot_group_switches_both_latest_pointers(
     assert json.loads((qfq_root / "LATEST.json").read_text())["snapshot_id"] == "qfq-001"
 
 
+def test_publish_snapshot_group_uses_explicit_publication_timestamp(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    module.write_root_manifest(
+        quant_data,
+        {},
+        generated_at="2026-08-16T07:45:00+08:00",
+    )
+    raw_stage = finalize_raw_snapshot(module, quant_data, "raw-timestamped")
+    raw_root = quant_data / "parquet" / "ashare_1d" / "ashare_daily_raw"
+
+    module.publish_snapshot_group(
+        [(raw_stage, raw_root)],
+        quant_data_root=quant_data,
+        update_root_catalog=True,
+        published_at="2026-08-16T07:46:00+08:00",
+    )
+
+    pointer = json.loads((raw_root / "LATEST.json").read_text())
+    catalog = json.loads((quant_data / "DATA_MANIFEST.json").read_text())
+    assert pointer["published_at"] == "2026-08-16T07:46:00+08:00"
+    assert catalog["generated_at"] == "2026-08-16T07:46:00+08:00"
+
+
 def test_publish_fsyncs_snapshot_tree_and_destination_before_latest_pointer(
     tmp_path: Path,
 ) -> None:

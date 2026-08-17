@@ -412,7 +412,11 @@ def expand_daily_factors(
     if raw_bars.empty:
         raise BaostockV2Error("raw bars are empty")
     raw_dates = pd.DataFrame(
-        {"date": pd.to_datetime(raw_bars["date"], errors="coerce").dt.normalize()}
+        {
+            "date": pd.to_datetime(raw_bars["date"], errors="coerce")
+            .dt.normalize()
+            .astype("datetime64[ns]")
+        }
     ).dropna()
     raw_dates = raw_dates.sort_values("date").drop_duplicates("date")
     events = factor_events.copy()
@@ -420,7 +424,7 @@ def expand_daily_factors(
         raise BaostockV2Error("factor event fields are incomplete")
     events["source_event_date"] = pd.to_datetime(
         events["dividOperateDate"], errors="coerce"
-    ).dt.normalize()
+    ).dt.normalize().astype("datetime64[ns]")
     events["factor"] = pd.to_numeric(events["foreAdjustFactor"], errors="coerce")
     events = events.dropna(subset=["source_event_date", "factor"])
     events = events.sort_values("source_event_date").drop_duplicates(
@@ -429,7 +433,20 @@ def expand_daily_factors(
     paired_factors: pd.DataFrame | None = None
     provider_terminal_factor = np.nan
     if provider_qfq is not None:
-        paired_factors = derive_paired_daily_factors(raw_bars, provider_qfq)
+        provider_dates = pd.to_datetime(
+            provider_qfq["date"], errors="coerce"
+        ).dt.normalize()
+        provider_raw = raw_bars.copy()
+        provider_raw["date"] = pd.to_datetime(
+            provider_raw["date"], errors="coerce"
+        ).dt.normalize()
+        provider_raw = provider_raw.loc[
+            provider_raw["date"].isin(provider_dates)
+        ]
+        paired_factors = derive_paired_daily_factors(provider_raw, provider_qfq)
+        paired_factors["date"] = pd.to_datetime(
+            paired_factors["date"], errors="coerce"
+        ).dt.normalize().astype("datetime64[ns]")
         provider_terminal_factor = float(
             paired_factors.sort_values("date")["factor"].iloc[-1]
         )
@@ -443,21 +460,12 @@ def expand_daily_factors(
             paired_factors["factor"] / provider_terminal_factor
         )
     terminal_normalized = False
-    if not events.empty:
-        source_terminal_factor = float(events["factor"].iloc[-1])
-        if not np.isfinite(source_terminal_factor) or source_terminal_factor <= 0:
-            raise BaostockV2Error("terminal foreAdjustFactor must be positive")
-        if not np.isclose(source_terminal_factor, 1.0, atol=1e-6):
-            if paired_factors is None:
-                raise BaostockV2Error(
-                    "non-unit terminal foreAdjustFactor requires provider qfq verification"
-                )
-            events["factor"] = events["factor"] / source_terminal_factor
-            terminal_normalized = True
     first_raw_date = raw_dates["date"].iloc[0]
     if events.empty:
         if paired_factors is None:
             raise BaostockV2Error("factor events do not cover earliest raw bar")
+        if len(paired_factors) != len(raw_dates):
+            raise BaostockV2Error("paired raw/qfq dates do not match")
         daily = raw_dates.merge(
             paired_factors,
             on="date",
@@ -493,10 +501,30 @@ def expand_daily_factors(
         raise BaostockV2Error("factor events do not cover every raw bar")
     latest_factor = float(daily.sort_values("date")["factor"].iloc[-1])
     if not np.isclose(latest_factor, 1.0, atol=1e-6, rtol=1e-6):
-        raise BaostockV2Error("provider qfq terminal factor must equal 1")
+        if paired_factors is None:
+            raise BaostockV2Error(
+                "non-unit terminal foreAdjustFactor requires provider qfq verification"
+            )
+        if paired_factors["date"].max() != raw_dates["date"].max():
+            raise BaostockV2Error("provider qfq does not cover latest raw bar")
+        # A company-action event may be dated after the last valid trading
+        # day, for example while a suspended stock has no bar after the event.
+        # Normalize to the factor effective on the last available bar instead
+        # of applying a future event before it becomes tradable.
+        daily["factor"] = daily["factor"] / latest_factor
+        terminal_normalized = True
     if terminal_normalized:
         local_qfq = build_local_qfq(raw_bars, daily)
-        compare_provider_qfq(local_qfq, provider_qfq)
+        provider_dates = pd.to_datetime(
+            provider_qfq["date"], errors="coerce"
+        ).dt.normalize()
+        local_dates = pd.to_datetime(
+            local_qfq["date"], errors="coerce"
+        ).dt.normalize()
+        compare_provider_qfq(
+            local_qfq.loc[local_dates.isin(provider_dates)],
+            provider_qfq,
+        )
     daily["factor_source"] = (
         "baostock_foreAdjustFactor_terminal_normalized"
         if terminal_normalized

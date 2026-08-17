@@ -2473,11 +2473,13 @@ def publish_snapshot(
     dataset_root: Path,
     quant_data_root: Path,
     publication_lock_held: bool = False,
+    published_at: str | None = None,
 ) -> Path:
     return publish_snapshot_group(
         [(staging_snapshot, dataset_root)],
         quant_data_root=quant_data_root,
         publication_lock_held=publication_lock_held,
+        published_at=published_at,
     )[0]
 
 
@@ -2487,6 +2489,7 @@ def _publish_snapshot_group_unlocked(
     quant_data_root: Path,
     update_root_catalog: bool = False,
     validated_cache: ValidatedResolutionCache | None = None,
+    published_at: str | None = None,
 ) -> list[Path]:
     """Publish related snapshots and roll back every formal pointer on failure."""
 
@@ -2543,7 +2546,9 @@ def _publish_snapshot_group_unlocked(
             moved.append(item)
             _fsync_directory(item["staging"].parent)
             _fsync_directory(destination.parent)
-        published_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        publication_timestamp = published_at or datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
         for item in prepared:
             pointer_path = item["dataset_root"] / "LATEST.json"
             pointer_backups[pointer_path] = (
@@ -2563,7 +2568,7 @@ def _publish_snapshot_group_unlocked(
                     "manifest_sha256": sha256_file(
                         destination / "DATASET_MANIFEST.json"
                     ),
-                    "published_at": published_at,
+                    "published_at": publication_timestamp,
                 },
             )
         if catalog_backup is not None:
@@ -2582,6 +2587,7 @@ def _publish_snapshot_group_unlocked(
                 quant_data_root,
                 datasets,
                 existing=catalog_backup,
+                generated_at=publication_timestamp,
             )
     except Exception as publish_error:
         rollback_errors: list[tuple[str, Exception]] = []
@@ -2649,6 +2655,7 @@ def publish_snapshot_group(
     update_root_catalog: bool = False,
     publication_lock_held: bool = False,
     validated_cache: ValidatedResolutionCache | None = None,
+    published_at: str | None = None,
 ) -> list[Path]:
     quant_data_root = Path(quant_data_root).expanduser().resolve()
     if publication_lock_held:
@@ -2657,6 +2664,7 @@ def publish_snapshot_group(
             quant_data_root=quant_data_root,
             update_root_catalog=update_root_catalog,
             validated_cache=validated_cache,
+            published_at=published_at,
         )
     with dataset_publication_lock(quant_data_root):
         return _publish_snapshot_group_unlocked(
@@ -2664,6 +2672,7 @@ def publish_snapshot_group(
             quant_data_root=quant_data_root,
             update_root_catalog=update_root_catalog,
             validated_cache=validated_cache,
+            published_at=published_at,
         )
 
 
@@ -2675,6 +2684,7 @@ def publish_qlib_snapshot(
     update_root_catalog: bool = False,
     publication_lock_held: bool = False,
     validated_cache: ValidatedResolutionCache | None = None,
+    published_at: str | None = None,
 ) -> Path:
     return publish_snapshot_group(
         [(staging_snapshot, dataset_root)],
@@ -2682,6 +2692,7 @@ def publish_qlib_snapshot(
         update_root_catalog=update_root_catalog,
         publication_lock_held=publication_lock_held,
         validated_cache=validated_cache,
+        published_at=published_at,
     )[0]
 
 
@@ -2835,13 +2846,15 @@ def write_root_manifest(
     datasets: Mapping[str, Mapping[str, Any]],
     *,
     existing: Mapping[str, Any] | None = None,
+    generated_at: str | None = None,
 ) -> Path:
     quant_data_root = Path(quant_data_root).expanduser().resolve()
     payload = dict(existing or {})
     payload.update(
         {
             "schema_version": SCHEMA_VERSION,
-            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "generated_at": generated_at
+            or datetime.now().astimezone().isoformat(timespec="seconds"),
             "path_format": "relative_to_quant_data_root",
             "datasets": {key: dict(value) for key, value in sorted(datasets.items())},
         }

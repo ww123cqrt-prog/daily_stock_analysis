@@ -948,6 +948,99 @@ def test_update_cn_index_daily_invalid_through_is_a_bounded_cli_error(
     assert "Traceback" not in captured.err
 
 
+def test_expand_cn_etf_universe_cli_uses_the_separate_governed_entrypoint(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    calls: list[dict[str, object]] = []
+    published = tmp_path / "quant_data" / "expanded-snapshot"
+
+    def expand_cn_etf_universe(**kwargs):
+        calls.append(kwargs)
+        return published
+
+    class FakeCnEtfDownloadError(RuntimeError):
+        pass
+
+    fake_module = types.SimpleNamespace(
+        CnEtfDownloadError=FakeCnEtfDownloadError,
+        expand_cn_etf_universe=expand_cn_etf_universe
+    )
+    with patch.dict(sys.modules, {"download_cn_etf_data": fake_module}):
+        result = module.main(
+            [
+                "--root",
+                str(tmp_path / "quant_data"),
+                "expand-cn-etf-universe",
+                "--target-size",
+                "200",
+                "--through",
+                "2026-08-14",
+            ]
+        )
+
+    assert result == 0
+    assert calls == [
+        {
+            "quant_data_dir": (tmp_path / "quant_data").resolve(),
+            "target_size": 200,
+            "end_date": "2026-08-14",
+        }
+    ]
+    assert capsys.readouterr().out.strip() == str(published)
+
+
+def test_expand_cn_etf_universe_cli_rejects_unregistered_target_size(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+
+    with pytest.raises(SystemExit):
+        module.main(
+            [
+                "--root",
+                str(tmp_path / "quant_data"),
+                "expand-cn-etf-universe",
+                "--target-size",
+                "150",
+                "--through",
+                "2026-08-14",
+            ]
+        )
+
+
+def test_expand_cn_etf_universe_cli_handles_download_error_without_traceback(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+
+    class FakeCnEtfDownloadError(RuntimeError):
+        pass
+
+    def expand_cn_etf_universe(**_kwargs):
+        raise FakeCnEtfDownloadError("provider rejected the bounded request")
+
+    fake_module = types.SimpleNamespace(
+        CnEtfDownloadError=FakeCnEtfDownloadError,
+        expand_cn_etf_universe=expand_cn_etf_universe,
+    )
+    with patch.dict(sys.modules, {"download_cn_etf_data": fake_module}):
+        result = module.main(
+            [
+                "--root",
+                str(tmp_path / "quant_data"),
+                "expand-cn-etf-universe",
+                "--through",
+                "2026-08-14",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "provider rejected the bounded request" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_update_recovers_interrupted_transaction_before_new_publication(
     tmp_path: Path,
 ) -> None:
@@ -977,6 +1070,10 @@ def test_update_recovers_interrupted_transaction_before_new_publication(
     }
 
     with patch.dict(sys.modules, fake_modules), patch.object(
+        module,
+        "_refresh_qlib_cleaning_plan",
+        return_value={"status": "not_registered"},
+    ), patch.object(
         module,
         "build_direct_provider_descriptor",
         side_effect=fake_direct_provider_builder(quant_data),
@@ -1111,6 +1208,10 @@ def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
         / "ashare_1d"
         / "ashare_daily_qfq"
         / "LATEST.json": b'{"old":"qfq"}',
+        quant_data
+        / "reference"
+        / "qlib_cleaning_plan"
+        / "LATEST.json": b'{"old":"cleaning"}',
     }
     for path, value in tracked.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1118,12 +1219,21 @@ def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
 
     tracked_paths = list(tracked)
 
+    observed_steps: list[str] = []
+
     def build_snapshots(**_kwargs):
+        observed_steps.append("raw_qfq")
         for path in tracked_paths[0:3]:
             path.write_text('{"new":"snapshot"}', encoding="utf-8")
         return quant_data / "new-raw", quant_data / "new-qfq"
 
+    def refresh_cleaning_plan(_root):
+        observed_steps.append("qlib_cleaning_plan")
+        tracked_paths[3].write_text('{"new":"cleaning"}', encoding="utf-8")
+        return {"status": "published"}
+
     def build_direct(**kwargs):
+        observed_steps.append(f"direct_{kwargs['cleaning_mode']}")
         if kwargs["cleaning_mode"] == "cleaned":
             raise RuntimeError("cleaned direct provider build failed")
         descriptor = quant_data / "direct-canonical" / "PROVIDER_DESCRIPTOR.json"
@@ -1141,8 +1251,8 @@ def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
     }
 
     with patch.dict(sys.modules, fake_modules), patch.object(
-        module, "build_direct_provider_descriptor", side_effect=build_direct
-    ):
+        module, "_refresh_qlib_cleaning_plan", side_effect=refresh_cleaning_plan, create=True
+    ), patch.object(module, "build_direct_provider_descriptor", side_effect=build_direct):
         try:
             module._update(quant_data, "ashare_daily_qfq", None, bundle)
         except module.DataContractError as exc:
@@ -1152,6 +1262,12 @@ def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
 
     for path, value in tracked.items():
         assert path.read_bytes() == value
+    assert observed_steps == [
+        "raw_qfq",
+        "qlib_cleaning_plan",
+        "direct_canonical",
+        "direct_cleaned",
+    ]
     status = json.loads(
         (
             quant_data
@@ -1164,6 +1280,7 @@ def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
     assert status["failed_step"] == "direct_provider_cleaned"
     assert status["completed_steps"] == [
         "raw_qfq_v2",
+        "qlib_cleaning_plan",
         "direct_provider_canonical",
     ]
     assert not (quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH).exists()
@@ -1231,6 +1348,7 @@ def test_compatibility_refresh_failure_does_not_roll_back_native_v2(
     assert status["status"] == "completed_with_legacy_warning"
     assert status["completed_steps"] == [
         "raw_qfq_v2",
+        "qlib_cleaning_plan",
         "direct_provider_canonical",
         "direct_provider_cleaned",
     ]
@@ -1567,3 +1685,102 @@ def test_human_description_reports_native_upstream_and_benchmark_lineage() -> No
     assert f"交易日历哈希: {'b' * 64}" in text
     for symbol in ("SH000300", "SH000905", "SH000906"):
         assert symbol in text
+
+
+def test_compare_snapshots_command_writes_machine_readable_report(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    output = tmp_path / "comparison.json"
+    payload = {
+        "status": "increment_comparison_passed",
+        "dataset_id": "ashare_daily_raw",
+        "checked_symbols": 5516,
+    }
+
+    with patch.object(
+        module, "compare_snapshot_increment", return_value=payload, create=True
+    ) as compare:
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "compare-snapshots",
+                "ashare_daily_raw",
+                "--base-snapshot",
+                "raw-base",
+                "--candidate-snapshot",
+                "raw-candidate",
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == payload
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    compare.assert_called_once_with(
+        "ashare_daily_raw",
+        quant_data_root=quant_data.resolve(),
+        base_snapshot_id="raw-base",
+        candidate_snapshot_id="raw-candidate",
+    )
+
+
+def test_sample_increment_command_uses_comparison_report_for_category_coverage(
+    tmp_path: Path, capsys
+) -> None:
+    module = load_module()
+    quant_data = tmp_path / "quant_data"
+    quant_data.mkdir()
+    bundle = tmp_path / "bundle"
+    comparison = tmp_path / "comparison.json"
+    comparison_payload = {
+        "status": "increment_comparison_passed",
+        "factor_changed_symbols": ["SH600000"],
+    }
+    comparison.write_text(json.dumps(comparison_payload), encoding="utf-8")
+    payload = {
+        "status": "increment_sample_passed",
+        "dataset_id": "ashare_daily_qfq",
+        "sampled_symbol_count": 100,
+    }
+
+    with patch.object(
+        module, "sample_increment_against_bundle", return_value=payload, create=True
+    ) as sample:
+        result = module.main(
+            [
+                "--root",
+                str(quant_data),
+                "sample-increment",
+                "ashare_daily_qfq",
+                "--base-snapshot",
+                "qfq-base",
+                "--candidate-snapshot",
+                "qfq-candidate",
+                "--bundle-dir",
+                str(bundle),
+                "--sample-size",
+                "100",
+                "--seed",
+                "daily-check",
+                "--comparison-report",
+                str(comparison),
+            ]
+        )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == payload
+    sample.assert_called_once_with(
+        "ashare_daily_qfq",
+        quant_data_root=quant_data.resolve(),
+        base_snapshot_id="qfq-base",
+        candidate_snapshot_id="qfq-candidate",
+        bundle_dir=bundle.resolve(),
+        sample_size=100,
+        seed="daily-check",
+        comparison_result=comparison_payload,
+    )

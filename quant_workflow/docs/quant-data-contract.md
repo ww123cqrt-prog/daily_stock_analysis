@@ -279,6 +279,43 @@ CLI 必须先读取 `BUNDLE_MANIFEST.json.bundle_mode`。`incremental` bundle �
 复权因子指纹变化的证券才重算自身全历史 qfq；`full` bundle 才调用完整构建器。
 两种模式都将 raw/qfq 成组校验并原子发布，禁止把增量 bundle 误送到完整构建器。
 
+增量发布后使用下面两条只读命令验收。省略 `--candidate-snapshot` 时，候选固定为
+命令启动时解析到的当前正式快照；`--output` 可将与标准输出相同的 JSON 结果原子
+写入报告文件。
+
+```bash
+# 逐一读取旧、新快照的全部证券，证明新快照只是旧快照的合规增量
+python quant_workflow/scripts/quant_data_cli.py \
+  --root /Users/cq/WorkingProjects/quant_data \
+  compare-snapshots ashare_daily_raw \
+  --base-snapshot <old-raw-snapshot-id> \
+  --candidate-snapshot <new-raw-snapshot-id> \
+  --output <raw-comparison.json>
+
+# 从新增区间确定性抽样，并逐行对照发布时保留的本地 Baostock bundle
+python quant_workflow/scripts/quant_data_cli.py \
+  --root /Users/cq/WorkingProjects/quant_data \
+  sample-increment ashare_daily_raw \
+  --base-snapshot <old-raw-snapshot-id> \
+  --candidate-snapshot <new-raw-snapshot-id> \
+  --bundle-dir <verified-local-bundle> \
+  --sample-size 100 \
+  --comparison-report <raw-comparison.json> \
+  --output <raw-sample.json>
+```
+
+`compare-snapshots` 对 raw 要求旧截止日及以前逐行不变；对 qfq 只允许因逐日复权
+因子数值确实变化而重算旧价格。清单中的 `factor_changed_symbols` 按完整公司行为事件
+历史核对；报告另行列出因子数值变化数、因子证据元数据变化数和真正改写旧 qfq
+价格的证券数，不能把三种口径混为一个数字。两种价格口径都检查证券集合、文件
+哈希、日期顺序、重复日期、新增日期边界、OHLC 与成交量。
+`sample-increment` 不联网，raw 直接对照 bundle 原始行情，qfq 则使用 bundle 的 raw
+与完整因子证据按冻结公式重建后对照。抽检报告必须列出已检查和未检查证券数量；
+命令会在当前进程内重新执行完整增量对比，并要求 `--comparison-report` 与重算结果
+完全一致，不能用人工构造或过期报告跳过历史检查。qfq 的增量基础身份通过旧 qfq
+快照声明的唯一 raw 上游绑定，和候选清单的 `source.base_snapshot_id` 对照。抽检通过
+不能替代完整增量对比。
+
 任意股票 raw、因子或 qfq 抽样核对失败，整个 bundle 都不能发布。完整更新链路持有 `runtime/locks/ashare_v2_update.lock` 单实例锁，第二个并发更新会在改写任何正式指针前退出。第一次发布前，命令把根清单以及 raw、qfq 两个正式 `LATEST.json` 的原始内容持久化到 `runtime/transactions/ashare_v2_update.json` 并执行 `fsync`。每个 staging 快照发布时，先对全部文件和子目录执行 `fsync`，再原子 rename，并同步 staging 与正式 `snapshots/` 目录；只有这些步骤成功后才写 `LATEST.json` 和根清单。raw、qfq 发布完成后，事务继续生成并校验 canonical、cleaned 两个 metadata-only Direct Provider 描述符；两者都成功才删除事务记录并正式提交。普通异常会立即恢复旧指针，进程被强制结束或机器断电时，下一次更新会在持有更新锁和发布锁后先自动恢复，再开始新的发布。事务记录缺失字段、内容哈希不符或无法读取时直接阻断更新，不能猜测旧状态。恢复结果写入 `runtime/status/quant_data_update_latest.json`，状态为 `rolled_back` 或 `recovered_interrupted_update`。已经完成校验但失去正式指针的不可变快照可以保留作审计，它们不会被 `resolve` 选中。默认更新到这里结束，不改旧固定路径或物理 `.bin` 数据。只有显式传入 `--refresh-legacy-compatibility` 才会在正式链成功后维护兼容输出；该可选步骤失败只写 `completed_with_legacy_warning`，不能撤销有效的原生快照。回滚本身失败则明确写 `rollback_failed`，并保留事务记录供下次恢复。
 
 ## Qlib 直接适配层

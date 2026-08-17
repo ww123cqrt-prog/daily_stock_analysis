@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] `quant_data_cli.py` 新增只读 `compare-snapshots`，逐证券证明 A 股 raw/qfq 新快照是指定旧快照的合规增量，并为复权因子变化导致的历史重算保留可核对证据。
+- [新功能] `quant_data_cli.py` 新增只读 `sample-increment`，运行时重新执行完整快照语义比较并要求外部比较报告与实际结果完全一致，再按固定种子抽检新增区间并离线对照本地 Baostock bundle；报告明确已检查与未检查证券数量，不能用伪造或过期报告把抽检冒充全检。
+
 ## [3.31.0] - 2026-08-14
 
 - [收尾] 量化研究工作台定版：提交全部未提交的 v1 开发成果（回测引擎、脚本沙箱、策略资产、研究注册表、前端工作台），打 tag `v3.31.0`；清理开发期运行时产物（日志、报告、universe 缓存、Python 工具缓存、前端构建产物、误建的空目录 `quant_workflow/Users/`），保留 `strategy_assets.db` 与 `quant_research.db` 两个用户数据库、MLflow 实验历史（`quant_workflow/mlruns/`）与本地数据目录；.gitignore 补充 `.ruff_cache/` 与 SQLite 伴生文件（`*.db-journal/-wal/-shm`）。

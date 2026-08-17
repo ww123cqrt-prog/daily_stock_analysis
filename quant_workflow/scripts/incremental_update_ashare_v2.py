@@ -184,7 +184,13 @@ def _canonical_events(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     if missing:
         raise DataContractError(f"factor event values are missing for {symbol}")
     normalized = pd.DataFrame(
-        {"event_date": pd.to_datetime(events[date_column], errors="coerce").dt.normalize()}
+        {
+            "event_date": pd.to_datetime(
+                events[date_column], errors="coerce"
+            )
+            .dt.normalize()
+            .astype("datetime64[ns]")
+        }
     )
     for column in _EVENT_VALUE_COLUMNS:
         normalized[column] = pd.to_numeric(events[column], errors="coerce")
@@ -334,6 +340,27 @@ def build_incremental_price_snapshots(
                 base_factors = pd.read_parquet(
                     qfq_base.snapshot_path / "factors" / f"{symbol}.parquet"
                 )
+                provider_qfq = None
+                provider_relative = getattr(row, "qfq_provider_path", None)
+                if isinstance(provider_relative, str) and provider_relative:
+                    provider_path = _bundle_file(
+                        bundle,
+                        provider_relative,
+                        label=f"incremental qfq audit file for {symbol}",
+                    )
+                    provider_hash = getattr(row, "qfq_provider_sha256", None)
+                    if not isinstance(provider_hash, str) or not provider_hash:
+                        raise DataContractError(
+                            f"incremental qfq audit hash is missing for {symbol}"
+                        )
+                    if sha256_file(provider_path) != provider_hash:
+                        raise DataContractError(
+                            f"incremental qfq audit hash mismatch for {symbol}"
+                        )
+                    provider_qfq = _normalize_bars(
+                        pd.read_parquet(provider_path),
+                        symbol=symbol,
+                    )
             except (OSError, ValueError) as exc:
                 raise DataContractError(f"incremental inputs are unreadable for {symbol}") from exc
             downloaded_rows += len(raw_update)
@@ -350,7 +377,11 @@ def build_incremental_price_snapshots(
             if factor_changed:
                 if canonical_new_events.empty:
                     raise DataContractError(f"factor history disappeared for {symbol}")
-                daily_factors = expand_daily_factors(merged_raw, new_events)
+                daily_factors = expand_daily_factors(
+                    merged_raw,
+                    new_events,
+                    provider_qfq=provider_qfq,
+                )
                 merged_qfq = build_local_qfq(merged_raw, daily_factors)
                 changed.append(symbol)
             elif raw_update.empty:

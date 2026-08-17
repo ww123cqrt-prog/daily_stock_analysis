@@ -227,6 +227,66 @@ def test_incremental_price_import_reuses_history_and_recalculates_only_changed_f
     assert result.qfq_recalculated_symbols == ("SH000002",)
 
 
+def test_incremental_price_import_uses_partial_qfq_audit_for_future_factor_event(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_bundle(root)
+    source = load_script("download_baostock_v2")
+    symbol = "SH000002"
+
+    events_path = bundle / "factor_events" / f"{symbol}.parquet"
+    events = pd.read_parquet(events_path)
+    events.loc[events.index[-1], "dividOperateDate"] = pd.Timestamp("2026-08-12")
+    events.to_parquet(events_path, index=False)
+
+    raw_path = bundle / "raw" / f"{symbol}.parquet"
+    provider_qfq_path = bundle / "qfq_provider" / f"{symbol}.parquet"
+    provider_qfq_path.parent.mkdir(parents=True, exist_ok=True)
+    provider_qfq = pd.read_parquet(raw_path)
+    for column in source.PRICE_COLUMNS:
+        provider_qfq[column] = provider_qfq[column] * 0.4
+    provider_qfq.to_parquet(provider_qfq_path, index=False)
+
+    index_path = bundle / "BUNDLE_FILE_INDEX.parquet"
+    index = pd.read_parquet(index_path)
+    selected = index["symbol"].eq(symbol)
+    index.loc[selected, "factor_events_sha256"] = source.sha256_file(events_path)
+    index.loc[selected, "qfq_provider_path"] = f"qfq_provider/{symbol}.parquet"
+    index.loc[selected, "qfq_provider_sha256"] = source.sha256_file(
+        provider_qfq_path
+    )
+    index.to_parquet(index_path, index=False)
+
+    module = load_script("incremental_update_ashare_v2")
+    result = module.build_incremental_price_snapshots(
+        bundle_dir=bundle,
+        quant_data_root=root,
+    )
+
+    factors = pd.read_parquet(result.qfq_stage / "factors" / f"{symbol}.parquet")
+    assert factors["factor"].iloc[-1] == pytest.approx(1.0)
+    assert factors["factor_terminal_normalized"].all()
+
+
+def test_events_changed_ignores_parquet_datetime_unit_difference() -> None:
+    module = load_script("incremental_update_ashare_v2")
+    values = {
+        "event_date": ["2026-08-04"],
+        "foreAdjustFactor": [1.0],
+        "backAdjustFactor": [1.0],
+        "adjustFactor": [1.0],
+        "symbol": ["SH000001"],
+    }
+    old = pd.DataFrame(values)
+    new = pd.DataFrame(values)
+    old["event_date"] = pd.to_datetime(old["event_date"]).astype("datetime64[us]")
+    new["event_date"] = pd.to_datetime(new["event_date"]).astype("datetime64[ns]")
+
+    assert not module._events_changed(old, new, symbol="SH000001")
+
+
 def test_incremental_price_import_rejects_full_bundle_without_touching_latest(
     tmp_path: Path,
 ) -> None:

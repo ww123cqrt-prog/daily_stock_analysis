@@ -7,9 +7,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -55,12 +57,76 @@ DEFAULT_INCREMENTAL_PAGE_SIZE = 64
 DEFAULT_REQUIRED_CODES = ("512890", "513010", "510720", "159915", "513100")
 DEFAULT_SNAPSHOT_RETENTION = 2
 DEFAULT_INCREMENTAL_OVERLAP_DAYS = 14
+DEFAULT_REPRESENTATIVE_TARGET_SIZE = 200
+DEFAULT_MINIMUM_HISTORY_ROWS = 60
 MIN_REQUEST_INTERVAL = 0.2
+MIN_EXPANSION_REQUEST_INTERVAL = 0.3
 MAX_CONSECUTIVE_FAILURES = 3
 PRODUCER_VERSION = "2"
 AFFINE_RESIDUAL_TOLERANCE = 0.0015
 AFFINE_NEAR_TIE_TOLERANCE = 0.00015
 AFFINE_FIT_WINDOWS = (10, 7, 5, 3, 2, 1)
+REPRESENTATIVE_CATEGORY_TARGETS = {
+    "core_broad": 32,
+    "sector_theme": 73,
+    "dividend_factor": 22,
+    "hong_kong": 24,
+    "overseas": 16,
+    "bond": 21,
+    "commodity": 7,
+    "cash": 5,
+}
+ETF_MANAGER_TOKENS = (
+    "华泰柏瑞",
+    "易方达",
+    "汇添富",
+    "海富通",
+    "博时",
+    "南方",
+    "华夏",
+    "嘉实",
+    "国泰",
+    "广发",
+    "招商",
+    "富国",
+    "鹏华",
+    "银华",
+    "华宝",
+    "中银",
+    "兴业",
+    "摩根",
+    "平安",
+    "天弘",
+    "工银瑞信",
+    "华安",
+    "建信",
+    "景顺长城",
+    "国联安",
+    "国寿安保",
+    "大成",
+    "交银施罗德",
+    "融通",
+    "万家",
+    "申万菱信",
+    "长城",
+    "长盛",
+    "中欧",
+    "中金",
+    "中信保诚",
+    "中信建投",
+    "中邮",
+    "东财",
+    "西部利得",
+    "永赢",
+    "浦银安盛",
+    "泰康",
+    "国投瑞银",
+    "华富",
+    "诺安",
+    "创金合信",
+    "前海开源",
+    "鹏扬",
+)
 
 
 class CnEtfDownloadError(RuntimeError):
@@ -161,6 +227,7 @@ def build_etf_universe(
             "in_ths": False,
             "ths_latest_trade_date": None,
             "sina_amount": float(amount) if pd.notna(amount) else 0.0,
+            "fund_type": None,
         }
 
     through_date = _as_date(through)
@@ -177,6 +244,7 @@ def build_etf_universe(
             records[symbol]["ths_latest_trade_date"] = (
                 latest.date().isoformat() if pd.notna(latest) else None
             )
+            records[symbol]["fund_type"] = str(row.get("基金类型") or "").strip() or None
             continue
         if pd.isna(latest) or latest < recent_cutoff or latest > through_date:
             continue
@@ -190,6 +258,7 @@ def build_etf_universe(
             "in_ths": True,
             "ths_latest_trade_date": latest.date().isoformat(),
             "sina_amount": 0.0,
+            "fund_type": str(row.get("基金类型") or "").strip() or None,
         }
 
     if not records:
@@ -238,13 +307,294 @@ def select_trial_universe(
     return selected
 
 
-def fetch_etf_universe(
+def classify_representative_category(name: object, fund_type: object = None) -> str:
+    """Assign one mutually exclusive research category from public metadata."""
+
+    text = unicodedata.normalize("NFKC", str(name or "")).upper().replace(" ", "")
+    type_text = unicodedata.normalize("NFKC", str(fund_type or "")).upper()
+    if any(
+        keyword in text
+        for keyword in (
+            "货币",
+            "现金",
+            "日利",
+            "添益",
+            "保证金",
+            "快线",
+            "金利",
+            "理财金",
+        )
+    ):
+        return "cash"
+    if "债" in text or "债券" in type_text or "短融" in text:
+        return "bond"
+    if any(
+        keyword in text
+        for keyword in (
+            "黄金",
+            "白银",
+            "豆粕",
+            "商品",
+            "原油",
+            "能源化工",
+            "有色金属期货",
+        )
+    ):
+        return "commodity"
+    if any(
+        keyword in text
+        for keyword in ("恒生", "港股", "港股通", "香港", "H股", "中概")
+    ):
+        return "hong_kong"
+    if any(
+        keyword in text
+        for keyword in (
+            "纳指",
+            "纳斯达克",
+            "标普",
+            "日经",
+            "东证",
+            "德国",
+            "法国",
+            "美国",
+            "美股",
+            "沙特",
+            "印度",
+            "东南亚",
+            "全球",
+            "海外",
+            "欧洲",
+            "韩国",
+        )
+    ):
+        return "overseas"
+    if any(
+        keyword in text
+        for keyword in (
+            "红利",
+            "低波",
+            "价值",
+            "质量",
+            "成长",
+            "自由现金流",
+            "现金流",
+            "股息",
+            "基本面",
+        )
+    ):
+        return "dividend_factor"
+    if any(
+        keyword in text
+        for keyword in (
+            "沪深300",
+            "中证500",
+            "中证800",
+            "中证1000",
+            "中证2000",
+            "中证A500",
+            "A500",
+            "中证A50",
+            "A50",
+            "上证50",
+            "上证180",
+            "上证380",
+            "深证100",
+            "深证50",
+            "创业板",
+            "科创50",
+            "科创100",
+            "科创200",
+            "国证2000",
+            "北证50",
+            "中小100",
+            "深证成指",
+            "上证指数",
+        )
+    ):
+        return "core_broad"
+    return "sector_theme"
+
+
+def representative_tracking_key(name: object, code: object = None) -> str:
+    """Normalize a display name enough to avoid adding another same-index ETF."""
+
+    text = unicodedata.normalize("NFKC", str(name or "")).upper()
+    text = text.replace("交易型开放式指数证券投资基金", "")
+    for token in ETF_MANAGER_TOKENS:
+        text = text.replace(token.upper(), "")
+    text = text.replace("ETF", "").replace("基金", "")
+    normalized = re.sub(r"[^0-9A-Z\u4e00-\u9fff]+", "", text)
+    return normalized or str(code or "").zfill(6)
+
+
+def select_representative_universe(
+    universe: pd.DataFrame,
+    current_universe: pd.DataFrame,
+    *,
+    target_size: int = DEFAULT_REPRESENTATIVE_TARGET_SIZE,
+    category_targets: dict[str, int] | None = None,
+    minimum_turnover: float = 1_000_000.0,
+    excluded_symbols: tuple[str, ...] = (),
+) -> pd.DataFrame:
+    """Retain the frozen pool and fill deterministic category quotas by liquidity."""
+
+    if category_targets is None and target_size != DEFAULT_REPRESENTATIVE_TARGET_SIZE:
+        raise ValueError(
+            "default representative quotas support target_size=200; "
+            "provide explicit category_targets for another registered contract"
+        )
+    targets = dict(category_targets or REPRESENTATIVE_CATEGORY_TARGETS)
+    if target_size < 1 or target_size > 500:
+        raise ValueError("representative ETF target_size must be between 1 and 500")
+    if sum(targets.values()) != target_size or any(value < 0 for value in targets.values()):
+        raise ValueError("representative ETF category targets must sum to target_size")
+    unknown = sorted(set(targets) - set(REPRESENTATIVE_CATEGORY_TARGETS))
+    if unknown:
+        raise ValueError("unknown representative ETF categories: " + ", ".join(unknown))
+    required = {"symbol", "code", "market", "name"}
+    if universe.empty or not required.issubset(universe.columns):
+        raise CnEtfDownloadError("ETF catalog is incomplete for representative selection")
+    if current_universe.empty or not required.issubset(current_universe.columns):
+        raise CnEtfDownloadError("current ETF universe is incomplete")
+    current = current_universe.drop_duplicates("symbol", keep="first").copy()
+    normalized_exclusions = {
+        str(symbol).strip().upper() for symbol in excluded_symbols if str(symbol).strip()
+    }
+    current_symbol_set = set(current["symbol"].astype(str))
+    if normalized_exclusions & current_symbol_set:
+        raise CnEtfDownloadError(
+            "representative exclusions cannot remove a current ETF symbol"
+        )
+    if len(current) > target_size:
+        raise CnEtfDownloadError("representative expansion cannot shrink the current universe")
+
+    ranked = universe.drop_duplicates("symbol", keep="first").copy()
+    optional_defaults = {
+        "sina_amount": 0.0,
+        "in_sina": False,
+        "in_ths": False,
+        "fund_type": None,
+        "sina_code": None,
+        "ths_latest_trade_date": None,
+    }
+    for column, default in optional_defaults.items():
+        if column not in ranked.columns:
+            ranked[column] = pd.Series(default, index=ranked.index)
+    ranked["sina_amount"] = pd.to_numeric(
+        ranked["sina_amount"], errors="coerce"
+    ).fillna(0.0)
+    ranked["in_sina"] = ranked["in_sina"].fillna(False).astype(bool)
+    ranked["in_ths"] = ranked["in_ths"].fillna(False).astype(bool)
+    ranked["representative_category"] = [
+        classify_representative_category(row.name, getattr(row, "fund_type", None))
+        for row in ranked.itertuples(index=False)
+    ]
+    ranked["tracking_key"] = [
+        representative_tracking_key(row.name, row.code)
+        for row in ranked.itertuples(index=False)
+    ]
+    ranked["catalog_pair"] = ranked["in_sina"] & ranked["in_ths"]
+    ranked = ranked.sort_values(
+        ["catalog_pair", "sina_amount", "symbol"],
+        ascending=[False, False, True],
+        kind="stable",
+    )
+
+    catalog_by_symbol = ranked.set_index("symbol", drop=False)
+    selected_records: list[dict[str, Any]] = []
+    selected_symbols: set[str] = set()
+    used_keys: set[str] = set()
+    counts = {category: 0 for category in targets}
+    for row in current.itertuples(index=False):
+        symbol = str(row.symbol)
+        source = (
+            catalog_by_symbol.loc[symbol].to_dict()
+            if symbol in catalog_by_symbol.index
+            else row._asdict()
+        )
+        category = classify_representative_category(
+            source.get("name"), source.get("fund_type")
+        )
+        if category not in targets:
+            raise CnEtfDownloadError(
+                f"current ETF category is not covered by the selection contract: {symbol}"
+            )
+        key = representative_tracking_key(source.get("name"), source.get("code"))
+        source.update(
+            {
+                "representative_category": category,
+                "tracking_key": key,
+                "selection_reason": "existing_snapshot",
+            }
+        )
+        selected_records.append(source)
+        selected_symbols.add(symbol)
+        used_keys.add(key)
+        counts[category] += 1
+
+    overfilled = {
+        category: counts[category] - target
+        for category, target in targets.items()
+        if counts[category] > target
+    }
+    if overfilled:
+        details = ", ".join(f"{key}=+{value}" for key, value in overfilled.items())
+        raise CnEtfDownloadError(
+            "current ETF universe already exceeds representative quotas: " + details
+        )
+
+    eligible = ranked.loc[
+        ranked["in_sina"]
+        & (ranked["sina_amount"] >= float(minimum_turnover))
+        & ~ranked["symbol"].astype(str).isin(selected_symbols)
+        & ~ranked["symbol"].astype(str).isin(normalized_exclusions)
+    ]
+    for category, target in targets.items():
+        needed = target - counts[category]
+        if needed <= 0:
+            continue
+        added = 0
+        for row in eligible.loc[
+            eligible["representative_category"] == category
+        ].itertuples(index=False):
+            symbol = str(row.symbol)
+            key = str(row.tracking_key)
+            if symbol in selected_symbols or key in used_keys:
+                continue
+            record = row._asdict()
+            record["selection_reason"] = f"representative_{category}"
+            selected_records.append(record)
+            selected_symbols.add(symbol)
+            used_keys.add(key)
+            counts[category] += 1
+            added += 1
+            if added == needed:
+                break
+        if added != needed:
+            raise CnEtfDownloadError(
+                f"representative ETF category {category} needs {needed} additions but only {added} passed selection"
+            )
+
+    selected = pd.DataFrame(selected_records)
+    if len(selected) != target_size or selected["symbol"].astype(str).duplicated().any():
+        raise CnEtfDownloadError("representative ETF universe did not reach the exact target")
+    final_counts = selected["representative_category"].value_counts().to_dict()
+    if any(int(final_counts.get(category, 0)) != target for category, target in targets.items()):
+        raise CnEtfDownloadError("representative ETF category quotas are inconsistent")
+    selected = selected.drop(
+        columns=["catalog_pair", "selection_rank"], errors="ignore"
+    )
+    selected.insert(0, "selection_rank", range(1, len(selected) + 1))
+    return selected.reset_index(drop=True)
+
+
+def fetch_etf_catalog(
     *,
     through: str,
     request_gate: RequestGate,
-    limit: int = DEFAULT_LIMIT,
-    required_codes: tuple[str, ...] = DEFAULT_REQUIRED_CODES,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Fetch only the two public ETF metadata catalogs used for selection."""
+
     import akshare as ak
 
     sina = request_gate.call(ak.fund_etf_category_sina, symbol="ETF基金")
@@ -252,15 +602,31 @@ def fetch_etf_universe(
     if sina is None or sina.empty or ths is None or ths.empty:
         raise CnEtfDownloadError("ETF catalog source returned no rows")
     reconciled = build_etf_universe(sina, ths, through=through)
+    return reconciled, {
+        "sina_count": int(len(sina)),
+        "ths_count": int(len(ths)),
+        "reconciled_count": int(len(reconciled)),
+    }
+
+
+def fetch_etf_universe(
+    *,
+    through: str,
+    request_gate: RequestGate,
+    limit: int = DEFAULT_LIMIT,
+    required_codes: tuple[str, ...] = DEFAULT_REQUIRED_CODES,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    reconciled, summary = fetch_etf_catalog(
+        through=through,
+        request_gate=request_gate,
+    )
     selected = select_trial_universe(
         reconciled,
         limit=limit,
         required_codes=required_codes,
     )
     return selected, {
-        "sina_count": int(len(sina)),
-        "ths_count": int(len(ths)),
-        "reconciled_count": int(len(reconciled)),
+        **summary,
         "selected_count": int(len(selected)),
         "selection_method": "sina_turnover_top_n_plus_required_codes",
         "required_codes": list(required_codes),
@@ -950,6 +1316,7 @@ def prune_snapshot_history(
     dataset_root: Path,
     *,
     keep: int = DEFAULT_SNAPSHOT_RETENTION,
+    preferred_backup_snapshot_id: str | None = None,
 ) -> list[str]:
     """Keep the current complete snapshot and at most one previous snapshot."""
 
@@ -993,6 +1360,12 @@ def prune_snapshot_history(
 
     ordered = sorted(records, key=lambda item: (item[0], item[1]), reverse=True)
     retained = {current}
+    if preferred_backup_snapshot_id:
+        preferred = str(preferred_backup_snapshot_id)
+        available = {snapshot_id for _, snapshot_id, _ in records}
+        if preferred == current or preferred not in available:
+            raise CnEtfDownloadError("preferred ETF backup snapshot is unavailable")
+        retained.add(preferred)
     for _, snapshot_id, _ in ordered:
         if len(retained) >= keep:
             break
@@ -1018,6 +1391,8 @@ def prune_snapshot_history(
 def _post_publish_housekeeping(
     root: Path,
     dataset_root: Path,
+    *,
+    preferred_backup_snapshot_id: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Run non-transactional housekeeping without hiding a committed publish."""
 
@@ -1027,6 +1402,7 @@ def _post_publish_housekeeping(
         removed = prune_snapshot_history(
             dataset_root,
             keep=DEFAULT_SNAPSHOT_RETENTION,
+            preferred_backup_snapshot_id=preferred_backup_snapshot_id,
         )
     except Exception as exc:
         warnings.append(f"retention cleanup failed: {type(exc).__name__}: {exc}")
@@ -1359,6 +1735,7 @@ def update_cn_etf_snapshot(
             removed_snapshots, post_publish_warnings = _post_publish_housekeeping(
                 root,
                 dataset_root,
+                preferred_backup_snapshot_id=current.name,
             )
             published_status = {
                 "status": (
@@ -1388,6 +1765,791 @@ def update_cn_etf_snapshot(
             except Exception as exc:
                 print(
                     "ETF snapshot was published; status write failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            return published
+        finally:
+            shutil.rmtree(staging_run, ignore_errors=True)
+
+
+def _expansion_cache_symbol_complete(
+    cache: Path,
+    symbol: str,
+    *,
+    minimum_history_rows: int,
+    through: pd.Timestamp,
+) -> bool:
+    if not _cache_symbol_complete(cache, symbol):
+        return False
+    try:
+        raw = pd.read_parquet(cache / "raw" / f"{symbol}.parquet")
+        qfq = pd.read_parquet(cache / "qfq" / f"{symbol}.parquet")
+    except Exception:
+        return False
+    for frame in (raw, qfq):
+        values = frame[["open", "high", "low", "close"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        if (
+            values.isna().any().any()
+            or (values <= 0).any().any()
+            or (
+                values["high"]
+                < values[["open", "low", "close"]].max(axis=1)
+            ).any()
+            or (
+                values["low"]
+                > values[["open", "high", "close"]].min(axis=1)
+            ).any()
+        ):
+            return False
+    raw_dates = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
+    qfq_dates = pd.to_datetime(qfq["date"], errors="coerce").dt.normalize()
+    return bool(
+        len(raw_dates) >= minimum_history_rows
+        and raw_dates.notna().all()
+        and qfq_dates.notna().all()
+        and raw_dates.tolist() == qfq_dates.tolist()
+        and raw_dates.max() == through
+    )
+
+
+def _reuse_expansion_symbol_from_prior_contract(
+    cache: Path,
+    symbol: str,
+    *,
+    selection_config: dict[str, Any],
+    minimum_history_rows: int,
+    through: pd.Timestamp,
+) -> str | None:
+    """Copy a verified symbol cache from a compatible failed selection contract."""
+
+    compatible_fields = (
+        "parent_identity",
+        "start_date",
+        "through",
+        "provider",
+        "producer_version",
+    )
+    parent = cache.parent
+    if parent.is_symlink() or not parent.is_dir():
+        return None
+    for sibling in sorted(parent.iterdir()):
+        if sibling == cache or sibling.is_symlink() or not sibling.is_dir():
+            continue
+        contract_path = sibling / "RUN_CONTRACT.json"
+        if contract_path.is_symlink() or not contract_path.is_file():
+            continue
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            sibling_config = contract["selection_config"]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not isinstance(sibling_config, dict) or any(
+            sibling_config.get(field) != selection_config.get(field)
+            for field in compatible_fields
+        ):
+            continue
+        if not _expansion_cache_symbol_complete(
+            sibling,
+            symbol,
+            minimum_history_rows=minimum_history_rows,
+            through=through,
+        ):
+            continue
+        for component in ("raw", "qfq", "factors"):
+            _link_or_copy(
+                sibling / component / f"{symbol}.parquet",
+                cache / component / f"{symbol}.parquet",
+            )
+        if not _expansion_cache_symbol_complete(
+            cache,
+            symbol,
+            minimum_history_rows=minimum_history_rows,
+            through=through,
+        ):
+            for component in ("raw", "qfq", "factors"):
+                (cache / component / f"{symbol}.parquet").unlink(missing_ok=True)
+            continue
+        return sibling.name
+    return None
+
+
+def expand_cn_etf_universe(
+    *,
+    quant_data_dir: Path | None = None,
+    target_size: int = DEFAULT_REPRESENTATIVE_TARGET_SIZE,
+    category_targets: dict[str, int] | None = None,
+    start_date: str = DEFAULT_START_DATE,
+    end_date: str | None = None,
+    minimum_turnover: float = 1_000_000.0,
+    minimum_history_rows: int = DEFAULT_MINIMUM_HISTORY_ROWS,
+    excluded_symbols: tuple[str, ...] = (),
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
+    request_budget: int = DEFAULT_REQUEST_BUDGET,
+    retries: int = 2,
+    timeout: float = 20.0,
+    max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
+    generated_at: str | None = None,
+    resume: bool = True,
+) -> Path:
+    """Expand the frozen ETF universe without re-downloading existing symbols."""
+
+    if category_targets is None and target_size != DEFAULT_REPRESENTATIVE_TARGET_SIZE:
+        raise ValueError(
+            "default representative quotas support target_size=200; "
+            "provide explicit category_targets for another registered contract"
+        )
+    targets = dict(category_targets or REPRESENTATIVE_CATEGORY_TARGETS)
+    if target_size < 1 or target_size > 500:
+        raise ValueError("representative ETF target_size must be between 1 and 500")
+    if sum(targets.values()) != target_size:
+        raise ValueError("representative ETF category targets must sum to target_size")
+    if minimum_turnover < 0:
+        raise ValueError("minimum_turnover must be nonnegative")
+    if minimum_history_rows < 1:
+        raise ValueError("minimum_history_rows must be positive")
+    if request_interval < MIN_EXPANSION_REQUEST_INTERVAL:
+        raise ValueError(
+            f"request_interval must be at least {MIN_EXPANSION_REQUEST_INTERVAL}"
+        )
+    if request_budget < 1 or request_budget > 10_000:
+        raise ValueError("expansion request_budget must be between 1 and 10000")
+    if retries < 1 or retries > 2:
+        raise ValueError("retries must be between 1 and 2")
+    if max_consecutive_failures < 1 or max_consecutive_failures > 3:
+        raise ValueError("max_consecutive_failures must be between 1 and 3")
+
+    root = Path(quant_data_dir or quant_data_root()).expanduser().resolve()
+    through = _as_date(
+        end_date or pd.Timestamp.now(tz="Asia/Shanghai").date().isoformat()
+    )
+    if through.weekday() >= 5:
+        through = through - pd.Timedelta(days=through.weekday() - 4)
+    if _as_date(start_date) > through:
+        raise ValueError("start_date must not be after end_date")
+    timestamp = generated_at or datetime.now().astimezone().isoformat()
+    normalized_exclusions = tuple(
+        sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in excluded_symbols
+                if str(symbol).strip()
+            }
+        )
+    )
+    lock_path = root / "runtime" / "locks" / "cn_etf_update.lock"
+    started = time.monotonic()
+
+    with _run_lock(lock_path):
+        resolved = resolve_dataset(
+            DATASET_ID,
+            quant_data_root=root,
+            require_basis="qfq",
+        )
+        current = resolved.snapshot_path
+        manifest = resolved.manifest
+        if manifest.get("data_kind") != "paired_daily_bars":
+            raise DataContractError("cn_etf_daily is not a paired raw/qfq snapshot")
+        current_universe_path = current / "ETF_UNIVERSE.parquet"
+        if not current_universe_path.is_file():
+            raise DataContractError("current ETF universe is unavailable")
+        current_universe = pd.read_parquet(current_universe_path)
+        current_symbols = set(current_universe["symbol"].astype(str))
+        if len(current_symbols) != len(current_universe):
+            raise DataContractError("current ETF universe contains duplicate symbols")
+        if len(current_symbols) == target_size:
+            return current
+        if len(current_symbols) > target_size:
+            raise CnEtfDownloadError(
+                "ETF universe expansion cannot remove current symbols"
+            )
+
+        parent_identity = {
+            "snapshot_id": current.name,
+            "manifest_sha256": str(
+                resolved.catalog_entry.get("manifest_sha256") or ""
+            ),
+            "content_sha256": str(manifest.get("content_sha256") or ""),
+        }
+        selection_config = {
+            "schema_version": 1,
+            "parent_identity": parent_identity,
+            "start_date": _as_date(start_date).date().isoformat(),
+            "through": through.date().isoformat(),
+            "target_size": int(target_size),
+            "category_targets": targets,
+            "minimum_turnover": float(minimum_turnover),
+            "minimum_history_rows": int(minimum_history_rows),
+            "excluded_symbols": list(normalized_exclusions),
+            "provider": "tencent",
+            "producer_version": PRODUCER_VERSION,
+        }
+        config_sha256 = hashlib.sha256(
+            json.dumps(selection_config, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cache = (
+            root
+            / "cache"
+            / DATASET_ID
+            / "expansion"
+            / "v1"
+            / current.name
+            / through.date().isoformat()
+            / f"target-{target_size}-{config_sha256[:12]}"
+        )
+        cache.mkdir(parents=True, exist_ok=True)
+        contract_path = cache / "RUN_CONTRACT.json"
+        universe_path = cache / "ETF_UNIVERSE.parquet"
+        summary_path = cache / "UNIVERSE_SUMMARY.json"
+        gate = RequestGate(interval=request_interval, budget=request_budget)
+
+        if resume and contract_path.is_file() and universe_path.is_file() and summary_path.is_file():
+            try:
+                contract = json.loads(contract_path.read_text(encoding="utf-8"))
+                selected = pd.read_parquet(universe_path)
+                catalog_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                raise CnEtfDownloadError("ETF expansion resume cache is unreadable") from exc
+            if contract.get("selection_config") != selection_config:
+                raise CnEtfDownloadError("ETF expansion resume cache has another contract")
+            if contract.get("universe_sha256") != _universe_hash(selected):
+                raise CnEtfDownloadError("ETF expansion universe hash is inconsistent")
+        else:
+            catalog, catalog_summary = fetch_etf_catalog(
+                through=through.date().isoformat(),
+                request_gate=gate,
+            )
+            selected = select_representative_universe(
+                catalog,
+                current_universe,
+                target_size=target_size,
+                category_targets=targets,
+                minimum_turnover=minimum_turnover,
+                excluded_symbols=normalized_exclusions,
+            )
+            universe_sha256 = _universe_hash(selected)
+            contract = {
+                "selection_config": selection_config,
+                "universe_sha256": universe_sha256,
+                "symbol_count": int(len(selected)),
+                "added_symbols": sorted(
+                    set(selected["symbol"].astype(str)) - current_symbols
+                ),
+            }
+            atomic_write_json(contract_path, contract)
+            _atomic_parquet(selected, universe_path)
+            atomic_write_json(summary_path, catalog_summary)
+
+        selected_symbols = set(selected["symbol"].astype(str))
+        if not current_symbols.issubset(selected_symbols):
+            raise CnEtfDownloadError("ETF expansion dropped a current symbol")
+        added_symbols = sorted(selected_symbols - current_symbols)
+        if len(selected_symbols) != target_size:
+            raise CnEtfDownloadError("ETF expansion cache has the wrong symbol count")
+
+        import requests
+
+        session = requests.Session()
+        session.trust_env = False
+        failures: dict[str, str] = {}
+        failures_path = cache / "failures.json"
+        if failures_path.is_file():
+            try:
+                payload = json.loads(failures_path.read_text(encoding="utf-8"))
+                failures = {
+                    str(item["symbol"]): str(item["error"])
+                    for item in payload.get("failures", [])
+                    if isinstance(item, dict) and item.get("symbol")
+                }
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                failures = {}
+
+        metadata_by_symbol = {
+            str(row.symbol): row for row in selected.itertuples(index=False)
+        }
+        completed = 0
+        downloaded = 0
+        consecutive_failures = 0
+        reused_prior_contract_symbols: list[str] = []
+        for position, symbol in enumerate(added_symbols, 1):
+            atomic_write_json(
+                cache / "progress.json",
+                {
+                    "status": "running",
+                    "parent_snapshot_id": current.name,
+                    "current": position,
+                    "total": len(added_symbols),
+                    "symbol": symbol,
+                    "completed": completed,
+                    "downloaded_this_run": downloaded,
+                    "requests_used": gate.calls,
+                    "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                },
+            )
+            if resume:
+                cache_complete = _expansion_cache_symbol_complete(
+                    cache,
+                    symbol,
+                    minimum_history_rows=minimum_history_rows,
+                    through=through,
+                )
+                if not cache_complete:
+                    reused_from = _reuse_expansion_symbol_from_prior_contract(
+                        cache,
+                        symbol,
+                        selection_config=selection_config,
+                        minimum_history_rows=minimum_history_rows,
+                        through=through,
+                    )
+                    if reused_from is not None:
+                        reused_prior_contract_symbols.append(symbol)
+                        cache_complete = True
+                if cache_complete:
+                    completed += 1
+                    failures.pop(symbol, None)
+                    continue
+            row = metadata_by_symbol[symbol]
+            metadata = {
+                "code": str(row.code).zfill(6),
+                "market": str(row.market).lower(),
+                "name": str(row.name),
+            }
+            try:
+                raw, qfq = fetch_tencent_pair(
+                    symbol,
+                    metadata,
+                    start_date=_as_date(start_date).date().isoformat(),
+                    end_date=through.date().isoformat(),
+                    session=session,
+                    request_gate=gate,
+                    retries=retries,
+                    timeout=timeout,
+                )
+                raw = _normalize_component_frame(
+                    raw, symbol=symbol, component="expansion raw"
+                )
+                qfq = _normalize_component_frame(
+                    qfq, symbol=symbol, component="expansion qfq"
+                )
+                if len(raw) < minimum_history_rows:
+                    raise DataContractError(
+                        f"expansion history is shorter than {minimum_history_rows} rows for {symbol}"
+                    )
+                if raw["date"].tolist() != qfq["date"].tolist():
+                    raise DataContractError(f"expansion raw/qfq dates differ for {symbol}")
+                if _as_date(raw["date"].max()) != through:
+                    raise DataContractError(
+                        f"expansion history does not reach {through.date().isoformat()} for {symbol}"
+                    )
+                raw["source_id"] = raw["source"].astype(str)
+                qfq["source_id"] = qfq["source"].astype(str)
+                factors = build_paired_adjustments(symbol, raw, qfq)
+                _atomic_parquet(raw, cache / "raw" / f"{symbol}.parquet")
+                _atomic_parquet(qfq, cache / "qfq" / f"{symbol}.parquet")
+                _atomic_parquet(factors, cache / "factors" / f"{symbol}.parquet")
+                failures.pop(symbol, None)
+                completed += 1
+                downloaded += 1
+                consecutive_failures = 0
+            except Exception as exc:
+                consecutive_failures += 1
+                failures[symbol] = f"{type(exc).__name__}: {str(exc)[:300]}"
+                atomic_write_json(
+                    failures_path,
+                    {
+                        "failures": [
+                            {"symbol": key, "error": value}
+                            for key, value in sorted(failures.items())
+                        ]
+                    },
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    break
+
+        atomic_write_json(
+            failures_path,
+            {
+                "failures": [
+                    {"symbol": key, "error": value}
+                    for key, value in sorted(failures.items())
+                ]
+            },
+        )
+        incomplete = [
+            symbol
+            for symbol in added_symbols
+            if not _expansion_cache_symbol_complete(
+                cache,
+                symbol,
+                minimum_history_rows=minimum_history_rows,
+                through=through,
+            )
+        ]
+        if incomplete:
+            atomic_write_json(
+                cache / "progress.json",
+                {
+                    "status": "incomplete",
+                    "parent_snapshot_id": current.name,
+                    "completed": len(added_symbols) - len(incomplete),
+                    "total": len(added_symbols),
+                    "incomplete": incomplete,
+                    "requests_used": gate.calls,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
+            )
+            raise CnEtfDownloadError(
+                f"ETF universe expansion is incomplete: {len(incomplete)} of {len(added_symbols)} new symbols failed; cache retained for resume"
+            )
+
+        run_id = pd.Timestamp(timestamp).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        snapshot_id = f"cn-etf-tencent-expansion-{run_id}"
+        staging_run = root / "staging" / f"cn-etf-expansion-{run_id}"
+        stage = staging_run / snapshot_id
+        old_hashes: dict[str, dict[str, str]] = {
+            component: {} for component in ("raw", "qfq", "factors")
+        }
+        try:
+            factors_by_symbol: dict[str, pd.DataFrame] = {}
+            for symbol in sorted(current_symbols):
+                for component in ("raw", "qfq", "factors"):
+                    source_path = current / component / f"{symbol}.parquet"
+                    if not source_path.is_file():
+                        raise DataContractError(
+                            f"current ETF {component} file is missing for {symbol}"
+                        )
+                    old_hashes[component][symbol] = sha256_file(source_path)
+                    _link_or_copy(
+                        source_path,
+                        stage / component / source_path.name,
+                    )
+                factors_by_symbol[symbol] = pd.read_parquet(
+                    current / "factors" / f"{symbol}.parquet"
+                )
+            for symbol in added_symbols:
+                for component in ("raw", "qfq", "factors"):
+                    _link_or_copy(
+                        cache / component / f"{symbol}.parquet",
+                        stage / component / f"{symbol}.parquet",
+                    )
+                factors_by_symbol[symbol] = pd.read_parquet(
+                    cache / "factors" / f"{symbol}.parquet"
+                )
+            for component, hashes in old_hashes.items():
+                for symbol, digest in hashes.items():
+                    if sha256_file(stage / component / f"{symbol}.parquet") != digest:
+                        raise DataContractError(
+                            f"ETF expansion changed inherited {component} content for {symbol}"
+                        )
+
+            actions = _corporate_actions_from_adjustments(
+                factors_by_symbol,
+                provider="tencent",
+            )
+            _atomic_parquet(actions, stage / "corporate_actions.parquet")
+            _atomic_parquet(selected, stage / "ETF_UNIVERSE.parquet")
+            universe_sha256 = _universe_hash(selected)
+            category_counts = {
+                key: int(value)
+                for key, value in selected["representative_category"]
+                .value_counts()
+                .to_dict()
+                .items()
+            }
+            universe_manifest = {
+                **catalog_summary,
+                "selected_count": int(len(selected)),
+                "symbol_count": int(len(selected)),
+                "retrieved_at": timestamp,
+                "through": through.date().isoformat(),
+                "parent_snapshot_id": current.name,
+                "parent_content_sha256": parent_identity["content_sha256"],
+                "selection_method": "frozen_existing_plus_category_quota_liquidity",
+                "selection_config_sha256": config_sha256,
+                "category_targets": targets,
+                "category_counts": category_counts,
+                "universe_sha256": universe_sha256,
+                "universe_file_sha256": sha256_file(stage / "ETF_UNIVERSE.parquet"),
+            }
+            atomic_write_json(stage / "UNIVERSE_MANIFEST.json", universe_manifest)
+            qfq_response_keys = sorted(
+                {
+                    str(value)
+                    for path in sorted((stage / "qfq").glob("*.parquet"))
+                    for value in pd.read_parquet(
+                        path, columns=["provider_response_key"]
+                    )["provider_response_key"].dropna().unique()
+                }
+            )
+            source = dict(manifest.get("source") or {})
+            source.update(
+                {
+                    "provider": "tencent",
+                    "interface": "ifzq_day_and_qfqday_full_history_for_new_symbols",
+                    "update_mode": "universe_expansion",
+                    "parent_snapshot_id": current.name,
+                    "parent_content_sha256": parent_identity["content_sha256"],
+                    "selection_method": "frozen_existing_plus_category_quota_liquidity",
+                    "selection_config_sha256": config_sha256,
+                    "universe_path": "ETF_UNIVERSE.parquet",
+                    "universe_manifest_path": "UNIVERSE_MANIFEST.json",
+                    "universe_sha256": universe_sha256,
+                    "retained_symbol_count": len(current_symbols),
+                    "added_symbol_count": len(added_symbols),
+                    "added_symbols": added_symbols,
+                    "excluded_symbols": list(normalized_exclusions),
+                    "reused_prior_contract_symbol_count": len(
+                        reused_prior_contract_symbols
+                    ),
+                    "reused_prior_contract_symbols": sorted(
+                        reused_prior_contract_symbols
+                    ),
+                    "category_targets": targets,
+                    "category_counts": category_counts,
+                    "qfq_response_keys": qfq_response_keys,
+                    "snapshot_retention": {
+                        "policy": "current_plus_one_previous",
+                        "max_complete_snapshots": DEFAULT_SNAPSHOT_RETENTION,
+                    },
+                }
+            )
+            finalize_paired_price_snapshot(
+                stage,
+                dataset_id=DATASET_ID,
+                snapshot_id=snapshot_id,
+                role="canonical",
+                status="ready",
+                source=source,
+                adjustment={
+                    "method": "provider_native_paired",
+                    "adjusted_at": timestamp,
+                    "adjustment_as_of": through.date().isoformat(),
+                    "adjusted_fields": ["open", "high", "low", "close"],
+                    "normalization_rule": (
+                        "latest_valid_trade_date_factor_equals_1_and_offset_equals_0"
+                    ),
+                    "algorithm_version": "provider-native-affine-paired-v1",
+                    "paired_raw_component_path": "raw",
+                    "volume_adjusted": False,
+                },
+                producer={
+                    "script": "download_cn_etf_data.py",
+                    "version": PRODUCER_VERSION,
+                },
+                source_retrieved_at=timestamp,
+            )
+            for component, hashes in old_hashes.items():
+                for symbol, digest in hashes.items():
+                    if sha256_file(stage / component / f"{symbol}.parquet") != digest:
+                        raise DataContractError(
+                            f"ETF expansion altered inherited {component} after finalization for {symbol}"
+                        )
+            dataset_root = root / "parquet" / "etf_1d" / DATASET_ID
+            published = publish_snapshot_group(
+                [(stage, dataset_root)],
+                quant_data_root=root,
+                update_root_catalog=True,
+                published_at=timestamp,
+            )[0]
+            removed_snapshots, post_publish_warnings = _post_publish_housekeeping(
+                root,
+                dataset_root,
+            )
+            status = {
+                "status": (
+                    "published_with_warnings"
+                    if post_publish_warnings
+                    else "published"
+                ),
+                "dataset_id": DATASET_ID,
+                "snapshot_id": published.name,
+                "parent_snapshot_id": current.name,
+                "through": through.date().isoformat(),
+                "target_size": target_size,
+                "retained_symbol_count": len(current_symbols),
+                "added_symbol_count": len(added_symbols),
+                "downloaded_this_run": downloaded,
+                "reused_prior_contract_symbol_count": len(
+                    reused_prior_contract_symbols
+                ),
+                "requests_used": gate.calls,
+                "category_counts": category_counts,
+                "removed_snapshots": removed_snapshots,
+                "post_publish_warnings": post_publish_warnings,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "generated_at": timestamp,
+            }
+            try:
+                atomic_write_json(
+                    root / "runtime" / "status" / "cn_etf_daily_expand_latest.json",
+                    status,
+                )
+                atomic_write_json(cache / "progress.json", status)
+            except Exception as exc:
+                print(
+                    "ETF expansion was published; status write failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            return published
+        finally:
+            shutil.rmtree(staging_run, ignore_errors=True)
+
+
+def reissue_cn_etf_expansion_metadata(
+    *,
+    quant_data_dir: Path | None = None,
+    generated_at: str | None = None,
+) -> Path:
+    """Publish corrected expansion lineage without changing or downloading bars."""
+
+    root = Path(quant_data_dir or quant_data_root()).expanduser().resolve()
+    timestamp = generated_at or datetime.now().astimezone().isoformat()
+    lock_path = root / "runtime" / "locks" / "cn_etf_update.lock"
+    with _run_lock(lock_path):
+        resolved = resolve_dataset(
+            DATASET_ID,
+            quant_data_root=root,
+            require_basis="qfq",
+        )
+        current = resolved.snapshot_path
+        manifest = resolved.manifest
+        source = dict(manifest.get("source") or {})
+        if source.get("update_mode") != "universe_expansion":
+            raise CnEtfDownloadError(
+                "current ETF snapshot is not an expansion snapshot"
+            )
+        parent_snapshot_id = str(source.get("parent_snapshot_id") or "")
+        dataset_root = root / "parquet" / "etf_1d" / DATASET_ID
+        parent_snapshot = dataset_root / "snapshots" / parent_snapshot_id
+        if (
+            not parent_snapshot_id
+            or parent_snapshot.is_symlink()
+            or not parent_snapshot.is_dir()
+        ):
+            raise CnEtfDownloadError(
+                "ETF expansion parent snapshot is unavailable for metadata correction"
+            )
+        universe_path = current / "ETF_UNIVERSE.parquet"
+        universe_manifest_path = current / "UNIVERSE_MANIFEST.json"
+        if not universe_path.is_file() or not universe_manifest_path.is_file():
+            raise DataContractError("ETF expansion universe evidence is unavailable")
+        universe = pd.read_parquet(universe_path)
+        universe_manifest = json.loads(
+            universe_manifest_path.read_text(encoding="utf-8")
+        )
+        universe_sha256 = _universe_hash(universe)
+        category_counts = (
+            {
+                key: int(value)
+                for key, value in universe["representative_category"]
+                .value_counts()
+                .to_dict()
+                .items()
+            }
+            if "representative_category" in universe.columns
+            else dict(source.get("category_counts") or {})
+        )
+
+        run_id = pd.Timestamp(timestamp).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        snapshot_id = f"cn-etf-tencent-expansion-metadata-{run_id}"
+        staging_run = root / "staging" / f"cn-etf-expansion-metadata-{run_id}"
+        stage = staging_run / snapshot_id
+        try:
+            for component in ("raw", "qfq", "factors"):
+                component_root = current / component
+                if component_root.is_symlink() or not component_root.is_dir():
+                    raise DataContractError(
+                        f"ETF expansion {component} component is unavailable"
+                    )
+                for path in sorted(component_root.glob("*.parquet")):
+                    _link_or_copy(path, stage / component / path.name)
+            for name in ("corporate_actions.parquet", "ETF_UNIVERSE.parquet"):
+                path = current / name
+                if path.is_symlink() or not path.is_file():
+                    raise DataContractError(
+                        f"ETF expansion metadata correction source is missing: {name}"
+                    )
+                _link_or_copy(path, stage / name)
+
+            universe_manifest.update(
+                {
+                    "selected_count": int(len(universe)),
+                    "symbol_count": int(len(universe)),
+                    "metadata_corrected_at": timestamp,
+                    "metadata_correction_of_snapshot_id": current.name,
+                    "universe_sha256": universe_sha256,
+                    "universe_file_sha256": sha256_file(
+                        stage / "ETF_UNIVERSE.parquet"
+                    ),
+                }
+            )
+            atomic_write_json(stage / "UNIVERSE_MANIFEST.json", universe_manifest)
+            source.update(
+                {
+                    "universe_sha256": universe_sha256,
+                    "category_counts": category_counts,
+                    "metadata_corrected_at": timestamp,
+                    "metadata_correction_of_snapshot_id": current.name,
+                }
+            )
+            adjustment = dict(manifest.get("adjustment") or {})
+            producer = dict(manifest.get("producer") or {})
+            producer.update(
+                {
+                    "script": "download_cn_etf_data.py",
+                    "version": PRODUCER_VERSION,
+                    "operation": "expansion_metadata_correction",
+                }
+            )
+            finalize_paired_price_snapshot(
+                stage,
+                dataset_id=DATASET_ID,
+                snapshot_id=snapshot_id,
+                role="canonical",
+                status="ready",
+                source=source,
+                adjustment=adjustment,
+                producer=producer,
+                source_retrieved_at=str(
+                    manifest.get("source_retrieved_at") or timestamp
+                ),
+            )
+            published = publish_snapshot_group(
+                [(stage, dataset_root)],
+                quant_data_root=root,
+                update_root_catalog=True,
+                published_at=timestamp,
+            )[0]
+            removed_snapshots, post_publish_warnings = _post_publish_housekeeping(
+                root,
+                dataset_root,
+                preferred_backup_snapshot_id=parent_snapshot_id,
+            )
+            try:
+                atomic_write_json(
+                    root / "runtime" / "status" / "cn_etf_daily_expand_latest.json",
+                    {
+                        "status": (
+                            "published_with_warnings"
+                            if post_publish_warnings
+                            else "published"
+                        ),
+                        "dataset_id": DATASET_ID,
+                        "snapshot_id": published.name,
+                        "parent_snapshot_id": parent_snapshot_id,
+                        "metadata_correction_of_snapshot_id": current.name,
+                        "symbol_count": int(len(universe)),
+                        "removed_snapshots": removed_snapshots,
+                        "post_publish_warnings": post_publish_warnings,
+                        "generated_at": timestamp,
+                    },
+                )
+            except Exception as exc:
+                print(
+                    "ETF metadata correction was published; status write failed: "
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )

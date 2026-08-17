@@ -351,6 +351,36 @@ def test_cache_requires_matching_affine_factor_and_offset(tmp_path) -> None:
     assert not module._cache_symbol_complete(tmp_path, symbol)
 
 
+def test_expansion_cache_rejects_ohlc_relationships_the_release_validator_rejects(
+    tmp_path,
+) -> None:
+    module = load_module()
+    symbol = "SH510180"
+    raw = paired_frame(
+        symbol,
+        name="上证180ETF",
+        source=module.TENCENT_RAW_SOURCE_NAME,
+        closes=[1.0, 1.1, 1.2],
+    )
+    raw.loc[0, "high"] = 0.99
+    qfq = raw.assign(
+        source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+        provider_response_key="qfqday",
+    )
+    factors = module.build_paired_adjustments(symbol, raw, qfq)
+    for component, frame in (("raw", raw), ("qfq", qfq), ("factors", factors)):
+        path = tmp_path / component / f"{symbol}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+
+    assert not module._expansion_cache_symbol_complete(
+        tmp_path,
+        symbol,
+        minimum_history_rows=3,
+        through=pd.Timestamp("2026-08-06"),
+    )
+
+
 def test_resume_upgrades_legacy_factor_cache_without_downloading(tmp_path) -> None:
     module = load_module()
     symbol = "SH510300"
@@ -517,6 +547,42 @@ def test_prune_snapshot_history_keeps_current_and_one_backup(tmp_path) -> None:
     assert removed == ["snapshot-0"]
     assert sorted(path.name for path in snapshots.iterdir()) == [
         "snapshot-1",
+        "snapshot-2",
+    ]
+
+
+def test_prune_snapshot_history_can_preserve_the_expansion_parent_backup(
+    tmp_path,
+) -> None:
+    module = load_module()
+    dataset_root = tmp_path / "cn_etf_daily"
+    snapshots = dataset_root / "snapshots"
+    for index in range(3):
+        snapshot_id = f"snapshot-{index}"
+        snapshot = snapshots / snapshot_id
+        snapshot.mkdir(parents=True)
+        (snapshot / "DATASET_MANIFEST.json").write_text(
+            json.dumps(
+                {
+                    "snapshot_id": snapshot_id,
+                    "source_retrieved_at": f"2026-08-0{index + 1}T10:00:00+08:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+    (dataset_root / "LATEST.json").write_text(
+        json.dumps({"snapshot_id": "snapshot-2"}), encoding="utf-8"
+    )
+
+    removed = module.prune_snapshot_history(
+        dataset_root,
+        keep=2,
+        preferred_backup_snapshot_id="snapshot-0",
+    )
+
+    assert removed == ["snapshot-1"]
+    assert sorted(path.name for path in snapshots.iterdir()) == [
+        "snapshot-0",
         "snapshot-2",
     ]
 
@@ -904,3 +970,473 @@ def test_full_rebuild_function_refuses_without_all_three_confirmations() -> None
 
     with pytest.raises(module.CnEtfDownloadError, match="explicit user approval"):
         module.publish_cn_etf_snapshot(end_date="2026-08-07")
+
+
+def _representative_catalog_row(
+    module,
+    code: str,
+    name: str,
+    amount: float,
+) -> dict[str, object]:
+    market = module._market_for_code(code)
+    return {
+        "symbol": f"{market.upper()}{code}",
+        "code": code,
+        "market": market,
+        "name": name,
+        "sina_code": f"{market}{code}",
+        "in_sina": True,
+        "in_ths": True,
+        "ths_latest_trade_date": "2026-08-14",
+        "sina_amount": amount,
+        "fund_type": "股票型",
+    }
+
+
+def test_representative_selection_reaches_200_and_preserves_every_existing_symbol() -> None:
+    module = load_module()
+    targets = module.REPRESENTATIVE_CATEGORY_TARGETS
+    prefixes = {
+        "core_broad": "沪深300增强",
+        "sector_theme": "半导体主题",
+        "dividend_factor": "红利低波策略",
+        "hong_kong": "恒生科技策略",
+        "overseas": "纳指海外策略",
+        "bond": "国债策略",
+        "commodity": "黄金商品策略",
+        "cash": "货币现金策略",
+    }
+    rows: list[dict[str, object]] = []
+    existing_rows: list[dict[str, object]] = []
+    next_sh = 510000
+    next_sz = 159000
+    for category, count in targets.items():
+        for index in range(count):
+            if category in {"hong_kong", "overseas"}:
+                code = f"{next_sh:06d}"
+                next_sh += 1
+            else:
+                code = f"{next_sz:06d}"
+                next_sz += 1
+            row = _representative_catalog_row(
+                module,
+                code,
+                f"{prefixes[category]}{index:02d}ETF",
+                amount=float(10_000_000 - len(rows)),
+            )
+            rows.append(row)
+            if index == 0:
+                existing_rows.append(row)
+
+    selected = module.select_representative_universe(
+        pd.DataFrame(rows),
+        pd.DataFrame(existing_rows),
+        target_size=200,
+        category_targets=targets,
+    )
+
+    assert len(selected) == 200
+    assert set(row["symbol"] for row in existing_rows).issubset(
+        set(selected["symbol"])
+    )
+    assert selected["representative_category"].value_counts().to_dict() == targets
+    existing_symbols = {str(row["symbol"]) for row in existing_rows}
+    assert set(
+        selected.loc[
+            selected["symbol"].isin(existing_symbols), "selection_reason"
+        ]
+    ) == {"existing_snapshot"}
+
+
+def test_representative_selection_does_not_add_a_duplicate_tracking_target() -> None:
+    module = load_module()
+    current = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "512480", "半导体ETF华夏", 100.0
+            )
+        ]
+    )
+    catalog = pd.DataFrame(
+        [
+            *current.to_dict(orient="records"),
+            _representative_catalog_row(
+                module, "159995", "半导体ETF国泰", 1_000.0
+            ),
+            _representative_catalog_row(
+                module, "588200", "科创芯片ETF嘉实", 900.0
+            ),
+        ]
+    )
+
+    selected = module.select_representative_universe(
+        catalog,
+        current,
+        target_size=2,
+        category_targets={"sector_theme": 2},
+        minimum_turnover=0.0,
+    )
+
+    assert set(selected["code"]) == {"512480", "588200"}
+    assert selected["tracking_key"].nunique() == 2
+
+
+def test_representative_selection_defaults_missing_optional_catalog_columns() -> None:
+    module = load_module()
+    minimal = pd.DataFrame(
+        [
+            {
+                "symbol": "SH510300",
+                "code": "510300",
+                "market": "sh",
+                "name": "沪深300ETF",
+            }
+        ]
+    )
+
+    selected = module.select_representative_universe(
+        minimal,
+        minimal,
+        target_size=1,
+        category_targets={"core_broad": 1},
+        minimum_turnover=0.0,
+    )
+
+    assert selected["symbol"].tolist() == ["SH510300"]
+    assert not bool(selected.iloc[0]["in_sina"])
+    assert not bool(selected.iloc[0]["in_ths"])
+    assert float(selected.iloc[0]["sina_amount"]) == 0.0
+
+
+def test_representative_default_quotas_only_support_the_registered_200_size() -> None:
+    module = load_module()
+
+    with pytest.raises(ValueError, match="default representative quotas support target_size=200"):
+        module.select_representative_universe(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            target_size=150,
+        )
+
+
+def test_expansion_request_interval_has_a_point_three_second_floor(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+
+    with pytest.raises(ValueError, match="request_interval must be at least 0.3"):
+        module.expand_cn_etf_universe(
+            quant_data_dir=tmp_path / "quant_data",
+            target_size=200,
+            end_date="2026-08-14",
+            request_interval=0.2,
+        )
+
+
+def test_expand_universe_downloads_only_new_symbols_and_preserves_old_hashes(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
+    additions = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "512480", "半导体ETF华夏", 900.0
+            ),
+            _representative_catalog_row(
+                module, "588200", "科创芯片ETF嘉实", 800.0
+            ),
+        ]
+    )
+    catalog = pd.concat([current_universe, additions], ignore_index=True)
+    monkeypatch.setattr(
+        module,
+        "fetch_etf_catalog",
+        lambda **_kwargs: (
+            catalog,
+            {"sina_count": 4, "ths_count": 4, "reconciled_count": 4},
+        ),
+    )
+    calls: list[str] = []
+
+    def added_pair(symbol, metadata, **_kwargs):
+        calls.append(symbol)
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2],
+        )
+        qfq = raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+            provider_response_key="qfqday",
+        )
+        return raw, qfq
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", added_pair)
+    old_hashes = {
+        component: {
+            symbol: module.sha256_file(current / component / f"{symbol}.parquet")
+            for symbol in current_universe["symbol"].astype(str)
+        }
+        for component in ("raw", "qfq", "factors")
+    }
+
+    expanded = module.expand_cn_etf_universe(
+        quant_data_dir=root,
+        target_size=4,
+        category_targets={"core_broad": 2, "sector_theme": 2},
+        end_date="2026-08-06",
+        generated_at="2026-08-07T12:00:00+08:00",
+        request_interval=0.3,
+        request_budget=20,
+        minimum_turnover=0.0,
+        minimum_history_rows=3,
+    )
+
+    assert set(calls) == {"SH512480", "SH588200"}
+    expanded_universe = pd.read_parquet(expanded / "ETF_UNIVERSE.parquet")
+    assert len(expanded_universe) == 4
+    assert set(current_universe["symbol"]).issubset(set(expanded_universe["symbol"]))
+    for component, hashes in old_hashes.items():
+        for symbol, digest in hashes.items():
+            assert module.sha256_file(expanded / component / f"{symbol}.parquet") == digest
+    manifest = json.loads((expanded / "DATASET_MANIFEST.json").read_text())
+    universe_manifest = json.loads(
+        (expanded / "UNIVERSE_MANIFEST.json").read_text()
+    )
+    assert manifest["source"]["update_mode"] == "universe_expansion"
+    assert manifest["source"]["parent_snapshot_id"] == current.name
+    assert manifest["source"]["retained_symbol_count"] == 2
+    assert manifest["source"]["added_symbol_count"] == 2
+    assert manifest["source"]["universe_sha256"] == universe_manifest["universe_sha256"]
+    assert universe_manifest["selected_count"] == 4
+
+
+def test_expand_universe_failure_keeps_latest_pointer_unchanged(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
+    additions = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "512480", "半导体ETF华夏", 900.0
+            ),
+            _representative_catalog_row(
+                module, "588200", "科创芯片ETF嘉实", 800.0
+            ),
+        ]
+    )
+    catalog = pd.concat([current_universe, additions], ignore_index=True)
+    monkeypatch.setattr(
+        module,
+        "fetch_etf_catalog",
+        lambda **_kwargs: (catalog, {"reconciled_count": 4}),
+    )
+
+    def fail_one(symbol, metadata, **_kwargs):
+        if symbol == "SH588200":
+            raise ConnectionError("provider unavailable")
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+            provider_response_key="qfqday",
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", fail_one)
+    latest_path = root / "parquet" / "etf_1d" / "cn_etf_daily" / "LATEST.json"
+    before = latest_path.read_bytes()
+
+    with pytest.raises(module.CnEtfDownloadError, match="incomplete"):
+        module.expand_cn_etf_universe(
+            quant_data_dir=root,
+            target_size=4,
+            category_targets={"core_broad": 2, "sector_theme": 2},
+            end_date="2026-08-06",
+            generated_at="2026-08-07T12:00:00+08:00",
+            request_interval=0.3,
+            request_budget=20,
+            minimum_turnover=0.0,
+            minimum_history_rows=3,
+        )
+
+    assert latest_path.read_bytes() == before
+    assert json.loads(latest_path.read_text())["snapshot_id"] == current.name
+
+
+def test_revised_expansion_reuses_prior_contract_cache_and_downloads_only_replacement(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
+    candidates = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "512480", "半导体ETF华夏", 900.0
+            ),
+            _representative_catalog_row(
+                module, "588200", "科创芯片ETF嘉实", 800.0
+            ),
+            _representative_catalog_row(
+                module, "515880", "通信ETF国泰", 700.0
+            ),
+        ]
+    )
+    catalog = pd.concat([current_universe, candidates], ignore_index=True)
+    monkeypatch.setattr(
+        module,
+        "fetch_etf_catalog",
+        lambda **_kwargs: (catalog, {"reconciled_count": 5}),
+    )
+    calls: list[str] = []
+
+    def first_pair(symbol, metadata, **_kwargs):
+        calls.append(symbol)
+        if symbol == "SH588200":
+            raise ConnectionError("provider pair is incompatible")
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+            provider_response_key="qfqday",
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", first_pair)
+    with pytest.raises(module.CnEtfDownloadError, match="incomplete"):
+        module.expand_cn_etf_universe(
+            quant_data_dir=root,
+            target_size=4,
+            category_targets={"core_broad": 2, "sector_theme": 2},
+            end_date="2026-08-06",
+            generated_at="2026-08-07T12:00:00+08:00",
+            request_interval=0.3,
+            request_budget=20,
+            minimum_turnover=0.0,
+            minimum_history_rows=3,
+        )
+    assert set(calls) == {"SH512480", "SH588200"}
+
+    calls.clear()
+
+    def replacement_pair(symbol, metadata, **_kwargs):
+        calls.append(symbol)
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+            provider_response_key="qfqday",
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", replacement_pair)
+    expanded = module.expand_cn_etf_universe(
+        quant_data_dir=root,
+        target_size=4,
+        category_targets={"core_broad": 2, "sector_theme": 2},
+        excluded_symbols=("SH588200",),
+        end_date="2026-08-06",
+        generated_at="2026-08-07T12:30:00+08:00",
+        request_interval=0.3,
+        request_budget=20,
+        minimum_turnover=0.0,
+        minimum_history_rows=3,
+    )
+
+    assert calls == ["SH515880"]
+    final_universe = pd.read_parquet(expanded / "ETF_UNIVERSE.parquet")
+    assert set(final_universe["symbol"]) == {
+        "SH510050",
+        "SZ159915",
+        "SH512480",
+        "SH515880",
+    }
+    manifest = json.loads((expanded / "DATASET_MANIFEST.json").read_text())
+    assert manifest["source"]["excluded_symbols"] == ["SH588200"]
+    assert manifest["source"]["reused_prior_contract_symbol_count"] == 1
+
+
+def test_metadata_reissue_keeps_the_original_51_style_parent_as_the_only_backup(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, parent = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    current_universe = pd.read_parquet(parent / "ETF_UNIVERSE.parquet")
+    additions = pd.DataFrame(
+        [
+            _representative_catalog_row(
+                module, "512480", "半导体ETF华夏", 900.0
+            ),
+            _representative_catalog_row(
+                module, "588200", "科创芯片ETF嘉实", 800.0
+            ),
+        ]
+    )
+    catalog = pd.concat([current_universe, additions], ignore_index=True)
+    monkeypatch.setattr(
+        module,
+        "fetch_etf_catalog",
+        lambda **_kwargs: (catalog, {"reconciled_count": 4}),
+    )
+
+    def added_pair(symbol, metadata, **_kwargs):
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME,
+            provider_response_key="qfqday",
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", added_pair)
+    expanded = module.expand_cn_etf_universe(
+        quant_data_dir=root,
+        target_size=4,
+        category_targets={"core_broad": 2, "sector_theme": 2},
+        end_date="2026-08-06",
+        generated_at="2026-08-07T12:00:00+08:00",
+        request_interval=0.3,
+        request_budget=20,
+        minimum_turnover=0.0,
+        minimum_history_rows=3,
+    )
+
+    corrected = module.reissue_cn_etf_expansion_metadata(
+        quant_data_dir=root,
+        generated_at="2026-08-07T12:30:00+08:00",
+    )
+
+    assert corrected != expanded
+    snapshots = corrected.parents[1] / "snapshots"
+    assert {path.name for path in snapshots.iterdir()} == {
+        parent.name,
+        corrected.name,
+    }
+    pointer = json.loads((corrected.parents[1] / "LATEST.json").read_text())
+    assert pointer["published_at"] == "2026-08-07T12:30:00+08:00"
+    manifest = json.loads((corrected / "DATASET_MANIFEST.json").read_text())
+    universe_manifest = json.loads(
+        (corrected / "UNIVERSE_MANIFEST.json").read_text()
+    )
+    assert manifest["source"]["parent_snapshot_id"] == parent.name
+    assert manifest["source"]["metadata_correction_of_snapshot_id"] == expanded.name
+    assert manifest["source"]["universe_sha256"] == universe_manifest["universe_sha256"]
+    assert universe_manifest["selected_count"] == 4
