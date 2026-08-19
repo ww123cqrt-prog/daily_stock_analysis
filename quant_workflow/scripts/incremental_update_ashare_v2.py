@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import uuid
@@ -44,6 +45,7 @@ _EVENT_VALUE_COLUMNS = (
     "backAdjustFactor",
     "adjustFactor",
 )
+_PROVIDER_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 
 @dataclass(frozen=True)
@@ -86,8 +88,23 @@ def _validate_bundle(bundle_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
         raise DataContractError("incremental bundle is not ready")
     if manifest.get("bundle_mode") != "incremental":
         raise DataContractError("incremental update requires an incremental bundle")
-    if manifest.get("factor_requested_start") != "1990-01-01":
+    bundle_kind = str(manifest.get("bundle_kind") or "")
+    provider_paired = bundle_kind == "provider_paired_raw_qfq"
+    if not provider_paired and manifest.get("factor_requested_start") != "1990-01-01":
         raise DataContractError("incremental bundle does not contain full factor history")
+    if provider_paired:
+        source = manifest.get("source")
+        provider = source.get("provider") if isinstance(source, dict) else None
+        if not isinstance(provider, str) or not _PROVIDER_ID_RE.fullmatch(provider):
+            raise DataContractError("provider-paired bundle source is incomplete")
+        snapshot_id = manifest.get("base_qfq_snapshot_id")
+        manifest_sha256 = str(manifest.get("base_qfq_manifest_sha256") or "")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise DataContractError("provider-paired base qfq identity is missing")
+        if len(manifest_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in manifest_sha256
+        ):
+            raise DataContractError("provider-paired base qfq identity is invalid")
     try:
         requested_start = pd.Timestamp(manifest["requested_start"]).normalize()
         requested_through = pd.Timestamp(manifest["requested_through"]).normalize()
@@ -110,11 +127,13 @@ def _validate_bundle(bundle_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
     required = {
         "symbol",
         "raw_path",
-        "factor_events_path",
         "raw_sha256",
-        "factor_events_sha256",
         "raw_rows",
     }
+    if provider_paired:
+        required.update({"qfq_provider_path", "qfq_provider_sha256"})
+    else:
+        required.update({"factor_events_path", "factor_events_sha256"})
     if required.difference(index.columns):
         raise DataContractError("incremental bundle index is incomplete")
     if index.empty or index["symbol"].duplicated().any():
@@ -128,11 +147,28 @@ def _validate_bundle(bundle_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
             row.raw_path,
             label=f"incremental raw file for {symbol}",
         )
-        _bundle_file(
-            bundle_dir,
-            row.factor_events_path,
-            label=f"incremental factor file for {symbol}",
-        )
+        if provider_paired:
+            qfq_path = getattr(row, "qfq_provider_path", None)
+            qfq_hash = getattr(row, "qfq_provider_sha256", None)
+            if not isinstance(qfq_path, str) or not qfq_path:
+                raise DataContractError(
+                    f"qfq audit file is required for provider-paired symbol {symbol}"
+                )
+            if not isinstance(qfq_hash, str) or len(qfq_hash) != 64:
+                raise DataContractError(
+                    f"qfq audit hash is required for provider-paired symbol {symbol}"
+                )
+            _bundle_file(
+                bundle_dir,
+                qfq_path,
+                label=f"incremental qfq audit file for {symbol}",
+            )
+        else:
+            _bundle_file(
+                bundle_dir,
+                row.factor_events_path,
+                label=f"incremental factor file for {symbol}",
+            )
     return manifest, index.sort_values("symbol", kind="stable").reset_index(drop=True)
 
 
@@ -260,6 +296,229 @@ def _identity_extension(
     return _merge_by_date(base_factors, extension)
 
 
+def _provider_alignment_scale(
+    base_qfq: pd.DataFrame,
+    provider_qfq: pd.DataFrame,
+    *,
+    symbol: str,
+) -> tuple[float, float]:
+    left = base_qfq[["date", *PRICE_COLUMNS]].copy()
+    right = provider_qfq[["date", *PRICE_COLUMNS]].copy()
+    for frame in (left, right):
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        for column in PRICE_COLUMNS:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    merged = left.merge(right, on="date", suffixes=("_base", "_provider"))
+    if len(merged) != len(left) or len(merged) != len(right) or merged.empty:
+        raise DataContractError(
+            f"provider-paired qfq dates do not match the base overlap for {symbol}"
+        )
+    ratios: list[float] = []
+    for column in PRICE_COLUMNS:
+        base_values = merged[f"{column}_base"].to_numpy(dtype=float)
+        provider_values = merged[f"{column}_provider"].to_numpy(dtype=float)
+        if (
+            not np.isfinite(base_values).all()
+            or not np.isfinite(provider_values).all()
+            or (base_values <= 0).any()
+            or (provider_values <= 0).any()
+        ):
+            raise DataContractError(
+                f"provider-paired qfq prices are invalid for {symbol}"
+            )
+        ratios.extend((base_values / provider_values).tolist())
+    scale = float(np.median(np.asarray(ratios, dtype=float)))
+    # EastMoney A-share prices are cent-rounded. Scaling a provider series can
+    # magnify that half-cent source rounding, so validate in price space.
+    absolute_tolerance = 0.011 * max(1.0, abs(scale))
+    for column in PRICE_COLUMNS:
+        errors = (
+            merged[f"{column}_base"]
+            - merged[f"{column}_provider"] * scale
+        ).abs()
+        if (errors > absolute_tolerance).any():
+            raise DataContractError(
+                f"provider-paired qfq scale is inconsistent for {symbol}"
+            )
+    return scale, absolute_tolerance
+
+
+def _validate_provider_pair_relation(
+    raw_bars: pd.DataFrame,
+    provider_qfq: pd.DataFrame,
+    factors: pd.DataFrame,
+    *,
+    absolute_tolerance: float,
+    symbol: str,
+) -> None:
+    raw = raw_bars[["date", *PRICE_COLUMNS]].copy()
+    qfq = provider_qfq[["date", *PRICE_COLUMNS]].copy()
+    factor_frame = factors[["date", "factor"]].copy()
+    for frame in (raw, qfq, factor_frame):
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    merged = raw.merge(qfq, on="date", suffixes=("_raw", "_qfq"), validate="one_to_one")
+    merged = merged.merge(factor_frame, on="date", how="inner", validate="one_to_one")
+    if len(merged) != len(raw):
+        raise DataContractError(
+            f"provider-paired OHLC reconstruction is incomplete for {symbol}"
+        )
+    factor_values = pd.to_numeric(merged["factor"], errors="coerce")
+    for column in PRICE_COLUMNS:
+        expected = (
+            pd.to_numeric(merged[f"{column}_raw"], errors="coerce")
+            * factor_values
+        )
+        actual = pd.to_numeric(merged[f"{column}_qfq"], errors="coerce")
+        if (expected - actual).abs().gt(absolute_tolerance).any():
+            raise DataContractError(
+                f"provider-paired OHLC reconstruction failed for {symbol}"
+            )
+
+
+def _provider_pair_update(
+    *,
+    base_raw: pd.DataFrame,
+    base_qfq: pd.DataFrame,
+    base_factors: pd.DataFrame,
+    raw_update: pd.DataFrame,
+    provider_qfq: pd.DataFrame,
+    symbol: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Align a bounded provider raw/qfq pair to the frozen qfq scale.
+
+    The overlap with the base snapshot is the evidence that the provider's
+    current qfq scale is compatible with the frozen history.  A changing
+    factor inside the overlap is rejected instead of silently stitching two
+    incompatible histories together.
+    """
+
+    raw_dates = set(pd.to_datetime(raw_update["date"]).dt.normalize())
+    qfq_dates = set(pd.to_datetime(provider_qfq["date"]).dt.normalize())
+    if raw_dates != qfq_dates:
+        raise DataContractError(f"paired raw/qfq dates do not match for {symbol}")
+    if not raw_dates:
+        return base_qfq.copy(), base_factors.copy(), raw_update.copy()
+
+    base_qfq_dates = pd.to_datetime(base_qfq["date"]).dt.normalize()
+    overlap_dates = raw_dates.intersection(set(base_qfq_dates))
+    if not overlap_dates:
+        raise DataContractError(
+            f"provider-paired update has no overlap with base qfq for {symbol}"
+        )
+    overlap = pd.Series(sorted(overlap_dates), name="date")
+    base_overlap = base_qfq.loc[base_qfq_dates.isin(overlap)].copy()
+    provider_dates = pd.to_datetime(provider_qfq["date"]).dt.normalize()
+    provider_overlap = provider_qfq.loc[provider_dates.isin(overlap)].copy()
+    scale, alignment_tolerance = _provider_alignment_scale(
+        base_overlap,
+        provider_overlap,
+        symbol=symbol,
+    )
+    aligned_qfq = provider_qfq.copy()
+    for column in PRICE_COLUMNS:
+        aligned_qfq[column] = (
+            pd.to_numeric(aligned_qfq[column], errors="coerce") * scale
+        ).round(4)
+    if "preclose" in aligned_qfq.columns:
+        aligned_qfq["preclose"] = (
+            pd.to_numeric(aligned_qfq["preclose"], errors="coerce") * scale
+        ).round(4)
+    if "source_id" in aligned_qfq.columns:
+        aligned_qfq["source_id"] = aligned_qfq["source_id"].astype(str).map(
+            lambda value: f"{value}_aligned_to_base_qfq"
+        )
+    else:
+        aligned_qfq["source_id"] = "provider_qfq_aligned_to_base_qfq"
+
+    from download_baostock_v2 import derive_paired_daily_factors
+
+    try:
+        provider_native_factors = derive_paired_daily_factors(
+            raw_update,
+            provider_qfq,
+            ratio_tolerance=0.02,
+        )
+        paired_factors = derive_paired_daily_factors(
+            raw_update,
+            aligned_qfq,
+            ratio_tolerance=0.02,
+        )
+    except Exception as exc:
+        raise DataContractError(
+            f"provider-paired OHLC adjustment ratios disagree for {symbol}"
+        ) from exc
+    provider_terminal_factor = float(
+        provider_native_factors.sort_values("date")["factor"].iloc[-1]
+    )
+    _validate_provider_pair_relation(
+        raw_update,
+        provider_qfq,
+        provider_native_factors,
+        absolute_tolerance=0.011,
+        symbol=symbol,
+    )
+    _validate_provider_pair_relation(
+        raw_update,
+        aligned_qfq,
+        paired_factors,
+        absolute_tolerance=alignment_tolerance,
+        symbol=symbol,
+    )
+    minimum_raw_price = float(
+        pd.to_numeric(
+            raw_update[list(PRICE_COLUMNS)].stack(), errors="coerce"
+        ).min()
+    )
+    if not np.isfinite(minimum_raw_price) or minimum_raw_price <= 0:
+        raise DataContractError(f"provider-paired raw prices are invalid for {symbol}")
+    factor_tolerance = max(1e-4, alignment_tolerance / minimum_raw_price)
+    base_raw_dates = pd.to_datetime(base_raw["date"]).dt.normalize()
+    base_qfq_dates = pd.to_datetime(base_qfq["date"]).dt.normalize()
+    base_pair_dates = sorted(set(base_raw_dates).intersection(set(base_qfq_dates)))
+    base_pair_raw = base_raw.loc[base_raw_dates.isin(base_pair_dates)]
+    base_pair_qfq = base_qfq.loc[base_qfq_dates.isin(base_pair_dates)]
+    base_paired_factors = derive_paired_daily_factors(base_pair_raw, base_pair_qfq)
+    base_factor_map = base_paired_factors.set_index("date")
+    overlap_factors = paired_factors.loc[
+        paired_factors["date"].isin(overlap_dates)
+    ]
+    if not overlap_factors.empty:
+        expected = overlap_factors["date"].map(base_factor_map["factor"])
+        if expected.isna().any() or not np.isclose(
+            overlap_factors["factor"].to_numpy(dtype=float),
+            expected.to_numpy(dtype=float),
+            rtol=0.0,
+            atol=factor_tolerance,
+        ).all():
+            raise DataContractError(
+                f"provider-paired factor continuity failed for {symbol}"
+            )
+    latest_base_factor = float(base_paired_factors.sort_values("date")["factor"].iloc[-1])
+    future_factors = paired_factors.loc[
+        paired_factors["date"] > max(overlap_dates)
+    ]
+    if not future_factors.empty and not np.isclose(
+        future_factors["factor"].to_numpy(dtype=float),
+        latest_base_factor,
+        rtol=0.0,
+        atol=factor_tolerance,
+    ).all():
+        raise DataContractError(
+            f"provider-paired factor changed for {symbol}; targeted full-history qfq is required"
+        )
+    update_factors = paired_factors.copy()
+    update_factors["source_event_date"] = pd.NaT
+    update_factors["factor_source"] = "provider_native_paired"
+    update_factors["factor_backfilled_before_first_event"] = False
+    update_factors["factor_paired_fallback"] = True
+    update_factors["factor_terminal_normalized"] = False
+    update_factors["provider_qfq_terminal_factor"] = provider_terminal_factor
+    update_factors["provider_qfq_alignment_scale"] = scale
+    merged_factors = _merge_by_date(base_factors, update_factors)
+    merged_qfq = _merge_by_date(base_qfq, aligned_qfq)
+    return merged_qfq, merged_factors, raw_update
+
+
 def _copy_or_link(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -275,6 +534,7 @@ def build_incremental_price_snapshots(
     root = Path(quant_data_root).expanduser().resolve()
     bundle = Path(bundle_dir).expanduser().resolve()
     manifest, index = _validate_bundle(bundle)
+    provider_paired = str(manifest.get("bundle_kind") or "") == "provider_paired_raw_qfq"
     raw_base = resolve_dataset("ashare_daily_raw", quant_data_root=root, require_basis="raw")
     qfq_base = resolve_dataset("ashare_daily_qfq", quant_data_root=root, require_basis="qfq")
     base_latest = str(manifest["base_latest_trade_date"])
@@ -282,6 +542,27 @@ def build_incremental_price_snapshots(
         raise DataContractError("incremental bundle does not match current raw snapshot")
     if qfq_base.manifest.get("latest_trade_date") != base_latest:
         raise DataContractError("incremental bundle does not match current qfq snapshot")
+    if provider_paired:
+        qfq_manifest_hash = sha256_file(
+            qfq_base.snapshot_path / "DATASET_MANIFEST.json"
+        )
+        if (
+            manifest.get("base_qfq_snapshot_id")
+            != qfq_base.manifest.get("snapshot_id")
+            or manifest.get("base_qfq_manifest_sha256") != qfq_manifest_hash
+        ):
+            raise DataContractError(
+                "provider-paired bundle does not match current qfq snapshot identity"
+            )
+        raw_upstreams = [
+            item
+            for item in qfq_base.manifest.get("upstream_snapshots", [])
+            if isinstance(item, dict) and item.get("dataset_id") == "ashare_daily_raw"
+        ]
+        if len(raw_upstreams) != 1 or raw_upstreams[0].get(
+            "snapshot_id"
+        ) != raw_base.manifest.get("snapshot_id"):
+            raise DataContractError("current raw/qfq snapshot identities disagree")
 
     raw_symbols = {path.stem for path in (raw_base.snapshot_path / "bars").glob("*.parquet")}
     qfq_symbols = {path.stem for path in (qfq_base.snapshot_path / "bars").glob("*.parquet")}
@@ -294,8 +575,13 @@ def build_incremental_price_snapshots(
 
     run_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     run_root = root / "staging" / f"ashare-incremental-v2-{run_id}"
-    raw_stage = run_root / f"ashare-baostock-raw-{run_id}"
-    qfq_stage = run_root / f"ashare-baostock-qfq-{run_id}"
+    source_provider = (
+        str((manifest.get("source") or {}).get("provider"))
+        if provider_paired
+        else "baostock"
+    )
+    raw_stage = run_root / f"ashare-{source_provider}-raw-{run_id}"
+    qfq_stage = run_root / f"ashare-{source_provider}-qfq-{run_id}"
     actions_path = qfq_base.snapshot_path / "corporate_actions.parquet"
     try:
         old_actions = pd.read_parquet(actions_path)
@@ -306,6 +592,7 @@ def build_incremental_price_snapshots(
     changed: list[str] = []
     actions: list[pd.DataFrame] = []
     downloaded_rows = 0
+    latest_observed_trade_date: pd.Timestamp | None = None
     requested_start = pd.Timestamp(manifest["requested_start"]).normalize()
     requested_through = pd.Timestamp(manifest["requested_through"]).normalize()
 
@@ -317,18 +604,24 @@ def build_incremental_price_snapshots(
                 row.raw_path,
                 label=f"incremental raw file for {symbol}",
             )
-            events_path = _bundle_file(
-                bundle,
-                row.factor_events_path,
-                label=f"incremental factor file for {symbol}",
-            )
+            events_path = None
+            if not provider_paired:
+                events_path = _bundle_file(
+                    bundle,
+                    row.factor_events_path,
+                    label=f"incremental factor file for {symbol}",
+                )
             if sha256_file(raw_update_path) != str(row.raw_sha256):
                 raise DataContractError(f"incremental raw hash mismatch for {symbol}")
-            if sha256_file(events_path) != str(row.factor_events_sha256):
+            if not provider_paired and sha256_file(events_path) != str(row.factor_events_sha256):
                 raise DataContractError(f"incremental factor hash mismatch for {symbol}")
             try:
                 raw_update = _normalize_bars(pd.read_parquet(raw_update_path), symbol=symbol)
-                new_events = pd.read_parquet(events_path)
+                new_events = (
+                    pd.read_parquet(events_path)
+                    if events_path is not None
+                    else pd.DataFrame()
+                )
                 base_raw = _normalize_bars(
                     pd.read_parquet(raw_base.snapshot_path / "bars" / f"{symbol}.parquet"),
                     symbol=symbol,
@@ -342,7 +635,7 @@ def build_incremental_price_snapshots(
                 )
                 provider_qfq = None
                 provider_relative = getattr(row, "qfq_provider_path", None)
-                if isinstance(provider_relative, str) and provider_relative:
+                if provider_paired or (isinstance(provider_relative, str) and provider_relative):
                     provider_path = _bundle_file(
                         bundle,
                         provider_relative,
@@ -372,9 +665,36 @@ def build_incremental_price_snapshots(
             ):
                 raise DataContractError(f"incremental raw dates are out of range for {symbol}")
             merged_raw = _merge_by_date(base_raw, raw_update)
-            factor_changed = _events_changed(old_actions, new_events, symbol=symbol)
-            canonical_new_events = _canonical_events(new_events, symbol=symbol)
-            if factor_changed:
+            symbol_latest_trade_date = pd.to_datetime(merged_raw["date"]).max()
+            if latest_observed_trade_date is None or symbol_latest_trade_date > latest_observed_trade_date:
+                latest_observed_trade_date = symbol_latest_trade_date
+            if provider_paired:
+                if provider_qfq is None:
+                    raise DataContractError(f"qfq audit file is required for {symbol}")
+                merged_qfq, daily_factors, _ = _provider_pair_update(
+                    base_raw=base_raw,
+                    base_qfq=base_qfq,
+                    base_factors=base_factors,
+                    raw_update=raw_update,
+                    provider_qfq=provider_qfq,
+                    symbol=symbol,
+                )
+                if raw_update.empty:
+                    _copy_or_link(
+                        qfq_base.snapshot_path / "bars" / f"{symbol}.parquet",
+                        qfq_stage / "bars" / f"{symbol}.parquet",
+                    )
+                    _copy_or_link(
+                        qfq_base.snapshot_path / "factors" / f"{symbol}.parquet",
+                        qfq_stage / "factors" / f"{symbol}.parquet",
+                    )
+                    merged_qfq = None
+                    daily_factors = None
+                reused.append(symbol)
+            else:
+                factor_changed = _events_changed(old_actions, new_events, symbol=symbol)
+                canonical_new_events = _canonical_events(new_events, symbol=symbol)
+            if not provider_paired and factor_changed:
                 if canonical_new_events.empty:
                     raise DataContractError(f"factor history disappeared for {symbol}")
                 daily_factors = expand_daily_factors(
@@ -384,7 +704,7 @@ def build_incremental_price_snapshots(
                 )
                 merged_qfq = build_local_qfq(merged_raw, daily_factors)
                 changed.append(symbol)
-            elif raw_update.empty:
+            elif not provider_paired and raw_update.empty:
                 _copy_or_link(
                     qfq_base.snapshot_path / "bars" / f"{symbol}.parquet",
                     qfq_stage / "bars" / f"{symbol}.parquet",
@@ -396,7 +716,7 @@ def build_incremental_price_snapshots(
                 merged_qfq = None
                 daily_factors = None
                 reused.append(symbol)
-            else:
+            elif not provider_paired:
                 if canonical_new_events.empty:
                     daily_factors = _identity_extension(
                         base_factors, raw_update, symbol=symbol
@@ -415,12 +735,17 @@ def build_incremental_price_snapshots(
             if merged_qfq is not None and daily_factors is not None:
                 atomic_parquet(merged_qfq, qfq_stage / "bars" / f"{symbol}.parquet")
                 atomic_parquet(daily_factors, qfq_stage / "factors" / f"{symbol}.parquet")
-            actions.append(_event_output(new_events, symbol=symbol))
+            if not provider_paired:
+                actions.append(_event_output(new_events, symbol=symbol))
 
         corporate_actions = (
-            pd.concat(actions, ignore_index=True)
-            if actions
-            else pd.DataFrame(columns=["event_date", *FACTOR_COLUMNS, "symbol", "action_type"])
+            old_actions.copy()
+            if provider_paired
+            else (
+                pd.concat(actions, ignore_index=True)
+                if actions
+                else pd.DataFrame(columns=["event_date", *FACTOR_COLUMNS, "symbol", "action_type"])
+            )
         )
         atomic_parquet(corporate_actions, raw_stage / "corporate_actions.parquet")
         atomic_parquet(corporate_actions, qfq_stage / "corporate_actions.parquet")
@@ -429,9 +754,13 @@ def build_incremental_price_snapshots(
             datetime.fromisoformat(source_retrieved_at)
         except ValueError as exc:
             raise DataContractError("incremental bundle retrieval timestamp is invalid") from exc
+        bundle_source = manifest.get("source") if provider_paired else None
         source = {
-            "provider": "baostock",
-            "interface": "incremental_raw_plus_complete_factor_history",
+            "provider": source_provider,
+            "interface": str(
+                (bundle_source or {}).get("interface")
+                or "incremental_raw_plus_complete_factor_history"
+            ),
             "source_bundle_sha256": sha256_file(
                 _bundle_file(
                     bundle,
@@ -442,10 +771,14 @@ def build_incremental_price_snapshots(
             "execution_environment": manifest.get("source", {}).get(
                 "execution_environment", "private_remote_windows"
             ),
+            "bundle_kind": manifest.get("bundle_kind"),
             "base_snapshot_id": raw_base.manifest["snapshot_id"],
             "requested_start": str(manifest["requested_start"]),
             "requested_through": str(manifest["requested_through"]),
         }
+        if latest_observed_trade_date is None or pd.isna(latest_observed_trade_date):
+            raise DataContractError("incremental bundle produced no trade dates")
+        actual_latest_trade_date = str(latest_observed_trade_date.date())
         finalize_price_snapshot(
             raw_stage,
             dataset_id="ashare_daily_raw",
@@ -475,14 +808,30 @@ def build_incremental_price_snapshots(
             source=source,
             price_basis="qfq",
             adjustment={
-                "method": "local_factor",
+                "method": "provider_native_paired" if provider_paired else "local_factor",
                 "adjusted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "adjustment_as_of": str(manifest["requested_through"]),
+                    "adjustment_as_of": actual_latest_trade_date,
                 "adjusted_fields": list(PRICE_COLUMNS),
-                "normalization_rule": "latest_valid_trade_date_factor_equals_1",
-                "algorithm_version": "baostock-factor-incremental-v1",
+                "normalization_rule": (
+                    "provider qfq aligned to frozen base qfq scale"
+                    if provider_paired
+                    else "latest_valid_trade_date_factor_equals_1"
+                ),
+                "algorithm_version": (
+                    "provider-native-paired-incremental-v1"
+                    if provider_paired
+                    else "baostock-factor-incremental-v1"
+                ),
                 "factor_changed_symbols": len(changed),
                 "volume_adjusted": False,
+                **(
+                    {
+                        "paired_raw_snapshot_id": raw_stage.name,
+                        "paired_raw_component_path": None,
+                    }
+                    if provider_paired
+                    else {}
+                ),
             },
             producer={"script": "incremental_update_ashare_v2.py", "version": "1"},
             source_retrieved_at=source_retrieved_at,
@@ -497,7 +846,11 @@ def build_incremental_price_snapshots(
         shutil.rmtree(run_root, ignore_errors=True)
         raise
 
-    latest = str(pd.Timestamp(manifest["requested_through"]).date())
+    finalized_raw = _read_json(
+        raw_stage / "DATASET_MANIFEST.json",
+        label="finalized incremental raw manifest",
+    )
+    latest = str(finalized_raw["latest_trade_date"])
     return IncrementalPriceResult(
         raw_stage=raw_stage,
         qfq_stage=qfq_stage,

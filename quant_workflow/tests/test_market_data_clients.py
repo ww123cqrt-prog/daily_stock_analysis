@@ -67,6 +67,31 @@ class MarketDataClientsTest(unittest.TestCase):
         self.assertEqual(frame["volume"].tolist(), ["123"])
         self.assertEqual(frame["turn"].tolist(), ["0.75"])
 
+    def test_fetch_eastmoney_daily_supports_raw_mode(self):
+        module = load_module()
+        session = FakeSession(
+            FakeResponse(
+                {
+                    "data": {
+                        "klines": [
+                            "2026-07-08,10.00,10.20,10.50,9.90,123,123456.7,0,1.50,0,0.75",
+                        ],
+                    }
+                }
+            )
+        )
+
+        module.fetch_eastmoney_daily(
+            "600519",
+            "2026-07-01",
+            "2026-07-08",
+            fqt=0,
+            session=session,
+            timeout=9,
+        )
+
+        self.assertEqual(session.calls[0]["params"]["fqt"], "0")
+
     def test_parse_sina_quote_text_returns_normalized_snapshot_rows(self):
         module = load_module()
         text = (

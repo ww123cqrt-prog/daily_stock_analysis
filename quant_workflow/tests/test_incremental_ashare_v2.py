@@ -201,6 +201,231 @@ def _write_bundle(root: Path) -> Path:
     return bundle
 
 
+def _write_provider_paired_bundle(root: Path) -> Path:
+    source = load_script("download_baostock_v2")
+    bundle = root / "provider-paired-bundle"
+    qfq_pointer = json.loads(
+        (root / "parquet/ashare_1d/ashare_daily_qfq/LATEST.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    dates = ["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"]
+    index_rows: list[dict[str, object]] = []
+    for symbol, provider_scale in (("SH000001", 1.0), ("SH000002", 0.4)):
+        raw_path = bundle / "raw" / f"{symbol}.parquet"
+        qfq_path = bundle / "qfq_provider" / f"{symbol}.parquet"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        qfq_path.parent.mkdir(parents=True, exist_ok=True)
+        raw = _bars(symbol, [11.0, 11.2, 11.3, 11.4], dates)
+        provider_qfq = raw.copy()
+        provider_qfq[["open", "high", "low", "close", "preclose"]] = provider_qfq[
+            ["open", "high", "low", "close", "preclose"]
+        ].mul(provider_scale)
+        provider_qfq["source_id"] = "eastmoney_qfq_provider"
+        raw["source_id"] = "eastmoney_raw"
+        raw.to_parquet(raw_path, index=False)
+        provider_qfq.to_parquet(qfq_path, index=False)
+        index_rows.append(
+            {
+                "symbol": symbol,
+                "provider_code": f"sh.{symbol[2:]}",
+                "raw_path": f"raw/{symbol}.parquet",
+                "qfq_provider_path": f"qfq_provider/{symbol}.parquet",
+                "qfq_provider_sha256": source.sha256_file(qfq_path),
+                "raw_rows": len(raw),
+                "first_date": "2026-08-04",
+                "last_date": "2026-08-07",
+                "raw_sha256": source.sha256_file(raw_path),
+            }
+        )
+    source.atomic_parquet(pd.DataFrame(index_rows), bundle / "BUNDLE_FILE_INDEX.parquet")
+    source.atomic_json(
+        bundle / "BUNDLE_MANIFEST.json",
+        {
+            "schema_version": 3,
+            "bundle_kind": "provider_paired_raw_qfq",
+            "bundle_mode": "incremental",
+            "status": "ready",
+            "source": {
+                "provider": "eastmoney",
+                "interface": "push2his_kline_fqt_0_and_fqt_1",
+            },
+            "source_retrieved_at": "2026-08-07T18:00:00+08:00",
+            "base_qfq_snapshot_id": qfq_pointer["snapshot_id"],
+            "base_qfq_manifest_sha256": qfq_pointer["manifest_sha256"],
+            "requested_start": "2026-07-27",
+            "requested_through": "2026-08-07",
+            "base_latest_trade_date": "2026-08-04",
+            "requested_symbols": 2,
+            "completed_symbols": 2,
+            "empty_symbols": 0,
+            "failed_symbols": 0,
+            "index_path": "BUNDLE_FILE_INDEX.parquet",
+        },
+    )
+    return bundle
+
+
+def test_incremental_price_import_accepts_provider_native_paired_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    module = load_script("incremental_update_ashare_v2")
+
+    result = module.build_incremental_price_snapshots(
+        bundle_dir=bundle,
+        quant_data_root=root,
+    )
+
+    qfq_manifest = json.loads(
+        (result.qfq_stage / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    assert qfq_manifest["source"]["provider"] == "eastmoney"
+    assert qfq_manifest["adjustment"]["method"] == "provider_native_paired"
+    assert qfq_manifest["adjustment"]["paired_raw_snapshot_id"] == result.raw_stage.name
+    qfq = pd.read_parquet(result.qfq_stage / "bars/SH000002.parquet")
+    assert qfq.loc[qfq["date"] == "2026-08-05", "close"].iloc[0] == pytest.approx(8.96)
+
+
+def test_provider_native_paired_bundle_requires_qfq_for_every_symbol(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    index_path = bundle / "BUNDLE_FILE_INDEX.parquet"
+    index = pd.read_parquet(index_path)
+    index.loc[0, "qfq_provider_path"] = None
+    index.loc[0, "qfq_provider_sha256"] = None
+    index.to_parquet(index_path, index=False)
+    module = load_script("incremental_update_ashare_v2")
+
+    with pytest.raises(module.DataContractError, match="qfq audit file is required"):
+        module.build_incremental_price_snapshots(bundle_dir=bundle, quant_data_root=root)
+
+
+def test_provider_native_paired_bundle_rejects_raw_qfq_date_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    source = load_script("download_baostock_v2")
+    symbol = "SH000001"
+    qfq_path = bundle / "qfq_provider" / f"{symbol}.parquet"
+    qfq = pd.read_parquet(qfq_path).iloc[:-1].copy()
+    qfq.to_parquet(qfq_path, index=False)
+    index_path = bundle / "BUNDLE_FILE_INDEX.parquet"
+    index = pd.read_parquet(index_path)
+    selected = index["symbol"].eq(symbol)
+    index.loc[selected, "qfq_provider_sha256"] = source.sha256_file(qfq_path)
+    index.to_parquet(index_path, index=False)
+    module = load_script("incremental_update_ashare_v2")
+
+    with pytest.raises(module.DataContractError, match="paired raw/qfq dates"):
+        module.build_incremental_price_snapshots(bundle_dir=bundle, quant_data_root=root)
+
+
+def test_provider_native_paired_bundle_rejects_different_base_snapshot(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    manifest_path = bundle / "BUNDLE_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["base_qfq_snapshot_id"] = "different-qfq-base"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    module = load_script("incremental_update_ashare_v2")
+
+    with pytest.raises(module.DataContractError, match="current qfq snapshot identity"):
+        module.build_incremental_price_snapshots(bundle_dir=bundle, quant_data_root=root)
+
+
+def test_provider_native_paired_result_reports_actual_latest_trade_date(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    manifest_path = bundle / "BUNDLE_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["requested_through"] = "2026-08-08"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    module = load_script("incremental_update_ashare_v2")
+
+    result = module.build_incremental_price_snapshots(
+        bundle_dir=bundle,
+        quant_data_root=root,
+    )
+
+    assert result.latest_trade_date == "2026-08-07"
+    qfq_manifest = json.loads(
+        (result.qfq_stage / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    assert qfq_manifest["adjustment"]["adjustment_as_of"] == "2026-08-07"
+
+
+def test_provider_native_paired_accepts_cent_rounded_provider_prices(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    source = load_script("download_baostock_v2")
+    symbol = "SH000002"
+    raw = pd.read_parquet(bundle / f"raw/{symbol}.parquet")
+    qfq_path = bundle / f"qfq_provider/{symbol}.parquet"
+    qfq = raw.copy()
+    qfq[["open", "high", "low", "close", "preclose"]] = (
+        qfq[["open", "high", "low", "close", "preclose"]] * (1.0 / 3.0)
+    ).round(2)
+    qfq["source_id"] = "eastmoney_qfq_provider"
+    qfq.to_parquet(qfq_path, index=False)
+    index_path = bundle / "BUNDLE_FILE_INDEX.parquet"
+    index = pd.read_parquet(index_path)
+    selected = index["symbol"].eq(symbol)
+    index.loc[selected, "qfq_provider_sha256"] = source.sha256_file(qfq_path)
+    index.to_parquet(index_path, index=False)
+    module = load_script("incremental_update_ashare_v2")
+
+    result = module.build_incremental_price_snapshots(
+        bundle_dir=bundle,
+        quant_data_root=root,
+    )
+
+    assert result.latest_trade_date == "2026-08-07"
+
+
+def test_provider_native_paired_rejects_future_ohlc_ratio_disagreement(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "quant_data"
+    _publish_base(root)
+    bundle = _write_provider_paired_bundle(root)
+    source = load_script("download_baostock_v2")
+    symbol = "SH000001"
+    qfq_path = bundle / f"qfq_provider/{symbol}.parquet"
+    qfq = pd.read_parquet(qfq_path)
+    future = pd.to_datetime(qfq["date"]) > pd.Timestamp("2026-08-04")
+    qfq.loc[future, "high"] = qfq.loc[future, "high"] * 1.01
+    qfq.to_parquet(qfq_path, index=False)
+    index_path = bundle / "BUNDLE_FILE_INDEX.parquet"
+    index = pd.read_parquet(index_path)
+    selected = index["symbol"].eq(symbol)
+    index.loc[selected, "qfq_provider_sha256"] = source.sha256_file(qfq_path)
+    index.to_parquet(index_path, index=False)
+    module = load_script("incremental_update_ashare_v2")
+
+    with pytest.raises(module.DataContractError, match="OHLC reconstruction"):
+        module.build_incremental_price_snapshots(
+            bundle_dir=bundle,
+            quant_data_root=root,
+        )
+
+
 def test_incremental_price_import_reuses_history_and_recalculates_only_changed_factor_symbol(
     tmp_path: Path,
 ) -> None:

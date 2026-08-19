@@ -165,16 +165,23 @@ def parse_eastmoney_kline_payload(payload: dict[str, Any] | None) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-def fetch_eastmoney_qfq_daily(
+def fetch_eastmoney_daily(
     symbol: str,
     start: str,
     end: str,
     *,
+    fqt: int = 1,
     session: requests.Session | None = None,
     timeout: float = 30,
     use_system_proxy: bool = False,
 ) -> pd.DataFrame:
-    """Fetch EastMoney qfq daily bars. Volume is returned in hands."""
+    """Fetch EastMoney daily bars with an explicit adjustment mode.
+
+    ``fqt=0`` is raw and ``fqt=1`` is provider-native qfq. Volume is returned
+    in hands by the upstream endpoint.
+    """
+    if fqt not in {0, 1}:
+        raise ValueError("EastMoney fqt must be 0 (raw) or 1 (qfq)")
     session, close_session = _open_session(session, use_system_proxy)
     try:
         with proxy_bypass_env(use_system_proxy):
@@ -185,7 +192,7 @@ def fetch_eastmoney_qfq_daily(
                     "fields1": EASTMONEY_KLINE_FIELDS1,
                     "fields2": EASTMONEY_KLINE_FIELDS2,
                     "klt": "101",
-                    "fqt": "1",
+                    "fqt": str(fqt),
                     "beg": compact_date(start),
                     "end": compact_date(end),
                 },
@@ -197,6 +204,27 @@ def fetch_eastmoney_qfq_daily(
     finally:
         if close_session:
             session.close()
+
+
+def fetch_eastmoney_qfq_daily(
+    symbol: str,
+    start: str,
+    end: str,
+    *,
+    session: requests.Session | None = None,
+    timeout: float = 30,
+    use_system_proxy: bool = False,
+) -> pd.DataFrame:
+    """Fetch EastMoney provider-native qfq daily bars."""
+    return fetch_eastmoney_daily(
+        symbol,
+        start,
+        end,
+        fqt=1,
+        session=session,
+        timeout=timeout,
+        use_system_proxy=use_system_proxy,
+    )
 
 
 def fetch_akshare_qfq_daily(
