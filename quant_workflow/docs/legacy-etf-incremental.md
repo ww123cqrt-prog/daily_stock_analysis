@@ -2,6 +2,8 @@
 
 本入口维护旧版 `cn_etf_daily` 的 raw、QFQ、因子 Parquet 和快照索引。它只更新文件数据集的 `LATEST.json`，不启动项目版数据服务，不创建正式 candidate，也不改变 `ACTIVE_RELEASE_SET.json`。
 
+独立检查现有文件可运行 `quant_data_cli.py check-etf`，见[ETF 只读体检](etf-data-healthcheck.md)。它只生成诊断报告，不作为更新、读取或回测的新门禁。
+
 ## 更新现有证券池
 
 在 DSA 仓库根运行，填写数据根和已经结束的目标交易日：

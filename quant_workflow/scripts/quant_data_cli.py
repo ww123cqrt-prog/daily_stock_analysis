@@ -1505,6 +1505,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the read-only ETF release acceptance check without network access",
     )
 
+    check_etf_parser = commands.add_parser(
+        "check-etf", help="Read-only ETF data diagnostics; never a release/read gate"
+    )
+    check_etf_parser.add_argument("--output-dir", type=Path)
+    check_etf_parser.add_argument("--calendar", type=Path)
+    check_etf_parser.add_argument("--split-evidence", type=Path)
+
     compare_parser = commands.add_parser("compare-snapshots")
     compare_parser.add_argument("dataset_id")
     compare_parser.add_argument("--base-snapshot", required=True)
@@ -1582,6 +1589,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "validate":
             return _validate(root, args.target, release=args.release)
+        if args.command == "check-etf":
+            from check_etf_data import main as check_etf
+
+            options = ["--root", str(root)]
+            if args.output_dir is not None:
+                options.extend(["--output-dir", str(args.output_dir)])
+            if args.calendar is not None:
+                options.extend(["--calendar", str(args.calendar)])
+            if args.split_evidence is not None:
+                options.extend(["--split-evidence", str(args.split_evidence)])
+            return check_etf(options)
         if args.command == "compare-snapshots":
             payload = compare_snapshot_increment(
                 args.dataset_id,

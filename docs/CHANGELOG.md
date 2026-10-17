@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 增加独立的 `check-etf` 只读体检入口，复用行情/复权检查并按证券、日期和字段区分确定错误、证据不足及核查线索，不接入读取或发布门禁。
+
 - [改进] ETF 旧文件增量支持 Baostock 有界 raw/QFQ 补缺，保留 SDK 证据与原始成交量，按旧文件单位核对衔接并隔离来源冲突。
 
 - [修复] 恢复 ETF 文件快照的有界增量更新：保留已有历史、核对 QFQ 衔接，支持腾讯与东方财富补缺、采集缓存复用及逐证券失败披露；不依赖项目版服务。
