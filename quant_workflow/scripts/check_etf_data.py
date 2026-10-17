@@ -547,16 +547,43 @@ def inspect_etf_frames(
             if not np.isclose(
                 actual_ratio, float(event["ratio"]), rtol=2e-6, atol=1e-8
             ):
+                # A fitted affine representation can be nonunique on flat
+                # bars; rounding can also perturb its scale. Only convict
+                # the explicit unchanged-raw-as-QFQ case, not the fit alone.
+                raw_boundary = np.column_stack(
+                    [
+                        _numeric(raw, field).iloc[[left, right]].to_numpy()
+                        for field in PRICE_FIELDS
+                    ]
+                )
+                qfq_boundary = np.column_stack(
+                    [
+                        _numeric(qfq, field).iloc[[left, right]].to_numpy()
+                        for field in PRICE_FIELDS
+                    ]
+                )
+                missing_adjustment = np.array_equal(
+                    raw_boundary, qfq_boundary
+                ) and np.isclose(actual_ratio, 1.0, rtol=1e-12, atol=1e-12)
                 issues.append(
                     _finding(
-                        "split_adjustment_missing",
+                        "split_adjustment_missing"
+                        if missing_adjustment
+                        else "split_ratio_disagreement",
                         symbol,
                         "qfq/factors",
                         "factor_ratio",
+                        severity="confirmed_error"
+                        if missing_adjustment
+                        else "needs_review",
                         date=_date(effective),
                         observed=actual_ratio,
                         expected=float(event["ratio"]),
-                        detail=f"与所提供纯拆分/合并记录矛盾；前一行情日{_date(raw_dates.iloc[left])}，不能仅凭raw×factor+offset自洽判为复权正确",
+                        detail=(
+                            f"与所提供纯拆分/合并记录矛盾；前一行情日{_date(raw_dates.iloc[left])}，边界两侧QFQ仍完全等于raw"
+                            if missing_adjustment
+                            else "拟合因子比例与公告不同，可能涉及精度或非唯一的平价仿射表示，不能只凭比例直接判错"
+                        ),
                         evidence=event.get("source_url", ""),
                     )
                 )

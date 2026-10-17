@@ -500,3 +500,29 @@ def test_verified_split_is_not_counted_as_still_pending_jump():
     issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor, split_events=events)
     assert any(i["rule"] == "split_adjustment_missing" for i in issues)
     assert not any(i["rule"] == "large_adjusted_return" for i in issues)
+
+
+@pytest.mark.parametrize("representation", ["rounded_ratio", "flat_price_offset"])
+def test_split_factor_representation_does_not_create_false_conviction(representation):
+    mod = checker()
+    raw, qfq, factor = frames()
+    if representation == "rounded_ratio":
+        factor.loc[0, "factor"] = 1 / 8.00037281
+        qfq.loc[0, ["open", "high", "low", "close"]] = [
+            10 / 8.00037281,
+            12 / 8.00037281,
+            9 / 8.00037281,
+            11 / 8.00037281,
+        ]
+    else:
+        raw.loc[0, ["open", "high", "low", "close"]] = 8.0
+        raw.loc[1, ["open", "high", "low", "close"]] = 1.0
+        qfq.loc[:, ["open", "high", "low", "close"]] = 1.0
+        factor.loc[0, "offset"] = -7.0
+    events = [{"effective_trade_date": "2026-10-16", "ratio": 8.0}]
+    issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor, split_events=events)
+    assert not [i for i in issues if i["severity"] == "confirmed_error"]
+    assert any(
+        i["rule"] == "split_ratio_disagreement" and i["severity"] == "needs_review"
+        for i in issues
+    )
