@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import unicodedata
@@ -934,6 +935,119 @@ def fetch_eastmoney_pair(
     return raw, qfq
 
 
+_BAOSTOCK_WINDOW_SCRIPT = r'''
+import json, sys
+import baostock as bs
+request = json.loads(sys.argv[1])
+try:
+    login = bs.login()
+    if str(login.error_code) != "0":
+        raise RuntimeError("Baostock login failed: " + str(login.error_code))
+    result = bs.query_history_k_data_plus(**request)
+    rows = []
+    while str(result.error_code) == "0" and result.next():
+        rows.append(result.get_row_data())
+        if len(rows) > 640:
+            raise RuntimeError("Baostock response exceeded bounded row limit")
+    payload = dict(request=request, error_code=str(result.error_code),
+                   error_msg=result.error_msg, fields=result.fields, rows=rows)
+finally:
+    primary = sys.exc_info()[1]
+    try:
+        bs.logout()
+    except Exception as cleanup:
+        if primary is None:
+            raise
+        primary.add_note("Baostock logout failed: " + str(cleanup))
+print("ETF_RESULT:" + json.dumps(payload, ensure_ascii=False))
+'''
+
+
+def _read_baostock_window(request: dict[str, str], *, timeout: float) -> dict[str, Any]:
+    """Bound login, all SDK pages, logout and EOF loops in one owned child."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _BAOSTOCK_WINDOW_SCRIPT, json.dumps(request)],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+        records = [line.removeprefix("ETF_RESULT:") for line in result.stdout.splitlines()
+                   if line.startswith("ETF_RESULT:")]
+        if len(records) != 1 or len(records[0]) > 1_000_000:
+            raise ValueError("missing or oversized SDK result")
+        return json.loads(records[0])
+    except (subprocess.SubprocessError, ValueError) as exc:
+        raise CnEtfDownloadError(f"Baostock bounded request failed: {exc}") from exc
+
+
+def fetch_baostock_pair(
+    symbol: str, metadata: dict[str, str], *, start_date: str, end_date: str,
+    session: Any, request_gate: RequestGate,
+    page_size: int = DEFAULT_INCREMENTAL_PAGE_SIZE,
+    retries: int = 2, timeout: float = 20.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read only a bounded raw/QFQ tail; preserve the SDK's native values."""
+    start, end = _as_date(start_date), _as_date(end_date)
+    if start > end or len(pd.bdate_range(start, end)) > 640:
+        raise CnEtfDownloadError("Baostock incremental window exceeds its bounded limit")
+    code = f"{metadata['market']}.{metadata['code']}"
+    if code != symbol[:2].lower() + "." + symbol[2:]:
+        raise CnEtfDownloadError(f"Baostock metadata differs for {symbol}")
+    fields = "date,code,open,high,low,close,volume,amount,tradestatus"
+    frames, responses = [], []
+    for flag, kind in (("3", "raw"), ("2", "qfq")):
+        request = dict(code=code, fields=fields, start_date=start.date().isoformat(),
+                       end_date=end.date().isoformat(), frequency="d", adjustflag=flag)
+        for attempt in range(retries):
+            try:
+                payload = request_gate.call(_read_baostock_window, request, timeout=timeout)
+                break
+            except CnEtfDownloadError:
+                if attempt + 1 == retries:
+                    raise
+        if (payload.get("request") != request or payload.get("error_code") != "0"
+                or payload.get("fields") != fields.split(",")):
+            raise CnEtfDownloadError(f"Baostock response identity differs for {symbol}")
+        responses.append(payload)
+        try:
+            frame = pd.DataFrame(payload["rows"], columns=payload["fields"])
+            if frame.empty or set(frame["code"]) != {code}:
+                raise ValueError("missing rows or wrong code")
+            frame["date"] = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
+            if frame["date"].duplicated().any() or not frame["date"].between(start, end).all():
+                raise ValueError("invalid dates")
+            if not set(frame["tradestatus"]).issubset({"0", "1"}):
+                raise ValueError("unknown trade status")
+            # SDK suspension placeholders are evidence, never newly manufactured bars.
+            frame = frame.loc[frame["tradestatus"] == "1"].copy()
+            if frame.empty:
+                raise ValueError("no actual trading rows")
+            for field in ("open", "high", "low", "close", "volume", "amount"):
+                frame[field] = pd.to_numeric(frame[field], errors="raise")
+            if not np.isfinite(frame[["open", "high", "low", "close", "volume", "amount"]]).all().all():
+                raise ValueError("nonfinite bar values")
+            if (frame[["volume", "amount"]] < 0).any().any():
+                raise ValueError("negative volume or amount")
+            frame["native_volume"] = frame["volume"]
+            frame["volume"] = np.floor(frame["volume"] / 100.0 + 0.5)
+            frame["volume_unit"] = "lot_100_shares_rounded"
+            frame["symbol"], frame["name"] = symbol, metadata["name"]
+            frame["source"] = f"baostock.etf_daily_{kind}"
+            if kind == "qfq":
+                frame["provider_response_key"] = "baostock_adjustflag_2"
+            frames.append(frame.drop(columns=["code"]).sort_values("date").reset_index(drop=True))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CnEtfDownloadError(f"invalid Baostock {kind} response for {symbol}: {exc}") from exc
+    raw, qfq = frames
+    if raw["date"].tolist() != qfq["date"].tolist() or not np.array_equal(raw["volume"], qfq["volume"]):
+        raise CnEtfDownloadError(f"Baostock raw/qfq keys or volume differ for {symbol}")
+    build_paired_adjustments(symbol, raw, qfq)
+    raw.attrs["source_receipt"] = {
+        "provider": "baostock", "responses": responses,
+        "volume_rule": "floor(shares / 100 + 0.5) to legacy whole lots",
+    }
+    return raw, qfq
+
+
 def build_paired_adjustments(
     symbol: str,
     raw: pd.DataFrame,
@@ -1444,9 +1558,12 @@ def _cached_incremental_pair(
     identity = {"base_manifest_sha256": base_manifest_sha256, "symbol": symbol,
                 "metadata": metadata, "start": start_date, "end": end_date,
                 "provider": provider, "rules": "affine-bounded-increment-v1"}
+    if provider == "baostock":
+        identity["volume_rule"] = "native-shares-to-half-up-100-share-lots-v2"
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     folder = cache / key
     marker = folder / "COMPLETE.json"
+    receipt_path = folder / "SOURCE_RESPONSE.json"
     paths = {kind: folder / kind / f"{symbol}.parquet" for kind in ("raw", "qfq", "factors")}
 
     def attributed(raw: pd.DataFrame, qfq: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1465,11 +1582,17 @@ def _cached_incremental_pair(
                 for kind, path in paths.items()
             ) or not _cache_symbol_complete(folder, symbol):
                 raise DataContractError(f"incremental cache changed for {symbol}")
+            if provider == "baostock" and (
+                not receipt_path.is_file()
+                or sha256_file(receipt_path) != complete.get("source_receipt_sha256")
+            ):
+                raise DataContractError(f"incremental source response changed for {symbol}")
             return attributed(pd.read_parquet(paths["raw"]), pd.read_parquet(paths["qfq"]))
         except (OSError, ValueError, KeyError) as exc:
             raise DataContractError(f"incremental cache is invalid for {symbol}") from exc
     try:
-        fetch_pair = fetch_tencent_pair if provider == "tencent" else fetch_eastmoney_pair
+        fetch_pair = {"tencent": fetch_tencent_pair, "eastmoney": fetch_eastmoney_pair,
+                      "baostock": fetch_baostock_pair}[provider]
         raw, qfq = fetch_pair(
             symbol, metadata, start_date=start_date, end_date=end_date, session=session,
             request_gate=request_gate, page_size=DEFAULT_INCREMENTAL_PAGE_SIZE,
@@ -1482,8 +1605,11 @@ def _cached_incremental_pair(
         raise CnEtfDownloadError(f"incoming raw/qfq pair is invalid for {symbol}: {exc}") from exc
     for kind, frame in (("raw", raw), ("qfq", qfq), ("factors", factors)):
         _atomic_parquet(frame, paths[kind])
-    atomic_write_json(marker, {"identity": identity,
-                              "sha256": {kind: sha256_file(path) for kind, path in paths.items()}})
+    complete = {"identity": identity, "sha256": {kind: sha256_file(path) for kind, path in paths.items()}}
+    if provider == "baostock":
+        atomic_write_json(receipt_path, raw.attrs["source_receipt"])
+        complete["source_receipt_sha256"] = sha256_file(receipt_path)
+    atomic_write_json(marker, complete)
     return attributed(raw, qfq)
 
 
@@ -1635,8 +1761,8 @@ def update_cn_etf_snapshot(
 ) -> Path:
     """Reuse the frozen ETF snapshot and fetch only its missing date window."""
 
-    if provider not in {"tencent", "eastmoney"}:
-        raise ValueError("incremental provider must be tencent or eastmoney")
+    if provider not in {"tencent", "eastmoney", "baostock"}:
+        raise ValueError("incremental provider must be tencent, eastmoney or baostock")
     if overlap_days < 1 or overlap_days > 60:
         raise ValueError("overlap_days must be between 1 and 60")
     if request_interval < MIN_REQUEST_INTERVAL:
@@ -1676,7 +1802,7 @@ def update_cn_etf_snapshot(
         if manifest.get("data_kind") != "paired_daily_bars":
             raise DataContractError("cn_etf_daily is not a paired raw/qfq snapshot")
         history_provider = (manifest.get("source") or {}).get("provider")
-        if history_provider not in {"tencent", "eastmoney", "tickflow", "mixed"}:
+        if history_provider not in {"tencent", "eastmoney", "baostock", "tickflow", "mixed"}:
             raise DataContractError("incremental update requires an identified frozen history provider")
         base_manifest_sha256 = sha256_file(current / "DATASET_MANIFEST.json")
 
@@ -1904,7 +2030,7 @@ def update_cn_etf_snapshot(
                     "increment_provider": provider,
                     "retained_history_provider": history_provider,
                     "interface": ("ifzq_day_and_qfqday_bounded_increment" if provider == "tencent"
-                                  else "eastmoney_raw_qfq_bounded_increment"),
+                                  else f"{provider}_raw_qfq_bounded_increment"),
                     "update_mode": "missing_dates_only",
                     "parent_snapshot_id": current.name,
                     "selection_method": "frozen_previous_snapshot",
@@ -3215,7 +3341,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--full-rebuild", action="store_true")
     parser.add_argument("--update", action="store_true", help="Update the existing file snapshot without the project service")
     parser.add_argument("--base-snapshot", type=Path, help="Explicit frozen file snapshot")
-    parser.add_argument("--provider", choices=("tencent", "eastmoney"), default="tencent", help="Provider for bounded updates only")
+    parser.add_argument("--provider", choices=("tencent", "eastmoney", "baostock"), default="tencent", help="Provider for bounded updates only")
     parser.add_argument("--symbol", action="append", dest="symbols", help="Prepare selected existing symbols only")
     parser.add_argument("--prepare-only", action="store_true", help="Validate staged files without changing LATEST")
     parser.add_argument("--keep-failed-history", action="store_true", help="Disclose supplier failures and retain those symbols' exact old files")

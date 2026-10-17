@@ -2117,3 +2117,152 @@ def test_metadata_reissue_keeps_the_original_51_style_parent_in_immutable_histor
     assert manifest["source"]["metadata_correction_of_snapshot_id"] == expanded.name
     assert manifest["source"]["universe_sha256"] == universe_manifest["universe_sha256"]
     assert universe_manifest["selected_count"] == 4
+
+
+def _baostock_payload(symbol, flag, *, dates=None, closes=None):
+    code = symbol[:2].lower() + '.' + symbol[2:]
+    dates = dates or ['2026-08-04', '2026-08-05', '2026-08-06', '2026-08-07']
+    closes = closes or [1, 1.1, 1.2, 1.3]
+    return {
+        'request': {'code': code, 'fields': 'date,code,open,high,low,close,volume,amount,tradestatus',
+                    'start_date': '2026-08-04', 'end_date': '2026-08-07',
+                    'frequency': 'd', 'adjustflag': flag},
+        'error_code': '0', 'error_msg': 'success',
+        'fields': ['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'tradestatus'],
+        'rows': [[day, code, str(c), str(c * 1.01), str(c * .99), str(c), '10043', '1000', '1']
+                 for day, c in zip(dates, closes)],
+    }
+
+
+def test_baostock_pair_retains_native_evidence_and_converts_volume(monkeypatch):
+    module = load_module()
+    calls = []
+
+    def sdk_window(request, *, timeout):
+        calls.append(request)
+        return _baostock_payload('SH510050', request['adjustflag'])
+
+    monkeypatch.setattr(module, '_read_baostock_window', sdk_window)
+    raw, qfq = module.fetch_baostock_pair(
+        'SH510050', {'code': '510050', 'market': 'sh', 'name': 'ETF'},
+        start_date='2026-08-04', end_date='2026-08-07', session=None,
+        request_gate=module.RequestGate(0, 2), retries=1,
+    )
+    assert raw['volume'].tolist() == [100.0] * 4
+    assert raw['native_volume'].tolist() == [10043] * 4
+    assert raw['amount'].tolist() == [1000] * 4
+    assert raw['source'].unique().tolist() == ['baostock.etf_daily_raw']
+    assert qfq['provider_response_key'].unique().tolist() == ['baostock_adjustflag_2']
+    assert [p['adjustflag'] for p in calls] == ['3', '2']
+    assert raw.attrs['source_receipt']['responses'][0]['rows'][0][6] == '10043'
+
+
+@pytest.mark.parametrize('bad', ['symbol', 'duplicate', 'outside', 'halted', 'volume'])
+def test_baostock_pair_rejects_invalid_or_fake_trading_rows(monkeypatch, bad):
+    module = load_module()
+
+    def sdk_window(request, *, timeout):
+        response = _baostock_payload('SH510050', request['adjustflag'])
+        if bad == 'symbol':
+            response['rows'][0][1] = 'sz.159915'
+        if bad == 'duplicate':
+            response['rows'].append(response['rows'][0])
+        if bad == 'outside':
+            response['rows'][0][0] = '2004-01-01'
+        if bad == 'halted':
+            for row in response['rows']:
+                row[8] = '0'
+        if bad == 'volume' and request['adjustflag'] == '2':
+            response['rows'][0][6] = '20000'
+        return response
+
+    monkeypatch.setattr(module, '_read_baostock_window', sdk_window)
+    with pytest.raises(module.CnEtfDownloadError):
+        module.fetch_baostock_pair(
+            'SH510050', {'code': '510050', 'market': 'sh', 'name': 'ETF'},
+            start_date='2026-08-04', end_date='2026-08-07', session=None,
+            request_gate=module.RequestGate(0, 2), retries=1,
+        )
+
+
+def test_baostock_update_replays_receipt_and_preserves_history(monkeypatch, tmp_path):
+    module = load_module()
+    root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    calls = []
+
+    def sdk_window(request, *, timeout):
+        calls.append(request)
+        return _baostock_payload(request['code'][:2].upper() + request['code'][3:], request['adjustflag'])
+
+    monkeypatch.setattr(module, '_read_baostock_window', sdk_window)
+    prepared = module.update_cn_etf_snapshot(
+        quant_data_dir=root, end_date='2026-08-07', provider='baostock', publish=False,
+    )
+    assert len(calls) == 4
+    receipt = next((root / 'cache/cn-etf-incremental').glob('*/SOURCE_RESPONSE.json'))
+    assert json.loads(receipt.read_text())['volume_rule'] == 'floor(shares / 100 + 0.5) to legacy whole lots'
+    new = module.update_cn_etf_snapshot(
+        quant_data_dir=root, end_date='2026-08-07', provider='baostock',
+    )
+    assert len(calls) == 4
+    assert prepared != new
+    for symbol in ['SH510050', 'SZ159915']:
+        before = pd.read_parquet(old / 'raw' / f'{symbol}.parquet')
+        after = pd.read_parquet(new / 'raw' / f'{symbol}.parquet')
+        pd.testing.assert_frame_equal(after.iloc[:3][before.columns].reset_index(drop=True), before)
+        assert after.iloc[-1]['source'].startswith('baostock')
+    assert module.update_cn_etf_snapshot(quant_data_dir=root, end_date='2026-08-07', provider='baostock') == new
+    assert len(calls) == 4
+    # A source response must remain bound even on the cached preparation route.
+    receipt.write_text('{}')
+    with pytest.raises(module.DataContractError):
+        module.update_cn_etf_snapshot(
+            quant_data_dir=root, base_snapshot=old, end_date='2026-08-07',
+            provider='baostock', publish=False,
+        )
+
+
+def test_baostock_sdk_child_bounds_logout_and_returns_exact_request(monkeypatch, tmp_path):
+    module = load_module()
+    # Only the external SDK boundary is replaced; run the actual owned child.
+    (tmp_path / 'baostock.py').write_text('''
+class Result:
+    error_code = '0'
+    error_msg = 'success'
+    fields = ['date', 'code']
+    def next(self): return False
+
+def login(): return Result()
+def query_history_k_data_plus(**kwargs): return Result()
+def logout(): pass
+''')
+    monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+    request = {'code': 'sh.510050'}
+    response = module._read_baostock_window(request, timeout=5)
+    assert response['request'] == request
+    assert response['rows'] == []
+    (tmp_path / 'baostock.py').write_text((tmp_path / 'baostock.py').read_text().replace(
+        'def logout(): pass', 'def logout():\n    import time\n    time.sleep(60)'))
+    import time
+    started = time.monotonic()
+    with pytest.raises(module.CnEtfDownloadError, match='bounded request failed'):
+        module._read_baostock_window(request, timeout=.3)
+    assert time.monotonic() - started < 3
+
+
+def test_baostock_half_lot_matches_legacy_half_up_precision(monkeypatch):
+    module = load_module()
+
+    def sdk_window(request, *, timeout):
+        response = _baostock_payload('SH510050', request['adjustflag'])
+        response['rows'][0][6] = '10050'
+        return response
+
+    monkeypatch.setattr(module, '_read_baostock_window', sdk_window)
+    raw, qfq = module.fetch_baostock_pair(
+        'SH510050', {'code': '510050', 'market': 'sh', 'name': 'ETF'},
+        start_date='2026-08-04', end_date='2026-08-07', session=None,
+        request_gate=module.RequestGate(0, 2), retries=1,
+    )
+    assert raw['native_volume'].iloc[0] == 10050
+    assert raw['volume'].iloc[0] == qfq['volume'].iloc[0] == 101
