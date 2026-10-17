@@ -195,8 +195,8 @@ def test_tencent_history_pages_backwards_until_listing_date() -> None:
     )
 
     assert calls == [
-        "sh510050,day,,2026-08-06,2,qfq",
-        "sh510050,day,,2026-08-04,2,qfq",
+        "sh510050,day,2026-08-04,2026-08-06,2,qfq",
+        "sh510050,day,2026-08-04,2026-08-04,2,qfq",
     ]
     assert result["date"].dt.strftime("%Y-%m-%d").tolist() == [
         "2026-08-04",
@@ -587,6 +587,37 @@ def test_prune_snapshot_history_can_preserve_the_expansion_parent_backup(
     ]
 
 
+def test_prune_snapshot_history_supports_three_immutable_snapshots(tmp_path) -> None:
+    module = load_module()
+    dataset_root = tmp_path / "cn_etf_daily"
+    snapshots = dataset_root / "snapshots"
+    for index in range(4):
+        snapshot_id = f"snapshot-{index}"
+        snapshot = snapshots / snapshot_id
+        snapshot.mkdir(parents=True)
+        (snapshot / "DATASET_MANIFEST.json").write_text(
+            json.dumps(
+                {
+                    "snapshot_id": snapshot_id,
+                    "source_retrieved_at": f"2026-08-0{index + 1}T10:00:00+08:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+    (dataset_root / "LATEST.json").write_text(
+        json.dumps({"snapshot_id": "snapshot-3"}), encoding="utf-8"
+    )
+
+    removed = module.prune_snapshot_history(dataset_root, keep=3)
+
+    assert removed == ["snapshot-0"]
+    assert sorted(path.name for path in snapshots.iterdir()) == [
+        "snapshot-1",
+        "snapshot-2",
+        "snapshot-3",
+    ]
+
+
 def test_prune_snapshot_history_rejects_symlinked_dataset_root(tmp_path) -> None:
     module = load_module()
     external = tmp_path / "external"
@@ -904,7 +935,7 @@ def test_snapshot_file_copies_do_not_share_inode(tmp_path) -> None:
     assert source.read_bytes() == b"snapshot"
 
 
-def test_incremental_update_refreshes_only_the_symbol_with_a_proven_revision(
+def test_incremental_update_rebases_only_the_symbol_with_a_proven_basis_change(
     monkeypatch, tmp_path
 ) -> None:
     module = load_module()
@@ -938,9 +969,12 @@ def test_incremental_update_refreshes_only_the_symbol_with_a_proven_revision(
         generated_at="2026-08-07T11:00:00+08:00",
     )
 
-    assert call_counts == {"SH510050": 2, "SZ159915": 1}
-    manifest = json.loads((updated / "DATASET_MANIFEST.json").read_text(encoding="utf-8"))
-    assert manifest["source"]["targeted_full_refresh_symbols"] == ["SH510050"]
+    assert call_counts == {"SH510050": 1, "SZ159915": 1}
+    manifest = json.loads(
+        (updated / "DATASET_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    assert manifest["source"]["targeted_full_refresh_symbols"] == []
+    assert set(manifest["source"]["historical_qfq_rebases"]) == {"SH510050"}
 
 
 def test_full_rebuild_cli_refuses_without_all_three_confirmations(
@@ -963,6 +997,623 @@ def test_full_rebuild_cli_refuses_without_all_three_confirmations(
 
     assert result == 2
     assert "备份无法恢复" in capsys.readouterr().err
+
+
+def test_incremental_cash_adjustment_rebases_cached_history_without_refetch(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    original = pd.read_parquet(old / "raw/SH510050.parquet")
+    calls = []
+
+    def incoming(symbol, metadata, **kwargs):
+        calls.append((symbol, kwargs["start_date"]))
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        qfq = raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+        if symbol == "SH510050":
+            for field in ("open", "high", "low", "close"):
+                qfq.loc[:2, field] -= 0.1
+        return raw, qfq
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+    assert len(calls) == 2, "a QFQ basis change must not request full history"
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(old / "raw/SH510050.parquet"), original
+    )
+    assert pd.read_parquet(new / "qfq/SH510050.parquet")["close"].round(6).tolist() == [
+        0.9,
+        1.0,
+        1.1,
+        1.3,
+    ]
+    manifest = json.loads((new / "DATASET_MANIFEST.json").read_text())
+    assert manifest["source"]["targeted_full_refresh_symbols"] == []
+    assert manifest["source"]["historical_qfq_rebases"]["SH510050"][
+        "offset"
+    ] == pytest.approx(-0.1)
+
+
+def test_incremental_raw_revision_stops_without_full_history_request(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    calls = []
+
+    def revised(symbol, metadata, **kwargs):
+        calls.append(symbol)
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.05, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", revised)
+    with pytest.raises(module.HistoricalRevisionDetected, match="raw history"):
+        module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+    assert len(calls) == 1
+    assert (
+        module.resolve_dataset(
+            "cn_etf_daily", quant_data_root=root, require_basis="qfq"
+        ).snapshot_path
+        == current
+    )
+
+
+def test_prepared_symbol_update_reuses_downloads_before_full_update(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    pointer = root / "parquet/etf_1d/cn_etf_daily/LATEST.json"
+    original_pointer = pointer.read_bytes()
+    calls = []
+
+    def incoming(symbol, metadata, **kwargs):
+        calls.append(symbol)
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    prepared = module.update_cn_etf_snapshot(
+        quant_data_dir=root,
+        end_date="2026-08-07",
+        base_snapshot=current,
+        symbols=["SH510050"],
+        publish=False,
+    )
+    assert pointer.read_bytes() == original_pointer
+    assert pd.read_parquet(prepared / "qfq/SH510050.parquet")["close"].tolist() == [
+        1.0,
+        1.1,
+        1.2,
+        1.3,
+    ]
+    new = module.update_cn_etf_snapshot(
+        quant_data_dir=root, end_date="2026-08-07", base_snapshot=current
+    )
+    assert calls == ["SH510050", "SZ159915"]
+    assert pd.read_parquet(new / "ETF_UNIVERSE.parquet")["symbol"].tolist() == [
+        "SH510050",
+        "SZ159915",
+    ]
+
+
+def test_incremental_rejects_inconsistent_qfq_rebase() -> None:
+    module = load_module()
+    old = paired_frame(
+        "SH510050",
+        name="ETF",
+        source=module.TENCENT_RAW_SOURCE_NAME,
+        closes=[1.0, 1.1, 1.2],
+    )
+    new = paired_frame(
+        "SH510050",
+        name="ETF",
+        source=module.TENCENT_RAW_SOURCE_NAME,
+        closes=[1.0, 1.1, 1.2, 1.3],
+        dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+    )
+    bad = new.copy()
+    bad.loc[0, "close"] -= 0.1
+    with pytest.raises(module.HistoricalRevisionDetected):
+        module.merge_incremental_pair("SH510050", old, old.copy(), new, bad)
+
+
+def test_incremental_scale_and_cash_rebase_preserves_volume() -> None:
+    module = load_module()
+    old = paired_frame(
+        "SH510050",
+        name="ETF",
+        source=module.TENCENT_RAW_SOURCE_NAME,
+        closes=[1.0, 1.1, 1.2],
+    )
+    new = paired_frame(
+        "SH510050",
+        name="ETF",
+        source=module.TENCENT_RAW_SOURCE_NAME,
+        closes=[1.0, 1.1, 1.2, 1.3],
+        dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+    )
+    adjusted = new.copy()
+    for field in ("open", "high", "low", "close"):
+        adjusted.loc[:2, field] = adjusted.loc[:2, field] * 0.5 - 0.1
+    raw, qfq, count = module.merge_incremental_pair(
+        "SH510050", old, old.copy(), new, adjusted
+    )
+    assert count == 1
+    assert qfq["close"].round(6).tolist() == [0.4, 0.45, 0.5, 1.3]
+    assert qfq["volume"].tolist() == raw["volume"].tolist()
+
+
+def test_incremental_prepared_cache_tampering_is_rejected(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+
+    def incoming(symbol, metadata, **kwargs):
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    module.update_cn_etf_snapshot(
+        quant_data_dir=root,
+        end_date="2026-08-07",
+        base_snapshot=current,
+        symbols=["SH510050"],
+        publish=False,
+    )
+    raw_path = next((root / "cache/cn-etf-incremental").glob("*/raw/SH510050.parquet"))
+    changed = pd.read_parquet(raw_path)
+    changed.loc[0, "close"] = 99.0
+    changed.to_parquet(raw_path, index=False)
+    monkeypatch.setattr(
+        module,
+        "fetch_tencent_pair",
+        lambda *a, **kw: pytest.fail(
+            "tampering must not trigger a replacement download"
+        ),
+    )
+    with pytest.raises(module.DataContractError, match="cache changed"):
+        module.update_cn_etf_snapshot(
+            quant_data_dir=root,
+            end_date="2026-08-07",
+            base_snapshot=current,
+            symbols=["SH510050"],
+            publish=False,
+        )
+
+
+def test_explicit_failure_isolation_keeps_old_symbol_and_updates_healthy_one(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    old_bytes = (old / "raw/SH510050.parquet").read_bytes()
+
+    def incoming(symbol, metadata, **kwargs):
+        if symbol == "SH510050":
+            raise module.CnEtfDownloadError("no current rows from the supplier")
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    new = module.update_cn_etf_snapshot(
+        quant_data_dir=root, end_date="2026-08-07", keep_failed_history=True
+    )
+    assert (new / "raw/SH510050.parquet").read_bytes() == old_bytes
+    assert len(pd.read_parquet(new / "qfq/SZ159915.parquet")) == 4
+    m = json.loads((new / "DATASET_MANIFEST.json").read_text())
+    assert set(m["source"]["symbol_update_failures"]) == {"SH510050"}
+    assert (
+        m["source"]["symbol_update_failures"]["SH510050"]["last_verified_date"]
+        == "2026-08-06"
+    )
+
+
+def test_incremental_publication_does_not_rescan_unrelated_data(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+
+    def incoming(symbol, metadata, **kwargs):
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    def unrelated_scan(*args, **kwargs):
+        pytest.fail(
+            "targeted ETF publication must not scan PIT, Qlib, or the project service"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    monkeypatch.setattr(module, "_sync_root_manifest", unrelated_scan)
+    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+    assert (
+        module.resolve_dataset(
+            "cn_etf_daily", quant_data_root=root, require_basis="qfq"
+        ).snapshot_path
+        == new
+    )
+
+
+def test_eastmoney_pair_is_bounded_and_retains_amount() -> None:
+    module = load_module()
+    import requests
+
+    calls = []
+
+    class Session:
+        def get(self, url, *, params, timeout):
+            calls.append(dict(params))
+            qfq = params["fqt"] == "1"
+            first = (
+                "2026-08-06,1.1,1.1,1.2,1.0,10,1200,0,0,0,0"
+                if qfq
+                else "2026-08-06,1.2,1.2,1.3,1.1,10,1200,0,0,0,0"
+            )
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(
+                {
+                    "rc": 0,
+                    "data": {
+                        "klines": [first, "2026-08-07,1.3,1.3,1.4,1.2,11,1300,0,0,0,0"]
+                    },
+                }
+            ).encode()
+            return response
+
+    raw, qfq = module.fetch_eastmoney_pair(
+        "SH510050",
+        {"code": "510050", "market": "sh", "name": "ETF"},
+        start_date="2026-08-06",
+        end_date="2026-08-07",
+        session=Session(),
+        request_gate=module.RequestGate(0, 4),
+        retries=1,
+        timeout=1,
+    )
+    assert raw["close"].tolist() == [1.2, 1.3]
+    assert qfq["close"].tolist() == [1.1, 1.3]
+    assert raw["amount"].tolist() == [1200, 1300]
+    assert len(calls) == 2
+    assert all(c["beg"] == "20260806" and c["end"] == "20260807" for c in calls)
+    assert [c["fqt"] for c in calls] == ["0", "1"]
+
+
+def test_eastmoney_update_preserves_history_and_source_then_replays_without_network(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    import requests
+
+    calls = []
+
+    class Session:
+        def get(self, url, *, params, timeout):
+            calls.append(dict(params))
+            rows = [
+                "2026-08-04,1,1,1.01,0.99,100,1000,0,0,0,0",
+                "2026-08-05,1.1,1.1,1.111,1.089,100,1100,0,0,0,0",
+                "2026-08-06,1.2,1.2,1.212,1.188,100,1200,0,0,0,0",
+                "2026-08-07,1.3,1.3,1.313,1.287,100,1300,0,0,0,0",
+            ]
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps({"rc": 0, "data": {"klines": rows}}).encode()
+            return response
+
+        def close(self):
+            pass
+
+    # The frozen fixture's volume is supplied literally by paired_frame.
+    old_volume = pd.read_parquet(old / "raw/SH510050.parquet")["volume"].iloc[0]
+    assert old_volume == 100
+    monkeypatch.setattr(requests, "Session", Session)
+    new = module.update_cn_etf_snapshot(
+        quant_data_dir=root, end_date="2026-08-07", provider="eastmoney"
+    )
+    frame = pd.read_parquet(new / "raw/SH510050.parquet")
+    assert frame["close"].tolist() == [1, 1.1, 1.2, 1.3]
+    assert frame.iloc[-1]["source"].startswith("eastmoney")
+    assert frame.iloc[-1]["source_id"].startswith("eastmoney:")
+    m = json.loads((new / "DATASET_MANIFEST.json").read_text())
+    assert m["source"]["increment_provider"] == "eastmoney"
+    assert (
+        module.update_cn_etf_snapshot(
+            quant_data_dir=root, end_date="2026-08-07", provider="eastmoney"
+        )
+        == new
+    )
+    assert len(calls) == 4
+
+
+def test_eastmoney_empty_pair_is_not_accepted() -> None:
+    module = load_module()
+    import requests
+
+    class Session:
+        def get(self, url, **kwargs):
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b'{"rc":0,"data":{"klines":[]}}'
+            return response
+
+    with pytest.raises(module.CnEtfDownloadError):
+        module.fetch_eastmoney_pair(
+            "SH510050",
+            {"code": "510050", "market": "sh", "name": "ETF"},
+            start_date="2026-08-06",
+            end_date="2026-08-07",
+            session=Session(),
+            request_gate=module.RequestGate(0, 2),
+            retries=1,
+            timeout=1,
+        )
+
+
+def test_incomplete_increment_is_not_saved_as_complete(monkeypatch, tmp_path) -> None:
+    module = load_module()
+    raw = paired_frame("SH510050", name="ETF", source="tencent", closes=[1, 1.1, 1.2])
+    monkeypatch.setattr(
+        module, "fetch_tencent_pair", lambda *args, **kwargs: (raw, raw.copy())
+    )
+    with pytest.raises(module.CnEtfDownloadError, match="before requested"):
+        module._cached_incremental_pair(
+            tmp_path,
+            "SH510050",
+            {"code": "510050", "market": "sh", "name": "ETF"},
+            base_manifest_sha256="a" * 64,
+            start_date="2026-08-04",
+            end_date="2026-08-07",
+            session=object(),
+            request_gate=module.RequestGate(0, 2),
+            retries=1,
+            timeout=1,
+        )
+    assert not list(tmp_path.rglob("COMPLETE.json"))
+
+
+def test_eastmoney_cleanup_cannot_replace_cancellation() -> None:
+    module = load_module()
+    import requests
+
+    class Response(requests.Response):
+        def json(self, **kwargs):
+            raise KeyboardInterrupt("cancelled while reading")
+
+        def close(self):
+            raise OSError("close failed")
+
+    class Session:
+        def get(self, *args, **kwargs):
+            response = Response()
+            response.status_code = 200
+            return response
+
+    with pytest.raises(KeyboardInterrupt, match="cancelled while reading") as caught:
+        module.fetch_eastmoney_pair(
+            "SH510050",
+            {"code": "510050", "market": "sh", "name": "ETF"},
+            start_date="2026-08-06",
+            end_date="2026-08-07",
+            session=Session(),
+            request_gate=module.RequestGate(0, 2),
+            retries=2,
+            timeout=1,
+        )
+    assert "close failed" in caught.value.__notes__[0]
+
+
+@pytest.mark.parametrize("status,expected_calls", [(501, 1), (503, 2)])
+def test_tencent_retries_only_transient_http_failures(status, expected_calls) -> None:
+    module = load_module()
+    import requests
+
+    calls = []
+
+    class Session:
+        def get(self, *args, **kwargs):
+            calls.append(kwargs)
+            response = requests.Response()
+            response.status_code = status
+            response._content = b"supplier unavailable"
+            return response
+
+    with pytest.raises(module.CnEtfDownloadError):
+        module.fetch_tencent_pair(
+            "SH510050",
+            {"code": "510050", "market": "sh", "name": "ETF"},
+            start_date="2026-08-06",
+            end_date="2026-08-07",
+            session=Session(),
+            request_gate=module.RequestGate(0, 4),
+            retries=2,
+            timeout=1,
+        )
+    assert len(calls) == expected_calls
+
+
+def test_symbol_scoped_preparation_cannot_publish_full_dataset(
+    monkeypatch, tmp_path
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        module,
+        "fetch_tencent_pair",
+        lambda *a, **kw: pytest.fail("scope check must precede acquisition"),
+    )
+    with pytest.raises(ValueError, match="symbol-scoped"):
+        module.update_cn_etf_snapshot(
+            quant_data_dir=root,
+            end_date="2026-08-07",
+            base_snapshot=current,
+            symbols=["SH510050"],
+        )
+
+
+def test_tencent_incremental_http_request_has_explicit_start_boundary() -> None:
+    module = load_module()
+    seen = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "code": 0,
+                "data": {
+                    "sh510050": {"day": [["2026-08-07", "1", "1", "1", "1", "10"]]}
+                },
+            }
+
+    class Session:
+        def get(self, url, *, params, timeout):
+            seen.append(params["param"])
+            return Response()
+
+    frame = module.fetch_tencent_history(
+        "SH510050",
+        {"code": "510050", "market": "sh", "name": "ETF"},
+        adjustment="raw",
+        start_date="2026-08-07",
+        end_date="2026-08-07",
+        session=Session(),
+        request_gate=module.RequestGate(0, 2),
+        page_size=64,
+        retries=1,
+    )
+    assert len(frame) == 1
+    assert seen == ["sh510050,day,2026-08-07,2026-08-07,64"]
+
+
+@pytest.mark.parametrize("metadata_only_symbol", [False, True])
+def test_tickflow_history_can_receive_tencent_increment_without_relabeling(
+    monkeypatch, tmp_path, metadata_only_symbol
+) -> None:
+    module = load_module()
+    root, current = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    old_manifest = json.loads((current / "DATASET_MANIFEST.json").read_text())
+    frozen = current.parent / "frozen-tickflow-base"
+    frozen.mkdir()
+    for sym in ["SH510050", "SZ159915"]:
+        for kind in ["raw", "qfq"]:
+            f = pd.read_parquet(current / kind / f"{sym}.parquet")
+            f = f[["date", "open", "high", "low", "close", "volume"]]
+            module._atomic_parquet(f, frozen / kind / f"{sym}.parquet")
+        module._link_or_copy(
+            current / "factors" / f"{sym}.parquet",
+            frozen / "factors" / f"{sym}.parquet",
+        )
+    module._link_or_copy(
+        current / "ETF_UNIVERSE.parquet", frozen / "ETF_UNIVERSE.parquet"
+    )
+    if metadata_only_symbol:
+        universe = pd.read_parquet(frozen / "ETF_UNIVERSE.parquet")
+        extra = universe.iloc[[0]].assign(symbol="SH510099", code="510099")
+        module._atomic_parquet(
+            pd.concat([universe, extra], ignore_index=True),
+            frozen / "ETF_UNIVERSE.parquet",
+        )
+    module._link_or_copy(
+        current / "corporate_actions.parquet", frozen / "corporate_actions.parquet"
+    )
+    module.finalize_paired_price_snapshot(
+        frozen,
+        dataset_id="cn_etf_daily",
+        snapshot_id=frozen.name,
+        role="canonical",
+        status="ready",
+        source={"provider": "tickflow"},
+        adjustment=old_manifest["adjustment"],
+        producer=old_manifest["producer"],
+        source_retrieved_at=old_manifest["source_retrieved_at"],
+    )
+
+    def incoming(symbol, metadata, **kwargs):
+        raw = paired_frame(
+            symbol,
+            name=metadata["name"],
+            source=module.TENCENT_RAW_SOURCE_NAME,
+            closes=[1.0, 1.1, 1.2, 1.3],
+            dates=["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"],
+        )
+        return raw, raw.assign(
+            source=module.TENCENT_ADJUSTED_SOURCE_NAME, provider_response_key="qfqday"
+        )
+
+    monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
+    new = module.update_cn_etf_snapshot(
+        quant_data_dir=root, base_snapshot=frozen, end_date="2026-08-07"
+    )
+    raw = pd.read_parquet(new / "raw/SH510050.parquet")
+    assert raw["close"].tolist() == [1.0, 1.1, 1.2, 1.3]
+    assert raw.iloc[0]["source"] == "tickflow"
+    assert raw.iloc[0]["source_id"].startswith("tickflow:")
+    assert raw.iloc[-1]["source"] == module.TENCENT_RAW_SOURCE_NAME
+    assert raw["source_id"].notna().all()
+    new_manifest = json.loads((new / "DATASET_MANIFEST.json").read_text())
+    assert new_manifest["source"]["retained_history_provider"] == "tickflow"
+    assert set(pd.read_parquet(new / "ETF_UNIVERSE.parquet")["symbol"]) == {
+        "SH510050",
+        "SZ159915",
+    }
+    if metadata_only_symbol:
+        assert new_manifest["source"]["metadata_only_symbols_without_history"] == [
+            "SH510099"
+        ]
 
 
 def test_full_rebuild_function_refuses_without_all_three_confirmations() -> None:
@@ -993,7 +1644,9 @@ def _representative_catalog_row(
     }
 
 
-def test_representative_selection_reaches_200_and_preserves_every_existing_symbol() -> None:
+def test_representative_selection_reaches_200_and_preserves_every_existing_symbol() -> (
+    None
+):
     module = load_module()
     targets = module.REPRESENTATIVE_CATEGORY_TARGETS
     prefixes = {
@@ -1036,36 +1689,24 @@ def test_representative_selection_reaches_200_and_preserves_every_existing_symbo
     )
 
     assert len(selected) == 200
-    assert set(row["symbol"] for row in existing_rows).issubset(
-        set(selected["symbol"])
-    )
+    assert set(row["symbol"] for row in existing_rows).issubset(set(selected["symbol"]))
     assert selected["representative_category"].value_counts().to_dict() == targets
     existing_symbols = {str(row["symbol"]) for row in existing_rows}
     assert set(
-        selected.loc[
-            selected["symbol"].isin(existing_symbols), "selection_reason"
-        ]
+        selected.loc[selected["symbol"].isin(existing_symbols), "selection_reason"]
     ) == {"existing_snapshot"}
 
 
 def test_representative_selection_does_not_add_a_duplicate_tracking_target() -> None:
     module = load_module()
     current = pd.DataFrame(
-        [
-            _representative_catalog_row(
-                module, "512480", "半导体ETF华夏", 100.0
-            )
-        ]
+        [_representative_catalog_row(module, "512480", "半导体ETF华夏", 100.0)]
     )
     catalog = pd.DataFrame(
         [
             *current.to_dict(orient="records"),
-            _representative_catalog_row(
-                module, "159995", "半导体ETF国泰", 1_000.0
-            ),
-            _representative_catalog_row(
-                module, "588200", "科创芯片ETF嘉实", 900.0
-            ),
+            _representative_catalog_row(module, "159995", "半导体ETF国泰", 1_000.0),
+            _representative_catalog_row(module, "588200", "科创芯片ETF嘉实", 900.0),
         ]
     )
 
@@ -1084,11 +1725,7 @@ def test_representative_selection_does_not_add_a_duplicate_tracking_target() -> 
 def test_representative_selection_keeps_an_explicit_duplicate_tracking_target() -> None:
     module = load_module()
     current = pd.DataFrame(
-        [
-            _representative_catalog_row(
-                module, "159516", "半导体设备ETF国泰", 100.0
-            )
-        ]
+        [_representative_catalog_row(module, "159516", "半导体设备ETF国泰", 100.0)]
     )
     catalog = pd.DataFrame(
         [
@@ -1144,7 +1781,9 @@ def test_representative_selection_defaults_missing_optional_catalog_columns() ->
 def test_representative_default_quotas_only_support_the_registered_200_size() -> None:
     module = load_module()
 
-    with pytest.raises(ValueError, match="default representative quotas support target_size=200"):
+    with pytest.raises(
+        ValueError, match="default representative quotas support target_size=200"
+    ):
         module.select_representative_universe(
             pd.DataFrame(),
             pd.DataFrame(),
@@ -1192,12 +1831,8 @@ def test_expand_universe_downloads_only_new_symbols_and_preserves_old_hashes(
     current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
     additions = pd.DataFrame(
         [
-            _representative_catalog_row(
-                module, "512480", "半导体ETF华夏", 900.0
-            ),
-            _representative_catalog_row(
-                module, "588200", "科创芯片ETF嘉实", 800.0
-            ),
+            _representative_catalog_row(module, "512480", "半导体ETF华夏", 900.0),
+            _representative_catalog_row(module, "588200", "科创芯片ETF嘉实", 800.0),
         ]
     )
     catalog = pd.concat([current_universe, additions], ignore_index=True)
@@ -1257,11 +1892,11 @@ def test_expand_universe_downloads_only_new_symbols_and_preserves_old_hashes(
     )
     for component, hashes in old_hashes.items():
         for symbol, digest in hashes.items():
-            assert module.sha256_file(expanded / component / f"{symbol}.parquet") == digest
+            assert (
+                module.sha256_file(expanded / component / f"{symbol}.parquet") == digest
+            )
     manifest = json.loads((expanded / "DATASET_MANIFEST.json").read_text())
-    universe_manifest = json.loads(
-        (expanded / "UNIVERSE_MANIFEST.json").read_text()
-    )
+    universe_manifest = json.loads((expanded / "UNIVERSE_MANIFEST.json").read_text())
     assert manifest["source"]["update_mode"] == "universe_expansion"
     assert manifest["source"]["parent_snapshot_id"] == current.name
     assert manifest["source"]["retained_symbol_count"] == 2
@@ -1279,12 +1914,8 @@ def test_expand_universe_failure_keeps_latest_pointer_unchanged(
     current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
     additions = pd.DataFrame(
         [
-            _representative_catalog_row(
-                module, "512480", "半导体ETF华夏", 900.0
-            ),
-            _representative_catalog_row(
-                module, "588200", "科创芯片ETF嘉实", 800.0
-            ),
+            _representative_catalog_row(module, "512480", "半导体ETF华夏", 900.0),
+            _representative_catalog_row(module, "588200", "科创芯片ETF嘉实", 800.0),
         ]
     )
     catalog = pd.concat([current_universe, additions], ignore_index=True)
@@ -1337,15 +1968,9 @@ def test_revised_expansion_reuses_prior_contract_cache_and_downloads_only_replac
     current_universe = pd.read_parquet(current / "ETF_UNIVERSE.parquet")
     candidates = pd.DataFrame(
         [
-            _representative_catalog_row(
-                module, "512480", "半导体ETF华夏", 900.0
-            ),
-            _representative_catalog_row(
-                module, "588200", "科创芯片ETF嘉实", 800.0
-            ),
-            _representative_catalog_row(
-                module, "515880", "通信ETF国泰", 700.0
-            ),
+            _representative_catalog_row(module, "512480", "半导体ETF华夏", 900.0),
+            _representative_catalog_row(module, "588200", "科创芯片ETF嘉实", 800.0),
+            _representative_catalog_row(module, "515880", "通信ETF国泰", 700.0),
         ]
     )
     catalog = pd.concat([current_universe, candidates], ignore_index=True)
@@ -1428,7 +2053,7 @@ def test_revised_expansion_reuses_prior_contract_cache_and_downloads_only_replac
     assert manifest["source"]["reused_prior_contract_symbol_count"] == 1
 
 
-def test_metadata_reissue_keeps_the_original_51_style_parent_as_the_only_backup(
+def test_metadata_reissue_keeps_the_original_51_style_parent_in_immutable_history(
     monkeypatch, tmp_path
 ) -> None:
     module = load_module()
@@ -1436,12 +2061,8 @@ def test_metadata_reissue_keeps_the_original_51_style_parent_as_the_only_backup(
     current_universe = pd.read_parquet(parent / "ETF_UNIVERSE.parquet")
     additions = pd.DataFrame(
         [
-            _representative_catalog_row(
-                module, "512480", "半导体ETF华夏", 900.0
-            ),
-            _representative_catalog_row(
-                module, "588200", "科创芯片ETF嘉实", 800.0
-            ),
+            _representative_catalog_row(module, "512480", "半导体ETF华夏", 900.0),
+            _representative_catalog_row(module, "588200", "科创芯片ETF嘉实", 800.0),
         ]
     )
     catalog = pd.concat([current_universe, additions], ignore_index=True)
@@ -1485,14 +2106,13 @@ def test_metadata_reissue_keeps_the_original_51_style_parent_as_the_only_backup(
     snapshots = corrected.parents[1] / "snapshots"
     assert {path.name for path in snapshots.iterdir()} == {
         parent.name,
+        expanded.name,
         corrected.name,
     }
     pointer = json.loads((corrected.parents[1] / "LATEST.json").read_text())
     assert pointer["published_at"] == "2026-08-07T12:30:00+08:00"
     manifest = json.loads((corrected / "DATASET_MANIFEST.json").read_text())
-    universe_manifest = json.loads(
-        (corrected / "UNIVERSE_MANIFEST.json").read_text()
-    )
+    universe_manifest = json.loads((corrected / "UNIVERSE_MANIFEST.json").read_text())
     assert manifest["source"]["parent_snapshot_id"] == parent.name
     assert manifest["source"]["metadata_correction_of_snapshot_id"] == expanded.name
     assert manifest["source"]["universe_sha256"] == universe_manifest["universe_sha256"]

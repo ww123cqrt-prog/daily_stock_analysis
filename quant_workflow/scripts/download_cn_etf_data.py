@@ -43,6 +43,7 @@ from quant_data_contract import (  # noqa: E402
     publish_snapshot_group,
     resolve_dataset,
     sha256_file,
+    validate_dataset_snapshot,
 )
 
 
@@ -52,10 +53,11 @@ DEFAULT_PAGE_SIZE = 640
 DEFAULT_LIMIT = 51
 DEFAULT_REQUEST_INTERVAL = 0.3
 DEFAULT_REQUEST_BUDGET = 5_000
-DEFAULT_INCREMENTAL_REQUEST_BUDGET = 250
+DEFAULT_INCREMENTAL_REQUEST_BUDGET = 5_000
 DEFAULT_INCREMENTAL_PAGE_SIZE = 64
 DEFAULT_REQUIRED_CODES = ("512890", "513010", "510720", "159915", "513100")
-DEFAULT_SNAPSHOT_RETENTION = 2
+DEFAULT_SNAPSHOT_RETENTION = 3
+SNAPSHOT_RETENTION_POLICY = "immutable_history"
 DEFAULT_INCREMENTAL_OVERLAP_DAYS = 14
 DEFAULT_REPRESENTATIVE_TARGET_SIZE = 200
 DEFAULT_MINIMUM_HISTORY_ROWS = 60
@@ -134,7 +136,7 @@ class CnEtfDownloadError(RuntimeError):
 
 
 class HistoricalRevisionDetected(CnEtfDownloadError):
-    """A bounded overlap proves one symbol needs a targeted history refresh."""
+    """A bounded overlap cannot safely reuse the frozen history."""
 
 
 @dataclass
@@ -710,6 +712,8 @@ def _request_tencent_page(
             return rows, selected_key
         except Exception as exc:
             last_error = exc
+            if getattr(getattr(exc, 'response', None), 'status_code', None) in {400, 401, 403, 404, 501}:
+                break
             if attempt + 1 < retries:
                 time.sleep(float(attempt + 1))
     raise CnEtfDownloadError(
@@ -750,7 +754,10 @@ def fetch_tencent_history(
     response_keys_seen: set[str] = set()
     previous_oldest: pd.Timestamp | None = None
     for _page in range(32):
-        param = f"{ticker},day,,{page_end.date().isoformat()},{page_size}{suffix}"
+        param = (
+            f"{ticker},day,{start.date().isoformat()},"
+            f"{page_end.date().isoformat()},{page_size}{suffix}"
+        )
         rows, response_key_used = _request_tencent_page(
             session=session,
             request_gate=request_gate,
@@ -846,6 +853,84 @@ def fetch_tencent_pair(
         timeout=timeout,
     )
     build_paired_adjustments(symbol, raw, qfq)
+    return raw, qfq
+
+
+def fetch_eastmoney_pair(
+    symbol: str, metadata: dict[str, str], *, start_date: str, end_date: str,
+    session: Any, request_gate: RequestGate,
+    page_size: int = DEFAULT_INCREMENTAL_PAGE_SIZE,
+    retries: int = 2, timeout: float = 20.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read a bounded raw/QFQ window from the legacy EastMoney endpoint."""
+    start, end = _as_date(start_date), _as_date(end_date)
+    limit = max(page_size, len(pd.bdate_range(start, end)))
+    if start > end or limit > 640:
+        raise CnEtfDownloadError("EastMoney incremental window exceeds its bounded limit")
+    frames = []
+    for fqt, kind in (("0", "raw"), ("1", "qfq")):
+        params = {
+            "secid": ("1." if symbol.startswith("SH") else "0.") + metadata["code"],
+            "klt": "101", "fqt": fqt, "beg": start.strftime("%Y%m%d"),
+            "end": end.strftime("%Y%m%d"), "lmt": str(limit),
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        }
+        last_error = None
+        for attempt in range(retries):
+            response = None
+            try:
+                try:
+                    response = request_gate.call(
+                        session.get, "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                        params=params, timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                finally:
+                    if response is not None:
+                        primary = sys.exc_info()[1]
+                        try:
+                            response.close()
+                        except Exception as cleanup:
+                            if primary is None:
+                                raise
+                            primary.add_note(f"response cleanup failed: {cleanup}")
+                data = payload.get("data") or {}
+                rows = data.get("klines")
+                if payload.get("rc") != 0 or not rows:
+                    raise CnEtfDownloadError(f"no EastMoney {kind} rows for {symbol}")
+                if data.get("code", metadata["code"]) != metadata["code"]:
+                    raise CnEtfDownloadError(f"EastMoney symbol differs for {symbol}")
+                values = [row.split(",") for row in rows]
+                frame = pd.DataFrame(values, columns=[
+                    "date", "open", "close", "high", "low", "volume", "amount",
+                    "amplitude", "pctChg", "change", "turnover",
+                ])[['date', 'open', 'high', 'low', 'close', 'volume', 'amount']]
+                frame["date"] = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
+                if (frame["date"].duplicated().any()
+                        or not frame["date"].between(start, end).all()):
+                    raise CnEtfDownloadError(f"EastMoney dates are invalid for {symbol}")
+                for field in ("open", "high", "low", "close", "volume", "amount"):
+                    frame[field] = pd.to_numeric(frame[field], errors="raise")
+                frame.insert(0, "symbol", symbol)
+                frame.insert(1, "name", metadata["name"])
+                frame["source"] = f"eastmoney.etf_daily_{kind}"
+                if kind == "qfq":
+                    frame["adjustment"] = "qfq"
+                    frame["provider_response_key"] = "eastmoney_fqt_1"
+                frames.append(frame.sort_values("date", kind="stable").reset_index(drop=True))
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < retries:
+                    time.sleep(float(attempt + 1))
+        else:
+            raise CnEtfDownloadError(f"EastMoney {kind} request failed for {symbol}: {last_error}") from last_error
+    raw, qfq = frames
+    build_paired_adjustments(symbol, raw, qfq)
+    if not np.array_equal(raw["volume"].to_numpy(), qfq["volume"].to_numpy()):
+        raise CnEtfDownloadError(f"EastMoney raw/qfq volume differs for {symbol}")
     return raw, qfq
 
 
@@ -1273,7 +1358,7 @@ def merge_incremental_pair(
     incoming_raw: pd.DataFrame,
     incoming_qfq: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, int]:
-    """Append a bounded provider pair after proving its overlap is unchanged."""
+    """Keep raw history and align an affine QFQ basis using a bounded overlap."""
 
     old_raw = _normalize_component_frame(
         current_raw, symbol=symbol, component="current raw"
@@ -1303,10 +1388,35 @@ def merge_incremental_pair(
         raise HistoricalRevisionDetected(
             f"provider revised raw history for {symbol}"
         )
+    rebase = None
     if not _overlap_values_match(old_qfq, new_qfq, overlap):
-        raise HistoricalRevisionDetected(
-            f"provider revised qfq history for {symbol}"
-        )
+        if len(overlap) < 2 or old_dates.max() not in overlap:
+            raise HistoricalRevisionDetected(f"insufficient qfq overlap for {symbol}")
+        fields = ("open", "high", "low", "close")
+        values = old_qfq.set_index("date").loc[overlap, fields].to_numpy(dtype=float).ravel()
+        targets = new_qfq.set_index("date").loc[overlap, fields].to_numpy(dtype=float).ravel()
+        candidates = [(1.0, float(np.median(targets - values)), "offset"),
+                      (float(np.median(targets / values)), 0.0, "scale")]
+        if np.isfinite(values).all() and float(np.ptp(values)) > 1e-9:
+            scale, offset = np.linalg.lstsq(np.column_stack([values, np.ones(len(values))]), targets, rcond=None)[0]
+            candidates.append((float(scale), float(offset), "affine"))
+        for scale, offset, method in candidates:
+            error = float(np.max(np.abs(targets - (values * scale + offset))))
+            if (np.isfinite(scale) and np.isfinite(offset) and scale > 0
+                    and np.isfinite(error) and error <= AFFINE_RESIDUAL_TOLERANCE):
+                rebase = {"scale": scale, "offset": offset, "method": method,
+                          "overlap_start": overlap.min().date().isoformat(),
+                          "overlap_end": overlap.max().date().isoformat(),
+                          "overlap_sessions": len(overlap), "max_ohlc_residual": error}
+                break
+        if rebase is None:
+            raise HistoricalRevisionDetected(f"provider revised qfq history nonuniformly for {symbol}")
+        old_qfq = old_qfq.copy()
+        for field in fields:
+            old_qfq[field] = pd.to_numeric(old_qfq[field]) * rebase["scale"] + rebase["offset"]
+        rebased = old_qfq[list(fields)].to_numpy(dtype=float)
+        if not np.isfinite(rebased).all() or (rebased <= 0).any():
+            raise HistoricalRevisionDetected(f"qfq rebase produces invalid historical prices for {symbol}")
 
     old_end = old_dates.max()
     append_raw = new_raw.loc[new_raw["date"] > old_end]
@@ -1314,10 +1424,67 @@ def merge_incremental_pair(
     if append_raw["date"].tolist() != append_qfq["date"].tolist():
         raise DataContractError(f"incremental raw/qfq additions differ for {symbol}")
     if append_raw.empty:
+        if rebase:
+            old_qfq.attrs["historical_rebase"] = rebase
         return old_raw, old_qfq, 0
     combined_raw = pd.concat([old_raw, append_raw], ignore_index=True)
     combined_qfq = pd.concat([old_qfq, append_qfq], ignore_index=True)
+    if rebase:
+        combined_qfq.attrs["historical_rebase"] = rebase
     return combined_raw, combined_qfq, int(len(append_raw))
+
+
+def _cached_incremental_pair(
+    cache: Path, symbol: str, metadata: dict[str, str], *,
+    base_manifest_sha256: str, start_date: str, end_date: str,
+    session: Any, request_gate: RequestGate, retries: int, timeout: float,
+    provider: str = "tencent",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Retain a verified bounded acquisition across preparation and publication."""
+    identity = {"base_manifest_sha256": base_manifest_sha256, "symbol": symbol,
+                "metadata": metadata, "start": start_date, "end": end_date,
+                "provider": provider, "rules": "affine-bounded-increment-v1"}
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    folder = cache / key
+    marker = folder / "COMPLETE.json"
+    paths = {kind: folder / kind / f"{symbol}.parquet" for kind in ("raw", "qfq", "factors")}
+
+    def attributed(raw: pd.DataFrame, qfq: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        for kind, frame in (("raw", raw), ("qfq", qfq)):
+            source_id = f"{provider}:normalized-{kind}:{sha256_file(paths[kind])}"
+            if "source_id" not in frame:
+                frame["source_id"] = source_id
+            else:
+                frame["source_id"] = frame["source_id"].fillna(source_id)
+        return raw, qfq
+    if marker.is_file():
+        try:
+            complete = json.loads(marker.read_text())
+            if complete["identity"] != identity or any(
+                not path.is_file() or sha256_file(path) != complete["sha256"][kind]
+                for kind, path in paths.items()
+            ) or not _cache_symbol_complete(folder, symbol):
+                raise DataContractError(f"incremental cache changed for {symbol}")
+            return attributed(pd.read_parquet(paths["raw"]), pd.read_parquet(paths["qfq"]))
+        except (OSError, ValueError, KeyError) as exc:
+            raise DataContractError(f"incremental cache is invalid for {symbol}") from exc
+    try:
+        fetch_pair = fetch_tencent_pair if provider == "tencent" else fetch_eastmoney_pair
+        raw, qfq = fetch_pair(
+            symbol, metadata, start_date=start_date, end_date=end_date, session=session,
+            request_gate=request_gate, page_size=DEFAULT_INCREMENTAL_PAGE_SIZE,
+            retries=retries, timeout=timeout,
+        )
+        if _as_date(raw["date"].max()) < _as_date(end_date):
+            raise CnEtfDownloadError(f"{provider} response for {symbol} ends at {raw['date'].max()}, before requested {end_date}")
+        factors = build_paired_adjustments(symbol, raw, qfq)
+    except DataContractError as exc:
+        raise CnEtfDownloadError(f"incoming raw/qfq pair is invalid for {symbol}: {exc}") from exc
+    for kind, frame in (("raw", raw), ("qfq", qfq), ("factors", factors)):
+        _atomic_parquet(frame, paths[kind])
+    atomic_write_json(marker, {"identity": identity,
+                              "sha256": {kind: sha256_file(path) for kind, path in paths.items()}})
+    return attributed(raw, qfq)
 
 
 def _link_or_copy(source: Path, destination: Path) -> None:
@@ -1351,10 +1518,10 @@ def prune_snapshot_history(
     keep: int = DEFAULT_SNAPSHOT_RETENTION,
     preferred_backup_snapshot_id: str | None = None,
 ) -> list[str]:
-    """Keep the current complete snapshot and at most one previous snapshot."""
+    """Keep the current complete snapshot and a configurable immutable history."""
 
-    if keep < 1 or keep > 2:
-        raise ValueError("ETF snapshot retention must be 1 or 2")
+    if keep < 1:
+        raise ValueError("ETF snapshot retention must be at least 1")
     dataset_root = Path(dataset_root).expanduser()
     if dataset_root.is_symlink():
         raise CnEtfDownloadError("ETF dataset root cannot be a symlink")
@@ -1426,6 +1593,7 @@ def _post_publish_housekeeping(
     dataset_root: Path,
     *,
     preferred_backup_snapshot_id: str | None = None,
+    sync_catalog: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Run non-transactional housekeeping without hiding a committed publish."""
 
@@ -1439,10 +1607,11 @@ def _post_publish_housekeeping(
         )
     except Exception as exc:
         warnings.append(f"retention cleanup failed: {type(exc).__name__}: {exc}")
-    try:
-        _sync_root_manifest(root)
-    except Exception as exc:
-        warnings.append(f"manifest sync failed: {type(exc).__name__}: {exc}")
+    if sync_catalog:
+        try:
+            _sync_root_manifest(root)
+        except Exception as exc:
+            warnings.append(f"manifest sync failed: {type(exc).__name__}: {exc}")
     for warning in warnings:
         print(f"ETF snapshot was published; {warning}", file=sys.stderr)
     return removed, warnings
@@ -1458,15 +1627,22 @@ def update_cn_etf_snapshot(
     retries: int = 2,
     timeout: float = 20.0,
     generated_at: str | None = None,
+    base_snapshot: Path | None = None,
+    symbols: list[str] | None = None,
+    publish: bool = True,
+    keep_failed_history: bool = False,
+    provider: str = "tencent",
 ) -> Path:
     """Reuse the frozen ETF snapshot and fetch only its missing date window."""
 
+    if provider not in {"tencent", "eastmoney"}:
+        raise ValueError("incremental provider must be tencent or eastmoney")
     if overlap_days < 1 or overlap_days > 60:
         raise ValueError("overlap_days must be between 1 and 60")
     if request_interval < MIN_REQUEST_INTERVAL:
         raise ValueError(f"request_interval must be at least {MIN_REQUEST_INTERVAL}")
-    if request_budget < 1 or request_budget > 500:
-        raise ValueError("incremental request_budget must be between 1 and 500")
+    if request_budget < 1 or request_budget > 10_000:
+        raise ValueError("incremental request_budget must be between 1 and 10000")
     if retries < 1 or retries > 2:
         raise ValueError("retries must be between 1 and 2")
 
@@ -1485,15 +1661,24 @@ def update_cn_etf_snapshot(
     started = time.monotonic()
 
     with _run_lock(lock_path):
-        resolved = resolve_dataset(
-            DATASET_ID,
-            quant_data_root=root,
-            require_basis="qfq",
-        )
-        current = resolved.snapshot_path
-        manifest = resolved.manifest
+        if base_snapshot is None:
+            resolved = resolve_dataset(DATASET_ID, quant_data_root=root, require_basis="qfq")
+            current, manifest = resolved.snapshot_path, resolved.manifest
+        else:
+            current = Path(base_snapshot).expanduser().resolve()
+            try:
+                current.relative_to(root / "parquet/etf_1d/cn_etf_daily/snapshots")
+            except ValueError as exc:
+                raise DataContractError("ETF base snapshot is outside its dataset") from exc
+            manifest = validate_dataset_snapshot(current, verify_hashes=True)
+            if manifest.get("dataset_id") != DATASET_ID or manifest.get("snapshot_id") != current.name:
+                raise DataContractError("ETF base snapshot identity differs")
         if manifest.get("data_kind") != "paired_daily_bars":
             raise DataContractError("cn_etf_daily is not a paired raw/qfq snapshot")
+        history_provider = (manifest.get("source") or {}).get("provider")
+        if history_provider not in {"tencent", "eastmoney", "tickflow", "mixed"}:
+            raise DataContractError("incremental update requires an identified frozen history provider")
+        base_manifest_sha256 = sha256_file(current / "DATASET_MANIFEST.json")
 
         universe_path = current / "ETF_UNIVERSE.parquet"
         if not universe_path.is_file():
@@ -1508,14 +1693,25 @@ def update_cn_etf_snapshot(
         qfq_index = pd.read_parquet(current / str(manifest["file_index_path"]))
         indexed_symbols = set(qfq_index["symbol"].astype(str))
         universe_symbols = set(universe["symbol"].astype(str))
+        metadata_only_symbols: list[str] = []
         if indexed_symbols != universe_symbols:
-            raise DataContractError("current ETF universe and snapshot symbols differ")
+            if base_snapshot is not None and history_provider == "tickflow" and indexed_symbols.issubset(universe_symbols):
+                metadata_only_symbols = sorted(universe_symbols - indexed_symbols)
+                universe = universe.loc[universe["symbol"].astype(str).isin(indexed_symbols)].reset_index(drop=True)
+                universe_symbols = indexed_symbols
+            else:
+                raise DataContractError("current ETF universe and snapshot symbols differ")
+        selected = universe_symbols if symbols is None else set(symbols)
+        if not selected or not selected.issubset(universe_symbols):
+            raise ValueError("requested ETF symbols must belong to the frozen universe")
+        if publish and selected != universe_symbols:
+            raise ValueError("a symbol-scoped preparation cannot publish the whole ETF dataset")
         last_by_symbol = {
             str(row.symbol): _as_date(str(row.last_date))
             for row in qfq_index.itertuples(index=False)
         }
         missing_symbols = sorted(
-            symbol for symbol, last_date in last_by_symbol.items() if last_date < through
+            symbol for symbol, last_date in last_by_symbol.items() if symbol in selected and last_date < through
         )
         if not missing_symbols:
             _write_incremental_status(
@@ -1540,17 +1736,20 @@ def update_cn_etf_snapshot(
         session = requests.Session()
         session.trust_env = False
         run_id = pd.Timestamp(timestamp).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-        snapshot_id = f"cn-etf-tencent-incremental-{run_id}"
+        snapshot_id = f"cn-etf-{provider}-incremental-{run_id}"
         staging_run = root / "staging" / f"cn-etf-incremental-{run_id}"
         stage = staging_run / snapshot_id
         changed_symbols: list[str] = []
         targeted_full_refresh_symbols: list[str] = []
+        historical_qfq_rebases: dict[str, dict[str, Any]] = {}
+        symbol_update_failures: dict[str, dict[str, str]] = {}
         rows_added_by_symbol: dict[str, int] = {}
         factors_by_symbol: dict[str, pd.DataFrame] = {}
         metadata_by_symbol = {
             str(row.symbol): row
             for row in universe.itertuples(index=False)
         }
+        keep_prepared = False
         try:
             for symbol in sorted(universe_symbols):
                 current_raw_path = current / "raw" / f"{symbol}.parquet"
@@ -1576,73 +1775,60 @@ def update_cn_etf_snapshot(
 
                 current_raw = pd.read_parquet(current_raw_path)
                 current_qfq = pd.read_parquet(current_qfq_path)
+                row = metadata_by_symbol[symbol]
+                metadata = {"code": str(row.code).zfill(6), "market": str(row.market).lower(), "name": str(row.name)}
+                for kind, frame in (("raw", current_raw), ("qfq", current_qfq)):
+                    if "symbol" not in frame:
+                        frame.insert(0, "symbol", symbol)
+                    if "name" not in frame:
+                        frame.insert(1, "name", metadata["name"])
+                    if "source" not in frame:
+                        frame["source"] = history_provider
+                    if "source_id" not in frame:
+                        frame["source_id"] = f"{history_provider}:{base_manifest_sha256}"
+                    else:
+                        frame["source_id"] = frame["source_id"].fillna(f"{history_provider}:{base_manifest_sha256}")
+                    if kind == "qfq" and "provider_response_key" not in frame:
+                        frame["provider_response_key"] = f"frozen_{history_provider}_snapshot"
+                for frame in (current_raw, current_qfq):
+                    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
                 old_start = _as_date(current_raw["date"].min())
                 old_end = _as_date(current_raw["date"].max())
                 overlap_start = max(
                     old_start,
                     old_end - pd.Timedelta(days=overlap_days),
                 )
-                row = metadata_by_symbol[symbol]
-                metadata = {
-                    "code": str(row.code).zfill(6),
-                    "market": str(row.market).lower(),
-                    "name": str(row.name),
-                }
-                incoming_raw, incoming_qfq = fetch_tencent_pair(
-                    symbol,
-                    metadata,
-                    start_date=overlap_start.date().isoformat(),
-                    end_date=through.date().isoformat(),
-                    session=session,
-                    request_gate=gate,
-                    page_size=DEFAULT_INCREMENTAL_PAGE_SIZE,
-                    retries=retries,
-                    timeout=timeout,
-                )
                 try:
+                    incoming_raw, incoming_qfq = _cached_incremental_pair(
+                        root / "cache" / "cn-etf-incremental", symbol, metadata,
+                        base_manifest_sha256=base_manifest_sha256,
+                        start_date=overlap_start.date().isoformat(), end_date=through.date().isoformat(),
+                        session=session, request_gate=gate, retries=retries, timeout=timeout,
+                        provider=provider,
+                    )
                     updated_raw, updated_qfq, rows_added = merge_incremental_pair(
-                        symbol,
-                        current_raw,
-                        current_qfq,
-                        incoming_raw,
-                        incoming_qfq,
+                        symbol, current_raw, current_qfq, incoming_raw, incoming_qfq,
                     )
-                except HistoricalRevisionDetected:
-                    updated_raw, updated_qfq = fetch_tencent_pair(
-                        symbol,
-                        metadata,
-                        start_date=old_start.date().isoformat(),
-                        end_date=through.date().isoformat(),
-                        session=session,
-                        request_gate=gate,
-                        retries=retries,
-                        timeout=timeout,
-                    )
-                    updated_raw = _normalize_component_frame(
-                        updated_raw, symbol=symbol, component="targeted full raw"
-                    )
-                    updated_qfq = _normalize_component_frame(
-                        updated_qfq, symbol=symbol, component="targeted full qfq"
-                    )
-                    if updated_raw["date"].tolist() != updated_qfq["date"].tolist():
-                        raise DataContractError(
-                            f"targeted raw/qfq dates differ for {symbol}"
-                        )
-                    if _as_date(updated_raw["date"].min()) > old_start:
-                        raise DataContractError(
-                            f"targeted history does not cover the old start for {symbol}"
-                        )
-                    rows_added = int(
-                        (updated_raw["date"] > old_end).sum()
-                    )
-                    targeted_full_refresh_symbols.append(symbol)
+                except CnEtfDownloadError as exc:
+                    if not keep_failed_history:
+                        raise
+                    symbol_update_failures[symbol] = {"error_type": type(exc).__name__, "error": str(exc),
+                                                     "last_verified_date": old_end.date().isoformat(),
+                                                     "requested_through": through.date().isoformat()}
+                    for kind in ("raw", "qfq", "factors"):
+                        _link_or_copy(current / kind / f"{symbol}.parquet", stage / kind / f"{symbol}.parquet")
+                    factors_by_symbol[symbol] = pd.read_parquet(current_factor_path)
+                    continue
+                rebase = updated_qfq.attrs.get("historical_rebase")
+                if rebase:
+                    historical_qfq_rebases[symbol] = dict(rebase)
 
                 if "source_id" not in updated_raw.columns:
                     updated_raw["source_id"] = updated_raw["source"].astype(str)
                 if "source_id" not in updated_qfq.columns:
                     updated_qfq["source_id"] = updated_qfq["source"].astype(str)
                 factors = build_paired_adjustments(symbol, updated_raw, updated_qfq)
-                if rows_added == 0 and symbol not in targeted_full_refresh_symbols:
+                if rows_added == 0 and not rebase:
                     _link_or_copy(current_raw_path, stage / "raw" / current_raw_path.name)
                     _link_or_copy(current_qfq_path, stage / "qfq" / current_qfq_path.name)
                     _link_or_copy(
@@ -1663,7 +1849,7 @@ def update_cn_etf_snapshot(
                 _write_incremental_status(
                     root,
                     {
-                        "status": "no_new_trade_rows",
+                        "status": "blocked" if symbol_update_failures else "no_new_trade_rows",
                         "dataset_id": DATASET_ID,
                         "snapshot_id": current.name,
                         "through": through.date().isoformat(),
@@ -1671,16 +1857,24 @@ def update_cn_etf_snapshot(
                         "symbols_requested": len(missing_symbols),
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                         "generated_at": timestamp,
+                        "symbol_update_failures": symbol_update_failures,
                     },
                 )
                 return current
 
+            combined_provider = provider if history_provider == provider else "mixed"
             actions = _corporate_actions_from_adjustments(
-                factors_by_symbol,
-                provider="tencent",
+                factors_by_symbol, provider=combined_provider,
             )
+            if combined_provider == "mixed":
+                actions["evidence_method"] = actions["evidence_method"].str.replace(
+                    "same_provider", "frozen_history_and_verified_increment", regex=False,
+                )
             _atomic_parquet(actions, stage / "corporate_actions.parquet")
-            _link_or_copy(universe_path, stage / "ETF_UNIVERSE.parquet")
+            if metadata_only_symbols:
+                _atomic_parquet(universe, stage / "ETF_UNIVERSE.parquet")
+            else:
+                _link_or_copy(universe_path, stage / "ETF_UNIVERSE.parquet")
             current_universe_manifest_path = current / "UNIVERSE_MANIFEST.json"
             if current_universe_manifest_path.is_file():
                 universe_manifest = json.loads(
@@ -1697,20 +1891,20 @@ def update_cn_etf_snapshot(
             )
             atomic_write_json(stage / "UNIVERSE_MANIFEST.json", universe_manifest)
 
-            qfq_response_keys = sorted(
-                {
-                    str(value)
-                    for path in sorted((stage / "qfq").glob("*.parquet"))
-                    for value in pd.read_parquet(
-                        path, columns=["provider_response_key"]
-                    )["provider_response_key"].dropna().unique()
-                }
-            )
+            import pyarrow.parquet as pq
+            qfq_response_keys = set()
+            for path in sorted((stage / "qfq").glob("*.parquet")):
+                if "provider_response_key" in pq.read_schema(path).names:
+                    qfq_response_keys.update(str(v) for v in pd.read_parquet(path, columns=["provider_response_key"])["provider_response_key"].dropna().unique())
+            qfq_response_keys = sorted(qfq_response_keys)
             source = dict(manifest.get("source") or {})
             source.update(
                 {
-                    "provider": "tencent",
-                    "interface": "ifzq_day_and_qfqday_bounded_increment",
+                    "provider": combined_provider,
+                    "increment_provider": provider,
+                    "retained_history_provider": history_provider,
+                    "interface": ("ifzq_day_and_qfqday_bounded_increment" if provider == "tencent"
+                                  else "eastmoney_raw_qfq_bounded_increment"),
                     "update_mode": "missing_dates_only",
                     "parent_snapshot_id": current.name,
                     "selection_method": "frozen_previous_snapshot",
@@ -1720,12 +1914,19 @@ def update_cn_etf_snapshot(
                     "reused_symbol_count": int(len(universe) - len(changed_symbols)),
                     "overlap_calendar_days": int(overlap_days),
                     "rows_added": int(sum(rows_added_by_symbol.values())),
+                    "provider_request_calls": gate.calls,
+                    "network_requests": getattr(session, "network_calls", gate.calls),
                     "targeted_full_refresh_symbols": sorted(
                         targeted_full_refresh_symbols
                     ),
+                    "historical_qfq_rebases": historical_qfq_rebases,
+                    "parent_manifest_sha256": base_manifest_sha256,
+                    "prepared_only": not publish,
+                    "symbol_update_failures": symbol_update_failures,
+                    "metadata_only_symbols_without_history": metadata_only_symbols,
                     "qfq_response_keys": qfq_response_keys,
                     "snapshot_retention": {
-                        "policy": "current_plus_one_previous",
+                        "policy": SNAPSHOT_RETENTION_POLICY,
                         "max_complete_snapshots": DEFAULT_SNAPSHOT_RETENTION,
                     },
                 }
@@ -1760,6 +1961,10 @@ def update_cn_etf_snapshot(
                 source_retrieved_at=timestamp,
             )
             dataset_root = root / "parquet" / "etf_1d" / DATASET_ID
+            if not publish:
+                validate_dataset_snapshot(stage, verify_hashes=True)
+                keep_prepared = True
+                return stage
             published = publish_snapshot_group(
                 [(stage, dataset_root)],
                 quant_data_root=root,
@@ -1769,12 +1974,14 @@ def update_cn_etf_snapshot(
                 root,
                 dataset_root,
                 preferred_backup_snapshot_id=current.name,
+                # publish_snapshot_group already updated the exact catalog entry.
+                sync_catalog=False,
             )
             published_status = {
                 "status": (
                     "published_with_warnings"
                     if post_publish_warnings
-                    else "published"
+                    else ("published_partial" if symbol_update_failures else "published")
                 ),
                 "dataset_id": DATASET_ID,
                 "snapshot_id": published.name,
@@ -1788,6 +1995,7 @@ def update_cn_etf_snapshot(
                 "targeted_full_refresh_symbols": sorted(
                     targeted_full_refresh_symbols
                 ),
+                "symbol_update_failures": symbol_update_failures,
                 "removed_snapshots": removed_snapshots,
                 "post_publish_warnings": post_publish_warnings,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -1803,7 +2011,9 @@ def update_cn_etf_snapshot(
                 )
             return published
         finally:
-            shutil.rmtree(staging_run, ignore_errors=True)
+            session.close()
+            if not keep_prepared:
+                shutil.rmtree(staging_run, ignore_errors=True)
 
 
 def _expansion_cache_symbol_complete(
@@ -2364,7 +2574,7 @@ def expand_cn_etf_universe(
                     "category_counts": category_counts,
                     "qfq_response_keys": qfq_response_keys,
                     "snapshot_retention": {
-                        "policy": "current_plus_one_previous",
+                        "policy": SNAPSHOT_RETENTION_POLICY,
                         "max_complete_snapshots": DEFAULT_SNAPSHOT_RETENTION,
                     },
                 }
@@ -2885,7 +3095,7 @@ def _publish_cn_etf_snapshot_locked(
             "requested_symbol_count": int(len(universe)),
             "qfq_response_keys": qfq_response_keys,
             "snapshot_retention": {
-                "policy": "current_plus_one_previous",
+                "policy": SNAPSHOT_RETENTION_POLICY,
                 "max_complete_snapshots": DEFAULT_SNAPSHOT_RETENTION,
             },
         }
@@ -3003,6 +3213,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quant-data-root", type=Path, default=quant_data_root())
     parser.add_argument("--full-rebuild", action="store_true")
+    parser.add_argument("--update", action="store_true", help="Update the existing file snapshot without the project service")
+    parser.add_argument("--base-snapshot", type=Path, help="Explicit frozen file snapshot")
+    parser.add_argument("--provider", choices=("tencent", "eastmoney"), default="tencent", help="Provider for bounded updates only")
+    parser.add_argument("--symbol", action="append", dest="symbols", help="Prepare selected existing symbols only")
+    parser.add_argument("--prepare-only", action="store_true", help="Validate staged files without changing LATEST")
+    parser.add_argument("--keep-failed-history", action="store_true", help="Disclose supplier failures and retain those symbols' exact old files")
     parser.add_argument("--confirm-severe-current-corruption", action="store_true")
     parser.add_argument("--confirm-backup-unrecoverable", action="store_true")
     parser.add_argument("--confirm-user-approved", action="store_true")
@@ -3020,6 +3236,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.update:
+        if args.full_rebuild:
+            raise ValueError("--update and --full-rebuild are mutually exclusive")
+        updated = update_cn_etf_snapshot(
+            quant_data_dir=args.quant_data_root, end_date=args.through,
+            base_snapshot=args.base_snapshot, symbols=args.symbols, publish=not args.prepare_only,
+            keep_failed_history=args.keep_failed_history, provider=args.provider,
+            request_interval=args.request_interval,
+            request_budget=args.request_budget, retries=args.retries, timeout=args.timeout,
+        )
+        print(updated)
+        return 0
     confirmations = (
         args.full_rebuild,
         args.confirm_severe_current_corruption,

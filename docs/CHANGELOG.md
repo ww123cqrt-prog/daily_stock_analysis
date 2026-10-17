@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 恢复 ETF 文件快照的有界增量更新：保留已有历史、核对 QFQ 衔接，支持腾讯与东方财富补缺、采集缓存复用及逐证券失败披露；不依赖项目版服务。
+
 - [新功能] `quant_data_cli.py` 新增只读 `compare-snapshots`，逐证券证明 A 股 raw/qfq 新快照是指定旧快照的合规增量，并为复权因子变化导致的历史重算保留可核对证据。
 - [新功能] `quant_data_cli.py` 新增只读 `sample-increment`，运行时重新执行完整快照语义比较并要求外部比较报告与实际结果完全一致，再按固定种子抽检新增区间并离线对照本地 Baostock bundle；报告明确已检查与未检查证券数量，不能用伪造或过期报告把抽检冒充全检。
 
