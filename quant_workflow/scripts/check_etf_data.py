@@ -592,7 +592,9 @@ def inspect_etf_frames(
         sources = factors.get(
             "factor_source", pd.Series("unknown", index=factors.index)
         ).astype(str)
-        unproven = sources.str.contains("derived_same_provider|unknown", regex=True)
+        unproven = sources.str.contains(
+            "derived_same_provider|derived_close_ratio|unknown", regex=True
+        )
         issues.extend(
             _mask_findings(
                 unproven,

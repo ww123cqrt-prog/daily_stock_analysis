@@ -205,6 +205,69 @@ def _merge_by_date(base: pd.DataFrame, update: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def restore_tickflow_factor_metadata(
+    raw: pd.DataFrame,
+    qfq: pd.DataFrame,
+    factors: pd.DataFrame,
+    *,
+    symbol: str,
+) -> pd.DataFrame:
+    """Restore omitted cells in a frozen TickFlow multiplicative factor table.
+
+    This explicit offline repair is not part of reading or ordinary updating.
+    The caller must bind all three files to their frozen manifest/index. Only
+    missing cells are candidates; existing prices and known metadata stay intact.
+    """
+    restored = factors.copy(deep=True)
+    missing_symbol = (
+        restored["symbol"].isna() if "symbol" in restored
+        else pd.Series(False, index=restored.index)
+    )
+    missing_offset = (
+        restored["offset"].isna() if "offset" in restored
+        else pd.Series(False, index=restored.index)
+    )
+    affected = missing_symbol | missing_offset
+    if not affected.any():
+        return restored
+    try:
+        dates = pd.to_datetime(restored["date"], errors="raise").reset_index(drop=True)
+        if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+            raise ValueError("factor dates are invalid")
+        for frame in (raw, qfq, restored):
+            actual_dates = pd.to_datetime(frame["date"], errors="raise").reset_index(drop=True)
+            if not actual_dates.equals(dates):
+                raise ValueError("raw/QFQ/factor keys differ")
+            if "symbol" in frame and not frame["symbol"].dropna().eq(symbol).all():
+                raise ValueError("known symbol differs from frozen index")
+        if not restored.loc[affected, "factor_source"].eq("tickflow_adj_factor").all():
+            raise ValueError("missing metadata is not a declared TickFlow factor")
+        scale = pd.to_numeric(restored.loc[affected, "factor"], errors="raise").to_numpy(float)
+        offsets = (
+            pd.to_numeric(restored["offset"], errors="raise").fillna(0.0)
+            if "offset" in restored else pd.Series(0.0, index=restored.index)
+        ).loc[affected].to_numpy(float)
+        if not np.isfinite(scale).all() or (scale <= 0).any() or not np.isfinite(offsets).all():
+            raise ValueError("factor or offset is invalid")
+        positions = np.flatnonzero(affected.to_numpy())
+        for field in PRICE_COLUMNS:
+            left = pd.to_numeric(raw.iloc[positions][field], errors="raise").to_numpy(float)
+            right = pd.to_numeric(qfq.iloc[positions][field], errors="raise").to_numpy(float)
+            if (
+                not np.isfinite(left).all() or not np.isfinite(right).all()
+                or (left <= 0).any() or (right <= 0).any()
+                or not np.isclose(left * scale + offsets, right, rtol=1e-12, atol=1e-12).all()
+            ):
+                raise ValueError("saved OHLC do not prove the proposed metadata")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataContractError(f"cannot restore factor metadata for {symbol}: {exc}") from exc
+    if "symbol" in restored:
+        restored.loc[missing_symbol, "symbol"] = symbol
+    if "offset" in restored:
+        restored.loc[missing_offset, "offset"] = 0.0
+    return restored
+
+
 def _canonical_events(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     events = frame.copy()
     if "action_type" in events.columns:

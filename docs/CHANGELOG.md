@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 增加按冻结 raw/QFQ 数值证明补齐旧 TickFlow 因子缺失元数据的显式离线工具；ETF 体检将旧 close 比值拟合正确列为证据不足，不新增读取门禁。
+
 - [修复] MiniQMT 短窗口核验不再因窗口之前的股改记录误拒绝股票；实际受未知股改影响的价格仍拒绝。
 
 - [新功能] 沪深股票/ETF 默认接入 HOME MiniQMT 行情桥：复用现有数据源管理器及 ETF Parquet 增量入口，批量补缺、核对现金/份额复权并保留来源和逐证券失败披露；其他数据源及封存服务边界保持。

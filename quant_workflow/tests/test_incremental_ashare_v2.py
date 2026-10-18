@@ -44,6 +44,71 @@ def _bars(symbol: str, closes: list[float], dates: list[str]) -> pd.DataFrame:
     )
 
 
+def _tickflow_metadata_fixture():
+    raw = _bars("SH600519", [10.0, 11.0], ["2026-08-13", "2026-08-14"])
+    factors = pd.DataFrame({
+        "date": raw.date, "factor": [1.0, 1.0],
+        "symbol": ["SH600519", None], "offset": [0.0, float("nan")],
+        "factor_source": ["tickflow_adj_factor", "tickflow_adj_factor"],
+    })
+    return raw, raw.copy(), factors
+
+
+def test_restore_tickflow_metadata_does_not_change_prices_or_known_fields():
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors = _tickflow_metadata_fixture()
+    before = factors.copy(deep=True)
+    restored = mod.restore_tickflow_factor_metadata(raw, qfq, factors, symbol="SH600519")
+    assert restored.symbol.tolist() == ["SH600519", "SH600519"]
+    assert restored.offset.tolist() == [0.0, 0.0]
+    pd.testing.assert_frame_equal(factors, before)
+    pd.testing.assert_frame_equal(restored.drop(columns=["symbol", "offset"]),
+                                  before.drop(columns=["symbol", "offset"]))
+    pd.testing.assert_frame_equal(raw, qfq)
+    pd.testing.assert_frame_equal(
+        mod.restore_tickflow_factor_metadata(raw, qfq, restored, symbol="SH600519"),
+        restored,
+    )
+
+
+@pytest.mark.parametrize("damage", ["changed_price", "wrong_raw_symbol", "wrong_qfq_symbol",
+    "wrong_factor_symbol", "different_dates", "duplicate_dates", "unknown_source",
+    "nonfinite_price", "nonpositive_factor", "wrong_known_offset"])
+def test_restore_tickflow_metadata_cannot_invent_unproven_identity_or_offset(damage):
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors = _tickflow_metadata_fixture()
+    if damage == "changed_price":
+        qfq.loc[1, "close"] += 0.01
+    elif damage.startswith("wrong_") and damage.endswith("symbol"):
+        {"wrong_raw_symbol": raw, "wrong_qfq_symbol": qfq,
+         "wrong_factor_symbol": factors}[damage].loc[1, "symbol"] = "SH600000"
+    elif damage == "different_dates":
+        factors.loc[1, "date"] = pd.Timestamp("2026-08-17")
+    elif damage == "duplicate_dates":
+        for frame in (raw, qfq, factors):
+            frame.loc[1, "date"] = frame.loc[0, "date"]
+    elif damage == "unknown_source":
+        factors.loc[1, "factor_source"] = "unverified_affine_fit"
+    elif damage == "nonfinite_price":
+        qfq.loc[1, "open"] = float("nan")
+    elif damage == "nonpositive_factor":
+        factors.loc[1, "factor"] = 0.0
+    elif damage == "wrong_known_offset":
+        factors.loc[1, "offset"] = 0.1
+    with pytest.raises(mod.DataContractError):
+        mod.restore_tickflow_factor_metadata(raw, qfq, factors, symbol="SH600519")
+
+
+def test_restore_tickflow_metadata_keeps_optional_columns_absent():
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors = _tickflow_metadata_fixture()
+    factors = factors.drop(columns=["symbol", "offset"])
+    pd.testing.assert_frame_equal(
+        mod.restore_tickflow_factor_metadata(raw, qfq, factors, symbol="SH600519"),
+        factors,
+    )
+
+
 def _events(symbol: str, first_factor: float) -> pd.DataFrame:
     return pd.DataFrame(
         {

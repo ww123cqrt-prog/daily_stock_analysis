@@ -201,10 +201,13 @@ def test_auxiliary_check_requires_declared_same_basis_semantics():
     )
 
 
-def test_fitted_factor_is_not_independent_company_action_proof():
+@pytest.mark.parametrize("source", [
+    "derived_same_provider_raw_qfq_piecewise_affine_ohlc", "derived_close_ratio",
+])
+def test_fitted_factor_is_not_independent_company_action_proof(source):
     mod = checker()
     raw, qfq, factor = frames()
-    factor["factor_source"] = "derived_same_provider_raw_qfq_piecewise_affine_ohlc"
+    factor["factor_source"] = source
     issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor)
     assert any(
         i["rule"] == "factor_authority_unproven"
