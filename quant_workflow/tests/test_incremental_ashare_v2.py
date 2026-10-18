@@ -109,6 +109,22 @@ def test_restore_tickflow_metadata_keeps_optional_columns_absent():
     )
 
 
+@pytest.mark.parametrize("with_optional_columns", [True, False])
+def test_identity_factor_extension_preserves_the_declared_metadata_schema(with_optional_columns):
+    mod = load_script("incremental_update_ashare_v2")
+    raw, _, factors = _tickflow_metadata_fixture()
+    factors = factors.iloc[:1].copy()
+    if not with_optional_columns:
+        factors = factors.drop(columns=["symbol", "offset"])
+    result = mod._identity_extension(factors, raw.iloc[1:], symbol="SH600519")
+    pd.testing.assert_frame_equal(result[factors.columns].iloc[:1], factors)
+    if with_optional_columns:
+        assert result.symbol.tolist() == ["SH600519", "SH600519"]
+        assert result.offset.tolist() == [0.0, 0.0]
+    else:
+        assert "symbol" not in result and "offset" not in result
+
+
 def _events(symbol: str, first_factor: float) -> pd.DataFrame:
     return pd.DataFrame(
         {

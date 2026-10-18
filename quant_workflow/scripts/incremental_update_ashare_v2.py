@@ -356,6 +356,10 @@ def _identity_extension(
     extension["factor_paired_fallback"] = False
     extension["factor_terminal_normalized"] = False
     extension["provider_qfq_terminal_factor"] = np.nan
+    if "symbol" in base_factors:
+        extension["symbol"] = symbol
+    if "offset" in base_factors:
+        extension["offset"] = 0.0
     return _merge_by_date(base_factors, extension)
 
 

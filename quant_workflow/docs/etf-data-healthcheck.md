@@ -72,7 +72,7 @@ symbol,effective_trade_date,action_type,ratio,source_url,evidence_path,evidence_
 
 算术自洽不能自证公司行为正确。例如 raw/QFQ 相同、因子为 1 也能通过公式；若存在真实的 1 拆 8，仍然漏了复权。独立拆分记录用于识别这种矛盾，不能以价格跳变反推比例后强行修正。
 
-A 股旧 TickFlow 因子表的空 `symbol`/`offset`，可通过 `incremental_update_ashare_v2.restore_tickflow_factor_metadata` 做显式离线修复。调用方须先核对冻结清单、索引和文件摘要；函数只补已声明为 `tickflow_adj_factor` 的缺失单元，证券须与已知字段一致，填入偏移量后四个 OHLC 必须与保存的 raw/QFQ 逐键吻合。无法证明就拒绝修复，不改已有价格、非空字段或省略了可选列的合法旧表。修复结果写入新快照，旧文件保留；正常读取和体检不会自动调用它。
+A 股旧 TickFlow 因子表的空 `symbol`/`offset`，可通过 `incremental_update_ashare_v2.restore_tickflow_factor_metadata` 做显式离线修复。调用方须先核对冻结清单、索引和文件摘要；函数只补已声明为 `tickflow_adj_factor` 的缺失单元，证券须与已知字段一致，填入偏移量后四个 OHLC 必须与保存的 raw/QFQ 逐键吻合。无法证明就拒绝修复，不改已有价格、非空字段或省略了可选列的合法旧表。修复结果写入新快照，旧文件保留；正常读取和体检不会自动调用它。增量工具在追加单位因子时沿用已声明的证券和零偏移列，避免新行再次因拼接丢失这些字段。
 
 拟合因子存在舍入差异，平价行情的仿射表示也可能不唯一。这类比例差异只列待核查，不直接判错；明确拆分且边界两侧 QFQ 仍完全等于 raw 时，才归为确定漏复权。
 
