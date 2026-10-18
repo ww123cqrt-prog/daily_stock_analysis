@@ -10,6 +10,7 @@
 3. 防封禁流控策略
 
 数据源优先级（动态调整）：
+已配置 MiniQMT 工作站时，MiniQMTFetcher 为沪深行情默认首选；其他源保持回退顺序。
 【配置了 TUSHARE_TOKEN 时】
 1. TushareFetcher (Priority 0) - 🔥 最高优先级（动态提升）
 2. EfinanceFetcher (Priority 0) - 同优先级
@@ -41,6 +42,7 @@ from .pytdx_fetcher import PytdxFetcher
 from .baostock_fetcher import BaostockFetcher
 from .yfinance_fetcher import YfinanceFetcher
 from .longbridge_fetcher import LongbridgeFetcher
+from .miniqmt_fetcher import MiniQMTFetcher
 from .finnhub_fetcher import FinnhubFetcher
 from .alphavantage_fetcher import AlphaVantageFetcher
 from .us_index_mapping import is_us_index_code, is_us_stock_code, get_us_index_yf_symbol, US_INDEX_MAPPING
@@ -56,6 +58,7 @@ __all__ = [
     'BaostockFetcher',
     'YfinanceFetcher',
     'LongbridgeFetcher',
+    'MiniQMTFetcher',
     'FinnhubFetcher',
     'AlphaVantageFetcher',
     'is_us_index_code',

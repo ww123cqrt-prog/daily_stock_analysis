@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 沪深股票/ETF 默认接入 HOME MiniQMT 行情桥：复用现有数据源管理器及 ETF Parquet 增量入口，批量补缺、核对现金/份额复权并保留来源和逐证券失败披露；其他数据源及封存服务边界保持。
+
 - [新功能] 增加独立的 `check-etf` 只读体检入口，复用行情/复权检查并按证券、日期和字段区分确定错误、证据不足及核查线索，不接入读取或发布门禁。
 
 - [改进] ETF 旧文件增量支持 Baostock 有界 raw/QFQ 补缺，保留 SDK 证据与原始成交量，按旧文件单位核对衔接并隔离来源冲突。

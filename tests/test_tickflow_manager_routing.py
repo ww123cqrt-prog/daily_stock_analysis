@@ -154,7 +154,7 @@ class TestTickFlowManagerRouting(unittest.TestCase):
         self.assertEqual(config.tickflow_priority, 0)
 
     def test_tickflow_api_key_does_not_auto_inject_realtime_priority(self):
-        with patch.dict(os.environ, {"TICKFLOW_API_KEY": "tk-test"}, clear=True):
+        with patch.dict(os.environ, {"TICKFLOW_API_KEY": "tk-test", "MINIQMT_ENABLED": "false"}, clear=True):
             self.assertEqual(
                 Config._resolve_realtime_source_priority(),
                 "tencent,akshare_sina,efinance,akshare_em",

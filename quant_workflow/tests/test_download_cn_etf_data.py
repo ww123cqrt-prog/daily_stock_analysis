@@ -779,6 +779,7 @@ def test_incremental_update_is_zero_request_noop_when_target_is_already_present(
         quant_data_dir=root,
         end_date="2026-08-06",
         generated_at="2026-08-07T11:00:00+08:00",
+        provider="tencent",
     )
 
     assert result == current
@@ -818,6 +819,7 @@ def test_incremental_update_reuses_frozen_universe_and_fetches_only_recent_windo
         end_date="2026-08-07",
         generated_at="2026-08-07T11:00:00+08:00",
         overlap_days=14,
+        provider="tencent",
     )
 
     assert updated != current
@@ -868,6 +870,7 @@ def test_incremental_update_reports_post_publish_housekeeping_warning(
         quant_data_dir=root,
         end_date="2026-08-07",
         generated_at="2026-08-07T11:00:00+08:00",
+        provider="tencent",
     )
 
     assert updated != current
@@ -908,6 +911,7 @@ def test_incremental_update_normalizes_weekend_to_previous_weekday(
         quant_data_dir=root,
         end_date="2026-08-08",  # Saturday; effective target is Friday 08-07.
         generated_at="2026-08-08T10:00:00+08:00",
+        provider="tencent",
     )
 
     assert updated != current
@@ -967,6 +971,7 @@ def test_incremental_update_rebases_only_the_symbol_with_a_proven_basis_change(
         quant_data_dir=root,
         end_date="2026-08-07",
         generated_at="2026-08-07T11:00:00+08:00",
+        provider="tencent",
     )
 
     assert call_counts == {"SH510050": 1, "SZ159915": 1}
@@ -1025,7 +1030,7 @@ def test_incremental_cash_adjustment_rebases_cached_history_without_refetch(
         return raw, qfq
 
     monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
-    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07", provider="tencent")
     assert len(calls) == 2, "a QFQ basis change must not request full history"
     pd.testing.assert_frame_equal(
         pd.read_parquet(old / "raw/SH510050.parquet"), original
@@ -1065,7 +1070,7 @@ def test_incremental_raw_revision_stops_without_full_history_request(
 
     monkeypatch.setattr(module, "fetch_tencent_pair", revised)
     with pytest.raises(module.HistoricalRevisionDetected, match="raw history"):
-        module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+        module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07", provider="tencent")
     assert len(calls) == 1
     assert (
         module.resolve_dataset(
@@ -1104,6 +1109,7 @@ def test_prepared_symbol_update_reuses_downloads_before_full_update(
         base_snapshot=current,
         symbols=["SH510050"],
         publish=False,
+        provider="tencent",
     )
     assert pointer.read_bytes() == original_pointer
     assert pd.read_parquet(prepared / "qfq/SH510050.parquet")["close"].tolist() == [
@@ -1113,7 +1119,8 @@ def test_prepared_symbol_update_reuses_downloads_before_full_update(
         1.3,
     ]
     new = module.update_cn_etf_snapshot(
-        quant_data_dir=root, end_date="2026-08-07", base_snapshot=current
+        quant_data_dir=root, end_date="2026-08-07", base_snapshot=current,
+        provider="tencent",
     )
     assert calls == ["SH510050", "SZ159915"]
     assert pd.read_parquet(new / "ETF_UNIVERSE.parquet")["symbol"].tolist() == [
@@ -1194,6 +1201,7 @@ def test_incremental_prepared_cache_tampering_is_rejected(
         base_snapshot=current,
         symbols=["SH510050"],
         publish=False,
+        provider="tencent",
     )
     raw_path = next((root / "cache/cn-etf-incremental").glob("*/raw/SH510050.parquet"))
     changed = pd.read_parquet(raw_path)
@@ -1213,6 +1221,7 @@ def test_incremental_prepared_cache_tampering_is_rejected(
             base_snapshot=current,
             symbols=["SH510050"],
             publish=False,
+            provider="tencent",
         )
 
 
@@ -1239,7 +1248,8 @@ def test_explicit_failure_isolation_keeps_old_symbol_and_updates_healthy_one(
 
     monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
     new = module.update_cn_etf_snapshot(
-        quant_data_dir=root, end_date="2026-08-07", keep_failed_history=True
+        quant_data_dir=root, end_date="2026-08-07", keep_failed_history=True,
+        provider="tencent",
     )
     assert (new / "raw/SH510050.parquet").read_bytes() == old_bytes
     assert len(pd.read_parquet(new / "qfq/SZ159915.parquet")) == 4
@@ -1276,7 +1286,7 @@ def test_incremental_publication_does_not_rescan_unrelated_data(
 
     monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
     monkeypatch.setattr(module, "_sync_root_manifest", unrelated_scan)
-    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07")
+    new = module.update_cn_etf_snapshot(quant_data_dir=root, end_date="2026-08-07", provider="tencent")
     assert (
         module.resolve_dataset(
             "cn_etf_daily", quant_data_root=root, require_basis="qfq"
@@ -1500,6 +1510,7 @@ def test_symbol_scoped_preparation_cannot_publish_full_dataset(
             end_date="2026-08-07",
             base_snapshot=current,
             symbols=["SH510050"],
+            provider="tencent",
         )
 
 
@@ -1596,7 +1607,8 @@ def test_tickflow_history_can_receive_tencent_increment_without_relabeling(
 
     monkeypatch.setattr(module, "fetch_tencent_pair", incoming)
     new = module.update_cn_etf_snapshot(
-        quant_data_dir=root, base_snapshot=frozen, end_date="2026-08-07"
+        quant_data_dir=root, base_snapshot=frozen, end_date="2026-08-07",
+        provider="tencent",
     )
     raw = pd.read_parquet(new / "raw/SH510050.parquet")
     assert raw["close"].tolist() == [1.0, 1.1, 1.2, 1.3]

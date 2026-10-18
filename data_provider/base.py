@@ -616,6 +616,7 @@ class DataFetcherManager:
     """
 
     _DAILY_MARKET_FETCHER_SUPPORT = {
+        "MiniQMTFetcher": {"cn"},
         "EfinanceFetcher": {"cn"},
         "TencentFetcher": {"cn"},
         "AkshareFetcher": {"cn", "hk"},
@@ -1165,6 +1166,8 @@ class DataFetcherManager:
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
+        from .miniqmt_bridge import MiniQMTBridgeClient
+        from .miniqmt_fetcher import MiniQMTFetcher
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         efinance = EfinanceFetcher()
@@ -1174,6 +1177,8 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         optional_fetchers: List[BaseFetcher] = []
+        if MiniQMTBridgeClient.configured():
+            optional_fetchers.append(MiniQMTFetcher())
 
         tushare_token = (getattr(config, "tushare_token", None) or "").strip()
         if tushare_token:
@@ -1632,6 +1637,9 @@ class DataFetcherManager:
 
     def prefetch_daily_klines(self, stock_codes: List[str], days: int = 30) -> int:
         """Batch-prefetch TickFlow daily K-lines without changing per-stock callers."""
+        first = self._filter_fetchers_by_capability(self._get_fetchers_snapshot(), "daily_data")
+        if first and first[0].name == "MiniQMTFetcher":
+            return 0  # Do not download a second provider before the primary is queried.
         fetcher = self._get_fetcher_by_name("TickFlowFetcher", capability="daily_data")
         if fetcher is None or not hasattr(fetcher, "prefetch_daily_klines"):
             return 0
@@ -1892,6 +1900,13 @@ class DataFetcherManager:
                             operation="get_realtime_quote",
                         )
                         quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+
+                elif source == "miniqmt":
+                    fetcher = self._get_fetcher_by_name("MiniQMTFetcher", capability="realtime_quote")
+                    if fetcher is not None:
+                        record_provider_run_started(data_type="realtime_quote", provider=fetcher.name,
+                                                    operation="get_realtime_quote")
+                        quote = self._call_fetcher_method(fetcher, "get_realtime_quote", raw_stock_code or stock_code)
 
                 elif source == "tickflow":
                     fetcher = self._get_fetcher_by_name("TickFlowFetcher", capability="realtime_quote")

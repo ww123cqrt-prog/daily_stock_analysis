@@ -1405,7 +1405,10 @@ def _update(
     *,
     refresh_legacy_compatibility: bool = False,
     use_system_proxy: bool = False,
+    etf_provider: str | None = None,
 ) -> int:
+    if etf_provider is not None and dataset_id != "cn_etf_daily":
+        raise DataContractError("--provider is supported only by cn_etf_daily")
     if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
         update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
         update_lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1442,12 +1445,17 @@ def _update(
             + "; pass --bundle-dir after the remote raw/factor/qfq bundle is verified"
         )
     if dataset_id == "cn_etf_daily":
-        from download_cn_etf_data import update_cn_etf_snapshot
+        import download_cn_etf_data
 
-        path = update_cn_etf_snapshot(
-            quant_data_dir=root,
-            end_date=through,
-        )
+        options = {"provider": etf_provider} if etf_provider is not None else {}
+        try:
+            path = download_cn_etf_data.update_cn_etf_snapshot(quant_data_dir=root, end_date=through, **options)
+        except Exception as exc:
+            from data_provider.miniqmt_bridge import MiniQMTError
+            expected = (MiniQMTError, getattr(download_cn_etf_data, "CnEtfDownloadError", DataContractError))
+            if not isinstance(exc, expected):
+                raise
+            raise DataContractError(str(exc)) from exc
         print(path)
         return 0
     if dataset_id == "cn_index_daily":
@@ -1542,6 +1550,8 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("dataset_id")
     update_parser.add_argument("--through")
     update_parser.add_argument("--bundle-dir", type=Path)
+    update_parser.add_argument("--provider", choices=("miniqmt", "tencent", "eastmoney", "baostock"),
+                               help="Explicit ETF source override; the default is MiniQMT")
     update_parser.add_argument(
         "--refresh-legacy-compatibility",
         action="store_true",
@@ -1655,6 +1665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.bundle_dir,
                 refresh_legacy_compatibility=args.refresh_legacy_compatibility,
                 use_system_proxy=args.use_system_proxy,
+                etf_provider=args.provider,
             )
     except (DataContractError, ValueError, TypeError) as exc:
         print(f"不能使用 quant_data 数据：{exc}", file=sys.stderr)

@@ -139,7 +139,8 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             return_value=_StubFetcher("LongbridgeFetcher", 5),
         ) as mock_longbridge:
             mock_longbridge.has_configured_credentials.return_value = False
-            manager = DataFetcherManager()
+            with patch("data_provider.miniqmt_bridge.MiniQMTBridgeClient.configured", return_value=False):
+                manager = DataFetcherManager()
 
         self.assertEqual(
             manager.available_fetchers,

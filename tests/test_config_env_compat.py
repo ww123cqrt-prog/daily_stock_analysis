@@ -146,6 +146,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             os.environ,
             {
                 "STOCK_LIST": "600519",
+                "MINIQMT_ENABLED": "false",
             },
             clear=True,
         ):

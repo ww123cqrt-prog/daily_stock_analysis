@@ -2943,19 +2943,22 @@ class Config:
             # User explicitly set priority, respect it
             return explicit
 
+        from data_provider.miniqmt_bridge import MiniQMTBridgeClient
+        miniqmt_configured = MiniQMTBridgeClient.configured()
+
         tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
         if tushare_token:
             # Token configured but no explicit priority override
             # Prepend tushare so the paid source is tried first
             import logging
             logger = logging.getLogger(__name__)
-            resolved = f'tushare,{default_priority}'
+            resolved = ('miniqmt,' if miniqmt_configured else '') + f'tushare,{default_priority}'
             logger.info(
                 f"TUSHARE_TOKEN detected, auto-injecting tushare into realtime priority: {resolved}"
             )
             return resolved
 
-        return default_priority
+        return ('miniqmt,' if miniqmt_configured else '') + default_priority
 
     @classmethod
     def reset_instance(cls) -> None:

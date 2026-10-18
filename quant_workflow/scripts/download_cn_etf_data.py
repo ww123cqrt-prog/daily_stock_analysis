@@ -1548,6 +1548,17 @@ def merge_incremental_pair(
     return combined_raw, combined_qfq, int(len(append_raw))
 
 
+def _incremental_identity(symbol, metadata, base_manifest_sha256, start_date, end_date, provider):
+    identity = {"base_manifest_sha256": base_manifest_sha256, "symbol": symbol,
+                "metadata": metadata, "start": start_date, "end": end_date,
+                "provider": provider, "rules": "affine-bounded-increment-v1"}
+    if provider == "baostock":
+        identity["volume_rule"] = "native-shares-to-half-up-100-share-lots-v2"
+    if provider == "miniqmt":
+        identity["source_rule"] = "bounded-cash-share-front-sdk-lots-v1"
+    return identity
+
+
 def _cached_incremental_pair(
     cache: Path, symbol: str, metadata: dict[str, str], *,
     base_manifest_sha256: str, start_date: str, end_date: str,
@@ -1555,11 +1566,7 @@ def _cached_incremental_pair(
     provider: str = "tencent",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Retain a verified bounded acquisition across preparation and publication."""
-    identity = {"base_manifest_sha256": base_manifest_sha256, "symbol": symbol,
-                "metadata": metadata, "start": start_date, "end": end_date,
-                "provider": provider, "rules": "affine-bounded-increment-v1"}
-    if provider == "baostock":
-        identity["volume_rule"] = "native-shares-to-half-up-100-share-lots-v2"
+    identity = _incremental_identity(symbol, metadata, base_manifest_sha256, start_date, end_date, provider)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     folder = cache / key
     marker = folder / "COMPLETE.json"
@@ -1582,17 +1589,34 @@ def _cached_incremental_pair(
                 for kind, path in paths.items()
             ) or not _cache_symbol_complete(folder, symbol):
                 raise DataContractError(f"incremental cache changed for {symbol}")
-            if provider == "baostock" and (
+            if provider in {"baostock", "miniqmt"} and (
                 not receipt_path.is_file()
                 or sha256_file(receipt_path) != complete.get("source_receipt_sha256")
             ):
                 raise DataContractError(f"incremental source response changed for {symbol}")
-            return attributed(pd.read_parquet(paths["raw"]), pd.read_parquet(paths["qfq"]))
+            raw, qfq = attributed(pd.read_parquet(paths["raw"]), pd.read_parquet(paths["qfq"]))
+            if provider == "miniqmt":
+                from miniqmt_etf_source import verified_response
+                receipt = json.loads(receipt_path.read_text())
+                _, response = verified_response(cache, receipt)
+                raw.attrs["source_receipt"] = receipt
+                from data_provider.miniqmt_fetcher import market_symbol
+                request = response["request"]
+                if (request.get("operation") != "update_pair" or request.get("adjustment") != "none"
+                        or request.get("start") != start_date.replace("-", "")
+                        or request.get("end") != end_date.replace("-", "")
+                        or market_symbol(symbol) not in request.get("symbols", [])):
+                    raise DataContractError("MiniQMT source response request changed")
+                observed = response["data"][market_symbol(symbol)]
+                raw.attrs["miniqmt_actions"] = observed["actions"]
+                raw.attrs["miniqmt_action_through"] = observed.get("action_history_through", end_date)
+            return raw, qfq
         except (OSError, ValueError, KeyError) as exc:
             raise DataContractError(f"incremental cache is invalid for {symbol}") from exc
     try:
-        fetch_pair = {"tencent": fetch_tencent_pair, "eastmoney": fetch_eastmoney_pair,
-                      "baostock": fetch_baostock_pair}[provider]
+        fetch_pair = session.fetch_pair if provider == "miniqmt" else {
+            "tencent": fetch_tencent_pair, "eastmoney": fetch_eastmoney_pair,
+            "baostock": fetch_baostock_pair}[provider]
         raw, qfq = fetch_pair(
             symbol, metadata, start_date=start_date, end_date=end_date, session=session,
             request_gate=request_gate, page_size=DEFAULT_INCREMENTAL_PAGE_SIZE,
@@ -1603,10 +1627,15 @@ def _cached_incremental_pair(
         factors = build_paired_adjustments(symbol, raw, qfq)
     except DataContractError as exc:
         raise CnEtfDownloadError(f"incoming raw/qfq pair is invalid for {symbol}: {exc}") from exc
+    except Exception as exc:
+        from data_provider.miniqmt_bridge import MiniQMTError
+        if provider != "miniqmt" or not isinstance(exc, MiniQMTError):
+            raise
+        raise CnEtfDownloadError(f"MiniQMT input unavailable for {symbol}: {exc}") from exc
     for kind, frame in (("raw", raw), ("qfq", qfq), ("factors", factors)):
         _atomic_parquet(frame, paths[kind])
     complete = {"identity": identity, "sha256": {kind: sha256_file(path) for kind, path in paths.items()}}
-    if provider == "baostock":
+    if provider in {"baostock", "miniqmt"}:
         atomic_write_json(receipt_path, raw.attrs["source_receipt"])
         complete["source_receipt_sha256"] = sha256_file(receipt_path)
     atomic_write_json(marker, complete)
@@ -1756,13 +1785,15 @@ def update_cn_etf_snapshot(
     base_snapshot: Path | None = None,
     symbols: list[str] | None = None,
     publish: bool = True,
-    keep_failed_history: bool = False,
-    provider: str = "tencent",
+    keep_failed_history: bool | None = None,
+    provider: str = "miniqmt",
 ) -> Path:
     """Reuse the frozen ETF snapshot and fetch only its missing date window."""
 
-    if provider not in {"tencent", "eastmoney", "baostock"}:
-        raise ValueError("incremental provider must be tencent, eastmoney or baostock")
+    if provider not in {"miniqmt", "tencent", "eastmoney", "baostock"}:
+        raise ValueError("unsupported incremental ETF provider")
+    if keep_failed_history is None:
+        keep_failed_history = provider == "miniqmt"
     if overlap_days < 1 or overlap_days > 60:
         raise ValueError("overlap_days must be between 1 and 60")
     if request_interval < MIN_REQUEST_INTERVAL:
@@ -1802,7 +1833,7 @@ def update_cn_etf_snapshot(
         if manifest.get("data_kind") != "paired_daily_bars":
             raise DataContractError("cn_etf_daily is not a paired raw/qfq snapshot")
         history_provider = (manifest.get("source") or {}).get("provider")
-        if history_provider not in {"tencent", "eastmoney", "baostock", "tickflow", "mixed"}:
+        if history_provider not in {"miniqmt", "tencent", "eastmoney", "baostock", "tickflow", "mixed"}:
             raise DataContractError("incremental update requires an identified frozen history provider")
         base_manifest_sha256 = sha256_file(current / "DATASET_MANIFEST.json")
 
@@ -1836,6 +1867,29 @@ def update_cn_etf_snapshot(
             str(row.symbol): _as_date(str(row.last_date))
             for row in qfq_index.itertuples(index=False)
         }
+        metadata_by_symbol = {str(row.symbol): row for row in universe.itertuples(index=False)}
+        first_by_symbol = {str(row.symbol): _as_date(str(row.first_date)) for row in qfq_index.itertuples(index=False)} if provider == "miniqmt" else {}
+        calendar_bridge_calls = 0
+        if provider == "miniqmt" and through > max(last_by_symbol.values()):
+            frozen = False
+            for s in sorted(selected):
+                if last_by_symbol[s] >= through:
+                    continue
+                row = metadata_by_symbol[s]
+                first = first_by_symbol[s]
+                start = max(first, last_by_symbol[s] - pd.Timedelta(days=overlap_days)).date().isoformat()
+                metadata = {"code": str(row.code).zfill(6), "market": str(row.market).lower(), "name": str(row.name)}
+                identity = _incremental_identity(s, metadata, base_manifest_sha256, start, through.date().isoformat(), provider)
+                key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+                if (root / "cache/cn-etf-incremental" / key / "COMPLETE.json").is_file():
+                    frozen = True
+                    break
+            # This only avoids a redundant calendar RPC. Every cache and its
+            # frozen source request is still validated before any adoption.
+            if not frozen:
+                from miniqmt_etf_source import latest_session
+                through = latest_session(through)
+                calendar_bridge_calls = 1
         missing_symbols = sorted(
             symbol for symbol, last_date in last_by_symbol.items() if symbol in selected and last_date < through
         )
@@ -1848,7 +1902,8 @@ def update_cn_etf_snapshot(
                     "snapshot_id": current.name,
                     "requested_through": requested_through.date().isoformat(),
                     "through": through.date().isoformat(),
-                    "requests_used": 0,
+                    "requests_used": calendar_bridge_calls,
+                    "calendar_bridge_calls": calendar_bridge_calls,
                     "symbols_requested": 0,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                     "generated_at": timestamp,
@@ -1859,8 +1914,17 @@ def update_cn_etf_snapshot(
         gate = RequestGate(interval=request_interval, budget=request_budget)
         import requests
 
-        session = requests.Session()
-        session.trust_env = False
+        if provider == "miniqmt":
+            from miniqmt_etf_source import MiniQMTEtfSource
+            windows = {
+                s: (max(first_by_symbol[s],
+                        last_by_symbol[s] - pd.Timedelta(days=overlap_days)).date().isoformat(), through.date().isoformat())
+                for s in missing_symbols
+            }
+            session = MiniQMTEtfSource(root / "cache/cn-etf-incremental", windows)
+        else:
+            session = requests.Session()
+            session.trust_env = False
         run_id = pd.Timestamp(timestamp).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         snapshot_id = f"cn-etf-{provider}-incremental-{run_id}"
         staging_run = root / "staging" / f"cn-etf-incremental-{run_id}"
@@ -1871,10 +1935,8 @@ def update_cn_etf_snapshot(
         symbol_update_failures: dict[str, dict[str, str]] = {}
         rows_added_by_symbol: dict[str, int] = {}
         factors_by_symbol: dict[str, pd.DataFrame] = {}
-        metadata_by_symbol = {
-            str(row.symbol): row
-            for row in universe.itertuples(index=False)
-        }
+        miniqmt_receipts: dict[str, dict] = {}
+        miniqmt_action_history = dict((manifest.get("source") or {}).get("miniqmt_action_history") or {})
         keep_prepared = False
         try:
             for symbol in sorted(universe_symbols):
@@ -1932,9 +1994,29 @@ def update_cn_etf_snapshot(
                         session=session, request_gate=gate, retries=retries, timeout=timeout,
                         provider=provider,
                     )
+                    if provider == "miniqmt":
+                        from data_provider.miniqmt_bridge import action_history_digest
+                        previous = miniqmt_action_history.get(symbol)
+                        if previous and action_history_digest(incoming_raw.attrs["miniqmt_actions"], previous["through"], previous.get("since")) != previous["sha256"]:
+                            raise HistoricalRevisionDetected(f"MiniQMT revised historical cash/share events for {symbol}; retain old files for separate repair")
                     updated_raw, updated_qfq, rows_added = merge_incremental_pair(
                         symbol, current_raw, current_qfq, incoming_raw, incoming_qfq,
                     )
+                    if provider == "miniqmt":
+                        from miniqmt_etf_source import verified_response
+                        receipt = incoming_raw.attrs["source_receipt"]
+                        response_path, _ = verified_response(root / "cache/cn-etf-incremental", receipt)
+                        destination = stage / "source_receipts/miniqmt" / response_path.name
+                        if not destination.exists():
+                            _link_or_copy(response_path, destination)
+                        miniqmt_receipts[receipt["sha256"]] = {
+                            "relative_path": destination.relative_to(stage).as_posix(), "sha256": receipt["sha256"]}
+                        action_through = incoming_raw.attrs["miniqmt_action_through"]
+                        miniqmt_action_history[symbol] = {
+                            "through": action_through,
+                            "since": first_by_symbol[symbol].date().isoformat(),
+                            "sha256": action_history_digest(incoming_raw.attrs["miniqmt_actions"], action_through, first_by_symbol[symbol].date().isoformat()),
+                        }
                 except CnEtfDownloadError as exc:
                     if not keep_failed_history:
                         raise
@@ -2041,6 +2123,7 @@ def update_cn_etf_snapshot(
                     "overlap_calendar_days": int(overlap_days),
                     "rows_added": int(sum(rows_added_by_symbol.values())),
                     "provider_request_calls": gate.calls,
+                    "calendar_bridge_calls": calendar_bridge_calls,
                     "network_requests": getattr(session, "network_calls", gate.calls),
                     "targeted_full_refresh_symbols": sorted(
                         targeted_full_refresh_symbols
@@ -2057,6 +2140,12 @@ def update_cn_etf_snapshot(
                     },
                 }
             )
+            if provider == "miniqmt":
+                source["miniqmt_receipts"] = list(miniqmt_receipts.values())
+                source["bridge_calls"] = session.bridge_calls
+                source["volume_unit"] = "lots"
+                source["qfq_event_rule"] = "cash-share-affine-front-v1"
+                source["miniqmt_action_history"] = miniqmt_action_history
             latest_date = max(
                 _as_date(pd.read_parquet(path, columns=["date"])["date"].max())
                 for path in (stage / "qfq").glob("*.parquet")
@@ -3341,10 +3430,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--full-rebuild", action="store_true")
     parser.add_argument("--update", action="store_true", help="Update the existing file snapshot without the project service")
     parser.add_argument("--base-snapshot", type=Path, help="Explicit frozen file snapshot")
-    parser.add_argument("--provider", choices=("tencent", "eastmoney", "baostock"), default="tencent", help="Provider for bounded updates only")
+    parser.add_argument("--provider", choices=("miniqmt", "tencent", "eastmoney", "baostock"), default="miniqmt", help="Provider for bounded updates only")
     parser.add_argument("--symbol", action="append", dest="symbols", help="Prepare selected existing symbols only")
     parser.add_argument("--prepare-only", action="store_true", help="Validate staged files without changing LATEST")
-    parser.add_argument("--keep-failed-history", action="store_true", help="Disclose supplier failures and retain those symbols' exact old files")
+    parser.add_argument("--keep-failed-history", action="store_true", default=None, help="Disclose supplier failures and retain those symbols' exact old files (default for MiniQMT)")
     parser.add_argument("--confirm-severe-current-corruption", action="store_true")
     parser.add_argument("--confirm-backup-unrecoverable", action="store_true")
     parser.add_argument("--confirm-user-approved", action="store_true")

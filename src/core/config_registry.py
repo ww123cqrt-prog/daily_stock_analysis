@@ -915,7 +915,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "REALTIME_SOURCE_PRIORITY": {
         "title": "Realtime Source Priority",
-        "description": "Comma-separated priority for realtime quote providers.",
+        "description": "Comma-separated realtime providers. With a configured MiniQMT workstation, the automatic default starts with miniqmt; an explicit value overrides this order.",
         "category": "data_source",
         "data_type": "string",
         "ui_control": "text",
