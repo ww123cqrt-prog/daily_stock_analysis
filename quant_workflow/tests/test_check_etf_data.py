@@ -529,3 +529,95 @@ def test_split_factor_representation_does_not_create_false_conviction(representa
         i["rule"] == "split_ratio_disagreement" and i["severity"] == "needs_review"
         for i in issues
     )
+
+
+def absence_fixture(root):
+    snapshot = frozen_fixture(root)
+    document = snapshot / "provenance" / "announcement.body"
+    document.parent.mkdir()
+    document.write_bytes(b"operator inspected suspension announcement")
+    binding = {}
+    for component, index_name in (
+        ("raw", "RAW_FILE_INDEX.parquet"), ("qfq", "QFQ_FILE_INDEX.parquet")
+    ):
+        binding[component] = pd.read_parquet(snapshot / index_name).iloc[0].sha256
+    bundle = {
+        "dataset_id": "cn_etf_daily",
+        "checked_through": "2026-10-20",
+        "absence_intervals": [{
+            "symbol": "SH510010", "start": "2026-10-19", "end": "2026-10-19",
+            "reason": "trading_suspended", "component_sha256": binding,
+            "sources": [{
+                "path": "provenance/announcement.body",
+                "sha256": hashlib.sha256(document.read_bytes()).hexdigest(),
+                "url": "https://example.test/announcement.pdf",
+            }],
+            "note": "The announcement was inspected; scope is this date only.",
+        }],
+    }
+    proof = snapshot / "provenance" / "followup.json"
+    proof.write_text(json.dumps(bundle))
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["latest_trade_date"] = "2026-10-20"
+    manifest["source"]["evidence_followup"] = {
+        "path": "provenance/followup.json",
+        "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    pointer_path = snapshot.parent.parent / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+    return snapshot, document, proof, bundle
+
+
+def test_announced_absence_is_separate_from_unexplained_missing_bar(tmp_path):
+    mod = checker()
+    root = tmp_path / "data"
+    absence_fixture(root)
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": ["2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"]}).to_csv(calendar, index=False)
+    before = digest_tree(root)
+    result = mod.audit_etf_snapshot(root, output_dir=tmp_path / "report", calendar_path=calendar)
+    assert result["explained_absence_sessions"] == 1
+    assert result["symbols_at_target"] == 0 and result["raw_rows"] == 2
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-20"}
+    explained = pd.read_csv(tmp_path / "report/explained_absences.csv")
+    assert explained.iloc[0].date == "2026-10-19"
+    assert explained.iloc[0].reason == "trading_suspended"
+    assert digest_tree(root) == before
+
+
+@pytest.mark.parametrize("damage", ["document", "binding", "path_escape", "reason"])
+def test_invalid_absence_evidence_never_hides_missing_sessions(tmp_path, damage):
+    mod = checker()
+    root = tmp_path / "data"
+    snapshot, document, proof, bundle = absence_fixture(root)
+    record = bundle["absence_intervals"][0]
+    if damage == "document":
+        document.write_bytes(b"other announcement bytes")
+    else:
+        if damage == "binding":
+            record["component_sha256"]["raw"] = "0" * 64
+        elif damage == "path_escape":
+            record["sources"][0]["path"] = "../outside.body"
+        else:
+            record["reason"] = "cache_is_empty"
+        proof.write_text(json.dumps(bundle))
+        manifest_path = snapshot / "DATASET_MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source"]["evidence_followup"]["sha256"] = hashlib.sha256(proof.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        pointer_path = snapshot.parent.parent / "LATEST.json"
+        pointer = json.loads(pointer_path.read_text())
+        pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        pointer_path.write_text(json.dumps(pointer))
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": ["2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"]}).to_csv(calendar, index=False)
+    result = mod.audit_etf_snapshot(root, output_dir=tmp_path / "report", calendar_path=calendar)
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert result["explained_absence_sessions"] == 0
+    assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-19", "2026-10-20"}
+    assert (findings.rule == "absence_evidence_unavailable").any()

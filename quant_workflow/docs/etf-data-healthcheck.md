@@ -25,6 +25,7 @@
 | `REPORT.md` | 中文概览和检查边界 |
 | `findings.csv` | 按证券、日期、组件、字段列出异常及依据 |
 | `symbols.csv` | 每只 ETF 的日期、行数和各类问题数量 |
+| `explained_absences.csv` | 已核读公告解释的无行情日期，不填造 bar、不推进实际末日 |
 | `summary.json` | 版本、规则、计数、耗时、内存及外部证据对照 |
 | `read-set.json` | 实际读取的文件、字节数和 SHA256 |
 
@@ -77,6 +78,10 @@ A 股旧 TickFlow 因子表的空 `symbol`/`offset`，可通过 `incremental_upd
 拟合因子存在舍入差异，平价行情的仿射表示也可能不唯一。这类比例差异只列待核查，不直接判错；明确拆分且边界两侧 QFQ 仍完全等于 raw 时，才归为确定漏复权。
 
 快照已声明并冻结的腾讯正文会离线重放，按证券、共同日期和四个 OHLC 字段比较。样本只支持实际窗口，不证明全历史。需要新增核验时，将有限材料放在报告目录，旧行情不动；默认一键检查不联网。
+
+已核读的停牌、清算或终止上市公告可随新派生快照保存。清单的 `source.evidence_followup` 引用快照内 JSON 的 `path`、`sha256`；该文件声明 `dataset_id=cn_etf_daily`、`checked_through` 和 `absence_intervals`。每段包含 `symbol/start/end/reason`、当前 `raw/qfq` 的 `component_sha256`、`sources`（公告 `path/sha256/url`）及核读 `note`。原因仅接受 `trading_suspended`、`fund_liquidation`、`delisted`。
+
+这是人工核读结果的有界留存，和拆分 CSV 一样，工具只复核文件、摘要、证券及日期绑定，不自动认证公告真伪或推断日期。材料缺失、被替换、价格文件已变或范围不符时，缺日仍列证据不足。已解释日期另列，实际文件末日和目标达标数不改。MiniQMT 空缓存、空因子表、周末的 `IsTrading=False` 或零成交观测，均不能代替停牌公告。补到部分因子事件也不证明其余历史不存在事件；第三方对照按实际证券、日期、字段留存。
 
 ## 回滚与范围
 

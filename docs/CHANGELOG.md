@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] ETF 只读体检单列经核读公告解释的停牌、清算和退市缺日，绑定实际文件及公告摘要；不补造行情、不推进末日、不影响正常读取。
+
 - [修复] 增加按冻结 raw/QFQ 数值证明补齐旧 TickFlow 因子缺失元数据的显式离线工具；ETF 体检将旧 close 比值拟合正确列为证据不足，不新增读取门禁。
 
 - [修复] MiniQMT 短窗口核验不再因窗口之前的股改记录误拒绝股票；实际受未知股改影响的价格仍拒绝。

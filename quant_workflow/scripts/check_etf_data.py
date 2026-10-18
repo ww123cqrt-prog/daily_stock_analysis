@@ -55,7 +55,7 @@ FINDING_FIELDS = (
     "detail",
     "evidence",
 )
-RULE_VERSION = "etf-readonly-healthcheck.v1"
+RULE_VERSION = "etf-readonly-healthcheck.v2"
 # Rules are copied/adapted, not imported from or executed by the sealed service.
 RULE_ORIGIN = {
     "existing": "quant_workflow/scripts/quant_data_contract.py:_validate_bar_frame,_validate_paired_snapshot_components",
@@ -768,6 +768,70 @@ def _write_csv(path, rows, columns):
         writer.writerows(rows)
 
 
+def _announced_absences(snapshot, source, indexes, target, readset):
+    """Use operator-inspected announcements only for the exact bound snapshot.
+
+    As with split evidence, hashes prove retained bytes, not document authenticity
+    or the operator's interpretation. Empty vendor caches are never announcements.
+    """
+    descriptor = source.get("evidence_followup")
+    if not descriptor:
+        return {}, []
+    accepted, issues = {}, []
+    try:
+        bundle = readset.json(
+            _child(snapshot, descriptor["path"]), descriptor["sha256"]
+        )
+        if (
+            bundle["dataset_id"] != "cn_etf_daily"
+            or pd.isna(pd.Timestamp(bundle["checked_through"]))
+            or pd.Timestamp(bundle["checked_through"]) < target
+            or not isinstance(bundle["absence_intervals"], list)
+        ):
+            raise ValueError("absence evidence dataset/date scope differs")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {}, [_finding(
+            "absence_evidence_unavailable", "*", "evidence", "absence",
+            severity="insufficient_evidence", detail=str(exc),
+        )]
+    for record in bundle["absence_intervals"]:
+        symbol = str(record.get("symbol", "*")) if isinstance(record, dict) else "*"
+        try:
+            start, end = (pd.Timestamp(record[key]) for key in ("start", "end"))
+            if (
+                pd.isna(start) or pd.isna(end) or start > end
+                or start != start.normalize() or end != end.normalize()
+                or end > pd.Timestamp(bundle["checked_through"])
+                or record["reason"] not in {
+                    "trading_suspended", "fund_liquidation", "delisted"
+                }
+                or not isinstance(record["sources"], list) or not record["sources"]
+            ):
+                raise ValueError("invalid announcement interval/reason")
+            for component in ("raw", "qfq"):
+                if record["component_sha256"][component] != indexes[component][symbol]["sha256"]:
+                    raise ValueError("announcement binding differs from current price files")
+            for document in record["sources"]:
+                if (
+                    not isinstance(document["sha256"], str)
+                    or len(document["sha256"]) != 64
+                    or not str(document["url"]).startswith(("https://", "http://"))
+                ):
+                    raise ValueError("announcement source reference is incomplete")
+                readset.read(_child(snapshot, document["path"]), document["sha256"])
+            accepted.setdefault(symbol, []).append({
+                "start": start, "end": end, "reason": record["reason"],
+                "detail": str(record.get("note", "")),
+                "evidence": " | ".join(item["url"] for item in record["sources"]),
+            })
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            issues.append(_finding(
+                "absence_evidence_unavailable", symbol, "evidence", "absence",
+                severity="insufficient_evidence", detail=str(exc),
+            ))
+    return accepted, issues
+
+
 def _reference_comparison(symbol, qfq, body, evidence):
     """Replay exact saved Tencent observations; a disagreement doesn't pick a winner."""
     payload = json.loads(body)
@@ -993,6 +1057,11 @@ def audit_etf_snapshot(
             )
         )
     target = pd.Timestamp(manifest["latest_trade_date"])
+    absence_intervals, absence_issues = _announced_absences(
+        snapshot, source, indexes, target, readset
+    )
+    issues.extend(absence_issues)
+    explained_absences = []
     date_arrays = {}
     semantic_started = time.monotonic()
     for count, symbol in enumerate(symbols, 1):
@@ -1124,6 +1193,17 @@ def audit_etf_snapshot(
         absent = np.setdiff1d(within, dates)
         last = dates.max()
         for day in absent:
+            explanation = next((
+                item for item in absence_intervals.get(symbol, ())
+                if item["start"] <= pd.Timestamp(day) <= item["end"]
+            ), None)
+            if explanation is not None:
+                explained_absences.append({
+                    "symbol": symbol, "date": _date(day),
+                    "reason": explanation["reason"], "detail": explanation["detail"],
+                    "evidence": explanation["evidence"],
+                })
+                continue
             issues.append(
                 _finding(
                     "tail_not_covered" if day > last else "missing_session_unexplained",
@@ -1217,6 +1297,7 @@ def audit_etf_snapshot(
             i["native_volume_checked_rows"] for i in summaries
         ),
         "symbols_at_target": sum(i["at_target"] for i in summaries),
+        "explained_absence_sessions": len(explained_absences),
         "counts": dict(counts),
         "rules": dict(Counter(i["rule"] for i in issues)),
         "affected_symbols": {
@@ -1255,9 +1336,14 @@ def audit_etf_snapshot(
             "未提供日历/停牌证据时缺日为证据不足",
             "同类连续缺失按起止日期和实际行数汇总，数值矛盾逐日列出",
             "此报告不改变数据、不授权发布、不影响查询或回测",
+            "公告缺日解释仅适用于绑定文件和日期；工具核对字节摘要，不自动认证公告出处或替代人工核读；不会填造行情或推进实际行情末日",
         ],
     }
     _write_csv(output_dir / "findings.csv", issues, FINDING_FIELDS)
+    _write_csv(
+        output_dir / "explained_absences.csv", explained_absences,
+        ["symbol", "date", "reason", "detail", "evidence"],
+    )
     _write_csv(
         output_dir / "symbols.csv",
         summaries,
@@ -1276,6 +1362,7 @@ def audit_etf_snapshot(
     )
     text += (
         "\n详单见 findings.csv（证券、日期、字段、原值/对照值）；逐证券汇总见 symbols.csv。\n\n"
+        + f"经核读公告解释的无行情交易日 {len(explained_absences)} 项，另见 explained_absences.csv；实际行情末日不变。\n\n"
         + "\n".join(f"- {limit}" for limit in report["limits"])
         + f"\n\n输入未变：{unchanged}；耗时 {report['timing']['elapsed_seconds']} 秒；峰值RSS {report['peak_rss_mib']} MiB。\n"
     )
