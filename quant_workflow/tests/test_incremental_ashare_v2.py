@@ -145,6 +145,26 @@ def test_miniqmt_ratio_increment_repairs_only_explicitly_proven_omitted_event():
         mod.merge_miniqmt_ratio_increment(**kwargs, repair_event_dates=("2026-08-26",))
 
 
+@pytest.mark.parametrize("has_offset", [False, True])
+def test_miniqmt_ratio_increment_can_be_replayed_without_introducing_unknown_identity(has_offset):
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    if not has_offset:
+        factors = factors.drop(columns="offset")
+    first = mod.merge_miniqmt_ratio_increment(
+        base_raw=raw, base_qfq=qfq, base_factors=factors,
+        raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+    )
+    assert "symbol" not in first[2]
+    assert ("offset" in first[2]) == has_offset
+    second = mod.merge_miniqmt_ratio_increment(
+        base_raw=first[0], base_qfq=first[1], base_factors=first[2],
+        raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+    )
+    for old, new in zip(first, second):
+        pd.testing.assert_frame_equal(old, new, check_dtype=False)
+
+
 @pytest.mark.parametrize("damage", ["missing_action", "wrong_dr", "cash_basis", "raw_conflict", "bad_old_factor"])
 def test_miniqmt_ratio_increment_refuses_unexplained_or_mixed_basis(damage):
     mod = load_script("incremental_update_ashare_v2")

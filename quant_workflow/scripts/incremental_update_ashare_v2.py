@@ -696,6 +696,9 @@ def merge_miniqmt_ratio_increment(
                               "factor": scales[tail] * anchor, "offset": 0.,
                               "factor_source": "miniqmt_explicit_dr_ratio",
                               "factor_terminal_normalized": anchor == 1.})
+    # Absence means an implicit identity/zero offset in the old format. Adding
+    # these columns only on the tail would turn proven old rows into NaNs.
+    extension = extension.drop(columns=[c for c in ("symbol", "offset") if c not in factors])
     aligned["factor"] = scales * anchor
     aligned["source_id"] = aligned.get("source_id", pd.Series("miniqmt", index=aligned.index)).astype(str) + "|front_ratio"
     out_raw = pd.concat([old_raw, raw.loc[tail]], ignore_index=True)
