@@ -691,6 +691,12 @@ def merge_miniqmt_ratio_increment(
         historical.loc[changed, "source_id"] = historical.loc[changed, "source_id"].astype(str) + "|miniqmt-explicit-dr"
     if "factor_source" in factors:
         factors.loc[changed, "factor_source"] = factors.loc[changed, "factor_source"].astype(str) + "|miniqmt-explicit-dr"
+    if not exact_history and rounded_history:
+        # Preserve a proven four-decimal representation through later updates.
+        # Scaling previously rounded prices would leave an unrecorded residual
+        # and fail the next exact/rounded reconstruction check.
+        historical[list(PRICE_COLUMNS)] = np.round(old_prices * factors.factor.to_numpy()[:, None], 4)
+        aligned[list(PRICE_COLUMNS)] = aligned[list(PRICE_COLUMNS)].round(4)
     tail = np.asarray(raw.date > end)
     extension = pd.DataFrame({"date": raw.loc[tail, "date"], "symbol": symbol,
                               "factor": scales[tail] * anchor, "offset": 0.,
@@ -704,7 +710,8 @@ def merge_miniqmt_ratio_increment(
     out_raw = pd.concat([old_raw, raw.loc[tail]], ignore_index=True)
     out_qfq = pd.concat([historical, aligned.loc[tail]], ignore_index=True)
     for frame in (out_raw, out_qfq):
-        begin = 1 if frame is out_qfq and repairs else len(old_raw)
+        recalculate_history_aux = repairs or (not exact_history and rounded_history and changed.any())
+        begin = 1 if frame is out_qfq and recalculate_history_aux else len(old_raw)
         if "preclose" in frame:
             frame.loc[begin:, "preclose"] = frame.close.shift(1).iloc[begin:].to_numpy()
         if "pctChg" in frame:

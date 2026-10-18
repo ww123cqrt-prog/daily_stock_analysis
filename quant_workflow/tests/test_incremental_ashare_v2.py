@@ -95,7 +95,7 @@ def test_miniqmt_ratio_increment_preserves_verified_four_decimal_history():
         base_raw=raw, base_qfq=qfq, base_factors=factors,
         raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
     )
-    assert mq.close.iloc[0] == pytest.approx(qfq.close.iloc[0] / 1.022026)
+    assert mq.close.iloc[0] == pytest.approx(round(raw.close.iloc[0] * factors.factor.iloc[0] / 1.022026, 4))
     qfq.loc[0, "close"] += .0001
     with pytest.raises(mod.DataContractError, match="old raw/factor/QFQ"):
         mod.merge_miniqmt_ratio_increment(
@@ -146,9 +146,14 @@ def test_miniqmt_ratio_increment_repairs_only_explicitly_proven_omitted_event():
 
 
 @pytest.mark.parametrize("has_offset", [False, True])
-def test_miniqmt_ratio_increment_can_be_replayed_without_introducing_unknown_identity(has_offset):
+@pytest.mark.parametrize("rounded_history", [False, True])
+def test_miniqmt_ratio_increment_can_be_replayed_without_introducing_unknown_identity(has_offset, rounded_history):
     mod = load_script("incremental_update_ashare_v2")
     raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    if rounded_history:
+        factors.loc[0, "factor"] = .01234567
+        for field in ("open", "high", "low", "close"):
+            qfq[field] = (raw[field] * factors.factor).round(4)
     if not has_offset:
         factors = factors.drop(columns="offset")
     first = mod.merge_miniqmt_ratio_increment(
