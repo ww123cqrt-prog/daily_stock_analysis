@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -55,7 +56,7 @@ FINDING_FIELDS = (
     "detail",
     "evidence",
 )
-RULE_VERSION = "etf-readonly-healthcheck.v2"
+RULE_VERSION = "etf-readonly-healthcheck.v3"
 # Rules are copied/adapted, not imported from or executed by the sealed service.
 RULE_ORIGIN = {
     "existing": "quant_workflow/scripts/quant_data_contract.py:_validate_bar_frame,_validate_paired_snapshot_components",
@@ -593,7 +594,7 @@ def inspect_etf_frames(
             "factor_source", pd.Series("unknown", index=factors.index)
         ).astype(str)
         unproven = sources.str.contains(
-            "derived_same_provider|derived_close_ratio|unknown", regex=True
+            "derived_same_provider|derived_close_ratio|unknown|^sina_qfq_registry$", regex=True
         )
         issues.extend(
             _mask_findings(
@@ -832,6 +833,86 @@ def _announced_absences(snapshot, source, indexes, target, readset):
     return accepted, issues
 
 
+def _provider_zero_activity(snapshot, source, indexes, readset):
+    """Explain sparse dates using retained observations, without inventing bars.
+
+    A vendor's zero-activity row is neither an exchange announcement nor proof
+    that no trade occurred. Keep that distinction in the exported explanation.
+    """
+    descriptor = source.get("zero_activity_evidence")
+    if not descriptor:
+        return {}, []
+    accepted, issues, duplicates = {}, [], set()
+    try:
+        bundle = readset.json(_child(snapshot, descriptor["path"]), descriptor["sha256"])
+        if (
+            bundle["dataset_id"] != "cn_etf_daily" or bundle["provider"] != "baostock"
+            or not isinstance(bundle["responses"], list)
+        ):
+            raise ValueError("zero-activity evidence dataset/provider differs")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {}, [_finding(
+            "zero_activity_evidence_unavailable", "*", "evidence", "absence",
+            severity="insufficient_evidence", detail=str(exc),
+        )]
+    for entry in bundle["responses"]:
+        symbol = str(entry.get("symbol", "*")) if isinstance(entry, dict) else "*"
+        try:
+            for component in ("raw", "qfq"):
+                if entry["component_sha256"][component] != indexes[component][symbol]["sha256"]:
+                    raise ValueError("zero-activity binding differs from current price files")
+            response = readset.json(_child(snapshot, entry["path"]), entry["sha256"])
+            request, fields = response["request"], response["fields"]
+            code = symbol[:2].lower() + "." + symbol[2:]
+            needed = {"date", "code", "open", "high", "low", "close", "volume", "amount", "adjustflag", "tradestatus"}
+            if (
+                response["error_code"] != "0" or request["code"] != code
+                or request["frequency"] != "d" or request["adjustflag"] != "3"
+                or not isinstance(fields, list) or len(set(fields)) != len(fields)
+                or not needed.issubset(fields) or not isinstance(response["rows"], list)
+            ):
+                raise ValueError("zero-activity response request/schema differs")
+            start, end = (pd.Timestamp(request[key]) for key in ("start_date", "end_date"))
+            if pd.isna(start) or pd.isna(end) or start > end or start != start.normalize() or end != end.normalize():
+                raise ValueError("invalid zero-activity request dates")
+            pending, seen = {}, set()
+            for values in response["rows"]:
+                if not isinstance(values, list) or len(values) != len(fields):
+                    raise ValueError("invalid zero-activity response row")
+                row = dict(zip(fields, values))
+                day = pd.Timestamp(row["date"])
+                if (
+                    pd.isna(day) or day != day.normalize() or not start <= day <= end
+                    or day in seen or row["code"] != code or row["adjustflag"] != "3"
+                    or row["tradestatus"] not in {"0", "1"}
+                ):
+                    raise ValueError("zero-activity row identity/status differs")
+                seen.add(day)
+                prices = np.array([float(row[k]) for k in ("open", "high", "low", "close")])
+                volume, amount = float(row["volume"]), float(row["amount"])
+                if not np.isfinite(np.r_[prices, volume, amount]).all() or (prices <= 0).any() or min(volume, amount) < 0:
+                    raise ValueError("invalid zero-activity numbers")
+                if volume != 0 or amount != 0 or not (prices == prices[0]).all():
+                    continue
+                key = (symbol, day)
+                if key in accepted or key in duplicates:
+                    accepted.pop(key, None)
+                    duplicates.add(key)
+                    raise ValueError("duplicate zero-activity observation")
+                pending[key] = {
+                    "reason": "provider_reported_zero_activity",
+                    "detail": f"Baostock记录成交量/额为0、OHLC相同，tradestatus={row['tradestatus']}；不是交易所停牌公告，也不等于独立证明无成交；保留稀疏原表，不插入成交bar",
+                    "evidence": entry["path"] + "#sha256=" + entry["sha256"],
+                }
+            accepted.update(pending)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            issues.append(_finding(
+                "zero_activity_evidence_unavailable", symbol, "evidence", "absence",
+                severity="insufficient_evidence", detail=str(exc),
+            ))
+    return accepted, issues
+
+
 def _reference_comparison(symbol, qfq, body, evidence):
     """Replay exact saved Tencent observations; a disagreement doesn't pick a winner."""
     payload = json.loads(body)
@@ -889,6 +970,83 @@ def _reference_comparison(symbol, qfq, body, evidence):
         "start": min(dates) if dates else "",
         "end": max(dates) if dates else "",
         "scope": "saved observation only, not certification of full history",
+    }
+
+
+def _sina_factor_transform(symbol, dates, body):
+    """Replay the provider's quoted affine regimes, never fit local prices."""
+    if len(body) > 500_000 or dates.empty or dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+        raise ValueError("invalid factor evidence size or local date keys")
+    text = body.decode("gb18030")
+    prefix = re.match(r"\s*var\s+" + re.escape(symbol.lower()) + r"qfq\s*=\s*", text)
+    if prefix is None:
+        raise ValueError("factor registry instrument differs")
+    value, _ = json.JSONDecoder().raw_decode(text[prefix.end():])
+    if (
+        not isinstance(value, dict) or type(value.get("total")) is not int
+        or not 0 < value["total"] <= 10_000
+        or not isinstance(value.get("data"), list) or len(value["data"]) != value["total"]
+    ):
+        raise ValueError("factor registry is empty or incomplete")
+    regimes = pd.DataFrame(value["data"])
+    if not {"d", "f", "s", "u"}.issubset(regimes):
+        raise ValueError("factor registry fields are incomplete")
+    regimes["d"] = pd.to_datetime(regimes.d, errors="raise").dt.normalize()
+    if regimes.d.isna().any() or regimes.d.duplicated().any():
+        raise ValueError("factor registry date keys are invalid")
+    for field in ("f", "s", "u"):
+        if regimes[field].map(lambda v: isinstance(v, bool)).any():
+            raise ValueError("boolean factor value is invalid")
+        regimes[field] = pd.to_numeric(regimes[field], errors="raise")
+        if not np.isfinite(regimes[field]).all():
+            raise ValueError("nonfinite factor value")
+    if not regimes.f.eq(1).all() or not regimes.s.gt(0).all():
+        raise ValueError("unsupported factor regime")
+    selected = pd.merge_asof(
+        pd.DataFrame({"date": dates.to_numpy()}), regimes.sort_values("d"),
+        left_on="date", right_on="d",
+    )
+    if selected.s.isna().any():
+        raise ValueError("factor registry does not cover local dates")
+    scale = 1 / selected.s.to_numpy(float)
+    offset = -selected.u.to_numpy(float)
+    # Anchor at the actual local tail; a future quoted event must not leak in.
+    offset = (offset - offset[-1]) / scale[-1]
+    scale = scale / scale[-1]
+    return scale, offset
+
+
+def _factor_registry_comparison(symbol, frames, descriptor, indexes, snapshot, readset):
+    dates = _frame_dates(frames["raw"])
+    if descriptor["as_of"] != _date(dates.max()) or any(
+        descriptor["component_sha256"][component] != indexes[component][symbol]["sha256"]
+        for component in ("raw", "qfq", "factors")
+    ):
+        raise ValueError("factor evidence differs from current files or anchor")
+    body = readset.read(_child(snapshot, descriptor["path"]), descriptor["sha256"])
+    scale, offset = _sina_factor_transform(symbol, dates, body)
+    issues = []
+    for field, actual, expected, component, atol in [
+        (field, _numeric(frames["qfq"], field), _numeric(frames["raw"], field) * scale + offset, "qfq", PAIRED_PRICE_ABSOLUTE_TOLERANCE)
+        for field in PRICE_FIELDS
+    ] + [
+        ("factor", _numeric(frames["factors"], "factor"), scale, "factors", 1e-12),
+        ("offset", _numeric(frames["factors"], "offset"), offset, "factors", 1e-12),
+    ]:
+        bad = ~np.isclose(actual, expected, rtol=1e-12, atol=atol)
+        issues.extend(_mask_findings(
+            bad, dates, rule="external_factor_disagreement", symbol=symbol,
+            component=component, field=field, values=actual,
+            severity="needs_review", compress=True,
+            detail="与已存外部因子表的逐日变换不同；不自动选择来源或改价",
+        ))
+    for item in issues:
+        item["evidence"] = descriptor["path"]
+    return issues, {
+        "symbol": symbol, "provider": "sina", "comparison": "factor_registry",
+        "evidence": descriptor["path"], "status": "disagreed" if issues else "matched",
+        "dates": len(dates), "start": _date(dates.min()), "end": _date(dates.max()),
+        "scope": "reported provider regimes support these files; not certification of every real historical event",
     }
 
 
@@ -1061,6 +1219,8 @@ def audit_etf_snapshot(
         snapshot, source, indexes, target, readset
     )
     issues.extend(absence_issues)
+    zero_activity, zero_issues = _provider_zero_activity(snapshot, source, indexes, readset)
+    issues.extend(zero_issues)
     explained_absences = []
     date_arrays = {}
     semantic_started = time.monotonic()
@@ -1141,6 +1301,25 @@ def audit_etf_snapshot(
                             detail=str(exc),
                         )
                     )
+            factor_reference = source.get("factor_registry_evidence", {}).get(symbol)
+            if factor_reference:
+                try:
+                    more, reference = _factor_registry_comparison(
+                        symbol, frames, factor_reference, indexes, snapshot, readset
+                    )
+                    issues.extend(more)
+                    references.append(reference)
+                    declared = frames["factors"].get("factor_source", pd.Series(dtype=str))
+                    if reference["status"] == "matched" and len(declared) and declared.eq("sina_qfq_registry").all():
+                        issues[beginning:] = [
+                            item for item in issues[beginning:]
+                            if item["rule"] != "factor_authority_unproven"
+                        ]
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    issues.append(_finding(
+                        "factor_evidence_unavailable", symbol, "evidence", "factor/offset",
+                        severity="insufficient_evidence", detail=str(exc),
+                    ))
         raw = frames.get("raw", pd.DataFrame())
         dates = _frame_dates(raw)
         last = dates.max()
@@ -1197,6 +1376,8 @@ def audit_etf_snapshot(
                 item for item in absence_intervals.get(symbol, ())
                 if item["start"] <= pd.Timestamp(day) <= item["end"]
             ), None)
+            if explanation is None:
+                explanation = zero_activity.get((symbol, pd.Timestamp(day)))
             if explanation is not None:
                 explained_absences.append({
                     "symbol": symbol, "date": _date(day),
@@ -1298,6 +1479,16 @@ def audit_etf_snapshot(
         ),
         "symbols_at_target": sum(i["at_target"] for i in summaries),
         "explained_absence_sessions": len(explained_absences),
+        "announced_absence_sessions": sum(
+            item["reason"] != "provider_reported_zero_activity" for item in explained_absences
+        ),
+        "provider_zero_activity_sessions": sum(
+            item["reason"] == "provider_reported_zero_activity" for item in explained_absences
+        ),
+        "factor_registry_matches": sum(
+            item.get("comparison") == "factor_registry" and item["status"] == "matched"
+            for item in references
+        ),
         "counts": dict(counts),
         "rules": dict(Counter(i["rule"] for i in issues)),
         "affected_symbols": {
@@ -1337,6 +1528,8 @@ def audit_etf_snapshot(
             "同类连续缺失按起止日期和实际行数汇总，数值矛盾逐日列出",
             "此报告不改变数据、不授权发布、不影响查询或回测",
             "公告缺日解释仅适用于绑定文件和日期；工具核对字节摘要，不自动认证公告出处或替代人工核读；不会填造行情或推进实际行情末日",
+            "供应商零成交记录单列为该来源的观察，不是交易所停牌公告，也不是独立认证无成交",
+            "外部因子复核只确认所存供应商变换支持这些文件，不认证供应商已穷尽全部真实历史事件；空SDK回复不单独视为无事件证明",
         ],
     }
     _write_csv(output_dir / "findings.csv", issues, FINDING_FIELDS)
@@ -1362,7 +1555,8 @@ def audit_etf_snapshot(
     )
     text += (
         "\n详单见 findings.csv（证券、日期、字段、原值/对照值）；逐证券汇总见 symbols.csv。\n\n"
-        + f"经核读公告解释的无行情交易日 {len(explained_absences)} 项，另见 explained_absences.csv；实际行情末日不变。\n\n"
+        + f"无行情日期说明：公告 {report['announced_absence_sessions']} 项，供应商零成交记录 {report['provider_zero_activity_sessions']} 项；后者不等于独立认证无成交。详见 explained_absences.csv，实际行情末日不变。\n\n"
+        + f"所存外部因子表逐日核对吻合 {report['factor_registry_matches']} 只，详见 summary.json 的 external_replays；不等于认证全部真实历史事件。\n\n"
         + "\n".join(f"- {limit}" for limit in report["limits"])
         + f"\n\n输入未变：{unchanged}；耗时 {report['timing']['elapsed_seconds']} 秒；峰值RSS {report['peak_rss_mib']} MiB。\n"
     )

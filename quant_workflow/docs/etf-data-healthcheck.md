@@ -25,7 +25,7 @@
 | `REPORT.md` | 中文概览和检查边界 |
 | `findings.csv` | 按证券、日期、组件、字段列出异常及依据 |
 | `symbols.csv` | 每只 ETF 的日期、行数和各类问题数量 |
-| `explained_absences.csv` | 已核读公告解释的无行情日期，不填造 bar、不推进实际末日 |
+| `explained_absences.csv` | 分列公告解释与供应商零成交记录；后者不等于独立认证无成交，不填造 bar、不推进实际末日 |
 | `summary.json` | 版本、规则、计数、耗时、内存及外部证据对照 |
 | `read-set.json` | 实际读取的文件、字节数和 SHA256 |
 
@@ -82,6 +82,12 @@ A 股旧 TickFlow 因子表的空 `symbol`/`offset`，可通过 `incremental_upd
 已核读的停牌、清算或终止上市公告可随新派生快照保存。清单的 `source.evidence_followup` 引用快照内 JSON 的 `path`、`sha256`；该文件声明 `dataset_id=cn_etf_daily`、`checked_through` 和 `absence_intervals`。每段包含 `symbol/start/end/reason`、当前 `raw/qfq` 的 `component_sha256`、`sources`（公告 `path/sha256/url`）及核读 `note`。原因仅接受 `trading_suspended`、`fund_liquidation`、`delisted`。
 
 这是人工核读结果的有界留存，和拆分 CSV 一样，工具只复核文件、摘要、证券及日期绑定，不自动认证公告真伪或推断日期。材料缺失、被替换、价格文件已变或范围不符时，缺日仍列证据不足。已解释日期另列，实际文件末日和目标达标数不改。MiniQMT 空缓存、空因子表、周末的 `IsTrading=False` 或零成交观测，均不能代替停牌公告。补到部分因子事件也不证明其余历史不存在事件；第三方对照按实际证券、日期、字段留存。
+
+若因子已从供应商实际公布的表取得，可用 `source.factor_registry_evidence` 按证券保存新浪表的 `path/sha256/as_of/component_sha256`。绑定包括当前 raw、QFQ、因子三个文件。体检离线解析对应证券的 `qfq.js`，检查完整条数、日期唯一、支持的变换类型和有限正比例，再按实际文件末日归一；逐日核对四个 OHLC 及因子、偏移。只有这些都吻合，且因子明确标为 `sina_qfq_registry`，才移除该文件“仅从同组价格反推”的提示。只改标签、空回复、缺文件、摘要/范围不符或数值不同均不能获得该结果。
+
+这证明所存供应商因子表支持这些数值，不认证供应商穷尽了所有真实事件；MiniQMT 空列表仍不单独证明从未分红。`front` 的加减式前复权和 `front_ratio` 等比前复权有不同数值，后者不能为消除前者的负数而静默替换。缺日补充必须是实际保存的来源记录，成交量为零不等于程序可以凭前收盘填造 bar；来源明确报停牌或复权关系未核实时分别披露，不阻断其他文件读取。
+
+缺日核实可保留 Baostock 的逐日原始响应，通过 `source.zero_activity_evidence` 绑定当前 raw/QFQ 文件摘要。体检只把实际返回的、同证券同日、原始口径、零成交量与成交额且 OHLC 相同的记录列为 `provider_reported_zero_activity`；供应商的 `tradestatus=0/1` 原样披露。这不是交易所停牌公告，也不是独立证明当日无成交，不插入假 bar、不推进实际行情末日。空响应、非零成交、身份变化或被篡改的记录不能解除缺日提示。完整说明在 `explained_absences.csv`，与正式公告证据分开。
 
 ## 回滚与范围
 

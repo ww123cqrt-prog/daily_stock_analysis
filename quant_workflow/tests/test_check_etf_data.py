@@ -621,3 +621,214 @@ def test_invalid_absence_evidence_never_hides_missing_sessions(tmp_path, damage)
     assert result["explained_absence_sessions"] == 0
     assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-19", "2026-10-20"}
     assert (findings.rule == "absence_evidence_unavailable").any()
+
+
+def registry_body(symbol="SH510010", rows=None):
+    rows = rows if rows is not None else [{"d": "1900-01-01", "f": "1", "s": "1", "u": "0"}]
+    return ("var " + symbol.lower() + "qfq=" + json.dumps(
+        {"total": len(rows), "data": rows}, separators=(",", ":")
+    ) + "; /* provider suffix */").encode()
+
+
+def test_reported_factor_regimes_use_their_affine_rule_and_current_anchor():
+    mod = checker()
+    days = pd.Series(pd.to_datetime(["2026-10-15", "2026-10-16"]))
+    rows = [
+        {"d": "1900-01-01", "f": "1", "s": "2", "u": "0.5"},
+        {"d": "2026-10-16", "f": "1", "s": "1", "u": "0"},
+    ]
+    scale, offset = mod._sina_factor_transform("SH510010", days, registry_body(rows=rows))
+    np.testing.assert_array_equal(scale, [0.5, 1.0])
+    np.testing.assert_array_equal(offset, [-0.5, 0.0])
+    rows[-1]["d"] = "2026-10-19"
+    scale, offset = mod._sina_factor_transform("SH510010", days, registry_body(rows=rows))
+    np.testing.assert_array_equal(scale, [1.0, 1.0])
+    np.testing.assert_array_equal(offset, [0.0, 0.0])
+
+
+def test_reverse_share_event_and_reported_transform_can_agree_without_negative_prices():
+    from data_provider.miniqmt_bridge import adjusted_prices, verified_pair
+
+    mod = checker()
+    days = pd.Series(pd.to_datetime(["2026-10-15", "2026-10-16"]))
+    raw = pd.DataFrame({"date": days, **{f: [1.0, 10.0] for f in ("open", "high", "low", "close")}, "volume": [100.0, 100.0], "amount": [100.0, 1000.0], "suspendFlag": [0, 0]})
+    event = {"date": "2026-10-16", "interest": 0.0, "stockBonus": -0.9, "stockGift": 0.0, "allotNum": 0.0, "allotPrice": 0.0, "gugai": 0, "dr": 1.0}
+    native = adjusted_prices(raw, [event])
+    body = registry_body(rows=[{"d": "1900-01-01", "f": "1", "s": "0.1", "u": "0"}, {"d": "2026-10-16", "f": "1", "s": "1", "u": "0"}])
+    scale, offset = mod._sina_factor_transform("SH510010", days, body)
+    np.testing.assert_allclose(native.close, raw.close * scale + offset, rtol=1e-12)
+    assert native.close.gt(0).all()
+    raw["date"] = raw.date.dt.strftime("%Y-%m-%d")
+    native["date"] = native.date.dt.strftime("%Y-%m-%d")
+    verified_pair({"raw": raw.to_dict("records"), "qfq": native.to_dict("records"), "calendar": raw.date.tolist(), "actions": [event]}, "20261015", "20261016")
+
+
+@pytest.mark.parametrize("damage", ["symbol", "empty", "duplicate", "zero_scale", "uncovered", "mode"])
+def test_invalid_registry_is_not_a_no_event_certificate(damage):
+    mod = checker()
+    days = pd.Series(pd.to_datetime(["2026-10-15", "2026-10-16"]))
+    rows = [{"d": "1900-01-01", "f": "1", "s": "1", "u": "0"}]
+    symbol = "SZ159915" if damage == "symbol" else "SH510010"
+    if damage == "empty":
+        rows = []
+    elif damage == "duplicate":
+        rows *= 2
+    elif damage == "zero_scale":
+        rows[0]["s"] = "0"
+    elif damage == "uncovered":
+        rows[0]["d"] = "2026-10-16"
+    elif damage == "mode":
+        rows[0]["f"] = "2"
+    with pytest.raises(ValueError):
+        mod._sina_factor_transform("SH510010", days, registry_body(symbol, rows))
+
+
+def registry_fixture(root, damage=None):
+    snapshot = frozen_fixture(root)
+    factor_path = snapshot / "factors/SH510010.parquet"
+    factors = pd.read_parquet(factor_path)
+    factors["factor_source"] = "sina_qfq_registry"
+    factors.to_parquet(factor_path, index=False)
+    factor_index = snapshot / "FACTOR_INDEX.parquet"
+    index = pd.read_parquet(factor_index)
+    index.loc[0, "sha256"] = hashlib.sha256(factor_path.read_bytes()).hexdigest()
+    index.to_parquet(factor_index, index=False)
+    evidence = snapshot / "provenance/SH510010.body"
+    evidence.parent.mkdir()
+    body = registry_body("SZ159915" if damage == "symbol" else "SH510010")
+    if damage == "values":
+        body = registry_body(rows=[
+            {"d": "1900-01-01", "f": "1", "s": "1", "u": "1"},
+            {"d": "2026-10-16", "f": "1", "s": "1", "u": "0"},
+        ])
+    evidence.write_bytes(body)
+    desc = {
+        "path": "provenance/SH510010.body", "sha256": hashlib.sha256(body).hexdigest(),
+        "as_of": "2026-10-16",
+        "component_sha256": {
+            component: pd.read_parquet(snapshot / name).iloc[0].sha256
+            for component, name in [("raw", "RAW_FILE_INDEX.parquet"), ("qfq", "QFQ_FILE_INDEX.parquet"), ("factors", "FACTOR_INDEX.parquet")]
+        },
+    }
+    if damage == "binding":
+        desc["component_sha256"]["raw"] = "0" * 64
+    if damage == "body_swap":
+        evidence.write_bytes(body.replace(b'"u":"0"', b'"u":"1"'))
+    if damage == "missing":
+        evidence.unlink()
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source"]["factor_registry_evidence"] = {} if damage == "tag_only" else {"SH510010": desc}
+    manifest_path.write_text(json.dumps(manifest))
+    pointer_path = snapshot.parent.parent / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+    return snapshot
+
+
+def test_public_checker_replays_provider_factor_bytes_without_changing_prices(tmp_path):
+    mod = checker()
+    root = tmp_path / "data"
+    registry_fixture(root)
+    before = digest_tree(root)
+    result = mod.audit_etf_snapshot(root, output_dir=tmp_path / "report")
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert result["factor_registry_matches"] == 1
+    assert not (findings.rule == "factor_authority_unproven").any()
+    assert digest_tree(root) == before and result["network_requests"] == 0
+
+
+@pytest.mark.parametrize("damage", ["binding", "body_swap", "symbol", "values", "missing", "tag_only"])
+def test_factor_evidence_must_match_current_files_and_values(tmp_path, damage):
+    mod = checker()
+    root = tmp_path / "data"
+    registry_fixture(root, damage)
+    result = mod.audit_etf_snapshot(root, output_dir=tmp_path / "report")
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert result["factor_registry_matches"] == 0
+    assert (findings.rule == "factor_authority_unproven").any()
+
+
+def zero_activity_fixture(root, damage=None, trading_status="1"):
+    snapshot = frozen_fixture(root)
+    evidence = snapshot / "provenance/zero-activity.json"
+    evidence.parent.mkdir()
+    response = {
+        "request": {
+            "code": "sh.510010", "start_date": "2026-10-19",
+            "end_date": "2026-10-19", "frequency": "d", "adjustflag": "3",
+        },
+        "error_code": "0",
+        "fields": ["date", "code", "open", "high", "low", "close", "volume", "amount", "adjustflag", "tradestatus"],
+        "rows": [["2026-10-19", "sh.510010", "11", "11", "11", "11", "0", "0", "3", trading_status]],
+    }
+    if damage == "traded":
+        response["rows"][0][6] = "1"
+    elif damage == "symbol":
+        response["rows"][0][1] = "sh.510020"
+    elif damage == "nonflat":
+        response["rows"][0][3] = "12"
+    elif damage == "empty":
+        response["rows"] = []
+    elif damage == "status":
+        response["rows"][0][-1] = "unknown"
+    evidence.write_text(json.dumps(response))
+    entry = {
+        "symbol": "SH510010", "path": "provenance/zero-activity.json",
+        "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        "component_sha256": {
+            c: pd.read_parquet(snapshot / n).iloc[0].sha256
+            for c, n in [("raw", "RAW_FILE_INDEX.parquet"), ("qfq", "QFQ_FILE_INDEX.parquet")]
+        },
+    }
+    if damage == "binding":
+        entry["component_sha256"]["raw"] = "0" * 64
+    elif damage == "body_swap":
+        evidence.write_bytes(evidence.read_bytes().replace(b'"11"', b'"12"'))
+    proof = snapshot / "provenance/zero-index.json"
+    proof.write_text(json.dumps({"dataset_id": "cn_etf_daily", "provider": "baostock", "responses": [entry]}))
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["latest_trade_date"] = "2026-10-20"
+    manifest["source"]["zero_activity_evidence"] = {
+        "path": "provenance/zero-index.json", "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    pointer_path = snapshot.parent.parent / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+    return snapshot
+
+
+@pytest.mark.parametrize("trading_status", ["0", "1"])
+def test_provider_zero_activity_explains_date_without_creating_trade_bar(tmp_path, trading_status):
+    root = tmp_path / "data"
+    zero_activity_fixture(root, trading_status=trading_status)
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": ["2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"]}).to_csv(calendar, index=False)
+    before = digest_tree(root)
+    result = checker().audit_etf_snapshot(root, output_dir=tmp_path / "report", calendar_path=calendar)
+    assert result["provider_zero_activity_sessions"] == 1
+    assert result["announced_absence_sessions"] == 0
+    assert "公告 0 项，供应商零成交记录 1 项" in (tmp_path / "report/REPORT.md").read_text()
+    assert result["raw_rows"] == 2 and result["symbols_at_target"] == 0
+    explained = pd.read_csv(tmp_path / "report/explained_absences.csv")
+    assert explained.iloc[0].reason == "provider_reported_zero_activity"
+    assert "不是交易所停牌公告" in explained.iloc[0].detail
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-20"}
+    assert digest_tree(root) == before
+
+
+@pytest.mark.parametrize("damage", ["traded", "symbol", "nonflat", "empty", "status", "binding", "body_swap"])
+def test_zero_activity_needs_exact_source_rows_and_current_binding(tmp_path, damage):
+    root = tmp_path / "data"
+    zero_activity_fixture(root, damage)
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": ["2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"]}).to_csv(calendar, index=False)
+    result = checker().audit_etf_snapshot(root, output_dir=tmp_path / "report", calendar_path=calendar)
+    assert result["provider_zero_activity_sessions"] == 0
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-19", "2026-10-20"}
