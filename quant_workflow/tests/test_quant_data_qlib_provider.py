@@ -788,6 +788,21 @@ def test_workflow_provider_entrypoint_uses_direct_descriptor(
     assert config["provider"] == "LocalProvider"
 
 
+def test_training_uses_frozen_local_inputs_beside_archived_active(direct_fixture, monkeypatch):
+    root, _, expected_descriptor = direct_fixture
+    from quant_workflow.scripts import _paths
+
+    archived = root / "ACTIVE_RELEASE_SET.json"
+    archived.write_text('{"archived": true}', encoding="utf-8")
+    monkeypatch.setenv("QUANT_DATA_ROOT", str(root))
+    descriptor = _paths.qlib_workflow_provider_descriptor()
+    payload = json.loads(descriptor.read_text())
+    assert descriptor == expected_descriptor
+    assert payload["dataset"]["snapshot_id"] == "qfq-001"
+    assert payload["membership"]["snapshot_id"] == "pit-csi800-001"
+    assert archived.read_text() == '{"archived": true}'
+
+
 def test_membership_versions_get_distinct_frozen_descriptors(
     direct_fixture: tuple[Path, Path, Path],
 ) -> None:

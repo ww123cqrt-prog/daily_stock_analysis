@@ -448,7 +448,7 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
               disabled={running}
               className={INPUT}
             >
-              <option value="etf">{zh ? 'ETF 池（51 只）' : 'ETF pool (51)'}</option>
+              <option value="etf">{zh ? 'ETF 池' : 'ETF pool'}</option>
               <option value="csi800">{zh ? 'CSI800（PIT 成员）' : 'CSI800 (PIT members)'}</option>
               <option value="all_a">{zh ? '全 A（PIT 可用集）' : 'All A-shares (PIT)'}</option>
               <option value="custom">{zh ? '自选股票' : 'Custom'}</option>

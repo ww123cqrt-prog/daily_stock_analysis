@@ -28,9 +28,7 @@ class ScriptPathsTest(unittest.TestCase):
         self.assertEqual(module.workflow_root(), workflow_root)
         self.assertEqual(module.projects_root(), dsa_root.parent)
         sibling_quant_data = dsa_root.parent / "quant_data"
-        expected_quant_data = dsa_root / "quant_data"
-        if not expected_quant_data.exists() and sibling_quant_data.exists():
-            expected_quant_data = sibling_quant_data
+        expected_quant_data = sibling_quant_data if sibling_quant_data.exists() else dsa_root / "quant_data"
         self.assertEqual(module.quant_data_root(), expected_quant_data)
         expected_reports = workflow_root / "reports"
         self.assertEqual(module.reports_root(), expected_reports)
@@ -72,6 +70,15 @@ class ScriptPathsTest(unittest.TestCase):
                 clear=False,
             ):
                 self.assertEqual(module.quant_data_root(), sibling_data)
+
+    def test_archived_active_pointer_cannot_replace_a_missing_local_catalog(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ACTIVE_RELEASE_SET.json").write_text("{}", encoding="utf-8")
+            with patch.dict(os.environ, {"QUANT_DATA_ROOT": str(root)}, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "catalog"):
+                    module.qlib_direct_provider_descriptor()
 
     def test_repo_local_reports_and_mlruns_are_default_even_when_sibling_payload_exists(self):
         module = load_module()

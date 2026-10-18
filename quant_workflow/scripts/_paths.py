@@ -77,10 +77,10 @@ def quant_data_root() -> Path:
 
     repo_local = DEFAULT_DSA_ROOT / "quant_data"
     sibling = projects_root() / "quant_data"
-    if repo_local.exists():
-        return repo_local
     if sibling.exists():
         return sibling
+    if repo_local.exists():
+        return repo_local
     return repo_local
 
 
@@ -252,6 +252,8 @@ def qlib_direct_provider_descriptor(provider: str = "canonical") -> Path:
             "QLIB_CLEANED_PROVIDER_URI and use the governed Qlib Provider"
         )
     root = quant_data_root().expanduser().resolve()
+    # The local Parquet catalog is the selected source. An archived service
+    # pointer in the same data directory does not select a different backend.
     return _resolve_direct_qlib_descriptor(
         str(root),
         "cn_index_daily",

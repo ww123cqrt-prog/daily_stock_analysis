@@ -9,6 +9,7 @@ bundle keyed by the immutable snapshot id so a pool is assembled only once.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 from datetime import date
@@ -17,11 +18,10 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from src.core.script_market import MarketBundle, MarketView, build_market_bundle
-from src.services.quant_workflow_paths import reports_root
+from src.services.quant_workflow_paths import reports_root, quant_data_root as local_quant_data_root
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ VALID_POOLS = ("etf", "csi800", "all_a", "custom")
 _ASHARE_DATASET_ID = "ashare_daily_qfq"
 _ETF_DATASET_ID = "cn_etf_daily"
 
-_UNIVERSE_CACHE_VERSION = "universe-cache-v1"
+_UNIVERSE_CACHE_VERSION = "universe-cache-v3-local-snapshots"
 
 
 def _normalize_ashare_symbol(value: str) -> str:
@@ -54,20 +54,34 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_snapshot_latest(quant_data_root: Path, family: str, dataset_id: str) -> dict[str, Any]:
+def _read_snapshot_latest(
+    quant_data_root: Path, family: str, dataset_id: str, *,
+    expected_identity: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     latest_path = quant_data_root / "parquet" / family / dataset_id / "LATEST.json"
-    payload = json.loads(latest_path.read_text(encoding="utf-8"))
+    payload = expected_identity or json.loads(latest_path.read_text(encoding="utf-8"))
     snapshot_id = payload.get("snapshot_id")
     snapshot_path = payload.get("snapshot_path")
     if not isinstance(snapshot_id, str) or not isinstance(snapshot_path, str):
         raise ValueError(f"{dataset_id} LATEST.json is invalid")
+    snapshot = (quant_data_root / snapshot_path).resolve()
+    try:
+        snapshot.relative_to(quant_data_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{dataset_id} snapshot leaves the data root") from exc
+    if payload.get("dataset_id", dataset_id) != dataset_id:
+        raise ValueError(f"{dataset_id} snapshot dataset identity differs")
     manifest_sha256 = str(payload.get("manifest_sha256") or "")
+    if not manifest_sha256:
+        raise ValueError(f"{dataset_id} snapshot manifest identity is missing")
     content_sha256 = ""
     latest_trade_date = ""
+    manifest_payload: dict[str, Any] = {}
     if manifest_sha256:
-        manifest_path = quant_data_root / snapshot_path / "DATASET_MANIFEST.json"
+        manifest_path = snapshot / "DATASET_MANIFEST.json"
         if manifest_path.is_file():
-            actual = _file_sha256(manifest_path)
+            manifest_bytes = manifest_path.read_bytes()
+            actual = hashlib.sha256(manifest_bytes).hexdigest()
             if actual != manifest_sha256:
                 raise ValueError(
                     f"{dataset_id} snapshot manifest does not match LATEST.json: "
@@ -75,8 +89,11 @@ def _read_snapshot_latest(quant_data_root: Path, family: str, dataset_id: str) -
                 )
             try:
                 manifest_payload = json.loads(
-                    manifest_path.read_text(encoding="utf-8")
+                    manifest_bytes
                 )
+                if (manifest_payload.get("snapshot_id") != snapshot_id
+                        or manifest_payload.get("dataset_id") != dataset_id):
+                    raise ValueError(f"{dataset_id} snapshot manifest identity differs")
                 content_sha256 = str(manifest_payload.get("content_sha256") or "")
                 latest_trade_date = str(
                     manifest_payload.get("latest_trade_date") or ""
@@ -87,12 +104,29 @@ def _read_snapshot_latest(quant_data_root: Path, family: str, dataset_id: str) -
                     manifest_path,
                 )
                 latest_trade_date = ""
+        else:
+            raise ValueError(f"{dataset_id} snapshot manifest is unavailable")
+    index_path = snapshot / str(manifest_payload.get("file_index_path") or "FILE_INDEX.parquet")
+    index_path.resolve().relative_to(snapshot)
+    index_bytes = index_path.read_bytes()
+    index_sha256 = hashlib.sha256(index_bytes).hexdigest()
+    if expected_identity and expected_identity.get("file_index_sha256", index_sha256) != index_sha256:
+        raise ValueError(f"{dataset_id} file index changed")
     return {
         "snapshot_id": snapshot_id,
         "manifest_sha256": manifest_sha256,
         "content_sha256": content_sha256,
         "latest_trade_date": latest_trade_date,
-        "bars_dir": quant_data_root / snapshot_path / "bars",
+        "bars_dir": snapshot / "bars",
+        "file_index": pd.read_parquet(io.BytesIO(index_bytes)),
+        "index_path": index_path,
+        "identity": {
+            "dataset_id": dataset_id, "snapshot_id": snapshot_id,
+            "snapshot_path": snapshot.relative_to(quant_data_root.resolve()).as_posix(),
+            "manifest_sha256": manifest_sha256, "content_sha256": content_sha256,
+            "latest_trade_date": latest_trade_date,
+            "file_index_sha256": index_sha256,
+        },
     }
 
 
@@ -102,28 +136,53 @@ def _load_bars_long(
     start: Optional[str],
     end: Optional[str],
     symbols: Optional[Sequence[str]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    """Read date/symbol/open/close for per-symbol parquet files in one scan."""
-    dataset = ds.dataset(str(bars_dir), format="parquet")
-    # Snapshot date columns are timestamps (ns or us depending on the
-    # producer); compare against timestamp scalars so string literals never
-    # hit the missing pyarrow kernel.
-    date_field = ds.field("date").cast("timestamp[ns]")
-    expression = None
-    if start is not None:
-        expression = date_field >= pd.Timestamp(start)
-    if end is not None:
-        bound = date_field <= pd.Timestamp(end)
-        expression = bound if expression is None else expression & bound
+    """Read date/symbol/open/close/volume for per-symbol parquet files."""
+    if snapshot is None:
+        raise ValueError("local bar reads require a frozen snapshot")
+    index = snapshot["file_index"]
     if symbols is not None:
-        wanted = [str(symbol).strip().upper() for symbol in symbols]
-        bound = ds.field("symbol").isin(wanted)
-        expression = bound if expression is None else expression & bound
-    table = dataset.to_table(
-        columns=["date", "symbol", "open", "close"],
-        filter=expression,
+        index = index.loc[index["symbol"].isin(symbols)]
+    if index["symbol"].duplicated().any():
+        raise ValueError("snapshot file index contains duplicate symbols")
+    frames = []
+    source_files = {}
+    for item in index.itertuples(index=False):
+        path = (bars_dir.parent / item.relative_path).resolve()
+        path.relative_to(bars_dir.resolve())
+        before = _file_token(path)
+        payload = path.read_bytes()
+        if _file_token(path) != before or hashlib.sha256(payload).hexdigest() != item.sha256:
+            raise ValueError(f"price file hash changed: {item.symbol}")
+        columns = ["date", "symbol", "open", "close"]
+        if "volume" in pq.read_schema(io.BytesIO(payload)).names:
+            columns.append("volume")
+        frame = pd.read_parquet(io.BytesIO(payload), columns=columns)
+        if len(frame) != item.row_count or set(frame["symbol"]) != {item.symbol}:
+            raise ValueError(f"price file identity changed: {item.symbol}")
+        frame["date"] = pd.to_datetime(frame["date"], errors="raise")
+        if frame["date"].isna().any() or frame["date"].duplicated().any():
+            raise ValueError(f"price file dates are invalid: {item.symbol}")
+        if "volume" not in frame:
+            frame["volume"] = np.nan
+        if start is not None:
+            frame = frame.loc[frame["date"] >= pd.Timestamp(start)]
+        if end is not None:
+            frame = frame.loc[frame["date"] <= pd.Timestamp(end)]
+        frames.append(frame)
+        source_files[str(path)] = before
+    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["date", "symbol", "open", "close", "volume"],
     )
-    return table.to_pandas()
+    source_files[str(snapshot["index_path"])] = _file_token(snapshot["index_path"])
+    frame.attrs["source_files"] = source_files
+    return frame
+
+
+def _file_token(path: Path) -> list[int]:
+    value = path.stat()
+    return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
 
 
 def _interval_membership(
@@ -159,7 +218,7 @@ def _interval_membership(
 
 def _build_wide_matrices(
     long_frame: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     dates_series = pd.to_datetime(long_frame["date"]).dt.date
     unique_dates = sorted(dates_series.unique())
     unique_symbols = sorted(str(symbol) for symbol in long_frame["symbol"].unique())
@@ -168,13 +227,37 @@ def _build_wide_matrices(
     dates = np.array([value.toordinal() for value in unique_dates], dtype=np.int32)
     open_matrix = np.full((len(unique_dates), len(unique_symbols)), np.nan, dtype=np.float64)
     close_matrix = np.full_like(open_matrix, np.nan)
+    volume_matrix = np.full_like(open_matrix, np.nan)
     date_codes = dates_series.map(date_index).to_numpy(dtype=np.int32)
     symbol_codes = long_frame["symbol"].astype(str).str.strip().str.upper().map(symbol_index).to_numpy(dtype=np.int32)
     open_values = long_frame["open"].to_numpy(dtype=np.float64)
     close_values = long_frame["close"].to_numpy(dtype=np.float64)
+    volume_values = long_frame["volume"].to_numpy(dtype=np.float64)
     open_matrix[date_codes, symbol_codes] = open_values
     close_matrix[date_codes, symbol_codes] = close_values
-    return dates, np.array(unique_symbols, dtype=object), open_matrix, close_matrix
+    volume_matrix[date_codes, symbol_codes] = volume_values
+    return dates, np.array(unique_symbols, dtype=object), open_matrix, close_matrix, volume_matrix
+
+
+def _load_cyb_index_close(
+    quant_data_root: Path, dates: np.ndarray, snapshot: Optional[dict[str, Any]] = None,
+    source_files: Optional[dict[str, Any]] = None,
+) -> np.ndarray:
+    """Align 创业板指 closes to the custom stock-pool calendar."""
+    snapshot = snapshot or _read_snapshot_latest(quant_data_root, "index_1d", "cn_index_daily")
+    path = snapshot["bars_dir"] / "SZ399006.parquet"
+    if not path.is_file():
+        return np.full(len(dates), np.nan, dtype=np.float64)
+    frame = _load_bars_long(snapshot["bars_dir"], start=None, end=None,
+                            symbols=["SZ399006"], snapshot=snapshot)
+    if source_files is not None:
+        source_files.update(frame.attrs["source_files"])
+    frame["date"] = pd.to_datetime(frame["date"]).dt.date
+    values = frame.set_index("date")["close"]
+    return np.array(
+        [float(values.get(date.fromordinal(int(value)), np.nan)) for value in dates],
+        dtype=np.float64,
+    )
 
 
 def _pool_cache_key(
@@ -195,7 +278,7 @@ def _pool_cache_key(
     when the price snapshot id is unchanged), and the secondary (ETF) snapshot
     id for mixed custom pools.
     """
-    identity = f"{pool}|{snapshot_id}|{start or ''}|{end or ''}"
+    identity = f"{_UNIVERSE_CACHE_VERSION}|{pool}|{snapshot_id}|{start or ''}|{end or ''}"
     if custom_symbols:
         ordered = sorted(str(symbol).strip().upper() for symbol in custom_symbols)
         identity += "|symbols:" + ",".join(ordered)
@@ -241,9 +324,7 @@ def load_market_view(
         if not custom_symbols:
             raise ValueError("custom pool requires custom_symbols")
     if quant_data_root is None:
-        from src.services.quant_workflow_paths import quant_data_root as resolve_root
-
-        quant_data_root = resolve_root()
+        quant_data_root = local_quant_data_root()
     quant_data_root = Path(quant_data_root)
     if cache_dir is None:
         cache_dir = reports_root() / "cache" / "universe"
@@ -277,15 +358,30 @@ def load_market_view(
     if pool == "custom":
         etf_snapshot = _read_snapshot_latest(quant_data_root, "etf_1d", _ETF_DATASET_ID)
 
+    # The benchmark index is only an input for custom A-share pools that can
+    # run regime-switching scripts such as BVR-20. ETF, CSI800 and all-A
+    # runs must remain usable when the optional index snapshot is absent.
+    index_snapshot: Optional[dict[str, Any]] = None
+    if pool == "custom":
+        requested = [str(symbol).strip().upper() for symbol in custom_symbols or ()]
+        has_ashare = any(_normalize_ashare_symbol(symbol).startswith(("SH", "SZ")) for symbol in requested)
+        if has_ashare:
+            try:
+                index_snapshot = _read_snapshot_latest(quant_data_root, "index_1d", "cn_index_daily")
+            except FileNotFoundError:
+                logger.warning("optional cn_index_daily snapshot is unavailable for custom pool")
     cache_key = _pool_cache_key(
         pool,
-        snapshot_id,
+        snapshot_id + "|" + snapshot["manifest_sha256"] + snapshot["identity"]["file_index_sha256"],
         start,
         end,
         custom_symbols=custom_symbols if pool == "custom" else None,
         membership_sha256=membership_sha256,
-        secondary_snapshot_id=(
-            etf_snapshot["snapshot_id"] if etf_snapshot is not None else ""
+        secondary_snapshot_id="|".join(
+            value for value in (
+                etf_snapshot["snapshot_id"] + etf_snapshot["manifest_sha256"] if etf_snapshot is not None else "",
+                index_snapshot["snapshot_id"] + index_snapshot["manifest_sha256"] if index_snapshot is not None else "",
+            ) if value
         ),
     )
     cache_bundle_dir = cache_dir / f"{dataset_id}_{pool}_{cache_key}"
@@ -294,7 +390,10 @@ def load_market_view(
         try:
             meta_path = cache_bundle_dir / "universe.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8")).get("meta", {})
-            if meta.get("snapshot_id") == snapshot_id:
+            if meta.get("_cache_key") == cache_key and all(
+                _file_token(Path(path)) == token
+                for path, token in meta.get("_source_files", {}).items()
+            ):
                 logger.info("universe cache hit for %s/%s", pool, snapshot_id)
                 meta.setdefault("content_sha256", snapshot["content_sha256"])
                 meta.setdefault("latest_trade_date", snapshot["latest_trade_date"])
@@ -315,7 +414,7 @@ def load_market_view(
             {str(symbol).strip().upper() for symbol in intervals["symbol"]}
         )
         bars = _load_bars_long(
-            snapshot["bars_dir"], start=start, end=end, symbols=member_symbols
+            snapshot["bars_dir"], start=start, end=end, symbols=member_symbols, snapshot=snapshot,
         )
     elif pool == "custom":
         # A custom pool may mix A-shares and ETFs (e.g. 600519, 159915):
@@ -347,21 +446,24 @@ def load_market_view(
         if ashare_wanted:
             frames.append(
                 _load_bars_long(
-                    snapshot["bars_dir"], start=start, end=end, symbols=ashare_wanted
+                    snapshot["bars_dir"], start=start, end=end, symbols=ashare_wanted, snapshot=snapshot,
                 )
             )
         if etf_wanted:
             frames.append(
-                _load_bars_long(etf_bars_dir, start=start, end=end, symbols=etf_wanted)
+                _load_bars_long(etf_bars_dir, start=start, end=end, symbols=etf_wanted, snapshot=etf_snapshot)
             )
         bars = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        bars.attrs["source_files"] = {
+            path: token for frame in frames for path, token in frame.attrs["source_files"].items()
+        }
         if bars.empty:
             raise ValueError(
                 "none of the custom symbols exist in the canonical A-share or ETF datasets"
             )
     else:
-        bars = _load_bars_long(snapshot["bars_dir"], start=start, end=end)
-    dates, symbols, open_matrix, close_matrix = _build_wide_matrices(bars)
+        bars = _load_bars_long(snapshot["bars_dir"], start=start, end=end, snapshot=snapshot)
+    dates, symbols, open_matrix, close_matrix, volume_matrix = _build_wide_matrices(bars)
 
     if pool == "csi800":
         membership_path = quant_data_root / "reference" / "pit_csi800" / "membership_intervals.parquet"
@@ -389,11 +491,35 @@ def load_market_view(
     else:
         members = ~np.isnan(close_matrix)
 
+    source_files = dict(bars.attrs.get("source_files", {}))
+    if membership_path is not None and membership_path.is_file():
+        source_files[str(membership_path)] = _file_token(membership_path)
+    index_close = (
+        _load_cyb_index_close(quant_data_root, dates, index_snapshot, source_files)
+        if index_snapshot is not None and pool == "custom" and any(str(symbol).startswith(("SH", "SZ")) for symbol in symbols)
+        else np.full(len(dates), np.nan, dtype=np.float64)
+    )
+
     dataset_ids = {dataset_id}
+    datasets = {dataset_id: snapshot["identity"]}
     if etf_wanted:
         dataset_ids.add(_ETF_DATASET_ID)
+        datasets[_ETF_DATASET_ID] = etf_snapshot["identity"]
+        if not ashare_wanted:
+            dataset_ids.discard(_ASHARE_DATASET_ID)
+            datasets.pop(_ASHARE_DATASET_ID, None)
+            dataset_id = _ETF_DATASET_ID
+            snapshot = etf_snapshot
+            snapshot_id = snapshot["snapshot_id"]
+    if index_snapshot is not None:
+        datasets["cn_index_daily"] = index_snapshot["identity"]
     meta = {
         "pool": pool,
+        "dataset_set_version": "local_snapshots",
+        "provider": "local_parquet",
+        "datasets": datasets,
+        "_cache_key": cache_key,
+        "_source_files": source_files,
         "dataset_id": "+".join(sorted(dataset_ids)),
         "snapshot_id": snapshot_id,
         "manifest_sha256": snapshot["manifest_sha256"],
@@ -405,6 +531,12 @@ def load_market_view(
         "start": start,
         "end": end,
     }
+    if index_snapshot is not None:
+        meta.update({
+            "index_snapshot_id": index_snapshot["snapshot_id"],
+            "index_manifest_sha256": index_snapshot["manifest_sha256"],
+            "index_latest_trade_date": index_snapshot["latest_trade_date"],
+        })
     if etf_wanted:
         meta["etf_snapshot_id"] = etf_snapshot["snapshot_id"]
         meta["etf_manifest_sha256"] = etf_snapshot["manifest_sha256"]
@@ -419,6 +551,8 @@ def load_market_view(
         close=close_matrix,
         members=members,
         meta=meta,
+        volume=volume_matrix,
+        index_close=index_close,
     )
     # The bundle directory is also the sandbox input, so it is always
     # materialised on disk (the cache is the transport).
@@ -458,6 +592,10 @@ def load_benchmark_series(
     symbols: Sequence[str],
     *,
     quant_data_root: Optional[Path] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    expected_release: Optional[dict[str, Any]] = None,
+    expected_snapshots: Optional[dict[str, Any]] = None,
 ) -> dict[str, pd.DataFrame]:
     """Load close series for comparison benchmarks.
 
@@ -469,36 +607,46 @@ def load_benchmark_series(
        snapshot universe.
     """
     if quant_data_root is None:
-        from src.services.quant_workflow_paths import quant_data_root as resolve_root
-
-        quant_data_root = resolve_root()
+        quant_data_root = local_quant_data_root()
+    if expected_release is not None:
+        raise ValueError("local benchmarks require snapshot identities, not a service release")
     quant_data_root = Path(quant_data_root)
     wanted = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
     if not wanted:
         return {}
 
-    index_snapshot = _read_snapshot_latest(quant_data_root, "index_1d", "cn_index_daily")
-    ashare_snapshot = _read_snapshot_latest(quant_data_root, "ashare_1d", _ASHARE_DATASET_ID)
-    etf_snapshot = _read_snapshot_latest(quant_data_root, "etf_1d", _ETF_DATASET_ID)
-    etf_bars_dir = etf_snapshot["bars_dir"].parent / "qfq"
+    snapshots: dict[str, dict[str, Any]] = {}
 
-    etf_code_to_symbol = _etf_code_to_symbol(etf_snapshot)
+    def frozen(family: str, dataset_id: str) -> dict[str, Any]:
+        if dataset_id not in snapshots:
+            snapshots[dataset_id] = _read_snapshot_latest(
+                quant_data_root, family, dataset_id,
+                expected_identity=(expected_snapshots or {}).get(dataset_id),
+            )
+        return snapshots[dataset_id]
 
     result: dict[str, pd.DataFrame] = {}
     for symbol in sorted(wanted):
         resolved: Optional[tuple[str, Path]] = None
         if symbol in INDEX_BENCHMARK_LABELS:
-            resolved = (symbol, index_snapshot["bars_dir"])
+            selected_snapshot = frozen("index_1d", "cn_index_daily")
+            resolved = (symbol, selected_snapshot["bars_dir"])
         else:
             normalized = _normalize_ashare_symbol(symbol)
+            ashare_snapshot = frozen("ashare_1d", _ASHARE_DATASET_ID)
             ashare_path = ashare_snapshot["bars_dir"] / f"{normalized}.parquet"
             if ashare_path.exists():
+                selected_snapshot = ashare_snapshot
                 resolved = (normalized, ashare_snapshot["bars_dir"])
             else:
+                etf_snapshot = frozen("etf_1d", _ETF_DATASET_ID)
+                etf_bars_dir = etf_snapshot["bars_dir"].parent / "qfq"
+                etf_code_to_symbol = _etf_code_to_symbol(etf_snapshot)
                 etf_symbol = etf_code_to_symbol.get(symbol) or etf_code_to_symbol.get(normalized)
                 if etf_symbol:
                     etf_path = etf_bars_dir / f"{etf_symbol}.parquet"
                     if etf_path.exists():
+                        selected_snapshot = etf_snapshot
                         resolved = (etf_symbol, etf_bars_dir)
         if resolved is None:
             continue
@@ -506,7 +654,9 @@ def load_benchmark_series(
         path = bars_dir / f"{resolved_symbol}.parquet"
         if not path.exists():
             continue
-        frame = pd.read_parquet(path, columns=["date", "close"])
+        frame = _load_bars_long(bars_dir, start=start, end=end,
+                                symbols=[resolved_symbol], snapshot=selected_snapshot)
         frame["date"] = pd.to_datetime(frame["date"]).dt.date
+        frame.attrs["dataset_identity"] = selected_snapshot["identity"]
         result[resolved_symbol] = frame
     return result

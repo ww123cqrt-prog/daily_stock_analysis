@@ -104,7 +104,7 @@ class BacktestService:
             raise ValueError(f"unsupported strategy_id: {strategy_id}")
         return {
             "strategy_id": strategy_id,
-            "asset_scope": "any_symbol_in_a_ready_canonical_qfq_dataset",
+            "asset_scope": "symbols_with_strictly_covered_qfq_bars",
             "signal_at": "trading_day_close",
             "execution": "next_common_trading_day_open",
             **definitions[strategy_id],
@@ -126,7 +126,7 @@ class BacktestService:
         slow_ma_days: int = 20,
         top_n: int = 1,
     ) -> Dict[str, Any]:
-        """Run one explicit form strategy against a governed qfq snapshot."""
+        """Run one explicit form strategy against governed qfq bars."""
 
         normalized_strategy = str(strategy_id or "").strip().lower()
         if start_date and end_date and start_date > end_date:
@@ -144,7 +144,9 @@ class BacktestService:
             slow_ma_days=int(slow_ma_days),
             top_n=int(top_n),
         )
-        price_data = QuantPriceRepository().load(symbols, end_date=end_date)
+        price_data = QuantPriceRepository().load(
+            symbols, start_date=start_date, end_date=end_date,
+        )
         bars = list(price_data.bars)
 
         if normalized_strategy == "momentum_rotation":
@@ -180,6 +182,11 @@ class BacktestService:
 
         data_quality = {
             "dataset_id": price_data.dataset_id,
+            "dataset_set_version": price_data.dataset_set_version,
+            "generation": price_data.generation,
+            "release_set_sha256": price_data.release_set_sha256,
+            "module_identities": price_data.module_identities,
+            "datasets": price_data.dataset_identities,
             "snapshot_id": price_data.snapshot_id,
             "price_basis": price_data.price_basis,
             "provider": price_data.provider,
@@ -262,7 +269,17 @@ class BacktestService:
             end_date=end_date,
             timeout_seconds=30,
         )
-        benchmark_frames = load_benchmark_series(benchmarks or [])
+        benchmark_frames = load_benchmark_series(
+            benchmarks or [],
+            start=start_date.isoformat() if start_date else None,
+            end=end_date.isoformat() if end_date else None,
+            expected_release=pool_meta.get("release"),
+            expected_snapshots=pool_meta.get("datasets"),
+        )
+        for frame in benchmark_frames.values():
+            identity = frame.attrs.get("dataset_identity")
+            if identity:
+                pool_meta.setdefault("datasets", {})[identity["dataset_id"]] = identity
         strategy_comparisons, comparison_failures = self._run_strategy_comparisons(
             strategy_ids=comparison_strategy_ids or [],
             presets=comparison_presets or [],
@@ -276,7 +293,7 @@ class BacktestService:
             "strategy_id": "python_script",
             "name": "DSA Python strategy",
             "pool": pool,
-            "asset_scope": "any_symbol_in_a_ready_canonical_qfq_dataset",
+            "asset_scope": "symbols_from_frozen_local_qfq_snapshots",
             "signal_at": "trading_day_close",
             "execution": "next_common_trading_day_open",
             "script_api_version": check.get("api_version"),
@@ -284,6 +301,10 @@ class BacktestService:
         }
         data_quality = {
             "dataset_id": pool_meta.get("dataset_id"),
+            "dataset_set_version": pool_meta.get("dataset_set_version"),
+            "release_set_sha256": pool_meta.get("release_set_sha256"),
+            "generation": pool_meta.get("generation"),
+            "datasets": pool_meta.get("datasets"),
             "snapshot_id": pool_meta.get("snapshot_id"),
             "manifest_sha256": pool_meta.get("manifest_sha256"),
             "content_sha256": pool_meta.get("content_sha256"),
@@ -294,7 +315,7 @@ class BacktestService:
             "etf_content_sha256": pool_meta.get("etf_content_sha256"),
             "etf_latest_trade_date": pool_meta.get("etf_latest_trade_date") or None,
             "price_basis": "qfq",
-            "provider": "quant_data",
+            "provider": pool_meta.get("provider", "quant_data"),
             "data_kind": "daily_bars",
             "pool": pool,
             "symbol_count": pool_meta.get("symbol_count"),

@@ -77,7 +77,7 @@ sed -n '1,260p' docs/install-local-quant-workbench.md
 7. 不将 ETF/场内基金误按单家公司财报逻辑分析。ETF 基本面必须标注降级或待补强。
 8. 不接券商自动交易。本阶段同花顺和手机镜像只作为后续只读观察方向。
 9. `run_daily_update.py` 只负责 18:40 数据更新；60 日纸面跟踪由 19:10 的 `run_robust_shadow_schedule.py` 独立运行。不得重新把跟踪做成可选 warning，也不得在冻结组合含 `mps_dnn` 时用普通 `.venv` 或 CPU 代替 MPS。
-10. 数据质量检查属于 `quant_data` 发布过程。DSA 通用训练不得读取历史质量报告或比较新旧验收快照，只检查 `quant_data /ready`、所需正式数据集、Qlib Provider 可读性和完整数据血缘。旧质量字段只能为空或标记 `deprecated`；存量文件暂留以保护既有 Run，CSI800 专用冻结 readiness 契约不变。
+10. 当前训练与网页回测使用本地快照，不访问封存项目版服务的 `/ready`。只检查本次所用快照、Qlib Provider 可读性及运行血缘，不读取历史质量报告作为全库门禁。保留的 `ACTIVE_RELEASE_SET.json` 不自动选择服务后端；不得为恢复本地入口删除它。既有 Run 的冻结身份和 CSI800 专用数据契约继续保留，数据日期不足时明确报告实际范围。
 
 ## 用户沟通口径
 
