@@ -49,7 +49,7 @@ Mac 无须安装 xtquant，通过已有 SSH 路线调用 HOME 的 `qmt-strategy-
 
 - 冻结已有快照和证券池，先读 HOME 缓存，仅下载窗口内缺失的交易日；按最多 20 只同窗口证券复用一次 SDK 连接。单个原始日线请求最多 400 个日历日，完整历史不因切换默认入口而重新下载。
 - 已覆盖目标日的证券不请求；已准备的合格输入通过原缓存续接。周末和非交易日按日历选实际交易日。不要将盘中未结束的日线当作已完成收盘数据。
-- 现金分红和份额变化按逐事件仿射关系计算并与 SDK 前复权值核对：`R=1+stockBonus+stockGift+allotNum`，`C=interest-allotNum*allotPrice`，旧日价格按事件先后应用 `(price-C)/R`。不把原生 `dr` 当作乘法因子。空事件返回不构成“全历史没有事件”的证明。
+- ETF 的 SDK `front` 路径采用逐事件仿射关系：`R=1+stockBonus+stockGift+allotNum`，`C=interest-allotNum*allotPrice`，旧日价格按事件先后应用 `(price-C)/R`。此口径不能用 `dr` 代替现金、送转和配股字段。空事件返回不构成“全历史没有事件”的证明。
 - 前复权采用 SDK 当前已知事件锚；查询旧日期时，后续分红也可能影响价格。响应的 `action_history_through` 记录本次核对的事件截止日，不把它冒充查询日之前的时点数据。
 - 早于或等于窗口首日的股改事件不影响该窗口的价格，不因此拒绝短窗口核验；窗口内实际受未知股改影响的价格仍拒绝，事件身份和字段检查保留。
 - 已观察过的旧因子事件发生变化时，该证券保留旧文件并披露需单独修复。普通尾部追加沿用现有有界 overlap 和 QFQ 衔接校验，不借机改写全部历史。
@@ -59,6 +59,16 @@ Mac 无须安装 xtquant，通过已有 SSH 路线调用 HOME 的 `qmt-strategy-
 桥接响应校验精确 request、request SHA、data SHA；原有缓存另绑定 base manifest、证券、日期和规则。批量响应按 SHA 保存一份，在新快照的 `source_receipts/miniqmt/` 中保留本轮来源引用。源端 SDK 内部请求数不可观察时，`network_requests` 为 null；`bridge_calls` 与 `calendar_bridge_calls` 记录桥接调用，响应的 `network_download_requested` 说明是否请求了补缺。
 
 超时由远端命令和 SDK worker 的已有 Windows Job Object 有界收尾；不按名称结束 MiniQMT。只有文件快照更新使用原单实例锁和原子 LATEST 切换；没有项目版 Active、候选审批或发布操作。
+
+## 已有股票比例复权的衔接
+
+旧股票快照中的 `raw × factor`、零偏移价格属于比例复权，不能直接对这些历史价格减去新现金分红。SDK 的 `front` 与 `front_ratio` 是不同口径；即使最近价格接近，现金减法也可能把很早的低复权价变成负数。
+
+`incremental_update_ashare_v2.merge_miniqmt_ratio_increment` 用于已冻结股票输入的显式衔接：调用方绑定原文件和来源回执，函数核对旧 raw/factor/QFQ、原始行情 overlap、明确除权事件与 SDK `front_ratio`，只追加实际取得的行情。历史价格按新事件的 `1/dr` 比例调整，保留原来已经证明的四位小数表示；不把现金式历史自动转换为比例式历史。
+
+发现旧窗口内遗漏的事件时，必须显式列入 `repair_event_dates`，且旧因子在事件边界没有变化、修复后完整 overlap 与 SDK 结果一致，才允许补回。不能用这项修复为未知修订兜底。新的快照保留原快照、原始响应和逐证券修复说明，不覆盖旧文件。
+
+源端缺行单列为未解释缺日，已核实的其他行仍可供本地读取；没有证券资料不等于已经证明退市。该衔接函数不增加全库读取门禁，也不代表已接通新的全市场股票 CLI 或北交所默认桥接能力。
 
 ## 验证与回滚
 

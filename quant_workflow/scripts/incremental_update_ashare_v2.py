@@ -586,6 +586,129 @@ def _provider_pair_update(
     return merged_qfq, merged_factors, raw_update
 
 
+def merge_miniqmt_ratio_increment(
+    *, base_raw: pd.DataFrame, base_qfq: pd.DataFrame,
+    base_factors: pd.DataFrame, raw_update: pd.DataFrame,
+    ratio_qfq: pd.DataFrame, actions: list[dict], symbol: str,
+    repair_event_dates: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Extend a proven multiplicative stock history using SDK ``front_ratio``.
+
+    Cash ``front`` and ratio-adjusted history are different price bases. Never
+    subtract a new cash dividend from the old ratio-adjusted prices. A newly
+    effective event supplies ``dr``; the SDK ratio series independently checks
+    its use on the bounded window. Earlier unexplained revisions are rejected.
+    An explicitly selected omitted event additionally needs an unchanged old
+    factor boundary and a matching SDK overlap after applying that event.
+    The caller verifies receipt identity, calendar and suspension evidence.
+    """
+    frames = [base_raw.copy(), base_qfq.copy(), base_factors.copy(),
+              raw_update.copy(), ratio_qfq.copy()]
+    for frame in frames:
+        frame["date"] = pd.to_datetime(frame["date"], errors="raise").dt.normalize()
+        if frame.empty or frame.date.duplicated().any() or not frame.date.is_monotonic_increasing:
+            raise DataContractError(f"invalid MiniQMT ratio dates for {symbol}")
+        if "symbol" in frame and not frame.symbol.eq(symbol).all():
+            raise DataContractError(f"different MiniQMT ratio symbol for {symbol}")
+    old_raw, old_qfq, factors, raw, observed = frames
+    if (old_raw.date.tolist() != old_qfq.date.tolist()
+            or old_raw.date.tolist() != factors.date.tolist()
+            or raw.date.tolist() != observed.date.tolist()):
+        raise DataContractError(f"MiniQMT ratio keys differ for {symbol}")
+    offsets = pd.to_numeric(factors.get("offset", pd.Series(0., index=factors.index)), errors="coerce")
+    if offsets.isna().any() or offsets.ne(0).any():
+        raise DataContractError(f"existing history is not a proven ratio basis for {symbol}")
+    factor = pd.to_numeric(factors.factor, errors="coerce").to_numpy(float)
+    old_prices = old_raw[list(PRICE_COLUMNS)].to_numpy(float)
+    qfq_prices = old_qfq[list(PRICE_COLUMNS)].to_numpy(float)
+    reconstructed = old_prices * factor[:, None]
+    exact_history = np.allclose(reconstructed, qfq_prices, rtol=1e-9, atol=1e-8)
+    # Some frozen TickFlow snapshots stored prices rounded to four decimals.
+    # Prove that exact representation, rather than admitting arbitrary errors.
+    rounded_history = np.allclose(np.round(reconstructed, 4), qfq_prices, rtol=0, atol=1e-8)
+    if (not np.isfinite(factor).all() or (factor <= 0).any()
+            or not np.isfinite(old_prices).all() or not np.isfinite(qfq_prices).all()
+            or (old_prices <= 0).any() or (qfq_prices <= 0).any()
+            or not (exact_history or rounded_history)):
+        raise DataContractError(f"old raw/factor/QFQ relation differs for {symbol}")
+    end = old_raw.date.max()
+    applicable = []
+    for action in actions:
+        day = pd.Timestamp(action["date"]).normalize()
+        if day <= raw.date.min() or day > raw.date.max():
+            continue
+        dr = float(action["dr"])
+        if not np.isfinite(dr) or dr <= 0:
+            raise DataContractError(f"invalid MiniQMT ratio event for {symbol}")
+        if day <= raw.date.max():
+            applicable.append((day, dr))
+    if len({day for day, _ in applicable}) != len(applicable):
+        raise DataContractError(f"duplicate MiniQMT ratio event for {symbol}")
+    scales = np.ones(len(raw))
+    history_scales = np.ones(len(old_raw))
+    repairs = {pd.Timestamp(day).normalize() for day in repair_event_dates}
+    if len(repairs) != len(repair_event_dates) or not repairs.issubset({day for day, _ in applicable}):
+        raise DataContractError(f"unproven ratio repair event for {symbol}")
+    for day, dr in sorted(applicable):
+        scales[np.asarray(raw.date < day)] /= dr
+        if day > end:
+            history_scales /= dr
+        elif day in repairs:
+            before = factors.loc[factors.date < day, "factor"]
+            after = factors.loc[factors.date >= day, "factor"]
+            if (before.empty or after.empty or day not in set(raw.date)
+                    or not np.isclose(float(before.iloc[-1]), float(after.iloc[0]), rtol=1e-10, atol=1e-12)):
+                raise DataContractError(f"ratio event is not omitted at frozen boundary for {symbol}")
+            history_scales[np.asarray(old_raw.date < day)] /= dr
+    native_expected = raw[list(PRICE_COLUMNS)].to_numpy(float) * scales[:, None]
+    if not np.allclose(native_expected, observed[list(PRICE_COLUMNS)].to_numpy(float), rtol=1e-9, atol=1e-8):
+        raise DataContractError(f"MiniQMT raw/events/front_ratio relation differs for {symbol}")
+    overlap = old_raw.merge(raw, on="date", suffixes=("_old", "_new"))
+    if overlap.empty:
+        raise DataContractError(f"MiniQMT ratio update has no overlap for {symbol}")
+    for field in (*PRICE_COLUMNS, "volume"):
+        if not np.allclose(overlap[field + "_old"], overlap[field + "_new"], rtol=0, atol=1e-8):
+            raise DataContractError(f"MiniQMT raw overlap differs for {symbol}: {field}")
+    anchor = float(factor[-1])
+    aligned = observed.copy()
+    for field in PRICE_COLUMNS:
+        aligned[field] *= anchor
+    check = old_qfq.merge(aligned, on="date", suffixes=("_old", "_new"))
+    overlap_scales = check.date.map(dict(zip(old_raw.date, history_scales))).to_numpy(float)[:, None]
+    overlap_tolerance = 1e-8 if exact_history else 0.00005 * overlap_scales + 1e-8
+    if not np.allclose(check[[c + "_old" for c in PRICE_COLUMNS]].to_numpy(float) * overlap_scales,
+                       check[[c + "_new" for c in PRICE_COLUMNS]].to_numpy(float), rtol=1e-9, atol=overlap_tolerance):
+        raise DataContractError(f"unexplained historical ratio revision for {symbol}")
+    historical = old_qfq.copy()
+    for field in (*PRICE_COLUMNS, "preclose"):
+        if field in historical:
+            historical[field] *= history_scales
+    if "factor" in historical:
+        historical["factor"] *= history_scales
+    factors["factor"] = factor * history_scales
+    changed = history_scales != 1.
+    if "source_id" in historical:
+        historical.loc[changed, "source_id"] = historical.loc[changed, "source_id"].astype(str) + "|miniqmt-explicit-dr"
+    if "factor_source" in factors:
+        factors.loc[changed, "factor_source"] = factors.loc[changed, "factor_source"].astype(str) + "|miniqmt-explicit-dr"
+    tail = np.asarray(raw.date > end)
+    extension = pd.DataFrame({"date": raw.loc[tail, "date"], "symbol": symbol,
+                              "factor": scales[tail] * anchor, "offset": 0.,
+                              "factor_source": "miniqmt_explicit_dr_ratio",
+                              "factor_terminal_normalized": anchor == 1.})
+    aligned["factor"] = scales * anchor
+    aligned["source_id"] = aligned.get("source_id", pd.Series("miniqmt", index=aligned.index)).astype(str) + "|front_ratio"
+    out_raw = pd.concat([old_raw, raw.loc[tail]], ignore_index=True)
+    out_qfq = pd.concat([historical, aligned.loc[tail]], ignore_index=True)
+    for frame in (out_raw, out_qfq):
+        begin = 1 if frame is out_qfq and repairs else len(old_raw)
+        if "preclose" in frame:
+            frame.loc[begin:, "preclose"] = frame.close.shift(1).iloc[begin:].to_numpy()
+        if "pctChg" in frame:
+            frame.loc[begin:, "pctChg"] = frame.close.pct_change(fill_method=None).iloc[begin:].to_numpy() * 100
+    return out_raw, out_qfq, pd.concat([factors, extension], ignore_index=True)
+
+
 def _copy_or_link(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)

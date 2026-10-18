@@ -54,6 +54,118 @@ def _tickflow_metadata_fixture():
     return raw, raw.copy(), factors
 
 
+def _ratio_increment_fixture():
+    raw = _bars("SZ000001", [20., 11.59], ["1991-08-17", "2026-08-27"])
+    qfq = raw.copy()
+    for field in ("open", "high", "low", "close"):
+        qfq.loc[0, field] *= .01
+    factors = pd.DataFrame({"date": raw.date, "factor": [.01, 1.], "offset": 0.})
+    update = _bars("SZ000001", [11.59, 11.30], ["2026-08-27", "2026-09-24"])
+    observed = update.copy()
+    for field in ("open", "high", "low", "close"):
+        observed.loc[0, field] /= 1.022026
+    actions = [{"date": "2026-09-24", "dr": 1.022026}]
+    return raw, qfq, factors, update, observed, actions
+
+
+def test_miniqmt_ratio_increment_preserves_stock_basis_instead_of_subtracting_cash():
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    before = [frame.copy(deep=True) for frame in (raw, qfq, factors)]
+    mr, mq, mf = mod.merge_miniqmt_ratio_increment(
+        base_raw=raw, base_qfq=qfq, base_factors=factors,
+        raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+    )
+    assert mq.close.iloc[0] == pytest.approx(.20 / 1.022026)
+    assert (mq[["open", "high", "low", "close"]] > 0).all().all()
+    assert mr.date.tolist() == mq.date.tolist() == mf.date.tolist()
+    assert mf.factor.tolist() == pytest.approx([.01 / 1.022026, 1 / 1.022026, 1.])
+    pd.testing.assert_frame_equal(mr.iloc[:2], raw, check_dtype=False)
+    for frame, original in zip((raw, qfq, factors), before):
+        pd.testing.assert_frame_equal(frame, original)
+
+
+def test_miniqmt_ratio_increment_preserves_verified_four_decimal_history():
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    factors.loc[0, "factor"] = .01234567
+    for field in ("open", "high", "low", "close"):
+        qfq[field] = (raw[field] * factors.factor).round(4)
+    mr, mq, mf = mod.merge_miniqmt_ratio_increment(
+        base_raw=raw, base_qfq=qfq, base_factors=factors,
+        raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+    )
+    assert mq.close.iloc[0] == pytest.approx(qfq.close.iloc[0] / 1.022026)
+    qfq.loc[0, "close"] += .0001
+    with pytest.raises(mod.DataContractError, match="old raw/factor/QFQ"):
+        mod.merge_miniqmt_ratio_increment(
+            base_raw=raw, base_qfq=qfq, base_factors=factors,
+            raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+        )
+
+
+def test_miniqmt_ratio_increment_does_not_use_irrelevant_ancient_events():
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    # This event predates the bounded observation; frozen old factors, not a
+    # newly fetched ancient event, prove the retained historical relationship.
+    actions.insert(0, {"date": "1980-01-01", "dr": -2.})
+    _, result, _ = mod.merge_miniqmt_ratio_increment(
+        base_raw=raw, base_qfq=qfq, base_factors=factors,
+        raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+    )
+    assert result.close.iloc[0] == pytest.approx(.20 / 1.022026)
+
+
+def test_miniqmt_ratio_increment_repairs_only_explicitly_proven_omitted_event():
+    mod = load_script("incremental_update_ashare_v2")
+    raw = _bars("SZ000001", [10., 10., 10.], ["2026-08-25", "2026-08-26", "2026-08-27"])
+    factors = pd.DataFrame({"date": raw.date, "factor": 1., "offset": 0.})
+    update = _bars("SZ000001", [10., 10., 10., 10.],
+                   ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"])
+    observed = update.copy()
+    for field in ("open", "high", "low", "close"):
+        observed.loc[0, field] /= 1.1
+    kwargs = dict(base_raw=raw, base_qfq=raw.copy(), base_factors=factors,
+                  raw_update=update, ratio_qfq=observed,
+                  actions=[{"date": "2026-08-26", "dr": 1.1}], symbol="SZ000001")
+    with pytest.raises(mod.DataContractError, match="unexplained"):
+        mod.merge_miniqmt_ratio_increment(**kwargs)
+    mr, mq, mf = mod.merge_miniqmt_ratio_increment(
+        **kwargs, repair_event_dates=("2026-08-26",),
+    )
+    assert mf.factor.tolist() == pytest.approx([1 / 1.1, 1., 1., 1.])
+    assert mq.close.tolist() == pytest.approx([10 / 1.1, 10., 10., 10.])
+    assert mq.preclose.iloc[1] == pytest.approx(10 / 1.1)
+    pd.testing.assert_frame_equal(mr.iloc[:3], raw, check_dtype=False)
+    # A nonconstant old factor boundary is not evidence of an omitted event.
+    factors.loc[0, "factor"] = 1 / 1.1
+    kwargs["base_qfq"] = observed.iloc[:3].copy()
+    with pytest.raises(mod.DataContractError, match="not omitted"):
+        mod.merge_miniqmt_ratio_increment(**kwargs, repair_event_dates=("2026-08-26",))
+
+
+@pytest.mark.parametrize("damage", ["missing_action", "wrong_dr", "cash_basis", "raw_conflict", "bad_old_factor"])
+def test_miniqmt_ratio_increment_refuses_unexplained_or_mixed_basis(damage):
+    mod = load_script("incremental_update_ashare_v2")
+    raw, qfq, factors, update, observed, actions = _ratio_increment_fixture()
+    if damage == "missing_action":
+        actions = []
+    elif damage == "wrong_dr":
+        actions[0]["dr"] = 1.1
+    elif damage == "cash_basis":
+        factors.loc[0, "offset"] = -.1
+    elif damage == "raw_conflict":
+        update.loc[0, "close"] += .01
+    else:
+        factors.loc[0, "factor"] = .02
+    with pytest.raises(mod.DataContractError):
+        mod.merge_miniqmt_ratio_increment(
+            base_raw=raw, base_qfq=qfq, base_factors=factors,
+            raw_update=update, ratio_qfq=observed, actions=actions, symbol="SZ000001",
+        )
+
+
 def test_restore_tickflow_metadata_does_not_change_prices_or_known_fields():
     mod = load_script("incremental_update_ashare_v2")
     raw, qfq, factors = _tickflow_metadata_fixture()
