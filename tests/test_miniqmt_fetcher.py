@@ -100,6 +100,25 @@ def test_affine_actions_apply_cash_and_split_in_order_without_using_dr():
     pd.testing.assert_frame_equal(raw, pd.DataFrame([bar("2026-10-12", 10), bar("2026-10-13", 12), bar("2026-10-14", 7)]))
 
 
+@pytest.mark.parametrize("event_day", ["2006-05-12", "2026-10-12"])
+def test_irrelevant_share_conversion_does_not_block_later_raw_window(event_day):
+    from data_provider.miniqmt_bridge import adjusted_prices
+    raw = pd.DataFrame([bar("2026-10-12", 10), bar("2026-10-13", 12)])
+    event = dict(date=event_day, interest=0, stockBonus=0.3, stockGift=0,
+                 allotNum=0, allotPrice=0, gugai=1)
+    pd.testing.assert_frame_equal(adjusted_prices(raw, [event]), raw.astype(
+        {field: float for field in ("open", "high", "low", "close")}))
+
+
+def test_relevant_share_conversion_still_rejects_without_a_supported_rule():
+    from data_provider.miniqmt_bridge import adjusted_prices, MiniQMTError
+    raw = pd.DataFrame([bar("2026-10-12", 10), bar("2026-10-13", 12)])
+    event = dict(date="2026-10-13", interest=0, stockBonus=0.3, stockGift=0,
+                 allotNum=0, allotPrice=0, gugai=1)
+    with pytest.raises(MiniQMTError, match="unsupported MiniQMT share conversion"):
+        adjusted_prices(raw, [event])
+
+
 def test_default_stock_manager_selects_miniqmt_when_private_profile_is_available(monkeypatch):
     from data_provider.miniqmt_bridge import MiniQMTBridgeClient
     from data_provider.base import DataFetcherManager

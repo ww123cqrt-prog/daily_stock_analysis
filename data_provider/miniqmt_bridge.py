@@ -192,9 +192,9 @@ def adjusted_prices(raw: pd.DataFrame, actions: list[dict]) -> pd.DataFrame:
             values[field] = value
         ratio = 1 + values["stockBonus"] + values["stockGift"] + values["allotNum"]
         cash = values["interest"] - values["allotNum"] * values["allotPrice"]
-        if ratio <= 0 or values["gugai"] != 0:
-            raise MiniQMTError("unsupported MiniQMT share conversion")
         before = days < pd.Timestamp(day)
+        if ratio <= 0 or (values["gugai"] != 0 and before.any()):
+            raise MiniQMTError("unsupported MiniQMT share conversion")
         for field in ("open", "high", "low", "close"):
             result.loc[before, field] = (pd.to_numeric(result.loc[before, field]) - cash) / ratio
     return result
