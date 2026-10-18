@@ -832,3 +832,140 @@ def test_zero_activity_needs_exact_source_rows_and_current_binding(tmp_path, dam
     assert result["provider_zero_activity_sessions"] == 0
     findings = pd.read_csv(tmp_path / "report/findings.csv")
     assert set(findings.loc[findings.rule == "tail_not_covered", "date"]) == {"2026-10-19", "2026-10-20"}
+
+
+def cash_share_bundle():
+    return {
+        "dataset_id": "cn_etf_daily", "symbol": "SH510010",
+        "as_of": "2026-10-16", "convention": "cash_share_affine_front",
+        "events": [{
+            "effective_date": "2026-10-16", "cash_per_old_share": "0.2",
+            "new_shares_per_old_share": "2",
+        }],
+        "sources": [{
+            "kind": "issuer_announcement", "path": "provenance/announcement.body",
+            "sha256": hashlib.sha256(b"synthetic announcement").hexdigest(),
+            "url": "https://example.invalid/announcement",
+        }],
+    }
+
+
+def test_cash_share_events_keep_the_existing_affine_convention_and_cash_units():
+    mod = checker()
+    bundle = cash_share_bundle()
+    bundle["events"].insert(0, {
+        "effective_date": "2026-10-15", "cash_per_old_share": "0.2",
+        "new_shares_per_old_share": "1",
+    })
+    days = pd.Series(pd.to_datetime(["2026-10-14", "2026-10-15", "2026-10-16"]))
+    scale, offset = mod._cash_share_factor_transform("SH510010", days, bundle)
+    np.testing.assert_array_equal(scale, [0.5, 0.5, 1.0])
+    np.testing.assert_allclose(offset, [-0.2, -0.1, 0.0], rtol=0, atol=1e-15)
+    # A dividend of 0.1 per new share after a 2:1 split is 0.2 per old share.
+    assert 10 * scale[1] + offset[1] == 10 / 2 - 0.1
+
+
+@pytest.mark.parametrize("damage", [
+    "symbol", "anchor", "mode", "duplicate", "future", "zero_ratio",
+    "bool_ratio", "negative_cash", "nan", "missing_field", "no_sources",
+])
+def test_invalid_action_evidence_cannot_supply_a_transform(damage):
+    bundle = cash_share_bundle()
+    if damage == "symbol":
+        bundle["symbol"] = "SZ159915"
+    elif damage == "anchor":
+        bundle["as_of"] = "2026-10-19"
+    elif damage == "mode":
+        bundle["convention"] = "front_ratio"
+    elif damage == "duplicate":
+        bundle["events"] *= 2
+    elif damage == "future":
+        bundle["events"][0]["effective_date"] = "2026-10-19"
+    elif damage == "zero_ratio":
+        bundle["events"][0]["new_shares_per_old_share"] = "0"
+    elif damage == "bool_ratio":
+        bundle["events"][0]["new_shares_per_old_share"] = True
+    elif damage == "negative_cash":
+        bundle["events"][0]["cash_per_old_share"] = -1
+    elif damage == "nan":
+        bundle["events"][0]["cash_per_old_share"] = "NaN"
+    elif damage == "missing_field":
+        del bundle["events"][0]["cash_per_old_share"]
+    elif damage == "no_sources":
+        bundle["sources"] = []
+    with pytest.raises(ValueError):
+        checker()._cash_share_factor_transform(
+            "SH510010", pd.Series(pd.to_datetime(["2026-10-15", "2026-10-16"])), bundle
+        )
+
+
+def action_evidence_fixture(root, damage=None):
+    snapshot = registry_fixture(root)
+    bundle = cash_share_bundle()
+    announcement = snapshot / "provenance/announcement.body"
+    announcement.write_bytes(b"synthetic announcement")
+    for component, index_name in [("qfq", "QFQ_FILE_INDEX.parquet"), ("factors", "FACTOR_INDEX.parquet")]:
+        path = snapshot / component / "SH510010.parquet"
+        frame = pd.read_parquet(path)
+        if component == "qfq":
+            for field in ("open", "high", "low", "close"):
+                frame.loc[0, field] = frame.loc[0, field] / 2 - 0.1
+            if damage == "values":
+                frame.loc[0, "close"] += 0.1
+        else:
+            frame["factor"] = [0.5, 1.0]
+            frame["offset"] = [-0.1, 0.0]
+            frame["factor_source"] = "verified_cash_share_events"
+        frame.to_parquet(path, index=False)
+        index = pd.read_parquet(snapshot / index_name)
+        index.loc[0, "sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        index.to_parquet(snapshot / index_name, index=False)
+    evidence = snapshot / "provenance/SH510010.body"
+    evidence.write_text(json.dumps(bundle))
+    manifest_path = snapshot / "DATASET_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    desc = manifest["source"]["factor_registry_evidence"]["SH510010"]
+    desc.update(provider="verified_cash_share_events", sha256=hashlib.sha256(evidence.read_bytes()).hexdigest())
+    desc["component_sha256"] = {
+        component: pd.read_parquet(snapshot / name).iloc[0].sha256
+        for component, name in [("raw", "RAW_FILE_INDEX.parquet"), ("qfq", "QFQ_FILE_INDEX.parquet"), ("factors", "FACTOR_INDEX.parquet")]
+    }
+    if damage == "binding":
+        desc["component_sha256"]["raw"] = "0" * 64
+    elif damage == "body_swap":
+        evidence.write_bytes(evidence.read_bytes().replace(b'"0.2"', b'"0.3"'))
+    elif damage == "dependency_swap":
+        announcement.write_bytes(b"synthetic announcemEnt")
+    elif damage == "missing_dependency":
+        announcement.unlink()
+    elif damage == "tag_only":
+        manifest["source"]["factor_registry_evidence"] = {}
+    manifest_path.write_text(json.dumps(manifest))
+    pointer_path = snapshot.parent.parent / "LATEST.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+    return snapshot
+
+
+def test_readonly_audit_replays_inspected_actions_and_bound_source_bytes(tmp_path):
+    root = tmp_path / "data"
+    action_evidence_fixture(root)
+    before = digest_tree(root)
+    result = checker().audit_etf_snapshot(root, output_dir=tmp_path / "report")
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert result["cash_share_event_matches"] == 1
+    assert not (findings.rule == "factor_authority_unproven").any()
+    assert digest_tree(root) == before and result["network_requests"] == 0
+
+
+@pytest.mark.parametrize("damage", [
+    "binding", "body_swap", "dependency_swap", "missing_dependency", "values", "tag_only",
+])
+def test_action_evidence_does_not_hide_unproven_or_replaced_inputs(tmp_path, damage):
+    root = tmp_path / "data"
+    action_evidence_fixture(root, damage)
+    result = checker().audit_etf_snapshot(root, output_dir=tmp_path / "report")
+    findings = pd.read_csv(tmp_path / "report/findings.csv")
+    assert result["cash_share_event_matches"] == 0
+    assert (findings.rule == "factor_authority_unproven").any()

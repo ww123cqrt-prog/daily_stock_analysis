@@ -56,7 +56,7 @@ FINDING_FIELDS = (
     "detail",
     "evidence",
 )
-RULE_VERSION = "etf-readonly-healthcheck.v3"
+RULE_VERSION = "etf-readonly-healthcheck.v4"
 # Rules are copied/adapted, not imported from or executed by the sealed service.
 RULE_ORIGIN = {
     "existing": "quant_workflow/scripts/quant_data_contract.py:_validate_bar_frame,_validate_paired_snapshot_components",
@@ -594,7 +594,7 @@ def inspect_etf_frames(
             "factor_source", pd.Series("unknown", index=factors.index)
         ).astype(str)
         unproven = sources.str.contains(
-            "derived_same_provider|derived_close_ratio|unknown|^sina_qfq_registry$", regex=True
+            "derived_same_provider|derived_close_ratio|unknown|^sina_qfq_registry$|^verified_cash_share_events$", regex=True
         )
         issues.extend(
             _mask_findings(
@@ -1016,6 +1016,49 @@ def _sina_factor_transform(symbol, dates, body):
     return scale, offset
 
 
+def _cash_share_factor_transform(symbol, dates, bundle):
+    """Replay inspected events in the existing (old_price - cash) / shares mode.
+
+    Cash is explicitly per OLD share. A dividend declared per new share must
+    first be converted using the inspected announcement, never inferred from
+    local prices. Source authenticity/interpretation remains operator evidence.
+    """
+    if (
+        dates.empty or dates.isna().any() or dates.duplicated().any()
+        or not dates.is_monotonic_increasing or not isinstance(bundle, dict)
+        or bundle.get("dataset_id") != "cn_etf_daily" or bundle.get("symbol") != symbol
+        or bundle.get("as_of") != _date(dates.max())
+        or bundle.get("convention") != "cash_share_affine_front"
+        or not isinstance(bundle.get("events"), list) or len(bundle["events"]) > 10_000
+        or not isinstance(bundle.get("sources"), list) or not bundle["sources"]
+    ):
+        raise ValueError("cash/share evidence identity, convention or anchor differs")
+    scale, offset = np.ones(len(dates)), np.zeros(len(dates))
+    previous = None
+    for event in bundle["events"]:
+        try:
+            day = pd.Timestamp(event["effective_date"])
+            cash, ratio = (event[k] for k in ("cash_per_old_share", "new_shares_per_old_share"))
+            if isinstance(cash, bool) or isinstance(ratio, bool):
+                raise ValueError("boolean event value")
+            cash, ratio = float(cash), float(ratio)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid cash/share event") from exc
+        if (
+            pd.isna(day) or day != day.normalize() or str(event["effective_date"]) != _date(day)
+            or day > dates.max() or (previous is not None and day <= previous)
+            or not np.isfinite([cash, ratio]).all() or cash < 0 or ratio <= 0
+        ):
+            raise ValueError("invalid or duplicated cash/share event date/value")
+        previous = day
+        before = (dates < day).to_numpy()
+        scale[before] /= ratio
+        offset[before] = (offset[before] - cash) / ratio
+    if not np.isfinite(scale).all() or not np.isfinite(offset).all() or not (scale > 0).all():
+        raise ValueError("cash/share transform overflow")
+    return scale, offset
+
+
 def _factor_registry_comparison(symbol, frames, descriptor, indexes, snapshot, readset):
     dates = _frame_dates(frames["raw"])
     if descriptor["as_of"] != _date(dates.max()) or any(
@@ -1024,7 +1067,29 @@ def _factor_registry_comparison(symbol, frames, descriptor, indexes, snapshot, r
     ):
         raise ValueError("factor evidence differs from current files or anchor")
     body = readset.read(_child(snapshot, descriptor["path"]), descriptor["sha256"])
-    scale, offset = _sina_factor_transform(symbol, dates, body)
+    provider = descriptor.get("provider", "sina")
+    if provider == "sina":
+        scale, offset = _sina_factor_transform(symbol, dates, body)
+        comparison = "factor_registry"
+    elif provider == "verified_cash_share_events":
+        bundle = json.loads(body)
+        scale, offset = _cash_share_factor_transform(symbol, dates, bundle)
+        for document in bundle["sources"]:
+            if (
+                document["kind"] not in {
+                    "issuer_announcement", "issuer_announcement_reprint",
+                    "miniqmt_factor_response", "eastmoney_corporate_actions",
+                    "sina_factor_registry", "tencent_price_sample",
+                }
+                or not re.fullmatch(r"[0-9a-f]{64}", document["sha256"])
+                or (document["kind"] != "miniqmt_factor_response"
+                    and not str(document["url"]).startswith(("https://", "http://")))
+            ):
+                raise ValueError("cash/share source reference is incomplete")
+            readset.read(_child(snapshot, document["path"]), document["sha256"])
+        comparison = "cash_share_events"
+    else:
+        raise ValueError("unsupported factor evidence provider")
     issues = []
     for field, actual, expected, component, atol in [
         (field, _numeric(frames["qfq"], field), _numeric(frames["raw"], field) * scale + offset, "qfq", PAIRED_PRICE_ABSOLUTE_TOLERANCE)
@@ -1043,10 +1108,10 @@ def _factor_registry_comparison(symbol, frames, descriptor, indexes, snapshot, r
     for item in issues:
         item["evidence"] = descriptor["path"]
     return issues, {
-        "symbol": symbol, "provider": "sina", "comparison": "factor_registry",
+        "symbol": symbol, "provider": provider, "comparison": comparison,
         "evidence": descriptor["path"], "status": "disagreed" if issues else "matched",
         "dates": len(dates), "start": _date(dates.min()), "end": _date(dates.max()),
-        "scope": "reported provider regimes support these files; not certification of every real historical event",
+        "scope": "retained regimes or operator-inspected cash/share events support these files; source authenticity and event interpretation are not automatically certified",
     }
 
 
@@ -1310,7 +1375,11 @@ def audit_etf_snapshot(
                     issues.extend(more)
                     references.append(reference)
                     declared = frames["factors"].get("factor_source", pd.Series(dtype=str))
-                    if reference["status"] == "matched" and len(declared) and declared.eq("sina_qfq_registry").all():
+                    expected_tag = {
+                        "sina": "sina_qfq_registry",
+                        "verified_cash_share_events": "verified_cash_share_events",
+                    }[reference["provider"]]
+                    if reference["status"] == "matched" and len(declared) and declared.eq(expected_tag).all():
                         issues[beginning:] = [
                             item for item in issues[beginning:]
                             if item["rule"] != "factor_authority_unproven"
@@ -1489,6 +1558,10 @@ def audit_etf_snapshot(
             item.get("comparison") == "factor_registry" and item["status"] == "matched"
             for item in references
         ),
+        "cash_share_event_matches": sum(
+            item.get("comparison") == "cash_share_events" and item["status"] == "matched"
+            for item in references
+        ),
         "counts": dict(counts),
         "rules": dict(Counter(i["rule"] for i in issues)),
         "affected_symbols": {
@@ -1530,6 +1603,7 @@ def audit_etf_snapshot(
             "公告缺日解释仅适用于绑定文件和日期；工具核对字节摘要，不自动认证公告出处或替代人工核读；不会填造行情或推进实际行情末日",
             "供应商零成交记录单列为该来源的观察，不是交易所停牌公告，也不是独立认证无成交",
             "外部因子复核只确认所存供应商变换支持这些文件，不认证供应商已穷尽全部真实历史事件；空SDK回复不单独视为无事件证明",
+            "现金/份额事件按人工核读记录重放，核对当前文件与原证据字节；每旧份现金与每新份现金明确区分，不切换成等比前复权，也不自动认证公告解释",
         ],
     }
     _write_csv(output_dir / "findings.csv", issues, FINDING_FIELDS)
@@ -1557,6 +1631,7 @@ def audit_etf_snapshot(
         "\n详单见 findings.csv（证券、日期、字段、原值/对照值）；逐证券汇总见 symbols.csv。\n\n"
         + f"无行情日期说明：公告 {report['announced_absence_sessions']} 项，供应商零成交记录 {report['provider_zero_activity_sessions']} 项；后者不等于独立认证无成交。详见 explained_absences.csv，实际行情末日不变。\n\n"
         + f"所存外部因子表逐日核对吻合 {report['factor_registry_matches']} 只，详见 summary.json 的 external_replays；不等于认证全部真实历史事件。\n\n"
+        + f"人工核读现金/份额事件重放吻合 {report['cash_share_event_matches']} 只；原文与文件绑定见 external_replays。\n\n"
         + "\n".join(f"- {limit}" for limit in report["limits"])
         + f"\n\n输入未变：{unchanged}；耗时 {report['timing']['elapsed_seconds']} 秒；峰值RSS {report['peak_rss_mib']} MiB。\n"
     )

@@ -87,6 +87,10 @@ A 股旧 TickFlow 因子表的空 `symbol`/`offset`，可通过 `incremental_upd
 
 这证明所存供应商因子表支持这些数值，不认证供应商穷尽了所有真实事件；MiniQMT 空列表仍不单独证明从未分红。`front` 的加减式前复权和 `front_ratio` 等比前复权有不同数值，后者不能为消除前者的负数而静默替换。缺日补充必须是实际保存的来源记录，成交量为零不等于程序可以凭前收盘填造 bar；来源明确报停牌或复权关系未核实时分别披露，不阻断其他文件读取。
 
+发行公告与供应商事件有冲突时，可以在同一 `factor_registry_evidence` 引用中使用 `provider=verified_cash_share_events`。其 JSON 记录证券、实际末日、`convention=cash_share_affine_front`、按生效日排列的事件和原始来源文件引用。事件明确写出 `cash_per_old_share`（每旧份现金）与 `new_shares_per_old_share`（每旧份对应的新份额），重放既有的 `(价格－现金)÷份额比例`；若公告按拆分后的新份额分红，须先有据换算现金单位，不能拿原生字段直接套算。
+
+该模式仍逐日核对 OHLC、factor、offset，并读取绑定的公告或回执字节；缺失、替换、错误锚点或仅改 `verified_cash_share_events` 标签不能消除证据不足。报告单列 `cash_share_event_matches`。原文真伪及事件解释仍由人工核读负责，工具不自动挑选供应商，也不据此阻断读取。证据和转换修复保存在新的派生快照中，原始行情与旧快照保留。
+
 缺日核实可保留 Baostock 的逐日原始响应，通过 `source.zero_activity_evidence` 绑定当前 raw/QFQ 文件摘要。体检只把实际返回的、同证券同日、原始口径、零成交量与成交额且 OHLC 相同的记录列为 `provider_reported_zero_activity`；供应商的 `tradestatus=0/1` 原样披露。这不是交易所停牌公告，也不是独立证明当日无成交，不插入假 bar、不推进实际行情末日。空响应、非零成交、身份变化或被篡改的记录不能解除缺日提示。完整说明在 `explained_absences.csv`，与正式公告证据分开。
 
 ## 回滚与范围
