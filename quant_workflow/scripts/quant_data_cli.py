@@ -1453,6 +1453,11 @@ def _update(
             raise DataContractError("the lightweight updater does not rebuild legacy compatibility datasets")
 
         try:
+            if not bundle_dir and (dataset_id != "cn_etf_daily" or (etf_provider or "miniqmt") == "miniqmt"):
+                result = provider.maintain_market("etf" if dataset_id == "cn_etf_daily" else "stock",
+                                                  quant_data_dir=root, through=through)
+                _json_dump({**result, "backend": "quant_qmt_data"})
+                return 2 if result.get("status") in {"blocked", "failed", "partial"} else 0
             if dataset_id == "cn_etf_daily":
                 result = {}
                 path = provider.update_cn_etf_snapshot(

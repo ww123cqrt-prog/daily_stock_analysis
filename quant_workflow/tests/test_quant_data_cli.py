@@ -1120,6 +1120,7 @@ def test_updater_domain_failure_is_nonzero_without_a_second_publisher(tmp_path, 
         raise error("bounded supplier or input failure")
     monkeypatch.setattr(provider, "update_ashare_snapshot", fail)
     monkeypatch.setattr(provider, "update_cn_etf_snapshot", fail)
+    monkeypatch.setattr(provider, "maintain_market", lambda *args, **kwargs: fail(**kwargs))
     dataset = "cn_etf_daily" if domain == "etf" else "ashare_daily_qfq"
     assert cli.main(["--root", str(tmp_path), "update", dataset]) == 2
     assert "bounded supplier or input failure" in capsys.readouterr().err
@@ -1135,6 +1136,7 @@ def test_etf_cli_uses_this_provider_operation_result(tmp_path, monkeypatch, caps
         kwargs["_result"].update(status=state, failed_symbols=["SZ159915"] if expected else [])
         return tmp_path / "snapshot"
     monkeypatch.setattr(provider, "update_cn_etf_snapshot", update)
+    monkeypatch.setattr(provider, "maintain_market", lambda *args, **kwargs: dict(status=state, failed_symbols=["SZ159915"] if expected else []))
     assert cli.main(["--root", str(tmp_path), "update", "cn_etf_daily"]) == expected
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == state and result["backend"] == "quant_qmt_data"
@@ -1146,3 +1148,17 @@ def test_old_compatibility_refresh_is_not_silently_ignored(tmp_path, capsys):
     assert cli.main(["--root", str(tmp_path), "update", "ashare_daily_qfq",
                      "--refresh-legacy-compatibility"]) == 2
     assert "does not rebuild legacy" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("dataset,asset", [("ashare_daily_qfq", "stock"), ("cn_etf_daily", "etf")])
+def test_daily_update_uses_market_maintenance_including_security_discovery(tmp_path, monkeypatch, capsys, dataset, asset):
+    import quant_qmt_data as provider
+    cli = load_module()
+    def maintain(kind, **kwargs):
+        assert kind == asset and kwargs["quant_data_dir"] == tmp_path
+        return dict(status="updated", added_symbols=["new-security"], snapshots=["new-snapshot"])
+    monkeypatch.setattr(provider, "maintain_market", maintain)
+    monkeypatch.setattr(provider, "update_ashare_snapshot", lambda **_: pytest.fail("fixed stock universe used"))
+    monkeypatch.setattr(provider, "update_cn_etf_snapshot", lambda **_: pytest.fail("fixed ETF universe used"))
+    assert cli.main(["--root", str(tmp_path), "update", dataset, "--through", "2026-10-19"]) == 0
+    assert json.loads(capsys.readouterr().out)["added_symbols"] == ["new-security"]
