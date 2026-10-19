@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, _is_etf_code
 from .miniqmt_bridge import MiniQMTBridgeClient, MiniQMTError
 from .realtime_types import RealtimeSource, UnifiedRealtimeQuote
 
@@ -91,3 +91,43 @@ class MiniQMTFetcher(BaseFetcher):
             provider_timestamp=datetime.fromtimestamp(stamp / 1000, timezone.utc).isoformat() if stamp else None,
             market="cn", currency="CNY",
         )
+
+
+class QuantQMTDataFetcher(BaseFetcher):
+    """Ordinary DSA historical bars from the same committed local snapshots.
+
+    This adapter does no acquisition. Updates remain an explicit separate
+    operation, so a read cannot silently mix unpublished supplier responses.
+    """
+    name = "QuantQMTDataFetcher"
+    priority = -2
+
+    def __init__(self, *, quant_data_root=None):
+        from pathlib import Path
+        from src.services.quant_workflow_paths import quant_data_root as default_root
+        self.root = Path(quant_data_root or default_root())
+
+    def _fetch_raw_data(self, stock_code, start_date, end_date):
+        from quant_qmt_data import DataContractError, bar_snapshot, read_bars
+        dataset = "cn_etf_daily" if _is_etf_code(stock_code) else "ashare_daily_qfq"
+        try:
+            snapshot = bar_snapshot(dataset, quant_data_root=self.root, price_basis="qfq")
+            frame = read_bars(dataset, stock_code, quant_data_root=self.root, price_basis="qfq",
+                              expected_identity=snapshot["identity"], start=start_date, end=end_date)
+        except (DataContractError, OSError, ValueError) as exc:
+            raise DataFetchError("本机快照无法满足该证券请求；请显式更新或核对数据范围。") from exc
+        frame.attrs.update(dataset_identity=snapshot["identity"], backend="quant_qmt_data",
+                           volume_unit="units" if dataset == "cn_etf_daily" else "shares")
+        return frame
+
+    def _normalize_data(self, df, stock_code):
+        result = df.copy()
+        result["date"] = pd.to_datetime(result["date"])
+        result["code"] = normalize_stock_code(stock_code)
+        # The package already returns shares / ETF units; never multiply again.
+        if "pctChg" in result:
+            result["pct_chg"] = pd.to_numeric(result["pctChg"], errors="coerce")
+        else:
+            result["pct_chg"] = pd.to_numeric(result["close"]).pct_change(fill_method=None) * 100
+            result.loc[result.index[0], "pct_chg"] = 0.0
+        return result[["code", *STANDARD_COLUMNS]]

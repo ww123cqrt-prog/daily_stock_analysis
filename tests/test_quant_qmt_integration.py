@@ -180,6 +180,12 @@ def test_update_cli_runs_real_temporary_increment_and_zero_network_replay(tmp_pa
     frozen = provider.bar_snapshot(dataset, quant_data_root=tmp_path, price_basis="qfq")
     old_file = frozen["bars_dir"] / f"{symbol}.parquet"
     old_bytes = old_file.read_bytes()
+    from data_provider.miniqmt_fetcher import QuantQMTDataFetcher
+    ordinary = QuantQMTDataFetcher(quant_data_root=tmp_path).get_daily_data(
+        symbol[2:], days[0], days[1])
+    assert ordinary["volume"].tolist() == old["volume"].tolist()
+    assert ordinary["close"].tolist() == old["close"].tolist()
+    assert ordinary.attrs["dataset_identity"] == frozen["identity"]
     if not stocks:
         from datetime import date
         from src.repositories.quant_price_repo import QuantPriceRepository

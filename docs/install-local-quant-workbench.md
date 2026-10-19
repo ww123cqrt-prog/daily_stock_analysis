@@ -55,6 +55,8 @@ DSA 使用独立的 `quant_qmt_data` Python 包和 `quant_qmt_data/data` 快照�
 
 本分支需要配套轻量包中的 `bar_snapshot`、`inspect_datasets` 及 `read_bars(expected_identity=...)` 接口；不能仅更新 DSA 后仍使用旧版轻量包。普通行情、脚本回测及 Qlib 的行情文件读取委托该包，DSA 仍负责策略、历史成员池与研究清洗规则。`/data` 展示已提交快照的日期、口径及摘要，只核对清单身份，不冒充全库质量体检。回测保存快照 ID、manifest/content/file-index 摘要；重放按保存的身份读取，旧版被清理后明确失败，不静默改读新版。股票成交量按股，ETF 按份；文件中的原始数量不改写。
 
+本机存在或显式配置该快照库时，普通 A 股／ETF 分析的历史日线也从相同快照读取并保留 DataFrame 身份；缺失时提示显式更新，不自动转向供应商取另一版行情。实时行情、新闻及海外市场继续使用现有入口。
+
 网页 `/workflow` 提供独立的“更新股票快照（MiniQMT）”和“更新 ETF 快照（MiniQMT）”，只做行情更新，不附带训练。命令入口保持：
 
 ```bash

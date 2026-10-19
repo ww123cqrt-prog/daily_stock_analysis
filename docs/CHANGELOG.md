@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] 普通 A 股／ETF 分析的历史日线在本机快照库已配置时也使用 `quant_qmt_data`，保留输入身份与基础成交量单位；本地缺失不隐式下载另一来源，实时行情与海外路由保持。
+
 - [改进] Mac 的行情读取、股票／ETF 增量更新与网页数据状态统一委托 `quant_qmt_data`；按根清单固定快照并保留回测血缘，ETF 独立回测不加载无关 A 股历史，状态页只检查清单身份，不连接封存服务。
 
 - [修复] 股票增量衔接区分现金式与比例式前复权，凭冻结 raw/factor/QFQ、明确事件及 SDK 重叠价格续接比例历史，支持显式补回已证明遗漏的事件；保留旧快照和逐证券缺日说明，不新增读取门禁。

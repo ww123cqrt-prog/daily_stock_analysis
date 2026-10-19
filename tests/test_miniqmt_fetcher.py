@@ -119,12 +119,39 @@ def test_relevant_share_conversion_still_rejects_without_a_supported_rule():
         adjusted_prices(raw, [event])
 
 
-def test_default_stock_manager_selects_miniqmt_when_private_profile_is_available(monkeypatch):
+def test_default_stock_manager_selects_miniqmt_when_private_profile_is_available(monkeypatch, tmp_path):
     from data_provider.miniqmt_bridge import MiniQMTBridgeClient
     from data_provider.base import DataFetcherManager
     monkeypatch.setattr(MiniQMTBridgeClient, "configured", staticmethod(lambda: True))
+    monkeypatch.setenv("QUANT_DATA_ROOT", "")
+    monkeypatch.setattr("src.services.quant_workflow_paths.quant_data_root", lambda: tmp_path)
     manager = DataFetcherManager()
     assert manager.available_fetchers[0] == "MiniQMTFetcher"
+
+
+def test_configured_local_history_is_available_without_a_quote_connection(monkeypatch, tmp_path):
+    from data_provider.base import DataFetcherManager
+    from data_provider.miniqmt_bridge import MiniQMTBridgeClient
+    monkeypatch.setenv("QUANT_DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(MiniQMTBridgeClient, "configured", staticmethod(lambda: False))
+    manager = DataFetcherManager()
+    assert manager.available_fetchers[0] == "QuantQMTDataFetcher"
+    assert "QuantQMTDataFetcher" not in [f.name for f in manager._filter_daily_fetchers_for_market(
+        manager._get_fetchers_snapshot(), "hk")]
+
+
+def test_local_history_failure_does_not_implicitly_download_from_another_source(tmp_path):
+    from data_provider.base import BaseFetcher, DataFetcherManager, DataFetchError
+    from data_provider.miniqmt_fetcher import QuantQMTDataFetcher
+    class NetworkFallback(BaseFetcher):
+        name, priority = "NetworkFallback", 0
+        def _fetch_raw_data(self, *args):
+            pytest.fail("local snapshot error triggered a supplier request")
+        def _normalize_data(self, data, code):
+            return data
+    manager = DataFetcherManager(fetchers=[QuantQMTDataFetcher(quant_data_root=tmp_path), NetworkFallback()])
+    with pytest.raises(DataFetchError):
+        manager.get_daily_data("000001", "2026-10-14", "2026-10-16")
 
 
 def test_miniqmt_snapshot_quote_retains_provider_timestamp():

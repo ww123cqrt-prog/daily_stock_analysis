@@ -15,6 +15,7 @@
 """
 
 import logging
+import os
 import random
 import time
 from threading import BoundedSemaphore, RLock, Thread
@@ -616,6 +617,7 @@ class DataFetcherManager:
     """
 
     _DAILY_MARKET_FETCHER_SUPPORT = {
+        "QuantQMTDataFetcher": {"cn"},
         "MiniQMTFetcher": {"cn"},
         "EfinanceFetcher": {"cn"},
         "TencentFetcher": {"cn"},
@@ -1167,7 +1169,8 @@ class DataFetcherManager:
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
         from .miniqmt_bridge import MiniQMTBridgeClient
-        from .miniqmt_fetcher import MiniQMTFetcher
+        from .miniqmt_fetcher import MiniQMTFetcher, QuantQMTDataFetcher
+        from src.services.quant_workflow_paths import quant_data_root
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         efinance = EfinanceFetcher()
@@ -1177,6 +1180,9 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         optional_fetchers: List[BaseFetcher] = []
+        local_root = quant_data_root()
+        if os.environ.get("QUANT_DATA_ROOT") or (local_root / "DATA_MANIFEST.json").is_file():
+            optional_fetchers.append(QuantQMTDataFetcher(quant_data_root=local_root))
         if MiniQMTBridgeClient.configured():
             optional_fetchers.append(MiniQMTFetcher())
 
@@ -1297,6 +1303,18 @@ class DataFetcherManager:
         is_kr = (not is_us) and (not is_hk) and _is_kr_market(stock_code)
         is_tw = (not is_us) and (not is_hk) and _is_tw_market(stock_code)
         market = "us" if is_us else "hk" if is_hk else "jp" if is_jp else "kr" if is_kr else "tw" if is_tw else "cn"
+        if market == "cn":
+            local = next((f for f in fetchers if f.name == "QuantQMTDataFetcher"), None)
+            if local is not None:
+                # A committed local read is a different responsibility from
+                # supplier failover. Missing local evidence must not trigger
+                # an implicit download with a different price/source basis.
+                frame = self._call_fetcher_method(
+                    local, "get_daily_data", stock_code=stock_code,
+                    start_date=start_date, end_date=end_date, days=days)
+                if frame is None or frame.empty:
+                    raise DataFetchError("本机快照在该区间无行情；请显式更新或核对证券与日期。")
+                return frame, local.name
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
