@@ -75,13 +75,7 @@ def quant_data_root() -> Path:
     if configured:
         return Path(configured).expanduser()
 
-    repo_local = DEFAULT_DSA_ROOT / "quant_data"
-    sibling = projects_root() / "quant_data"
-    if sibling.exists():
-        return sibling
-    if repo_local.exists():
-        return repo_local
-    return repo_local
+    return projects_root() / "quant_qmt_data" / "data"
 
 
 def china_astock_root() -> Path:

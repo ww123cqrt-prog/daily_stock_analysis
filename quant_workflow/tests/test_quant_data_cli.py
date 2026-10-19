@@ -122,8 +122,8 @@ def _write_etf_release_snapshot(
             "universe_manifest_path": "UNIVERSE_MANIFEST.json",
             "universe_sha256": "u" * 64,
             "snapshot_retention": {
-                "policy": "current_plus_one_previous",
-                "max_complete_snapshots": 2,
+                "policy": "immutable_history",
+                "max_complete_snapshots": 3,
             },
         },
         adjustment={
@@ -411,7 +411,8 @@ def test_release_validation_checks_current_backup_and_strategy_symbols(
     assert payload["network_requests"] == 0
     assert payload["snapshot_retention"] == {
         "count": 2,
-        "policy": "current_plus_one_previous",
+        "policy": "immutable_history",
+        "max_complete_snapshots": 3,
     }
     assert payload["current"]["snapshot_id"] == "cn-etf-current"
     assert payload["backup"]["snapshot_id"] == "cn-etf-backup"
@@ -441,7 +442,7 @@ def test_release_validation_allows_governed_resume_cache(
     assert json.loads(capsys.readouterr().out)["status"] == "full_validation_passed"
 
 
-def test_release_validation_fails_when_backup_is_missing(
+def test_release_validation_allows_single_complete_snapshot(
     tmp_path: Path, capsys
 ) -> None:
     module = load_module()
@@ -458,19 +459,52 @@ def test_release_validation_fails_when_backup_is_missing(
         ]
     )
 
-    assert result == 2
+    assert result == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "full_validation_failed"
-    assert "backup" in payload["error"]["message"]
+    assert payload["status"] == "full_validation_passed"
+    assert payload["snapshot_retention"] == {
+        "count": 1,
+        "policy": "immutable_history",
+        "max_complete_snapshots": 3,
+    }
+    assert payload["backup"] is None
 
 
-def test_release_validation_fails_on_extra_snapshot_or_old_entry(
+def test_release_validation_accepts_extra_complete_snapshot_or_rejects_old_entry(
     tmp_path: Path, capsys
 ) -> None:
     module = load_module()
-    quant_data, current, _backup = _build_etf_release_fixture(module, tmp_path)
-    snapshots = current.parent
-    shutil.copytree(snapshots / "cn-etf-backup", snapshots / "cn-etf-extra")
+    quant_data, _current, _backup = _build_etf_release_fixture(module, tmp_path)
+    contract = sys.modules["quant_data_contract"]
+    dataset_root = quant_data / "parquet" / "etf_1d" / "cn_etf_daily"
+    extra_staging = _write_etf_release_snapshot(
+        contract,
+        quant_data,
+        snapshot_id="cn-etf-extra",
+        symbols=(
+            "SH512890",
+            "SH513010",
+            "SH510720",
+            "SZ159915",
+            "SH513100",
+        ),
+        retrieved_at="2026-08-08T18:00:00+08:00",
+    )
+    extra = contract.publish_snapshot(
+        extra_staging,
+        dataset_root=dataset_root,
+        quant_data_root=quant_data,
+    )
+    contract.write_root_manifest(
+        quant_data,
+        {
+            "cn_etf_daily": contract.catalog_entry_from_snapshot(
+                extra,
+                quant_data_root=quant_data,
+                dataset_root=dataset_root,
+            )
+        },
+    )
 
     result = module.main(
         [
@@ -482,12 +516,31 @@ def test_release_validation_fails_on_extra_snapshot_or_old_entry(
         ]
     )
 
-    assert result == 2
+    assert result == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "full_validation_failed"
-    assert "exactly" in payload["error"]["message"]
+    assert payload["status"] == "full_validation_passed"
+    assert payload["snapshot_retention"] == {
+        "count": 3,
+        "policy": "immutable_history",
+        "max_complete_snapshots": 3,
+    }
+    assert payload["validated_snapshot_ids"] == [
+        "cn-etf-backup",
+        "cn-etf-current",
+        "cn-etf-extra",
+    ]
 
-    shutil.rmtree(snapshots / "cn-etf-extra")
+    catalog_path = quant_data / "DATA_MANIFEST.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["datasets"]["cn_etf_daily_qfq"] = {
+        "dataset_id": "cn_etf_daily_qfq",
+        "data_kind": "daily_bars",
+        "role": "canonical",
+        "status": "ready",
+        "price_basis": "qfq",
+        "dataset_root": "parquet/etf_1d/cn_etf_daily_qfq",
+    }
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
     (quant_data / "parquet" / "etf_1d" / "etf_momentum_daily_qfq").mkdir(
         parents=True
     )
@@ -638,250 +691,12 @@ def test_release_validation_rejects_strategy_symbol_outside_qfq_component(
         )
 
 
-def test_update_reports_registered_ashare_v2_blockers(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_catalog(quant_data)
-    path = quant_data / "DATA_MANIFEST.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["datasets"]["ashare_daily_qfq"] = {
-        "dataset_id": "ashare_daily_qfq",
-        "data_kind": "daily_bars",
-        "role": "canonical",
-        "status": "blocked",
-        "source": {"provider": "baostock", "interface": "adjust_factor"},
-        "price_basis": "qfq",
-        "path": "parquet/ashare_1d/ashare_daily_qfq",
-        "adjustment": {"method": "local_factor"},
-        "blocker_codes": ["raw_snapshot_missing", "factor_snapshot_missing"],
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = module.main(
-        ["--root", str(quant_data), "update", "ashare_daily_qfq"]
-    )
-
-    assert result == 2
-    error = capsys.readouterr().err
-    assert "A-share v2 update is blocked" in error
-    assert "raw_snapshot_missing" in error
 
 
-def test_update_ashare_v2_builds_and_publishes_a_verified_bundle(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    write_catalog(quant_data)
-    raw = quant_data / "raw-snapshot"
-    qfq = quant_data / "qfq-snapshot"
-    fake = types.SimpleNamespace(
-        build_snapshots_from_bundle=lambda **kwargs: (raw, qfq)
-    )
-    builder_calls: list[dict[str, object]] = []
-    build_direct = fake_direct_provider_builder(quant_data, builder_calls)
-
-    with patch.dict(sys.modules, {"download_baostock_v2": fake}), patch.object(
-        module, "build_direct_provider_descriptor", side_effect=build_direct
-    ):
-        result = module.main(
-            [
-                "--root",
-                str(quant_data),
-                "update",
-                "ashare_daily_qfq",
-                "--bundle-dir",
-                str(bundle),
-            ]
-        )
-
-    assert result == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "legacy_compatibility": {"status": "not_requested"},
-        "qfq": str(qfq),
-        "qlib_cleaned_provider": str(quant_data / "direct-cleaned"),
-        "qlib_provider": str(quant_data / "direct-canonical"),
-        "raw": str(raw),
-    }
-    assert [call["cleaning_mode"] for call in builder_calls] == [
-        "canonical",
-        "cleaned",
-    ]
-    status = json.loads(
-        (
-            quant_data
-            / "runtime"
-            / "status"
-            / "quant_data_update_latest.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert status["status"] == "completed"
-    assert status["legacy_compatibility"] == {"status": "not_requested"}
-    assert not (quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH).exists()
 
 
-def test_update_ashare_v2_dispatches_incremental_bundle_without_full_rebuild(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    (bundle / "BUNDLE_MANIFEST.json").write_text(
-        json.dumps({"bundle_mode": "incremental"}),
-        encoding="utf-8",
-    )
-    write_catalog(quant_data)
-    raw_stage = quant_data / "staging" / "raw-incremental"
-    qfq_stage = quant_data / "staging" / "qfq-incremental"
-    raw_published = quant_data / "published-raw"
-    qfq_published = quant_data / "published-qfq"
-    incremental_calls: list[dict[str, object]] = []
-    publish_calls: list[dict[str, object]] = []
-
-    def build_incremental(**kwargs):
-        incremental_calls.append(kwargs)
-        return types.SimpleNamespace(
-            raw_stage=raw_stage,
-            qfq_stage=qfq_stage,
-            base_latest_trade_date="2026-08-04",
-            latest_trade_date="2026-08-07",
-            downloaded_rows=16_548,
-            reused_symbols=("SH600000",),
-            factor_changed_symbols=("SZ000001",),
-            qfq_recalculated_symbols=("SZ000001",),
-        )
-
-    def reject_full_rebuild(**_kwargs):
-        raise AssertionError("incremental bundle must not use the full builder")
-
-    def publish_group(snapshots, **kwargs):
-        publish_calls.append({"snapshots": snapshots, **kwargs})
-        return [raw_published, qfq_published]
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=reject_full_rebuild
-        ),
-        "incremental_update_ashare_v2": types.SimpleNamespace(
-            build_incremental_price_snapshots=build_incremental
-        ),
-    }
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "publish_snapshot_group",
-        side_effect=publish_group,
-        create=True,
-    ), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data),
-    ):
-        result = module.main(
-            [
-                "--root",
-                str(quant_data),
-                "update",
-                "ashare_daily_qfq",
-                "--bundle-dir",
-                str(bundle),
-            ]
-        )
-
-    assert result == 0
-    assert incremental_calls == [
-        {"bundle_dir": bundle, "quant_data_root": quant_data.resolve()}
-    ]
-    assert publish_calls == [
-        {
-            "snapshots": [
-                (
-                    raw_stage,
-                    quant_data.resolve()
-                    / "parquet/ashare_1d/ashare_daily_raw",
-                ),
-                (
-                    qfq_stage,
-                    quant_data.resolve()
-                    / "parquet/ashare_1d/ashare_daily_qfq",
-                ),
-            ],
-            "quant_data_root": quant_data.resolve(),
-            "update_root_catalog": True,
-            "publication_lock_held": True,
-        }
-    ]
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["update_mode"] == "incremental"
-    assert payload["incremental"]["base_latest_trade_date"] == "2026-08-04"
-    assert payload["incremental"]["latest_trade_date"] == "2026-08-07"
-    assert payload["incremental"]["downloaded_rows"] == 16_548
-    assert payload["incremental"]["factor_changed_symbols"] == 1
 
 
-def test_update_ashare_v2_builds_direct_provider_descriptors_not_bin_snapshots(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    write_catalog(quant_data)
-    raw = quant_data / "raw-snapshot"
-    qfq = quant_data / "qfq-snapshot"
-    calls: list[dict[str, object]] = []
-
-    def build_direct(**kwargs):
-        calls.append(kwargs)
-        mode = str(kwargs["cleaning_mode"])
-        descriptor = quant_data / f"direct-{mode}" / "PROVIDER_DESCRIPTOR.json"
-        descriptor.parent.mkdir(parents=True, exist_ok=True)
-        descriptor.write_text("{}", encoding="utf-8")
-        return descriptor
-
-    fake_download = types.SimpleNamespace(
-        build_snapshots_from_bundle=lambda **_kwargs: (raw, qfq)
-    )
-    fake_legacy = types.SimpleNamespace(
-        build_qlib_v2=lambda **_kwargs: quant_data / "legacy-qlib",
-    )
-    fake_legacy_cleaned = types.SimpleNamespace(
-        build_cleaned_qlib_v2=lambda **_kwargs: quant_data / "legacy-cleaned",
-    )
-    with patch.dict(
-        sys.modules,
-        {
-            "download_baostock_v2": fake_download,
-            "build_qlib_v2": fake_legacy,
-            "build_cleaned_qlib_v2": fake_legacy_cleaned,
-        },
-    ), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=build_direct,
-        create=True,
-    ):
-        result = module.main(
-            [
-                "--root",
-                str(quant_data),
-                "update",
-                "ashare_daily_qfq",
-                "--bundle-dir",
-                str(bundle),
-            ]
-        )
-
-    assert result == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["qlib_provider"] == str(quant_data / "direct-canonical")
-    assert payload["qlib_cleaned_provider"] == str(quant_data / "direct-cleaned")
-    assert [call["cleaning_mode"] for call in calls] == ["canonical", "cleaned"]
-    assert "qlib_v2" not in payload
-    assert "qlib_cleaned_v2" not in payload
 
 
 def test_update_cn_index_daily_uses_formal_parquet_updater(
@@ -1041,396 +856,18 @@ def test_expand_cn_etf_universe_cli_handles_download_error_without_traceback(
     assert "Traceback" not in captured.err
 
 
-def test_update_recovers_interrupted_transaction_before_new_publication(
-    tmp_path: Path,
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    original = write_pointer_state(module, quant_data, "before-interruption")
-    module._write_update_transaction(
-        quant_data,
-        module._capture_file_state(quant_data),
-        dataset_id="ashare_daily_qfq",
-        started_at="2026-07-30T10:00:00+08:00",
-    )
-    write_pointer_state(module, quant_data, "partially-published")
-    observed_restored_state = False
-
-    def build_snapshots(**_kwargs):
-        nonlocal observed_restored_state
-        observed_restored_state = all(
-            path.read_bytes() == value for path, value in original.items()
-        )
-        return quant_data / "new-raw", quant_data / "new-qfq"
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=build_snapshots
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "_refresh_qlib_cleaning_plan",
-        return_value={"status": "not_registered"},
-    ), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data),
-    ):
-        assert (
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                tmp_path / "bundle",
-            )
-            == 0
-        )
-
-    assert observed_restored_state
-    assert not (quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH).exists()
 
 
-def test_corrupt_interrupted_transaction_blocks_new_publication(
-    tmp_path: Path,
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_pointer_state(module, quant_data, "stable")
-    journal = quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH
-    journal.parent.mkdir(parents=True)
-    journal.write_text("not-json", encoding="utf-8")
-    builder_called = False
-
-    def build_snapshots(**_kwargs):
-        nonlocal builder_called
-        builder_called = True
-        return quant_data / "new-raw", quant_data / "new-qfq"
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=build_snapshots
-        ),
-        "build_qlib_v2": types.SimpleNamespace(
-            build_qlib_v2=lambda **_kwargs: quant_data / "new-qlib"
-        ),
-        "build_cleaned_qlib_v2": types.SimpleNamespace(
-            build_cleaned_qlib_v2=lambda **_kwargs: quant_data / "new-cleaned"
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules):
-        with pytest.raises(module.DataContractError, match="transaction journal"):
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                tmp_path / "bundle",
-            )
-
-    assert not builder_called
-    assert journal.exists()
 
 
-def test_update_refreshes_legacy_compatibility_only_when_explicitly_requested(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    write_catalog(quant_data)
-    calls: list[dict[str, object]] = []
-
-    def build_compatibility(**kwargs):
-        calls.append(kwargs)
-        return {"status": "published", "run_id": "compat-001"}
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=lambda **_kwargs: (
-                quant_data / "raw",
-                quant_data / "qfq",
-            )
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=build_compatibility
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data),
-    ):
-        result = module.main(
-            [
-                "--root",
-                str(quant_data),
-                "update",
-                "ashare_daily_qfq",
-                "--bundle-dir",
-                str(bundle),
-                "--refresh-legacy-compatibility",
-            ]
-        )
-
-    assert result == 0
-    assert calls == [
-        {
-            "quant_data_root": quant_data.resolve(),
-            "publication_lock_held": True,
-        }
-    ]
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["legacy_compatibility"] == {
-        "status": "published",
-        "run_id": "compat-001",
-    }
 
 
-def test_update_rolls_back_all_native_pointers_when_cleaned_build_fails(
-    tmp_path: Path,
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    write_catalog(quant_data)
-    tracked = {
-        quant_data / "DATA_MANIFEST.json": b'{"old":"manifest"}',
-        quant_data
-        / "parquet"
-        / "ashare_1d"
-        / "ashare_daily_raw"
-        / "LATEST.json": b'{"old":"raw"}',
-        quant_data
-        / "parquet"
-        / "ashare_1d"
-        / "ashare_daily_qfq"
-        / "LATEST.json": b'{"old":"qfq"}',
-        quant_data
-        / "reference"
-        / "qlib_cleaning_plan"
-        / "LATEST.json": b'{"old":"cleaning"}',
-    }
-    for path, value in tracked.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(value)
-
-    tracked_paths = list(tracked)
-
-    observed_steps: list[str] = []
-
-    def build_snapshots(**_kwargs):
-        observed_steps.append("raw_qfq")
-        for path in tracked_paths[0:3]:
-            path.write_text('{"new":"snapshot"}', encoding="utf-8")
-        return quant_data / "new-raw", quant_data / "new-qfq"
-
-    def refresh_cleaning_plan(_root):
-        observed_steps.append("qlib_cleaning_plan")
-        tracked_paths[3].write_text('{"new":"cleaning"}', encoding="utf-8")
-        return {"status": "published"}
-
-    def build_direct(**kwargs):
-        observed_steps.append(f"direct_{kwargs['cleaning_mode']}")
-        if kwargs["cleaning_mode"] == "cleaned":
-            raise RuntimeError("cleaned direct provider build failed")
-        descriptor = quant_data / "direct-canonical" / "PROVIDER_DESCRIPTOR.json"
-        descriptor.parent.mkdir(parents=True, exist_ok=True)
-        descriptor.write_text("{}", encoding="utf-8")
-        return descriptor
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=build_snapshots
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=lambda **_kwargs: None
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module, "_refresh_qlib_cleaning_plan", side_effect=refresh_cleaning_plan, create=True
-    ), patch.object(module, "build_direct_provider_descriptor", side_effect=build_direct):
-        try:
-            module._update(quant_data, "ashare_daily_qfq", None, bundle)
-        except module.DataContractError as exc:
-            assert "rolled back" in str(exc)
-        else:
-            raise AssertionError("partial update must fail")
-
-    for path, value in tracked.items():
-        assert path.read_bytes() == value
-    assert observed_steps == [
-        "raw_qfq",
-        "qlib_cleaning_plan",
-        "direct_canonical",
-        "direct_cleaned",
-    ]
-    status = json.loads(
-        (
-            quant_data
-            / "runtime"
-            / "status"
-            / "quant_data_update_latest.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert status["status"] == "rolled_back"
-    assert status["failed_step"] == "direct_provider_cleaned"
-    assert status["completed_steps"] == [
-        "raw_qfq_v2",
-        "qlib_cleaning_plan",
-        "direct_provider_canonical",
-    ]
-    assert not (quant_data / module.ASHARE_UPDATE_TRANSACTION_PATH).exists()
 
 
-def test_compatibility_refresh_failure_does_not_roll_back_native_v2(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    bundle = tmp_path / "bundle"
-    write_catalog(quant_data)
-    pointers = {
-        quant_data / "parquet/ashare_1d/ashare_daily_raw/LATEST.json": "raw-new",
-        quant_data / "parquet/ashare_1d/ashare_daily_qfq/LATEST.json": "qfq-new",
-    }
-
-    def publish_pointer(path: Path, value: str) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
-        return path.parent / value
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=lambda **_kwargs: (
-                publish_pointer(next(iter(pointers)), "raw-new"),
-                publish_pointer(list(pointers)[1], "qfq-new"),
-            )
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=lambda **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("compatibility failed")
-            )
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data),
-    ):
-        assert (
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                bundle,
-                refresh_legacy_compatibility=True,
-            )
-            == 0
-        )
-
-    for path, value in pointers.items():
-        assert path.read_text(encoding="utf-8") == value
-    output = json.loads(capsys.readouterr().out)
-    assert output["legacy_compatibility"] == {
-        "status": "legacy_refresh_failed",
-        "error_type": "RuntimeError",
-    }
-    status = json.loads(
-        (quant_data / "runtime/status/quant_data_update_latest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert status["status"] == "completed_with_legacy_warning"
-    assert status["completed_steps"] == [
-        "raw_qfq_v2",
-        "qlib_cleaning_plan",
-        "direct_provider_canonical",
-        "direct_provider_cleaned",
-    ]
 
 
-def test_rollback_status_write_failure_does_not_mask_update_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_catalog(quant_data)
-    original_manifest = (quant_data / "DATA_MANIFEST.json").read_bytes()
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=lambda **_kwargs: (
-                quant_data / "new-raw",
-                quant_data / "new-qfq",
-            )
-        ),
-    }
-    monkeypatch.setattr(
-        module,
-        "_write_update_status",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("status unavailable")),
-    )
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data, fail_cleaned=True),
-    ):
-        with pytest.raises(module.DataContractError, match="was rolled back") as exc_info:
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                tmp_path / "bundle",
-                refresh_legacy_compatibility=True,
-            )
-
-    assert "status" in str(exc_info.value)
-    assert (quant_data / "DATA_MANIFEST.json").read_bytes() == original_manifest
 
 
-def test_pointer_rollback_failure_reports_update_and_rollback_error_types(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_catalog(quant_data)
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=lambda **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("bundle build failed")
-            )
-        ),
-        "build_qlib_v2": types.SimpleNamespace(build_qlib_v2=lambda **_kwargs: None),
-        "build_cleaned_qlib_v2": types.SimpleNamespace(
-            build_cleaned_qlib_v2=lambda **_kwargs: None
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=lambda **_kwargs: None
-        ),
-    }
-    monkeypatch.setattr(
-        module,
-        "_restore_file_state",
-        lambda _state: (_ for _ in ()).throw(OSError("pointer rollback failed")),
-    )
-
-    with patch.dict(sys.modules, fake_modules):
-        with pytest.raises(module.DataContractError) as exc_info:
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                tmp_path / "bundle",
-            )
-
-    message = str(exc_info.value)
-    assert "RuntimeError" in message
-    assert "OSError" in message
 
 
 def test_atomic_restore_deletion_fsyncs_parent_directory(
@@ -1449,89 +886,21 @@ def test_atomic_restore_deletion_fsyncs_parent_directory(
     assert len(fsync_calls) == (0 if module.os.name == "nt" else 1)
 
 
-def test_update_dispatches_common_etf_updater(
-    tmp_path: Path, capsys
-) -> None:
-    module = load_module()
-    published = tmp_path / "quant_data" / "published-qfq"
-    calls: list[dict[str, object]] = []
-    fake_module = types.SimpleNamespace(
-        update_cn_etf_snapshot=lambda **kwargs: calls.append(kwargs) or published
-    )
-
-    with patch.dict(sys.modules, {"download_cn_etf_data": fake_module}):
-        assert (
-            module._update(
-                tmp_path / "quant_data",
-                "cn_etf_daily",
-                "2026-08-06",
-                None,
-            )
-            == 0
-        )
-
-    assert calls == [
-        {
-            "quant_data_dir": tmp_path / "quant_data",
-            "end_date": "2026-08-06",
-        }
-    ]
-    assert capsys.readouterr().out.strip() == str(published)
 
 
-def test_completed_status_write_failure_does_not_report_publication_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_catalog(quant_data)
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=lambda **_kwargs: (
-                quant_data / "new-raw",
-                quant_data / "new-qfq",
-            )
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=lambda **_kwargs: {
-                "status": "published"
-            }
-        ),
-    }
-    monkeypatch.setattr(
-        module,
-        "_write_update_status",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("status unavailable")),
-    )
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module,
-        "build_direct_provider_descriptor",
-        side_effect=fake_direct_provider_builder(quant_data),
-    ):
-        result = module._update(
-            quant_data,
-            "ashare_daily_qfq",
-            None,
-            tmp_path / "bundle",
-        )
-
-    assert result == 0
-    output = json.loads(capsys.readouterr().out)
-    assert output["status_record"]["status"] == "write_failed"
-    assert output["status_record"]["error_type"] == "OSError"
 
 
 def test_update_refuses_when_another_ashare_update_holds_the_lock(
     tmp_path: Path,
 ) -> None:
+    from quant_qmt_data._file_lock import lock_file as provider_lock_file, unlock_file as provider_unlock_file
     module = load_module()
     quant_data = tmp_path / "quant_data"
     write_catalog(quant_data)
     lock_path = quant_data / "runtime" / "locks" / "ashare_v2_update.lock"
     lock_path.parent.mkdir(parents=True)
     with lock_path.open("a+b") as handle:
-        module.lock_file(handle, exclusive=True, blocking=False)
+        provider_lock_file(handle, exclusive=True, blocking=False)
         try:
             with pytest.raises(module.DataContractError, match="already in progress"):
                 module._update(
@@ -1541,73 +910,9 @@ def test_update_refuses_when_another_ashare_update_holds_the_lock(
                     tmp_path / "bundle",
                 )
         finally:
-            module.unlock_file(handle)
+            provider_unlock_file(handle)
 
 
-def test_update_holds_dataset_publication_lock_across_all_publish_steps(
-    tmp_path: Path,
-) -> None:
-    module = load_module()
-    quant_data = tmp_path / "quant_data"
-    write_catalog(quant_data)
-    observed_steps: list[str] = []
-
-    def assert_publication_lock(step: str, **kwargs):
-        if kwargs:
-            assert kwargs["publication_lock_held"] is True
-        lock_path = (
-            quant_data / "runtime" / "locks" / "dataset_publication.lock"
-        )
-        with lock_path.open("a+b") as handle:
-            with pytest.raises(BlockingIOError):
-                module.lock_file(handle, exclusive=True, blocking=False)
-        observed_steps.append(step)
-
-    def build_snapshots(**kwargs):
-        assert_publication_lock("raw_qfq_v2", **kwargs)
-        return quant_data / "new-raw", quant_data / "new-qfq"
-
-    def build_direct(**_kwargs):
-        assert_publication_lock("direct_provider")
-        mode = str(_kwargs["cleaning_mode"])
-        descriptor = quant_data / f"direct-{mode}" / "PROVIDER_DESCRIPTOR.json"
-        descriptor.parent.mkdir(parents=True, exist_ok=True)
-        descriptor.write_text("{}", encoding="utf-8")
-        return descriptor
-
-    def build_compatibility(**kwargs):
-        assert_publication_lock("compatibility", **kwargs)
-        return {"status": "published"}
-
-    fake_modules = {
-        "download_baostock_v2": types.SimpleNamespace(
-            build_snapshots_from_bundle=build_snapshots
-        ),
-        "publish_v2_compatibility": types.SimpleNamespace(
-            rebuild_and_publish_v1_compatibility=build_compatibility
-        ),
-    }
-
-    with patch.dict(sys.modules, fake_modules), patch.object(
-        module, "build_direct_provider_descriptor", side_effect=build_direct
-    ):
-        assert (
-            module._update(
-                quant_data,
-                "ashare_daily_qfq",
-                None,
-                tmp_path / "bundle",
-                refresh_legacy_compatibility=True,
-            )
-            == 0
-        )
-
-    assert observed_steps == [
-        "raw_qfq_v2",
-        "direct_provider",
-        "direct_provider",
-        "compatibility",
-    ]
 
 
 def test_human_description_does_not_call_compatibility_output_audit_only() -> None:
@@ -1784,3 +1089,60 @@ def test_sample_increment_command_uses_comparison_report_for_category_coverage(
         seed="daily-check",
         comparison_result=comparison_payload,
     )
+
+
+@pytest.mark.parametrize("dataset", ["ashare_daily_raw", "ashare_daily_qfq"])
+def test_stock_update_delegates_existing_bundle_without_automatic_qlib(tmp_path, monkeypatch, capsys, dataset):
+    import quant_qmt_data as provider
+    cli = load_module()
+    calls = []
+    def publish(**kwargs):
+        calls.append(kwargs)
+        return tmp_path / "raw", tmp_path / "qfq"
+    monkeypatch.setattr(provider, "publish_ashare_bundle", publish)
+    monkeypatch.setattr(cli, "build_direct_provider_descriptor", lambda **_: pytest.fail("update rebuilt Qlib"))
+    assert cli.main(["--root", str(tmp_path), "update", dataset,
+                     "--bundle-dir", str(tmp_path / "bundle")]) == 0
+    assert calls == [{"quant_data_dir": tmp_path, "bundle_dir": tmp_path / "bundle"}]
+    assert json.loads(capsys.readouterr().out)["backend"] == "quant_qmt_data"
+    assert not (tmp_path / cli.ASHARE_UPDATE_TRANSACTION_PATH).exists()
+
+
+@pytest.mark.parametrize("domain", ["contract", "bridge", "bundle", "etf"])
+def test_updater_domain_failure_is_nonzero_without_a_second_publisher(tmp_path, monkeypatch, capsys, domain):
+    import quant_qmt_data as provider
+    from quant_qmt_data.download_baostock_v2 import BaostockV2Error
+    from quant_qmt_data.download_cn_etf_data import CnEtfDownloadError
+    cli = load_module()
+    error = {"contract": provider.DataContractError, "bridge": provider.MiniQMTError,
+             "bundle": BaostockV2Error, "etf": CnEtfDownloadError}[domain]
+    def fail(**kwargs):
+        raise error("bounded supplier or input failure")
+    monkeypatch.setattr(provider, "update_ashare_snapshot", fail)
+    monkeypatch.setattr(provider, "update_cn_etf_snapshot", fail)
+    dataset = "cn_etf_daily" if domain == "etf" else "ashare_daily_qfq"
+    assert cli.main(["--root", str(tmp_path), "update", dataset]) == 2
+    assert "bounded supplier or input failure" in capsys.readouterr().err
+    assert not (tmp_path / "DATA_MANIFEST.json").exists()
+
+
+@pytest.mark.parametrize("state,expected", [("no_gap", 0), ("prepared", 0), ("published", 0),
+                                            ("partial", 2), ("blocked", 2), ("failed", 2)])
+def test_etf_cli_uses_this_provider_operation_result(tmp_path, monkeypatch, capsys, state, expected):
+    import quant_qmt_data as provider
+    cli = load_module()
+    def update(**kwargs):
+        kwargs["_result"].update(status=state, failed_symbols=["SZ159915"] if expected else [])
+        return tmp_path / "snapshot"
+    monkeypatch.setattr(provider, "update_cn_etf_snapshot", update)
+    assert cli.main(["--root", str(tmp_path), "update", "cn_etf_daily"]) == expected
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == state and result["backend"] == "quant_qmt_data"
+    assert bool(result["failed_symbols"]) == bool(expected)
+
+
+def test_old_compatibility_refresh_is_not_silently_ignored(tmp_path, capsys):
+    cli = load_module()
+    assert cli.main(["--root", str(tmp_path), "update", "ashare_daily_qfq",
+                     "--refresh-legacy-compatibility"]) == 2
+    assert "does not rebuild legacy" in capsys.readouterr().err

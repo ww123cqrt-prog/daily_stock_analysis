@@ -45,11 +45,4 @@ def quant_data_root(root: Path | None = None) -> Path:
     if configured:
         return Path(configured).expanduser()
 
-    dsa = root or dsa_root()
-    primary = dsa / "quant_data"
-    sibling = projects_root(root) / "quant_data"
-    if primary.exists():
-        return primary
-    if sibling.exists():
-        return sibling
-    return primary
+    return projects_root(root) / "quant_qmt_data" / "data"

@@ -2,8 +2,8 @@
 """Run scheduled market refreshes and validate the governed A-share V2 data.
 
 Legacy network downloaders update audit caches only. A canonical A-share
-publication is allowed only from an explicitly supplied, previously verified
-V2 bundle and is delegated to ``quant_data_cli.py``. The daily runner never
+update delegates to quant_qmt_data through ``quant_data_cli.py``; an explicit
+verified bundle remains supported. The daily runner never
 rebuilds or promotes the fixed-path V1 compatibility providers itself.
 """
 
@@ -207,7 +207,11 @@ def build_stages(args: argparse.Namespace, run_id: str = "planned") -> list[Stag
     stages: list[Stage] = []
 
     if not args.skip_download:
-        selected_source = getattr(args, "ashare_source", "none")
+        selected_source = getattr(args, "ashare_source", "miniqmt")
+        if selected_source == "miniqmt" and getattr(args, "ashare_v2_bundle_dir", None) is None:
+            stages.append(Stage("update_ashare_miniqmt", _script("quant_data_cli.py") + [
+                "--root", str(QUANT_DATA), "update", "ashare_daily_qfq", "--through", str(args.end),
+            ]))
         download_specs = {
             "baostock": ("download_baostock", "download_baostock.py", args.skip_baostock, False),
             "eastmoney": ("download_eastmoney", "download_eastmoney.py", args.skip_eastmoney, False),
@@ -521,9 +525,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument(
         "--ashare-source",
-        choices=["none", "baostock", "eastmoney", "akshare"],
-        default="none",
-        help="Run at most one A-share history source; none keeps network history quarantined.",
+        choices=["miniqmt", "none", "baostock", "eastmoney", "akshare"],
+        default="miniqmt",
+        help="Default: incremental stock snapshots through quant_qmt_data; other sources are explicit audit caches.",
     )
     parser.add_argument("--overlap-days", type=int, default=7)
     parser.add_argument("--sleep", type=float, default=2.0)

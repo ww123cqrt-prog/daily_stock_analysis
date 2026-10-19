@@ -27,8 +27,7 @@ class ScriptPathsTest(unittest.TestCase):
 
         self.assertEqual(module.workflow_root(), workflow_root)
         self.assertEqual(module.projects_root(), dsa_root.parent)
-        sibling_quant_data = dsa_root.parent / "quant_data"
-        expected_quant_data = sibling_quant_data if sibling_quant_data.exists() else dsa_root / "quant_data"
+        expected_quant_data = dsa_root.parent / "quant_qmt_data" / "data"
         self.assertEqual(module.quant_data_root(), expected_quant_data)
         expected_reports = workflow_root / "reports"
         self.assertEqual(module.reports_root(), expected_reports)
@@ -40,13 +39,13 @@ class ScriptPathsTest(unittest.TestCase):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             projects_root = Path(temp_dir) / "WorkingProjects"
-            with patch.dict(os.environ, {"WORKING_PROJECTS_ROOT": str(projects_root)}, clear=False):
+            with patch.dict(os.environ, {"WORKING_PROJECTS_ROOT": str(projects_root), "QUANT_DATA_ROOT": ""}, clear=False):
                 self.assertEqual(module.projects_root(), projects_root)
                 self.assertEqual(module.workflow_root(), Path(__file__).resolve().parents[1])
-                self.assertEqual(module.quant_data_root(), Path(__file__).resolve().parents[2] / "quant_data")
+                self.assertEqual(module.quant_data_root(), projects_root / "quant_qmt_data" / "data")
                 self.assertEqual(module.china_astock_root(), projects_root / "china-astock-quant")
 
-    def test_sibling_quant_data_is_used_when_repo_local_data_is_absent(self):
+    def test_lightweight_store_is_selected_even_when_archived_data_exists(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -69,7 +68,7 @@ class ScriptPathsTest(unittest.TestCase):
                 },
                 clear=False,
             ):
-                self.assertEqual(module.quant_data_root(), sibling_data)
+                self.assertEqual(module.quant_data_root(), temp_root / "quant_qmt_data" / "data")
 
     def test_archived_active_pointer_cannot_replace_a_missing_local_catalog(self):
         module = load_module()

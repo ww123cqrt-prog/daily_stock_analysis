@@ -203,9 +203,42 @@ class _StrategyData:
     def open(self, symbol: str, ago: int = 0) -> float:
         return self._history_value(symbol, "open", ago)
 
+    def volume(self, symbol: str, ago: int = 0) -> float:
+        normalized = self._symbol(symbol)
+        if isinstance(ago, bool) or not isinstance(ago, int) or ago < 0:
+            raise ValueError("ago must be non-negative")
+        target = self._index - ago
+        if target < 0:
+            raise ValueError("requested history is not available yet")
+        value = self._view.volume[target, self._view.symbol_index(normalized)]
+        if bool(np.isnan(value)):
+            raise ValueError(f"volume is not available for {normalized} on this date")
+        return float(value)
+
+    def index_close(self, ago: int = 0) -> float:
+        if isinstance(ago, bool) or not isinstance(ago, int) or ago < 0:
+            raise ValueError("ago must be non-negative")
+        target = self._index - ago
+        if target < 0:
+            raise ValueError("requested history is not available yet")
+        value = self._view.index_close[target]
+        if bool(np.isnan(value)):
+            raise ValueError("benchmark index close is not available on this date")
+        return float(value)
+
+    def index_history(self, count: int) -> tuple[float, ...]:
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("history count must be a positive integer")
+        start = self._index - count + 1
+        if start < 0:
+            return ()
+        values = self._view.index_close[start:self._index + 1]
+        values = values[~np.isnan(values)]
+        return tuple(float(value) for value in values)
+
     def history(self, symbol: str, count: int, field: str = "close") -> tuple[float, ...]:
-        if field not in {"open", "close"}:
-            raise ValueError("history field must be open or close")
+        if field not in {"open", "close", "volume"}:
+            raise ValueError("history field must be open, close, or volume")
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             raise ValueError("history count must be a positive integer")
         start = self._index - count + 1
@@ -213,7 +246,7 @@ class _StrategyData:
             return ()
         normalized = self._symbol(symbol)
         symbol_index = self._view.symbol_index(normalized)
-        matrix = self._view.open if field == "open" else self._view.close
+        matrix = self._view.open if field == "open" else self._view.close if field == "close" else self._view.volume
         values = matrix[start:self._index + 1, symbol_index]
         values = values[~np.isnan(values)]
         return tuple(float(value) for value in values)

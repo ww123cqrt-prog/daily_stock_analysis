@@ -141,6 +141,8 @@ ASHARE_SOURCE_JOB_TYPES = {
     "run_daily_update",
 }
 QUANT_DATA_NETWORK_JOB_TYPES = ASHARE_SOURCE_JOB_TYPES | {
+    "update_ashare_miniqmt",
+    "download_etf_momentum",
     "download_global_daily",
     "download_jqdata",
     "validate_latest_snapshot",
@@ -524,8 +526,8 @@ def _validate_ashare_source_safety(job_type: str, params: Mapping[str, Any]) -> 
         )
 
     if job_type == "run_daily_update":
-        source = str(params.get("ashare_source") or "none")
-        allowed_sources = {"none", "baostock", "eastmoney", "akshare"}
+        source = str(params.get("ashare_source") or "miniqmt")
+        allowed_sources = {"miniqmt", "none", "baostock", "eastmoney", "akshare"}
         if source not in allowed_sources:
             raise ValueError(f"Param ashare_source must be one of: {', '.join(sorted(allowed_sources))}.")
 
@@ -1040,6 +1042,11 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_value(command, params, "end", "--through")
         return command
 
+    def update_ashare_miniqmt(params: Mapping[str, Any]) -> List[str]:
+        command = _script_command("quant_data_cli.py") + ["update", "ashare_daily_qfq"]
+        _append_value(command, params, "end", "--through")
+        return command
+
     def generate_etf_momentum_report(params: Mapping[str, Any]) -> List[str]:
         del params
         return _script_command("generate_etf_momentum_strategy_report.py")
@@ -1404,6 +1411,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         ]
 
     return {
+        "update_ashare_miniqmt": {
+            "label": "更新股票快照（MiniQMT）",
+            "command": update_ashare_miniqmt,
+            "allowed_params": {"end"},
+            "artifact_patterns": [str(quant_data_root(DSA_ROOT) / "DATA_MANIFEST.json")],
+        },
         "prepare_baostock_refresh": {
             "label": "准备 Baostock 增量清单",
             "command": prepare_baostock_refresh,

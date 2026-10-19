@@ -70,7 +70,7 @@ const DataPage: React.FC = () => {
     <AppPage className="max-w-[1400px] space-y-4">
       <PageHeader
         title={zh ? '数据状态' : 'Data Status'}
-        description={zh ? 'quant_data 数据后端的只读状态' : 'Read-only status from the quant_data backend'}
+        description={zh ? 'quant_qmt_data 本机快照，保留数据版本追溯' : 'Local quant_qmt_data snapshots with version provenance'}
         actions={(
           <Button
             variant="secondary"
@@ -99,16 +99,17 @@ const DataPage: React.FC = () => {
         <>
           <section className="grid gap-px overflow-hidden rounded-lg border border-border/70 bg-border/70 sm:grid-cols-3">
             <div className="bg-card px-4 py-4">
-              <p className="text-xs text-secondary-text">{zh ? '服务状态' : 'Service'}</p>
+              <p className="text-xs text-secondary-text">{zh ? '本机数据状态' : 'Local data'}</p>
               <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-foreground">
                 <StatusDot tone={status.status === 'ready' ? 'success' : 'warning'} />
                 {status.status === 'ready' ? 'Ready' : status.status}
+                {status.datasetSetVersion === 'production.v2' ? ` · v2 #${status.generation}` : null}
               </div>
             </div>
             <div className="bg-card px-4 py-4">
-              <p className="text-xs text-secondary-text">{zh ? '正式数据集' : 'Canonical datasets'}</p>
+              <p className="text-xs text-secondary-text">{zh ? '可用数据集' : 'Available datasets'}</p>
               <p className="mt-2 text-sm font-semibold text-foreground">
-                {zh ? `${status.validatedDatasets} 个正式数据集` : `${status.validatedDatasets} datasets`}
+                {zh ? `${status.availableDatasets} 个可用数据集` : `${status.availableDatasets} datasets`}
               </p>
             </div>
             <div className="bg-card px-4 py-4">
@@ -117,10 +118,14 @@ const DataPage: React.FC = () => {
             </div>
           </section>
 
-          <section className="overflow-hidden rounded-lg border border-border/70 bg-card" aria-label={zh ? '正式数据集列表' : 'Canonical dataset list'}>
+          <p className="text-xs text-secondary-text">
+            {zh ? '这里只检查已提交清单与快照身份，不是全库质量检查；读取时仍核对所用数据。' : 'This checks committed metadata and snapshot identities, not a full data audit. Reads verify their inputs.'}
+          </p>
+
+          <section className="overflow-hidden rounded-lg border border-border/70 bg-card" aria-label={zh ? '本机快照列表' : 'Local snapshot list'}>
             <div className="flex items-center gap-2 border-b border-border/70 px-4 py-3">
               <Database className="h-4 w-4 text-cyan" />
-              <h2 className="text-sm font-semibold text-foreground">{zh ? '正式数据集' : 'Canonical datasets'}</h2>
+              <h2 className="text-sm font-semibold text-foreground">{zh ? '本机快照' : 'Local snapshots'}</h2>
             </div>
             <div className="divide-y divide-border/60">
               {status.datasets.map((dataset) => (
@@ -136,22 +141,30 @@ const DataPage: React.FC = () => {
                     <p className="mt-1 break-all font-mono text-xs text-secondary-text">{dataset.datasetId}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-muted-text">{zh ? '最新交易日' : 'Latest date'}</p>
-                    <p className="mt-1 text-sm text-foreground">{dataset.latestTradeDate || '-'}</p>
+                    <p className="text-xs text-muted-text">{status.datasetSetVersion === 'production.v2' ? (zh ? '请求截止日' : 'Requested through') : (zh ? '最新交易日' : 'Latest date')}</p>
+                    <p className="mt-1 text-sm text-foreground">{dataset.requestedThrough || dataset.latestTradeDate || '-'}</p>
                   </div>
                   <div>
                     <p className="text-xs text-muted-text">{zh ? '价格口径' : 'Price basis'}</p>
-                    <p className="mt-1 text-sm text-foreground">{dataset.priceBasis || '-'}</p>
+                    <p className="mt-1 text-sm text-foreground">{dataset.priceBasis || dataset.components?.filter(value => value === 'raw' || value === 'qfq').join(' / ') || '-'}</p>
                   </div>
                   <div className="min-w-0">
-                    <p className="text-xs text-muted-text">{zh ? '快照身份' : 'Snapshot identity'}</p>
-                    <p className="mt-1 break-all font-mono text-xs text-foreground">{dataset.snapshotId}</p>
-                    <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.contentSha256}>
-                      content {dataset.contentSha256}
-                    </p>
-                    <p className="mt-1 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.manifestSha256}>
-                      manifest {dataset.manifestSha256}
-                    </p>
+                    <p className="text-xs text-muted-text">{dataset.moduleReleaseSha256 ? (zh ? '模块发布身份' : 'Module release') : (zh ? '快照身份' : 'Snapshot identity')}</p>
+                    <p className="mt-1 break-all font-mono text-xs text-foreground">{dataset.moduleReleaseSha256 || dataset.snapshotId || '-'}</p>
+                    {dataset.contentManifestSha256 ? (
+                      <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.contentManifestSha256}>
+                        manifest {dataset.contentManifestSha256}
+                      </p>
+                    ) : (
+                      <>
+                        <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.contentSha256}>
+                          content {dataset.contentSha256}
+                        </p>
+                        <p className="mt-1 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.manifestSha256}>
+                          manifest {dataset.manifestSha256}
+                        </p>
+                      </>
+                    )}
                   </div>
                 </article>
               ))}

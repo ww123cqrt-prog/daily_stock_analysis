@@ -28,7 +28,8 @@ from qlib.data.data import (
     LocalProvider,
 )
 
-from quant_workflow.scripts.quant_data_contract import (
+from quant_qmt_data.quant_data_contract import (
+    _committed_snapshot_path,
     DataContractError,
     ResolvedDataset,
     ResolvedDatasetArtifact,
@@ -796,22 +797,11 @@ def _current_dataset_identity(
         raise DirectProviderError(
             f"formal {expected_price_basis} dataset is not ready: {dataset_id}"
         )
-    pointer_path = _safe_child(root, entry.get("latest_pointer"), "latest pointer")
-    pointer = _read_json(pointer_path, "latest pointer")
-    for field in ("dataset_id", "snapshot_id"):
-        if pointer.get(field) != entry.get(field):
-            raise DirectProviderError("catalog and latest pointer are out of sync")
-    if pointer.get("manifest_sha256") != entry.get("snapshot_manifest_sha256"):
-        raise DirectProviderError("catalog and latest pointer are out of sync")
-    snapshot = _safe_child(root, pointer.get("snapshot_path"), "snapshot path")
-    if snapshot.name != str(entry.get("snapshot_id") or ""):
-        raise DirectProviderError("latest pointer snapshot path is invalid")
+    try:
+        snapshot = _committed_snapshot_path(root, entry)
+    except DataContractError as exc:
+        raise DirectProviderError(str(exc)) from exc
     manifest_path = snapshot / "DATASET_MANIFEST.json"
-    _validate_file_hash(
-        manifest_path,
-        pointer.get("manifest_sha256"),
-        "latest snapshot manifest",
-    )
     manifest = _read_json(manifest_path, "latest snapshot manifest")
     for field in (
         "dataset_id",
@@ -1499,16 +1489,21 @@ class QuantDataFeatureProvider(FeatureProvider):
             raise DirectProviderError(f"instrument is not in frozen snapshot: {symbol}")
         if snapshot is None:
             raise DirectProviderError(f"instrument is not in frozen snapshot: {symbol}")
-        path = _safe_snapshot_child(
-            snapshot,
-            row.relative_path,
-            "bar path",
-        )
-        _validate_file_hash(path, row.sha256, f"bar file {symbol}")
+        # Qlib's pool/cleaning behavior stays in this consumer. The package
+        # owns frozen price resolution, byte validation and unit conversion.
+        from quant_qmt_data import DataContractError as PackageError, read_bars
+        spec = self._context.descriptor[
+            "dataset" if symbol in self._rows else "index_dataset"]
+        identity = {key: spec[key] for key in (
+            "dataset_id", "snapshot_id", "snapshot_path", "manifest_sha256",
+            "content_sha256", "latest_trade_date", "file_index_sha256")}
         try:
-            frame = pd.read_parquet(path)
-        except Exception as exc:
-            raise DirectProviderError(f"cannot read bar file {symbol}") from exc
+            frame = read_bars(
+                spec["dataset_id"], symbol, quant_data_root=self._context.quant_data_root,
+                expected_identity=identity,
+                volume_unit="native" if spec["dataset_id"] == "cn_index_daily" else "base")
+        except (PackageError, ValueError, OSError) as exc:
+            raise DirectProviderError(f"cannot read bar file {symbol}: {exc}") from exc
         if "date" not in frame.columns:
             raise DirectProviderError(f"bar file has no date column: {symbol}")
         dates = pd.DatetimeIndex(pd.to_datetime(frame["date"], errors="coerce")).normalize()

@@ -21,7 +21,9 @@ describe('DataPage', () => {
     getDataStatus.mockReset();
     getDataStatus.mockResolvedValue({
       status: 'ready',
-      validatedDatasets: 2,
+      availableDatasets: 2,
+      backend: "quant_qmt_data",
+      validationScope: "snapshot_metadata",
       checkedAt: '2026-08-11T03:30:00Z',
       datasets: [
         {
@@ -50,7 +52,7 @@ describe('DataPage', () => {
     });
   });
 
-  it('renders only the governed quant_data readiness and immutable identities', async () => {
+  it('renders lightweight local metadata and immutable snapshot identities', async () => {
     render(
       <UiLanguageProvider>
         <DataPage />
@@ -58,9 +60,11 @@ describe('DataPage', () => {
     );
 
     expect(await screen.findByRole('heading', { name: '数据状态' })).toBeInTheDocument();
-    expect(screen.getByText('2 个正式数据集')).toBeInTheDocument();
+    expect(screen.getByText('2 个可用数据集')).toBeInTheDocument();
     expect(screen.getByText('A股前复权日线')).toBeInTheDocument();
     expect(screen.getByText('ETF 日线')).toBeInTheDocument();
+    expect(screen.getByText(/quant_qmt_data 本机快照/)).toBeInTheDocument();
+    expect(screen.getByText(/不是全库质量检查/)).toBeInTheDocument();
     expect(screen.getByText('ashare-snapshot-1')).toBeInTheDocument();
     expect(screen.getByText('etf-snapshot-1')).toBeInTheDocument();
     expect(screen.queryByText('旧数据任务中心')).not.toBeInTheDocument();

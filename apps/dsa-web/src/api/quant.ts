@@ -134,21 +134,31 @@ export interface QuantStatusOptions {
 
 export interface QuantDataStatusDataset {
   datasetId: string;
-  snapshotId: string;
-  manifestSha256: string;
-  contentSha256: string;
-  latestTradeDate: string;
-  priceBasis: string;
-  dataKind: string;
-  role: string;
+  snapshotId?: string;
+  manifestSha256?: string;
+  contentSha256?: string;
+  latestTradeDate?: string;
+  priceBasis?: string;
+  dataKind?: string;
+  role?: string;
+  moduleReleaseSha256?: string;
+  contentManifestSha256?: string;
+  requestedThrough?: string;
+  components?: string[];
   status: string;
 }
 
 export interface QuantDataStatus {
   status: string;
-  validatedDatasets: number;
+  validatedDatasets?: number;
+  availableDatasets: number;
+  backend: string;
+  validationScope: string;
   checkedAt: string;
   datasets: QuantDataStatusDataset[];
+  datasetSetVersion?: string;
+  generation?: number;
+  releaseSetSha256?: string;
 }
 
 export interface QuantJobLog {
@@ -253,7 +263,9 @@ export const quantApi = {
     const converted = toCamelCase<Partial<QuantDataStatus>>(response.data);
     return {
       status: typeof converted.status === 'string' ? converted.status : 'unknown',
-      validatedDatasets: Number(converted.validatedDatasets || 0),
+      availableDatasets: Number(converted.availableDatasets || 0),
+      backend: typeof converted.backend === "string" ? converted.backend : "unknown",
+      validationScope: typeof converted.validationScope === "string" ? converted.validationScope : "unknown",
       checkedAt: typeof converted.checkedAt === 'string' ? converted.checkedAt : '',
       datasets: Array.isArray(converted.datasets) ? converted.datasets : [],
     };

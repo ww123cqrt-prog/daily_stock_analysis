@@ -27,11 +27,10 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import quant_data_root as default_quant_data_root  # noqa: E402
-from _file_lock import lock_file, unlock_file  # noqa: E402
-from quant_data_contract import (  # noqa: E402
+from quant_data_contract import DataContractError as LegacyDataContractError  # noqa: E402
+from quant_qmt_data.quant_data_contract import (  # noqa: E402
     DataContractError,
     atomic_write_json,
-    dataset_publication_lock,
     describe_dataset,
     finalize_artifact_snapshot,
     publish_snapshot_group,
@@ -869,6 +868,38 @@ def _validate_release_snapshot(
     }
 
 
+def _snapshot_retention_contract(
+    manifest: Mapping[str, Any], snapshot_count: int
+) -> dict[str, Any]:
+    source = manifest.get("source")
+    retention = source.get("snapshot_retention") if isinstance(source, Mapping) else None
+    if retention is None:
+        return {
+            "policy": "legacy_inferred",
+            "max_complete_snapshots": snapshot_count,
+            "metadata_status": "inferred_from_retained_snapshots",
+        }
+    if not isinstance(retention, Mapping):
+        raise DataContractError("ETF release snapshot retention contract is invalid")
+    policy = str(retention.get("policy") or "")
+    if policy not in {"immutable_history", "current_plus_one_previous"}:
+        raise DataContractError("ETF release snapshot retention policy is invalid")
+    maximum = _release_int(
+        retention.get("max_complete_snapshots"),
+        "snapshot retention count",
+    )
+    if maximum < 1:
+        raise DataContractError("ETF release snapshot retention count is invalid")
+    result = {
+        "policy": policy,
+        "max_complete_snapshots": maximum,
+        "metadata_status": "declared",
+    }
+    if snapshot_count > maximum:
+        result["metadata_status"] = "declared_with_retention_overage"
+    return result
+
+
 def _validate_etf_release(root: Path) -> dict[str, Any]:
     root = Path(root).expanduser().resolve()
     catalog = _read_catalog(root)
@@ -944,38 +975,36 @@ def _validate_etf_release(root: Path) -> dict[str, Any]:
     snapshots = sorted(snapshots_root.iterdir(), key=lambda path: path.name)
     if any(path.is_symlink() or not path.is_dir() for path in snapshots):
         raise DataContractError("ETF release snapshots directory contains unsafe entries")
-    if len(snapshots) != 2:
-        raise DataContractError(
-            "ETF release requires exactly two complete snapshots: current plus one "
-            f"backup; found {len(snapshots)}"
-        )
+    if not snapshots:
+        raise DataContractError("ETF release requires at least one complete snapshot")
     current = resolved.snapshot_path.resolve()
     if current not in snapshots:
         raise DataContractError("ETF release current snapshot is not retained")
-    backup = next(path for path in snapshots if path != current)
 
-    current_summary = _validate_release_snapshot(
-        root,
-        current,
-        manifest=current_manifest,
-        required_symbols=ETF_RELEASE_REQUIRED_SYMBOLS,
+    snapshot_summaries: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        snapshot_summaries.append(
+            _validate_release_snapshot(
+                root,
+                snapshot,
+                manifest=current_manifest if snapshot == current else None,
+                required_symbols=(
+                    ETF_RELEASE_REQUIRED_SYMBOLS if snapshot == current else ()
+                ),
+            )
+        )
+    current_summary = next(
+        summary for summary in snapshot_summaries if summary["snapshot_id"] == current.name
     )
-    backup_summary = _validate_release_snapshot(root, backup)
-    current_source = current_manifest.get("source")
-    retention = (
-        current_source.get("snapshot_retention")
-        if isinstance(current_source, Mapping)
+    backup = next((path for path in reversed(snapshots) if path != current), None)
+    backup_summary = (
+        next(
+            summary for summary in snapshot_summaries if summary["snapshot_id"] == backup.name
+        )
+        if backup is not None
         else None
     )
-    if not isinstance(retention, Mapping) or (
-        retention.get("policy") != "current_plus_one_previous"
-        or _release_int(
-            retention.get("max_complete_snapshots"),
-            "snapshot retention count",
-        )
-        != 2
-    ):
-        raise DataContractError("ETF release snapshot retention contract is invalid")
+    retention = _snapshot_retention_contract(current_manifest, len(snapshots))
     return {
         "status": "full_validation_passed",
         "dataset_id": ETF_RELEASE_DATASET_ID,
@@ -987,8 +1016,14 @@ def _validate_etf_release(root: Path) -> dict[str, Any]:
         },
         "snapshot_retention": {
             "count": len(snapshots),
-            "policy": "current_plus_one_previous",
+            "policy": retention["policy"],
+            "max_complete_snapshots": retention["max_complete_snapshots"],
         },
+        "retention_metadata_status": retention["metadata_status"],
+        "validated_snapshot_ids": [
+            summary["snapshot_id"] for summary in snapshot_summaries
+        ],
+        "snapshots": snapshot_summaries,
         "current": current_summary,
         "backup": backup_summary,
         "strategy_symbols": {
@@ -1409,55 +1444,30 @@ def _update(
 ) -> int:
     if etf_provider is not None and dataset_id != "cn_etf_daily":
         raise DataContractError("--provider is supported only by cn_etf_daily")
-    if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"} and bundle_dir:
-        update_lock_path = root / "runtime" / "locks" / "ashare_v2_update.lock"
-        update_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        update_lock_handle = update_lock_path.open("a+b")
-        try:
-            lock_file(update_lock_handle, exclusive=True, blocking=False)
-        except BlockingIOError as exc:
-            update_lock_handle.close()
-            raise DataContractError(
-                "A-share v2 update is already in progress"
-            ) from exc
-        except Exception:
-            update_lock_handle.close()
-            raise
+    if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq", "cn_etf_daily"}:
+        import quant_qmt_data as provider
+        from quant_qmt_data.download_baostock_v2 import BaostockV2Error
+        from quant_qmt_data.download_cn_etf_data import CnEtfDownloadError
+
+        if refresh_legacy_compatibility:
+            raise DataContractError("the lightweight updater does not rebuild legacy compatibility datasets")
 
         try:
-            with dataset_publication_lock(root):
-                _recover_interrupted_update(root)
-                return _update_ashare_from_bundle(
-                    root,
-                    dataset_id,
-                    bundle_dir,
-                    refresh_legacy_compatibility=refresh_legacy_compatibility,
-                )
-        finally:
-            unlock_file(update_lock_handle)
-            update_lock_handle.close()
-    if dataset_id in {"ashare_daily_raw", "ashare_daily_qfq"}:
-        payload = describe_dataset(dataset_id, quant_data_root=root)
-        blockers = payload.get("blocker_codes") or []
-        raise DataContractError(
-            "A-share v2 update is blocked: "
-            + ", ".join(str(item) for item in blockers)
-            + "; pass --bundle-dir after the remote raw/factor/qfq bundle is verified"
-        )
-    if dataset_id == "cn_etf_daily":
-        import download_cn_etf_data
-
-        options = {"provider": etf_provider} if etf_provider is not None else {}
-        try:
-            path = download_cn_etf_data.update_cn_etf_snapshot(quant_data_dir=root, end_date=through, **options)
-        except Exception as exc:
-            from data_provider.miniqmt_bridge import MiniQMTError
-            expected = (MiniQMTError, getattr(download_cn_etf_data, "CnEtfDownloadError", DataContractError))
-            if not isinstance(exc, expected):
-                raise
+            if dataset_id == "cn_etf_daily":
+                result = {}
+                path = provider.update_cn_etf_snapshot(
+                    quant_data_dir=root, end_date=through,
+                    provider=etf_provider or "miniqmt", _result=result)
+                _json_dump({**result, "snapshot_path": str(path), "backend": "quant_qmt_data"})
+                return 2 if result.get("status") in {"blocked", "failed", "partial"} else 0
+            if bundle_dir:
+                paths = provider.publish_ashare_bundle(quant_data_dir=root, bundle_dir=bundle_dir)
+            else:
+                paths = provider.update_ashare_snapshot(quant_data_dir=root, through=through)
+            _json_dump({"backend": "quant_qmt_data", "snapshots": [str(path) for path in paths]})
+            return 0
+        except (provider.DataContractError, provider.MiniQMTError, BaostockV2Error, CnEtfDownloadError) as exc:
             raise DataContractError(str(exc)) from exc
-        print(path)
-        return 0
     if dataset_id == "cn_index_daily":
         from update_cn_index_dataset import update_cn_index_snapshot
 
@@ -1667,7 +1677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 use_system_proxy=args.use_system_proxy,
                 etf_provider=args.provider,
             )
-    except (DataContractError, ValueError, TypeError) as exc:
+    except (DataContractError, LegacyDataContractError, ValueError, TypeError) as exc:
         print(f"不能使用 quant_data 数据：{exc}", file=sys.stderr)
         return 2
     return 2

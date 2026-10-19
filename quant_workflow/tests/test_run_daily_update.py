@@ -143,10 +143,10 @@ class BuildStagesTest(unittest.TestCase):
 
         self.assertNotIn("download_ashare_news", [stage.name for stage in stages])
 
-    def test_default_arguments_quarantine_blocked_ashare_sources(self):
+    def test_default_arguments_use_miniqmt_and_quarantine_other_ashare_sources(self):
         args = self.module.parse_args([])
 
-        self.assertEqual(args.ashare_source, "none")
+        self.assertEqual(args.ashare_source, "miniqmt")
         self.assertEqual(args.sleep, 2.0)
         self.assertEqual(args.retries, 1)
         self.assertEqual(args.max_consecutive_failures, 3)
@@ -154,6 +154,7 @@ class BuildStagesTest(unittest.TestCase):
         self.assertEqual(args.overlap_days, 7)
         self.assertEqual(args.news_limit, 0)
         names = [stage.name for stage in self.module.build_stages(args)]
+        self.assertIn("update_ashare_miniqmt", names)
         self.assertFalse(set(names) & self.module.ASHARE_DOWNLOAD_STAGE_NAMES)
         self.assertNotIn("download_ashare_news", names)
         self.assertNotIn("update_ashare_v2_bundle", names)

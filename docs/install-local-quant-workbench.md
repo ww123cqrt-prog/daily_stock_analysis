@@ -31,7 +31,8 @@
 /path/to/
   daily_stock_analysis/
     quant_workflow/
-    quant_data/
+  quant_qmt_data/
+    data/
   china-astock-quant/
 ```
 
@@ -41,8 +42,27 @@
 DSA_ROOT=/path/to/daily_stock_analysis
 WORKING_PROJECTS_ROOT=/path/to
 QUANT_WORKFLOW_ROOT=/path/to/daily_stock_analysis/quant_workflow
-QUANT_DATA_ROOT=/path/to/daily_stock_analysis/quant_data
+QUANT_DATA_ROOT=/path/to/quant_qmt_data/data
 ```
+
+## Mac 本机数据入口
+
+DSA 使用独立的 `quant_qmt_data` Python 包和 `quant_qmt_data/data` 快照目录；它不是 HTTP 数据服务。先在同一 DSA 环境安装本地包：
+
+```bash
+/path/to/daily_stock_analysis/.venv/bin/python -m pip install -e '/path/to/quant_qmt_data[ssh]'
+```
+
+本分支需要配套轻量包中的 `bar_snapshot`、`inspect_datasets` 及 `read_bars(expected_identity=...)` 接口；不能仅更新 DSA 后仍使用旧版轻量包。普通行情、脚本回测及 Qlib 的行情文件读取委托该包，DSA 仍负责策略、历史成员池与研究清洗规则。`/data` 展示已提交快照的日期、口径及摘要，只核对清单身份，不冒充全库质量体检。回测保存快照 ID、manifest/content/file-index 摘要；重放按保存的身份读取，旧版被清理后明确失败，不静默改读新版。股票成交量按股，ETF 按份；文件中的原始数量不改写。
+
+网页 `/workflow` 提供独立的“更新股票快照（MiniQMT）”和“更新 ETF 快照（MiniQMT）”，只做行情更新，不附带训练。命令入口保持：
+
+```bash
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update ashare_daily_qfq --through YYYY-MM-DD
+.venv/bin/python quant_workflow/scripts/quant_data_cli.py update cn_etf_daily --through YYYY-MM-DD
+```
+
+它们调用轻量包既有的有界补缺、重叠核对及快照发布；Mac 实际采集由该包的 OpenSSH 配置决定。每日任务的默认 A 股来源为 `miniqmt`；`none` 显式跳过，其他来源仅更新审计缓存。数据根不可用就报错，不自动选择封存目录或项目版服务。此次接线验收不执行真实供应商采集，也不更新正式数据；本机价格快照的截止日仍以页面实际显示为准。
 
 ## 安装 DSA 后端
 
@@ -96,9 +116,8 @@ QUANT_WORKFLOW_ROOT=/path/to/daily_stock_analysis/quant_workflow
 # reports/mlruns 的正式位置是仓内 quant_workflow；外部路径仅用于迁移/回滚。
 # QUANT_WORKFLOW_REPORTS_ROOT=/path/to/daily_stock_analysis/quant_workflow/reports
 # QUANT_WORKFLOW_MLRUNS_DIR=/path/to/daily_stock_analysis/quant_workflow/mlruns
-# 数据可以放在仓内 quant_data，也可以放在 DSA 同级的 quant_data；
-# 不设置时会先找仓内目录，再找同级目录。
-# QUANT_DATA_ROOT=/path/to/quant_data
+# 默认数据根为 DSA 同级的 quant_qmt_data/data；其它位置须显式配置。
+# QUANT_DATA_ROOT=/path/to/quant_qmt_data/data
 QUANT_WORKFLOW_PYTHON=/path/to/daily_stock_analysis/.venv/bin/python
 MLFLOW_URL=http://127.0.0.1:6006/
 ```

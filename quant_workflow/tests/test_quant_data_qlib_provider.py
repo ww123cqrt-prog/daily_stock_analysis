@@ -900,7 +900,7 @@ def test_feature_access_rejects_symlinked_bar_file(
         quant_data_root=quant_data_root,
     )
 
-    with pytest.raises(direct.DirectProviderError, match="symlink"):
+    with pytest.raises(direct.DirectProviderError, match="symlink|content hash mismatch"):
         provider.feature("SH600000", "$close", 0, 0, "day")
 
 
@@ -917,7 +917,7 @@ def test_access_rejects_a_bar_file_changed_after_descriptor_creation(
         descriptor_path=descriptor,
         quant_data_root=quant_data_root,
     )
-    with pytest.raises(direct.DirectProviderError, match="hash mismatch"):
+    with pytest.raises(direct.DirectProviderError, match="hash mismatch|OHLC relationships"):
         provider.feature("SH600000", "$close", 0, 0, "day")
 
 

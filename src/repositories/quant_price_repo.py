@@ -175,7 +175,7 @@ class QuantPriceRepository:
         return QuantPriceLoad(
             symbols=normalized, bars=self._price_bars(normalized, frame),
             dataset_id=meta["dataset_id"], snapshot_id=meta["snapshot_id"],
-            price_basis="qfq", provider="local_parquet",
+            price_basis="qfq", provider="quant_qmt_data",
             latest_trade_date=meta.get("latest_trade_date"),
             manifest_sha256=meta.get("manifest_sha256"),
             content_sha256=meta.get("content_sha256"), data_kind="daily_bars",

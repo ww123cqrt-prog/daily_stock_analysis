@@ -24,6 +24,20 @@ describe('quantApi', () => {
     expect(quantApi).toHaveProperty('getDataStatus');
   });
 
+  it('preserves local snapshot status scope and availability without inventing a full audit', async () => {
+    get.mockResolvedValueOnce({ data: {
+      backend: 'quant_qmt_data', available_datasets: 7,
+      validation_scope: 'snapshot_metadata', status: 'ready', checked_at: '2026-10-20T00:00:00Z',
+      datasets: [{ dataset_id: 'cn_etf_daily', snapshot_id: 'etf-one', status: 'ready' }],
+    } });
+    const status = await quantApi.getDataStatus();
+    expect(status.backend).toBe('quant_qmt_data');
+    expect(status.availableDatasets).toBe(7);
+    expect(status.validationScope).toBe('snapshot_metadata');
+    expect(status.validatedDatasets).toBeUndefined();
+    expect(status.datasets[0].snapshotId).toBe('etf-one');
+  });
+
   it('preserves dynamic quant job type keys when loading status', async () => {
     get.mockResolvedValueOnce({
       data: {

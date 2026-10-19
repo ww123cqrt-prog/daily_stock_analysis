@@ -2,6 +2,7 @@
 """Tests for the bounded DSA Python strategy API."""
 
 from datetime import date
+import json
 
 import pytest
 
@@ -120,6 +121,53 @@ def test_sma_requires_a_full_window_of_valid_closes() -> None:
 def test_sma_returns_none_when_history_shorter_than_window() -> None:
     data = _data_view([10.0, 11.0])
     assert data.sma("SZ000001", 3) is None
+
+
+def test_volume_and_index_history_are_available_from_market_view() -> None:
+    close_matrix = np.array([[10.0], [11.0], [12.0]], dtype=np.float64)
+    volume_matrix = np.array([[100.0], [120.0], [140.0]], dtype=np.float64)
+    index_close = np.array([1000.0, 1010.0, 1020.0], dtype=np.float64)
+    view = MarketView(
+        dates=np.array(
+            [date(2026, 1, day).toordinal() for day in range(1, 4)],
+            dtype=np.int32,
+        ),
+        symbols=np.array(["SZ000001"], dtype=object),
+        open_matrix=close_matrix.copy(),
+        close_matrix=close_matrix,
+        members=np.ones_like(close_matrix, dtype=bool),
+        meta={},
+        volume_matrix=volume_matrix,
+        index_close=index_close,
+    )
+    data = _StrategyData(view)
+    data._index = 2
+    assert data.volume("SZ000001") == pytest.approx(140.0)
+    assert data.history("SZ000001", 3, "volume") == (100.0, 120.0, 140.0)
+    assert data.index_close() == pytest.approx(1020.0)
+    assert data.index_history(3) == (1000.0, 1010.0, 1020.0)
+
+
+def test_legacy_market_bundle_defaults_optional_arrays(tmp_path) -> None:
+    bundle = tmp_path / "legacy"
+    bundle.mkdir()
+    dates = np.array([date(2026, 1, 1).toordinal()], dtype=np.int32)
+    prices = np.array([[10.0]], dtype=np.float64)
+    np.savez_compressed(
+        bundle / "market.npz",
+        dates=dates,
+        symbols=np.array(["SZ000001"], dtype=object),
+        open=prices,
+        close=prices,
+        members=np.ones_like(prices, dtype=bool),
+    )
+    (bundle / "universe.json").write_text(
+        json.dumps({"version": "universe-v1", "meta": {}}),
+        encoding="utf-8",
+    )
+    loaded = MarketView.load(bundle)
+    assert np.isnan(loaded.volume).all()
+    assert np.isnan(loaded.index_close).all()
 
 
 def _pit_view() -> MarketView:

@@ -109,16 +109,16 @@ const WORKFLOW_INPUT_CLASS =
 const WORKFLOW_STEPS: WorkflowStep[] = [
   {
     title: '每日更新与校验',
-    description: '更新独立数据源，并校验当前 A 股 qfq 与 quant_data 数据后端的 Qlib Provider。',
+    description: '通过 quant_qmt_data 更新行情；完整流程还包括研究数据与 Qlib 检查。',
     icon: RefreshCw,
     jobs: [
       {
         type: 'run_daily_update',
         label: '运行每日 quant_data 更新与校验',
         description:
-          'A 股历史源默认关闭；手动启用时只更新审计缓存，不会发布正式行情。正式 A 股更新必须使用已核验的 quant_data 快照；本任务随后校验 A 股 qfq 数据与 Qlib Provider。',
+          '股票与 ETF 默认通过轻量包增量补缺并保留快照。后续研究检查单独报告；只更新行情请使用下方股票或 ETF 更新任务。',
         defaultParams: {
-          ashare_source: 'none',
+          ashare_source: 'miniqmt',
           overlap_days: '7',
           sleep: '2',
           retries: '1',
@@ -128,10 +128,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         params: [
           {
             key: 'ashare_source',
-            label: 'A股审计缓存来源',
+            label: 'A股数据更新来源',
             kind: 'select',
             options: [
-              { value: 'none', label: '关闭（默认）' },
+              { value: 'miniqmt', label: 'MiniQMT（quant_qmt_data，默认）' },
+              { value: 'none', label: '跳过股票更新' },
               { value: 'baostock', label: 'Baostock' },
               { value: 'eastmoney', label: '东方财富' },
               { value: 'akshare', label: 'AkShare（使用东财接口）' },
@@ -161,6 +162,12 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
     description: '更新 A 股、全球市场日线及可追溯原始数据。',
     icon: Database,
     jobs: [
+      {
+        type: 'update_ashare_miniqmt',
+        label: '更新股票快照（MiniQMT）',
+        description: '由 quant_qmt_data 补齐当前股票池缺失日线并核对重叠区间，保留配套 raw/QFQ 和旧快照；不运行训练。',
+        params: [{ key: 'end', label: '结束日期', kind: 'date' }],
+      },
       {
         type: 'prepare_baostock_refresh',
         label: '准备 Baostock 增量清单',
@@ -233,8 +240,8 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       },
       {
         type: 'download_etf_momentum',
-        label: '更新 ETF 动量数据',
-        description: '更新创业板 ETF（159915）和纳指 ETF（513100）的隔离数据，不写入 A 股个股 Qlib provider。',
+        label: '更新 ETF 快照（MiniQMT）',
+        description: '由 quant_qmt_data 增量更新当前 ETF 池，保留原始行情、复权证据和快照版本；不重下已有历史。',
         params: [
           { key: 'end', label: '结束日期', kind: 'date' },
         ],
@@ -567,6 +574,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
 ];
 
 const DATA_JOB_TYPES = new Set([
+  'update_ashare_miniqmt',
   'run_daily_update',
   'prepare_baostock_refresh',
   'download_baostock',

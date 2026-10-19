@@ -9,7 +9,6 @@ bundle keyed by the immutable snapshot id so a pool is assembled only once.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import logging
 from datetime import date
@@ -18,9 +17,8 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
-from src.core.script_market import MarketBundle, MarketView, build_market_bundle
+from src.core.script_market import MarketBundle, MarketView
 from src.services.quant_workflow_paths import reports_root, quant_data_root as local_quant_data_root
 
 logger = logging.getLogger(__name__)
@@ -30,7 +28,7 @@ VALID_POOLS = ("etf", "csi800", "all_a", "custom")
 _ASHARE_DATASET_ID = "ashare_daily_qfq"
 _ETF_DATASET_ID = "cn_etf_daily"
 
-_UNIVERSE_CACHE_VERSION = "universe-cache-v3-local-snapshots"
+_UNIVERSE_CACHE_VERSION = "universe-cache-v4-quant-qmt-base-volume"
 
 
 def _normalize_ashare_symbol(value: str) -> str:
@@ -58,126 +56,54 @@ def _read_snapshot_latest(
     quant_data_root: Path, family: str, dataset_id: str, *,
     expected_identity: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    latest_path = quant_data_root / "parquet" / family / dataset_id / "LATEST.json"
-    payload = expected_identity or json.loads(latest_path.read_text(encoding="utf-8"))
-    snapshot_id = payload.get("snapshot_id")
-    snapshot_path = payload.get("snapshot_path")
-    if not isinstance(snapshot_id, str) or not isinstance(snapshot_path, str):
-        raise ValueError(f"{dataset_id} LATEST.json is invalid")
-    snapshot = (quant_data_root / snapshot_path).resolve()
-    try:
-        snapshot.relative_to(quant_data_root.resolve())
-    except ValueError as exc:
-        raise ValueError(f"{dataset_id} snapshot leaves the data root") from exc
-    if payload.get("dataset_id", dataset_id) != dataset_id:
-        raise ValueError(f"{dataset_id} snapshot dataset identity differs")
-    manifest_sha256 = str(payload.get("manifest_sha256") or "")
-    if not manifest_sha256:
-        raise ValueError(f"{dataset_id} snapshot manifest identity is missing")
-    content_sha256 = ""
-    latest_trade_date = ""
-    manifest_payload: dict[str, Any] = {}
-    if manifest_sha256:
-        manifest_path = snapshot / "DATASET_MANIFEST.json"
-        if manifest_path.is_file():
-            manifest_bytes = manifest_path.read_bytes()
-            actual = hashlib.sha256(manifest_bytes).hexdigest()
-            if actual != manifest_sha256:
-                raise ValueError(
-                    f"{dataset_id} snapshot manifest does not match LATEST.json: "
-                    f"declared {manifest_sha256}, actual {actual}"
-                )
-            try:
-                manifest_payload = json.loads(
-                    manifest_bytes
-                )
-                if (manifest_payload.get("snapshot_id") != snapshot_id
-                        or manifest_payload.get("dataset_id") != dataset_id):
-                    raise ValueError(f"{dataset_id} snapshot manifest identity differs")
-                content_sha256 = str(manifest_payload.get("content_sha256") or "")
-                latest_trade_date = str(
-                    manifest_payload.get("latest_trade_date") or ""
-                )
-            except (json.JSONDecodeError, OSError):
-                logger.warning(
-                    "snapshot manifest unreadable, content identity unavailable: %s",
-                    manifest_path,
-                )
-                latest_trade_date = ""
-        else:
-            raise ValueError(f"{dataset_id} snapshot manifest is unavailable")
-    index_path = snapshot / str(manifest_payload.get("file_index_path") or "FILE_INDEX.parquet")
-    index_path.resolve().relative_to(snapshot)
-    index_bytes = index_path.read_bytes()
-    index_sha256 = hashlib.sha256(index_bytes).hexdigest()
-    if expected_identity and expected_identity.get("file_index_sha256", index_sha256) != index_sha256:
-        raise ValueError(f"{dataset_id} file index changed")
-    return {
-        "snapshot_id": snapshot_id,
-        "manifest_sha256": manifest_sha256,
-        "content_sha256": content_sha256,
-        "latest_trade_date": latest_trade_date,
-        "bars_dir": snapshot / "bars",
-        "file_index": pd.read_parquet(io.BytesIO(index_bytes)),
-        "index_path": index_path,
-        "identity": {
-            "dataset_id": dataset_id, "snapshot_id": snapshot_id,
-            "snapshot_path": snapshot.relative_to(quant_data_root.resolve()).as_posix(),
-            "manifest_sha256": manifest_sha256, "content_sha256": content_sha256,
-            "latest_trade_date": latest_trade_date,
-            "file_index_sha256": index_sha256,
-        },
-    }
+    """Keep DSA's lineage shape while the data package owns resolution."""
+    from quant_qmt_data import bar_snapshot
+
+    basis = "qfq" if dataset_id in {_ASHARE_DATASET_ID, _ETF_DATASET_ID} else None
+    return bar_snapshot(dataset_id, quant_data_root=quant_data_root,
+                        price_basis=basis, expected_identity=expected_identity)
 
 
 def _load_bars_long(
-    bars_dir: Path,
-    *,
-    start: Optional[str],
-    end: Optional[str],
+    bars_dir: Path, *, start: Optional[str], end: Optional[str],
     symbols: Optional[Sequence[str]] = None,
     snapshot: Optional[dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    """Read date/symbol/open/close/volume for per-symbol parquet files."""
+    """Adapt verified per-symbol package output to DSA's long table."""
+    from quant_qmt_data import read_bars
+
     if snapshot is None:
         raise ValueError("local bar reads require a frozen snapshot")
     index = snapshot["file_index"]
     if symbols is not None:
+        missing = set(symbols) - set(index["symbol"].astype(str))
+        if missing:
+            raise ValueError("snapshot symbols are unavailable: " + ", ".join(sorted(missing)))
         index = index.loc[index["symbol"].isin(symbols)]
-    if index["symbol"].duplicated().any():
-        raise ValueError("snapshot file index contains duplicate symbols")
-    frames = []
-    source_files = {}
-    for item in index.itertuples(index=False):
-        path = (bars_dir.parent / item.relative_path).resolve()
-        path.relative_to(bars_dir.resolve())
-        before = _file_token(path)
-        payload = path.read_bytes()
-        if _file_token(path) != before or hashlib.sha256(payload).hexdigest() != item.sha256:
-            raise ValueError(f"price file hash changed: {item.symbol}")
-        columns = ["date", "symbol", "open", "close"]
-        if "volume" in pq.read_schema(io.BytesIO(payload)).names:
-            columns.append("volume")
-        frame = pd.read_parquet(io.BytesIO(payload), columns=columns)
-        if len(frame) != item.row_count or set(frame["symbol"]) != {item.symbol}:
-            raise ValueError(f"price file identity changed: {item.symbol}")
-        frame["date"] = pd.to_datetime(frame["date"], errors="raise")
-        if frame["date"].isna().any() or frame["date"].duplicated().any():
-            raise ValueError(f"price file dates are invalid: {item.symbol}")
+    frames, source_files = [], {}
+    dataset_id = snapshot["identity"]["dataset_id"]
+    basis = "qfq" if dataset_id in {_ASHARE_DATASET_ID, _ETF_DATASET_ID} else None
+    for symbol in index["symbol"].astype(str):
+        frame = read_bars(
+            dataset_id, symbol, quant_data_root=snapshot["quant_data_root"],
+            price_basis=basis, expected_identity=snapshot["identity"],
+            start=start, end=end,
+            volume_unit="native" if dataset_id == "cn_index_daily" else "base",
+        )
+        if "symbol" in frame and not frame["symbol"].eq(symbol).all():
+            raise ValueError(f"price symbol differs from index: {symbol}")
+        frame["symbol"] = symbol
         if "volume" not in frame:
             frame["volume"] = np.nan
-        if start is not None:
-            frame = frame.loc[frame["date"] >= pd.Timestamp(start)]
-        if end is not None:
-            frame = frame.loc[frame["date"] <= pd.Timestamp(end)]
-        frames.append(frame)
-        source_files[str(path)] = before
-    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["date", "symbol", "open", "close", "volume"],
-    )
+        frames.append(frame[["date", "symbol", "open", "close", "volume"]])
+        source_files.update(frame.attrs.get("source_files", {}))
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["date", "symbol", "open", "close", "volume"])
     source_files[str(snapshot["index_path"])] = _file_token(snapshot["index_path"])
-    frame.attrs["source_files"] = source_files
-    return frame
+    source_files[str(snapshot["snapshot_path"] / "DATASET_MANIFEST.json")] = _file_token(
+        snapshot["snapshot_path"] / "DATASET_MANIFEST.json")
+    result.attrs["source_files"] = source_files
+    return result
 
 
 def _file_token(path: Path) -> list[int]:
@@ -290,16 +216,12 @@ def _pool_cache_key(
 
 
 def _etf_code_to_symbol(etf_snapshot: dict[str, Any]) -> dict[str, str]:
-    """Map bare ETF codes (159915) and SH/SZ forms to canonical ETF symbols."""
-    mapping: dict[str, str] = {}
-    universe_path = etf_snapshot["bars_dir"].parent / "ETF_UNIVERSE.parquet"
-    if universe_path.exists():
-        universe = pd.read_parquet(universe_path, columns=["symbol", "code"])
-        for row in universe.itertuples(index=False):
-            code = str(row.code).strip().upper()
-            symbol = str(row.symbol).strip().upper()
-            mapping[code] = symbol
-            mapping[symbol] = symbol
+    """Route only instruments in the already verified price index."""
+    symbols = etf_snapshot["file_index"]["symbol"].astype(str)
+    mapping = {symbol: symbol for symbol in symbols}
+    for code, group in symbols.groupby(symbols.str[2:]):
+        if len(group) == 1:
+            mapping[code] = group.iloc[0]
     return mapping
 
 
@@ -329,13 +251,23 @@ def load_market_view(
     if cache_dir is None:
         cache_dir = reports_root() / "cache" / "universe"
 
-    family = "etf_1d" if pool == "etf" else "ashare_1d"
-    dataset_id = _ETF_DATASET_ID if pool == "etf" else _ASHARE_DATASET_ID
-    snapshot = _read_snapshot_latest(quant_data_root, family, dataset_id)
+    etf_snapshot = None
+    only_etfs = pool == "etf"
+    if pool == "custom":
+        from quant_qmt_data import inspect_datasets
+        optional = inspect_datasets(quant_data_root=quant_data_root,
+                                    dataset_ids=[_ETF_DATASET_ID])
+        available = {item["dataset_id"] for item in optional["datasets"] if item["status"] == "ready"}
+        if _ETF_DATASET_ID in available:
+            etf_snapshot = _read_snapshot_latest(quant_data_root, "etf_1d", _ETF_DATASET_ID)
+            mapping = _etf_code_to_symbol(etf_snapshot)
+            only_etfs = all(mapping.get(str(value).strip().upper()) or mapping.get(
+                _normalize_ashare_symbol(value)) for value in custom_symbols)
+    family = "etf_1d" if only_etfs else "ashare_1d"
+    dataset_id = _ETF_DATASET_ID if only_etfs else _ASHARE_DATASET_ID
+    snapshot = etf_snapshot if only_etfs and etf_snapshot is not None else _read_snapshot_latest(
+        quant_data_root, family, dataset_id)
     snapshot_id = snapshot["snapshot_id"]
-    if pool == "etf":
-        # paired raw+qfq layout: bars live under the qfq basis subdirectory.
-        snapshot["bars_dir"] = snapshot["bars_dir"].parent / "qfq"
 
     # Resolve the PIT membership reference before the cache key so membership
     # edits invalidate the cache even when the price snapshot is unchanged.
@@ -351,21 +283,16 @@ def load_market_view(
     if membership_path is not None and membership_path.is_file():
         membership_sha256 = _file_sha256(membership_path)
 
-    # Mixed custom pools read the ETF snapshot too: resolve it before the
-    # cache key so an ETF republish invalidates cached mixed bundles even
-    # when the A-share snapshot is unchanged.
-    etf_snapshot: Optional[dict[str, Any]] = None
-    if pool == "custom":
-        etf_snapshot = _read_snapshot_latest(quant_data_root, "etf_1d", _ETF_DATASET_ID)
-
     # The benchmark index is only an input for custom A-share pools that can
     # run regime-switching scripts such as BVR-20. ETF, CSI800 and all-A
     # runs must remain usable when the optional index snapshot is absent.
     index_snapshot: Optional[dict[str, Any]] = None
-    if pool == "custom":
+    if pool == "custom" and not only_etfs:
+        from quant_qmt_data import inspect_datasets
+        optional_index = inspect_datasets(quant_data_root=quant_data_root, dataset_ids=["cn_index_daily"])
         requested = [str(symbol).strip().upper() for symbol in custom_symbols or ()]
         has_ashare = any(_normalize_ashare_symbol(symbol).startswith(("SH", "SZ")) for symbol in requested)
-        if has_ashare:
+        if has_ashare and optional_index["available_datasets"]:
             try:
                 index_snapshot = _read_snapshot_latest(quant_data_root, "index_1d", "cn_index_daily")
             except FileNotFoundError:
@@ -423,11 +350,11 @@ def load_market_view(
         raw_wanted = [str(symbol).strip().upper() for symbol in custom_symbols if str(symbol).strip()]
         ashare_wanted: list[str] = []
         unknown: list[str] = []
-        etf_bars_dir = etf_snapshot["bars_dir"].parent / "qfq"
-        code_to_symbol = _etf_code_to_symbol(etf_snapshot)
+        etf_bars_dir = etf_snapshot["bars_dir"] if etf_snapshot is not None else None
+        code_to_symbol = _etf_code_to_symbol(etf_snapshot) if etf_snapshot is not None else {}
         for raw in raw_wanted:
             normalized = _normalize_ashare_symbol(raw)
-            if (snapshot["bars_dir"] / f"{normalized}.parquet").exists():
+            if not only_etfs and (snapshot["bars_dir"] / f"{normalized}.parquet").exists():
                 ashare_wanted.append(normalized)
                 continue
             etf_symbol = code_to_symbol.get(raw) or code_to_symbol.get(normalized)
@@ -516,7 +443,8 @@ def load_market_view(
     meta = {
         "pool": pool,
         "dataset_set_version": "local_snapshots",
-        "provider": "local_parquet",
+        "provider": "quant_qmt_data",
+        "volume_unit": "base",
         "datasets": datasets,
         "_cache_key": cache_key,
         "_source_files": source_files,
