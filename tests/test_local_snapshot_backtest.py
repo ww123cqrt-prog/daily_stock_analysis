@@ -1,11 +1,11 @@
 """Local backtests must use frozen Parquet inputs, without a data service."""
 
-import hashlib
 import json
 from datetime import date
 
 import pandas as pd
 import pytest
+from quant_qmt_data import quant_data_contract as contract
 
 from src.services.script_universe_loader import load_market_view, load_benchmark_series
 from src.repositories.quant_price_repo import QuantPriceRepository
@@ -14,32 +14,63 @@ from src.repositories.quant_price_repo import QuantPriceRepository
 def _snapshot(root, dataset_id, symbol, close, *, snapshot_id=None):
     family = "etf_1d" if dataset_id == "cn_etf_daily" else "ashare_1d"
     snapshot_id = snapshot_id or dataset_id + "-fixture"
-    relative = f"parquet/{family}/{dataset_id}/snapshots/{snapshot_id}"
-    snapshot = root / relative
+    stage = root / "staging" / snapshot_id
     component = "qfq" if family == "etf_1d" else "bars"
-    (snapshot / component).mkdir(parents=True)
-    pd.DataFrame({
+    (stage / component).mkdir(parents=True)
+    frame = pd.DataFrame({
         "symbol": [symbol, symbol], "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-        "open": [close - .1, close], "close": [close, close + .2], "volume": [100., 120.],
-    }).to_parquet(snapshot / component / f"{symbol}.parquet", index=False)
-    if family == "etf_1d":
-        pd.DataFrame({"symbol": [symbol], "code": [symbol[2:]]}).to_parquet(
-            snapshot / "ETF_UNIVERSE.parquet", index=False,
-        )
-    bar_path = snapshot / component / f"{symbol}.parquet"
-    pd.DataFrame({"symbol": [symbol], "relative_path": [f"{component}/{symbol}.parquet"],
-                  "row_count": [2], "sha256": [hashlib.sha256(bar_path.read_bytes()).hexdigest()]}).to_parquet(
-        snapshot / "FILE_INDEX.parquet", index=False,
+        "open": [close - .1, close], "high": [close + .1, close + .3],
+        "low": [close - .2, close - .1], "close": [close, close + .2],
+        "volume": [100., 120.], "amount": [close * 100., (close + .2) * 120.],
+    })
+    frame.to_parquet(stage / component / f"{symbol}.parquet", index=False)
+    (stage / "factors").mkdir()
+    pd.DataFrame({"date": frame["date"], "factor": 1., "offset": 0.}).to_parquet(
+        stage / "factors" / f"{symbol}.parquet", index=False,
     )
-    manifest = {"dataset_id": dataset_id, "snapshot_id": snapshot_id, "file_index_path": "FILE_INDEX.parquet",
-                "content_sha256": hashlib.sha256(str(close).encode()).hexdigest(),
-                "latest_trade_date": "2024-01-03"}
-    manifest_bytes = json.dumps(manifest).encode()
-    (snapshot / "DATASET_MANIFEST.json").write_bytes(manifest_bytes)
-    pointer = {"dataset_id": dataset_id, "snapshot_id": snapshot_id,
-               "snapshot_path": relative, "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()}
-    (root / "parquet" / family / dataset_id / "LATEST.json").write_text(json.dumps(pointer))
-    return pointer, snapshot
+    pd.DataFrame(columns=["symbol", "ex_date", "effective_trade_date", "action_type"]).to_parquet(
+        stage / "corporate_actions.parquet", index=False,
+    )
+    common = dict(role="canonical", status="ready",
+                  source={"provider": "fixture", "volume_unit": "shares"},
+                  producer={"script": "test_local_snapshot_backtest", "version": "1"},
+                  source_retrieved_at="2024-01-03T16:00:00+08:00")
+    adjustment = dict(method="provider_native_paired", adjusted_at=common["source_retrieved_at"],
+                      adjustment_as_of="2024-01-03", adjusted_fields=["open", "high", "low", "close"],
+                      normalization_rule="latest_valid_trade_date_factor_equals_1_and_offset_equals_0",
+                      algorithm_version="provider-native-affine-paired-v1")
+    publications = []
+    if family == "etf_1d":
+        (stage / "raw").mkdir()
+        frame.to_parquet(stage / "raw" / f"{symbol}.parquet", index=False)
+        pd.DataFrame({"symbol": [symbol], "code": [symbol[2:]]}).to_parquet(
+            stage / "ETF_UNIVERSE.parquet", index=False,
+        )
+        contract.finalize_paired_price_snapshot(
+            stage, dataset_id=dataset_id, snapshot_id=snapshot_id, **common,
+            adjustment={**adjustment, "paired_raw_component_path": "raw", "volume_adjusted": False},
+        )
+    else:
+        raw = root / "staging" / (snapshot_id + "-raw")
+        (raw / "bars").mkdir(parents=True)
+        frame.to_parquet(raw / "bars" / f"{symbol}.parquet", index=False)
+        contract.finalize_price_snapshot(
+            raw, dataset_id="ashare_daily_raw", snapshot_id=raw.name, **common,
+            price_basis="raw", adjustment={"method": "none"},
+        )
+        contract.finalize_price_snapshot(
+            stage, dataset_id=dataset_id, snapshot_id=snapshot_id, **common,
+            price_basis="qfq", adjustment={**adjustment, "paired_raw_snapshot_id": raw.name},
+        )
+        publications.append((raw, root / "parquet" / family / "ashare_daily_raw"))
+    dataset_root = root / "parquet" / family / dataset_id
+    publications.append((stage, dataset_root))
+    if not (root / "DATA_MANIFEST.json").exists():
+        contract.write_root_manifest(root, {})
+    snapshot = contract.publish_snapshot_group(
+        publications, quant_data_root=root, update_root_catalog=True,
+    )[-1]
+    return json.loads((dataset_root / "LATEST.json").read_text()), snapshot
 
 
 @pytest.fixture
@@ -89,7 +120,7 @@ def test_benchmark_reuses_pinned_snapshot_after_latest_changes(local_root, tmp_p
 def test_changed_snapshot_manifest_is_rejected(local_root, tmp_path):
     path = local_root / "parquet/etf_1d/cn_etf_daily/snapshots/cn_etf_daily-fixture/DATASET_MANIFEST.json"
     path.write_text(path.read_text() + " ")
-    with pytest.raises(ValueError, match="manifest"):
+    with pytest.raises(contract.DataContractError, match="manifest hash mismatch"):
         load_market_view("etf", quant_data_root=local_root, cache_dir=tmp_path / "cache")
 
 
@@ -111,5 +142,7 @@ def test_changed_parquet_cannot_reuse_a_warm_bundle(local_root, tmp_path):
     frame = pd.read_parquet(path)
     frame["close"] = [3., 4.]
     frame.to_parquet(path, index=False)
-    with pytest.raises(ValueError, match="hash|changed"):
+    with pytest.raises(contract.DataContractError, match="indexed bar file is unreadable") as error:
         load_market_view("etf", **kwargs)
+    assert isinstance(error.value.__cause__, contract.DataContractError)
+    assert "hash mismatch" in str(error.value.__cause__)
