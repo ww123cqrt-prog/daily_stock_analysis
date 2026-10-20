@@ -453,7 +453,13 @@ def _training_provider_name(params: Dict[str, Any]) -> str:
 def _approved_provider_identity_from_status(
     research_status: Dict[str, Any],
 ) -> Dict[str, str]:
-    provider = research_status.get("qlib_provider")
+    preflight = research_status.get("training_preflight")
+    if isinstance(preflight, dict):
+        if preflight.get("status") != "passed":
+            raise ValueError("Training preflight did not approve the Qlib Provider.")
+        provider = preflight.get("provider_identity")
+    else:
+        provider = research_status.get("qlib_provider")
     if not isinstance(provider, dict):
         raise ValueError("Training status does not expose an approved Qlib Provider.")
     try:

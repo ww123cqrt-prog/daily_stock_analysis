@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+from data_provider.base import is_bse_code, normalize_stock_code
+
 from quant_workflow.scripts.quant_data_service_client import (
     DEFAULT_QUANT_DATA_SERVICE_URL,
     QuantDataServiceClient,
@@ -25,11 +27,16 @@ FORMAL_QFQ_DATASETS = ("cn_etf_daily", "ashare_daily_raw")
 
 
 def normalize_market_symbol(value: str) -> str:
-    symbol = str(value or "").strip().upper().replace(".", "")
-    if symbol.startswith(("SH", "SZ", "BJ")) and len(symbol) == 8:
-        return symbol
+    original = str(value or "").strip().upper()
+    symbol = normalize_stock_code(original)
     if len(symbol) != 6 or not symbol.isdigit():
         raise ValueError(f"invalid A-share or ETF symbol: {value}")
+    if original.startswith(("SH", "SZ", "BJ")):
+        return f"{original[:2]}{symbol}"
+    if original.endswith((".SH", ".SZ", ".BJ")):
+        return f"{original[-2:]}{symbol}"
+    if is_bse_code(symbol):
+        return f"BJ{symbol}"
     if symbol.startswith(("5", "6", "9")):
         return f"SH{symbol}"
     if symbol.startswith(("0", "1", "2", "3")):

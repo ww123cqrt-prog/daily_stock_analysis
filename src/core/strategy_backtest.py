@@ -13,9 +13,12 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date
 import math
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from src.core.script_market import MarketView
 
 
 CASH = "CASH"
@@ -902,6 +905,7 @@ def run_portfolio_backtest_view(
         """
         nonlocal cash, current_target, total_cost, turnover_notional, blocked_signal_count, pending_retry
         if current_target == weights:
+            pending_retry = None
             return
         t = dates.index(execution_date)
         equity_at_open = cash

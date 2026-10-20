@@ -256,17 +256,21 @@ class QuantResearchRepository:
         return self.get_research(research_id)
 
     def delete_research(self, research_id: str) -> None:
-        research = self.get_research(research_id)
-        if research is None:
-            raise ValueError(f"Research not found: {research_id}")
-        experiments = self.list_experiments(research_id)
-        for exp in experiments:
-            runs = self.list_runs(exp["id"])
-            if runs:
-                raise ValueError(f"Cannot delete research '{research['name']}': experiment '{exp['name']}' has {len(runs)} run(s)")
-            if exp["status"] != "draft":
-                raise ValueError(f"Cannot delete research '{research['name']}': experiment '{exp['name']}' is frozen")
         with self._transaction() as conn:
+            # Serialize the protection check with deletion and concurrent runs.
+            conn.execute("BEGIN IMMEDIATE")
+            research = conn.execute("SELECT name FROM research WHERE id = ?", (research_id,)).fetchone()
+            if research is None:
+                raise ValueError(f"Research not found: {research_id}")
+            protected = conn.execute(
+                """SELECT e.name, EXISTS(SELECT 1 FROM run r WHERE r.experiment_id = e.id) AS has_runs
+                   FROM experiment e WHERE e.research_id = ?
+                   AND (e.status != 'draft' OR EXISTS(SELECT 1 FROM run r WHERE r.experiment_id = e.id))
+                   LIMIT 1""", (research_id,),
+            ).fetchone()
+            if protected is not None:
+                reason = "has run(s)" if protected["has_runs"] else "is frozen"
+                raise ValueError(f"Cannot delete research '{research['name']}': experiment '{protected['name']}' {reason}")
             conn.execute("DELETE FROM research WHERE id = ?", (research_id,))
 
     def _row_to_research(self, row: sqlite3.Row) -> Dict[str, Any]:

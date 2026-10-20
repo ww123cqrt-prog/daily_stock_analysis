@@ -4,7 +4,7 @@
 
 ## 一句话架构
 
-当前框架是：入口统一到 DSA，数据治理留在 `quant_data`，研究执行留在仓内 `quant_workflow/` 与 Qlib。DSA 通过本机数据服务读取不可变快照身份和可用状态，不下载、不清洗、不发布数据。`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 保存实验原始记录，页面通过 DSA `/experiments/` 访问。
+当前框架是：入口统一到 DSA，股票／ETF 本地快照的读取与维护由 `quant_qmt_data` 提供，研究执行留在仓内 `quant_workflow/` 与 Qlib。DSA 委托轻量项目完成行情更新，不连接封存的 `quant_data` 项目版服务。`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 保存实验原始记录，页面通过 DSA `/experiments/` 访问。
 
 ## 默认 A 股股票费用口径
 
@@ -22,7 +22,7 @@
 | 入口 | 地址 | 用途 |
 | --- | --- | --- |
 | 首页 | `/` | 跳转到 DSA 功能、九点猫研和 MLflow，并以静态关系图说明各项目职责与数据流 |
-| 数据 | `/data` | 只读查看 `quant_data` 服务、正式数据集和不可变快照身份 |
+| 数据 | `/data` | 查看 `quant_qmt_data` 本地清单状态及快照身份，行情更新委托轻量项目 |
 | 量化研究 | `/research` | 在“选股研究”和“交易策略研究”之间切换 |
 | 个股分析 | `/stock-analysis` | 运行个股分析并查看历史报告 |
 | 持仓 | `/portfolio` | 管理账户、持仓、估值、风险和手工交易记录 |
@@ -38,6 +38,8 @@
 回测按 ETF／A 股快照读取 qfq 行情，结果保存实际快照 ID、清单摘要、内容摘要和文件索引摘要；同次比较基准沿用已经选定的快照，不能在中途切换到新的 `LATEST`。只校验本次实际读取的行情文件，不把独立体检报告变成全库门禁。行情文件被替换时，已有计算缓存失效并重新核对文件摘要。起始日也是本次可用行情的起点，需要均线等预热数据的策略会在积累足够样本后才产生信号；比较旧 Run 时，须使用相同预热区间、执行规则和费用口径。
 
 Qlib 继续使用已有 Direct Provider：冻结本地 A 股价格、历史成员区间、指数及适用清洗规则的身份，不复制整套行情为 bin，也不从供应商补历史。训练 Run 保留 descriptor SHA、股票与指数快照及配置／预测 artifact 身份。历史成员与指数的覆盖日期独立于股票行情；小规模跑通不代表最新日期的全部依赖已补齐。验证训练使用隔离的 reports／mlruns 和 `--no-publish-latest`，不会替换现有正式模型。
+
+网页训练提交使用同一 `QUANT_DATA_ROOT` 下的本地快照和 Qlib Provider 预检结果，不调用旧 HTTP `/ready`。只有本次训练所需数据齐备、Provider 可读且冻结的股票／指数身份与本地清单一致，任务才允许提交；缺失、篡改或身份不一致仍返回 409。历史质量报告不作为本地训练的全库门禁。
 
 ## 本地安全边界
 

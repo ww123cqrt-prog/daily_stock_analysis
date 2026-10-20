@@ -166,11 +166,26 @@ def ready_training_data() -> QuantDataReadyResult:
     )
 
 
+
+def local_training_catalog(readiness, lineage=None):
+    """Metadata fixture for paired stock/index identities in one local root."""
+    lineage = lineage or ready_provider_resolution().lineage
+    items = []
+    for identity in readiness.identities:
+        item = {**identity.as_dict(), "role": "canonical", "status": "ready"}
+        for prefix in ("", "index_"):
+            if item["dataset_id"] == lineage.get(f"{prefix}dataset_id"):
+                item.update({key: lineage[f"{prefix}{key}"]
+                             for key in ("snapshot_id", "manifest_sha256", "content_sha256")})
+        items.append(item)
+    return {"datasets": items}
+
+
 def ready_provider_resolution(provider: str = "canonical"):
     from api.v1.endpoints.research_status import _NativeQlibProviderResolution
 
     provider_name = "cleaned" if provider == "cleaned" else "canonical"
-    marker = "e" if provider_name == "canonical" else "f"
+    marker = "e"
     lineage = {
         "provider_contract": "direct_parquet_v1",
         "dataset_id": "ashare_daily_qfq",
@@ -2315,8 +2330,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_ready_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=ready_training_data(),
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(ready_training_data()),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -3845,8 +3860,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     return_value=native,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient",
-                    return_value=service,
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(readiness, lineage),
                 ) as service_client,
                 patch.dict(
                     os.environ,
@@ -3868,9 +3883,11 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             {"ashare_daily_qfq", "cn_index_daily", "pit_csi800"},
         )
         self.assertEqual(payload["qlib_provider"]["snapshot_id"], "provider-snapshot")
-        service_client.assert_called_once_with(base_url="http://localhost:8766")
-        service.__enter__.assert_called_once_with()
-        service.__exit__.assert_called_once()
+        service_client.assert_any_call(
+            quant_data_root=ANY,
+            dataset_ids=("ashare_daily_qfq", "cn_index_daily", "pit_csi800"),
+        )
+        service.ready.assert_not_called()
 
     def test_status_blocks_training_when_required_quant_data_dataset_is_missing(
         self,
@@ -3912,8 +3929,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         status = {"trainable": True}
 
         with patch(
-            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-            return_value=readiness,
+            "quant_qmt_data.inspect_datasets",
+            return_value=local_training_catalog(readiness),
         ):
             _apply_training_preflight(status, native)
 
@@ -3937,7 +3954,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         )
 
         with patch(
-            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
+            "quant_qmt_data.inspect_datasets",
             side_effect=QuantDataClientError("private service detail"),
         ):
             _apply_training_preflight(status, native)
@@ -4054,8 +4071,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=readiness,
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(readiness, canonical_lineage),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -4134,8 +4151,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_ready_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=ready_training_data(),
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(ready_training_data()),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -4185,8 +4202,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_ready_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=ready_training_data(),
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(ready_training_data()),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -4229,8 +4246,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                             side_effect=resolve_ready_provider,
                         ),
                         patch(
-                            "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                            return_value=ready_training_data(),
+                            "quant_qmt_data.inspect_datasets",
+                            return_value=local_training_catalog(ready_training_data()),
                         ),
                         patch(
                             "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -4271,8 +4288,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_ready_provider,
                 ) as resolve_native,
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=ready_training_data(),
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(ready_training_data()),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -4761,8 +4778,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     side_effect=resolve_ready_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=ready_training_data(),
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(ready_training_data()),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",
@@ -5592,6 +5609,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     "-c",
                     (
                         "import json; "
+                        "from unittest.mock import patch; "
+                        "patch('dotenv.load_dotenv', return_value=False).start(); "
                         "import api.v1.endpoints.research_status as r; "
                         "print(json.dumps({"
                         "'workflow_root': str(r.QUANT_WORKFLOW_ROOT), "
@@ -5613,7 +5632,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(
             payload["reports_root"], str(dsa_root / "quant_workflow" / "reports")
         )
-        self.assertEqual(payload["quant_data_root"], str(dsa_root / "quant_data"))
+        self.assertEqual(payload["quant_data_root"], str(dsa_root.parent / "quant_qmt_data" / "data"))
         self.assertEqual(
             payload["status_path"],
             str(

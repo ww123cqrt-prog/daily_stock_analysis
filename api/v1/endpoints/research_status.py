@@ -43,10 +43,8 @@ from quant_workflow.scripts._paths import (
     qlib_workflow_provider_uri,
 )
 from quant_workflow.scripts.quant_data_service_client import (
-    DEFAULT_QUANT_DATA_SERVICE_URL,
     QuantDataClientError,
     QuantDataIdentity,
-    QuantDataServiceClient,
 )
 from quant_workflow.scripts.prepare_robust_provider import RuntimeProviderIdentityCache
 from quant_workflow.scripts.robust_signal_data_contract import (
@@ -1840,7 +1838,22 @@ def _training_preflight_payload(
             "summary": "当前 Qlib Provider 缺少完整的不可变数据血缘，正式训练已阻止。",
         }
 
-    summary = "quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。"
+    if provider_identity_payload.get("provider_contract") == "direct_parquet_v1":
+        for prefix in ("", "index_"):
+            dataset_id = provider_identity_payload.get(f"{prefix}dataset_id")
+            identity = identities.get(dataset_id)
+            if identity is None or any(
+                getattr(identity, field) != provider_identity_payload.get(f"{prefix}{field}")
+                for field in ("snapshot_id", "manifest_sha256", "content_sha256")
+            ):
+                return {
+                    "status": "blocked", "provider": provider_name,
+                    "required_datasets": list(required_datasets),
+                    "available_datasets": sorted(identities), "checked_at": checked_at,
+                    "summary": "本地快照与当前 Qlib Provider 的冻结身份不一致，请刷新 Provider 后再训练。",
+                }
+
+    summary = "本地快照已具备所需数据集，当前 Qlib Provider 轻量预检通过。"
     return {
         "status": "passed",
         "provider": provider_name,
@@ -1856,20 +1869,29 @@ def _training_preflight_payload(
     }
 
 
-def _load_training_dataset_identities() -> Tuple[
+def _load_training_dataset_identities(*, provider_name: str = "canonical") -> Tuple[
     Optional[Dict[str, QuantDataIdentity]], Optional[str]
 ]:
     try:
-        with QuantDataServiceClient(
-            base_url=os.getenv(
-                "QUANT_DATA_SERVICE_URL", DEFAULT_QUANT_DATA_SERVICE_URL
-            )
-        ) as client:
-            readiness = client.ready()
-    except (QuantDataClientError, ValueError):
-        return None, "quant_data 数据后端暂不可用，正式训练已阻止。"
+        import quant_qmt_data as local_data
+    except ImportError:
+        return None, "quant_qmt_data 本地数据模块不可用，正式训练已阻止。"
+
+    try:
+        # The provider resolution validates its frozen inputs. Inspect only the
+        # selected local catalog identities here, without scanning other history.
+        catalog = local_data.inspect_datasets(
+            quant_data_root=QUANT_DATA_ROOT,
+            dataset_ids=_required_training_datasets(provider_name),
+        )
+        identities = {
+            item["dataset_id"]: QuantDataIdentity.from_mapping(item)
+            for item in catalog["datasets"] if item.get("status") == "ready"
+        }
+    except (local_data.DataContractError, OSError, QuantDataClientError, ValueError):
+        return None, "quant_data 本地快照不可用或身份校验失败，正式训练已阻止。"
     return (
-        {identity.dataset_id: identity for identity in readiness.identities},
+        identities,
         None,
     )
 
@@ -1882,7 +1904,7 @@ def _apply_training_preflight(
     service_error: Optional[str] = None,
 ) -> None:
     if identities is None and service_error is None and native_resolution.path is not None:
-        identities, service_error = _load_training_dataset_identities()
+        identities, service_error = _load_training_dataset_identities(provider_name=native_resolution.provider_name)
     preflight = _training_preflight_payload(
         native_resolution,
         identities=identities,
@@ -2069,15 +2091,17 @@ def _attach_training_preflights(
     payload["current_provider_identities"] = _current_native_provider_identities(
         resolutions
     )
-    dataset_identities, service_error = _load_training_dataset_identities()
-    payload["training_preflights"] = {
-        provider_name: _training_preflight_payload(
+    payload["training_preflights"] = {}
+    for provider_name, resolution in resolutions.items():
+        dataset_identities, service_error = (
+            _load_training_dataset_identities(provider_name=provider_name)
+            if resolution.path is not None else (None, None)
+        )
+        payload["training_preflights"][provider_name] = _training_preflight_payload(
             resolution,
             identities=dataset_identities,
             service_error=service_error,
         )
-        for provider_name, resolution in resolutions.items()
-    }
     requested_name = _provider_name_for_request(
         requested_dataset_id,
         requested_provider,

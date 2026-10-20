@@ -31,6 +31,30 @@ def repo(tmp_path):
 
 
 class TestQuantResearchRepository:
+    @pytest.mark.parametrize("protection", ["frozen", "run", None])
+    def test_delete_research_checks_experiments_beyond_first_page(self, repo, protection):
+        research = repo.create_research(name="Paged history")
+        old = repo.create_experiment(research_id=research["id"], name="Old", method_kind="rule")
+        if protection:
+            repo.update_experiment(old["id"], status="submitted")
+        if protection == "run":
+            repo.create_run(experiment_id=old["id"])
+        for i in range(50):
+            repo.create_experiment(research_id=research["id"], name=f"Draft {i}")
+        with repo._transaction() as conn:
+            conn.execute("UPDATE experiment SET created_at = ? WHERE id = ?", ("2000-01-01", old["id"]))
+        assert old["id"] not in {e["id"] for e in repo.list_experiments(research["id"])}
+        before = repo.get_overview()
+        if protection:
+            with pytest.raises(ValueError, match="run" if protection == "run" else "frozen"):
+                repo.delete_research(research["id"])
+            assert repo.get_overview() == before
+            assert repo.get_experiment(old["id"]) is not None
+        else:
+            repo.delete_research(research["id"])
+            assert repo.get_research(research["id"]) is None
+            assert repo.get_overview()["total_experiments"] == 0
+
     def test_create_and_get_research(self, repo):
         research = repo.create_research(
             name="Test Research",

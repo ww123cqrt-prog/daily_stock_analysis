@@ -919,6 +919,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("Unsupported params", str(legacy_ctx.exception))
 
     def test_status_includes_research_snapshot_for_workflow_header(self) -> None:
+        from tests.test_research_status_api import local_training_catalog
         from api.v1.endpoints.research_status import _NativeQlibProviderResolution
         from quant_workflow.scripts.quant_data_service_client import (
             QuantDataIdentity,
@@ -1127,8 +1128,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     side_effect=resolve_provider,
                 ),
                 patch(
-                    "api.v1.endpoints.research_status.QuantDataServiceClient.ready",
-                    return_value=readiness,
+                    "quant_qmt_data.inspect_datasets",
+                    return_value=local_training_catalog(readiness, resolve_provider().lineage),
                 ),
                 patch(
                     "api.v1.endpoints.research_status._qlib_provider_from_path",

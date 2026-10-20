@@ -23,6 +23,16 @@ from quant_workflow.scripts.quant_data_service_client import (
 from src.repositories.quant_price_repo import QuantPriceRepository
 
 
+@pytest.mark.parametrize("symbol,expected", [
+    ("920748", "BJ920748"), ("BJ920748", "BJ920748"), ("920748.BJ", "BJ920748"),
+    ("600519", "SH600519"), ("600519.SH", "SH600519"), ("000001", "SZ000001"),
+    ("159915", "SZ159915"), ("900901", "SH900901"), ("830799", "BJ830799"),
+])
+def test_price_symbols_share_exchange_rules(symbol, expected):
+    from src.repositories.quant_price_repo import normalize_market_symbol
+    assert normalize_market_symbol(symbol) == expected
+
+
 def _arrow_response(table: pa.Table, identity: dict) -> httpx.Response:
     sink = pa.BufferOutputStream()
     with ipc.new_stream(sink, table.schema) as writer:

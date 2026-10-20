@@ -320,6 +320,32 @@ def test_suspended_rebalance_retries_until_executed_without_new_signal() -> None
     )
 
 
+@pytest.mark.parametrize("cancel", [True, False])
+def test_new_hold_signal_cancels_pending_liquidation(cancel) -> None:
+    days = [date(2026, 1, day) for day in range(1, 8)]
+    view = _make_view(
+        days, ["SZ000001"],
+        open_matrix=[[10.], [10.], [10.], [None], [None], [10.], [12.]],
+        close_matrix=[[10.], [10.], [10.], [10.], [10.], [10.], [12.]],
+    )
+    allocations = [_allocation(1, {"SZ000001": 1.0}, 1), _allocation(3, {}, 2)]
+    if cancel:
+        allocations.append(_allocation(4, {"SZ000001": 1.0}, 3))
+    report = run_portfolio_backtest_view(
+        strategy_name="cancel liquidation", allocations=allocations,
+        view=view, config=_view_config(),
+    )
+    sells = [t for t in report["trades"] if t["action"] == "sell"]
+    if cancel:
+        assert sells == []
+        assert report["equity_curve"][-1]["position"] == "SZ000001"
+        assert report["metrics"]["final_equity"] == pytest.approx(120_000.)
+    else:
+        assert len(sells) == 1
+        assert sells[0]["execution_date"] == "2026-01-06"
+        assert report["metrics"]["final_equity"] == pytest.approx(100_000.)
+
+
 def test_sub_period_return_uses_opening_equity_not_original_capital() -> None:
     """P1: a sub-period that opens with carried-in profit must report its own
     return against the opening equity, not the original capital."""
