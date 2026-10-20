@@ -2580,6 +2580,63 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(sum("event: jobs" in event for event in events), 2)
         self.assertIn("event: stream_end", events[-1])
 
+    def test_stream_and_status_keep_completed_launcher_with_active_research(self) -> None:
+        from api.v1.endpoints.quant_jobs import _list_jobs_for_stream
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            progress_path = root / "durable-status.json"
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={"robust": {
+                    "cancel_command": [sys.executable, "-c", "print('cancel')"],
+                    "progress_patterns": [str(progress_path)],
+                }},
+            )
+            service._insert_job(QuantJob(
+                job_id="old_durable_launcher", job_type="robust", label="研究",
+                status="completed", params={"run_id": "durable-run"},
+                command=[sys.executable], cwd=temp_dir, return_code=0,
+                created_at="2026-07-01T01:00:00+08:00",
+                started_at="2026-07-01T01:00:01+08:00",
+                completed_at="2026-07-01T01:00:02+08:00",
+                updated_at="2026-07-01T01:00:02+08:00",
+                log_path=str(root / "jobs" / "old_durable_launcher" / "job.log"),
+            ))
+            for index in range(21):
+                timestamp = f"2026-07-{index + 2:02d}T01:00:00+08:00"
+                service._insert_job(QuantJob(
+                    job_id=f"recent_{index}", job_type="finished", label="历史",
+                    status="completed", params={}, command=[sys.executable], cwd=temp_dir,
+                    return_code=0, created_at=timestamp, updated_at=timestamp,
+                    log_path=str(root / "jobs" / f"recent_{index}" / "job.log"),
+                ))
+
+            for lifecycle in ("starting", "running", "pause_requested"):
+                progress_path.write_text(json.dumps({
+                    "run_id": "durable-run", "lifecycle_status": lifecycle,
+                }), encoding="utf-8")
+                with self.subTest(lifecycle=lifecycle):
+                    self.assertTrue(service.get_job("old_durable_launcher").can_cancel)
+                    stream_jobs = asyncio.run(_list_jobs_for_stream(service))
+                    self.assertEqual(len(stream_jobs), 21)
+                    self.assertEqual(len({job.job_id for job in stream_jobs}), 21)
+                    durable = next(job for job in stream_jobs if job.job_id == "old_durable_launcher")
+                    self.assertTrue(durable.can_cancel)
+                    _, _, recent = service.get_status_snapshot(recent_limit=2)
+                    self.assertEqual(len(recent), 3)
+                    self.assertIn("old_durable_launcher", {job.job_id for job in recent})
+
+            for progress in (
+                {"run_id": "durable-run", "lifecycle_status": "completed"},
+                {"run_id": "another-run", "lifecycle_status": "running"},
+            ):
+                progress_path.write_text(json.dumps(progress), encoding="utf-8")
+                self.assertFalse(service.get_job("old_durable_launcher").can_cancel)
+                self.assertNotIn("old_durable_launcher", {
+                    job.job_id for job in service.list_jobs_for_monitoring()
+                })
+
     def test_stream_event_generator_omits_internal_command_payload(self) -> None:
         from api.v1.endpoints.quant_jobs import _quant_job_event_generator
 
@@ -4076,9 +4133,13 @@ class QuantJobsApiTestCase(unittest.TestCase):
                             (
                                 "from pathlib import Path; "
                                 f"path=Path({str(marker)!r}); "
-                                "path.write_text(path.read_text() + 'x' if path.exists() else 'x')"
+                                "path.write_text(path.read_text() + 'x' if path.exists() else 'x'); "
+                                "print('{\"cancel_outcome\": \"cancelled\"}')"
                             ),
                         ],
+                        "cancel_result_contract": {
+                            "format": "json", "allowed_outcomes": ["cancelled"],
+                        },
                         "progress_patterns": [str(progress_path)],
                     }
                 },
@@ -4091,6 +4152,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 params={"run_id": "robust-signal-run"},
                 command=[sys.executable],
                 cwd=temp_dir,
+                pid=999999,
                 return_code=0,
                 created_at="2026-08-03T10:00:00+08:00",
                 started_at="2026-08-03T10:00:01+08:00",
@@ -4101,8 +4163,14 @@ class QuantJobsApiTestCase(unittest.TestCase):
             service._insert_job(job)
 
             before_cancel = service.get_job(job.job_id)
-            first = service.cancel_job(job.job_id)
-            second = service.cancel_job(job.job_id)
+            with (
+                patch.object(service, "_runner_identity_matches", return_value=False) as identity_check,
+                patch.object(service, "_terminate_process_group") as signal_process,
+            ):
+                first = service.cancel_job(job.job_id)
+                second = service.cancel_job(job.job_id)
+            identity_check.assert_not_called()
+            signal_process.assert_not_called()
             marker_value = marker.read_text(encoding="utf-8")
 
         self.assertTrue(before_cancel.can_cancel)
@@ -4110,6 +4178,33 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertFalse(first.can_cancel)
         self.assertEqual(second.status, "cancelled")
         self.assertEqual(marker_value, "x")
+
+    def test_durable_cancel_still_checks_a_nonterminal_launcher_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = QuantJobService(
+                jobs_root=root / "jobs",
+                command_specs={"robust": {
+                    "cancel_command": [sys.executable, "-c", "print('{\"cancel_outcome\": \"cancelled\"}')"],
+                    "cancel_result_contract": {"format": "json", "allowed_outcomes": ["cancelled"]},
+                }},
+            )
+            service._insert_job(QuantJob(
+                job_id="active_launcher", job_type="robust", label="研究",
+                status="running", params={}, command=[sys.executable], cwd=temp_dir,
+                pid=999999, created_at="2026-07-01T01:00:00+08:00",
+                updated_at="2026-07-01T01:00:00+08:00",
+                log_path=str(root / "jobs" / "active_launcher" / "job.log"),
+            ))
+            with (
+                patch.object(service, "_runner_identity_matches", return_value=False) as identity_check,
+                patch.object(service, "_terminate_process_group") as signal_process,
+            ):
+                returned = service.cancel_job("active_launcher")
+            self.assertTrue(identity_check.called)
+            signal_process.assert_not_called()
+            self.assertEqual(returned.status, "failed")
+            self.assertIn("identity no longer matches", returned.error)
 
     def test_durable_cancel_preserves_natural_completion_reported_by_contract(
         self,

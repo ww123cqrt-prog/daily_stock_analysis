@@ -2193,17 +2193,25 @@ class QuantJobService:
             with self._connect() as conn:
                 conn.execute("BEGIN")
                 rows = self._monitoring_job_rows(conn, bounded_limit)
-        return [self._row_to_job(row) for row in rows]
+        return self._monitoring_jobs(rows, bounded_limit)
 
     def _monitoring_job_rows(
         self, conn: sqlite3.Connection, history_limit: int
     ) -> List[sqlite3.Row]:
+        durable_types = [
+            job_type for job_type, spec in self.command_specs.items()
+            if spec.get("cancel_command") is not None
+        ]
+        active_filter = "status IN ('pending', 'running')"
+        if durable_types:
+            placeholders = ", ".join("?" for _ in durable_types)
+            active_filter += f" OR (status = 'completed' AND job_type IN ({placeholders}))"
         active_rows = list(
             conn.execute(
                 "SELECT rowid AS _rowid, * FROM jobs "
-                "WHERE status IN ('pending', 'running') "
+                f"WHERE {active_filter} "
                 "ORDER BY updated_at DESC, created_at DESC, rowid DESC",
-                (),
+                tuple(durable_types),
             ).fetchall()
         )
         history_rows = list(
@@ -2215,7 +2223,7 @@ class QuantJobService:
             ).fetchall()
         )
         return sorted(
-            [*active_rows, *history_rows],
+            {row["_rowid"]: row for row in [*active_rows, *history_rows]}.values(),
             key=lambda row: (
                 str(row["updated_at"]),
                 str(row["created_at"]),
@@ -2223,6 +2231,20 @@ class QuantJobService:
             ),
             reverse=True,
         )
+
+    def _monitoring_jobs(
+        self, rows: List[sqlite3.Row], history_limit: int
+    ) -> List[QuantJob]:
+        jobs = []
+        history_count = 0
+        for row in rows:
+            job = self._row_to_job(row)
+            if job.can_cancel:
+                jobs.append(job)
+            elif history_count < history_limit:
+                jobs.append(job)
+                history_count += 1
+        return jobs
 
     def get_latest_jobs_by_type(self) -> Dict[str, QuantJob]:
         rows = self._fetch_all(
@@ -2281,7 +2303,7 @@ class QuantJobService:
             row["job_type"]: self._row_to_job(row) for row in latest_rows
         }
         active_count = int(active_row["count"]) if active_row is not None else 0
-        recent_jobs = [self._row_to_job(row) for row in recent_rows]
+        recent_jobs = self._monitoring_jobs(recent_rows, bounded_limit)
         return latest_jobs, active_count, recent_jobs
 
     def _active_quant_data_network_job(
@@ -2435,7 +2457,9 @@ class QuantJobService:
                 self._terminate_process_group(process_pid, signal.SIGKILL)
                 if hasattr(process, "kill"):
                     process.kill()
-        elif job.pid:
+        elif job.pid and not (
+            durable_runner_stopped and job.status in TERMINAL_STATUSES
+        ):
             if not self._runner_identity_matches(job):
                 timestamp = _now()
                 self._update_job(

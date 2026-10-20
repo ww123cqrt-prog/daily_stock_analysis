@@ -232,7 +232,7 @@ scripts/launchd/install-robust-shadow.sh --uninstall
 - **检查点完整性**不再以“文件存在”作为完成依据。每个已完成子任务保存固定的 Run 内相对路径、SHA-256、字节数、任务身份、阶段、信号、选股模型、季度、训练窗口、时间切分、行数和 artifact schema；恢复时重新读取同一份预测 Parquet 字节校验字段与锁定日期范围，并校验 diagnostics JSON。模型 pickle 只核对受控路径、哈希和模型契约，不为检查点验证而反序列化。
 - **立即取消**调用服务端白名单中的专用取消命令，并核对 launch token、PID、进程启动身份和命令哈希。只有后台 runner 确认停止后才标记 `cancelled`；取消失败会保留可见错误，不能伪装成已停止。
 - **启动授权**采用两阶段协议。任务必须先在共享 SQLite 中原子完成 `pending -> running` 认领；耐久 wrapper 只登记签名身份并等待一次性许可，服务端再次核对任务状态、launch token 和 PID 后才允许执行真实命令。另一个 DSA 进程先取消时，任务不会被复活，真实训练命令也不会启动；授权先完成时，已登记的进程组可被准确终止。
-- **启动器与 runner 分离**：launchd 接管训练后，网页启动任务本身可以先显示 `completed`。只要同一个 Run 的持久化状态仍是 `starting`、`running` 或 `pause_requested`，API 仍返回 `can_cancel=true`，页面继续提供“立即取消”；自然完成或重复取消不会再次执行取消命令。
+- **启动器与 runner 分离**：launchd 接管训练后，网页启动任务本身可以先显示 `completed`。只要同一个 Run 的持久化状态仍是 `starting`、`running` 或 `pause_requested`，API 仍返回 `can_cancel=true`，监控快照始终保留该研究，最近历史条数限制不影响“立即取消”按钮。确认持久研究已取消、且启动器已结束时，不再检查启动器的旧 PID；仍运行的启动器继续执行原有进程身份检查。自然完成或重复取消不会再次执行取消命令。
 - **重启恢复**：API 重启时会等待严格的 runner identity 握手，并验证 token、PID、命令哈希、进程启动时间和实际进程命令。身份文件仍在生成时保留输出冲突锁；握手超时只终止本次新建且身份精确匹配的进程，不会误杀其他训练。
 - **恢复监控超时**：已验证仍存活的 runner 不会仅因监控窗口到期被标记为失败。页面显示告警，任务继续占用冲突产物并重新挂接监控，直到取得真实退出状态或完成经过身份核对的取消。
 
@@ -271,6 +271,8 @@ CSI800 选股信号稳定性检验仍使用前述专用 `robust_signal_data_v3` 
 `report_china_astock_indicators.py` 复用 `china-astock-quant/strategies/_indicators.py` 的 SMA、EMA、RSI、ATR 和 Bollinger 指标函数，读取本地 cleaned 行情生成 `china_astock_indicator_report_latest.{json,md}`。这是只读研究报告，不连接券商、不读取账号密码、不自动下单。网页端和脚本端省略 `limit` 时都默认只抽样 50 只股票，避免误把“安全报告”跑成全市场重任务；需要扩大范围时必须显式填写数量上限。
 
 `report_qlib_research.py` 在 `/workflow` 中作为“Qlib 研究增强”的 6 个固定任务出现：选股模型效果深度解释、交易策略回测详细分解、多选股模型/多实验对比、因子挖掘辅助、滚动训练计划和组合风险诊断。每个网页按钮都固定传入对应 section，不能从网页提交任意 section 或 shell 命令。脚本读取本地 MLflow/Qlib 既有产物生成 `qlib_research_model_explainability_latest.{json,md}` 等报告；首版不重新训练、不计算无限制 SHAP、不接券商、不自动下单。
+
+多模型比较中，最大回撤使用 Qlib 的有符号负值，越接近零越好；验证损失仍越小越好。单次运行报告严格使用指定 Run ID 或 `latest_training_result.json` 中的 Run ID，目标缺失就报错，不换成另一个运行；只有未指定 Run ID 且没有 latest 目标时才选择最近的本地运行。
 
 `run_candidate_pipeline.py` 是完整候选流程的固定编排入口，配置真源为 `quant_workflow/configs/candidate_pipeline.yaml`。五个选股模型使用同一个 Alpha158、CSI300、训练期、验证期、交易成本和基准；选股模型与交易策略组合的排名只读取 2024-2025，2026 指标只用于对已选组合做独立终审，不能根据 2026 成绩改选其他组合。每轮写入 `candidate_pipeline_latest.{json,md}`、进度 JSON 和同批次 MLflow runs；真实候选 Run 会保留在实验历史中以便追溯，但候选研究结束后会恢复运行前的 `latest_training_result.json`，不会自动替换日常选股模型、连接券商或下单。
 

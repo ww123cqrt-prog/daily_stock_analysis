@@ -106,6 +106,43 @@ class ReportQlibResearchTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.find_run_dir("../unsafe", latest_training_path=latest, mlruns_dir=root / "mlruns")
 
+    def test_find_run_dir_does_not_replace_a_missing_requested_run(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing = write_run(root, "other_run")
+            latest = root / "latest_training_result.json"
+            latest.write_text(json.dumps({"run_id": "other_run"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing_run"):
+                module.find_run_dir(
+                    "missing_run", latest_training_path=latest, mlruns_dir=root / "mlruns"
+                )
+            self.assertEqual(
+                module.find_run_dir("other_run", latest_training_path=latest, mlruns_dir=root / "mlruns"),
+                existing,
+            )
+
+    def test_find_run_dir_rejects_a_stale_latest_pointer_but_allows_no_target(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing = write_run(root, "other_run")
+            latest = root / "latest_training_result.json"
+            latest.write_text(json.dumps({"run_id": "missing_run"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing_run"):
+                module.find_run_dir(latest_training_path=latest, mlruns_dir=root / "mlruns")
+            self.assertEqual(
+                module.find_run_dir("other_run", latest_training_path=latest, mlruns_dir=root / "mlruns"),
+                existing,
+            )
+            latest.unlink()
+            self.assertEqual(
+                module.find_run_dir(latest_training_path=latest, mlruns_dir=root / "mlruns"),
+                existing,
+            )
+
     def test_model_explainability_and_factor_reports_are_read_only(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -157,6 +194,25 @@ class ReportQlibResearchTest(unittest.TestCase):
         self.assertEqual(comparison["run_count"], 2)
         self.assertIn("1day.excess_return_with_cost.annualized_return", comparison["best_by_metric"])
         self.assertEqual(len(comparison["prediction_correlations"]), 1)
+
+    def test_model_comparison_prefers_smaller_drawdown_and_validation_loss(self):
+        module = load_module()
+        drawdown_key = "1day.excess_return_with_cost.max_drawdown"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for run_id, drawdown, loss in (
+                ("deep_loss", -0.30, 0.01),
+                ("small_loss", -0.05, 0.02),
+                ("no_loss", 0.0, 0.03),
+            ):
+                run = write_run(root, run_id)
+                (run / "metrics" / drawdown_key).write_text(f"0 {drawdown} 0\n", encoding="utf-8")
+                (run / "metrics" / "l2.valid").write_text(f"0 {loss} 0\n", encoding="utf-8")
+
+            best = module.model_comparison(mlruns_dir=root / "mlruns")["best_by_metric"]
+
+        self.assertEqual(best[drawdown_key]["run_id"], "no_loss")
+        self.assertEqual(best["l2.valid"]["run_id"], "deep_loss")
 
     def test_rolling_training_plan_reads_provider_calendar(self):
         module = load_module()

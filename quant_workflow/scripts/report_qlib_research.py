@@ -163,9 +163,10 @@ def find_run_dir(
         matches = [path for path in matches if path.is_dir() and (path / "artifacts").exists()]
         if matches:
             return matches[-1]
-    runs = _run_dirs(mlruns_dir)
-    if runs:
-        return runs[0]
+    else:
+        runs = _run_dirs(mlruns_dir)
+        if runs:
+            return runs[0]
     detail = f" for run {requested}" if requested else ""
     raise FileNotFoundError(f"Could not find a Qlib MLflow run{detail} under {mlruns_dir}.")
 
@@ -535,7 +536,8 @@ def model_comparison(*, mlruns_dir: Path = MLRUNS_DIR, max_runs: int = DEFAULT_M
         rows = [row for row in table if row.get(key) is not None]
         if not rows:
             continue
-        reverse = key != "l2.valid" and not key.endswith("max_drawdown")
+        # Qlib drawdowns are signed losses: zero is better than a deeper negative value.
+        reverse = key != "l2.valid"
         best[key] = sorted(rows, key=lambda row: row.get(key), reverse=reverse)[0]
     correlations = []
     prediction_series = []

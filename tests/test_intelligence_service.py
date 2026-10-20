@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from unittest.mock import Mock, patch
 
@@ -565,6 +565,41 @@ class IntelligenceServiceTestCase(unittest.TestCase):
         self.assertEqual(repo.apply_retention(30), 1)
         with DatabaseManager.get_instance().get_session() as session:
             self.assertEqual(session.query(IntelligenceItem).count(), 0)
+
+    def test_published_window_uses_utc_without_changing_local_fetch_window(self) -> None:
+        local_tz = timezone(timedelta(hours=8))
+        instant = datetime(2026, 10, 20, 12, tzinfo=local_tz)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+        repo = IntelligenceRepository()
+        for days in (1, 3):
+            cutoff = instant.astimezone(timezone.utc) - timedelta(days=days)
+            for encoding in ("offset", "epoch_ms"):
+                scope = f"{days}-{encoding}"
+                for label, minutes in (("inside", 30), ("edge", 0), ("outside", -1)):
+                    published = cutoff + timedelta(minutes=minutes)
+                    raw = (published.astimezone(local_tz).isoformat() if encoding == "offset"
+                           else int(published.timestamp() * 1000))
+                    parsed = self.service._parse_datetime_or_timestamp(raw)
+                    self.assertEqual(parsed, published.replace(tzinfo=None))
+                    repo.upsert_items([{
+                        "source_name": "clock-test", "source_type": "rss",
+                        "title": label, "url": f"https://news.example.com/{scope}/{label}",
+                        "published_at": parsed,
+                        "fetched_at": instant.replace(tzinfo=None) - timedelta(days=1, minutes=1),
+                        "scope_type": "market", "scope_value": scope, "market": "cn",
+                    }])
+                with self.subTest(days=days, encoding=encoding), patch(
+                    "src.repositories.intelligence_repo.datetime", Clock
+                ):
+                    items, total = repo.list_items(scope_value=scope, published_days=days)
+                    self.assertEqual(total, 2)
+                    self.assertEqual({item.title for item in items}, {"inside", "edge"})
+                    self.assertEqual(repo.list_items(scope_value=scope, days=1)[1], 0)
 
 
 if __name__ == "__main__":
