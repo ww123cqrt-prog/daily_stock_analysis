@@ -973,6 +973,74 @@ def test_real_qlib_features_support_multiple_worker_processes(
     assert frame.loc[("SZ000001", pd.Timestamp("2026-01-05")), "$close"] == pytest.approx(21.0)
 
 
+def test_real_qlib_exchange_reads_change_as_fraction_without_changing_pctchg(
+    direct_fixture: tuple[Path, Path, Path],
+) -> None:
+    quant_data_root, _, descriptor = direct_fixture
+    direct.init_qlib_from_quant_data(
+        descriptor_path=descriptor,
+        quant_data_root=quant_data_root,
+        kernels=1,
+    )
+    from qlib.data import D
+    from qlib.backtest.exchange import Exchange
+
+    frame = D.features(
+        ["SH600000"], ["$pctchg", "$change"],
+        start_time="2026-01-02", end_time="2026-01-06",
+    )
+    first = ("SH600000", pd.Timestamp("2026-01-02"))
+    missing = ("SH600000", pd.Timestamp("2026-01-05"))
+    assert frame.loc[first, "$pctchg"] == pytest.approx(0.1)
+    assert frame.loc[first, "$change"] == pytest.approx(0.001)
+    assert np.isnan(frame.loc[missing, "$change"])
+
+    exchange = Exchange(
+        freq="day", start_time="2026-01-02", end_time="2026-01-06",
+        codes=["SH600000", "SZ000001"], deal_price="close", limit_threshold=0.095,
+    )
+    assert exchange.quote_df.loc[first, "$change"] == pytest.approx(0.001)
+    assert not exchange.quote_df.loc[first, "limit_buy"]
+    assert not exchange.quote_df.loc[first, "limit_sell"]
+
+
+def test_real_qlib_backtest_uses_only_frozen_calendar_for_future_flag(
+    direct_fixture: tuple[Path, Path, Path],
+) -> None:
+    quant_data_root, _, descriptor = direct_fixture
+    direct.init_qlib_from_quant_data(
+        descriptor_path=descriptor, quant_data_root=quant_data_root, kernels=1,
+    )
+    from qlib.backtest import backtest
+    from qlib.contrib.strategy import TopkDropoutStrategy
+    from qlib.data import D
+
+    signal = pd.DataFrame(
+        {"score": [0.0, 1.0]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2026-01-02"), "SH600000"),
+             (pd.Timestamp("2026-01-02"), "SZ000001")],
+            names=["datetime", "instrument"],
+        ),
+    )
+    metrics, _ = backtest(
+        start_time="2026-01-05", end_time="2026-01-05",
+        strategy=TopkDropoutStrategy(signal=signal, topk=1, n_drop=1),
+        executor={"class": "SimulatorExecutor", "module_path": "qlib.backtest.executor",
+                  "kwargs": {"time_per_step": "day", "generate_portfolio_metrics": True}},
+        account=1_000_000, benchmark="SH000300",
+        exchange_kwargs={"codes": ["SH600000", "SZ000001"],
+                         "deal_price": "close", "limit_threshold": 0.095},
+    )
+    report, _ = metrics["1day"]
+    assert report.index.tolist() == [pd.Timestamp("2026-01-05")]
+    assert np.isfinite(report[["return", "bench"]].to_numpy()).all()
+    assert list(D.calendar(future=True)) == list(
+        pd.to_datetime(["2026-01-02", "2026-01-05", "2026-01-06"])
+    )
+    assert len(D.calendar(start_time="2026-01-07", end_time="2026-01-08", future=True)) == 0
+
+
 def test_cli_smoke_empty_returns_failure(
     direct_fixture: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,

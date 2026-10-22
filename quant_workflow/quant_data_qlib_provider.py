@@ -59,6 +59,7 @@ SUPPORTED_FIELDS = {
     "amount": "amount",
     "turn": "turn",
     "pctchg": "pctChg",
+    "change": "pctChg",
     "preclose": "preclose",
     "tradestatus": "tradestatus",
     "isst": "isST",
@@ -1233,8 +1234,8 @@ class QuantDataCalendarProvider(CalendarProvider):
     def load_calendar(self, freq, future):
         if str(freq).lower() not in {"day", "1d"}:
             raise DirectProviderError("direct provider currently supports day frequency only")
-        if future:
-            raise DirectProviderError("direct provider has no unverified future calendar")
+        # Qlib's historical executor requests future=True too. It may use the
+        # frozen calendar, but no dates beyond this verified version are added.
         return list(self._context.calendar)
 
 
@@ -1559,6 +1560,9 @@ class QuantDataFeatureProvider(FeatureProvider):
                 frame[source_field].reindex(dates),
                 errors="coerce",
             )
+            if field_name == "change":
+                # Qlib's exchange limits use a fraction; pctChg remains percent.
+                values = values / 100.0
         return pd.Series(
             values.to_numpy(dtype=np.float32),
             index=np.arange(start, end + 1),
