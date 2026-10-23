@@ -1,5 +1,6 @@
 import importlib.util
 import errno
+import hashlib
 import json
 import os
 import subprocess
@@ -22,6 +23,50 @@ def load_module():
 
 
 class TrainBaselineLgbTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("mlflow"), "requires MLflow local store")
+    def test_training_metrics_read_the_configured_store_with_uri_reserved_characters(self):
+        import mlflow
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, {"MLFLOW_ALLOW_FILE_STORE": "true"}
+        ):
+            mlruns = Path(temp_dir) / "mlruns #100%20"
+            client = mlflow.tracking.MlflowClient(tracking_uri=mlruns.resolve().as_uri())
+            experiment_id = client.create_experiment("training-uri-roundtrip")
+            run = client.create_run(experiment_id)
+            client.log_metric(run.info.run_id, "IC", 0.125)
+            client.set_terminated(run.info.run_id)
+            with patch.dict(os.environ, {"QUANT_WORKFLOW_MLRUNS_DIR": str(mlruns)}):
+                module = load_module()
+                result = module.load_run_metrics(run.info.run_id, "training-uri-roundtrip")
+
+        self.assertEqual(result["run_id"], run.info.run_id)
+        self.assertEqual(result["experiment_id"], experiment_id)
+        self.assertEqual(result["metrics"]["IC"], 0.125)
+
+    @unittest.skipUnless(importlib.util.find_spec("mlflow"), "requires MLflow local store")
+    def test_training_artifact_hashes_are_tagged_in_the_store_with_uri_reserved_characters(self):
+        import mlflow
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, {"MLFLOW_ALLOW_FILE_STORE": "true"}
+        ):
+            root = Path(temp_dir)
+            mlruns = root / "mlruns #100%20"
+            client = mlflow.tracking.MlflowClient(tracking_uri=mlruns.resolve().as_uri())
+            experiment_id = client.create_experiment("artifact-uri-roundtrip")
+            run = client.create_run(experiment_id)
+            artifact = root / "pred.pkl"
+            artifact.write_bytes(b"fixed prediction artifact")
+            client.log_artifact(run.info.run_id, str(artifact))
+            module = load_module()
+            hashes = module.tag_training_run_artifacts(run.info.run_id, mlruns_dir=mlruns)
+            tags = client.get_run(run.info.run_id).data.tags
+
+        expected_hash = hashlib.sha256(b"fixed prediction artifact").hexdigest()
+        self.assertEqual(hashes, {"pred.pkl": expected_hash})
+        self.assertIn(expected_hash, tags.values())
+
     def test_immutable_training_registry_rejects_existing_content_mismatch(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

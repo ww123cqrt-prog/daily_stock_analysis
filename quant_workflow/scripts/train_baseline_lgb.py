@@ -56,7 +56,7 @@ LATEST_TRAINING_RESULT = REPORT_DIR / "latest_training_result.json"
 EXPERIMENT_LOG = REPORT_DIR / "experiment_log.md"
 EXPERIMENT_RUNS = REPORT_DIR / "experiment_runs.jsonl"
 MLRUNS_DIR = mlruns_root()
-MLFLOW_TRACKING_URI = f"file://{MLRUNS_DIR}"
+MLFLOW_TRACKING_URI = MLRUNS_DIR.expanduser().resolve().as_uri()
 QUANT_DATA = quant_data_root()
 STOCK_LIST_PATH = QUANT_DATA / "stock_lists.json"
 PROVIDER_NAMES = ("canonical", "cleaned")
@@ -462,7 +462,7 @@ def tag_training_run_artifacts(
         import mlflow
 
         client = mlflow.tracking.MlflowClient(
-            tracking_uri=f"file://{Path(mlruns_dir).expanduser().resolve()}"
+            tracking_uri=Path(mlruns_dir).expanduser().resolve().as_uri()
         )
     return tag_run_artifact_hashes(
         client,
