@@ -520,10 +520,11 @@ def test_calendar_fields_and_missing_dates_are_mapped_without_forward_fill(
     assert close.iloc[0] == pytest.approx(10.0)
     assert np.isnan(close.iloc[1])
     assert close.iloc[2] == pytest.approx(11.0)
+    assert volume.iloc[0] == pytest.approx(125.0)
     assert np.isnan(volume.iloc[1])
-    assert amount.iloc[0] == pytest.approx(12.5 * volume.iloc[0])
+    assert amount.iloc[0] == pytest.approx(1250.0)
     assert vwap.iloc[0] == pytest.approx(close.iloc[0])
-    assert factor.tolist()[0] == pytest.approx(1.0)
+    assert factor.tolist()[0] == pytest.approx(0.8)
     assert np.isnan(factor.iloc[1])
     assert factor.tolist()[2] == pytest.approx(1.0)
 

@@ -45,6 +45,9 @@ MEMBERSHIP_NAME = "MEMBERSHIP_INTERVALS.parquet"
 DESCRIPTOR_SCHEMA_VERSION = 2
 ADAPTER_VERSION = "2"
 VWAP_ADJUSTMENT_VERSION = "vwap-affine-v1"
+RATIO_EXECUTION_VERSION = "ratio-execution-v1"
+LEGACY_FACTOR_SEMANTICS = "unit_on_available_bar_no_second_adjustment"
+RATIO_FACTOR_SEMANTICS = "ratio_factor_inverse_volume_v1"
 DEFAULT_DATASET_ID = "ashare_daily_qfq"
 DEFAULT_INDEX_DATASET_ID = "cn_index_daily"
 MEMBERSHIP_DATASET_ID = "pit_csi800"
@@ -263,6 +266,18 @@ def _requires_vwap_adjustment(manifest: Mapping[str, Any]) -> bool:
         manifest.get("price_basis") == "qfq"
         and (manifest.get("adjustment") or {}).get("method") != "none"
     )
+
+
+def _factor_semantics(descriptor: Mapping[str, Any]) -> str:
+    contract = descriptor.get("field_contract")
+    if contract is None:
+        return LEGACY_FACTOR_SEMANTICS
+    if not isinstance(contract, Mapping):
+        raise DirectProviderError("provider factor semantics are invalid")
+    mode = contract.get("factor_semantics", LEGACY_FACTOR_SEMANTICS)
+    if mode not in (LEGACY_FACTOR_SEMANTICS, RATIO_FACTOR_SEMANTICS):
+        raise DirectProviderError("provider factor semantics are unsupported")
+    return mode
 
 
 def _normalize_cleaning_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -584,6 +599,7 @@ def _load_descriptor(
         or payload.get("storage_mode") != "direct_parquet"
     ):
         raise DirectProviderError("provider descriptor contract is invalid")
+    _factor_semantics(payload)
 
     dataset = payload.get("dataset")
     if not isinstance(dataset, dict):
@@ -888,7 +904,9 @@ def _descriptor_payload(
         },
         "field_contract": {
             "price_input": "already_qfq",
-            "factor_semantics": "unit_on_available_bar_no_second_adjustment",
+            "factor_semantics": RATIO_FACTOR_SEMANTICS,
+            "volume_semantics": "base_volume_divided_by_factor_for_whole_history_zero_offset",
+            "affine_execution_semantics": "synthetic_units_and_returns_not_actual_share_pnl",
             "vwap_semantics": "raw_amount_over_base_volume_times_frozen_factor_plus_offset",
             "missing_date_semantics": "nan_no_forward_fill",
             "supported_fields": [
@@ -995,7 +1013,7 @@ def build_direct_provider_descriptor(
         else "canonical"
     )
     if _requires_vwap_adjustment(current_entry):
-        cleaning_identity += f"-{VWAP_ADJUSTMENT_VERSION}"
+        cleaning_identity += f"-{VWAP_ADJUSTMENT_VERSION}-{RATIO_EXECUTION_VERSION}"
     provider_dir = (
         base
         / dataset_id
@@ -1009,6 +1027,7 @@ def build_direct_provider_descriptor(
         context = _load_descriptor(descriptor_path, root)
         if (
             context.snapshot_path != current_snapshot
+            or _factor_semantics(context.descriptor) != RATIO_FACTOR_SEMANTICS
             or context.manifest["content_sha256"]
             != current_entry["content_sha256"]
             or context.descriptor["membership"].get("snapshot_id")
@@ -1600,7 +1619,10 @@ class QuantDataFeatureProvider(FeatureProvider):
                   if "offset" in factors else np.zeros(len(factors), dtype=float))
         if not np.isfinite(factor).all() or (factor <= 0).any() or not np.isfinite(offset).all():
             raise DirectProviderError(f"factor values or offsets are invalid for {symbol}")
-        return pd.DataFrame({"factor": factor, "offset": offset}, index=factor_dates).reindex(dates)
+        result = pd.DataFrame({"factor": factor, "offset": offset}, index=factor_dates).reindex(dates)
+        # Classify the complete frozen history, before cleaning or request slicing.
+        result.attrs["all_offsets_zero"] = bool((offset == 0.0).all())
+        return result
 
     def feature(self, instrument, field, start_index, end_index, freq):
         if str(freq).lower() not in {"day", "1d"}:
@@ -1617,8 +1639,18 @@ class QuantDataFeatureProvider(FeatureProvider):
         frame = self._load_frame(symbol)
         dates = calendar[start : end + 1]
         field_name = str(field).lstrip("$").lower()
+        execution_factors = None
+        if (field_name in {"factor", "volume"}
+                and _factor_semantics(self._context.descriptor) == RATIO_FACTOR_SEMANTICS):
+            adjustments = self._load_vwap_adjustments(symbol, frame.index)
+            if adjustments is not None:
+                all_offsets_zero = adjustments.attrs.get("all_offsets_zero")
+                if not isinstance(all_offsets_zero, bool):
+                    raise DirectProviderError("complete frozen factor offset evidence is missing")
+                if all_offsets_zero:
+                    execution_factors = adjustments["factor"].reindex(dates)
         if field_name == "factor":
-            values = pd.Series(
+            values = execution_factors if execution_factors is not None else pd.Series(
                 np.where(dates.isin(frame.index), 1.0, np.nan),
                 index=dates,
                 dtype=float,
@@ -1646,6 +1678,8 @@ class QuantDataFeatureProvider(FeatureProvider):
                 frame[source_field].reindex(dates),
                 errors="coerce",
             )
+            if field_name == "volume" and execution_factors is not None:
+                values = values.div(execution_factors)
             if field_name == "change":
                 # Qlib's exchange limits use a fraction; pctChg remains percent.
                 values = values / 100.0
