@@ -5,6 +5,8 @@ outside the cloned Qlib source tree.
 
 ## Layout
 
+- `strategies/` - 唯一推荐的策略版本入口；按 ETF 轮动、BBOLL（当前命名入口为 BVR-20）和因子研究策略三个大类保存。AlphaPurify 等外部工具作为 `/Users/cq/WorkingProjects/` 下的独立项目安装，不作为策略版本保存。
+- `docs/external_tools/` - DSA 对独立外部研究项目的接入审查、固定 commit 和使用边界。
 - `scripts/` - durable scripts we expect to reuse.
 - `configs/` - Qlib workflow YAML configs. The canonical baseline is
   `baseline_lgb_alpha158.yaml`.

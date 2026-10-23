@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import math
@@ -24,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
     qlib_workflow_provider_uri,
     quant_data_root,
@@ -124,9 +124,9 @@ def _claim_run(report_dir: Path, run_id: str, *, resume: bool) -> Iterator[None]
     runs_dir = Path(report_dir) / "runs"
     lock_path = runs_dir / ".locks" / f"{run_id}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as stream:
+    with lock_path.open("a+b") as stream:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(stream, exclusive=True, blocking=False)
         except BlockingIOError as exc:
             raise ValueError(
                 f"robust strategy run {run_id!r} is already running"
@@ -139,7 +139,7 @@ def _claim_run(report_dir: Path, run_id: str, *, resume: bool) -> Iterator[None]
                 )
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock_file(stream)
 
 
 def file_sha256(path: Path) -> str:

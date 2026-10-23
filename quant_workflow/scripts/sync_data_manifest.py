@@ -31,6 +31,7 @@ from _robust_reference_integrity import (  # noqa: E402
 )
 from quant_data_contract import (  # noqa: E402
     DataContractError,
+    _fsync_directory,
     catalog_entry_from_snapshot,
     dataset_publication_lock,
     validate_latest_pointer,
@@ -1499,8 +1500,8 @@ def _render_catalog_block(manifest: dict[str, Any], prefix: str) -> str:
         "本表由 `sync_data_manifest.py` 根据实际清单生成。不要手工修改本区块。",
         "原生不可变快照必须使用 `quant_data_cli.py resolve`；`compatibility_output` 仅供旧程序读取清单中的固定路径；`legacy_unknown` 只能审计。",
         "",
-        "| dataset_id | 角色 | 状态 | 价格口径 | 最新交易日 | 来源 | 相对路径 |",
-        "|---|---|---|---|---|---|---|",
+        "| dataset_id | 角色 | 状态 | 价格口径 | 来源 | 相对路径 |",
+        "|---|---|---|---|---|---|",
     ]
     for entry in rows:
         source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
@@ -1509,13 +1510,12 @@ def _render_catalog_block(manifest: dict[str, Any], prefix: str) -> str:
             entry.get("role"),
             entry.get("status"),
             entry.get("price_basis"),
-            entry.get("latest_trade_date"),
             source.get("provider"),
             _dataset_storage_path(entry),
         )
         lines.append("| " + " | ".join(_markdown_cell(value) for value in values) + " |")
     if not rows:
-        lines.append("| - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - |")
     lines.extend(["", README_BLOCK_END])
     return "\n".join(lines)
 
@@ -1537,11 +1537,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1610,11 +1606,7 @@ def _sync_data_manifest_unlocked(
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
     sync_catalog_readmes(quant_data, manifest)

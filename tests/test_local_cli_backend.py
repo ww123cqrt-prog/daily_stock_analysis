@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import psutil
 
 from tests.litellm_stub import ensure_litellm_stub
 
@@ -66,7 +67,13 @@ def _config(**overrides):
 
 def _script(tmp_path: Path, source: str) -> str:
     path = tmp_path / "mock_cli.py"
-    path.write_text(source, encoding="utf-8")
+    # The mocked CLI speaks the backend's UTF-8 protocol. Keep native newlines
+    # so Windows still exercises diagnostic redaction with real CRLF input.
+    path.write_text(
+        "import sys\nsys.stdout.reconfigure(encoding='utf-8')\n"
+        "sys.stderr.reconfigure(encoding='utf-8')\n" + source,
+        encoding="utf-8",
+    )
     return str(path)
 
 
@@ -379,8 +386,12 @@ print(json.dumps({{"type": "step_finish", "reason": "stop"}}))
     assert "--attach" not in argv
     assert "--dangerously-skip-permissions" not in argv
     assert probe["prompt"] == "prompt from dsa"
-    assert probe["prompt_mode"] == 0o600
-    assert probe["cwd_mode"] == 0o700
+    if os.name != "nt":  # Windows stat/chmod bits do not describe its ACL.
+        assert probe["prompt_mode"] == 0o600
+        assert probe["cwd_mode"] == 0o700
+    prompt_path = Path(argv[argv.index("--file") + 1])
+    assert not prompt_path.exists()
+    assert not prompt_path.parent.exists()
     for tool_name in local_cli_backend_module._OPENCODE_DISABLED_TOOL_NAMES:
         assert opencode_config["tools"][tool_name] is False
     assert opencode_config["tools"]["websearch"] is False
@@ -1010,14 +1021,12 @@ time.sleep(30)
         backend.generate("prompt", {})
 
     assert exc_info.value.error_code is GenerationErrorCode.UNKNOWN_BACKEND_ERROR
-    assert exc_info.value.details["reason"] == "output_stat_failed"
+    assert exc_info.value.details["reason"] == "output_stat_failed", exc_info.value.details
     assert "sk-secret" not in exc_info.value.details["error"]
     child_pid = int(pid_file.read_text(encoding="utf-8"))
     deadline = time.time() + 3
     while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except OSError:
+        if not psutil.pid_exists(child_pid):
             break
         time.sleep(0.05)
     else:
@@ -1080,9 +1089,7 @@ time.sleep(30)
     child_pid = int(pid_file.read_text(encoding="utf-8"))
     deadline = time.time() + 3
     while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except OSError:
+        if not psutil.pid_exists(child_pid):
             break
         time.sleep(0.05)
     else:
@@ -1372,9 +1379,7 @@ time.sleep(30)
     child_pid = int(pid_file.read_text(encoding="utf-8"))
     deadline = time.time() + 3
     while time.time() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except OSError:
+        if not psutil.pid_exists(child_pid):
             break
         time.sleep(0.05)
     else:
@@ -1506,7 +1511,7 @@ print(json.dumps({key: os.environ.get(key) for key in keys}, ensure_ascii=False)
 
 
 def test_popen_session_kwargs_are_platform_specific(monkeypatch) -> None:
-    monkeypatch.setattr(local_cli_backend_module.os, "name", "nt")
+    monkeypatch.setattr(local_cli_backend_module, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(
         local_cli_backend_module.subprocess,
         "CREATE_NEW_PROCESS_GROUP",
@@ -1518,7 +1523,7 @@ def test_popen_session_kwargs_are_platform_specific(monkeypatch) -> None:
         "creationflags": 0x00000200,
     }
 
-    monkeypatch.setattr(local_cli_backend_module.os, "name", "posix")
+    monkeypatch.setattr(local_cli_backend_module, "os", SimpleNamespace(name="posix"))
 
     assert local_cli_backend_module._popen_session_kwargs() == {
         "start_new_session": True,
@@ -1549,7 +1554,13 @@ def test_windows_terminate_process_group_prefers_ctrl_break(monkeypatch) -> None
         def kill(self):
             self.killed = True
 
-    monkeypatch.setattr(local_cli_backend_module.os, "name", "nt")
+    monkeypatch.setattr(local_cli_backend_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        local_cli_backend_module,
+        "psutil",
+        SimpleNamespace(Process=lambda _pid: SimpleNamespace(children=lambda **_kwargs: [])),
+        raising=False,
+    )
     monkeypatch.setattr(
         local_cli_backend_module.signal,
         "CTRL_BREAK_EVENT",
@@ -1594,7 +1605,13 @@ def test_windows_terminate_process_group_falls_back_to_kill(monkeypatch) -> None
         def kill(self):
             self.killed = True
 
-    monkeypatch.setattr(local_cli_backend_module.os, "name", "nt")
+    monkeypatch.setattr(local_cli_backend_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        local_cli_backend_module,
+        "psutil",
+        SimpleNamespace(Process=lambda _pid: SimpleNamespace(children=lambda **_kwargs: [])),
+        raising=False,
+    )
     monkeypatch.setattr(
         local_cli_backend_module.signal,
         "CTRL_BREAK_EVENT",
@@ -1608,6 +1625,74 @@ def test_windows_terminate_process_group_falls_back_to_kill(monkeypatch) -> None
     assert process.signals == [1]
     assert process.terminated is True
     assert process.killed is True
+
+
+@pytest.mark.parametrize("survives_terminate", [False, True])
+def test_windows_terminate_cleans_captured_descendants_after_leader_exits(
+    monkeypatch,
+    survives_terminate: bool,
+) -> None:
+    events = []
+
+    class Descendant:
+        def __init__(self, name):
+            self.name = name
+
+        def terminate(self):
+            events.append(("terminate", self.name))
+
+        def kill(self):
+            events.append(("kill", self.name))
+
+    child = Descendant("child")
+    grandchild = Descendant("grandchild")
+
+    def _children(*, recursive):
+        assert recursive is True
+        events.append(("capture",))
+        return [child, grandchild]
+
+    def _wait_procs(processes, timeout):
+        assert timeout == 2
+        events.append(("wait", tuple(process.name for process in processes)))
+        if survives_terminate and processes == [child, grandchild]:
+            return [grandchild], [child]
+        return list(processes), []
+
+    class Leader:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _signal):
+            events.append(("signal",))
+
+        def wait(self, timeout):
+            assert timeout == 2
+            events.append(("leader_exited",))
+
+    monkeypatch.setattr(local_cli_backend_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        local_cli_backend_module,
+        "psutil",
+        SimpleNamespace(
+            Process=lambda _pid: SimpleNamespace(children=_children),
+            wait_procs=_wait_procs,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(local_cli_backend_module.signal, "CTRL_BREAK_EVENT", 1, raising=False)
+
+    LocalCliGenerationBackend._terminate_process_group(Leader())
+
+    assert events[:3] == [("capture",), ("signal",), ("leader_exited",)]
+    assert ("terminate", "grandchild") in events
+    assert ("terminate", "child") in events
+    assert ("wait", ("child", "grandchild")) in events
+    assert (("kill", "child") in events) is survives_terminate
+    if survives_terminate:
+        assert events[-1] == ("wait", ("child",))
 
 
 def test_diagnostics_redaction_and_truncation() -> None:
@@ -2570,7 +2655,7 @@ raise SystemExit(2)
     assert 'Authorization: <redacted> session_id=auth123' in stderr_preview
     assert 'Proxy-Authorization: <redacted> session_id=proxy123' in stderr_preview
     assert '{"accessToken":"<redacted>","session_id":"camel123"}' in stderr_preview
-    assert 'clientSecret: <redacted>\n' in stderr_preview
+    assert 'clientSecret: <redacted>\n' in stderr_preview.replace("\r\n", "\n")
 
 
 def test_nonzero_exit_diagnostic_previews_redact_ansi_oauth_and_multiline_quoted_secrets(
@@ -2599,9 +2684,9 @@ raise SystemExit(2)
     assert "tiny-secret" not in stderr_preview
     assert "correct horse" not in stderr_preview
     assert "battery staple" not in stderr_preview
-    assert "password: <redacted>\n" in stdout_preview
+    assert "password: <redacted>\n" in stdout_preview.replace("\r\n", "\n")
     assert "Authorization: <redacted> session_id=oauth123" in stderr_preview
-    assert "password: <redacted>\n" in stderr_preview
+    assert "password: <redacted>\n" in stderr_preview.replace("\r\n", "\n")
 
 
 def test_nonzero_exit_diagnostic_previews_redact_sensitive_collections(
@@ -2661,7 +2746,6 @@ print("OPENAI_FOO=\\\\ shell-short session_id=shell123", file=sys.stderr)
 print("OPENAI_API_KEY=\\\\\\ncontinued-shell-secret session_id=shell456", file=sys.stderr)
 print("API Key: label-short session_id=label123", file=sys.stderr)
 print("OpenAI API Keys (Multi): title-short session_id=title123", file=sys.stderr)
-print("? api_key\\n# note\\n: commented-explicit-secret\\nsession_id: explicit456", file=sys.stderr)
 raise SystemExit(2)
 """,
     )
@@ -2703,7 +2787,6 @@ raise SystemExit(2)
         "continued-shell-secret",
         "label-short",
         "title-short",
-        "commented-explicit-secret",
     ):
         assert secret not in f"{stdout_preview}\n{stderr_preview}"
     assert "api_keys: <redacted>" in stdout_preview
@@ -2721,10 +2804,10 @@ raise SystemExit(2)
     assert '{"AIHUBMIX_KEY":"<redacted>","session_id":"json123"}' in stderr_preview
     assert '{"set-cookie":"<redacted>","session_id":"header123"}' in stderr_preview
     assert r'{"api\u005fkey":"<redacted>","session_id":"escaped123"}' in stderr_preview
-    assert "? api_key\n: <redacted>\nsession_id: explicit123" in stderr_preview
-    assert "? 'api_key'\n: <redacted>\nsession_id: quoted-explicit123" in stderr_preview
-    assert "- ? api_key\n  : <redacted>\nsession_id: nested-explicit123" in stderr_preview
-    assert "- ? credentials\n  : <redacted>\nsession_id: nested-list123" in stderr_preview
+    assert "? api_key\n: <redacted>\nsession_id: explicit123" in stderr_preview.replace("\r\n", "\n")
+    assert "? 'api_key'\n: <redacted>\nsession_id: quoted-explicit123" in stderr_preview.replace("\r\n", "\n")
+    assert "- ? api_key\n  : <redacted>\nsession_id: nested-explicit123" in stderr_preview.replace("\r\n", "\n")
+    assert "- ? credentials\n  : <redacted>\nsession_id: nested-list123" in stderr_preview.replace("\r\n", "\n")
     assert "OPENAI_API_KEY='<redacted>' session_id=quoted123" in stderr_preview
     assert "OPENAI_API_KEY+=<redacted> session_id=append123" in stderr_preview
     assert "{'api_key': '<redacted>', 'session_id': 'single123'}" in stderr_preview
@@ -2734,7 +2817,30 @@ raise SystemExit(2)
     assert "OPENAI_API_KEY=<redacted> session_id=shell456" in stderr_preview
     assert "API Key: <redacted>" in stderr_preview
     assert "OpenAI API Keys (Multi): <redacted>" in stderr_preview
-    assert "? api_key\n: <redacted>\nsession_id: explicit456" in stderr_preview
+
+
+def test_nonzero_exit_previews_redact_explicit_yaml_with_comment(
+    tmp_path: Path,
+) -> None:
+    # Keep this packet below the preview limit, including native CRLF bytes.
+    backend = _backend(
+        tmp_path,
+        """
+import sys
+print("? api_key\\n# note\\n: commented-explicit-secret\\nsession_id: explicit456", file=sys.stderr)
+raise SystemExit(2)
+""",
+    )
+
+    with pytest.raises(GenerationError) as exc_info:
+        backend.generate("prompt", {})
+
+    assert exc_info.value.error_code is GenerationErrorCode.NON_ZERO_EXIT
+    stderr_preview = exc_info.value.details["stderr_preview"]
+    assert "commented-explicit-secret" not in stderr_preview
+    if os.name == "nt":
+        assert "\r\n" in stderr_preview
+    assert "? api_key\n: <redacted>\nsession_id: explicit456" in stderr_preview.replace("\r\n", "\n")
 
 
 def test_nonzero_exit_previews_redact_quoted_authorization_fields(
@@ -2809,7 +2915,7 @@ raise SystemExit(2)
     stderr_preview = exc_info.value.details["stderr_preview"]
 
     assert "indented-explicit-secret" not in stderr_preview
-    assert "? api_key\n: <redacted>\nsession_id: explicit789" in stderr_preview
+    assert "? api_key\n: <redacted>\nsession_id: explicit789" in stderr_preview.replace("\r\n", "\n")
 
 
 def test_nonzero_exit_previews_redact_tagged_and_yaml_escaped_explicit_keys(
@@ -2835,10 +2941,10 @@ raise SystemExit(2)
     assert "tagged-explicit-secret" not in stderr_preview
     assert "anchored-escaped-secret" not in stderr_preview
     assert r'{"api\x5fkey":"<redacted>","session_id":"escapedhex123"}' in stderr_preview
-    assert "? !!str api_key\n: <redacted>\nsession_id: tagged-explicit123" in stderr_preview
+    assert "? !!str api_key\n: <redacted>\nsession_id: tagged-explicit123" in stderr_preview.replace("\r\n", "\n")
     assert (
         '- ? &cred "api\\x5fkey"\n  : <redacted>\nsession_id: anchored-explicit123'
-        in stderr_preview
+        in stderr_preview.replace("\r\n", "\n")
     )
 
 
@@ -2884,7 +2990,7 @@ raise SystemExit(2)
     assert "NTFY_URL=<redacted> session_id=ntfy123" in stderr_preview
     assert "PUSHOVER_USER_KEY=<redacted> session_id=push123" in stderr_preview
     assert "proxyAuthorization: <redacted> session_id=proxy123" in stderr_preview
-    assert '"api_key":\n    "<redacted>"' in stderr_preview
+    assert '"api_key":\n    "<redacted>"' in stderr_preview.replace("\r\n", "\n")
     assert '"session_id": "json123"' in stderr_preview
     assert "Authorization: <redacted> session_id=aws123" in stderr_preview
     assert "Authorization: <redacted> token_budget=1000" in stderr_preview
@@ -3009,7 +3115,7 @@ raise SystemExit(2)
     assert exc_info.value.error_code is GenerationErrorCode.NON_ZERO_EXIT
     stdout_preview = exc_info.value.details["stdout_preview"]
     stderr_preview = exc_info.value.details["stderr_preview"]
-    assert stdout_preview == "password: <redacted>\n"
+    assert stdout_preview.replace("\r\n", "\n") == "password: <redacted>\n"
     assert "tiny-secret" not in stderr_preview
     assert "cookie-secret" not in stderr_preview
     assert '{"authorization":"<redacted>","session_id":"auth123"}' in stderr_preview

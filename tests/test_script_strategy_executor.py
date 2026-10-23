@@ -2,6 +2,7 @@
 """Process-isolation tests for user supplied strategy scripts."""
 
 from datetime import date
+import platform
 
 import pytest
 
@@ -20,6 +21,7 @@ _BARS = (
 )
 
 
+@pytest.mark.skipif(platform.system() != "Darwin", reason="Requires the native macOS sandbox-exec")
 def test_sandbox_returns_checked_allocations() -> None:
     allocations, logs, check = run_script_in_sandbox(
         "def on_bar(context, data):\n    context.target_equal(data.symbols)",
@@ -36,6 +38,7 @@ def test_sandbox_returns_checked_allocations() -> None:
     assert check["status"] == "passed"
 
 
+@pytest.mark.skipif(platform.system() != "Darwin", reason="Requires the native macOS sandbox-exec")
 def test_sandbox_terminates_an_infinite_strategy() -> None:
     with pytest.raises(ScriptExecutionError, match="exceeded"):
         run_script_in_sandbox(
@@ -48,14 +51,20 @@ def test_sandbox_terminates_an_infinite_strategy() -> None:
         )
 
 
-def test_refuses_execution_outside_macos_sandbox(monkeypatch) -> None:
+@pytest.mark.parametrize("host", ["Linux", "Windows"])
+def test_refuses_execution_outside_macos_sandbox(monkeypatch, host: str) -> None:
     """B-1: non-Darwin hosts must never silently run bare subprocesses."""
     import platform as platform_module
 
     from src.core.script_strategy import ScriptExecutionError
     from src.services.script_strategy_executor import run_script_in_sandbox
 
-    monkeypatch.setattr(platform_module, "system", lambda: "Linux")
+    monkeypatch.setattr(platform_module, "system", lambda: host)
+
+    def reject_process_launch(*_args, **_kwargs):
+        pytest.fail("unsupported platforms must not launch a strategy process")
+
+    monkeypatch.setattr("src.services.script_strategy_executor.subprocess.run", reject_process_launch)
     script = (
         "def initialize(context):\n"
         "    pass\n"

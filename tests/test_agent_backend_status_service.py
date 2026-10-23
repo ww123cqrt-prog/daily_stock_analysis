@@ -43,6 +43,7 @@ def _write_protocol_schemas(schema_dir: Path, *, missing: str | None = None) -> 
 
 
 def _install_successful_codex_probe(monkeypatch, *, version: str = "codex-cli test\n") -> list[list[str]]:
+    monkeypatch.setattr("src.services.agent_backend_status_service.is_native_windows", lambda: False)
     monkeypatch.setattr(
         "src.services.agent_backend_status_service.resolve_command",
         lambda: ["/usr/local/bin/codex", "app-server", "--stdio"],
@@ -182,6 +183,7 @@ def test_codex_status_rejects_each_missing_required_protocol_capability(
     monkeypatch,
     missing: str,
 ) -> None:
+    monkeypatch.setattr("src.services.agent_backend_status_service.is_native_windows", lambda: False)
     monkeypatch.setattr(
         "src.services.agent_backend_status_service.resolve_command",
         lambda: ["codex", "app-server", "--stdio"],
@@ -214,6 +216,7 @@ def test_codex_status_treats_version_as_optional_display_data(monkeypatch) -> No
 
 
 def test_codex_status_does_not_fail_when_optional_version_probe_times_out(monkeypatch) -> None:
+    monkeypatch.setattr("src.services.agent_backend_status_service.is_native_windows", lambda: False)
     monkeypatch.setattr(
         "src.services.agent_backend_status_service.resolve_command",
         lambda: ["/usr/local/bin/codex", "app-server", "--stdio"],

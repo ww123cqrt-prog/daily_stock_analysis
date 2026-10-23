@@ -23,10 +23,13 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
+
+import psutil
 
 from src.services.quant_workflow_paths import (
     dsa_root,
@@ -909,11 +912,12 @@ def _quant_job_child_env(
 
 
 def _return_code_indicates_cancel(return_code: Optional[int]) -> bool:
+    kill_signal = getattr(signal, "SIGKILL", 9)
     return return_code in {
         -signal.SIGTERM,
-        -signal.SIGKILL,
+        -kill_signal,
         128 + signal.SIGTERM,
-        128 + signal.SIGKILL,
+        128 + kill_signal,
     }
 
 
@@ -2386,6 +2390,7 @@ class QuantJobService:
             process = self._processes.get(job_id)
 
         durable_runner_stopped = False
+        windows_termination_confirmed = False
         job_spec = self.command_specs.get(job.job_type, {})
         cancel_spec = job_spec.get("cancel_command")
         if cancel_spec is not None:
@@ -2445,16 +2450,23 @@ class QuantJobService:
 
         if process is not None and process.poll() is None:
             process_pid = getattr(process, "pid", job.pid)
+            runtime_identity_matches = (
+                sys.platform == "win32" and self._runner_identity_matches(job)
+            )
+            terminated = self._terminate_process_group(process_pid, signal.SIGTERM)
+            windows_termination_confirmed = bool(runtime_identity_matches and terminated)
             if hasattr(process, "terminate"):
                 process.terminate()
-            self._terminate_process_group(process_pid, signal.SIGTERM)
             deadline = time.time() + JOB_TERMINATE_TIMEOUT_SECONDS
             while time.time() < deadline:
                 if process.poll() is not None:
                     break
                 time.sleep(0.1)
             if process.poll() is None:
-                self._terminate_process_group(process_pid, signal.SIGKILL)
+                terminated = self._terminate_process_group(
+                    process_pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+                )
+                windows_termination_confirmed |= bool(runtime_identity_matches and terminated)
                 if hasattr(process, "kill"):
                     process.kill()
         elif job.pid and not (
@@ -2473,17 +2485,27 @@ class QuantJobService:
                     ),
                 )
                 return self.get_job(job_id)
-            self._terminate_process_group(job.pid, signal.SIGTERM)
+            terminated = self._terminate_process_group(job.pid, signal.SIGTERM)
+            windows_termination_confirmed = sys.platform == "win32" and bool(terminated)
             deadline = time.time() + JOB_TERMINATE_TIMEOUT_SECONDS
             while time.time() < deadline and self._pid_is_alive(job.pid):
                 time.sleep(0.1)
             if self._pid_is_alive(job.pid):
-                self._terminate_process_group(job.pid, signal.SIGKILL)
+                terminated = self._terminate_process_group(
+                    job.pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+                )
+                windows_termination_confirmed |= sys.platform == "win32" and bool(terminated)
 
         with self._lock:
             current = self.get_job(job_id)
-            if current.status == "failed" and _return_code_indicates_cancel(
-                current.return_code
+            if current.status == "failed" and (
+                _return_code_indicates_cancel(current.return_code)
+                or (
+                    windows_termination_confirmed
+                    and job.runner_identity.get("cancel_requested") is True
+                    and current.pid == job.pid
+                    and current.return_code == signal.SIGTERM
+                )
             ):
                 timestamp = _now()
                 self._update_job(
@@ -2823,8 +2845,13 @@ class QuantJobService:
                 allowed_names=spec.get("env_names", ()),
                 allowed_prefixes=spec.get("env_prefixes", ()),
             )
+            runner_python = sys.executable
+            if sys.platform == "win32":
+                runner_python = sys._base_executable
+                if os.path.normcase(sys.executable) != os.path.normcase(runner_python):
+                    env["__PYVENV_LAUNCHER__"] = sys.executable
             process = subprocess.Popen(
-                [str(Path(sys.executable)), "-c", _DURABLE_RUNNER_CODE],
+                [str(Path(runner_python)), "-c", _DURABLE_RUNNER_CODE],
                 cwd=job.cwd or None,
                 env=env,
                 stdout=handle,
@@ -2961,6 +2988,19 @@ class QuantJobService:
     def _process_runtime_identity(pid: Optional[int]) -> Optional[Dict[str, str]]:
         if not pid:
             return None
+        if sys.platform == "win32":
+            try:
+                process = psutil.Process(pid)
+                process_start = process.create_time()
+                process_command = process.cmdline()
+                if not process_command or not process.is_running():
+                    return None
+            except (psutil.Error, OSError, ValueError):
+                return None
+            return {
+                "process_start": f"win32:{pid}:{process_start:.6f}",
+                "process_command_sha256": _command_sha256(process_command),
+            }
         try:
             completed = subprocess.run(
                 ["ps", "-ww", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
@@ -3082,17 +3122,19 @@ class QuantJobService:
 
     def _stop_unconfirmed_runner(self, process: subprocess.Popen[bytes]) -> None:
         process_pid = getattr(process, "pid", None)
+        self._terminate_process_group(process_pid, signal.SIGTERM)
         try:
             process.terminate()
         except (AttributeError, OSError):
             pass
-        self._terminate_process_group(process_pid, signal.SIGTERM)
         try:
             process.wait(timeout=JOB_TERMINATE_TIMEOUT_SECONDS)
             return
         except (AttributeError, OSError, subprocess.TimeoutExpired, TypeError):
             pass
-        self._terminate_process_group(process_pid, signal.SIGKILL)
+        self._terminate_process_group(
+            process_pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+        )
         try:
             process.kill()
         except (AttributeError, OSError):
@@ -3216,22 +3258,54 @@ class QuantJobService:
     def _pid_is_alive(self, pid: Optional[int]) -> bool:
         if not pid:
             return False
+        if sys.platform == "win32":
+            try:
+                process = psutil.Process(pid)
+                process.create_time()
+                return process.is_running()
+            except (psutil.Error, OSError, ValueError):
+                return False
         try:
             os.kill(pid, 0)
             return True
         except OSError:
             return False
 
-    def _terminate_process_group(self, pid: Optional[int], sig: int) -> None:
+    def _terminate_process_group(self, pid: Optional[int], sig: int) -> bool:
         if not pid:
-            return
+            return False
+        if sys.platform == "win32":
+            try:
+                process = psutil.Process(pid)
+                children = process.children(recursive=True)
+            except (psutil.Error, OSError, ValueError):
+                return False
+            # Windows has no POSIX process group. Keep the runner alive until
+            # its descendants are identified, then stop the owned process tree.
+            root_termination_sent = False
+            for owned_process in [*reversed(children), process]:
+                try:
+                    owned_process.terminate()
+                    if owned_process is process:
+                        root_termination_sent = True
+                except (psutil.Error, OSError):
+                    pass
+            try:
+                return (
+                    root_termination_sent
+                    and process.wait(timeout=JOB_TERMINATE_TIMEOUT_SECONDS) == signal.SIGTERM
+                )
+            except (psutil.Error, OSError):
+                return False
         try:
             os.killpg(os.getpgid(pid), sig)
+            return True
         except OSError:
             try:
                 os.kill(pid, sig)
+                return True
             except OSError:
-                pass
+                return False
 
     def _complete_job_from_return_code(
         self,
@@ -3664,12 +3738,17 @@ class QuantJobService:
                 conn.execute(f"UPDATE jobs SET {assignments} WHERE job_id = ?", values)
                 conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _fetch_one(self, query: str, params: tuple[Any, ...]) -> Optional[sqlite3.Row]:
         with self._connect() as conn:

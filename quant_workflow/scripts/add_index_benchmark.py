@@ -211,7 +211,9 @@ def _fsync_tree(root: Path) -> None:
             continue
         if not path.is_file():
             raise RuntimeError("benchmark feature tree contains a non-regular file")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+        flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
         try:
             os.fsync(descriptor)
         finally:

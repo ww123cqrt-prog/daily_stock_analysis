@@ -31,7 +31,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(os.environ.get("ENV_FILE"))
 
 # 添加项目根目录到 Python 路径，解决模块导入问题
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

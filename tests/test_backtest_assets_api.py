@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -33,7 +34,7 @@ def _report() -> dict:
         "strategy": {
             "strategy_id": "python_script",
             "name": "DSA Python strategy",
-            "script_sha256": "sha-of-report",
+            "script_sha256": hashlib.sha256(VALID_SCRIPT.encode("utf-8")).hexdigest(),
         },
         "data_quality": {
             "dataset_id": "cn_etf_daily",
@@ -141,6 +142,41 @@ class TestStrategyAssetEndpoints:
         assert updated.status_code == 200
         assert updated.json()["name"] == "A2"
         assert updated.json()["script"] == VALID_SCRIPT
+
+    def test_archive_and_restore_keeps_detail_and_run_link(self, client, repo):
+        created = client.post(
+            "/api/v1/backtest/strategies", json={"name": "Historical", "script": VALID_SCRIPT}
+        ).json()
+        run = repo.create_run(
+            strategy_id=created["id"], strategy_name=created["name"],
+            script_sha256=created["script_sha256"], script=VALID_SCRIPT,
+            symbols=["SZ159915"], params={}, data_quality={}, metrics={},
+            report={"status": "completed"},
+        )
+
+        archived = client.patch(
+            f"/api/v1/backtest/strategies/{created['id']}", json={"archived": True}
+        )
+        assert archived.status_code == 200
+        assert archived.json()["archived"] is True
+        assert client.get("/api/v1/backtest/strategies").json() == []
+        history = client.get("/api/v1/backtest/strategies", params={"archived": True}).json()
+        assert [item["id"] for item in history] == [created["id"]]
+        assert "script" not in history[0]
+        detail = client.get(f"/api/v1/backtest/strategies/{created['id']}").json()
+        assert detail["script"] == VALID_SCRIPT
+        assert detail["script_sha256"] == created["script_sha256"]
+        saved_run = client.get(f"/api/v1/backtest/runs/{run['id']}").json()
+        assert saved_run["strategy_id"] == created["id"]
+        assert saved_run["script"] == VALID_SCRIPT
+
+        restored = client.patch(
+            f"/api/v1/backtest/strategies/{created['id']}", json={"archived": False}
+        )
+        assert restored.status_code == 200
+        assert restored.json()["archived"] is False
+        assert len(client.get("/api/v1/backtest/strategies").json()) == 1
+        assert client.get("/api/v1/backtest/strategies", params={"archived": True}).json() == []
 
     def test_update_rejects_invalid_script(self, client):
         created = client.post(

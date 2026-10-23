@@ -26,6 +26,8 @@ import time
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
+import psutil
+
 from src.llm.backend_registry import (
     CLAUDE_CODE_CLI_BACKEND_ID,
     CODEX_CLI_BACKEND_ID,
@@ -2780,29 +2782,52 @@ class LocalCliGenerationBackend(GenerationBackend):
         if process.poll() is not None:
             return
         if os.name == "nt":
-            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-            if ctrl_break is not None:
-                try:
-                    process.send_signal(ctrl_break)
-                    process.wait(timeout=2)
-                    return
-                except Exception:
-                    pass
+            # Capture identities before the leader exits and its children are
+            # reparented. psutil checks these identities again before signalling.
             try:
-                process.terminate()
-            except Exception:
-                return
+                descendants = psutil.Process(process.pid).children(recursive=True)
+            except psutil.NoSuchProcess:
+                descendants = []
             try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+                ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                if ctrl_break is not None:
+                    try:
+                        process.send_signal(ctrl_break)
+                        process.wait(timeout=2)
+                        return
+                    except Exception:
+                        pass
                 try:
-                    process.kill()
+                    process.terminate()
                 except Exception:
                     return
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    return
+                    try:
+                        process.kill()
+                    except Exception:
+                        return
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        return
+            finally:
+                for child in reversed(descendants):
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                if descendants:
+                    _, alive = psutil.wait_procs(descendants, timeout=2)
+                    for child in alive:
+                        try:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                    _, alive = psutil.wait_procs(alive, timeout=2)
+                    if alive:
+                        raise subprocess.TimeoutExpired("local CLI descendant cleanup", 4)
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)

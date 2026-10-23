@@ -753,7 +753,10 @@ describe('DecisionSignalsPage', () => {
     expect(screen.queryByText(/已保存为新的 DecisionSignal #89/)).not.toBeInTheDocument();
   });
 
-  it('reports an expired signal refresh separately and refreshes active views', async () => {
+  it.each([
+    { daysAgo: 1, inTimeline: true },
+    { daysAgo: 91, inTimeline: false },
+  ])('reports an expired signal refresh separately and refreshes active views ($daysAgo days old)', async ({ daysAgo, inTimeline }) => {
     const refreshedItem = makeSignal({
       id: 90,
       decisionProfile: 'balanced',
@@ -761,6 +764,7 @@ describe('DecisionSignalsPage', () => {
       triggerSource: 'api',
       action: 'buy',
       status: 'active',
+      createdAt: new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString(),
       metadata: {
         decision_profile: 'balanced',
         profile_source: 'user_selected',
@@ -794,8 +798,15 @@ describe('DecisionSignalsPage', () => {
 
     expect(await screen.findByText('重评估信号已刷新')).toBeInTheDocument();
     expect(screen.getByText(/DecisionSignal #90 已按存储契约完成过期续期或缺失维度补齐/)).toBeInTheDocument();
-    expect(await screen.findByTestId('timeline-click-90')).toBeInTheDocument();
+    if (inTimeline) {
+      expect(await screen.findByTestId('timeline-click-90')).toBeInTheDocument();
+    } else {
+      expect(screen.queryByTestId('timeline-click-90')).not.toBeInTheDocument();
+    }
     await waitFor(() => expect(decisionSignalsApi.getLatest).toHaveBeenCalledTimes(2));
+    expect(
+      vi.mocked(decisionSignalsApi.list).mock.calls.filter(([params]) => params?.pageSize === 100),
+    ).toHaveLength(inTimeline ? 2 : 1);
   });
 
   it('keeps a terminal existing item terminal and does not inject it into active views', async () => {

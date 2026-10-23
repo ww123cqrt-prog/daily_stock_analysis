@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 try:
@@ -92,7 +92,8 @@ def normalize_provider_lineage(identity: Mapping[str, Any]) -> dict[str, str]:
         descriptor_path = Path(normalized["descriptor_path"])
         index_snapshot_id = normalized["index_snapshot_id"]
         if (
-            descriptor_path.is_absolute()
+            PurePosixPath(normalized["descriptor_path"]).anchor
+            or PureWindowsPath(normalized["descriptor_path"]).anchor
             or ".." in descriptor_path.parts
             or descriptor_path.name != "PROVIDER_DESCRIPTOR.json"
             or Path(index_snapshot_id).name != index_snapshot_id

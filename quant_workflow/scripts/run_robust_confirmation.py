@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import fcntl
 import json
 import os
 import sys
@@ -20,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import provider_calendar_days, quant_data_root, reports_root  # noqa: E402
 from _robust_membership_integrity import (  # noqa: E402
     MembershipIntegrityError,
@@ -93,12 +93,12 @@ def _provider_calendar(provider_uri: Path) -> pd.DatetimeIndex:
 def _claim_lock(directory: Path):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / ".confirmation.lock"
-    with path.open("a+") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    with path.open("a+b") as stream:
+        lock_file(stream, exclusive=True)
         try:
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock_file(stream)
 
 
 def build_confirmation_jobs(

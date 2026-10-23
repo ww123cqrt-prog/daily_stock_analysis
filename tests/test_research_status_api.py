@@ -47,11 +47,12 @@ def write_quality_evidence(
     markdown: str = "# Quality\n\n- Stock universe: 5509\n",
     timestamp: str = "20260731_110000",
 ) -> tuple[str, str]:
-    markdown_sha256 = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    markdown_bytes = markdown.encode("utf-8")
+    markdown_sha256 = hashlib.sha256(markdown_bytes).hexdigest()
     markdown_artifact = reports_dir / (
         f"data_quality_report_{timestamp}_{markdown_sha256[:16]}.md"
     )
-    markdown_artifact.write_text(markdown, encoding="utf-8")
+    markdown_artifact.write_bytes(markdown_bytes)
     evidence = {
         "schema_version": 3,
         "evidence_contract": "immutable_data_quality_evidence_v2",
@@ -2109,6 +2110,8 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             static_dir = Path(temp_dir) / "static"
             static_dir.mkdir()
+            app_path = Path(temp_dir) / "同花顺.app"
+            app_path.mkdir()
             status_path = Path(temp_dir) / "research_status_latest.json"
             log_path = Path(temp_dir) / "experiment_log.md"
             runs_path = Path(temp_dir) / "experiment_runs.jsonl"
@@ -2338,7 +2341,12 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                     return_value={},
                 ),
                 patch.dict(
-                    os.environ, {"MLFLOW_URL": "http://127.0.0.1:6106/"}, clear=False
+                    os.environ,
+                    {
+                        "MLFLOW_URL": "http://127.0.0.1:6106/",
+                        "TONGHUASHUN_APP_PATH": str(app_path),
+                    },
+                    clear=False,
                 ),
             ):
                 client = TestClient(
@@ -2388,11 +2396,11 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         )
         self.assertEqual(
             body["data_hygiene"]["cleanup_plan"]["actions"][0]["source"],
-            "WorkingProjects/quant_data/qlib/cn_data",
+            str(Path("WorkingProjects") / "quant_data" / "qlib" / "cn_data"),
         )
         self.assertEqual(
             body["data_hygiene"]["cleanup_plan"]["actions"][0]["destination"],
-            "WorkingProjects/quant_data/archive/qlib/cn_data",
+            str(Path("WorkingProjects") / "quant_data" / "archive" / "qlib" / "cn_data"),
         )
         self.assertEqual(
             body["data_hygiene"]["cleanup_plan"]["actions"][1]["source"], ""
@@ -2449,6 +2457,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
         self.assertEqual(
             matrix_by_id["external_tools_tonghuashun"]["status"], "read_only"
         )
+        self.assertEqual(body["external_tools"]["tonghuashun"]["path"], str(app_path))
         self.assertEqual(matrix_by_id["trading_execution"]["status"], "not_planned")
         self.assertIn("不自动下单", matrix_by_id["trading_execution"]["restrictions"])
         self.assertIn(
@@ -3485,6 +3494,39 @@ class ResearchStatusApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["inventory"]["status"], "stale")
         self.assertEqual(payload["inventory"]["official_entries"], 0)
+
+    def test_windows_data_hygiene_rechecks_bytes_when_metadata_is_unchanged(
+        self,
+    ) -> None:
+        from api.v1.endpoints import research_status
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_dir, data_root, provider = self._write_native_hygiene_inventory(
+                Path(temp_dir)
+            )
+            frozen_state = filesystem_state_fingerprint(provider)
+            with (
+                patch.object(research_status, "QUANT_DATA_ROOT", data_root),
+                patch.object(research_status.sys, "platform", "win32"),
+                patch.object(
+                    research_status,
+                    "_filesystem_state_fingerprint_live",
+                    return_value=frozen_state,
+                ),
+            ):
+                initial = research_status._data_hygiene_payload(reports_dir)
+                self.assertEqual(initial["inventory"]["status"], "available")
+                self.assertEqual(initial["inventory"]["official_entries"], 1)
+
+                feature = provider / "features" / "sh600000" / "close.day.bin"
+                before = feature.stat()
+                content = feature.read_bytes()
+                feature.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+                os.utime(feature, ns=(before.st_atime_ns, before.st_mtime_ns))
+                changed = research_status._data_hygiene_payload(reports_dir)
+
+        self.assertEqual(changed["inventory"]["status"], "stale")
+        self.assertEqual(changed["inventory"]["official_entries"], 0)
 
     def test_data_hygiene_rechecks_snapshot_on_every_status_read(self) -> None:
         from api.v1.endpoints.research_status import _data_hygiene_payload

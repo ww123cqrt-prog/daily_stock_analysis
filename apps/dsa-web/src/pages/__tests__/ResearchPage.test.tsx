@@ -5,11 +5,13 @@ import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
 import ResearchPage from '../ResearchPage';
 
-const { runScriptStrategy, listBacktestRuns, listStrategyAssets, saveStrategyAsset } = vi.hoisted(() => ({
+const { runScriptStrategy, listBacktestRuns, listStrategyAssets, saveStrategyAsset, getStrategyAsset, updateStrategyAsset } = vi.hoisted(() => ({
   runScriptStrategy: vi.fn(),
   listBacktestRuns: vi.fn().mockResolvedValue([]),
   listStrategyAssets: vi.fn().mockResolvedValue([]),
   saveStrategyAsset: vi.fn(),
+  getStrategyAsset: vi.fn(),
+  updateStrategyAsset: vi.fn(),
 }));
 
 vi.mock('../../api/backtest', () => ({
@@ -18,6 +20,8 @@ vi.mock('../../api/backtest', () => ({
     listBacktestRuns,
     listStrategyAssets,
     saveStrategyAsset,
+    getStrategyAsset,
+    updateStrategyAsset,
   },
 }));
 
@@ -145,6 +149,8 @@ describe('ResearchPage', () => {
     renderPage();
 
     const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
+    await waitFor(() => expect(select).toBeEnabled());
+    fireEvent.click(screen.getByRole('tab', { name: '脚本模板' }));
     const presetOptions = Array.from(select.querySelectorAll('optgroup[label="预置"] option')).map(
       option => (option as HTMLOptionElement).textContent,
     );
@@ -202,6 +208,9 @@ describe('ResearchPage', () => {
     renderPage();
 
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: '动量选股' } });
+    fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: '2020-01-01' } });
+    fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: '2020-06-30' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存脚本' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: '保存脚本' }));
 
     await waitFor(() => expect(saveStrategyAsset).toHaveBeenCalledWith({
@@ -209,5 +218,78 @@ describe('ResearchPage', () => {
       script: expect.stringContaining('rank_by_return'),
     }));
     await waitFor(() => expect(listStrategyAssets).toHaveBeenCalled());
+  });
+
+  function mockLibrary() {
+    const assets = [
+      { id: 'main', name: 'TQM-20 V1.6', archived: false, script: 'def on_bar(c, d):\n    c.target_cash()' },
+      { id: 'old', name: '3ETF 历史版本', archived: true, script: 'def on_bar(c, d):\n    c.target_equal([])' },
+    ];
+    listStrategyAssets.mockImplementation(async (params?: { archived?: boolean }) => (
+      assets.filter(item => item.archived === (params?.archived ?? false))
+    ));
+    getStrategyAsset.mockImplementation(async (id: string) => assets.find(item => item.id === id));
+    updateStrategyAsset.mockImplementation(async (id: string, patch: { archived: boolean }) => {
+      const asset = assets.find(item => item.id === id)!;
+      asset.archived = patch.archived;
+      return asset;
+    });
+  }
+
+  it('defaults to main strategies and loads archived scripts in a separate view', async () => {
+    mockLibrary();
+    renderPage();
+
+    const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
+    await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));
+    expect(select).not.toHaveTextContent('3ETF 历史版本');
+    expect(select.querySelector('optgroup[label="预置"]')).toBeNull();
+
+    fireEvent.click(screen.getByRole('tab', { name: '历史归档' }));
+    expect(select).toHaveTextContent('3ETF 历史版本');
+    expect(select).not.toHaveTextContent('TQM-20 V1.6');
+    fireEvent.change(select, { target: { value: 'old' } });
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('3ETF 历史版本'));
+    expect((screen.getByLabelText('Python交易策略脚本') as HTMLTextAreaElement).value).toContain('target_equal');
+
+    fireEvent.click(screen.getByRole('tab', { name: '主策略' }));
+    expect(select.value).toBe('');
+    expect(screen.getByLabelText('名称')).toHaveValue('');
+  });
+
+  it('archives a selected main strategy without deleting it', async () => {
+    mockLibrary();
+    renderPage();
+
+    const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
+    await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));
+    fireEvent.change(select, { target: { value: 'main' } });
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('TQM-20 V1.6'));
+    fireEvent.click(screen.getByRole('button', { name: '归档策略' }));
+
+    await waitFor(() => expect(updateStrategyAsset).toHaveBeenCalledWith('main', { archived: true }));
+    await waitFor(() => expect(select).not.toHaveTextContent('TQM-20 V1.6'));
+    await waitFor(() => expect(screen.getByRole('tab', { name: '历史归档' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('tab', { name: '历史归档' }));
+    expect(select).toHaveTextContent('TQM-20 V1.6');
+    expect(screen.queryByRole('button', { name: '删除脚本' })).not.toBeInTheDocument();
+  });
+
+  it('restores an archived strategy to the main list', async () => {
+    mockLibrary();
+    renderPage();
+
+    const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
+    await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));
+    fireEvent.click(screen.getByRole('tab', { name: '历史归档' }));
+    fireEvent.change(select, { target: { value: 'old' } });
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('3ETF 历史版本'));
+    fireEvent.click(screen.getByRole('button', { name: '恢复到主列表' }));
+
+    await waitFor(() => expect(updateStrategyAsset).toHaveBeenCalledWith('old', { archived: false }));
+    await waitFor(() => expect(select).not.toHaveTextContent('3ETF 历史版本'));
+    await waitFor(() => expect(screen.getByRole('tab', { name: '主策略' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('tab', { name: '主策略' }));
+    expect(select).toHaveTextContent('3ETF 历史版本');
   });
 });

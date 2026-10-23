@@ -2,6 +2,7 @@
 """Regression tests for quant_data lineage in strategy backtest reports."""
 
 from datetime import date
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -81,12 +82,55 @@ def test_form_strategy_report_preserves_complete_quant_data_identity(price_data)
     _assert_complete_identity(report)
 
 
-def test_script_strategy_report_preserves_complete_quant_data_identity() -> None:
+def test_form_strategy_report_preserves_production_v2_release_identity(price_data) -> None:
+    service = BacktestService.__new__(BacktestService)
+    native = replace(
+        price_data, snapshot_id=None, manifest_sha256=None, content_sha256=None,
+        latest_trade_date=None, data_kind="daily_bars",
+        dataset_set_version="production.v2", generation=10,
+        release_set_sha256="b" * 64,
+        module_identities={"cn_etf_daily": {"module_release_sha256": "c" * 64}},
+    )
+    with patch("src.services.backtest_service.QuantPriceRepository") as repository_cls, patch(
+        "src.services.backtest_service.run_portfolio_backtest",
+        return_value={"status": "completed"},
+    ):
+        repository_cls.return_value.load.return_value = native
+        report = service.run_strategy(
+            strategy_id="buy_and_hold", symbols=["159915"],
+            start_date=date(2026, 8, 6), end_date=date(2026, 8, 7),
+        )
+        repository_cls.return_value.load.assert_called_once_with(
+            ["159915"], start_date=date(2026, 8, 6), end_date=date(2026, 8, 7),
+        )
+    quality = report["data_quality"]
+    assert quality["dataset_set_version"] == "production.v2"
+    assert quality["release_set_sha256"] == "b" * 64
+    assert quality["module_identities"]["cn_etf_daily"]["module_release_sha256"] == "c" * 64
+    assert quality["snapshot_id"] is None
+
+
+def test_script_strategy_report_preserves_production_v2_release_identity() -> None:
     service = BacktestService.__new__(BacktestService)
 
     from src.core.strategy_backtest import TargetAllocation
 
     with patch(
+        "src.services.backtest_service.load_market_view",
+        return_value=(
+            object(),
+            {
+                "bundle_dir": "/tmp/test-universe", "dataset_id": "cn_etf_daily",
+                "dataset_set_version": "production.v2", "generation": 10,
+                "release_set_sha256": "b" * 64,
+                "release": {"generation": 10, "release_set_sha256": "b" * 64,
+                            "pointer_sha256": "a" * 64},
+                "datasets": {"cn_etf_daily": {"module_release_sha256": "c" * 64}},
+            },
+        ),
+    ), patch(
+        "src.services.backtest_service.load_benchmark_series", return_value={},
+    ), patch(
         "src.services.backtest_service.run_script_in_sandbox",
         return_value=(
             [
@@ -108,15 +152,14 @@ def test_script_strategy_report_preserves_complete_quant_data_identity() -> None
             script="def on_bar(context, data):\n    pass",
             symbols=["159915"],
             pool="etf",
+            start_date=date(2026, 8, 6), end_date=date(2026, 8, 7),
         )
 
-    # The script-strategy report carries the complete quant_data snapshot
-    # identity used to assemble the universe pool (dataset/snapshot/manifest
-    # hash/content hash).
     quality = report["data_quality"]
     assert quality["dataset_id"] == "cn_etf_daily"
-    assert quality["snapshot_id"]
-    assert len(quality["manifest_sha256"]) == 64
-    assert len(quality["content_sha256"]) == 64
+    assert quality["dataset_set_version"] == "production.v2"
+    assert quality["release_set_sha256"] == "b" * 64
+    assert quality["datasets"]["cn_etf_daily"]["module_release_sha256"] == "c" * 64
+    assert quality["snapshot_id"] is None
     assert quality["pool"] == "etf"
     assert quality["price_basis"] == "qfq"

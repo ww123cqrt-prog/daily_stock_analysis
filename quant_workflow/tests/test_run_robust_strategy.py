@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import fcntl
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
 import importlib.util
 import json
 from pathlib import Path
@@ -2126,8 +2126,8 @@ def test_run_rejects_concurrent_owner_of_same_run_id(tmp_path: Path) -> None:
     report_dir = tmp_path / "reports" / "robust_strategy"
     lock_path = report_dir / "runs" / ".locks" / "same-run.lock"
     lock_path.parent.mkdir(parents=True)
-    with lock_path.open("a+", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with lock_path.open("a+b") as stream:
+        lock_file(stream, exclusive=True, blocking=False)
         with pytest.raises(ValueError, match="already running"):
             module.run_pipeline(
                 CONFIG_PATH,
@@ -2406,9 +2406,9 @@ def test_run_lock_is_held_during_stage_and_released_after_exception(
     observed_locked = []
 
     def runner(stage):
-        with lock_path.open("a+", encoding="utf-8") as stream:
+        with lock_path.open("a+b") as stream:
             with pytest.raises(BlockingIOError):
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(stream, exclusive=True, blocking=False)
             observed_locked.append(True)
         raise RuntimeError("stop after lock check")
 
@@ -2424,9 +2424,9 @@ def test_run_lock_is_held_during_stage_and_released_after_exception(
         )
 
     assert observed_locked == [True]
-    with lock_path.open("a+", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    with lock_path.open("a+b") as stream:
+        lock_file(stream, exclusive=True, blocking=False)
+        unlock_file(stream)
 
 
 def test_final_identity_guard_does_not_swallow_body_integrity_error(

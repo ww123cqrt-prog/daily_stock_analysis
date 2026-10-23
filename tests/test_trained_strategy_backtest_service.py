@@ -400,7 +400,20 @@ def test_catalog_keeps_multiple_historical_runs_and_sanitizes_paths(
     assert "provider_uri" not in serialized
 
 
-def test_catalog_rejects_invalid_qlib_provider_lineage(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "descriptor_path",
+    [
+        "/private/PROVIDER_DESCRIPTOR.json",
+        "C:/private/PROVIDER_DESCRIPTOR.json",
+        "C:private/PROVIDER_DESCRIPTOR.json",
+        "\\private\\PROVIDER_DESCRIPTOR.json",
+        "\\\\server\\share\\PROVIDER_DESCRIPTOR.json",
+    ],
+)
+def test_catalog_rejects_invalid_qlib_provider_lineage(
+    tmp_path: Path,
+    descriptor_path: str,
+) -> None:
     reports_root, mlruns_root, config_path, market = _write_fixture(tmp_path)
     latest_path = reports_root / "latest_training_result.json"
     report = json.loads(latest_path.read_text(encoding="utf-8"))
@@ -410,7 +423,7 @@ def test_catalog_rejects_invalid_qlib_provider_lineage(tmp_path: Path) -> None:
         "snapshot_id": "ashare-qfq-001",
         "content_sha256": "a" * 64,
         "manifest_sha256": "b" * 64,
-        "descriptor_path": "/private/PROVIDER_DESCRIPTOR.json",
+        "descriptor_path": descriptor_path,
         "descriptor_sha256": "c" * 64,
         "cleaning_mode": "canonical",
         "index_dataset_id": "cn_index_daily",

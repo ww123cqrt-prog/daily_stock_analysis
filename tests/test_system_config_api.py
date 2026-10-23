@@ -318,6 +318,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="")
 
         with (
+            patch("src.services.agent_backend_status_service.is_native_windows", return_value=False),
             patch(
                 "src.services.agent_backend_status_service.resolve_command",
                 return_value=["/test/codex"],

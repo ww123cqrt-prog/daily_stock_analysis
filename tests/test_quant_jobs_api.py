@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,12 +15,14 @@ import time
 import unittest
 import asyncio
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+import psutil
 
 from api.app import create_app
 from quant_workflow.scripts.robust_signal_data_contract import RobustSignalDataBlocked
@@ -124,7 +127,177 @@ class QuantJobsApiTestCase(unittest.TestCase):
     ) -> None:
         self.assertIn(flag, command)
         reports_dir = command[command.index(flag) + 1]
-        self.assertTrue(reports_dir.endswith("quant_workflow/reports"), reports_dir)
+        self.assertEqual(
+            Path(reports_dir).parts[-2:], ("quant_workflow", "reports"), reports_dir
+        )
+
+    def test_store_closes_connections_after_reads_writes_and_rollback(self) -> None:
+        connections = []
+        real_connect = sqlite3.connect
+
+        def track_connection(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                with patch(
+                    "src.services.quant_job_service.sqlite3.connect",
+                    side_effect=track_connection,
+                ):
+                    service = QuantJobService(jobs_root=Path(temp_dir) / "jobs", command_specs={})
+                    job = QuantJob(
+                        job_id="qj_connection_lifetime",
+                        job_type="synthetic",
+                        label="synthetic",
+                        status="pending",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        created_at="2026-08-03T10:00:00+08:00",
+                        updated_at="2026-08-03T10:00:00+08:00",
+                        log_path=str(Path(temp_dir) / "jobs/job.log"),
+                    )
+                    service._insert_job(job)
+                    service._update_job(job.job_id, status="completed", return_code=0)
+                    self.assertEqual(service.get_job(job.job_id).status, "completed")
+                    self.assertEqual([item.job_id for item in service.list_jobs()], [job.job_id])
+                    with self.assertRaisesRegex(RuntimeError, "rollback probe"):
+                        with service._connect() as connection:
+                            connection.execute("UPDATE jobs SET status = 'failed'")
+                            raise RuntimeError("rollback probe")
+                    self.assertEqual(service.get_job(job.job_id).status, "completed")
+
+                self.assertTrue(connections)
+                for connection in connections:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute("SELECT 1")
+        finally:
+            for connection in connections:
+                connection.close()
+
+    def test_windows_process_probes_are_read_only_and_bind_runtime_identity(self) -> None:
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        expected_command_hash = hashlib.sha256(
+            json.dumps(process.cmdline(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        service = object.__new__(QuantJobService)
+        with (
+            patch("src.services.quant_job_service.sys.platform", "win32"),
+            patch(
+                "src.services.quant_job_service.os.kill",
+                side_effect=AssertionError("a process probe must not send a signal"),
+            ),
+            patch(
+                "src.services.quant_job_service.subprocess.run",
+                side_effect=AssertionError("Windows identity must not invoke POSIX ps"),
+            ),
+        ):
+            self.assertTrue(service._pid_is_alive(pid))
+            identity = service._process_runtime_identity(pid)
+
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity["process_start"], f"win32:{pid}:{process.create_time():.6f}")
+        self.assertEqual(identity["process_command_sha256"], expected_command_hash)
+
+    def test_windows_process_probes_reject_unreadable_runtime_identity(self) -> None:
+        service = object.__new__(QuantJobService)
+        with (
+            patch("src.services.quant_job_service.sys.platform", "win32"),
+            patch("psutil.Process", side_effect=psutil.AccessDenied(os.getpid())),
+            patch(
+                "src.services.quant_job_service.os.kill",
+                side_effect=AssertionError("a process probe must not send a signal"),
+            ),
+            patch(
+                "src.services.quant_job_service.subprocess.run",
+                side_effect=AssertionError("Windows identity must not invoke POSIX ps"),
+            ),
+        ):
+            self.assertIsNone(service._process_runtime_identity(os.getpid()))
+            self.assertFalse(service._pid_is_alive(os.getpid()))
+
+    def test_native_runner_confirms_identity_and_cancels_its_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "command.json"
+            service = QuantJobService(
+                jobs_root=Path(temp_dir) / "jobs",
+                default_cwd=Path(temp_dir),
+                command_specs={
+                    "synthetic": {
+                        "label": "synthetic",
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            "import json,os,sys,time; from pathlib import Path; "
+                            f"p=Path({str(marker)!r}); t=p.with_suffix('.tmp'); "
+                            "t.write_text(json.dumps({'pid':os.getpid(),"
+                            "'executable':sys.executable,'prefix':sys.prefix})); "
+                            "t.replace(p); "
+                            "time.sleep(30)",
+                        ],
+                    },
+                },
+            )
+            runner = None
+            child = None
+            job = None
+
+            def child_is_active() -> bool:
+                if child is None:
+                    return False
+                try:
+                    return child.is_running() and child.status() != psutil.STATUS_ZOMBIE
+                except psutil.NoSuchProcess:
+                    return False
+
+            try:
+                job = service.submit_job("synthetic")
+                self.assertEqual(job.status, "running", job.error)
+                self.assertEqual(job.runner_identity["handshake_status"], "confirmed")
+                self.assertTrue(service._runner_identity_matches(job))
+                runner = service._processes[job.job_id]
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists())
+                command_identity = json.loads(marker.read_text())
+                self.assertEqual(command_identity["executable"], sys.executable)
+                self.assertEqual(command_identity["prefix"], sys.prefix)
+                child = psutil.Process(command_identity["pid"])
+                self.assertIn(runner.pid, [parent.pid for parent in child.parents()])
+
+                cancelled = service.cancel_job(job.job_id)
+                self.assertEqual(cancelled.status, "cancelled")
+                runner.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                while job.job_id in service._processes and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertNotIn(job.job_id, service._processes)
+                deadline = time.monotonic() + 5
+                while child_is_active() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(
+                    child_is_active(),
+                    "the actual command child must stop with its durable runner",
+                )
+                self.assertIsNotNone(service.get_job(job.job_id).return_code)
+            finally:
+                if child is not None and child.is_running():
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                if runner is not None and runner.poll() is None:
+                    runner.kill()
+                    runner.wait(timeout=5)
+                if job is not None:
+                    deadline = time.monotonic() + 5
+                    while job.job_id in service._processes and time.monotonic() < deadline:
+                        time.sleep(0.02)
 
     def test_sanitize_job_error_redacts_absolute_paths(self) -> None:
         from api.v1.endpoints.quant_jobs import _sanitize_job_error
@@ -378,25 +551,25 @@ class QuantJobsApiTestCase(unittest.TestCase):
             real_connect = reader_service._connect
             select_count = 0
 
+            @contextmanager
             def connect_with_interleaved_writer():
-                connection = real_connect()
+                with real_connect() as connection:
+                    def trace(statement: str) -> None:
+                        nonlocal select_count
+                        if not statement.lstrip().upper().startswith("SELECT"):
+                            return
+                        select_count += 1
+                        if select_count == 2:
+                            writer_service._update_job(
+                                job.job_id,
+                                status="completed",
+                                return_code=0,
+                                completed_at="2026-07-30T06:00:01+08:00",
+                                updated_at="2026-07-30T06:00:01+08:00",
+                            )
 
-                def trace(statement: str) -> None:
-                    nonlocal select_count
-                    if not statement.lstrip().upper().startswith("SELECT"):
-                        return
-                    select_count += 1
-                    if select_count == 2:
-                        writer_service._update_job(
-                            job.job_id,
-                            status="completed",
-                            return_code=0,
-                            completed_at="2026-07-30T06:00:01+08:00",
-                            updated_at="2026-07-30T06:00:01+08:00",
-                        )
-
-                connection.set_trace_callback(trace)
-                return connection
+                    connection.set_trace_callback(trace)
+                    yield connection
 
             with patch.object(
                 reader_service,
@@ -3464,7 +3637,12 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(len(runner_calls), 1)
         self.assertEqual(recovered.status, "completed")
         args, kwargs = runner_calls[0]
-        self.assertEqual(args[0][0], sys.executable)
+        expected_runner_python = (
+            sys._base_executable if sys.platform == "win32" else sys.executable
+        )
+        self.assertEqual(args[0][0], expected_runner_python)
+        if sys.platform == "win32" and os.path.normcase(sys.executable) != os.path.normcase(sys._base_executable):
+            self.assertEqual(kwargs["env"]["__PYVENV_LAUNCHER__"], sys.executable)
         self.assertEqual(args[0][1], "-c")
         self.assertTrue(kwargs["start_new_session"])
         self.assertIn("QUANT_JOB_COMMAND_JSON", kwargs["env"])
@@ -3957,7 +4135,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
             service._processes[job.job_id] = FinishedDuringCancelProcess()  # type: ignore[assignment]
 
-            returned = service.cancel_job(job.job_id)
+            with patch.object(service, "_terminate_process_group"):
+                returned = service.cancel_job(job.job_id)
             recovered = service.get_job(job.job_id)
 
         self.assertEqual(returned.status, "completed")
@@ -4045,6 +4224,85 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(recovered.status, "cancelled")
         self.assertEqual(recovered.return_code, -signal.SIGTERM)
         self.assertEqual(recovered.error, "Cancelled by user from the web UI.")
+
+    def test_windows_child_termination_does_not_confirm_root_exit(self) -> None:
+        service = object.__new__(QuantJobService)
+        root = Mock()
+        child = Mock()
+        root.children.return_value = [child]
+        root.terminate.side_effect = psutil.AccessDenied(12345)
+        root.wait.return_value = 15
+        with (
+            patch("src.services.quant_job_service.sys.platform", "win32"),
+            patch("psutil.Process", return_value=root),
+        ):
+            confirmed = service._terminate_process_group(12345, signal.SIGTERM)
+        child.terminate.assert_called_once_with()
+        root.terminate.assert_called_once_with()
+        self.assertFalse(confirmed)
+
+    def test_windows_cancel_requires_confirmed_termination_for_positive_exit(self) -> None:
+        for return_code, terminated, matches, expected_status in (
+            (15, True, True, "cancelled"),
+            (15, False, True, "failed"),
+            (1, False, True, "failed"),
+            (1, True, True, "failed"),
+            (15, True, False, "failed"),
+        ):
+            with self.subTest(code=return_code, terminated=terminated, matches=matches):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    service = QuantJobService(
+                        jobs_root=Path(temp_dir) / "jobs", command_specs={}
+                    )
+                    job = QuantJob(
+                        job_id="qj_windows_cancel_race",
+                        job_type="synthetic",
+                        label="synthetic",
+                        status="running",
+                        params={},
+                        command=[sys.executable],
+                        cwd=temp_dir,
+                        pid=12345,
+                        created_at="2026-08-03T10:00:00+08:00",
+                        updated_at="2026-08-03T10:00:00+08:00",
+                        log_path=str(Path(temp_dir) / "jobs/job.log"),
+                    )
+                    service._insert_job(job)
+
+                    class Process:
+                        pid = job.pid
+                        code = None
+
+                        def poll(self):
+                            return self.code
+
+                        def terminate(self):
+                            return None
+
+                    process = Process()
+                    service._processes[job.job_id] = process
+
+                    def stop_tree(_pid, _signal):
+                        process.code = return_code
+                        service._complete_job_from_return_code(
+                            job,
+                            return_code,
+                            "2026-08-03T10:00:01+08:00",
+                            runner_error="original command failure",
+                        )
+                        return terminated
+
+                    with (
+                        patch("src.services.quant_job_service.sys.platform", "win32"),
+                        patch.object(service, "_runner_identity_matches", return_value=matches),
+                        patch.object(service, "_terminate_process_group", side_effect=stop_tree),
+                        patch.object(service, "_pid_is_alive", return_value=False),
+                    ):
+                        returned = service.cancel_job(job.job_id)
+                    self.assertEqual(returned.status, expected_status)
+                    self.assertEqual(returned.return_code, return_code)
+                    if expected_status == "failed":
+                        self.assertEqual(returned.error, "original command failure")
 
     def test_cancel_job_runs_the_whitelisted_durable_runner_cancel_command(
         self,
@@ -4451,9 +4709,9 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         cancel_codes = {
             -signal.SIGTERM,
-            -signal.SIGKILL,
+            -getattr(signal, "SIGKILL", 9),
             128 + signal.SIGTERM,
-            128 + signal.SIGKILL,
+            128 + getattr(signal, "SIGKILL", 9),
         }
 
         for return_code in cancel_codes:
@@ -5666,7 +5924,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("merge_to_qlib.py", command[1])
         self.assertIn("--smoke-fixture", command)
         self.assertIn("--smoke-dir", command)
-        self.assertTrue(any("reports/smoke/merge_to_qlib" in item for item in command))
+        self.assertEqual(
+            Path(command[command.index("--smoke-dir") + 1]).parts[-3:],
+            ("reports", "smoke", "merge_to_qlib"),
+        )
         self.assertEqual(
             status["merge_to_qlib"]["allowed_params"], ["no_overwrite", "smoke"]
         )
@@ -5930,6 +6191,10 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 jobs = service.list_jobs()
             finally:
                 service.cancel_job(first.job_id)
+                deadline = time.monotonic() + 5
+                while first.job_id in service._processes and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertNotIn(first.job_id, service._processes)
 
         self.assertIn("quant_data network job is already active", str(ctx.exception))
         self.assertEqual([job.job_type for job in jobs], ["download_eastmoney"])
@@ -6516,8 +6781,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertTrue(any("candidate_pipeline_latest.json" in item for item in spec["artifact_patterns"]))
         self.assertTrue(
             any(
-                "test_runs/candidate_pipeline/candidate_pipeline_test_latest.json"
-                in item
+                Path(item).parts[-3:]
+                == ("test_runs", "candidate_pipeline", "candidate_pipeline_test_latest.json")
                 for item in spec["artifact_patterns"]
             )
         )

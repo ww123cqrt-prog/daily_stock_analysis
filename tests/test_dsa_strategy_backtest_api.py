@@ -8,6 +8,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from quant_workflow.scripts.quant_data_service_client import QuantDataClientError
 
 
 def _client() -> tuple[tempfile.TemporaryDirectory, TestClient]:
@@ -206,6 +207,23 @@ def test_run_generic_strategy_backtest_passes_strategy_and_symbols() -> None:
     assert kwargs["top_n"] == 1
 
 
+def test_form_backtest_returns_strict_coverage_conflict() -> None:
+    temp_dir, client = _client()
+    try:
+        with patch("api.v1.endpoints.backtest.BacktestService") as service_cls:
+            service_cls.return_value.run_strategy.side_effect = QuantDataClientError(
+                "strict coverage unavailable", code="stale_coverage", status_code=409,
+            )
+            response = client.post("/api/v1/backtest/strategy/run", json={
+                "strategy_id": "buy_and_hold", "symbols": ["159915"],
+                "start_date": "2026-08-20", "end_date": "2026-08-21",
+            })
+    finally:
+        temp_dir.cleanup()
+    assert response.status_code == 409
+    assert response.json()["error"] == "stale_coverage"
+
+
 def test_run_script_strategy_backtest_passes_source_and_execution_inputs() -> None:
     temp_dir, client = _client()
     try:
@@ -234,6 +252,23 @@ def test_run_script_strategy_backtest_passes_source_and_execution_inputs() -> No
     kwargs = service_cls.return_value.run_script_strategy.call_args.kwargs
     assert kwargs["symbols"] == ["159915", "513100"]
     assert "def on_bar" in kwargs["script"]
+
+
+def test_script_backtest_returns_strict_coverage_conflict() -> None:
+    temp_dir, client = _client()
+    try:
+        with patch("api.v1.endpoints.backtest.BacktestService") as service_cls:
+            service_cls.return_value.run_script_strategy.side_effect = QuantDataClientError(
+                "strict coverage unavailable", code="stale_coverage", status_code=409,
+            )
+            response = client.post("/api/v1/backtest/strategy/script", json={
+                "script": "def on_bar(context, data):\n    context.target_cash()",
+                "pool": "etf", "start_date": "2026-08-20", "end_date": "2026-08-21",
+            })
+    finally:
+        temp_dir.cleanup()
+    assert response.status_code == 409
+    assert response.json()["error"] == "stale_coverage"
 
 
 def test_run_trained_strategy_backtest_passes_the_human_selected_run_and_parameters() -> None:

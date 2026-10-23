@@ -8,6 +8,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -159,6 +161,7 @@ esac
     codesign_tool.chmod(0o755)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="macOS signature audit mocks require POSIX shell tools")
 def test_macos_signature_audit_normalizes_invalid_signatures(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     _write_fake_macos_signature_tools(fake_bin)
@@ -192,6 +195,7 @@ def test_macos_signature_audit_normalizes_invalid_signatures(tmp_path: Path) -> 
     assert "removed=1" in result.stdout
 
 
+@pytest.mark.skipif(os.name == "nt", reason="macOS signature audit mocks require POSIX shell tools")
 def test_macos_signature_audit_rejects_invalid_signatures(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     _write_fake_macos_signature_tools(fake_bin)

@@ -37,6 +37,7 @@ from quant_data_contract import (  # noqa: E402
     PAIRED_PRICE_ABSOLUTE_TOLERANCE,
     DataContractError,
     _json_bytes,
+    _opened_file_matches_path,
     _validate_bar_frame,
 )
 
@@ -699,13 +700,15 @@ class _ReadSet:
             opened = os.fstat(stream.fileno())
             body = stream.read(128 * 1024 * 1024 + 1)
             after = os.fstat(stream.fileno())
+        after_path = path.lstat()
         if (
-            _state(before) != _state(opened)
+            _state(before) != _state(after_path)
             or _state(opened) != _state(after)
-            or _state(after) != _state(path.lstat())
+            or not _opened_file_matches_path(opened, before)
+            or not _opened_file_matches_path(after, after_path)
         ):
             raise ValueError("input changed while being read")
-        self.states[path] = _state(after)
+        self.states[path] = _state(after_path)
         digest = hashlib.sha256(body).hexdigest()
         self.bytes += len(body)
         self.records.append(

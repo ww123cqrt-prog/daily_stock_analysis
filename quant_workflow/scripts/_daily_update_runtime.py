@@ -28,6 +28,17 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 def pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import psutil
+        except ImportError:
+            return True
+        try:
+            return psutil.Process(pid).is_running()
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError, ValueError):
+            return True  # An unreadable owner must keep its lock.
     try:
         os.kill(pid, 0)
     except OSError as exc:

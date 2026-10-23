@@ -328,7 +328,7 @@ def test_repeated_lowering_from_shared_input_does_not_cross_pollute_results():
     assert original["messages"][0]["content"] == "stable rules"
 
 
-def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_capture():
+def test_litellm_openai_request_capture_respects_unverified_prompt_cache_gate():
     sanitized_env = os.environ.copy()
     for key in (
         "OPENAI_API_KEY",
@@ -355,8 +355,10 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
     script = textwrap.dedent(
         """
         import json
+        import os
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
+        from types import SimpleNamespace
 
         try:
             import litellm
@@ -364,6 +366,13 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
             print("LITELLM_MISSING")
             raise SystemExit(77)
 
+        from src.llm.provider_cache import (
+            apply_prompt_cache_hints,
+            build_provider_cache_route_context,
+        )
+
+        os.environ["LLM_USAGE_HMAC_SECRET"] = "cache-secret"
+        os.environ["LLM_USAGE_HMAC_KEY_VERSION"] = "cache-v1"
         captured = {}
         request_seen = threading.Event()
 
@@ -404,16 +413,35 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            litellm.completion(
-                model="openai/test-model",
-                api_base=f"http://127.0.0.1:{server.server_port}/v1",
-                api_key="sk-test",
-                messages=[{"role": "user", "content": "hello"}],
-                prompt_cache_key="cache-key",
-                max_tokens=1,
-                timeout=5,
-                num_retries=0,
+            call_kwargs = {
+                "model": "openai/gpt-4o",
+                "api_base": f"http://127.0.0.1:{server.server_port}/v1",
+                "api_key": "sk-test",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                "timeout": 5,
+                "num_retries": 0,
+            }
+            route_context = build_provider_cache_route_context(
+                model=call_kwargs["model"],
+                provider="openai",
+                call_kwargs=call_kwargs,
+                call_type="analysis",
             )
+            hint_result = apply_prompt_cache_hints(
+                call_kwargs,
+                route_context,
+                SimpleNamespace(
+                    llm_prompt_cache_hints_enabled=True,
+                    llm_prompt_cache_diagnostics_level="basic",
+                ),
+            )
+            # DSA owns capability verification; LiteLLM may support the field itself.
+            assert hint_result.disabled_reason == "capability_not_verified"
+            assert hint_result.diagnostics["verification_status"] == "doc_only"
+            assert not hint_result.hint_applied
+            assert "prompt_cache_key" not in hint_result.call_kwargs
+            litellm.completion(**hint_result.call_kwargs)
             if not request_seen.wait(timeout=10):
                 raise AssertionError("LiteLLM did not send request to local capture server")
         finally:

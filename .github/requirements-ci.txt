@@ -4,4 +4,5 @@
 # Test and lint tooling used by backend-gate.
 flake8
 pytest
+pytest-xdist>=3.6,<4
 pytest-timeout>=2.3.0

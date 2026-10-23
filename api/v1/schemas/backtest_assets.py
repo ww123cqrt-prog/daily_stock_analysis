@@ -23,6 +23,7 @@ class StrategyAssetUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = Field(None, max_length=2000)
     script: Optional[str] = Field(None, min_length=1)
+    archived: Optional[bool] = None
 
 
 class StrategyAssetSummary(BaseModel):
@@ -31,6 +32,7 @@ class StrategyAssetSummary(BaseModel):
     description: str
     script_sha256: str
     api_version: str
+    archived: bool = False
     created_at: str
     updated_at: str
 

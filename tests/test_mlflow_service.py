@@ -40,15 +40,16 @@ def test_start_local_mlflow_service_uses_fixed_detached_command(
 
     monkeypatch.setattr(mlflow_service.subprocess, "Popen", fake_popen)
 
+    python_executable = tmp_path / ".venv" / "python"
     result = mlflow_service.start_local_mlflow_service(
         repo_root=tmp_path,
-        python_executable=Path("/opt/dsa/.venv/bin/python"),
+        python_executable=python_executable,
         wait_seconds=0,
     )
 
     store_uri = (tmp_path / "quant_workflow" / "mlruns").resolve().as_uri()
     assert observed["command"] == [
-        "/opt/dsa/.venv/bin/python",
+        str(python_executable),
         "-m",
         "mlflow",
         "ui",

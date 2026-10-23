@@ -847,6 +847,6 @@ def test_max_result_bytes_caps_error_result_text() -> None:
 
 
 def test_stock_scope_no_longer_imports_runner_for_normalization() -> None:
-    source = Path("src/agent/stock_scope.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src/agent/stock_scope.py").read_text(encoding="utf-8")
 
     assert "from src.agent.runner import _normalize_tool_stock_code" not in source

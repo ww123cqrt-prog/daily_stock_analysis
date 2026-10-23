@@ -86,6 +86,10 @@ const FormStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
       setError(zh ? '至少输入一个标的代码。' : 'Enter at least one symbol.');
       return;
     }
+    if (!startDate || !endDate || startDate > endDate) {
+      setError(zh ? '请选择有效的开始和结束日期。' : 'Select a valid start and end date.');
+      return;
+    }
     if (![capital, cost, lot, lookback, average, fast, slow, selectedTopN].every(Number.isFinite)) {
       setError(zh ? '参数必须是有效数字。' : 'Parameters must be valid numbers.');
       return;
@@ -138,8 +142,8 @@ const FormStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
               <span className="text-xs text-secondary-text">{zh ? '标的代码（逗号分隔）' : 'Symbols (comma-separated)'}</span>
               <input value={symbols} onChange={event => setSymbols(event.target.value.toUpperCase())} className={INPUT} disabled={running} />
             </label>
-            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期（空=全部历史）' : 'Start date (empty=full)'}</span><input type="date" lang="en" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
-            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期（空=最新）' : 'End date (empty=latest)'}</span><input type="date" lang="en" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
+            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期' : 'Start date'}</span><input type="date" lang="en" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
+            <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期' : 'End date'}</span><input type="date" lang="en" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
             <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '初始资金' : 'Initial capital'}</span><input aria-label={zh ? '初始资金' : 'Initial capital'} type="number" min="1" value={initialCapital} onChange={event => setInitialCapital(event.target.value)} className={INPUT} disabled={running} /></label>
             <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '单边费率（%，佣金+滑点）' : 'Fee per side (%)'}</span><input aria-label={zh ? '单边费率（%）' : 'Fee per side (%)'} type="number" min="0" max="5" step="0.01" value={sideCostPct} onChange={event => setSideCostPct(event.target.value)} className={INPUT} disabled={running} /></label>
             <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '最小交易数量' : 'Lot size'}</span><input aria-label={zh ? '最小交易数量' : 'Lot size'} type="number" min="1" step="1" value={lotSize} onChange={event => setLotSize(event.target.value)} className={INPUT} disabled={running} /></label>

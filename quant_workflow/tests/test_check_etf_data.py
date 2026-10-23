@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import socket
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -113,6 +115,62 @@ def digest_tree(root):
         for p in root.rglob("*")
         if p.is_file()
     }
+
+
+@pytest.mark.parametrize("change", [None, "path_ctime", "descriptor_ctime"])
+def test_readset_windows_ctime_sources_are_checked_independently(
+    tmp_path, monkeypatch, change
+):
+    mod = checker()
+    target = tmp_path / "input.bin"
+    target.write_bytes(b"stable")
+    original_fstat, original_lstat = os.fstat, Path.lstat
+    fd_reads = 0
+    path_reads = 0
+
+    def metadata(info, ctime_offset):
+        fields = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        values = {name: getattr(info, name) for name in fields}
+        values["st_ctime_ns"] += ctime_offset
+        return SimpleNamespace(**values)
+
+    def windows_fstat(fd):
+        nonlocal fd_reads
+        fd_reads += 1
+        offset = 1000 + (change == "descriptor_ctime" and fd_reads > 1)
+        return metadata(original_fstat(fd), offset)
+
+    def path_stat(path, *args, **kwargs):
+        nonlocal path_reads
+        path_reads += path == target
+        offset = int(change == "path_ctime" and path_reads > 1)
+        return metadata(original_lstat(path, *args, **kwargs), offset)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "fstat", windows_fstat)
+    monkeypatch.setattr(Path, "lstat", path_stat)
+    readset = mod._ReadSet()
+    if change is None:
+        assert readset.read(target) == b"stable"
+        assert readset.unchanged() is True
+    else:
+        with pytest.raises(ValueError, match="input changed"):
+            readset.read(target)
+
+
+def test_readset_rejects_replacement_preserving_size_and_mtime(tmp_path):
+    mod = checker()
+    target, replacement = tmp_path / "input.bin", tmp_path / "replacement.bin"
+    target.write_bytes(b"before")
+    readset = mod._ReadSet()
+    assert readset.read(target) == b"before"
+    before = target.stat()
+    replacement.write_bytes(b"forged")
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(target)
+    assert target.stat().st_size == before.st_size
+    assert target.stat().st_mtime_ns == before.st_mtime_ns
+    assert readset.unchanged() is False
 
 
 def test_valid_affine_prices_are_not_forced_into_multiplicative_rule():

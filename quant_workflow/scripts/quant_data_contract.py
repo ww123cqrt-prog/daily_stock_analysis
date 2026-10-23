@@ -119,6 +119,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _opened_file_matches_path(opened: os.stat_result, path_metadata: os.stat_result) -> bool:
+    # Some Windows Pythons expose creation time through path stat, but last
+    # write time through fstat's ctime. Only compare ctime within one API there.
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if sys.platform != "win32":
+        fields += ("st_ctime_ns",)
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(path_metadata.st_mode)
+        and all(getattr(opened, name) == getattr(path_metadata, name) for name in fields)
+    )
+
+
 def filesystem_state_fingerprint(
     root: Path,
     *,
@@ -505,12 +518,12 @@ def _filesystem_state_fingerprint_fallback(
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or stat.S_ISLNK(after_open.st_mode)
-                or state(opened) != state(metadata)
-                or state(opened) != state(after_open)
+                or state(metadata) != state(after_open)
+                or not _opened_file_matches_path(opened, after_open)
             ):
                 raise DataContractError("fingerprint file changed during scan")
             relative = "/".join((*relative_parts, entry.name))
-            file_states.append((entry, state(opened)))
+            file_states.append((entry, state(after_open)))
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
             digest.update(str(metadata.st_size).encode("ascii"))

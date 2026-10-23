@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
-import fcntl
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
+import errno
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -251,9 +253,9 @@ def test_reference_read_lock_blocks_writer_after_integrity_check(
     def writer() -> None:
         with lock_path.open("a+b") as handle:
             writer_attempting.set()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            lock_file(handle, exclusive=True)
             writer_acquired.set()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
 
     thread = threading.Thread(target=writer)
     with module.reference_read_lock(reference) as snapshot:
@@ -345,17 +347,95 @@ def test_market_panel_rejects_reference_from_different_membership_snapshot(
         )
 
 
-def test_reference_fingerprint_rejects_symlinked_snapshot_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("without_nofollow", [False, True])
+def test_reference_fingerprint_rejects_symlinked_snapshot_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_nofollow: bool
+) -> None:
     module = load_module()
     _, _, reference = build_fixture(tmp_path)
+    if without_nofollow:
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
     external = tmp_path / "external-security.parquet"
     target = reference / "security_master.parquet"
+    original = target.read_bytes() + b"\r\n\x1aold"
+    target.write_bytes(original)
+    with module.reference_read_lock(reference) as snapshot:
+        original_fingerprint = snapshot.fingerprint()
+    target.write_bytes(original[:-3] + b"new")
+    with module.reference_read_lock(reference) as snapshot:
+        assert snapshot.fingerprint() != original_fingerprint
+    target.write_bytes(original)
+    with module.reference_read_lock(reference) as snapshot:
+        assert snapshot.fingerprint() == original_fingerprint
     target.replace(external)
     target.symlink_to(external)
+    assert target.is_symlink()
 
     with pytest.raises(ValueError, match="snapshot files are incomplete"):
         with module.reference_read_lock(reference) as snapshot:
             snapshot.fingerprint()
+    assert external.read_bytes() == original
+
+
+@pytest.mark.parametrize("change", ["before_open", "after_open", "fstat", "lstat"])
+def test_reference_fingerprint_rejects_replacement_and_closes_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    module = load_module()
+    _, _, reference = build_fixture(tmp_path)
+    target = reference / "security_master.parquet"
+    replacement = tmp_path / "replacement-security.parquet"
+    replacement.write_bytes(target.read_bytes())
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    real_open = os.open
+    real_fstat = os.fstat
+    real_lstat = Path.lstat
+    descriptors: list[int] = []
+
+    def changing_open(path, flags, *args, **kwargs):
+        if Path(path) != target:
+            return real_open(path, flags, *args, **kwargs)
+        if change == "before_open":
+            replacement.replace(target)
+        descriptor = real_open(path, flags, *args, **kwargs)
+        descriptors.append(descriptor)
+        if change == "after_open":
+            try:
+                replacement.replace(target)
+            except OSError:
+                # Windows may reject replacement while the original is open.
+                os.close(descriptor)
+                raise
+        return descriptor
+
+    def failing_fstat(descriptor):
+        if change == "fstat" and descriptor in descriptors:
+            raise OSError("injected fstat failure")
+        return real_fstat(descriptor)
+
+    def failing_lstat(path, *args, **kwargs):
+        if change == "lstat" and path == target and descriptors:
+            raise OSError("injected lstat failure")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", changing_open)
+    monkeypatch.setattr(os, "fstat", failing_fstat)
+    monkeypatch.setattr(Path, "lstat", failing_lstat)
+    try:
+        with pytest.raises(ValueError, match="snapshot files are incomplete"):
+            with module.reference_read_lock(reference) as snapshot:
+                snapshot.fingerprint()
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as closed:
+            real_fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        for descriptor in descriptors:
+            try:
+                real_fstat(descriptor)
+            except OSError:
+                continue
+            os.close(descriptor)
 
 
 @pytest.mark.parametrize("changed_snapshot", ["membership", "reference"])

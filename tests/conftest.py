@@ -256,19 +256,3 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
-
-
-@pytest.fixture(autouse=True)
-def _isolate_strategy_assets_db(tmp_path, monkeypatch):
-    """Point the strategy-assets store at a per-test database.
-
-    Prevents any test (including existing backtest endpoint tests that mock
-    the runner) from writing mock runs into the real
-    ``quant_workflow/reports/strategy_assets.db``.
-    """
-    monkeypatch.setenv("DSA_STRATEGY_ASSETS_DB", str(tmp_path / "strategy_assets.db"))
-    from src.repositories.strategy_assets_repo import _default_repo
-
-    monkeypatch.setattr("src.repositories.strategy_assets_repo._default_repo", None)
-    yield
-    monkeypatch.setattr("src.repositories.strategy_assets_repo._default_repo", None)

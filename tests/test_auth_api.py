@@ -767,6 +767,8 @@ class AuthDisableViaRealASGITestCase(unittest.TestCase):
     def setUp(self) -> None:
         # Each test starts from auth-enabled + a stored password; the disable
         # path mutates the .env so we restore it before every test.
+        os.environ["ENV_FILE"] = str(self.env_path)
+        os.environ["DATABASE_PATH"] = str(self.data_dir / "test.db")
         _reset_auth_globals()
         self.env_path.write_text(
             "STOCK_LIST=600519\nGEMINI_API_KEY=test\nADMIN_AUTH_ENABLED=true\n",

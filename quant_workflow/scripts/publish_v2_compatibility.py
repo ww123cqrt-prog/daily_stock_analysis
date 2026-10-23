@@ -145,7 +145,7 @@ def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         frame.to_parquet(temporary, index=False)
-        with temporary.open("rb") as handle:
+        with temporary.open("r+b" if os.name == "nt" else "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         _fsync_directory(path.parent)

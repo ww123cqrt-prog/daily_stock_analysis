@@ -33,7 +33,10 @@ def _day(value) -> date:
 
 
 def _private_directory() -> Path:
-    return Path(os.getenv("MINIQMT_CONFIG_DIR", str(Path.home() / ".agents/private/remote-windows-workstation"))).expanduser()
+    configured = os.getenv("MINIQMT_CONFIG_DIR")
+    if configured is not None:
+        return Path(configured).expanduser()
+    return Path.home() / ".agents/private/remote-windows-workstation"
 
 
 def _ps(value: str) -> str:
@@ -119,7 +122,10 @@ class MiniQMTBridgeClient:
     def configured() -> bool:
         if os.getenv("MINIQMT_ENABLED", "true").lower() in {"0", "false", "no", "off"}:
             return False
-        root = _private_directory()
+        try:
+            root = _private_directory()
+        except RuntimeError:  # A cleared Windows environment may have no home.
+            return False
         return (root / "machine_configuration.yaml").is_file() and (root / "connection-targets.env").is_file()
 
     def request(self, operation, symbols, start, end, *, adjustment="none") -> dict:

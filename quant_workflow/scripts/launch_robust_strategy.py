@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import mlruns_root, quant_data_root, reports_root, workflow_root  # noqa: E402
 from run_robust_strategy import (  # noqa: E402
     DEFAULT_CONFIG,
@@ -150,6 +150,23 @@ def _cpu_percent(pid: int) -> float | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            import psutil
+        except ImportError:
+            return True
+        try:
+            return psutil.Process(pid).is_running()
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError, ValueError):
+            return True  # Do not replace a runner whose status is unreadable.
     try:
         os.kill(int(pid), 0)
     except (OSError, ValueError):
@@ -177,15 +194,15 @@ def _claim_launch_record(
         Path(report_dir) / runner_namespace / ".locks" / f"{run_id}.lock"
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as stream:
+    with lock_path.open("a+b") as stream:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(stream, exclusive=True, blocking=False)
         except BlockingIOError as exc:
             raise ValueError(f"robust strategy launch {run_id!r} is already running") from exc
         try:
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock_file(stream)
 
 
 def _launchd_label(run_id: str) -> str:

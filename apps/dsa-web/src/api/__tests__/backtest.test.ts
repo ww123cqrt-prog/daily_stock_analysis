@@ -296,7 +296,20 @@ describe('backtestApi', () => {
 
     expect(result[0].id).toBe('s1');
     expect(result[0].scriptSha256).toBe('x'.repeat(64));
-    expect(get).toHaveBeenCalledWith('/api/v1/backtest/strategies');
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/strategies', {
+      params: { archived: false },
+    });
+  });
+
+  it('lists historical strategy assets separately', async () => {
+    get.mockResolvedValueOnce({ data: [{ id: 'old', name: 'Historical', archived: true }] });
+
+    const result = await backtestApi.listStrategyAssets({ archived: true });
+
+    expect(result[0].archived).toBe(true);
+    expect(get).toHaveBeenCalledWith('/api/v1/backtest/strategies', {
+      params: { archived: true },
+    });
   });
 
   it('saves a named strategy asset', async () => {
@@ -324,11 +337,27 @@ describe('backtestApi', () => {
       name: 'Beta',
       description: undefined,
       script: undefined,
+      archived: undefined,
     });
 
     del.mockResolvedValueOnce({ data: null });
     await backtestApi.deleteStrategyAsset('s1');
     expect(del).toHaveBeenCalledWith('/api/v1/backtest/strategies/s1');
+  });
+
+  it('sends both archive and restore states without deleting the asset', async () => {
+    patch.mockResolvedValue({ data: { id: 's1' } });
+
+    await backtestApi.updateStrategyAsset('s1', { archived: true });
+    await backtestApi.updateStrategyAsset('s1', { archived: false });
+
+    expect(patch).toHaveBeenNthCalledWith(1, '/api/v1/backtest/strategies/s1', {
+      name: undefined, description: undefined, script: undefined, archived: true,
+    });
+    expect(patch).toHaveBeenNthCalledWith(2, '/api/v1/backtest/strategies/s1', {
+      name: undefined, description: undefined, script: undefined, archived: false,
+    });
+    expect(del).not.toHaveBeenCalled();
   });
 
   it('lists backtest runs with filters and loads a full detail', async () => {

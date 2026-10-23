@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 
 SCRIPT_PATH = (
@@ -240,7 +241,10 @@ def test_reuse_check_rejects_modified_feature_even_after_restoring_read_only_mod
     assert module._snapshot_is_reusable(provider, result["provider_key"]) is False
 
 
-def test_reuse_check_rejects_group_or_other_writable_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("writable_mode", [0o644, 0o464, 0o446], ids=["owner", "group", "other"])
+def test_reuse_check_rejects_owner_group_or_other_writable_snapshot(
+    tmp_path: Path, writable_mode: int
+) -> None:
     module = load_module()
     canonical = tmp_path / "canonical"
     (canonical / "calendars").mkdir(parents=True)
@@ -266,7 +270,12 @@ def test_reuse_check_rejects_group_or_other_writable_snapshot(tmp_path: Path) ->
     )
     provider = Path(result["provider_uri"])
     feature = provider / "features" / "sample.bin"
-    feature.chmod(0o464)
+    assert module._snapshot_is_reusable(provider, result["provider_key"]) is True
+    feature.chmod(writable_mode)
+    write_bits = feature.stat().st_mode & 0o222
+    if writable_mode != 0o644 and not write_bits:
+        pytest.skip("filesystem chmod does not expose the requested write bit")
+    assert write_bits, "filesystem did not make the snapshot writable"
 
     assert module._snapshot_is_reusable(provider, result["provider_key"]) is False
 
@@ -527,6 +536,7 @@ def test_provider_snapshot_rejects_symlinks_without_touching_link_target(
     external = tmp_path / "external.bin"
     external.write_bytes(b"external")
     external.chmod(0o600)
+    external_mode = external.stat().st_mode
     (canonical / "features" / "linked.bin").symlink_to(external)
     intervals = tmp_path / "membership_intervals.parquet"
     pd.DataFrame(
@@ -551,7 +561,7 @@ def test_provider_snapshot_rejects_symlinks_without_touching_link_target(
         raise AssertionError("canonical provider symlink was accepted")
 
     assert external.read_bytes() == b"external"
-    assert external.stat().st_mode & 0o777 == 0o600
+    assert external.stat().st_mode == external_mode
 
 
 def test_reuse_check_rejects_provider_root_symlink(tmp_path: Path) -> None:
@@ -581,6 +591,7 @@ def test_invalid_cached_root_symlink_is_unlinked_without_modifying_target(
     feature = canonical / "features" / "sample.bin"
     feature.write_bytes(b"canonical")
     feature.chmod(0o600)
+    feature_mode = feature.stat().st_mode
     (canonical / "calendars" / "day.txt").write_text(
         "2023-01-02\n2023-01-03\n", encoding="utf-8"
     )
@@ -611,4 +622,4 @@ def test_invalid_cached_root_symlink_is_unlinked_without_modifying_target(
     assert Path(result["provider_uri"]).is_dir()
     assert not Path(result["provider_uri"]).is_symlink()
     assert feature.read_bytes() == b"canonical"
-    assert feature.stat().st_mode & 0o777 == 0o600
+    assert feature.stat().st_mode == feature_mode

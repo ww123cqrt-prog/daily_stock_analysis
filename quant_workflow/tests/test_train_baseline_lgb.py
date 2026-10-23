@@ -203,14 +203,14 @@ class TrainBaselineLgbTest(unittest.TestCase):
 
     def test_explicit_provider_uri_is_validated_and_used_without_reresolving_latest(self):
         module = load_module()
-        pinned = Path("/quant_data/qlib/cn_data_ashare_v2/snapshots/native-v2")
-
-        with patch.object(
-            module,
-            "qlib_workflow_init_config",
-            return_value={"provider_uri": str(pinned)},
-        ) as resolver:
-            resolved = module.resolve_provider_uri("canonical", pinned)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pinned = Path(temp_dir).resolve() / "qlib" / "snapshots" / "native-v2"
+            with patch.object(
+                module,
+                "qlib_workflow_init_config",
+                return_value={"provider_uri": str(pinned)},
+            ) as resolver:
+                resolved = module.resolve_provider_uri("canonical", pinned)
 
         self.assertEqual(resolved, pinned)
         resolver.assert_called_once_with(

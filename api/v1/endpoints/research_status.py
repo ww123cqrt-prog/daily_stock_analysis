@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from quant_workflow.scripts.quant_data_contract import (
     AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
     DataContractError,
     filesystem_state_fingerprint,
+    resolve_dataset,
     validate_latest_pointer,
 )
 from quant_workflow.scripts._file_lock import lock_file, unlock_file
@@ -2848,7 +2850,10 @@ def _manifest_official_entry_evidence(
             pointer_status = _inventory_latest_pointer_status(record)
             if pointer_status != "verified":
                 return {"official_entries": 0, "validation_status": pointer_status}
-            state_status = _inventory_snapshot_state_status(record)
+            state_status = _inventory_snapshot_state_status(
+                record,
+                catalog_entry=datasets.get(record.get("dataset_id")),
+            )
             if state_status != "verified":
                 return {"official_entries": 0, "validation_status": state_status}
         current_ids = {
@@ -2872,7 +2877,11 @@ def _manifest_official_entry_evidence(
     }
 
 
-def _inventory_snapshot_state_status(record: Dict[str, Any]) -> str:
+def _inventory_snapshot_state_status(
+    record: Dict[str, Any],
+    *,
+    catalog_entry: Optional[Dict[str, Any]] = None,
+) -> str:
     raw_path = record.get("snapshot_path")
     expected = record.get("state_fingerprint")
     if not isinstance(raw_path, str) or not raw_path or not isinstance(expected, dict):
@@ -2912,7 +2921,38 @@ def _inventory_snapshot_state_status(record: Dict[str, Any]) -> str:
         current = _filesystem_state_fingerprint_live(snapshot)
     except (DataContractError, OSError):
         return "stale"
-    return "verified" if current == normalized_expected else "stale"
+    if current != normalized_expected:
+        return "stale"
+    if sys.platform == "win32":
+        # Windows path ctime is creation time, so restoring mtime can hide a
+        # same-size rewrite from metadata. Reuse the existing content proofs.
+        try:
+            dataset_id = str(record.get("dataset_id") or "")
+            if record.get("storage_contract") == "immutable_snapshot_v2":
+                resolved = resolve_dataset(dataset_id, quant_data_root=root)
+                if (
+                    resolved.snapshot_path.resolve() != snapshot.resolve()
+                    or resolved.manifest.get("snapshot_id") != record.get("snapshot_id")
+                ):
+                    return "stale"
+            elif (
+                record.get("storage_contract") == "catalog_registered_fixed_path"
+                and isinstance(catalog_entry, dict)
+            ):
+                from quant_workflow.scripts.report_data_hygiene import (
+                    _validate_fixed_path_dataset,
+                )
+
+                snapshot_hash = _validate_fixed_path_dataset(
+                    dataset_id, snapshot, catalog_entry
+                )
+                if snapshot_hash != record.get("snapshot_id"):
+                    return "stale"
+            else:
+                return "unverified"
+        except (DataContractError, OSError, TypeError, ValueError):
+            return "stale"
+    return "verified"
 
 
 def _inventory_latest_pointer_status(record: Dict[str, Any]) -> str:

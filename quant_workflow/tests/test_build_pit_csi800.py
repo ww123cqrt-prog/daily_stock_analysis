@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -1316,11 +1317,12 @@ def test_concurrent_incremental_builds_do_not_lose_dates(tmp_path: Path) -> None
     daily_path = output_dir / "daily" / "2025.parquet"
     daily_path.parent.mkdir(parents=True)
     normalized_daily_membership(["2025-01-02"]).to_parquet(daily_path, index=False)
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     slow_started = context.Event()
     release_slow = context.Event()
     slow_finished = context.Event()
     fast_finished = context.Event()
+    fast_started = context.Event()
     result_queue = context.Queue()
     slow_process = context.Process(
         target=run_concurrent_build,
@@ -1344,7 +1346,7 @@ def test_concurrent_incremental_builds_do_not_lose_dates(tmp_path: Path) -> None
             "2025-01-06",
             "2025-01-06",
             None,
-            context.Event(),
+            fast_started,
             release_slow,
             fast_finished,
             result_queue,
@@ -1385,11 +1387,12 @@ def test_concurrent_incremental_builds_do_not_lose_dates(tmp_path: Path) -> None
 def test_concurrent_requests_cannot_publish_stale_latest_status(tmp_path: Path) -> None:
     output_dir = tmp_path / "pit"
     status_dir = tmp_path / "shared-status"
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     old_build_returned = context.Event()
     release_old = context.Event()
     old_finished = context.Event()
     new_finished = context.Event()
+    new_build_returned = context.Event()
     result_queue = context.Queue()
     old_process = context.Process(
         target=run_status_order_build,
@@ -1411,7 +1414,7 @@ def test_concurrent_requests_cannot_publish_stale_latest_status(tmp_path: Path) 
             str(status_dir),
             "2025-01-03",
             False,
-            context.Event(),
+            new_build_returned,
             release_old,
             new_finished,
             result_queue,
@@ -1811,6 +1814,51 @@ def test_parquet_transaction_rolls_back_installed_files_on_commit_error(
     assert not any(
         path.name.endswith((".stage", ".backup")) for path in tmp_path.rglob("*")
     )
+
+
+def test_windows_fsync_keeps_file_flush_without_directory_descriptors(tmp_path, monkeypatch):
+    module = load_module()
+    import quant_data_contract as contract
+
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"unchanged")
+    opened, flushed = [], []
+    original_open, original_fsync = os.open, os.fsync
+
+    def open_file(target, flags, *args, **kwargs):
+        assert Path(target).is_file(), "Windows must not open a directory descriptor"
+        assert flags & os.O_RDWR
+        opened.append(Path(target))
+        return original_open(target, flags, *args, **kwargs)
+
+    def flush_file(fd):
+        flushed.append(fd)
+        return original_fsync(fd)
+
+    fake_os = SimpleNamespace(
+        **{**vars(os), "name": "nt", "open": open_file, "fsync": flush_file}
+    )
+    monkeypatch.setattr(module, "os", fake_os)
+    monkeypatch.setattr(contract, "os", fake_os)
+    module._fsync_file(path)
+    module._fsync_directory(tmp_path)
+    assert opened == [path]
+    assert len(flushed) == 1
+    assert path.read_bytes() == b"unchanged"
+
+
+def test_file_fsync_error_is_not_suppressed(tmp_path, monkeypatch):
+    module = load_module()
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"unchanged")
+
+    def fail_flush(_fd):
+        raise OSError("file flush failed")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "fsync": fail_flush}))
+    with pytest.raises(OSError, match="file flush failed"):
+        module._fsync_file(path)
+    assert path.read_bytes() == b"unchanged"
 
 
 def test_membership_publish_fsyncs_before_and_after_install(

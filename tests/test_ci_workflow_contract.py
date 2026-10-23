@@ -92,7 +92,7 @@ def test_heavy_ci_jobs_are_path_filtered_and_backend_tests_are_sharded() -> None
 
     requirements = _read(".github/requirements-ci.txt")
     ci_gate = _read("scripts/ci_gate.sh")
-    assert "pytest-xdist" not in requirements
+    assert "pytest-xdist>=3.6,<4" in requirements
     assert "PYTEST_WORKERS" not in ci_gate
     assert "pytest-split" not in requirements
     assert 'python scripts/ci_test_shard.py' in ci_gate

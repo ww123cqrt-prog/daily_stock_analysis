@@ -21,6 +21,32 @@ def load_module():
 
 
 class OptimizeStrategyTest(unittest.TestCase):
+    def test_import_without_fork_still_supports_dry_run(self):
+        with (
+            patch("multiprocessing.get_all_start_methods", return_value=["spawn"]),
+            patch("multiprocessing.set_start_method") as set_start_method,
+        ):
+            module = load_module()
+        set_start_method.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status = module.run_report(
+                phase=1, topk=3, skip_training=True, dry_run=True,
+                output_dir=Path(temp_dir), timestamp="20261023_120000",
+            )
+            self.assertEqual(status["status"], "completed")
+            payload = json.loads(Path(status["latest_json"]).read_text(encoding="utf-8"))
+            self.assertTrue(payload["dry_run"])
+            self.assertEqual(len(payload["results"]), 5)
+
+    def test_import_preserves_fork_when_supported(self):
+        with (
+            patch("multiprocessing.get_all_start_methods", return_value=["spawn", "fork"]),
+            patch("multiprocessing.set_start_method") as set_start_method,
+        ):
+            load_module()
+        set_start_method.assert_called_once_with("fork", force=True)
+
     def test_data_dir_rejects_legacy_provider_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             quant_data = Path(temp_dir) / "quant_data"

@@ -123,7 +123,7 @@ def build_cleaning_plan(
             json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        with temporary.open("rb") as handle:
+        with temporary.open("r+b" if os.name == "nt" else "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, output_path)
     finally:

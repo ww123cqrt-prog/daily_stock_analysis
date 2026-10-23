@@ -20,6 +20,35 @@ def bar(day, close=10.0):
             "close": close, "volume": 12, "amount": 12000, "suspendFlag": 0}
 
 
+def test_explicit_private_profile_does_not_resolve_missing_home(tmp_path, monkeypatch):
+    from data_provider import miniqmt_bridge as bridge
+
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(bridge.Path, "home", classmethod(no_home))
+    monkeypatch.setenv("MINIQMT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("MINIQMT_ENABLED", "true")
+    (tmp_path / "machine_configuration.yaml").write_text("", encoding="utf-8")
+    (tmp_path / "connection-targets.env").write_text("", encoding="utf-8")
+
+    assert bridge._private_directory() == tmp_path
+    assert bridge.MiniQMTBridgeClient.configured()
+
+
+def test_miniqmt_is_unconfigured_when_profile_and_home_are_unavailable(monkeypatch):
+    from data_provider import miniqmt_bridge as bridge
+
+    def no_home(cls):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.delenv("MINIQMT_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("MINIQMT_ENABLED", "true")
+    monkeypatch.setattr(bridge.Path, "home", classmethod(no_home))
+
+    assert bridge.MiniQMTBridgeClient.configured() is False
+
+
 def test_client_rejects_changed_response_and_wrong_request():
     from data_provider.miniqmt_bridge import MiniQMTBridgeClient, MiniQMTError
 

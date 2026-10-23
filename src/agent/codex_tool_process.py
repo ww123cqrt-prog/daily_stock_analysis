@@ -233,6 +233,17 @@ def _tool_process_entry(
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import psutil
+        except ImportError:
+            return True
+        try:
+            return psutil.Process(pid).is_running()
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError, ValueError):
+            return True  # Unknown liveness cannot prove resource cleanup.
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

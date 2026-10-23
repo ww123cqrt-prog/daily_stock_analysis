@@ -3,12 +3,14 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux container entrypoint requires a POSIX shell")
 def test_docker_entrypoint_has_valid_shell_syntax() -> None:
     subprocess.run(
         ["sh", "-n", str(REPO_ROOT / "docker" / "entrypoint.sh")],
@@ -186,6 +188,7 @@ def _run_entrypoint_with_fake_tools(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux container entrypoint requires POSIX tools")
 def test_docker_entrypoint_repairs_nested_mount_ownership(tmp_path: Path) -> None:
     fakebin, log_dir = _prepare_fake_entrypoint_tools(
         tmp_path,
@@ -210,6 +213,7 @@ def test_docker_entrypoint_repairs_nested_mount_ownership(tmp_path: Path) -> Non
     assert "/app/data" in chmod_log
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux container entrypoint requires POSIX tools")
 def test_docker_entrypoint_skips_owner_chmod_when_chown_fails(tmp_path: Path) -> None:
     fakebin, log_dir = _prepare_fake_entrypoint_tools(
         tmp_path,

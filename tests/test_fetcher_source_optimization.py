@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Regression tests for fetcher routing and optional-source pruning."""
 
+import os
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -115,6 +117,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
                 "LONGBRIDGE_APP_KEY": "",
                 "LONGBRIDGE_APP_SECRET": "",
                 "LONGBRIDGE_ACCESS_TOKEN": "",
+                "QUANT_DATA_ROOT": "",
             },
         ), patch("data_provider.efinance_fetcher.EfinanceFetcher", return_value=_StubFetcher("EfinanceFetcher", 0)), patch(
             "data_provider.tencent_fetcher.TencentFetcher",
@@ -139,7 +142,10 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             return_value=_StubFetcher("LongbridgeFetcher", 5),
         ) as mock_longbridge:
             mock_longbridge.has_configured_credentials.return_value = False
-            with patch("data_provider.miniqmt_bridge.MiniQMTBridgeClient.configured", return_value=False):
+            with patch("data_provider.miniqmt_bridge.MiniQMTBridgeClient.configured", return_value=False), patch(
+                "src.services.quant_workflow_paths.quant_data_root",
+                return_value=Path(os.environ["ENV_FILE"]).parent / "missing-quant-data",
+            ):
                 manager = DataFetcherManager()
 
         self.assertEqual(

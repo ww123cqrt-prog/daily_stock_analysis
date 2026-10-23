@@ -9,6 +9,8 @@ import pyarrow.ipc as ipc
 import pytest
 
 from quant_workflow.scripts.quant_data_service_client import (
+    NativeDatasetIdentity,
+    NativeReleaseIdentity,
     QuantDataClientError,
     QuantDataIdentityError,
     QuantDataServiceClient,
@@ -287,3 +289,99 @@ def test_ready_fails_closed_for_an_inconsistent_response(payload) -> None:
 
     with pytest.raises(QuantDataClientError, match="readiness response"):
         client.ready()
+
+
+def _native_metadata(dataset_id: str = "cn_etf_daily") -> dict:
+    return {
+        "authority": "active",
+        "dataset_set_version": "production.v2",
+        "generation": 10,
+        "pointer_sha256": "a" * 64,
+        "release_set_sha256": "b" * 64,
+        "dataset_id": dataset_id,
+        "module_id": dataset_id,
+        "module_release_sha256": "c" * 64,
+        "content_manifest_sha256": "d" * 64,
+        "requested_through": "2026-09-11",
+        "component_identities": {"qfq": "e" * 64, "raw": "f" * 64},
+    }
+
+
+def test_native_bars_lock_release_and_require_strict_coverage() -> None:
+    meta = _native_metadata()
+    release = NativeReleaseIdentity.from_mapping(meta)
+    dataset = NativeDatasetIdentity.from_mapping(meta)
+    table = pa.table({
+        "symbol": ["SH513100"], "date": ["2026-09-11"],
+        "open": [2.21], "close": [2.20], "volume": [100.0],
+    })
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.path == "/v1/bars/query"
+        body = json.loads(request.content)
+        assert body["mode"] == "strict"
+        assert body["requested_through"] == "2026-09-11"
+        returned = dict(meta)
+        returned.update({
+            "basis": "qfq",
+            "staleness": {
+                "mode": "strict", "complete": True, "uncovered": [],
+                "requested_through": "2026-09-11",
+                "summary": {"included_symbol_count": 1, "excluded_symbol_count": 0},
+            },
+        })
+        if calls == 2:
+            returned["release_set_sha256"] = "1" * 64
+        if calls == 3:
+            returned["staleness"]["complete"] = False
+        return httpx.Response(200, content=_arrow_bytes(table), headers={
+            "X-Quant-Data-Metadata": json.dumps(returned),
+        })
+
+    client = _client(handler)
+    result = client.native_bars_batch(
+        dataset, ["SH513100"], basis="qfq",
+        fields=["open", "close", "volume"],
+        start="2026-09-10", end="2026-09-11",
+    )
+    assert result.identity.release == release
+    assert result.frame["close"].tolist() == [2.20]
+    with pytest.raises(QuantDataSnapshotChanged):
+        client.native_bars_batch(
+            dataset, ["SH513100"], basis="qfq", fields=["close"],
+            start="2026-09-10", end="2026-09-11",
+        )
+    with pytest.raises(QuantDataClientError, match="coverage is incomplete"):
+        client.native_bars_batch(
+            dataset, ["SH513100"], basis="qfq", fields=["close"],
+            start="2026-09-10", end="2026-09-11",
+        )
+
+
+def test_native_ready_and_dataset_use_production_v2_identity() -> None:
+    meta = _native_metadata()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={
+                **meta, "status": "ready", "validated_datasets": 1,
+                "datasets": [{"dataset_id": "cn_etf_daily", "module_id": "cn_etf_daily",
+                              "status": "ready", "availability": "AVAILABLE"}],
+            })
+        assert request.url.path == "/v1/datasets/cn_etf_daily"
+        return httpx.Response(200, json={
+            "metadata": {**meta, "availability": {"cn_etf_daily": "AVAILABLE"}},
+            "coverage": {"symbols": ["SH513100", "SZ159915"]},
+        })
+
+    client = _client(handler)
+    release = client.native_ready()
+    readiness = client.ready()
+    dataset = client.native_dataset("cn_etf_daily", expected_release=release)
+    assert readiness.native_release == release
+    assert readiness.datasets[0]["module_release_sha256"] == "c" * 64
+    assert dataset.symbols == ("SH513100", "SZ159915")
+    assert dataset.identity.component_identities["qfq"] == "e" * 64

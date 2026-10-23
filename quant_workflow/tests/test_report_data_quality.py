@@ -989,6 +989,54 @@ class ReportDataQualityTest(unittest.TestCase):
         self.assertFalse(ready)
         self.assertIn("required feature files", detail["summary"].lower())
 
+    def test_binary_reader_keeps_windows_stat_api_checks_separate(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feature = Path(temp_dir) / "close.day.bin"
+            feature.write_bytes(np.array([0.0, 1.0, 2.0], dtype="<f4").tobytes())
+            metadata = feature.stat()
+            original_lstat = Path.lstat
+
+            for changed_api in (None, "handle", "path"):
+                with self.subTest(changed_api=changed_api):
+                    fd_reads = 0
+
+                    def state(ctime_ns):
+                        return SimpleNamespace(
+                            st_mode=metadata.st_mode,
+                            st_dev=metadata.st_dev,
+                            st_ino=metadata.st_ino,
+                            st_size=metadata.st_size,
+                            st_mtime_ns=metadata.st_mtime_ns,
+                            st_ctime_ns=ctime_ns,
+                        )
+
+                    def fstat(_fd):
+                        nonlocal fd_reads
+                        fd_reads += 1
+                        changed = changed_api == "handle" and fd_reads > 1
+                        return state(metadata.st_ctime_ns + 1000 + int(changed))
+
+                    def lstat(path, *args, **kwargs):
+                        if path == feature:
+                            changed = changed_api == "path" and fd_reads > 1
+                            return state(metadata.st_ctime_ns + int(changed))
+                        return original_lstat(path, *args, **kwargs)
+
+                    with (
+                        patch.object(module.sys, "platform", "win32"),
+                        patch.object(module.os, "fstat", side_effect=fstat),
+                        patch.object(Path, "lstat", lstat),
+                    ):
+                        loaded = module._read_qlib_feature_binary(feature, calendar_size=2)
+
+                    if changed_api is None:
+                        self.assertIsNotNone(loaded)
+                        self.assertEqual(loaded[0], 0)
+                        np.testing.assert_array_equal(loaded[1], [1.0, 2.0])
+                    else:
+                        self.assertIsNone(loaded)
+
     def test_invalid_required_instrument_binary_files_block_training(self):
         module = load_module()
         invalid_payloads = {

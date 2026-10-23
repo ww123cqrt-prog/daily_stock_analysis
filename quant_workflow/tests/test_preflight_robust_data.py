@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
-import fcntl
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
 import json
 import sys
 import time
@@ -288,7 +288,7 @@ def test_preflight_fails_fast_for_active_membership_writer_without_reading_parqu
     lock_path = pit_dir / ".build_pit_csi800.lock"
     started = time.monotonic()
     with lock_path.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file(handle, exclusive=True, blocking=False)
         try:
             result = module.run_preflight(
                 pit_dir=pit_dir,
@@ -301,7 +301,7 @@ def test_preflight_fails_fast_for_active_membership_writer_without_reading_parqu
                 expected_members_per_day=2,
             )
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
 
     assert time.monotonic() - started < 0.5
     assert result["status"] == "blocked_data"

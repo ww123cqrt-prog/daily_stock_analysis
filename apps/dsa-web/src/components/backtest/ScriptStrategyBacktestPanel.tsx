@@ -4,7 +4,7 @@ import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
 import { EditorView } from '@codemirror/view';
 import { useTheme } from 'next-themes';
-import { Activity, ChevronDown, Code2, Loader2, Play, RotateCcw, Save, ShieldCheck, Trash2 } from 'lucide-react';
+import { Activity, Archive, ArchiveRestore, ChevronDown, Code2, Loader2, Play, RotateCcw, Save, ShieldCheck } from 'lucide-react';
 import { backtestApi } from '../../api/backtest';
 import { getParsedApiError } from '../../api/error';
 import type { UiLanguage } from '../../i18n/uiText';
@@ -14,7 +14,7 @@ import type {
   StrategyAssetSummary,
   StrategyBacktestResponse,
 } from '../../types/backtest';
-import { ConfirmDialog } from '../common';
+import { Button } from '../common';
 import { PRESET_SCRIPTS, SAMPLE_SCRIPT } from './presetScripts';
 import StabilityResultPanel from './StabilityResultPanel';
 import StrategyBacktestResults from './StrategyBacktestResults';
@@ -97,6 +97,14 @@ const INDEX_CHOICES: Array<{ code: string; labelZh: string; labelEn: string }> =
   { code: 'SH000688', labelZh: '科创50', labelEn: 'STAR 50' },
 ];
 
+const LIBRARY_VIEWS = [
+  { id: 'active', labelZh: '主策略', labelEn: 'Main strategies' },
+  { id: 'archived', labelZh: '历史归档', labelEn: 'Archive' },
+  { id: 'presets', labelZh: '脚本模板', labelEn: 'Templates' },
+] as const;
+
+type LibraryView = typeof LIBRARY_VIEWS[number]['id'];
+
 function parseSymbols(value: string): string[] {
   return value.split(/[\s,，;；]+/).map(item => item.trim()).filter(Boolean);
 }
@@ -132,23 +140,39 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
 
   // Saved script assets (rule-based models)
   const [strategies, setStrategies] = useState<StrategyAssetSummary[]>([]);
+  const [archivedStrategies, setArchivedStrategies] = useState<StrategyAssetSummary[]>([]);
+  const [libraryView, setLibraryView] = useState<LibraryView>('active');
+  const [loadingStrategies, setLoadingStrategies] = useState(true);
+  const [loadingStrategy, setLoadingStrategy] = useState(false);
+  const [changingArchive, setChangingArchive] = useState(false);
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
   const [activePresetId, setActivePresetId] = useState<string>('');
   const [strategyName, setStrategyName] = useState('');
   const [savingStrategy, setSavingStrategy] = useState(false);
-  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+
+  const visibleStrategies = libraryView === 'archived' ? archivedStrategies : strategies;
+  const selectedStrategy = [...strategies, ...archivedStrategies].find(item => item.id === selectedStrategyId);
+  const libraryBusy = loadingStrategies || loadingStrategy || savingStrategy || changingArchive;
 
   // Durable run history
   const [runs, setRuns] = useState<BacktestRunSummary[]>([]);
-  const [refreshingRuns, setRefreshingRuns] = useState(false);
+  const [refreshingRuns, setRefreshingRuns] = useState(true);
   const [loadingRunId, setLoadingRunId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
   const loadStrategies = async () => {
+    setLoadingStrategies(true);
     try {
-      setStrategies(await backtestApi.listStrategyAssets());
+      const [current, archived] = await Promise.all([
+        backtestApi.listStrategyAssets(),
+        backtestApi.listStrategyAssets({ archived: true }),
+      ]);
+      setStrategies(current);
+      setArchivedStrategies(archived);
     } catch (reason) {
       setError(getParsedApiError(reason).message);
+    } finally {
+      setLoadingStrategies(false);
     }
   };
 
@@ -164,9 +188,36 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
   };
 
   useEffect(() => {
-    void loadStrategies();
-    void loadRuns();
+    let active = true;
+    void Promise.all([
+      backtestApi.listStrategyAssets(),
+      backtestApi.listStrategyAssets({ archived: true }),
+    ]).then(([current, archived]) => {
+      if (!active) return;
+      setStrategies(current);
+      setArchivedStrategies(archived);
+    }).catch(reason => {
+      if (active) setError(getParsedApiError(reason).message);
+    }).finally(() => {
+      if (active) setLoadingStrategies(false);
+    });
+    void backtestApi.listBacktestRuns({ limit: 20 }).then(history => {
+      if (active) setRuns(history);
+    }).catch(reason => {
+      if (active) setError(getParsedApiError(reason).message);
+    }).finally(() => {
+      if (active) setRefreshingRuns(false);
+    });
+    return () => { active = false; };
   }, []);
+
+  const changeLibraryView = (view: LibraryView) => {
+    setLibraryView(view);
+    setSelectedStrategyId('');
+    setActivePresetId('');
+    setStrategyName('');
+    setError(null);
+  };
 
   const selectStrategy = async (value: string) => {
     setError(null);
@@ -186,6 +237,7 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
       }
       return;
     }
+    setLoadingStrategy(true);
     try {
       const detail = await backtestApi.getStrategyAsset(value);
       setScript(detail.script);
@@ -195,6 +247,8 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
     } catch (reason) {
       setError(getParsedApiError(reason).message);
       await loadStrategies();
+    } finally {
+      setLoadingStrategy(false);
     }
   };
 
@@ -208,6 +262,10 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
       setError(zh ? '交易策略脚本不能为空。' : 'Trading strategy script cannot be empty.');
       return;
     }
+    if (!startDate || !endDate || startDate > endDate) {
+      setError(zh ? '请选择有效的开始和结束日期。' : 'Select a valid start and end date.');
+      return;
+    }
     setSavingStrategy(true);
     setError(null);
     try {
@@ -215,7 +273,9 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
         ? await backtestApi.updateStrategyAsset(selectedStrategyId, { name, script })
         : await backtestApi.saveStrategyAsset({ name, script });
       setSelectedStrategyId(saved.id);
+      setActivePresetId('');
       setStrategyName(saved.name);
+      setLibraryView(saved.archived ? 'archived' : 'active');
       await loadStrategies();
     } catch (reason) {
       setError(getParsedApiError(reason).message);
@@ -224,18 +284,22 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
     }
   };
 
-  const deleteStrategy = async () => {
-    if (!selectedStrategyId) return;
+  const changeArchiveState = async () => {
+    if (!selectedStrategy) return;
+    setChangingArchive(true);
     setError(null);
     try {
-      await backtestApi.deleteStrategyAsset(selectedStrategyId);
+      await backtestApi.updateStrategyAsset(selectedStrategy.id, {
+        archived: !selectedStrategy.archived,
+      });
       setSelectedStrategyId('');
+      setActivePresetId('');
       setStrategyName('');
       await loadStrategies();
     } catch (reason) {
       setError(getParsedApiError(reason).message);
     } finally {
-      setConfirmDeleteOpen(false);
+      setChangingArchive(false);
     }
   };
 
@@ -300,6 +364,10 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
     const seedValue = stabilitySeed.trim();
     if (!script.trim()) {
       setError(zh ? '交易策略脚本不能为空。' : 'Trading strategy script cannot be empty.');
+      return;
+    }
+    if (!startDate || !endDate || startDate > endDate) {
+      setError(zh ? '请选择有效的开始和结束日期。' : 'Select a valid start and end date.');
       return;
     }
     if (![capital, cost, lot, minWindow, iterations].every(Number.isFinite)) {
@@ -383,27 +451,70 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
     <main className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
       <div className="mx-auto max-w-[1780px] space-y-3">
         <section className="border border-border/70 bg-card/35 p-3">
-          <div className="flex flex-wrap items-end gap-2">
+          <div
+            role="tablist"
+            aria-label={zh ? '策略库' : 'Strategy library'}
+            className="mb-3 flex w-fit max-w-full border-b border-border/70"
+            onKeyDown={event => {
+              if (running || libraryBusy) return;
+              const index = LIBRARY_VIEWS.findIndex(view => view.id === libraryView);
+              const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+              if (!offset && event.key !== 'Home' && event.key !== 'End') return;
+              event.preventDefault();
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? LIBRARY_VIEWS.length - 1
+                : (index + offset + LIBRARY_VIEWS.length) % LIBRARY_VIEWS.length;
+              changeLibraryView(LIBRARY_VIEWS[next].id);
+              event.currentTarget.querySelector<HTMLButtonElement>(`[data-view="${LIBRARY_VIEWS[next].id}"]`)?.focus();
+            }}
+          >
+            {LIBRARY_VIEWS.map(view => (
+              <button
+                key={view.id}
+                id={`strategy-library-tab-${view.id}`}
+                type="button"
+                role="tab"
+                data-view={view.id}
+                aria-selected={libraryView === view.id}
+                aria-controls="strategy-library-panel"
+                tabIndex={libraryView === view.id ? 0 : -1}
+                disabled={running || libraryBusy}
+                onClick={() => changeLibraryView(view.id)}
+                className={`h-9 border-b-2 px-3 text-xs whitespace-nowrap transition-colors disabled:opacity-50 ${
+                  libraryView === view.id ? 'border-cyan-500 text-foreground' : 'border-transparent text-secondary-text hover:text-foreground'
+                }`}
+              >
+                {zh ? view.labelZh : view.labelEn}
+              </button>
+            ))}
+          </div>
+          <div
+            id="strategy-library-panel"
+            role="tabpanel"
+            aria-labelledby={`strategy-library-tab-${libraryView}`}
+            className="flex flex-wrap items-end gap-2"
+          >
             <label className="min-w-[200px] flex-1 space-y-1">
               <span className="text-xs text-secondary-text">{zh ? '已保存的脚本' : 'Saved scripts'}</span>
               <select
                 aria-label={zh ? '已保存的脚本' : 'Saved scripts'}
                 value={activePresetId ? `preset:${activePresetId}` : selectedStrategyId}
                 onChange={event => void selectStrategy(event.target.value)}
-                disabled={running || savingStrategy}
+                disabled={running || libraryBusy}
                 className={INPUT}
               >
-                <optgroup label={zh ? '预置' : 'Presets'}>
+                <option value="">{libraryView === 'archived' && !visibleStrategies.length
+                  ? (zh ? '暂无历史归档' : 'No archived strategies')
+                  : (zh ? '未保存的脚本' : 'Unsaved script')}</option>
+                {libraryView === 'presets' ? <optgroup label={zh ? '预置' : 'Presets'}>
                   {PRESET_SCRIPTS.map(item => (
                     <option key={item.id} value={`preset:${item.id}`}>{zh ? item.nameZh : item.nameEn}</option>
                   ))}
-                </optgroup>
-                <optgroup label={zh ? '已保存' : 'Saved'}>
-                  <option value="">{zh ? '未保存的脚本' : 'Unsaved script'}</option>
-                  {strategies.map(item => (
+                </optgroup> : <optgroup label={libraryView === 'archived'
+                  ? (zh ? '历史归档' : 'Archive') : (zh ? '主策略' : 'Main strategies')}>
+                  {visibleStrategies.map(item => (
                     <option key={item.id} value={item.id}>{item.name}</option>
                   ))}
-                </optgroup>
+                </optgroup>}
               </select>
             </label>
             <label className="min-w-[180px] flex-1 space-y-1">
@@ -412,7 +523,7 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
                 aria-label={zh ? '名称' : 'Name'}
                 value={strategyName}
                 onChange={event => setStrategyName(event.target.value)}
-                disabled={running || savingStrategy}
+                disabled={running || libraryBusy}
                 placeholder={zh ? '输入名称后保存' : 'Name to save as'}
                 className={INPUT}
               />
@@ -420,21 +531,26 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
             <button
               type="button"
               onClick={() => void saveStrategy()}
-              disabled={running || savingStrategy || !strategyName.trim()}
+              disabled={running || libraryBusy || !strategyName.trim()}
               className="btn-primary h-10 shrink-0 gap-2 px-4"
             >
               {savingStrategy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
               {selectedStrategyId ? (zh ? '保存修改' : 'Update') : (zh ? '保存脚本' : 'Save script')}
             </button>
-            <button
+            <Button
               type="button"
-              onClick={() => setConfirmDeleteOpen(true)}
-              disabled={running || savingStrategy || !selectedStrategyId}
-              className="btn-secondary h-10 shrink-0 gap-2 px-3 disabled:opacity-50"
-              aria-label={zh ? '删除脚本' : 'Delete script'}
+              onClick={() => void changeArchiveState()}
+              disabled={running || libraryBusy || !selectedStrategy}
+              variant="secondary"
+              className="h-10 w-10 shrink-0 rounded-lg px-0"
+              aria-label={selectedStrategy?.archived
+                ? (zh ? '恢复到主列表' : 'Restore to main list') : (zh ? '归档策略' : 'Archive strategy')}
+              title={selectedStrategy?.archived
+                ? (zh ? '恢复到主列表' : 'Restore to main list') : (zh ? '归档策略' : 'Archive strategy')}
             >
-              <Trash2 className="h-4 w-4" />
-            </button>
+              {changingArchive ? <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                : selectedStrategy?.archived ? <ArchiveRestore className="h-4 w-4 shrink-0" /> : <Archive className="h-4 w-4 shrink-0" />}
+            </Button>
           </div>
         </section>
 
@@ -450,7 +566,7 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
             >
               <option value="etf">{zh ? 'ETF 池' : 'ETF pool'}</option>
               <option value="csi800">{zh ? 'CSI800（PIT 成员）' : 'CSI800 (PIT members)'}</option>
-              <option value="all_a">{zh ? '全 A（PIT 可用集）' : 'All A-shares (PIT)'}</option>
+              <option value="all_a" disabled>{zh ? '全 A（暂未开放）' : 'All A-shares (unavailable)'}</option>
               <option value="custom">{zh ? '自选股票' : 'Custom'}</option>
             </select>
           </label>
@@ -466,8 +582,8 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
               placeholder={pool === 'custom' ? '600519, 159915' : zh ? '自选池可用' : 'Available for custom pool'}
             />
           </label>
-          <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期（空=全部历史）' : 'Start date (empty=full)'}</span><input type="date" lang="en" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
-          <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期（空=最新）' : 'End date (empty=latest)'}</span><input type="date" lang="en" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
+          <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '开始日期' : 'Start date'}</span><input type="date" lang="en" value={startDate} onChange={event => setStartDate(event.target.value)} className={INPUT} disabled={running} /></label>
+          <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '结束日期' : 'End date'}</span><input type="date" lang="en" value={endDate} onChange={event => setEndDate(event.target.value)} className={INPUT} disabled={running} /></label>
           <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '初始资金' : 'Initial capital'}</span><input aria-label={zh ? '初始资金' : 'Initial capital'} type="number" min="1" value={initialCapital} onChange={event => setInitialCapital(event.target.value)} className={INPUT} disabled={running} /></label>
           <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '单边费率（%，佣金+滑点）' : 'Fee per side (%)'}</span><input aria-label={zh ? '单边费率（%）' : 'Fee per side (%)'} type="number" min="0" max="5" step="0.01" value={sideCostPct} onChange={event => setSideCostPct(event.target.value)} className={INPUT} disabled={running} /></label>
           <label className="space-y-1"><span className="text-xs text-secondary-text">{zh ? '最小交易数量' : 'Lot size'}</span><input aria-label={zh ? '最小交易数量' : 'Lot size'} type="number" min="1" step="1" value={lotSize} onChange={event => setLotSize(event.target.value)} className={INPUT} disabled={running} /></label>
@@ -535,6 +651,18 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
                     className="h-3.5 w-3.5 accent-cyan-500"
                   />
                   {item.name}
+                </label>
+              ))}
+              {archivedStrategies.map(item => (
+                <label key={item.id} className="flex cursor-pointer items-center gap-1.5 text-xs text-secondary-text">
+                  <input
+                    type="checkbox"
+                    checked={compareStrategyIds.includes(item.id)}
+                    onChange={() => toggleCompareStrategy(item.id)}
+                    disabled={running}
+                    className="h-3.5 w-3.5 accent-cyan-500"
+                  />
+                  {item.name}{zh ? '（历史）' : ' (archived)'}
                 </label>
               ))}
             </div>
@@ -624,15 +752,6 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
         </div>
       </div>
 
-      <ConfirmDialog
-        isOpen={confirmDeleteOpen}
-        isDanger
-        title={zh ? '删除脚本' : 'Delete script'}
-        message={zh ? '确定删除该脚本？历史回测记录会保留，但不再关联该脚本。' : 'Delete this script? Historical runs are kept but will no longer link to it.'}
-        confirmText={zh ? '删除' : 'Delete'}
-        onConfirm={() => void deleteStrategy()}
-        onCancel={() => setConfirmDeleteOpen(false)}
-      />
     </main>
   );
 };

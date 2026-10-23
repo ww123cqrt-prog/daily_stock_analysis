@@ -4,7 +4,9 @@ import importlib.util
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -254,6 +256,33 @@ def test_filesystem_state_fingerprint_supports_platforms_without_fd_capabilities
     assert actual == expected
 
 
+def test_filesystem_state_fingerprint_fallback_accepts_windows_fd_ctime(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    (root / "one.bin").write_bytes(b"one")
+    expected = reference_filesystem_state_fingerprint(root)
+    original_fstat = module.os.fstat
+
+    def windows_fstat(fd):
+        info = original_fstat(fd)
+        fields = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        values = {name: getattr(info, name) for name in fields}
+        values["st_ctime_ns"] += 1000
+        return SimpleNamespace(**values)
+
+    with (
+        patch.object(module.os, "supports_dir_fd", set()),
+        patch.object(module.sys, "platform", "win32"),
+        patch.object(module.os, "fstat", side_effect=windows_fstat),
+    ):
+        actual = module.filesystem_state_fingerprint(root)
+
+    assert actual == expected
+
+
 def test_filesystem_state_fingerprint_rejects_directory_replaced_by_symlink(
     tmp_path: Path,
 ) -> None:
@@ -281,14 +310,16 @@ def test_filesystem_state_fingerprint_rejects_directory_replaced_by_symlink(
             module.filesystem_state_fingerprint(root)
 
 
+@pytest.mark.parametrize("portable", [False, True])
 def test_filesystem_state_fingerprint_rejects_entry_added_after_enumeration(
-    tmp_path: Path,
+    tmp_path: Path, portable: bool,
 ) -> None:
     module = load_module()
     root = tmp_path / "snapshot"
     root.mkdir()
     (root / "initial.bin").write_bytes(b"initial")
     original_scandir = module.os.scandir
+    original_iterdir = Path.iterdir
     injected = False
 
     class MutatingScandir:
@@ -315,14 +346,27 @@ def test_filesystem_state_fingerprint_rejects_entry_added_after_enumeration(
                     (root / "added-after-enumeration.bin").write_bytes(b"changed")
                 raise
 
-    with patch.object(
-        module.os, "scandir", side_effect=MutatingScandir
-    ) as patched_scandir:
+    def mutating_iterdir(path):
+        nonlocal injected
+        yield from original_iterdir(path)
+        if path == root and not injected:
+            injected = True
+            (root / "added-after-enumeration.bin").write_bytes(b"changed")
+
+    with (
+        patch.object(module.os, "scandir", side_effect=MutatingScandir) as patched_scandir,
+        patch.object(Path, "iterdir", mutating_iterdir),
+    ):
         supported_fd = set(module.os.supports_fd)
         supported_fd.add(patched_scandir)
-        with patch.object(module.os, "supports_fd", supported_fd):
+        supported_dir_fd = set() if portable else module.os.supports_dir_fd
+        with (
+            patch.object(module.os, "supports_fd", supported_fd),
+            patch.object(module.os, "supports_dir_fd", supported_dir_fd),
+        ):
             with pytest.raises(module.DataContractError, match="directory changed"):
                 module.filesystem_state_fingerprint(root)
+    assert injected, "the platform's actual enumeration path must be exercised"
 
 
 def test_filesystem_state_fingerprint_rejects_file_rewritten_after_scan(
@@ -337,6 +381,7 @@ def test_filesystem_state_fingerprint_rejects_file_rewritten_after_scan(
     target_state = target.stat()
     target_identity = (target_state.st_dev, target_state.st_ino)
     original_close = module.os.close
+    original_open = Path.open
     rewritten = False
 
     def close_and_rewrite(fd: int) -> None:
@@ -351,7 +396,20 @@ def test_filesystem_state_fingerprint_rejects_file_rewritten_after_scan(
             rewritten = True
             target.write_bytes(b"after")
 
-    with patch.object(module.os, "close", side_effect=close_and_rewrite):
+    @contextmanager
+    def open_and_rewrite(path, *args, **kwargs):
+        with original_open(path, *args, **kwargs) as handle:
+            yield handle
+        # The portable scan closes a Python stream instead of calling os.close.
+        nonlocal rewritten
+        if not rewritten and path == target:
+            rewritten = True
+            target.write_bytes(b"after")
+
+    with (
+        patch.object(module.os, "close", side_effect=close_and_rewrite),
+        patch.object(Path, "open", open_and_rewrite),
+    ):
         with pytest.raises(module.DataContractError, match="file changed"):
             module.filesystem_state_fingerprint(root)
 

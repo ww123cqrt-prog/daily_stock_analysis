@@ -17,7 +17,8 @@ def test_build_command_uses_goal1_fundamental_entrypoint(tmp_path: Path) -> None
     assert command[1].endswith("download_robust_fundamentals.py")
     assert "--data-end 2025-12-31" in joined
     assert "--report-end 2025-12-31" in joined
-    assert "2026" not in joined
+    for flag in ("--data-start", "--data-end", "--report-start", "--report-end"):
+        assert command[command.index(flag) + 1] < "2026-01-01"
     assert str(tmp_path / "reports" / "runs" / "fundamental-run" / "status.json") in command
 
 

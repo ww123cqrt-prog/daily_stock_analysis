@@ -1,16 +1,20 @@
-import fcntl
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 
 def load_module():
@@ -285,7 +289,102 @@ def seed_qlib_v2_snapshot(module, quant_data: Path) -> Path:
     )
 
 
+def test_sync_windows_directory_fsync_keeps_file_flush_and_atomic_replace(
+    tmp_path, monkeypatch
+):
+    module = load_module()
+    contract = sys.modules["quant_data_contract"]
+    original_open, original_fsync, original_replace = os.open, os.fsync, os.replace
+    directories, flushed_modes, replacements = [], [], set()
+
+    def deny_directory(path, *args, **kwargs):
+        if Path(path).is_dir():
+            directories.append(Path(path))
+            raise PermissionError("Windows directory descriptors are unavailable")
+        return original_open(path, *args, **kwargs)
+
+    def flush_file(descriptor):
+        flushed_modes.append(os.fstat(descriptor).st_mode)
+        return original_fsync(descriptor)
+
+    def replace_file(source, destination):
+        assert Path(source).is_file()
+        replacements.add(Path(destination))
+        return original_replace(source, destination)
+
+    overrides = dict(open=deny_directory, fsync=flush_file, replace=replace_file)
+    monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), **overrides}))
+    monkeypatch.setattr(
+        contract, "os", SimpleNamespace(**{**vars(os), **overrides, "name": "nt"})
+    )
+    path = module.sync_data_manifest(
+        quant_data_root=tmp_path, reports_root=tmp_path / "reports"
+    )
+
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert module.README_BLOCK_START in (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert replacements >= {tmp_path / "DATA_MANIFEST.json", tmp_path / "README.md"}
+    assert len(flushed_modes) >= 2 and all(stat.S_ISREG(mode) for mode in flushed_modes)
+    assert directories == []
+    assert not list(tmp_path.rglob(".*.tmp"))
+
+
+@pytest.mark.parametrize("writer", ["manifest", "readme"])
+def test_sync_posix_directory_fsync_failure_is_not_suppressed(
+    tmp_path, monkeypatch, writer
+):
+    module = load_module()
+    contract = sys.modules["quant_data_contract"]
+    original_open = os.open
+    directories = []
+
+    def deny_directory(path, *args, **kwargs):
+        if Path(path).is_dir():
+            directories.append(Path(path))
+            raise PermissionError("POSIX directory flush denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        module, "os", SimpleNamespace(**{**vars(os), "open": deny_directory})
+    )
+    monkeypatch.setattr(
+        contract, "os", SimpleNamespace(**{**vars(os), "open": deny_directory, "name": "posix"})
+    )
+    with pytest.raises(PermissionError, match="POSIX directory flush denied"):
+        if writer == "manifest":
+            module.sync_data_manifest(quant_data_root=tmp_path, reports_root=tmp_path / "reports")
+        else:
+            module._atomic_write_text(tmp_path / "README.md", "updated text\n")
+    assert directories == [tmp_path]
+    assert not list(tmp_path.rglob(".*.tmp"))
+
+
 class SyncDataManifestTest(unittest.TestCase):
+    def test_render_catalog_hides_dynamic_latest_trade_date(self):
+        module = load_module()
+        manifest = {
+            "datasets": {
+                "ashare_daily_raw": {
+                    "dataset_id": "ashare_daily_raw",
+                    "role": "canonical",
+                    "status": "ready",
+                    "price_basis": "raw",
+                    "latest_trade_date": "2026-08-21",
+                    "source": {"provider": "baostock"},
+                    "path": "parquet/ashare_1d/ashare_daily_raw",
+                }
+            }
+        }
+
+        block = module._render_catalog_block(manifest, "")
+
+        self.assertNotIn("最新交易日", block)
+        self.assertNotIn("2026-08-21", block)
+        self.assertIn(
+            "| dataset_id | 角色 | 状态 | 价格口径 | 来源 | 相对路径 |",
+            block,
+        )
+
     def test_known_native_cleaned_pointer_resolves_stable_dataset_id(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -871,7 +970,7 @@ class SyncDataManifestTest(unittest.TestCase):
             )
             lock_path.parent.mkdir(parents=True)
             with lock_path.open("a+b") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(handle, exclusive=True, blocking=False)
                 try:
                     with self.assertRaisesRegex(
                         module.DataContractError,
@@ -882,7 +981,7 @@ class SyncDataManifestTest(unittest.TestCase):
                             reports_root=root / "reports",
                         )
                 finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    unlock_file(handle)
 
     def test_sync_manifest_reflects_actual_cleaned_provider_calendar(self):
         module = load_module()
@@ -1085,14 +1184,12 @@ class SyncDataManifestTest(unittest.TestCase):
             def probing_reference_lock(reference_dir):
                 with (pit_dir / ".build_pit_csi800.lock").open("a+b") as handle:
                     try:
-                        fcntl.flock(
-                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                        )
+                        lock_file(handle, exclusive=True, blocking=False)
                     except BlockingIOError:
                         exclusive_lock_acquired.append(False)
                     else:
                         exclusive_lock_acquired.append(True)
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        unlock_file(handle)
                 with original_reference_lock(reference_dir) as snapshot:
                     yield snapshot
 

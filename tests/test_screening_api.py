@@ -1977,14 +1977,17 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
     def test_hotspot_provider_detail_fallback_reuses_one_configured_deadline(self) -> None:
         provider = screening_service.DsaEastMoneyHotspotProvider()
         observed_timeouts: List[float] = []
+        monotonic_now = 0.0
 
         def record_remaining(value: Any) -> Any:
+            nonlocal monotonic_now
             observed_timeouts.append(provider._akshare_timeout_seconds())
-            time.sleep(0.005)
+            monotonic_now += 0.005
             return value
 
         with (
             patch.dict(os.environ, {"SCREENING_HOTSPOT_CALL_TIMEOUT_SEC": "0.25"}, clear=False),
+            patch("src.services.screening_service.time.monotonic", side_effect=lambda: monotonic_now),
             patch.object(provider, "_find_board_change", side_effect=lambda _topic: record_remaining({})),
             patch.object(provider, "_is_industry_hotspot", side_effect=lambda _topic: record_remaining(False)),
             patch.object(

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -46,8 +47,9 @@ class SuperviseBaostockTest(unittest.TestCase):
             check=True,
         )
 
-        self.assertIn(f'"python": "{sys.executable}"', result.stdout)
-        self.assertNotIn(str(override), result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(Path(payload["python"]), Path(sys.executable))
+        self.assertNotEqual(Path(payload["python"]), override)
 
     def test_quant_workflow_python_env_can_override_current_interpreter(self):
         override = Path("/tmp/dsa-shared-python")
@@ -75,8 +77,9 @@ class SuperviseBaostockTest(unittest.TestCase):
             check=True,
         )
 
-        self.assertIn(f'"python": "{override}"', result.stdout)
-        self.assertNotIn("/tmp/legacy-qlib-python", result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(Path(payload["python"]), override)
+        self.assertNotEqual(Path(payload["python"]), Path(env["QLIB_PYTHON"]))
 
 
 if __name__ == "__main__":

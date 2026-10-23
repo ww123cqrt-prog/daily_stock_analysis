@@ -1,10 +1,12 @@
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -58,6 +60,43 @@ def write_complete_provider(
 
 
 class AddIndexBenchmarkTest(unittest.TestCase):
+    def test_windows_tree_fsync_uses_writable_file_descriptors(self):
+        module = load_module()
+        opened, flushed = [], []
+        original_open, original_fsync = os.open, os.fsync
+
+        def open_file(path, flags, *args, **kwargs):
+            self.assertTrue(Path(path).is_file())
+            self.assertTrue(flags & os.O_RDWR)
+            opened.append(Path(path))
+            return original_open(path, flags, *args, **kwargs)
+
+        def flush_file(fd):
+            flushed.append(fd)
+            return original_fsync(fd)
+
+        fake_os = SimpleNamespace(
+            **{**vars(os), "name": "nt", "open": open_file, "fsync": flush_file}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "feature.bin"
+            path.write_bytes(b"unchanged")
+            with mock.patch.object(module, "os", fake_os):
+                module._fsync_tree(root)
+            self.assertEqual(opened, [path])
+            self.assertEqual(len(flushed), 1)
+            self.assertEqual(path.read_bytes(), b"unchanged")
+
+    def test_tree_file_fsync_error_is_not_suppressed(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "feature.bin").write_bytes(b"unchanged")
+            with mock.patch.object(module.os, "fsync", side_effect=OSError("file flush failed")):
+                with self.assertRaisesRegex(OSError, "file flush failed"):
+                    module._fsync_tree(root)
+
     def test_eastmoney_source_maps_daily_ohlcv_for_all_benchmarks(self):
         module = load_sources_module()
 

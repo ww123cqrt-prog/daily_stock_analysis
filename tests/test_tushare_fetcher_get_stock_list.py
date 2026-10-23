@@ -45,7 +45,7 @@ from data_provider.tushare_fetcher import TushareFetcher
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+    load_dotenv(os.environ.get("ENV_FILE", os.path.join(_PROJECT_ROOT, ".env")))
 except ImportError:
     pass
 

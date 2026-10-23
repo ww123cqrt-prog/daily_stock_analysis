@@ -36,10 +36,10 @@ def _script_sha256(script: str) -> str:
 
 
 @router.get("/strategies", response_model=list[StrategyAssetSummary])
-async def list_strategies() -> list[StrategyAssetSummary]:
+async def list_strategies(archived: bool = Query(False)) -> list[StrategyAssetSummary]:
     """List saved named strategies (newest first, script bodies excluded)."""
     repo = get_strategy_assets_repo()
-    return [StrategyAssetSummary(**item) for item in repo.list_strategies()]
+    return [StrategyAssetSummary(**item) for item in repo.list_strategies(archived=archived)]
 
 
 @router.post("/strategies", response_model=StrategyAssetDetail, status_code=201)

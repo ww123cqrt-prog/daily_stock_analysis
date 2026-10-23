@@ -20,6 +20,7 @@ stores are merged only when the workbench asset model is finalised.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = "2026-08-14-freeze-script"
+_SCHEMA_VERSION = "2026-10-18-strategy-archive"
 
 _local = threading.local()
 
@@ -114,6 +115,7 @@ class StrategyAssetsRepository:
                     script TEXT NOT NULL,
                     script_sha256 TEXT NOT NULL,
                     api_version TEXT NOT NULL DEFAULT 'dsa-script-v1',
+                    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -160,6 +162,14 @@ class StrategyAssetsRepository:
                 conn.execute(
                     "ALTER TABLE backtest_runs ADD COLUMN script_json TEXT NOT NULL DEFAULT ''"
                 )
+            asset_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(strategy_assets)")
+            }
+            if "archived" not in asset_columns:
+                conn.execute(
+                    "ALTER TABLE strategy_assets ADD COLUMN archived INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK (archived IN (0, 1))"
+                )
 
     # === Strategy asset CRUD ===
 
@@ -172,6 +182,9 @@ class StrategyAssetsRepository:
         description: str = "",
         api_version: str = "dsa-script-v1",
     ) -> Dict[str, Any]:
+        actual_script_sha256 = hashlib.sha256(script.encode("utf-8")).hexdigest()
+        if script_sha256 != actual_script_sha256:
+            raise ValueError("script_sha256 does not match script contents")
         strategy_id = _generate_id()
         now = _utc_now_iso()
         with self._transaction() as conn:
@@ -186,18 +199,21 @@ class StrategyAssetsRepository:
             )
         return self.get_strategy(strategy_id)  # type: ignore[return-value]
 
-    def list_strategies(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_strategies(
+        self, limit: int = 100, *, archived: bool = False
+    ) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         with self._transaction() as conn:
             rows = conn.execute(
                 """
-                SELECT id, name, description, script_sha256, api_version,
+                SELECT id, name, description, script_sha256, api_version, archived,
                        created_at, updated_at
                 FROM strategy_assets
+                WHERE archived = ?
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (int(archived), limit),
             ).fetchall()
         return [_strategy_summary_row(row) for row in rows]
 
@@ -217,10 +233,19 @@ class StrategyAssetsRepository:
         script: Optional[str] = None,
         script_sha256: Optional[str] = None,
         api_version: Optional[str] = None,
+        archived: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         existing = self.get_strategy(strategy_id)
         if existing is None:
             return None
+        if script is not None:
+            actual_script_sha256 = hashlib.sha256(script.encode("utf-8")).hexdigest()
+            if script_sha256 is None:
+                script_sha256 = actual_script_sha256
+            elif script_sha256 != actual_script_sha256:
+                raise ValueError("script_sha256 does not match script contents")
+        elif script_sha256 is not None and script_sha256 != existing["script_sha256"]:
+            raise ValueError("script_sha256 does not match existing script contents")
         updates: List[str] = []
         values: List[Any] = []
         if name is not None:
@@ -238,6 +263,9 @@ class StrategyAssetsRepository:
         if api_version is not None:
             updates.append("api_version = ?")
             values.append(api_version)
+        if archived is not None:
+            updates.append("archived = ?")
+            values.append(int(archived))
         if not updates:
             return existing
         updates.append("updated_at = ?")
@@ -272,6 +300,10 @@ class StrategyAssetsRepository:
         status: str = "completed",
         error_message: Optional[str] = None,
     ) -> Dict[str, Any]:
+        actual_script_sha256 = hashlib.sha256(script.encode("utf-8")).hexdigest()
+        if script_sha256 != actual_script_sha256:
+            raise ValueError("script_sha256 does not match script contents")
+
         run_id = _generate_id()
         created_at = _utc_now_iso()
         with self._transaction() as conn:
@@ -379,6 +411,7 @@ def _strategy_summary_row(row: sqlite3.Row) -> Dict[str, Any]:
         "description": row["description"],
         "script_sha256": row["script_sha256"],
         "api_version": row["api_version"],
+        "archived": bool(row["archived"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

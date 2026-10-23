@@ -28,6 +28,7 @@ from api.v1.schemas.backtest import (
     TrainedStrategyBacktestRunRequest,
 )
 from api.v1.schemas.common import ErrorResponse
+from quant_workflow.scripts.quant_data_service_client import QuantDataClientError
 from src.repositories.strategy_assets_repo import get_strategy_assets_repo
 from src.services.backtest_service import BacktestService
 from src.services.trained_strategy_backtest_service import TrainedStrategyBacktestService
@@ -52,6 +53,14 @@ def _validate_analysis_date_range(
                 "message": "analysis_date_from cannot be after analysis_date_to",
             },
         )
+
+
+def _quant_data_http_error(exc: QuantDataClientError) -> HTTPException:
+    status = exc.status_code if exc.status_code in {400, 404, 409, 503} else 503
+    return HTTPException(
+        status_code=status,
+        detail={"error": exc.code, "message": f"quant_data {exc.code}: {exc}"},
+    )
 
 
 @router.get(
@@ -197,6 +206,8 @@ def run_form_strategy_backtest(
             top_n=request.top_n,
         )
         return StrategyBacktestResponse(**report)
+    except QuantDataClientError as exc:
+        raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -254,6 +265,8 @@ def run_script_strategy_backtest(
             # completed backtest or its response.
             logger.warning("脚本回测结果落库失败（不影响本次回测）", exc_info=True)
         return StrategyBacktestResponse(**report)
+    except QuantDataClientError as exc:
+        raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -345,6 +358,8 @@ def run_script_stability_test(
             seed=request.seed,
         )
         return StabilityTestResponse(**report)
+    except QuantDataClientError as exc:
+        raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,

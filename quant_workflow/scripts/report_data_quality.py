@@ -39,6 +39,7 @@ from quant_data_contract import (  # noqa: E402
     AUTHORITATIVE_QUALITY_MIN_CALENDAR_DAYS,
     AUTHORITATIVE_QUALITY_MIN_INSTRUMENTS,
     DataContractError,
+    _opened_file_matches_path,
     atomic_write_json,
     filesystem_state_fingerprint,
     resolve_dataset,
@@ -613,6 +614,9 @@ def _read_qlib_feature_binary(
         flags |= os.O_CLOEXEC
     file_fd: int | None = None
     try:
+        path_before = path.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            return None
         file_fd = os.open(path, flags)
         before = os.fstat(file_fd)
         if (
@@ -652,7 +656,15 @@ def _read_qlib_feature_binary(
         if (
             not stat.S_ISREG(current.st_mode)
             or identity_before != identity_after
-            or identity_before != identity_current
+            or (
+                path_before.st_dev,
+                path_before.st_ino,
+                path_before.st_size,
+                path_before.st_mtime_ns,
+                path_before.st_ctime_ns,
+            ) != identity_current
+            or not _opened_file_matches_path(before, path_before)
+            or not _opened_file_matches_path(after, current)
         ):
             return None
         raw = np.frombuffer(payload, dtype="<f4")

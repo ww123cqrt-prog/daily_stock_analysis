@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _file_lock import lock_file, unlock_file
+from quant_data_contract import _opened_file_matches_path
 
 
 REFERENCE_SOURCE_FILENAME = "REFERENCE_SOURCE.json"
@@ -204,22 +205,43 @@ class LockedReferenceSnapshot:
         self._require_active()
         self.ensure_transaction_clean()
         digest = hashlib.sha256()
+        state_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
         try:
             for file_name in REFERENCE_SNAPSHOT_FILES:
                 encoded_name = file_name.encode("utf-8")
                 digest.update(len(encoded_name).to_bytes(4, "big"))
                 digest.update(encoded_name)
                 path = self.reference_dir / file_name
-                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(path, flags)
-                file_stat = os.fstat(descriptor)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    os.close(descriptor)
+                path_before = path.lstat()
+                if not stat.S_ISREG(path_before.st_mode):
                     raise OSError
-                digest.update(file_stat.st_size.to_bytes(8, "big"))
-                with os.fdopen(descriptor, "rb") as stream:
-                    while chunk := stream.read(1024 * 1024):
-                        digest.update(chunk)
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(path, flags)
+                try:
+                    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                        file_stat = os.fstat(descriptor)
+                        if not _opened_file_matches_path(file_stat, path_before):
+                            raise OSError
+                        digest.update(file_stat.st_size.to_bytes(8, "big"))
+                        while chunk := stream.read(1024 * 1024):
+                            digest.update(chunk)
+                        file_after = os.fstat(descriptor)
+                        path_after = path.lstat()
+                        # Compare ctime only within the same API on Windows.
+                        if (
+                            tuple(getattr(path_before, field) for field in state_fields)
+                            != tuple(getattr(path_after, field) for field in state_fields)
+                            or tuple(getattr(file_stat, field) for field in state_fields)
+                            != tuple(getattr(file_after, field) for field in state_fields)
+                            or not _opened_file_matches_path(file_after, path_after)
+                        ):
+                            raise OSError
+                finally:
+                    os.close(descriptor)
         except OSError as exc:
             raise ReferenceIntegrityError(
                 "reference_snapshot_invalid", "reference snapshot files are incomplete"

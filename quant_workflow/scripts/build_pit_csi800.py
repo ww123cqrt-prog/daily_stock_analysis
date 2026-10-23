@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import hashlib
 import json
 import math
@@ -27,9 +26,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import quant_data_root  # noqa: E402
 from _symbols import to_qlib_name  # noqa: E402
 from download_jqdata import _load_jq_module, authenticate  # noqa: E402
+from quant_data_contract import _fsync_directory  # noqa: E402
 
 
 CSI300 = "000300.XSHG"
@@ -317,12 +318,12 @@ def _normalize_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
 def _exclusive_build_lock(output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / ".build_pit_csi800.lock"
-    with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with lock_path.open("a+b") as lock_handle:
+        lock_file(lock_handle, exclusive=True)
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            unlock_file(lock_handle)
 
 
 @contextmanager
@@ -401,15 +402,9 @@ def _file_sha256(path: Path) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:

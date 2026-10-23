@@ -14,7 +14,8 @@ Usage:
     python scripts/optimize_strategy.py --dry-run           # 只跑内置小样本预演
 """
 import multiprocessing
-multiprocessing.set_start_method("fork", force=True)
+if "fork" in multiprocessing.get_all_start_methods():
+    multiprocessing.set_start_method("fork", force=True)
 
 import argparse
 import shutil

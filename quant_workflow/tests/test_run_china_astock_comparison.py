@@ -49,11 +49,15 @@ class RunChinaAstockComparisonTest(unittest.TestCase):
 
             paths = module.build_paths(project_root, None, None, None, timestamp="20260705_010203")
 
-        self.assertTrue(str(paths.project_root).endswith("china-astock-quant"))
+        self.assertEqual(paths.project_root.name, "china-astock-quant")
         self.assertEqual(paths.full_search, paths.project_root / "reports" / "full_search.json")
         self.assertEqual(paths.evaluation, paths.project_root / "reports" / "evaluate_winners.csv")
-        self.assertTrue(str(paths.out_csv).endswith("quant_workflow/reports/china_astock_strategy_comparison_20260705_010203.csv"))
-        self.assertTrue(str(paths.out_md).endswith("quant_workflow/reports/china_astock_strategy_comparison_20260705_010203.md"))
+        self.assertEqual(paths.out_csv.parts[-3:], (
+            "quant_workflow", "reports", "china_astock_strategy_comparison_20260705_010203.csv",
+        ))
+        self.assertEqual(paths.out_md.parts[-3:], (
+            "quant_workflow", "reports", "china_astock_strategy_comparison_20260705_010203.md",
+        ))
 
     def test_rejects_project_root_without_expected_script(self):
         module = load_module()

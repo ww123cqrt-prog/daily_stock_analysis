@@ -78,18 +78,62 @@ def test_miniqmt_shared_source_receipt_tampering_is_rejected(tmp_path, monkeypat
 
 
 def test_actual_cli_updates_temp_snapshot_through_default_source(tmp_path, monkeypatch, capsys):
-    from data_provider.miniqmt_bridge import MiniQMTBridgeClient
+    import quant_qmt_data as provider
+    from quant_qmt_data import miniqmt_etf_source as source
+    from quant_qmt_data.miniqmt_bridge import MiniQMTBridgeClient
     from quant_workflow.tests.test_quant_data_cli import load_module as load_cli
     module = load_module()
-    import miniqmt_etf_source
     root, old = _seed_current_paired_snapshot(module, monkeypatch, tmp_path)
+    previous = provider.read_bars("cn_etf_daily", "SH510050", quant_data_root=root, price_basis="qfq")
+    old_files = {path: path.read_bytes() for path in old.rglob("*") if path.is_file()}
     calls = []
-    monkeypatch.setattr(miniqmt_etf_source, "MiniQMTBridgeClient", lambda: MiniQMTBridgeClient(transport=source_transport(calls)))
+    network_allowed = True
+    days = ["2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"]
+
+    def transport(request):
+        assert network_allowed, "the committed update must replay without reconnecting MiniQMT"
+        calls.append(request)
+        selected = [day for day in days
+                    if pd.Timestamp(request["start"]) <= pd.Timestamp(day) <= pd.Timestamp(request["end"])]
+        if request["operation"] == "universe":
+            data = {asset: {"symbols": ["510050.SH", "159915.SZ"], "status": "ok"}
+                    for asset in request["symbols"]}
+        elif request["operation"] == "instruments":
+            data = {symbol: {"name": symbol, "open_date": days[0], "expire_date": None,
+                             "security_types": {"stock": False, "etf": True}}
+                    for symbol in request["symbols"]}
+        elif request["operation"] == "calendar":
+            data = {market: {"dates": selected} for market in request["symbols"]}
+        else:
+            assert request["operation"] == "update_pair"
+            rows = [dict(bar(day, close), high=close * 1.01, low=close * .99, volume=100)
+                    for day, close in zip(days, [1., 1.1, 1.2, 1.3]) if day in selected]
+            data = {symbol: dict(raw=rows, qfq=rows, actions=[], calendar=selected,
+                                 volume_unit="lots", action_history_through=days[-1])
+                    for symbol in request["symbols"]}
+        return reply(request, data)
+
+    monkeypatch.setattr(source, "MiniQMTBridgeClient", lambda: MiniQMTBridgeClient(transport=transport))
     cli = load_cli()
-    assert cli.main(["--root", str(root), "update", "cn_etf_daily", "--through", "2026-08-07"]) == 0
-    pointer = json.loads((root / "parquet/etf_1d/cn_etf_daily/LATEST.json").read_text())
+    command = ["--root", str(root), "update", "cn_etf_daily", "--through", days[-1]]
+    assert cli.main(command) == 0
+    pointer_path = root / "parquet/etf_1d/cn_etf_daily/LATEST.json"
+    pointer_bytes = pointer_path.read_bytes()
+    pointer = json.loads(pointer_bytes)
     assert pointer["snapshot_id"] != old.name
-    assert any(r["operation"] == "update_pair" for r in calls)
+    assert {"universe", "calendar", "update_pair"} <= {request["operation"] for request in calls}
+    updated = provider.read_bars("cn_etf_daily", "SH510050", quant_data_root=root, price_basis="qfq")
+    assert updated["close"].tolist() == [1., 1.1, 1.2, 1.3]
+    columns = ["date", "open", "high", "low", "close", "volume"]
+    pd.testing.assert_frame_equal(updated.iloc[:len(previous)][columns].reset_index(drop=True), previous[columns])
+    assert all(path.read_bytes() == body for path, body in old_files.items())
+    calls.clear()
+    network_allowed = False
+    assert cli.main(command) == 0
+    assert calls == []
+    assert pointer_path.read_bytes() == pointer_bytes
+    pd.testing.assert_frame_equal(
+        provider.read_bars("cn_etf_daily", "SH510050", quant_data_root=root, price_basis="qfq"), updated)
 
 
 def test_bad_symbol_keeps_old_history_while_healthy_symbol_updates(tmp_path, monkeypatch):

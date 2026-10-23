@@ -12,12 +12,20 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from sqlalchemy import create_engine
 from sqlalchemy.pool import QueuePool
 
 from src.agent.codex_tool_process import MAX_TOOL_RESULT_BYTES, CodexToolProcessRunner
 from src.agent.stock_scope import StockScope
 from src.agent.tools.execution import ToolAccessContext
+
+
+_POSIX_TOOL_PROCESS_ONLY = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Codex App Server tool workers require POSIX session/process-group isolation",
+)
 
 
 def _ok_result(tool_name: str, payload: dict) -> dict:
@@ -153,6 +161,7 @@ def _execute_in_thread(
     return thread, output
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_three_production_tools_execute_through_spawned_worker(
     tmp_path: Path,
     monkeypatch,
@@ -193,6 +202,7 @@ def test_three_production_tools_execute_through_spawned_worker(
     assert all(record["pid_alive_after"] is False for record in records)
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_running_sqlite_query_is_cancelled_and_reaped_three_times(tmp_path: Path) -> None:
     runner = CodexToolProcessRunner(worker=_sqlite_query_worker)
     try:
@@ -225,6 +235,7 @@ def test_running_sqlite_query_is_cancelled_and_reaped_three_times(tmp_path: Path
     assert all(record["pid_alive_after"] is False for record in records)
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_sqlite_lock_wait_is_cancelled_without_leaving_database_locked(tmp_path: Path) -> None:
     db_path = tmp_path / "lock.db"
     setup = sqlite3.connect(db_path, isolation_level=None)
@@ -263,6 +274,7 @@ def test_sqlite_lock_wait_is_cancelled_without_leaving_database_locked(tmp_path:
     assert runner.snapshot()[-1]["pid_alive_after"] is False
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_pool_wait_honors_deadline_and_releases_worker(tmp_path: Path) -> None:
     db_path = tmp_path / "pool.db"
     sqlite3.connect(db_path).close()
@@ -286,6 +298,7 @@ def test_pool_wait_honors_deadline_and_releases_worker(tmp_path: Path) -> None:
     verifier.close()
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_child_crash_is_reported_and_reaped(tmp_path: Path) -> None:
     marker = tmp_path / "crash.marker"
     runner = CodexToolProcessRunner(worker=_crash_worker)
@@ -322,6 +335,7 @@ def test_pre_cancelled_call_never_spawns_worker() -> None:
     assert runner.snapshot() == ()
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_ipc_limit_is_measured_on_raw_result_bytes_not_json_escaping() -> None:
     runner = CodexToolProcessRunner(worker=_escaped_result_worker)
     try:
@@ -337,6 +351,7 @@ def test_ipc_limit_is_measured_on_raw_result_bytes_not_json_escaping() -> None:
     assert len(result["result_text"].encode("utf-8")) == MAX_TOOL_RESULT_BYTES
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_ipc_reports_output_too_large_for_raw_result_over_limit() -> None:
     runner = CodexToolProcessRunner(worker=_escaped_result_worker)
     try:
@@ -352,6 +367,7 @@ def test_ipc_reports_output_too_large_for_raw_result_over_limit() -> None:
     assert result["error"]["code"] == "output_too_large"
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_ipc_rejects_tool_surface_truncation_as_output_too_large() -> None:
     runner = CodexToolProcessRunner(worker=_truncated_surface_result_worker)
     try:
@@ -367,6 +383,7 @@ def test_ipc_rejects_tool_surface_truncation_as_output_too_large() -> None:
     assert result["error"]["code"] == "output_too_large"
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_runner_close_reaps_active_worker_before_returning(tmp_path: Path) -> None:
     marker = tmp_path / "close.marker"
     runner = CodexToolProcessRunner(worker=_sqlite_query_worker)
@@ -389,6 +406,7 @@ def test_runner_close_reaps_active_worker_before_returning(tmp_path: Path) -> No
     assert runner.snapshot()[-1]["pid_alive_after"] is False
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_completed_cleanup_is_idempotent_for_stale_owner_reference(tmp_path: Path) -> None:
     marker = tmp_path / "close-race.marker"
     cancel_event = threading.Event()
@@ -413,6 +431,7 @@ def test_completed_cleanup_is_idempotent_for_stale_owner_reference(tmp_path: Pat
     assert runner.snapshot()[-1]["pid_alive_after"] is False
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_term_escalates_to_kill_and_reaps_owned_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "ignore-term.marker"
     cancel_event = threading.Event()
@@ -438,6 +457,7 @@ def test_term_escalates_to_kill_and_reaps_owned_process_group(tmp_path: Path) ->
     assert record["pid_alive_after"] is False
 
 
+@_POSIX_TOOL_PROCESS_ONLY
 def test_child_crash_reaps_descendant_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "descendant.pid"
     runner = CodexToolProcessRunner(worker=_crash_with_descendant_worker)

@@ -105,15 +105,33 @@ describe('BacktestPage', () => {
   it('runs the form strategy and shows the result', async () => {
     renderPage();
 
+    fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: '2020-01-01' } });
+    fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: '2020-06-30' } });
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => expect(runFormStrategy).toHaveBeenCalledWith(expect.objectContaining({
       strategyId: 'momentum_rotation',
       symbols: ['159915', '513100'],
+      startDate: '2020-01-01',
+      endDate: '2020-06-30',
       lookbackDays: 20,
       movingAverageDays: 20,
       topN: 1,
     })));
     expect(await screen.findByText('cn_etf_daily')).toBeInTheDocument();
+  });
+
+  it.each([
+    { startDate: '', endDate: '' },
+    { startDate: '2020-07-01', endDate: '2020-06-30' },
+  ])('rejects invalid dates before submitting ($startDate, $endDate)', ({ startDate, endDate }) => {
+    renderPage();
+
+    fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: startDate } });
+    fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: endDate } });
+    fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('请选择有效的开始和结束日期。');
+    expect(runFormStrategy).not.toHaveBeenCalled();
   });
 });

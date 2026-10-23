@@ -30,11 +30,17 @@ class PublishDailyCandidateTest(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_bytes(b"new")
 
-            with patch.object(module.os, "fsync") as fsync:
+            with (
+                patch.object(module.os, "fsync") as fsync,
+                patch.object(
+                    module, "_fsync_directory", wraps=module._fsync_directory
+                ) as fsync_directory,
+            ):
                 module._restore_manifest(path, b"old")
 
             self.assertEqual(path.read_bytes(), b"old")
-            self.assertEqual(fsync.call_count, 2)
+            fsync_directory.assert_called_once_with(path.parent)
+            self.assertEqual(fsync.call_count, 1 if module.os.name == "nt" else 2)
 
     def test_restore_manifest_fsyncs_parent_after_deletion(self):
         module = load_module()
@@ -43,11 +49,17 @@ class PublishDailyCandidateTest(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_bytes(b"new")
 
-            with patch.object(module.os, "fsync") as fsync:
+            with (
+                patch.object(module.os, "fsync") as fsync,
+                patch.object(
+                    module, "_fsync_directory", wraps=module._fsync_directory
+                ) as fsync_directory,
+            ):
                 module._restore_manifest(path, None)
 
             self.assertFalse(path.exists())
-            self.assertEqual(fsync.call_count, 1)
+            fsync_directory.assert_called_once_with(path.parent)
+            self.assertEqual(fsync.call_count, 0 if module.os.name == "nt" else 1)
 
     def test_legacy_publisher_refuses_to_replace_v2_compatibility_paths(self):
         module = load_module()

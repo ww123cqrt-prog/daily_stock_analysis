@@ -240,9 +240,10 @@ export const backtestApi = {
     }
   },
 
-  listStrategyAssets: async (): Promise<StrategyAssetSummary[]> => {
+  listStrategyAssets: async (params: { archived?: boolean } = {}): Promise<StrategyAssetSummary[]> => {
     const response = await apiClient.get<Record<string, unknown>[]>(
       '/api/v1/backtest/strategies',
+      { params: { archived: params.archived ?? false } },
     );
     return response.data.map((item) => toCamelCase<StrategyAssetSummary>(item));
   },
@@ -278,6 +279,7 @@ export const backtestApi = {
         name: request.name,
         description: request.description,
         script: request.script,
+        archived: request.archived,
       },
     );
     return toCamelCase<StrategyAssetDetail>(response.data);

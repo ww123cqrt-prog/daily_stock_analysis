@@ -369,6 +369,7 @@ export interface StrategyAssetSummary {
   description: string;
   scriptSha256: string;
   apiVersion: string;
+  archived: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -387,6 +388,7 @@ export interface StrategyAssetUpdateRequest {
   name?: string;
   description?: string;
   script?: string;
+  archived?: boolean;
 }
 
 export interface StabilityTestRequest {

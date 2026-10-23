@@ -87,6 +87,16 @@ sed -n '1,260p' docs/install-local-quant-workbench.md
 
 ## 可追溯要求
 
+全仓离线 Python 测试使用仓内 `scripts/testing/block_runner.py`，显式覆盖 `tests quant_workflow/tests`；默认使用 6 个 worker，按 `loadscope` 分配。小范围定向测试使用同一入口的 `--workers 0`。例如：
+
+```bash
+python scripts/testing/block_runner.py --run-dir /path/to/new-run --workers 6 --dist loadscope --wall-timeout 3600 -- tests quant_workflow/tests -m "not network"
+```
+
+入口保留首轮 JUnit、逐阶段检查点、日志、退出码和源码身份，并仅对首轮失败节点执行单进程复核。首轮失败不会因复核通过而改写为全绿；超时或节点未完成也不能当成通过。复用原工作区的未提交版本时，可传 `--source-manifest /path/to/source-manifest.json`，清单的 `files` 映射必须包含每个受测源码／测试的 SHA256 和模式；清单外运行源码或收集到的测试会被拒绝。测试环境使用临时数据库、报告和数据根，不读取项目真实 `.env`。Web 与桌面端测试单独记录，不计入 Python 节点数量。
+
+平台专属执行测试按实际能力运行：原生 Windows 不执行 POSIX shell／进程组、macOS sandbox-exec 或 Unix group/other 权限位用例；保留跨平台静态检查和不支持平台时明确拒绝的验证。macOS 上仍运行相应原生控制，Windows 上运行 Job Object 进程清理控制。跳过数和原因必须随各端结果列出，不能将平台跳过表述为功能已验证。
+
 每次改动必须能回答五个问题：
 
 | 问题 | 记录位置 |

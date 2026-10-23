@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import math
 import sys
@@ -20,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
     QlibProviderHistoryError,
     init_qlib_workflow,
@@ -84,13 +84,13 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 @contextmanager
 def _claim_lock(report_dir: Path):
     report_dir.mkdir(parents=True, exist_ok=True)
-    with (report_dir / ".shadow-day.lock").open("a+") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    with (report_dir / ".shadow-day.lock").open("a+b") as stream:
+        lock_file(stream, exclusive=True)
         try:
             with _file_guard(report_dir / "shadow_state_latest.json"):
                 yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock_file(stream)
 
 
 def _state_summary(state: Mapping[str, Any] | None) -> dict[str, Any]:

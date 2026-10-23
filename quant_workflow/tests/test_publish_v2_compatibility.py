@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -458,13 +459,26 @@ def test_restore_file_state_fsyncs_restored_file_and_directory(
     module = load_module()
     path = tmp_path / "DATA_MANIFEST.json"
     path.write_bytes(b"new")
-    fsync_calls: list[int] = []
-    monkeypatch.setattr(module.os, "fsync", fsync_calls.append)
+    fsync_modes, directories = [], []
+    real_fsync, real_directory_fsync = os.fsync, module._fsync_directory
+
+    def record_fsync(fd):
+        fsync_modes.append(os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    def record_directory(path):
+        directories.append(path)
+        return real_directory_fsync(path)
+
+    monkeypatch.setattr(module.os, "fsync", record_fsync)
+    monkeypatch.setattr(module, "_fsync_directory", record_directory)
 
     module._restore_file_state({path: b"old"})
 
     assert path.read_bytes() == b"old"
-    assert len(fsync_calls) == 2
+    assert directories == [path.parent]
+    assert sum(stat.S_ISREG(mode) for mode in fsync_modes) == 1
+    assert sum(stat.S_ISDIR(mode) for mode in fsync_modes) == (0 if os.name == "nt" else 1)
 
 
 def test_restore_file_state_attempts_every_file_and_reports_all_failures(
@@ -779,19 +793,63 @@ def test_atomic_parquet_fsyncs_file_and_parent_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = load_module()
-    calls: list[int] = []
-    real_fsync = os.fsync
+    flushed_modes, directories = [], []
+    real_fsync, real_directory_fsync = os.fsync, module._fsync_directory
 
     def record_fsync(fd: int) -> None:
-        calls.append(fd)
+        flushed_modes.append(os.fstat(fd).st_mode)
         real_fsync(fd)
 
+    def record_directory(path):
+        directories.append(path)
+        return real_directory_fsync(path)
+
     monkeypatch.setattr(module.os, "fsync", record_fsync)
+    monkeypatch.setattr(module, "_fsync_directory", record_directory)
     target = tmp_path / "data.parquet"
     module._atomic_parquet(pd.DataFrame({"value": [1]}), target)
 
     assert target.is_file()
-    assert len(calls) >= 2
+    assert directories == [target.parent]
+    assert sum(stat.S_ISREG(mode) for mode in flushed_modes) == 1
+    assert sum(stat.S_ISDIR(mode) for mode in flushed_modes) == (0 if os.name == "nt" else 1)
+
+
+def test_windows_atomic_parquet_fsync_uses_writable_file(tmp_path, monkeypatch):
+    module = load_module()
+    modes, flushed = [], []
+    original_open, original_fsync = Path.open, os.fsync
+
+    def record_open(path, mode="r", *args, **kwargs):
+        modes.append(mode)
+        return original_open(path, mode, *args, **kwargs)
+
+    def flush_file(fd):
+        assert modes[-1] == "r+b"
+        flushed.append(fd)
+        return original_fsync(fd)
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "name": "nt", "fsync": flush_file}))
+    monkeypatch.setattr(Path, "open", record_open)
+    target = tmp_path / "data.parquet"
+    module._atomic_parquet(pd.DataFrame({"value": [1]}), target)
+    assert len(flushed) == 1
+    assert pd.read_parquet(target).value.tolist() == [1]
+
+
+def test_atomic_parquet_file_fsync_failure_preserves_target(tmp_path, monkeypatch):
+    module = load_module()
+    target = tmp_path / "data.parquet"
+    target.write_bytes(b"previous")
+
+    def fail_flush(_fd):
+        raise OSError("file flush failed")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "fsync": fail_flush}))
+    with pytest.raises(OSError, match="file flush failed"):
+        module._atomic_parquet(pd.DataFrame({"value": [1]}), target)
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_validate_candidates_rejects_non_unit_qlib_factor(tmp_path: Path) -> None:

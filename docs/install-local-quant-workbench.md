@@ -176,6 +176,26 @@ curl -sS --max-time 5 -o /tmp/dsa-home.html -w '%{http_code} %{size_download}\n'
 
 期望返回 `200`。`8010` 是 DSA 日常网页入口；`6006` 是 MLflow 后台数据服务。
 
+## 启动 DSA（跳过前端构建）
+
+当 npm 缓存有权限问题（`EPERM` 错误）导致 `npm install` 卡住时，可设置 `WEBUI_AUTO_BUILD=false` 跳过前端构建，直接复用 `static/` 中已有的产物：
+
+```bash
+cd /Users/cq/WorkingProjects/daily_stock_analysis
+. .venv/bin/activate
+WEBUI_AUTO_BUILD=false python main.py --serve-only --host 127.0.0.1 --port 8014
+```
+
+访问地址：
+- Web UI：http://127.0.0.1:8014/research
+- API 文档：http://127.0.0.1:8014/docs
+- 健康检查：http://127.0.0.1:8014/health
+
+npm 缓存权限修复方法：
+```bash
+sudo chown -R 501:20 "/Users/cq/.npm"
+```
+
 ## 启动 MLflow
 
 MLflow 3.x 对 file store 有安全限制，本地启动时显式允许：

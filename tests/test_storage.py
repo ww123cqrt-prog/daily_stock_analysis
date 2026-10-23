@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+from contextlib import closing
 from datetime import date
 from unittest.mock import patch
 
@@ -22,7 +23,7 @@ class TestStorage(unittest.TestCase):
 
     @staticmethod
     def _list_sqlite_indexes(db_path: str, table_name: str) -> dict[str, list[str]]:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             indexes = {}
             for row in conn.execute(f"PRAGMA index_list({table_name})").fetchall():
                 index_name = row[1]
@@ -37,7 +38,7 @@ class TestStorage(unittest.TestCase):
 
     @staticmethod
     def _list_sqlite_unique_indexes(db_path: str, table_name: str) -> dict[str, list[str]]:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             rows = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
             unique_indexes = {}
             for row in rows:
@@ -57,7 +58,7 @@ class TestStorage(unittest.TestCase):
         db_path = os.path.join(temp_dir.name, "legacy_intel.sqlite")
 
         try:
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """CREATE TABLE intelligence_sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,7 +138,7 @@ class TestStorage(unittest.TestCase):
                 unique_indexes_after["uix_intel_item_scope"],
                 ["source_id", "url", "scope_type", "scope_value", "market"],
             )
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 table_count = conn.execute("SELECT COUNT(*) FROM intelligence_items").fetchone()[0]
                 temp_tables = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'intelligence_items_recreate_tmp_%'"
@@ -226,7 +227,7 @@ class TestStorage(unittest.TestCase):
         deeply_nested_json = "[" * 10_000 + "]" * 10_000
 
         try:
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """CREATE TABLE decision_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,7 +289,7 @@ class TestStorage(unittest.TestCase):
             with self.assertLogs("src.storage", level="INFO") as logs:
                 DatabaseManager(db_url=f"sqlite:///{db_path}")
 
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(decision_signals)").fetchall()}
                 rows = conn.execute(
                     "SELECT id, decision_profile FROM decision_signals ORDER BY id"
@@ -365,7 +366,7 @@ class TestStorage(unittest.TestCase):
         db_path = os.path.join(temp_dir.name, "existing_decision_profile.db")
 
         try:
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.execute(
                     """CREATE TABLE decision_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -395,7 +396,7 @@ class TestStorage(unittest.TestCase):
             with self.assertLogs("src.storage", level="INFO") as logs:
                 DatabaseManager(db_url=f"sqlite:///{db_path}")
 
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 profiles = conn.execute(
                     "SELECT decision_profile FROM decision_signals ORDER BY id"
                 ).fetchall()
@@ -841,6 +842,51 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_conversation_readers_preserve_message_order_at_identical_timestamps(self):
+        expected = [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+            ("assistant", "second answer"),
+        ]
+        # Both legal index orders must produce the same conversation, including
+        # limited history and the first user message used as the session title.
+        for index_id_order in ("ASC", "DESC"):
+            DatabaseManager.reset_instance()
+            db = DatabaseManager(db_url="sqlite:///:memory:")
+            try:
+                for role, content in expected:
+                    db.save_conversation_message("same-time", role, content)
+                with db._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "UPDATE conversation_messages SET created_at = ? WHERE session_id = ?",
+                        ("2026-10-23 00:00:00.000000", "same-time"),
+                    )
+                    connection.exec_driver_sql(
+                        "CREATE INDEX test_message_order ON conversation_messages "
+                        f"(session_id, created_at, id {index_id_order})"
+                    )
+
+                cases = (
+                    (db.get_conversation_history, {}, expected),
+                    (db.get_conversation_history, {"limit": 2}, expected[-2:]),
+                    (db.get_conversation_messages, {}, expected),
+                    (db.get_conversation_messages, {"limit": 2}, expected[:2]),
+                    (db.get_visible_conversation_messages, {}, expected),
+                    (db.get_visible_conversation_messages, {"limit": 2}, expected[-2:]),
+                )
+                for reader, options, wanted in cases:
+                    with self.subTest(index=index_id_order, reader=reader.__name__, **options):
+                        messages = reader("same-time", **options)
+                        self.assertEqual(
+                            [(message["role"], message["content"]) for message in messages],
+                            wanted,
+                        )
+                with self.subTest(index=index_id_order, reader="session_title"):
+                    self.assertEqual(db.get_chat_sessions()[0]["title"], "first question")
+            finally:
+                DatabaseManager.reset_instance()
+
     def test_file_sqlite_enables_wal_and_busy_timeout(self):
         temp_dir = tempfile.TemporaryDirectory()
         db_path = os.path.join(temp_dir.name, "sqlite_pragmas.db")
@@ -1155,8 +1201,8 @@ class TestStorage(unittest.TestCase):
 
             self.assertEqual(total, 1)
         finally:
-            temp_dir.cleanup()
             DatabaseManager.reset_instance()
+            temp_dir.cleanup()
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import fcntl
+from quant_workflow.scripts._file_lock import lock_file, unlock_file
 import importlib.util
 import json
 import os
@@ -1431,11 +1431,11 @@ def test_membership_writer_active_blocks_before_parquet_or_provider(
 
     monkeypatch.setattr(module.pd, "read_parquet", record_read_parquet)
     lock_handle = (pit_dir / ".build_pit_csi800.lock").open("a+b")
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    lock_file(lock_handle, exclusive=True)
     try:
         return_code, _, status_dir = run_main(module, tmp_path, provider)
     finally:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        unlock_file(lock_handle)
         lock_handle.close()
 
     status = json.loads(
@@ -1515,10 +1515,10 @@ def test_membership_shared_lock_covers_read_but_not_provider_network(
         handle = lock_path.open("a+b")
         try:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(handle, exclusive=True, blocking=False)
             except BlockingIOError:
                 return False
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(handle)
             return True
         finally:
             handle.close()
@@ -2102,7 +2102,7 @@ def test_writer_lock_is_released_during_build_and_reacquired_for_publish(
     publish_during_shared_lock = False
     try:
         try:
-            fcntl.flock(shared_handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            lock_file(shared_handle, exclusive=False, blocking=False)
             shared_acquired = True
         except BlockingIOError:
             shared_acquired = False
@@ -2111,7 +2111,7 @@ def test_writer_lock_is_released_during_build_and_reacquired_for_publish(
     finally:
         allow_build.set()
         if shared_acquired:
-            fcntl.flock(shared_handle.fileno(), fcntl.LOCK_UN)
+            unlock_file(shared_handle)
         shared_handle.close()
     assert publish_started.wait(timeout=2)
     writer.join(timeout=5)

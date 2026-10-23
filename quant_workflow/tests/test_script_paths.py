@@ -21,6 +21,15 @@ def load_module():
 
 class ScriptPathsTest(unittest.TestCase):
     def test_default_roots_follow_workflow_location(self):
+        # Exercise defaults explicitly; the shared suite uses private runtime roots.
+        with patch.dict(os.environ, {
+            "WORKING_PROJECTS_ROOT": "", "QUANT_DATA_ROOT": "",
+            "QUANT_WORKFLOW_ROOT": "", "QUANT_WORKFLOW_REPORTS_ROOT": "",
+            "QUANT_WORKFLOW_MLRUNS_DIR": "",
+        }, clear=False):
+            self._assert_default_roots_follow_workflow_location()
+
+    def _assert_default_roots_follow_workflow_location(self):
         module = load_module()
         workflow_root = Path(__file__).resolve().parents[1]
         dsa_root = workflow_root.parent

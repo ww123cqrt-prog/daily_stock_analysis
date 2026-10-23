@@ -224,7 +224,7 @@ test('renderDesktopShareImage captures the complete local poster and closes its 
   }
   FakeRenderWindow.getAllWindows = () => [];
 
-  const mainModule = loadMainModule(t, { browserWindow: FakeRenderWindow });
+  const mainModule = loadMainModule(t, { browserWindow: FakeRenderWindow, platform: 'linux' });
   const sourceWindow = {
     isDestroyed: () => false,
     webContents: {
