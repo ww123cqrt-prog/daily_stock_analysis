@@ -14,6 +14,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -161,6 +162,7 @@ def write_runtime_config_with_provider(
     extend_dates_to_provider_latest: bool = True,
 ) -> Path:
     import yaml
+    from qlib.config import C
 
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     qlib_init = dict(payload.get("qlib_init") or {})
@@ -170,6 +172,9 @@ def write_runtime_config_with_provider(
             provider_uri=provider_uri,
         )
     )
+    exp_manager = deepcopy(C["exp_manager"])
+    exp_manager["kwargs"]["uri"] = MLFLOW_TRACKING_URI
+    qlib_init["exp_manager"] = exp_manager
     payload["qlib_init"] = qlib_init
     if extend_dates_to_provider_latest:
         calendar_tail = provider_calendar_tail(provider_uri)
@@ -273,12 +278,25 @@ def run_qrun(
     config_path: str,
     experiment_name: str = "baseline_lgb_alpha158",
 ) -> str:
-    """Run qrun and return the one prediction Run created by this invocation."""
+    """Run a generated runtime config and return its one new prediction Run."""
     import mlflow
     from qlib.cli.run import workflow
 
     client = mlflow.tracking.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
     experiment = _experiment_by_name(client, experiment_name)
+    if experiment is None:
+        # Qlib 0.9.7 builds its creation-lock path from the still-encoded URI.
+        # Create through MLflow so Qlib reuses the experiment without that lock.
+        try:
+            experiment_id = client.create_experiment(experiment_name)
+        except mlflow.exceptions.MlflowException as exc:
+            if exc.error_code != "RESOURCE_ALREADY_EXISTS":
+                raise
+            experiment = _experiment_by_name(client, experiment_name)
+            if experiment is None:
+                raise
+        else:
+            experiment = client.get_experiment(experiment_id)
     before_run_ids = (
         experiment_run_ids(client, str(experiment.experiment_id))
         if experiment is not None

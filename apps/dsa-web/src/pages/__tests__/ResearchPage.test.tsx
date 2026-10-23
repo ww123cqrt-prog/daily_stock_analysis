@@ -3,10 +3,12 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
+import type { StrategyAssetDetail } from '../../types/backtest';
 import ResearchPage from '../ResearchPage';
 
-const { runScriptStrategy, listBacktestRuns, listStrategyAssets, saveStrategyAsset, getStrategyAsset, updateStrategyAsset } = vi.hoisted(() => ({
+const { runScriptStrategy, runStabilityTest, listBacktestRuns, listStrategyAssets, saveStrategyAsset, getStrategyAsset, updateStrategyAsset } = vi.hoisted(() => ({
   runScriptStrategy: vi.fn(),
+  runStabilityTest: vi.fn(),
   listBacktestRuns: vi.fn().mockResolvedValue([]),
   listStrategyAssets: vi.fn().mockResolvedValue([]),
   saveStrategyAsset: vi.fn(),
@@ -17,6 +19,7 @@ const { runScriptStrategy, listBacktestRuns, listStrategyAssets, saveStrategyAss
 vi.mock('../../api/backtest', () => ({
   backtestApi: {
     runScriptStrategy,
+    runStabilityTest,
     listBacktestRuns,
     listStrategyAssets,
     saveStrategyAsset,
@@ -105,14 +108,21 @@ const report = {
   scriptCheck: { status: 'passed' },
 };
 
-function renderPage() {
-  return render(
+async function renderPage() {
+  const view = render(
     <UiLanguageProvider>
       <MemoryRouter initialEntries={['/research']}>
         <ResearchPage />
       </MemoryRouter>
     </UiLanguageProvider>,
   );
+  await waitFor(() => expect(screen.getByLabelText('已保存的脚本')).toBeEnabled());
+  return view;
+}
+
+function setBacktestDates(startDate: string, endDate: string) {
+  fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: startDate } });
+  fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: endDate } });
 }
 
 describe('ResearchPage', () => {
@@ -125,8 +135,8 @@ describe('ResearchPage', () => {
     listStrategyAssets.mockResolvedValue([]);
   });
 
-  it('renders the research workbench with a Python strategy editor', () => {
-    renderPage();
+  it('renders the research workbench with a Python strategy editor', async () => {
+    await renderPage();
 
     expect(screen.getByRole('heading', { name: '量化研究' })).toBeInTheDocument();
     const editor = screen.getByLabelText('Python交易策略脚本');
@@ -134,8 +144,8 @@ describe('ResearchPage', () => {
     expect(screen.getByLabelText('股票池')).toBeInTheDocument();
   });
 
-  it('keeps the custom symbol input visible and enables it only for the custom pool', () => {
-    renderPage();
+  it('keeps the custom symbol input visible and enables it only for the custom pool', async () => {
+    await renderPage();
 
     const symbolInput = screen.getByLabelText('标的代码（自选时启用，逗号分隔）') as HTMLInputElement;
     expect(symbolInput).toBeInTheDocument();
@@ -146,7 +156,7 @@ describe('ResearchPage', () => {
   });
 
   it('offers preset scripts grouped with saved scripts', async () => {
-    renderPage();
+    await renderPage();
 
     const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
     await waitFor(() => expect(select).toBeEnabled());
@@ -174,8 +184,9 @@ describe('ResearchPage', () => {
   });
 
   it('runs the strategy script and shows the result', async () => {
-    renderPage();
+    await renderPage();
 
+    setBacktestDates('2020-01-01', '2020-06-30');
     fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
 
     await waitFor(() => expect(runScriptStrategy).toHaveBeenCalled());
@@ -183,33 +194,67 @@ describe('ResearchPage', () => {
     expect(request.pool).toBe('etf');
     expect(request.symbols).toBeUndefined();
     expect(request.script).toContain('data.rank_by_return');
+    expect(request.startDate).toBe('2020-01-01');
+    expect(request.endDate).toBe('2020-06-30');
     expect(await screen.findByText('cn_etf_daily')).toBeInTheDocument();
     expect(listBacktestRuns).toHaveBeenCalled();
   });
 
+  it.each([
+    { startDate: '', endDate: '' },
+    { startDate: '', endDate: '2020-06-30' },
+    { startDate: '2020-01-01', endDate: '' },
+    { startDate: '2020-07-01', endDate: '2020-06-30' },
+  ])('rejects invalid dates before running a script ($startDate, $endDate)', async ({ startDate, endDate }) => {
+    await renderPage();
+
+    setBacktestDates(startDate, endDate);
+    fireEvent.click(screen.getByRole('button', { name: '运行回测' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('请选择有效的开始和结束日期。');
+    expect(runScriptStrategy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { startDate: '', endDate: '' },
+    { startDate: '2020-07-01', endDate: '2020-06-30' },
+  ])('keeps date validation for stability tests ($startDate, $endDate)', async ({ startDate, endDate }) => {
+    await renderPage();
+
+    setBacktestDates(startDate, endDate);
+    fireEvent.click(screen.getByRole('button', { name: '运行稳定性测试' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('请选择有效的开始和结束日期。');
+    expect(runStabilityTest).not.toHaveBeenCalled();
+  });
+
   it('shows the run history empty state', async () => {
-    renderPage();
+    await renderPage();
 
     await waitFor(() => expect(listBacktestRuns).toHaveBeenCalled());
     expect(screen.getByText('暂无回测记录')).toBeInTheDocument();
   });
 
-  it('saves the current script as a named asset', async () => {
+  it.each([
+    { startDate: '', endDate: '' },
+    { startDate: '2020-07-01', endDate: '2020-06-30' },
+    { startDate: '2020-01-01', endDate: '2020-06-30' },
+  ])('saves a named script independently of backtest dates ($startDate, $endDate)', async ({ startDate, endDate }) => {
     saveStrategyAsset.mockResolvedValue({
       id: 's1',
       name: '动量选股',
       description: '',
       scriptSha256: 'x'.repeat(64),
       apiVersion: 'dsa-script-v1',
+      archived: false,
       createdAt: 't',
       updatedAt: 't',
       script: '',
     });
-    renderPage();
+    await renderPage();
 
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: '动量选股' } });
-    fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: '2020-01-01' } });
-    fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: '2020-06-30' } });
+    setBacktestDates(startDate, endDate);
     await waitFor(() => expect(screen.getByRole('button', { name: '保存脚本' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: '保存脚本' }));
 
@@ -217,7 +262,75 @@ describe('ResearchPage', () => {
       name: '动量选股',
       script: expect.stringContaining('rank_by_return'),
     }));
-    await waitFor(() => expect(listStrategyAssets).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存修改' })).toBeEnabled());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(updateStrategyAsset).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { startDate: '', endDate: '' },
+    { startDate: '2020-07-01', endDate: '2020-06-30' },
+  ])('updates a saved script independently of backtest dates ($startDate, $endDate)', async ({ startDate, endDate }) => {
+    const asset: StrategyAssetDetail = {
+      id: 'editing',
+      name: '原策略',
+      description: '',
+      scriptSha256: 'x'.repeat(64),
+      apiVersion: 'dsa-script-v1',
+      archived: false,
+      createdAt: '2020-01-01T00:00:00Z',
+      updatedAt: '2020-01-01T00:00:00Z',
+      script: 'def on_bar(context, data):\n    context.target_cash()',
+    };
+    const editedScript = 'def on_bar(context, data):\n    context.target_equal(data.universe())';
+    listStrategyAssets.mockImplementation(async (params?: { archived?: boolean }) => params?.archived ? [] : [asset]);
+    getStrategyAsset.mockResolvedValue(asset);
+    updateStrategyAsset.mockResolvedValue({ ...asset, name: '修改后策略', script: editedScript });
+    await renderPage();
+
+    const select = screen.getByLabelText('已保存的脚本');
+    await waitFor(() => expect(select).toBeEnabled());
+    fireEvent.change(select, { target: { value: 'editing' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存修改' })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '  修改后策略  ' } });
+    fireEvent.change(screen.getByLabelText('Python交易策略脚本'), { target: { value: editedScript } });
+    setBacktestDates(startDate, endDate);
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+
+    await waitFor(() => expect(updateStrategyAsset).toHaveBeenCalledWith('editing', {
+      name: '修改后策略',
+      script: editedScript,
+    }));
+    await waitFor(() => expect(screen.getByLabelText('名称')).toHaveValue('修改后策略'));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(saveStrategyAsset).not.toHaveBeenCalled();
+  });
+
+  it('keeps saving disabled when the strategy name is blank', async () => {
+    await renderPage();
+
+    await waitFor(() => expect(screen.getByLabelText('名称')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '   ' } });
+    const save = screen.getByRole('button', { name: '保存脚本' });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+
+    expect(saveStrategyAsset).not.toHaveBeenCalled();
+    expect(updateStrategyAsset).not.toHaveBeenCalled();
+  });
+
+  it('rejects saving an empty strategy script', async () => {
+    await renderPage();
+
+    await waitFor(() => expect(screen.getByLabelText('名称')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: '空策略' } });
+    fireEvent.change(screen.getByLabelText('Python交易策略脚本'), { target: { value: '  \n ' } });
+    setBacktestDates('2020-01-01', '2020-06-30');
+    fireEvent.click(screen.getByRole('button', { name: '保存脚本' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('交易策略脚本不能为空。');
+    expect(saveStrategyAsset).not.toHaveBeenCalled();
+    expect(updateStrategyAsset).not.toHaveBeenCalled();
   });
 
   function mockLibrary() {
@@ -238,7 +351,7 @@ describe('ResearchPage', () => {
 
   it('defaults to main strategies and loads archived scripts in a separate view', async () => {
     mockLibrary();
-    renderPage();
+    await renderPage();
 
     const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
     await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));
@@ -259,7 +372,7 @@ describe('ResearchPage', () => {
 
   it('archives a selected main strategy without deleting it', async () => {
     mockLibrary();
-    renderPage();
+    await renderPage();
 
     const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
     await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));
@@ -277,7 +390,7 @@ describe('ResearchPage', () => {
 
   it('restores an archived strategy to the main list', async () => {
     mockLibrary();
-    renderPage();
+    await renderPage();
 
     const select = screen.getByLabelText('已保存的脚本') as HTMLSelectElement;
     await waitFor(() => expect(select).toHaveTextContent('TQM-20 V1.6'));

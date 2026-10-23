@@ -262,10 +262,6 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
       setError(zh ? '交易策略脚本不能为空。' : 'Trading strategy script cannot be empty.');
       return;
     }
-    if (!startDate || !endDate || startDate > endDate) {
-      setError(zh ? '请选择有效的开始和结束日期。' : 'Select a valid start and end date.');
-      return;
-    }
     setSavingStrategy(true);
     setError(null);
     try {
@@ -410,6 +406,10 @@ const ScriptStrategyBacktestPanel: React.FC<Props> = ({ language }) => {
     }
     if (!script.trim()) {
       setError(zh ? '交易策略脚本不能为空。' : 'Trading strategy script cannot be empty.');
+      return;
+    }
+    if (!startDate || !endDate || startDate > endDate) {
+      setError(zh ? '请选择有效的开始和结束日期。' : 'Select a valid start and end date.');
       return;
     }
     if (![capital, cost, lot].every(Number.isFinite)) {

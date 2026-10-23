@@ -165,7 +165,7 @@ def simulate(merged: pd.DataFrame, signals: list[str], side_cost_bps=20.0) -> di
         "max_drawdown": float(dd.min()),
         "switch_count": switches,
         "invested_fraction": invested / periods if periods else 0,
-        "sharpe_like": ann_ret / (abs(float(dd.min())) + 0.01),
+        "custom_return_drawdown_score": ann_ret / (abs(float(dd.min())) + 0.01),
         "equity_curve": curve_df,
     }
 
@@ -194,11 +194,12 @@ def main():
         ("总收益", "total_return", "%"),
         ("年化收益", "annualized_return", "%"),
         ("最大回撤", "max_drawdown", "%"),
-        ("夏普比率", "sharpe_like", ""),
+        ("自定义收益回撤评分", "custom_return_drawdown_score", ""),
         ("交易次数", "switch_count", ""),
         ("投资比例", "invested_fraction", "%"),
     ]
 
+    print("自定义收益回撤评分 = 年化收益 / (最大回撤绝对值 + 0.01)")
     print(f"\n{'指标':<12} {'简单动量(A)':<20} {'TQM因子(B)':<20} {'B-A差异':<15}")
     print("-" * 70)
     for name, key, unit in rows:
@@ -224,17 +225,17 @@ def main():
     else:
         print("✗ 简单动量最大回撤更小")
 
-    if res_b["sharpe_like"] > res_a["sharpe_like"]:
-        print("✓ TQM因子风险调整后收益更好")
+    if res_b["custom_return_drawdown_score"] > res_a["custom_return_drawdown_score"]:
+        print("✓ TQM因子自定义收益回撤评分更高")
     else:
-        print("✗ 简单动量风险调整后收益更好")
+        print("✗ 简单动量自定义收益回撤评分更高")
 
     if res_b["switch_count"] < res_a["switch_count"]:
         print("✓ TQM因子交易次数更少")
     else:
         print("✗ 简单动量交易次数更少")
 
-    print(f"\n结论: {'TQM因子' if res_b['sharpe_like'] > res_a['sharpe_like'] else '简单动量'}策略更优")
+    print(f"\n结论（按自定义收益回撤评分）: {'TQM因子' if res_b['custom_return_drawdown_score'] > res_a['custom_return_drawdown_score'] else '简单动量'}")
 
     # 保存
     output_dir = SCRIPT_DIR / "backtest_results"

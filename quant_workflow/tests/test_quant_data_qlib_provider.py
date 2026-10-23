@@ -14,6 +14,15 @@ from quant_workflow import quant_data_qlib_provider as direct
 from quant_workflow.scripts import quant_data_contract as contract
 
 
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("native symlink creation requires a Windows privilege unavailable to this test user")
+        raise
+
+
 def _write_symbol(
     snapshot: Path,
     symbol: str,
@@ -36,7 +45,7 @@ def _write_symbol(
             "close": close,
             "preclose": close - 0.2,
             "volume": volume,
-            "amount": close * volume,
+            "amount": close / np.linspace(0.8, 1.0, len(dates)) * volume,
             "turn": np.arange(1, len(dates) + 1, dtype=float),
             "pctChg": np.arange(1, len(dates) + 1, dtype=float) / 10.0,
             "tradestatus": 1,
@@ -176,6 +185,7 @@ def _stage_index_snapshot(
                 "low": close - 1.0,
                 "close": close,
                 "volume": [1000.0, 1100.0, 1200.0],
+                "amount": close * [1000.0, 1100.0, 1200.0],
                 "source_id": "fixture.index",
             }
         )
@@ -511,7 +521,7 @@ def test_calendar_fields_and_missing_dates_are_mapped_without_forward_fill(
     assert np.isnan(close.iloc[1])
     assert close.iloc[2] == pytest.approx(11.0)
     assert np.isnan(volume.iloc[1])
-    assert amount.iloc[0] == pytest.approx(close.iloc[0] * volume.iloc[0])
+    assert amount.iloc[0] == pytest.approx(12.5 * volume.iloc[0])
     assert vwap.iloc[0] == pytest.approx(close.iloc[0])
     assert factor.tolist()[0] == pytest.approx(1.0)
     assert np.isnan(factor.iloc[1])
@@ -878,7 +888,7 @@ def test_descriptor_path_rejects_symlinked_directory(
     quant_data_root, _, descriptor = direct_fixture
     alias = quant_data_root / "runtime" / "qlib_direct" / "provider-alias"
     alias.parent.mkdir(parents=True, exist_ok=True)
-    alias.symlink_to(descriptor.parent, target_is_directory=True)
+    _symlink_or_skip(alias, descriptor.parent, target_is_directory=True)
 
     with pytest.raises(direct.DirectProviderError, match="symlink"):
         direct.QuantDataFeatureProvider(
@@ -894,7 +904,7 @@ def test_feature_access_rejects_symlinked_bar_file(
     bar_path = snapshot / "bars" / "SH600000.parquet"
     relocated = snapshot / "bars" / "SH600000.real.parquet"
     os.replace(bar_path, relocated)
-    bar_path.symlink_to(relocated)
+    _symlink_or_skip(bar_path, relocated)
     provider = direct.QuantDataFeatureProvider(
         descriptor_path=descriptor,
         quant_data_root=quant_data_root,

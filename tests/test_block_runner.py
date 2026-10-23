@@ -785,6 +785,84 @@ def test_skip():
             self.assertTrue(summary['complete'], summary)
             self.assertEqual(summary['statuses'][node], expected)
 
+    @unittest.skipIf(os.name == 'nt', 'LC_ALL=C ASCII parent encoding requires POSIX')
+    def test_git_unicode_diff_in_non_utf8_parent(self):
+        for changes_source in (False, True):
+            with self.subTest(changes_source=changes_source), tempfile.TemporaryDirectory() as temp:
+                parent = Path(temp)
+                source = ('from pathlib import Path\ndef test_changes_source():\n'
+                          '    Path("notes.txt").write_text("\\u4e2d\\u6587 second\\n", encoding="utf-8")\n'
+                          '    assert False\n' if changes_source else 'def test_pass():\n    pass\n')
+                suite = self._wall_suite(parent, source)
+                (suite / '.gitignore').write_text('__pycache__/\n')
+                notes = suite / 'notes.txt'
+                notes.write_text('baseline\n', encoding='utf-8')
+                for command in (['init'], ['add', '.'], ['-c', 'user.name=Test', '-c',
+                                'user.email=test@example.invalid', 'commit', '-m', 'baseline']):
+                    subprocess.run(['git', *command], cwd=suite, check=True, capture_output=True)
+                notes.write_bytes('\u4e2d\u6587 first\r\n'.encode('utf-8'))
+                command = ['git', 'diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--']
+                raw_diff = subprocess.check_output(command, cwd=suite)
+                display_diff = subprocess.check_output(command, cwd=suite, text=True,
+                                                       encoding='utf-8', errors='replace').strip()
+                run = parent / 'run'
+                env = dict(os.environ, LC_ALL='C', LC_CTYPE='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0',
+                           PYTEST_DISABLE_PLUGIN_AUTOLOAD='1', PYTEST_PLUGINS='xdist.plugin')
+                env.pop('PYTEST_ADDOPTS', None)
+                launcher = ('import json, locale; from scripts.testing import block_runner as r; '
+                            'print(json.dumps(dict(parent_encoding=locale.getencoding())), flush=True); '
+                            'raise SystemExit(r.main())')
+                record = subprocess.run([
+                    sys.executable, '-B', '-c', launcher, '--run-dir', str(run), '--workers', '0',
+                    '--wall-timeout', '10', '--', 'tests'], cwd=suite, env=env, capture_output=True,
+                    text=True, encoding='utf-8', errors='replace', timeout=30)
+                encoding = json.loads(record.stdout.splitlines()[0])['parent_encoding']
+                self.assertEqual('A'.encode(encoding), b'A')
+                with self.assertRaises(UnicodeEncodeError):
+                    '\u4e2d\u6587'.encode(encoding)
+                self.assertEqual(record.returncode, 2 if changes_source else 0, record.stdout + record.stderr)
+                version = json.loads((run / 'version.json').read_text(encoding='utf-8'))
+                self.assertIn('\u4e2d\u6587 first', version['diff'])
+                self.assertEqual(version['diff'], display_diff)
+                self.assertEqual(version['diff_sha256'], hashlib.sha256(raw_diff).hexdigest())
+                outcome = json.loads((run / 'outcome.json').read_text(encoding='utf-8'))
+                self.assertEqual(outcome['complete'], not changes_source, outcome)
+                if changes_source:
+                    self.assertIn('source version changed before rerun', outcome['problems'])
+                    self.assertFalse((run / 'rerun').exists())
+                    final = json.loads((run / 'version-final.json').read_text(encoding='utf-8'))
+                    self.assertNotEqual(version['diff_sha256'], final['diff_sha256'])
+                else:
+                    self.assertEqual(outcome['problems'], [])
+                    first = json.loads((run / 'first/summary.json').read_text(encoding='utf-8'))
+                    self.assertEqual(first['statuses'], {'tests/test_synthetic.py::test_pass': 'passed'})
+                    self.assertEqual(version, json.loads((run / 'version-final.json').read_text(encoding='utf-8')))
+
+    def test_git_source_identity_distinguishes_identical_lossy_displays(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp)
+            notes = source / 'notes.txt'
+            notes.write_bytes(b'baseline\n')
+            for command in (['init', '--object-format=sha1'], ['config', 'core.abbrev', '4'],
+                            ['add', 'notes.txt'], ['-c', 'user.name=Test', '-c',
+                             'user.email=test@example.invalid', 'commit', '-m', 'baseline']):
+                subprocess.run(['git', *command], cwd=source, check=True, capture_output=True)
+            versions = []
+            diffs = []
+            # Both real text blobs have SHA1 prefix fefa and decode to the same
+            # replacement characters. Git's abbreviated index line is equal too.
+            for content in (b'change \x81\xa4\n', b'change \x85\x86\n'):
+                notes.write_bytes(content)
+                raw = subprocess.check_output([
+                    'git', 'diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], cwd=source)
+                diffs.append(raw)
+                versions.append(runner.source_version(source))
+                self.assertEqual(versions[-1]['diff_sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertNotEqual(diffs[0], diffs[1])
+            self.assertEqual(diffs[0].decode('utf-8', errors='replace'), diffs[1].decode('utf-8', errors='replace'))
+            self.assertEqual(versions[0]['diff'], versions[1]['diff'])
+            self.assertNotEqual(versions[0], versions[1])
+
     def test_mock_process_argv_and_evidence(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / 'source'

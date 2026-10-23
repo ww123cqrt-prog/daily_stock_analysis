@@ -508,6 +508,7 @@ def manifest_version(root, manifest):
 
 
 def source_version(root, source_manifest=None):
+    """Keep Git stdout bytes authoritative; decoded text is for display only."""
     if source_manifest is not None:
         return manifest_version(root, source_manifest)
     version = {}
@@ -515,10 +516,14 @@ def source_version(root, source_manifest=None):
                           ('diff', ['diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--']),
                           ('status', ['status', '--short'])]:
         try:
-            record = subprocess.run(['git', *command], cwd=root, capture_output=True, text=True)
-            version[name] = record.stdout.strip() if record.returncode == 0 else None
+            record = subprocess.run(['git', *command], cwd=root, capture_output=True)
+            raw = record.stdout if record.returncode == 0 else None
+            version[name + '_sha256'] = hashlib.sha256(raw).hexdigest() if raw is not None else None
+            # Preserve the previous universal-newline/strip display, independently of locale.
+            version[name] = (raw.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n').strip()
+                             if raw is not None else None)
         except OSError:
-            version[name] = None
+            version[name] = version[name + '_sha256'] = None
     try:
         record = subprocess.run(['git', 'ls-files', '--others', '--exclude-standard', '-z'],
                                 cwd=root, capture_output=True)

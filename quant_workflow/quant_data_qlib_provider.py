@@ -44,6 +44,7 @@ CALENDAR_NAME = "CALENDAR.parquet"
 MEMBERSHIP_NAME = "MEMBERSHIP_INTERVALS.parquet"
 DESCRIPTOR_SCHEMA_VERSION = 2
 ADAPTER_VERSION = "2"
+VWAP_ADJUSTMENT_VERSION = "vwap-affine-v1"
 DEFAULT_DATASET_ID = "ashare_daily_qfq"
 DEFAULT_INDEX_DATASET_ID = "cn_index_daily"
 MEMBERSHIP_DATASET_ID = "pit_csi800"
@@ -235,7 +236,7 @@ def _validate_file_hash(path: Path, expected: object, label: str) -> None:
         raise DirectProviderError(f"{label} hash mismatch")
 
 
-def _read_file_index(path: Path) -> pd.DataFrame:
+def _read_file_index(path: Path | io.BytesIO) -> pd.DataFrame:
     try:
         index = pd.read_parquet(path)
     except Exception as exc:
@@ -255,6 +256,13 @@ def _read_file_index(path: Path) -> pd.DataFrame:
     if normalized["symbol"].duplicated().any():
         raise DirectProviderError("file index contains duplicate symbols")
     return normalized.sort_values("symbol").reset_index(drop=True)
+
+
+def _requires_vwap_adjustment(manifest: Mapping[str, Any]) -> bool:
+    return (
+        manifest.get("price_basis") == "qfq"
+        and (manifest.get("adjustment") or {}).get("method") != "none"
+    )
 
 
 def _normalize_cleaning_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -832,7 +840,7 @@ def _descriptor_payload(
 ) -> dict[str, Any]:
     def dataset_spec(item: ResolvedDataset, file_index_path: Path) -> dict[str, Any]:
         manifest_path = item.snapshot_path / "DATASET_MANIFEST.json"
-        return {
+        spec = {
             "dataset_id": item.dataset_id,
             "snapshot_id": item.manifest["snapshot_id"],
             "snapshot_path": _relative_path(
@@ -849,6 +857,12 @@ def _descriptor_payload(
             ).as_posix(),
             "file_index_sha256": sha256_file(file_index_path),
         }
+        if _requires_vwap_adjustment(item.manifest):
+            factor_index_path = _safe_snapshot_child(
+                item.snapshot_path, item.manifest.get("factor_index_path"), "factor file index"
+            )
+            spec["factor_index_sha256"] = sha256_file(factor_index_path)
+        return spec
 
     payload: dict[str, Any] = {
         "schema_version": DESCRIPTOR_SCHEMA_VERSION,
@@ -875,6 +889,7 @@ def _descriptor_payload(
         "field_contract": {
             "price_input": "already_qfq",
             "factor_semantics": "unit_on_available_bar_no_second_adjustment",
+            "vwap_semantics": "raw_amount_over_base_volume_times_frozen_factor_plus_offset",
             "missing_date_semantics": "nan_no_forward_fill",
             "supported_fields": [
                 "$open",
@@ -979,6 +994,8 @@ def build_direct_provider_descriptor(
         if cleaning_entry is not None
         else "canonical"
     )
+    if _requires_vwap_adjustment(current_entry):
+        cleaning_identity += f"-{VWAP_ADJUSTMENT_VERSION}"
     provider_dir = (
         base
         / dataset_id
@@ -1520,6 +1537,71 @@ class QuantDataFeatureProvider(FeatureProvider):
             self._frames.popitem(last=False)
         return loaded
 
+    def _load_vwap_adjustments(
+        self, symbol: str, dates: pd.DatetimeIndex,
+    ) -> pd.DataFrame | None:
+        if symbol not in self._rows or not _requires_vwap_adjustment(self._context.manifest):
+            return None
+        spec = self._context.descriptor["dataset"]
+        expected_index_hash = spec.get("factor_index_sha256")
+        if expected_index_hash is None:
+            raise DirectProviderError(
+                "$vwap requires frozen factor-index evidence; rebuild the provider descriptor"
+            )
+        snapshot = self._context.snapshot_path
+        manifest = self._context.manifest
+        index_path = _safe_snapshot_child(
+            snapshot, manifest.get("factor_index_path"), "factor file index"
+        )
+        try:
+            index_bytes = index_path.read_bytes()
+        except OSError as exc:
+            raise DirectProviderError("factor file index is unavailable") from exc
+        if hashlib.sha256(index_bytes).hexdigest() != _validate_sha256(
+            expected_index_hash, "frozen factor file index hash"
+        ):
+            raise DirectProviderError("factor file index hash mismatch")
+        # The descriptor binds this index during its existing snapshot validation.
+        # Read only the selected factor file, never revalidate the whole snapshot.
+        index = _read_file_index(io.BytesIO(index_bytes))
+        selected = index.loc[index["symbol"].eq(symbol)]
+        if len(selected) != 1:
+            raise DirectProviderError(f"factor evidence is missing for {symbol}")
+        row = selected.iloc[0]
+        factor_path = _safe_snapshot_child(snapshot, row["relative_path"], "factor file")
+        factor_dir = _safe_snapshot_child(
+            snapshot, manifest.get("adjustment", {}).get("factor_path"), "factor directory"
+        )
+        if factor_path.parent != factor_dir or factor_path.name != f"{symbol}.parquet":
+            raise DirectProviderError(f"factor file path differs for {symbol}")
+        try:
+            factor_bytes = factor_path.read_bytes()
+        except OSError as exc:
+            raise DirectProviderError(f"factor file is unavailable for {symbol}") from exc
+        if hashlib.sha256(factor_bytes).hexdigest() != _validate_sha256(
+            row["sha256"], "indexed factor file hash"
+        ):
+            raise DirectProviderError(f"factor file hash mismatch for {symbol}")
+        try:
+            factors = pd.read_parquet(io.BytesIO(factor_bytes))
+        except Exception as exc:
+            raise DirectProviderError(f"factor file is unreadable for {symbol}") from exc
+        if not {"date", "factor"}.issubset(factors.columns):
+            raise DirectProviderError(f"factor columns are invalid for {symbol}")
+        factor_dates = pd.DatetimeIndex(pd.to_datetime(factors["date"], errors="coerce")).normalize()
+        if (factor_dates.hasnans or factor_dates.has_duplicates
+                or not factor_dates.is_monotonic_increasing
+                or len(factor_dates) != int(self._rows[symbol].row_count)
+                or not dates.isin(factor_dates).all()
+                or (self._context.cleaning.get("mode") != "cleaned" and not dates.equals(factor_dates))):
+            raise DirectProviderError(f"factor dates differ from bar dates for {symbol}")
+        factor = pd.to_numeric(factors["factor"], errors="coerce").to_numpy(dtype=float)
+        offset = (pd.to_numeric(factors["offset"], errors="coerce").to_numpy(dtype=float)
+                  if "offset" in factors else np.zeros(len(factors), dtype=float))
+        if not np.isfinite(factor).all() or (factor <= 0).any() or not np.isfinite(offset).all():
+            raise DirectProviderError(f"factor values or offsets are invalid for {symbol}")
+        return pd.DataFrame({"factor": factor, "offset": offset}, index=factor_dates).reindex(dates)
+
     def feature(self, instrument, field, start_index, end_index, freq):
         if str(freq).lower() not in {"day", "1d"}:
             raise DirectProviderError("direct provider currently supports day frequency only")
@@ -1548,6 +1630,10 @@ class QuantDataFeatureProvider(FeatureProvider):
             amount = pd.to_numeric(aligned["amount"], errors="coerce")
             volume = pd.to_numeric(aligned["volume"], errors="coerce")
             values = amount.div(volume.where(volume != 0))
+            adjustments = self._load_vwap_adjustments(symbol, frame.index)
+            if adjustments is not None:
+                values = (values * adjustments["factor"].reindex(dates)
+                          + adjustments["offset"].reindex(dates))
         else:
             source_field = SUPPORTED_FIELDS.get(field_name)
             if source_field is None:

@@ -91,7 +91,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
             ):
                 module.write_immutable_training_run(info, report_dir=report_dir)
 
-    def test_immutable_training_registry_rejects_unsafe_existing_files(self):
+    def test_immutable_training_registry_rejects_symlinked_file(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
@@ -102,13 +102,25 @@ class TrainBaselineLgbTest(unittest.TestCase):
 
             target = report_dir / "target.json"
             target.write_text(json.dumps(info), encoding="utf-8")
-            path.symlink_to(target)
+            try:
+                path.symlink_to(target)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("native symlink creation requires a Windows privilege unavailable to this test user")
+                raise
             with self.assertRaisesRegex(
                 ValueError, "immutable_training_run_mismatch"
             ):
                 module.write_immutable_training_run(info, report_dir=report_dir)
 
-            path.unlink()
+    def test_immutable_training_registry_rejects_unsafe_existing_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            (report_dir / "training_runs").mkdir()
+            info = {"run_id": "unsafe-run", "status": "completed"}
+            path = report_dir / "training_runs" / "unsafe-run.json"
+
             path.write_text("not-json", encoding="utf-8")
             with self.assertRaisesRegex(
                 ValueError, "immutable_training_run_mismatch"
