@@ -182,6 +182,35 @@ def test_valid_affine_prices_are_not_forced_into_multiplicative_rule():
     assert not [i for i in issues if i["severity"] == "confirmed_error"]
 
 
+@pytest.mark.parametrize("offset", [-11., -20.])
+def test_finite_nonpositive_cash_qfq_is_checked_against_affine_inputs(offset):
+    mod = checker()
+    raw, qfq, factor = frames()
+    factor.loc[0, "offset"] = offset
+    for field in mod.PRICE_FIELDS:
+        qfq.loc[0, field] = raw.loc[0, field] + offset
+    issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor)
+    assert not [i for i in issues if i["severity"] == "confirmed_error"]
+
+
+def test_nonpositive_qfq_without_matching_transform_is_still_an_error():
+    mod = checker()
+    raw, qfq, factor = frames()
+    qfq.loc[0, list(mod.PRICE_FIELDS)] -= 20.
+    issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor)
+    assert any(i["rule"] == "qfq_transform" and i["severity"] == "confirmed_error" for i in issues)
+
+
+@pytest.mark.parametrize("price", [0., -1.])
+def test_raw_nonpositive_prices_remain_errors(price):
+    mod = checker()
+    raw, qfq, factor = frames()
+    raw.loc[0, "close"] = price
+    issues = mod.inspect_etf_frames("SH510010", raw, qfq, factor)
+    assert any(i["rule"] == "invalid_numeric" and i["component"] == "raw"
+               and i["field"] == "close" and i["severity"] == "confirmed_error" for i in issues)
+
+
 @pytest.mark.parametrize(
     "component,field,value,rule",
     [

@@ -57,7 +57,7 @@ FINDING_FIELDS = (
     "detail",
     "evidence",
 )
-RULE_VERSION = "etf-readonly-healthcheck.v4"
+RULE_VERSION = "etf-readonly-healthcheck.v5"
 # Rules are copied/adapted, not imported from or executed by the sealed service.
 RULE_ORIGIN = {
     "existing": "quant_workflow/scripts/quant_data_contract.py:_validate_bar_frame,_validate_paired_snapshot_components",
@@ -247,9 +247,13 @@ def inspect_etf_frames(
                 if field not in frame:
                     issues.append(_finding("missing_column", symbol, component, field))
                     continue
-                invalid = ~np.isfinite(numbers[field]) | (
-                    numbers[field] <= 0 if field in PRICE_FIELDS else numbers[field] < 0
-                )
+                invalid = ~np.isfinite(numbers[field])
+                if field not in PRICE_FIELDS:
+                    invalid |= numbers[field] < 0
+                elif component == "raw":
+                    invalid |= numbers[field] <= 0
+                # Cash offsets can make QFQ zero/negative. The affine checks
+                # below still compare all four prices to positive RAW inputs.
                 issues.extend(
                     _mask_findings(
                         invalid,

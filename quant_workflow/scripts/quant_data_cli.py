@@ -1535,6 +1535,13 @@ def build_parser() -> argparse.ArgumentParser:
     check_etf_parser.add_argument("--calendar", type=Path)
     check_etf_parser.add_argument("--split-evidence", type=Path)
 
+    strategy_check_parser = commands.add_parser(
+        "check-strategy", help="Seeded paired-snapshot strategy diagnostics; never a read gate"
+    )
+    from check_strategy_data import add_arguments
+
+    add_arguments(strategy_check_parser)
+
     compare_parser = commands.add_parser("compare-snapshots")
     compare_parser.add_argument("dataset_id")
     compare_parser.add_argument("--base-snapshot", required=True)
@@ -1625,6 +1632,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.split_evidence is not None:
                 options.extend(["--split-evidence", str(args.split_evidence)])
             return check_etf(options)
+        if args.command == "check-strategy":
+            from check_strategy_data import main as check_strategy
+
+            options = ["--root", str(root), "--reference-root", str(args.reference_root),
+                       "--market", args.market, "--batches", str(args.batches),
+                       "--sample-size", str(args.sample_size), "--sessions", str(args.sessions),
+                       "--seed", str(args.seed)]
+            for option, value in (("--start", args.start), ("--end", args.end),
+                                  ("--plan", args.plan), ("--evidence", args.evidence),
+                                  ("--calendar", args.calendar),
+                                  ("--output-dir", args.output_dir)):
+                if value is not None:
+                    options.extend((option, str(value)))
+            if args.codes:
+                options.extend(("--codes", *args.codes))
+            return check_strategy(options)
         if args.command == "compare-snapshots":
             payload = compare_snapshot_increment(
                 args.dataset_id,
