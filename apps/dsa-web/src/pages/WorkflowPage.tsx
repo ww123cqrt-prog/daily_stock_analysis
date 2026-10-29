@@ -108,144 +108,18 @@ const WORKFLOW_INPUT_CLASS =
 
 const WORKFLOW_STEPS: WorkflowStep[] = [
   {
-    title: '每日更新与校验',
-    description: '通过 quant_qmt_data 更新行情；完整流程还包括研究数据与 Qlib 检查。',
+    title: '实验输入检查',
+    description: '读取已冻结的行情、日历与标的列表，无需连接 QMT。',
     icon: RefreshCw,
     jobs: [
-      {
-        type: 'run_daily_update',
-        label: '运行每日 quant_data 更新与校验',
-        description:
-          '股票与 ETF 默认通过轻量包增量补缺并保留快照。后续研究检查单独报告；只更新行情请使用下方股票或 ETF 更新任务。',
-        defaultParams: {
-          ashare_source: 'miniqmt',
-          overlap_days: '7',
-          sleep: '2',
-          retries: '1',
-          max_consecutive_failures: '3',
-          max_requests: '6000',
-        },
-        params: [
-          {
-            key: 'ashare_source',
-            label: 'A股数据更新来源',
-            kind: 'select',
-            options: [
-              { value: 'miniqmt', label: 'MiniQMT（quant_qmt_data，默认）' },
-              { value: 'none', label: '跳过股票更新' },
-              { value: 'baostock', label: 'Baostock' },
-              { value: 'eastmoney', label: '东方财富' },
-              { value: 'akshare', label: 'AkShare（使用东财接口）' },
-            ],
-          },
-          { key: 'skip_download', label: '跳过下载，只校验 Qlib Provider', kind: 'checkbox' },
-          { key: 'dry_run', label: '仅预演不执行', kind: 'checkbox' },
-          { key: 'continue_on_error', label: '出错继续后续阶段', kind: 'checkbox' },
-          { key: 'skip_global_daily', label: '跳过全球日线', kind: 'checkbox' },
-          { key: 'skip_ashare_news', label: '跳过新闻原始证据', kind: 'checkbox' },
-          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
-          { key: 'end', label: '结束日期', kind: 'date' },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
-          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1, placeholder: '60' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
-          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
-          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
-          { key: 'news_limit', label: '新闻下载股票数', kind: 'number', min: 1, placeholder: '50' },
-        ],
-      },
+      { type: 'run_daily_update', label: '检查冻结实验输入', description: '检查已选输入能否离线读取；缺失行情请在 QMT 中维护后重新导出。' },
     ],
   },
   {
-    title: '更新数据',
-    description: '更新 A 股、全球市场日线及可追溯原始数据。',
+    title: '独立参考数据',
+    description: '保留独立新闻与国际市场参考能力，不参与 QMT 行情合并。',
     icon: Database,
     jobs: [
-      {
-        type: 'update_ashare_miniqmt',
-        label: '更新股票快照（MiniQMT）',
-        description: '由 quant_qmt_data 补齐当前股票池缺失日线并核对重叠区间，保留配套 raw/QFQ 和旧快照；不运行训练。',
-        params: [{ key: 'end', label: '结束日期', kind: 'date' }],
-      },
-      {
-        type: 'prepare_baostock_refresh',
-        label: '准备 Baostock 增量清单',
-        description: '根据异常清单和目标日期生成需要补拉的股票列表。',
-        params: [
-          { key: 'target_end', label: '目标结束日', kind: 'date' },
-          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, placeholder: '留空为全部' },
-        ],
-      },
-      {
-        type: 'download_baostock',
-        label: '下载 Baostock 长历史',
-        description: '补齐 A 股日线长历史，本地缓存为 Parquet。',
-        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
-        params: [
-          { key: 'start', label: '开始日期', kind: 'date' },
-          { key: 'end', label: '结束日期', kind: 'date' },
-          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
-          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
-          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
-          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
-          { key: 'retry_failed', label: '重试失败', kind: 'checkbox' },
-          { key: 'retry_empty', label: '重试空数据', kind: 'checkbox' },
-          { key: 'retry_timeout', label: '重试超时', kind: 'checkbox' },
-        ],
-      },
-      {
-        type: 'download_eastmoney',
-        label: '下载东方财富日线',
-        description: '匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。',
-        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
-        params: [
-          { key: 'start', label: '开始日期', kind: 'date' },
-          { key: 'end', label: '结束日期', kind: 'date' },
-          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
-          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
-          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
-          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
-          { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
-          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
-        ],
-      },
-      {
-        type: 'download_akshare',
-        label: '下载 AkShare 日线',
-        description: '调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。',
-        defaultParams: { incremental: true, sleep: '2', retries: '1', max_consecutive_failures: '3', max_requests: '6000', overlap_days: '7' },
-        params: [
-          { key: 'start', label: '开始日期', kind: 'date' },
-          { key: 'end', label: '结束日期', kind: 'date' },
-          { key: 'limit', label: '股票数量上限', kind: 'number', min: 1 },
-          { key: 'sleep', label: '请求间隔秒', kind: 'number', min: 2, step: 0.1, placeholder: '2' },
-          { key: 'retries', label: '重试次数', kind: 'number', min: 1, max: 1, placeholder: '1' },
-          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1 },
-          { key: 'max_consecutive_failures', label: '连续失败上限', kind: 'number', min: 1, max: 3, placeholder: '3' },
-          { key: 'max_requests', label: '单次请求上限', kind: 'number', min: 1, max: 6000, placeholder: '6000' },
-          { key: 'overlap_days', label: '增量重叠天数', kind: 'number', min: 0, max: 7, placeholder: '7' },
-          { key: 'incremental', label: '增量下载', kind: 'checkbox' },
-          { key: 'retry_failed', label: '只补未缓存', kind: 'checkbox' },
-          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
-        ],
-      },
-      {
-        type: 'download_etf_momentum',
-        label: '更新 ETF 快照（MiniQMT）',
-        description: '由 quant_qmt_data 增量更新当前 ETF 池，保留原始行情、复权证据和快照版本；不重下已有历史。',
-        params: [
-          { key: 'end', label: '结束日期', kind: 'date' },
-        ],
-      },
       {
         type: 'download_global_daily',
         label: '下载全球日线与原始证据',
@@ -292,32 +166,9 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
   {
     title: 'Qlib Provider',
-    description: '从正式前复权快照生成不可变 Qlib Provider，并通过清单原子发布。',
+    description: '检查研究输入和独立历史研究能力。',
     icon: RotateCw,
     jobs: [
-      {
-        type: 'merge_to_qlib',
-        label: '生成正式 Qlib Provider',
-        description: '正式运行会生成新的不可变 canonical 快照；隔离演练不会写入正式数据。',
-        params: [
-          { key: 'smoke', label: '使用隔离小样本演练', kind: 'checkbox' },
-        ],
-      },
-      {
-        type: 'repair_qlib_provider',
-        label: '预演旧兼容 Qlib 修复',
-        description: '只检查保留的旧兼容目录；网页端固定 dry-run，不影响正式 Qlib Provider。',
-      },
-      {
-        type: 'generate_csi300',
-        label: '预演旧兼容 CSI300 股票池',
-        description: '只检查保留的旧兼容目录；正式 Qlib Provider 的股票池由底层适配层提供。',
-      },
-      {
-        type: 'add_index_benchmark',
-        label: '预演旧兼容 benchmark',
-        description: '只检查保留的旧兼容目录；正式 Qlib Provider 已包含所需指数。',
-      },
       { type: 'check_qlib_data', label: '检查 Qlib 数据', description: '快速读取样本股票和字段，确认 provider 可用。' },
       {
         type: 'prepare_robust_signal_data',
@@ -328,25 +179,9 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
   },
   {
     title: '辅助报告',
-    description: '生成异常清单、数据治理盘点和其他只读辅助报告。',
+    description: '查看独立研究的只读辅助报告。',
     icon: ListChecks,
     jobs: [
-      { type: 'report_data_anomalies', label: '生成异常股票和清洗策略', description: '输出异常股票清单，并给出后续清洗策略。' },
-      {
-        type: 'validate_latest_snapshot',
-        label: '校验新浪最新快照',
-        description: '抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。',
-        params: [
-          { key: 'limit', label: '校验样本数', kind: 'number', min: 1, placeholder: '50' },
-          { key: 'timeout', label: '超时秒数', kind: 'number', min: 1, placeholder: '10' },
-          { key: 'use_system_proxy', label: '使用系统代理', kind: 'checkbox' },
-        ],
-      },
-      {
-        type: 'report_data_hygiene',
-        label: '生成数据治理盘点和清理预案',
-        description: '只读盘点当前数据、日志、旧 provider 和临时脚本，生成 inventory 与 dry-run 清理计划；不移动、不删除、不改配置。',
-      },
       {
         type: 'report_workbench_capabilities',
         label: '生成工作台能力盘点',
@@ -372,14 +207,6 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
           { key: 'limit', label: '股票数量上限', kind: 'number', min: 1, max: 500, placeholder: '50' },
         ],
       },
-      {
-        type: 'apply_data_cleaning',
-        label: '生成正式 cleaned Qlib Provider',
-        description: '正式运行从当前 canonical Qlib Provider 生成 cleaned Qlib Provider；勾选预演时只检查清洗计划，不发布数据。',
-        params: [
-          { key: 'dry_run', label: '只预演不写入', kind: 'checkbox' },
-        ],
-      },
     ],
   },
   {
@@ -390,20 +217,19 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
       {
         type: 'train_baseline_lgb',
         label: '训练 Qlib LightGBM 选股模型基线',
-        description: '执行 Qlib 选股模型训练和默认交易策略回测，写入最新训练摘要。',
-        defaultParams: { provider: 'canonical' },
+        description: '用冻结 QMT 行情训练 OHLCV 基线，写入独立 MLflow 实验，不覆盖已有模型或 latest。',
+        defaultParams: { provider: 'qmt_native' },
         params: [
           {
             key: 'provider',
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: 'Qlib Provider（canonical）' },
-              { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
+              { value: 'qmt_native', label: '冻结 QMT 实验输入' },
             ],
           },
-          { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_lgb_alpha158.yaml' },
-          { key: 'experiment_name', label: '实验名称', kind: 'text', placeholder: 'baseline_lgb_alpha158' },
+          { key: 'config', label: '配置文件', kind: 'text', placeholder: 'baseline_qmt_native.yaml' },
+          { key: 'experiment_name', label: '实验名称', kind: 'text', placeholder: 'dsa_qmt_native' },
         ],
       },
       {
@@ -411,15 +237,14 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
         label: '运行真实 LightGBM 网页等价验收',
         description: '真实训练使用服务器固定短周期配置和专用 MLflow 实验；测试结果不会进入正式候选、最新结果或普通回测列表。',
         testOnly: true,
-        defaultParams: { provider: 'canonical' },
+        defaultParams: { provider: 'qmt_native' },
         params: [
           {
             key: 'provider',
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: 'Qlib Provider（canonical）' },
-              { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
+              { value: 'qmt_native', label: '冻结 QMT 实验输入' },
             ],
           },
         ],
@@ -435,7 +260,7 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
             label: '数据版本',
             kind: 'select',
             options: [
-              { value: 'canonical', label: 'Qlib Provider（canonical）' },
+              { value: 'canonical', label: '历史 Provider（canonical）' },
               { value: 'cleaned', label: 'Qlib Provider（cleaned）' },
             ],
           },
@@ -574,25 +399,11 @@ const WORKFLOW_STEPS: WorkflowStep[] = [
 ];
 
 const DATA_JOB_TYPES = new Set([
-  'update_ashare_miniqmt',
   'run_daily_update',
-  'prepare_baostock_refresh',
-  'download_baostock',
-  'download_eastmoney',
-  'download_akshare',
-  'download_etf_momentum',
   'download_global_daily',
   'download_ashare_news',
   'download_jqdata',
-  'merge_to_qlib',
-  'repair_qlib_provider',
-  'generate_csi300',
-  'add_index_benchmark',
   'check_qlib_data',
-  'report_data_anomalies',
-  'validate_latest_snapshot',
-  'report_data_hygiene',
-  'apply_data_cleaning',
   'prepare_robust_signal_data',
 ]);
 
@@ -657,31 +468,38 @@ function isFormalTrainingBlocked(
     && providerTrainingState(status, params).trainable !== true;
 }
 
-function selectedProvider(params: Record<string, unknown>): 'canonical' | 'cleaned' {
-  return params.provider === 'cleaned' ? 'cleaned' : 'canonical';
+function selectedProvider(params: Record<string, unknown>): 'qmt_native' | 'canonical' | 'cleaned' {
+  return params.provider === 'cleaned' ? 'cleaned' : params.provider === 'canonical' ? 'canonical' : 'qmt_native';
 }
 
 function providerTrainingState(
   status: ResearchStatus | null,
   params: Record<string, unknown>,
 ): {
-  provider: 'canonical' | 'cleaned';
+  provider: 'qmt_native' | 'canonical' | 'cleaned';
   trainable: boolean;
   snapshotId?: string;
+  experimentId?: string;
   calendarEnd?: string;
   summary: string;
 } {
   const provider = selectedProvider(params);
-  const currentIdentity = status?.currentProviderIdentities?.[provider];
+  const currentIdentity = status?.currentProviderIdentities?.[provider] as (
+    NonNullable<ResearchStatus['currentProviderIdentities']>[string]
+    & { experimentId?: string; barsSha256?: string }
+  ) | undefined;
   const preflight = status?.trainingPreflights?.[provider]
     || (status?.trainingPreflight?.provider === provider ? status.trainingPreflight : undefined);
   const currentSnapshotReady = currentIdentity?.status === 'ready'
-    && Boolean(currentIdentity.snapshotId);
+    && (provider === 'qmt_native'
+      ? Boolean(currentIdentity.experimentId && currentIdentity.barsSha256)
+      : Boolean(currentIdentity.snapshotId));
   const trainable = currentSnapshotReady && preflight?.status === 'passed';
   return {
     provider,
     trainable,
     snapshotId: currentSnapshotReady ? currentIdentity?.snapshotId : undefined,
+    experimentId: currentSnapshotReady ? currentIdentity?.experimentId : undefined,
     calendarEnd: currentIdentity?.calendarEnd,
     summary: !currentSnapshotReady
       ? currentIdentity?.error || '当前 Qlib Provider 不可用。'
@@ -725,8 +543,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
       eyebrow: 'Quant Data',
       title: zh ? '数据更新与检查' : 'Data Updates and Checks',
       description: zh
-        ? '更新独立行情与参考数据，并校验正式 A 股 qfq 和 Qlib Provider。'
-        : 'Update independent market and reference data, then validate the canonical A-share qfq data and Qlib Provider.',
+        ? '只读检查冻结实验输入；行情由 QMT 维护。'
+        : 'Inspect frozen input; QMT maintains the underlying market data.',
     };
   }
   if (surface === 'training') {
@@ -751,8 +569,8 @@ function surfaceCopy(surface: QuantTaskSurface, language: 'zh' | 'en') {
     eyebrow: 'Quant Workflow',
     title: zh ? '量化任务中心' : 'Quant Workflow',
     description: zh
-      ? '在网页端查看 quant_data 实时状态，并运行 Qlib 转换、选股模型训练、实验追踪和交易策略回测；后台只执行白名单脚本。'
-      : 'View live quant_data status and run Qlib conversion, training, experiment, and backtest tasks through a browser-safe whitelist.',
+      ? '查看冻结 QMT 实验输入，运行选股模型训练、实验追踪和 DSA 回测；后台只执行白名单脚本。'
+      : 'Inspect frozen QMT input and run training, experiment and DSA backtest tasks through a browser-safe whitelist.',
   };
 }
 
@@ -1026,18 +844,6 @@ function buildDailyGuideSteps(
   latestJobs: Record<string, QuantJob>,
   mlflowUrl: string,
 ): DailyGuideStep[] {
-  const updateJob = latestJobForTypes(latestJobs, [
-    'run_daily_update',
-    'prepare_baostock_refresh',
-    'download_baostock',
-    'download_eastmoney',
-    'download_akshare',
-    'download_global_daily',
-    'download_ashare_news',
-    'download_jqdata',
-  ]);
-  const anomalyJob = latestJobs.report_data_anomalies;
-  const cleaningJob = latestJobs.apply_data_cleaning;
   const reviewJob = latestJobForTypes(latestJobs, ['report_market_regime', 'report_cash_control_backtest', 'train_baseline_lgb', 'run_dsa_backtest']);
 
   const dataStatus = researchStatus?.trainable
@@ -1048,21 +854,6 @@ function buildDailyGuideSteps(
         meta: researchStatus.qlibProvider?.calendarRange ? `Qlib: ${researchStatus.qlibProvider.calendarRange}` : undefined,
       }
     : jobDrivenStatus(latestJobs.check_qlib_data, 'todo', '待检查');
-
-  const updateStatus = jobDrivenStatus(updateJob, 'waiting', '按需更新');
-
-  const anomalyStatus = jobDrivenStatus(anomalyJob, 'todo', '待生成');
-
-  const cleaningStatus = (() => {
-    const base = jobDrivenStatus(cleaningJob, 'waiting', '建议先预演');
-    if (cleaningJob?.status === 'completed' && cleaningJob.params?.dry_run === true) {
-      return { ...base, statusLabel: '预演完成' };
-    }
-    if (cleaningJob?.status === 'completed') {
-      return { ...base, statusLabel: '已应用' };
-    }
-    return base;
-  })();
 
   const reviewStatus = (() => {
     const active = [latestJobs.report_market_regime, latestJobs.report_cash_control_backtest, latestJobs.train_baseline_lgb, latestJobs.run_dsa_backtest].find(isActiveJob);
@@ -1092,39 +883,11 @@ function buildDailyGuideSteps(
     {
       id: 'check-data',
       title: '检查数据',
-      detail: '确认 Qlib provider 可读、日期范围有效、当前数据是否可训练。',
+      detail: '检查冻结行情、日历与标的列表，确认本次实验输入可读取。',
       ...dataStatus,
       actions: [
-        { kind: 'job', label: '检查 Qlib', jobType: 'check_qlib_data' },
+        { kind: 'job', label: '检查输入', jobType: 'run_daily_update' },
         { kind: 'link', label: '研究总览', to: '/research' },
-      ],
-    },
-    {
-      id: 'refresh-data',
-      title: '更新数据',
-      detail: '日常先生成增量清单；真正下载长任务仍在左侧填写参数后运行。',
-      ...updateStatus,
-      actions: [
-        { kind: 'job', label: '全链路', jobType: 'run_daily_update' },
-        { kind: 'job', label: '增量清单', jobType: 'prepare_baostock_refresh' },
-      ],
-    },
-    {
-      id: 'anomalies',
-      title: '异常清单',
-      detail: '生成异常股票清单和清洗策略报告。',
-      ...anomalyStatus,
-      actions: [
-        { kind: 'job', label: '异常清单', jobType: 'report_data_anomalies' },
-      ],
-    },
-    {
-      id: 'cleaning',
-      title: '清洗预演',
-      detail: '默认只做 dry-run，不写 cleaned parquet，不转换 Qlib，适合先核对影响范围。',
-      ...cleaningStatus,
-      actions: [
-        { kind: 'job', label: '预演', jobType: 'apply_data_cleaning', params: { dry_run: true } },
       ],
     },
     {
@@ -1133,8 +896,6 @@ function buildDailyGuideSteps(
       detail: '跑 Qlib LightGBM 基线、现金仓位叠加或 DSA 历史准确性回测，然后进入回测页看结果。',
       ...reviewStatus,
       actions: [
-        { kind: 'job', label: '市场信号', jobType: 'report_market_regime' },
-        { kind: 'job', label: '现金叠加', jobType: 'report_cash_control_backtest' },
         { kind: 'job', label: '训练基线', jobType: 'train_baseline_lgb' },
         { kind: 'link', label: '回测页', to: '/backtest' },
       ],
@@ -1188,6 +949,11 @@ function providerFreshnessText(
   state: ReturnType<typeof providerTrainingState>,
   language: 'zh' | 'en',
 ): string {
+  if (state.provider === 'qmt_native') {
+    return `${language === 'zh' ? '冻结输入' : 'Frozen input'}: ${state.trainable
+      ? (language === 'zh' ? '离线可用' : 'offline ready')
+      : (language === 'zh' ? '未就绪' : 'not ready')}${state.calendarEnd ? ` · ${state.calendarEnd}` : ''}`;
+  }
   if (!state.trainable) {
     return language === 'zh'
       ? `实时检查未通过${state.calendarEnd ? ` · Provider 日历截止 ${state.calendarEnd}` : ''}`
@@ -1995,7 +1761,7 @@ export const QuantTaskPage: React.FC<{
     { label: language === 'zh' ? '协作暂停' : 'cooperative pause', info: robustPauseJobInfo },
     { label: language === 'zh' ? '恢复研究' : 'resume research', info: robustResumeJobInfo },
   ].filter(({ info }) => info.catalogLoaded && !info.isEnabled);
-  const providerStates = (['canonical', 'cleaned'] as const)
+  const providerStates = Object.keys(researchStatus?.currentProviderIdentities || {})
     .filter((provider) => Boolean(
       workflowStatus?.currentProviderIdentities?.[provider]
       || workflowStatus?.trainingPreflights?.[provider],
@@ -2527,7 +2293,7 @@ export const QuantTaskPage: React.FC<{
                               ) : null}
                               {formalTrainingBlocked && !loading ? (
                                 <Badge variant="warning" size="sm" className="shadow-none">
-                                  {language === 'zh' ? '等待数据修复' : 'Waiting for data'}
+                                  {language === 'zh' ? '等待实验输入' : 'Waiting for data'}
                                 </Badge>
                               ) : null}
                             </div>
@@ -2535,7 +2301,10 @@ export const QuantTaskPage: React.FC<{
                             {TRAINING_JOB_TYPES.has(job.type) ? (
                               <p className={`mt-1 text-xs ${providerState.trainable ? 'text-success' : 'text-warning'}`}>
                                 {language === 'zh' ? '当前数据' : 'Current data'}：{providerState.provider}
-                                {' · '}{language === 'zh' ? '快照' : 'snapshot'} {providerState.snapshotId || '-'}
+                                {' · '}{providerState.provider === 'qmt_native'
+                                  ? (language === 'zh' ? '实验输入' : 'Experiment input')
+                                  : (language === 'zh' ? '历史快照' : 'Historical snapshot')}
+                                {' '}{providerState.experimentId || providerState.snapshotId || '-'}
                                 {' · '}{providerFreshnessText(providerState, language)}
                                 {!providerState.trainable
                                   ? ` · ${localizedTrainingReadinessSummary(providerState.summary, language)}`

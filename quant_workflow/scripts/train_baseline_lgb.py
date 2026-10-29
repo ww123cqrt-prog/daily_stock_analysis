@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Thin wrapper for Qlib Alpha158 + LightGBM baseline training + backtest.
+Qlib OHLCV + LightGBM training and prediction on a frozen QMT input.
 
 Usage:
     python scripts/train_baseline_lgb.py                     # default config
     python scripts/train_baseline_lgb.py --config other.yaml # custom config
-    python scripts/train_baseline_lgb.py --train-only        # skip backtest
 """
 import argparse
 import hashlib
@@ -17,18 +16,19 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DSA_ROOT = SCRIPT_DIR.parents[1]
+if str(DSA_ROOT) not in sys.path:
+    sys.path.insert(0, str(DSA_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _file_lock import lock_file, unlock_file  # noqa: E402
 from _paths import (  # noqa: E402
-    china_astock_root,
     mlruns_root,
     provider_calendar_days,
-    provider_has_instrument_pool,
     provider_instrument_ranges,
     qlib_workflow_init_config,
     qlib_workflow_provider_uri,
@@ -45,8 +45,6 @@ from _mlflow_run_provenance import (  # noqa: E402
     tag_run_artifact_hashes,
     tag_run_with_provider,
 )
-from _symbols import to_qlib_name as _to_qlib_name  # noqa: E402
-from generate_csi300 import load_csi300_symbols as load_cached_csi300_symbols  # noqa: E402
 
 
 WORKFLOW_ROOT = workflow_root()
@@ -59,9 +57,7 @@ EXPERIMENT_RUNS = REPORT_DIR / "experiment_runs.jsonl"
 MLRUNS_DIR = mlruns_root()
 MLFLOW_TRACKING_URI = MLRUNS_DIR.expanduser().resolve().as_uri()
 QUANT_DATA = quant_data_root()
-STOCK_LIST_PATH = QUANT_DATA / "stock_lists.json"
-PROVIDER_NAMES = ("canonical", "cleaned")
-ASTOCK_PROJECT = china_astock_root()
+PROVIDER_NAMES = ("qmt_native",)
 REQUIRED_TRAINING_ARTIFACTS = ("pred.pkl", "label.pkl", "task")
 CANDIDATE_STRATEGY_CONFIG = CONFIGS_DIR / "candidate_pipeline.yaml"
 RESULT_SCOPES = ("official", "candidate_child", "training_equivalence")
@@ -92,7 +88,7 @@ def resolve_provider_uri(
     snapshot_override: str | Path | None = None,
     expected_provider_identity: Mapping[str, Any] | None = None,
 ) -> Path:
-    name = (provider or "canonical").strip().lower()
+    name = (provider or "qmt_native").strip().lower()
     if name not in PROVIDER_NAMES:
         choices = ", ".join(PROVIDER_NAMES)
         raise ValueError(f"Provider must be one of: {choices}.")
@@ -112,45 +108,50 @@ def resolve_provider_uri(
     return qlib_workflow_provider_uri(name)
 
 
-def to_qlib_name(sym: str) -> str:
-    return _to_qlib_name(sym, default_exchange="SZ")
-
-
 def load_provider_instrument_ranges(provider_uri: Path) -> dict[str, tuple[str, str]]:
     return provider_instrument_ranges(provider_uri)
 
 
-def build_csi300_lines(symbols: Iterable[str], ranges: dict[str, tuple[str, str]]) -> list[str]:
-    lines: list[str] = []
-    seen: set[str] = set()
-    for sym in symbols:
-        qlib_name = to_qlib_name(sym)
-        if qlib_name in seen or qlib_name not in ranges:
-            continue
-        seen.add(qlib_name)
-        start, end = ranges[qlib_name]
-        lines.append(f"{qlib_name}\t{start}\t{end}")
-    return lines
+def apply_information_boundaries(payload: dict, calendar_days: list[str]) -> None:
+    """Use the same label dependency and calendar in preflight and training."""
+    from qlib.config import C
+    # Use Qlib's expression dependency window and the frozen session calendar.
+    import pandas as pd
+    from qlib.data.data import LocalExpressionProvider
+    from qlib.data.ops import register_all_ops
 
+    register_all_ops(C)
+    dataset = payload["task"]["dataset"]["kwargs"]
+    handler = dataset["handler"]["kwargs"]
+    label_config = handler.get("label", [["Ref($close, -2)/Ref($close, -1) - 1"], ["LABEL0"]])
+    labels = label_config[0] if isinstance(label_config[0], (list, tuple)) else label_config
+    parser = LocalExpressionProvider()
+    future_sessions = max(parser.get_expression_instance(label).get_extended_window_size()[1] for label in labels)
+    calendar = pd.DatetimeIndex(calendar_days)
+    requested = deepcopy(dataset["segments"])
+    if not (pd.Timestamp(requested["train"][1]) < pd.Timestamp(requested["valid"][0])
+            and pd.Timestamp(requested["valid"][1]) < pd.Timestamp(requested["test"][0])):
+        raise ValueError("train/valid/test segments must be ordered and disjoint")
+    last_observation = {}
+    for segment in ("train", "valid", "test"):
+        start, end = requested[segment]
+        first = calendar.searchsorted(pd.Timestamp(start), side="left")
+        last = calendar.searchsorted(pd.Timestamp(end), side="right") - 1
+        effective_last = last - future_sessions
+        if effective_last < first:
+            raise ValueError(f"{segment} has no samples with a complete label window")
+        dataset["segments"][segment] = [calendar[first].date().isoformat(), calendar[effective_last].date().isoformat()]
+        last_observation[segment] = calendar[last].date().isoformat()
+    handler["fit_start_time"], handler["fit_end_time"] = dataset["segments"]["train"]
+    payload["task"]["time_semantics"] = {
+        "label_expressions": list(labels), "label_future_sessions": int(future_sessions),
+        "requested_segments": requested, "effective_segments": deepcopy(dataset["segments"]),
+        "label_last_observation": last_observation,
+        "preprocessor_fit": list(dataset["segments"]["train"]),
+        "feature_cutoff": "signal_date_close", "prediction_available": "signal_date_after_close",
+        "order_execution": "next_trading_day_open", "validation_used_for_model_selection": True,
+    }
 
-def load_csi300_symbols(stock_list_path: Path = STOCK_LIST_PATH) -> list[str]:
-    return load_cached_csi300_symbols(
-        stock_list_path,
-        ASTOCK_PROJECT,
-        allow_network_fallback=False,
-    )
-
-
-def ensure_csi300_instruments(provider_uri: Path, csi300_symbols: Iterable[str] | None = None):
-    """Require the immutable provider to contain its CSI300 pool."""
-    if provider_has_instrument_pool(provider_uri, "csi300"):
-        del csi300_symbols
-        return
-    del csi300_symbols
-    raise FileNotFoundError(
-        "The formal Qlib Provider has no CSI300 instruments; republish and validate "
-        "the quant_data backend before training"
-    )
 
 
 def write_runtime_config_with_provider(
@@ -159,7 +160,7 @@ def write_runtime_config_with_provider(
     provider_name: str,
     out_dir: Path = RUNTIME_CONFIG_DIR,
     *,
-    extend_dates_to_provider_latest: bool = True,
+    extend_dates_to_provider_latest: bool = False,
 ) -> Path:
     import yaml
     from qlib.config import C
@@ -185,6 +186,9 @@ def write_runtime_config_with_provider(
             latest_day,
             backtest_end_day=backtest_end_day,
         )
+
+    if provider_name == "qmt_native":
+        apply_information_boundaries(payload, provider_calendar_days(provider_uri))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -589,9 +593,24 @@ def build_training_replay_contract(
     runtime_config = Path(runtime_config).resolve()
     strategy_config = Path(strategy_config).resolve()
     runtime_payload = yaml.safe_load(runtime_config.read_text(encoding="utf-8")) or {}
-    strategy_payload = yaml.safe_load(strategy_config.read_text(encoding="utf-8")) or {}
     task = runtime_payload.get("task") if isinstance(runtime_payload, dict) else {}
     task = task if isinstance(task, dict) else {}
+    if not any(record.get("class") == "PortAnaRecord" for record in task.get("record", [])):
+        segments = task["dataset"]["kwargs"]["segments"]
+        contract = {
+            "contract_version": 3, "replay_engine": "dsa", "exact_strategy_ids": [],
+            "purpose": "data_engineering_acceptance",
+            "source_config_sha256": _file_sha256(source_config),
+            "runtime_config_sha256": _file_sha256(runtime_config),
+            "periods": {target: list(segments[source]) for source, target in (
+                ("train", "training"), ("valid", "validation"), ("test", "test"))},
+            "time_semantics": task["time_semantics"],
+        }
+        contract["config_hash"] = hashlib.sha256(json.dumps(
+            contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        return contract
+    strategy_payload = yaml.safe_load(strategy_config.read_text(encoding="utf-8")) or {}
     dataset = task.get("dataset") if isinstance(task.get("dataset"), dict) else {}
     dataset_kwargs = dataset.get("kwargs") if isinstance(dataset.get("kwargs"), dict) else {}
     segments = dataset_kwargs.get("segments") if isinstance(dataset_kwargs.get("segments"), dict) else {}
@@ -746,6 +765,11 @@ def _strategy_name(params: dict) -> str:
 
 
 def _experiment_conclusion(provider: str) -> tuple[str, str]:
+    if provider == "qmt_native":
+        return (
+            "冻结 QMT 输入已完成模型训练与预测的数据工程验收，未生成交易信号。",
+            "在 DSA 中使用同一冻结输入验收回测，不据此调整严格 holdout 上的模型参数。",
+        )
     if provider == "cleaned":
         return (
             "清洗后数据 baseline 已跑通，异常成交量和极端事件已按清洗策略处理；结果可用于和原始合并数据对比，但仍不是可直接实盘的策略。",
@@ -759,7 +783,7 @@ def _experiment_conclusion(provider: str) -> tuple[str, str]:
 
 def build_experiment_record(info: dict) -> dict:
     params = info.get("params") if isinstance(info.get("params"), dict) else {}
-    provider = str(info.get("provider") or "canonical")
+    provider = str(info.get("provider") or "qmt_native")
     conclusion, next_step = _experiment_conclusion(provider)
     return {
         "run_id": info.get("run_id"),
@@ -770,7 +794,7 @@ def build_experiment_record(info: dict) -> dict:
         "config_path": info.get("source_config"),
         "runtime_config": info.get("runtime_config"),
         "model": params.get("model.class", "LGBModel"),
-        "strategy": _strategy_name(params),
+        "strategy": "model_predictions" if provider == "qmt_native" else _strategy_name(params),
         "dataset_range": _dataset_range(params),
         "metrics": _metric_subset(info.get("metrics") or {}),
         "conclusion": conclusion,
@@ -962,6 +986,12 @@ def publish_training_result(
             ),
         }
     )
+    import yaml
+    runtime_payload = yaml.safe_load(Path(runtime_config).read_text(encoding="utf-8"))
+    info["time_semantics"] = runtime_payload["task"]["time_semantics"]
+    info["price_basis"] = final_identity["price_basis"]
+    info["execution_basis"] = "saved_price_research"
+    client.log_dict(run_id, info["time_semantics"], "time_semantics.json")
     record_training_result(
         info,
         publish_latest=publish_latest,
@@ -974,22 +1004,22 @@ def publish_training_result(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qlib Alpha158+LGB baseline")
+    parser = argparse.ArgumentParser(description="Qlib QMT OHLCV+LightGBM training and prediction")
     parser.add_argument(
         "--config",
-        default=str(CONFIGS_DIR / "baseline_lgb_alpha158.yaml"),
+        default=str(CONFIGS_DIR / "baseline_qmt_native.yaml"),
         help="Path to Qlib workflow YAML",
     )
     parser.add_argument(
         "--experiment-name",
-        default="baseline_lgb_alpha158",
+        default="baseline_qmt_native_ohlcv",
         help="MLflow experiment name",
     )
     parser.add_argument(
         "--provider",
-        default="canonical",
+        default="qmt_native",
         choices=PROVIDER_NAMES,
-        help="Local Qlib provider to use: canonical or cleaned",
+        help="Frozen QMT experiment input provider",
     )
     parser.add_argument(
         "--provider-uri",
@@ -1089,23 +1119,14 @@ def main():
         print(f"[error] {exc}")
         sys.exit(1)
 
-    # ── Step 1: Ensure instruments ──
-    try:
-        ensure_csi300_instruments(provider_uri)
-    except Exception as exc:
-        print(f"[error] Failed to prepare CSI300 instruments: {exc}")
-        sys.exit(1)
     runtime_config_path = write_runtime_config_with_provider(
         config_path,
         provider_uri,
         args.provider,
-        extend_dates_to_provider_latest=(
-            args.result_scope != "training_equivalence"
-        ),
+        extend_dates_to_provider_latest=False,
     )
 
-    # ── Step 2: Run training + backtest ──
-    ensure_mlruns_artifact_locations(MLRUNS_DIR)
+    # ── Step 2: Run training and prediction ──
 
     print(f"\n{'='*60}")
     print(f"[run] Source config: {config_path}")
@@ -1121,7 +1142,7 @@ def main():
 
     # ── Step 3: Print summary ──
     print(f"\n{'='*60}")
-    print("[done] Training + backtest complete.")
+    print("[done] Training and prediction complete.")
     print(f"{'='*60}")
 
     info = load_run_metrics(run_id, args.experiment_name)

@@ -1170,7 +1170,6 @@ class DataFetcherManager:
         from .longbridge_fetcher import LongbridgeFetcher
         from .miniqmt_bridge import MiniQMTBridgeClient
         from .miniqmt_fetcher import MiniQMTFetcher, QuantQMTDataFetcher
-        from src.services.quant_workflow_paths import quant_data_root
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         efinance = EfinanceFetcher()
@@ -1180,9 +1179,8 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         optional_fetchers: List[BaseFetcher] = []
-        local_root = quant_data_root()
-        if os.environ.get("QUANT_DATA_ROOT") or (local_root / "DATA_MANIFEST.json").is_file():
-            optional_fetchers.append(QuantQMTDataFetcher(quant_data_root=local_root))
+        if os.environ.get("QMT_DATASET_DIR") or os.environ.get("QMT_PORT"):
+            optional_fetchers.append(QuantQMTDataFetcher())
         if MiniQMTBridgeClient.configured():
             optional_fetchers.append(MiniQMTFetcher())
 
@@ -1306,14 +1304,13 @@ class DataFetcherManager:
         if market == "cn":
             local = next((f for f in fetchers if f.name == "QuantQMTDataFetcher"), None)
             if local is not None:
-                # A committed local read is a different responsibility from
-                # supplier failover. Missing local evidence must not trigger
-                # an implicit download with a different price/source basis.
+                # A selected local input must not trigger supplier failover
+                # with a different price/source basis when its bars are missing.
                 frame = self._call_fetcher_method(
                     local, "get_daily_data", stock_code=stock_code,
                     start_date=start_date, end_date=end_date, days=days)
                 if frame is None or frame.empty:
-                    raise DataFetchError("本机快照在该区间无行情；请显式更新或核对证券与日期。")
+                    raise DataFetchError("QMT 实验输入在该区间无行情；请核对输入或在 QMT 中维护行情。")
                 return frame, local.name
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)

@@ -949,7 +949,7 @@ def run_pipeline(
     if dry_run:
         artifacts, market, provider_state = _dry_run_artifacts(spec["models"])
         provider_uri = Path("dry-run-provider")
-        locked_provider_identity = provider_identity(provider_uri)
+        locked_provider_identity = None  # Synthetic dry-run has no real data identity.
     else:
         _preflight_dependencies(spec["models"])
         provider_uri = resolve_pipeline_provider(

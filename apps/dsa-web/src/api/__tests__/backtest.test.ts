@@ -213,6 +213,8 @@ describe('backtestApi', () => {
       endDate: '2025-12-31',
       topk: 50,
       costBps: 15,
+      initialCapital: 500000,
+      lotSize: 100,
     });
 
     expect(result.metrics.annualExcessReturn).toBe(0.12);
@@ -227,6 +229,8 @@ describe('backtestApi', () => {
         end_date: '2025-12-31',
         topk: 50,
         cost_bps: 15,
+        initial_capital: 500000,
+        lot_size: 100,
       },
       { timeout: 120000 },
     );

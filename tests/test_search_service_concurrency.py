@@ -349,14 +349,16 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
             provider="Filtered",
             success=True,
         )
+        now = [0.0]
 
         def wait_for_owner(_key, _event, *, timeout_seconds):
             self.assertGreater(timeout_seconds, 0)
             self.assertLessEqual(timeout_seconds, 0.2)
-            time.sleep(0.03)
+            now[0] += 0.03
             return None
 
         with (
+            patch("src.search_service.time.monotonic", side_effect=lambda: now[0]),
             patch.object(
                 service,
                 "_get_cached_or_reserve",
@@ -373,7 +375,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
         self.assertIs(actual, response)
         remaining = subprocess_call.call_args.kwargs["timeout_seconds"]
         self.assertGreater(remaining, 0)
-        self.assertLess(remaining, 0.2)
+        self.assertAlmostEqual(remaining, 0.17)
 
     def test_bounded_topic_search_timeout_terminates_and_reaps_process(self):
         with patch("src.search_service._search_topic_news_process_worker", _hang_topic_news_process_worker):

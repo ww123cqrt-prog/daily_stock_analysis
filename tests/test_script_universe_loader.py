@@ -1,78 +1,56 @@
-# -*- coding: utf-8 -*-
-"""Unit tests for universe pool symbol normalization."""
+"""Universe normalization and immutable-input bundle selection."""
+import numpy as np
+import json
+import pytest
 
-from src.services.script_universe_loader import _normalize_ashare_symbol
-
-
-def test_normalize_ashare_symbol_adds_exchange_prefix():
-    assert _normalize_ashare_symbol("600519") == "SH600519"
-    assert _normalize_ashare_symbol("000001") == "SZ000001"
-    assert _normalize_ashare_symbol("300750") == "SZ300750"
-    assert _normalize_ashare_symbol("688981") == "SH688981"
+from src.services.script_universe_loader import _normalize_ashare_symbol, load_market_view
+from tests.test_qmt_native_backtest import save_input
 
 
-def test_normalize_ashare_symbol_keeps_prefixed_and_lowercase():
-    assert _normalize_ashare_symbol("sh600519") == "SH600519"
-    assert _normalize_ashare_symbol("SZ000001") == "SZ000001"
+@pytest.mark.parametrize("value, expected", [("600519", "SH600519"), ("000001", "SZ000001"),
+    ("300750", "SZ300750"), ("159915", "SZ159915"), ("sh600519", "SH600519"),
+    ("920149", "BJ920149"), ("600519.SH", "SH600519")])
+def test_normalize_symbol(value, expected):
+    assert _normalize_ashare_symbol(value) == expected
 
 
-def test_normalize_ashare_symbol_passes_unknown_forms_through():
-    assert _normalize_ashare_symbol("159915") == "159915"
+def test_custom_selection_cannot_reuse_another_pools_bundle(tmp_path):
+    directory = save_input(tmp_path)
+    stock, a = load_market_view("custom", custom_symbols=["600519"], quant_data_root=directory,
+                                cache_dir=tmp_path / "bundles")
+    etf, b = load_market_view("custom", custom_symbols=["159915"], quant_data_root=directory,
+                              cache_dir=tmp_path / "bundles")
+    assert a["bundle_dir"] != b["bundle_dir"]
+    assert list(stock.symbols) == ["SH600519"]
+    assert list(etf.symbols) == ["SZ159915"]
 
 
-from src.services.script_universe_loader import _pool_cache_key
+def test_warm_bundle_preserves_same_experiment_and_missing_values(tmp_path):
+    directory = save_input(tmp_path, missing=True)
+    first, a = load_market_view("etf", quant_data_root=directory, cache_dir=tmp_path / "bundles")
+    second, b = load_market_view("etf", quant_data_root=directory, cache_dir=tmp_path / "bundles")
+    assert a["experiment_id"] == b["experiment_id"]
+    assert b["snapshot_id"] is None
+    np.testing.assert_equal(first.close, second.close)
 
 
-def test_pool_cache_key_includes_custom_symbols() -> None:
-    """C-1: different custom symbol lists must never share a cached bundle."""
-    base = _pool_cache_key("custom", "snap", "2024-01-01", "2024-06-30")
-    with_a = _pool_cache_key(
-        "custom", "snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["600519"],
-    )
-    with_b = _pool_cache_key(
-        "custom", "snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["000001"],
-    )
-    assert with_a != base
-    assert with_a != with_b
-    # Symbol order must not matter.
-    assert with_a == _pool_cache_key(
-        "custom", "snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["600519"],
-    )
+def test_changed_membership_cannot_reuse_a_warm_bundle(tmp_path):
+    directory = save_input(tmp_path, universe_kind="historical", membership_intervals=[
+        {"symbol": "SH600519", "start_date": "2024-01-02", "end_date": "2024-01-04"},
+    ])
+    first, a = load_market_view("csi800", quant_data_root=directory, cache_dir=tmp_path / "bundles")
+    from quant_qmt_data import load_dataset, save_dataset
 
-
-def test_pool_cache_key_includes_membership_sha() -> None:
-    """M-4: membership reference edits must invalidate the cache."""
-    base = _pool_cache_key("csi800", "snap", None, None)
-    assert base != _pool_cache_key(
-        "csi800", "snap", None, None, membership_sha256="a" * 64
-    )
-    assert base != _pool_cache_key(
-        "csi800", "snap", None, None, membership_sha256="b" * 64
-    )
-
-
-def test_pool_cache_key_includes_secondary_etf_snapshot() -> None:
-    """P1: an ETF republish must invalidate mixed custom-pool caches even
-    when the A-share snapshot id is unchanged."""
-    base = _pool_cache_key(
-        "custom", "ashare-snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["600519", "159915"],
-    )
-    with_etf_a = _pool_cache_key(
-        "custom", "ashare-snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["600519", "159915"],
-        secondary_snapshot_id="etf-snap-1",
-    )
-    with_etf_b = _pool_cache_key(
-        "custom", "ashare-snap", "2024-01-01", "2024-06-30",
-        custom_symbols=["600519", "159915"],
-        secondary_snapshot_id="etf-snap-2",
-    )
-    assert with_etf_a != base
-    assert with_etf_a != with_etf_b
+    frame = load_dataset(directory)
+    metadata = frame.attrs
+    changed = save_dataset(frame, tmp_path / "changed-membership", calendar=metadata["calendar"],
+        universe=metadata["universe"], universe_kind="historical", membership_intervals=[
+            {"symbol": "SH600519", "start_date": "2024-01-02", "end_date": "2024-01-03"},
+        ])
+    second, b = load_market_view("csi800", quant_data_root=changed, cache_dir=tmp_path / "bundles")
+    assert a["bundle_dir"] != b["bundle_dir"]
+    assert first.members[:, 0].tolist() == [True, True, True, False]
+    assert second.members[:, 0].tolist() == [True, True, False, False]
 
 
 def test_explicit_legacy_loader_reads_strict_production_v2_service(monkeypatch, tmp_path) -> None:

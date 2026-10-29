@@ -5,7 +5,6 @@ import { getParsedApiError, type ParsedApiError } from '../api/error';
 import {
   quantApi,
   type QuantDataStatus,
-  type QuantDataStatusDataset,
 } from '../api/quant';
 import {
   ApiErrorAlert,
@@ -17,21 +16,6 @@ import {
   StatusDot,
 } from '../components/common';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
-
-const DATASET_NAMES: Record<string, { zh: string; en: string }> = {
-  ashare_daily_qfq: { zh: 'A股前复权日线', en: 'A-share adjusted daily bars' },
-  ashare_daily_raw: { zh: 'A股原始日线', en: 'A-share raw daily bars' },
-  ashare_fundamentals_pit: { zh: '防前视基本面', en: 'Point-in-time fundamentals' },
-  cn_etf_daily: { zh: 'ETF 日线', en: 'ETF daily bars' },
-  cn_index_daily: { zh: '指数日线', en: 'Index daily bars' },
-  pit_csi800: { zh: 'CSI800 历史成分', en: 'CSI800 point-in-time members' },
-  qlib_cleaning_plan: { zh: 'Qlib 清洗规则', en: 'Qlib cleaning plan' },
-  robust_reference: { zh: '研究参考表', en: 'Research reference tables' },
-};
-
-function datasetName(dataset: QuantDataStatusDataset, language: 'zh' | 'en'): string {
-  return DATASET_NAMES[dataset.datasetId]?.[language] ?? dataset.datasetId;
-}
 
 function formatCheckedAt(value: string, language: 'zh' | 'en'): string {
   const date = new Date(value);
@@ -70,7 +54,7 @@ const DataPage: React.FC = () => {
     <AppPage className="max-w-[1400px] space-y-4">
       <PageHeader
         title={zh ? '数据状态' : 'Data Status'}
-        description={zh ? 'quant_qmt_data 本机快照，保留数据版本追溯' : 'Local quant_qmt_data snapshots with version provenance'}
+        description={zh ? '冻结 QMT 实验输入，训练与回测共用同一份数据' : 'Frozen QMT input shared by training and backtesting'}
         actions={(
           <Button
             variant="secondary"
@@ -99,77 +83,68 @@ const DataPage: React.FC = () => {
         <>
           <section className="grid gap-px overflow-hidden rounded-lg border border-border/70 bg-border/70 sm:grid-cols-3">
             <div className="bg-card px-4 py-4">
-              <p className="text-xs text-secondary-text">{zh ? '本机数据状态' : 'Local data'}</p>
-              <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-foreground">
+              <p className="text-xs text-secondary-text">{zh ? '实验输入状态' : 'Input status'}</p>
+              <div className="mt-2 flex items-center gap-2 text-sm font-semibold">
                 <StatusDot tone={status.status === 'ready' ? 'success' : 'warning'} />
-                {status.status === 'ready' ? 'Ready' : status.status}
-                {status.datasetSetVersion === 'production.v2' ? ` · v2 #${status.generation}` : null}
+                {status.status}
               </div>
             </div>
             <div className="bg-card px-4 py-4">
-              <p className="text-xs text-secondary-text">{zh ? '可用数据集' : 'Available datasets'}</p>
-              <p className="mt-2 text-sm font-semibold text-foreground">
-                {zh ? `${status.availableDatasets} 个可用数据集` : `${status.availableDatasets} datasets`}
-              </p>
+              <p className="text-xs text-secondary-text">{zh ? '所选范围' : 'Selected scope'}</p>
+              <p className="mt-2 text-sm font-semibold">{status.experiment
+                ? (zh ? `${status.experiment.symbolCount} 个标的 · ${status.experiment.calendarDays} 个交易日`
+                  : `${status.experiment.symbolCount} symbols · ${status.experiment.calendarDays} trading days`)
+                : '-'}</p>
             </div>
             <div className="bg-card px-4 py-4">
               <p className="text-xs text-secondary-text">{zh ? '检查时间' : 'Checked at'}</p>
-              <p className="mt-2 text-sm font-semibold text-foreground">{formatCheckedAt(status.checkedAt, language)}</p>
+              <p className="mt-2 text-sm font-semibold">{formatCheckedAt(status.checkedAt, language)}</p>
             </div>
           </section>
-
           <p className="text-xs text-secondary-text">
-            {zh ? '这里只检查已提交清单与快照身份，不是全库质量检查；读取时仍核对所用数据。' : 'This checks committed metadata and snapshot identities, not a full data audit. Reads verify their inputs.'}
+            {zh ? '完整冻结输入无需连接 QMT；状态可用不代表全市场历史齐备。缺失行情请在 QMT 中维护后重新导出。' : 'Complete frozen input works without QMT. Availability does not imply full market coverage. Maintain missing data in QMT before exporting again.'}
           </p>
-
-          <section className="overflow-hidden rounded-lg border border-border/70 bg-card" aria-label={zh ? '本机快照列表' : 'Local snapshot list'}>
-            <div className="flex items-center gap-2 border-b border-border/70 px-4 py-3">
-              <Database className="h-4 w-4 text-cyan" />
-              <h2 className="text-sm font-semibold text-foreground">{zh ? '本机快照' : 'Local snapshots'}</h2>
-            </div>
-            <div className="divide-y divide-border/60">
-              {status.datasets.map((dataset) => (
-                <article
-                  key={dataset.datasetId}
-                  className="grid min-w-0 gap-4 px-4 py-4 lg:grid-cols-[minmax(180px,1.1fr)_120px_130px_minmax(260px,1.4fr)]"
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-semibold text-foreground">{datasetName(dataset, language)}</h3>
-                      <Badge variant="success" size="sm">{dataset.status}</Badge>
-                    </div>
-                    <p className="mt-1 break-all font-mono text-xs text-secondary-text">{dataset.datasetId}</p>
+          {status.summary ? <p className="text-sm text-secondary-text">{status.summary}</p> : null}
+          {status.experiment ? (
+            <section className="overflow-hidden rounded-lg border border-border/70 bg-card" aria-label={zh ? '冻结实验输入' : 'Frozen experiment input'}>
+              <div className="flex items-center gap-2 border-b border-border/70 px-4 py-3">
+                <Database className="h-4 w-4 text-cyan" />
+                <h2 className="text-sm font-semibold text-foreground">{zh ? '冻结实验输入' : 'Frozen experiment input'}</h2>
+                <Badge variant="success" size="sm">{zh ? '离线可读' : 'Offline ready'}</Badge>
+              </div>
+              <dl className="grid gap-4 px-4 py-4 sm:grid-cols-2">
+                <div className="min-w-0">
+                  <dt className="text-xs text-muted-text">{zh ? '实验 ID' : 'Experiment ID'}</dt>
+                  <dd className="mt-1 break-all font-mono text-sm">{status.experiment.experimentId}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-muted-text">{zh ? '实际行情范围' : 'Observed bar range'}</dt>
+                  <dd className="mt-1 text-sm">{status.experiment.actualStart} ~ {status.experiment.actualEnd}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-muted-text">{zh ? '价格与成交量口径' : 'Price and volume basis'}</dt>
+                  <dd className="mt-1 text-sm">{status.experiment.priceBasis} · {[...new Set(Object.values(status.experiment.volumeUnits || {}))].join(' / ')}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-muted-text">{zh ? '标的列表性质' : 'Universe type'}</dt>
+                  <dd className="mt-1 text-sm">{status.experiment.universeKind === 'current'
+                    ? (zh ? '当前列表，包含存续偏差' : 'Current list; survivorship bias applies')
+                    : status.experiment.universeKind === 'historical'
+                      ? (zh ? '历史成员区间' : 'Historical membership')
+                      : (zh ? '自定义列表' : 'Custom list')}</dd>
+                </div>
+                <div className="min-w-0 sm:col-span-2">
+                  <dt className="text-xs text-muted-text">{zh ? '行情文件 SHA256' : 'Bars SHA256'}</dt>
+                  <dd className="mt-1 break-all font-mono text-xs">{status.experiment.barsSha256}</dd>
+                </div>
+                {status.experiment.missingSymbols?.length ? (
+                  <div className="sm:col-span-2 text-sm text-warning">
+                    {zh ? '未返回行情的标的：' : 'Symbols without bars: '}{status.experiment.missingSymbols.join(', ')}
                   </div>
-                  <div>
-                    <p className="text-xs text-muted-text">{status.datasetSetVersion === 'production.v2' ? (zh ? '请求截止日' : 'Requested through') : (zh ? '最新交易日' : 'Latest date')}</p>
-                    <p className="mt-1 text-sm text-foreground">{dataset.requestedThrough || dataset.latestTradeDate || '-'}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-muted-text">{zh ? '价格口径' : 'Price basis'}</p>
-                    <p className="mt-1 text-sm text-foreground">{dataset.priceBasis || dataset.components?.filter(value => value === 'raw' || value === 'qfq').join(' / ') || '-'}</p>
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-xs text-muted-text">{dataset.moduleReleaseSha256 ? (zh ? '模块发布身份' : 'Module release') : (zh ? '快照身份' : 'Snapshot identity')}</p>
-                    <p className="mt-1 break-all font-mono text-xs text-foreground">{dataset.moduleReleaseSha256 || dataset.snapshotId || '-'}</p>
-                    {dataset.contentManifestSha256 ? (
-                      <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.contentManifestSha256}>
-                        manifest {dataset.contentManifestSha256}
-                      </p>
-                    ) : (
-                      <>
-                        <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.contentSha256}>
-                          content {dataset.contentSha256}
-                        </p>
-                        <p className="mt-1 break-all font-mono text-[11px] leading-4 text-muted-text" title={dataset.manifestSha256}>
-                          manifest {dataset.manifestSha256}
-                        </p>
-                      </>
-                    )}
-                  </div>
-                </article>
-              ))}
-            </div>
-          </section>
+                ) : null}
+              </dl>
+            </section>
+          ) : null}
         </>
       ) : null}
     </AppPage>

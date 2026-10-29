@@ -114,6 +114,19 @@ def _refuse_live_miniqmt(*args, **kwargs):
     raise AssertionError("offline test attempted a live MiniQMT SSH/SDK request")
 
 
+@pytest.fixture
+def make_symlink():
+    """Create a real link, or report the specific missing Windows privilege."""
+    def create(link: Path, target: Path, *, target_is_directory: bool = False):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege unavailable (WinError 1314)")
+            raise
+    return create
+
+
 @pytest.fixture(autouse=True)
 def _isolate_test_runtime(tmp_path, monkeypatch, request):
     global _allow_network
@@ -124,7 +137,7 @@ def _isolate_test_runtime(tmp_path, monkeypatch, request):
     monkeypatch.chdir(tmp_path)
     for key, value in _runtime_environment(tmp_path).items():
         monkeypatch.setenv(key, value)
-    for key in _EXTERNAL_PATH_ENV:
+    for key in (*_EXTERNAL_PATH_ENV, "QMT_PYTHON", "QMT_PORT", "QMT_DATA_DIR", "QMT_TIMEOUT", "QMT_DATASET_DIR"):
         monkeypatch.delenv(key, raising=False)
     from src.config import Config
     from src import auth
@@ -135,14 +148,12 @@ def _isolate_test_runtime(tmp_path, monkeypatch, request):
 
     monkeypatch.setattr(miniqmt_bridge, "_ssh_request", _refuse_live_miniqmt)
     try:
-        from quant_qmt_data import miniqmt_bridge as qmt_bridge
+        from quant_qmt_data import QMTClient
     except ModuleNotFoundError as exc:
         if exc.name != "quant_qmt_data":
             raise
     else:
-        monkeypatch.setattr(qmt_bridge, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(qmt_bridge, "_ssh_request", _refuse_live_miniqmt)
-        monkeypatch.setattr(qmt_bridge, "_local_request", _refuse_live_miniqmt)
+        monkeypatch.setattr(QMTClient, "_request", _refuse_live_miniqmt)
 
     # Screening also searches its source root independently of ENV_FILE.
     monkeypatch.setattr(screening_config, "_PROJECT_ROOT", tmp_path)

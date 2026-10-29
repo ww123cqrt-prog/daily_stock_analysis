@@ -243,14 +243,16 @@ def test_resolver_checks_required_etf_hash_against_qfq_index(tmp_path: Path) -> 
         module.resolve_etf_research_preview(root)
 
 
-def test_resolver_rejects_symlinked_required_etf_file(tmp_path: Path) -> None:
+def test_resolver_rejects_symlinked_required_etf_file(
+    tmp_path: Path, make_symlink
+) -> None:
     module = load_module()
     root, snapshot, manifest = build_preview_snapshot(tmp_path)
     target = snapshot / "qfq/SZ159915.parquet"
     outside = tmp_path / "outside.parquet"
     outside.write_bytes(target.read_bytes())
     target.unlink()
-    target.symlink_to(outside)
+    make_symlink(target, outside)
     _refresh_publication(root, snapshot, manifest)
 
     with pytest.raises(module.DataContractError, match="symlink"):

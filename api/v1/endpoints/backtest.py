@@ -11,6 +11,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.deps import get_database_manager
+from api.v1.endpoints.research_status import _sanitize_public_tree
 from api.v1.schemas.backtest import (
     BacktestRunRequest,
     BacktestRunResponse,
@@ -31,6 +32,7 @@ from api.v1.schemas.common import ErrorResponse
 from quant_workflow.scripts.quant_data_service_client import QuantDataClientError
 from src.repositories.strategy_assets_repo import get_strategy_assets_repo
 from src.services.backtest_service import BacktestService
+from src.services.script_universe_loader import MarketDataUnavailable
 from src.services.trained_strategy_backtest_service import TrainedStrategyBacktestService
 from src.storage import DatabaseManager
 
@@ -59,7 +61,7 @@ def _quant_data_http_error(exc: QuantDataClientError) -> HTTPException:
     status = exc.status_code if exc.status_code in {400, 404, 409, 503} else 503
     return HTTPException(
         status_code=status,
-        detail={"error": exc.code, "message": f"quant_data {exc.code}: {exc}"},
+        detail={"error": exc.code, "message": f"quant_data {exc.code}: {_sanitize_public_tree(str(exc))}"},
     )
 
 
@@ -117,7 +119,7 @@ def run_backtest(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -125,7 +127,7 @@ def run_backtest(
         logger.error(f"回测执行失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"回测执行失败: {str(exc)}"},
+            detail={"error": "internal_error", "message": f"回测执行失败: {_sanitize_public_tree(str(exc))}"},
         )
 
 
@@ -158,11 +160,11 @@ def run_dsa_signal_strategy_backtest(
             side_cost_pct=request.side_cost_pct,
             lot_size=request.lot_size,
         )
-        return StrategyBacktestResponse(**report)
+        return StrategyBacktestResponse(**_sanitize_public_tree(report))
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -170,7 +172,7 @@ def run_dsa_signal_strategy_backtest(
         logger.error(f"DSA交易策略回测失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"DSA交易策略回测失败: {str(exc)}"},
+            detail={"error": "internal_error", "message": f"DSA交易策略回测失败: {_sanitize_public_tree(str(exc))}"},
         )
 
 
@@ -179,11 +181,12 @@ def run_dsa_signal_strategy_backtest(
     response_model=StrategyBacktestResponse,
     responses={
         200: {"description": "条件交易策略回测完成"},
+        503: {"description": "QMT 实验输入不可用", "model": ErrorResponse},
         400: {"description": "请求参数或数据错误", "model": ErrorResponse},
         500: {"description": "服务器错误", "model": ErrorResponse},
     },
     summary="运行条件交易策略回测",
-    description="运行明确选择的通用交易策略；规则在收盘后产生目标仓位，下一共同交易日开盘执行。",
+    description="运行明确选择的通用交易策略；规则在收盘后产生目标仓位，QMT 输入按冻结交易日历的下一交易日开盘执行。",
 )
 def run_form_strategy_backtest(
     request: FormStrategyBacktestRunRequest,
@@ -205,13 +208,17 @@ def run_form_strategy_backtest(
             slow_ma_days=request.slow_ma_days,
             top_n=request.top_n,
         )
-        return StrategyBacktestResponse(**report)
+        return StrategyBacktestResponse(**_sanitize_public_tree(report))
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "error": "market_data_unavailable", "message": "QMT 实验输入不可用；请核对输入和实际行情范围。",
+        }) from exc
     except QuantDataClientError as exc:
         raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -228,6 +235,7 @@ def run_form_strategy_backtest(
     response_model=StrategyBacktestResponse,
     responses={
         200: {"description": "脚本交易策略回测完成"},
+        503: {"description": "QMT 实验输入不可用", "model": ErrorResponse},
         400: {"description": "脚本、参数或数据错误", "model": ErrorResponse},
         500: {"description": "服务器错误", "model": ErrorResponse},
     },
@@ -264,13 +272,17 @@ def run_script_strategy_backtest(
             # Persistence is best-effort: a store failure must never break a
             # completed backtest or its response.
             logger.warning("脚本回测结果落库失败（不影响本次回测）", exc_info=True)
-        return StrategyBacktestResponse(**report)
+        return StrategyBacktestResponse(**_sanitize_public_tree(report))
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "error": "market_data_unavailable", "message": "QMT 实验输入不可用；请核对输入和实际行情范围。",
+        }) from exc
     except QuantDataClientError as exc:
         raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_script_or_params", "message": str(exc)},
+            detail={"error": "invalid_script_or_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -332,6 +344,7 @@ def _persist_script_backtest_run(
     response_model=StabilityTestResponse,
     responses={
         200: {"description": "时间均匀性/稳定性测试完成"},
+        503: {"description": "QMT 实验输入不可用", "model": ErrorResponse},
         400: {"description": "脚本、参数或数据错误", "model": ErrorResponse},
         500: {"description": "服务器错误", "model": ErrorResponse},
     },
@@ -357,13 +370,17 @@ def run_script_stability_test(
             iterations=request.iterations,
             seed=request.seed,
         )
-        return StabilityTestResponse(**report)
+        return StabilityTestResponse(**_sanitize_public_tree(report))
+    except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "error": "market_data_unavailable", "message": "QMT 实验输入不可用；请核对输入和实际行情范围。",
+        }) from exc
     except QuantDataClientError as exc:
         raise _quant_data_http_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_script_or_params", "message": str(exc)},
+            detail={"error": "invalid_script_or_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -410,12 +427,14 @@ def run_trained_strategy_backtest(
             end_date=(request.end_date.isoformat() if request.end_date else None),
             topk=request.topk,
             cost_bps=(float(request.cost_bps) if request.cost_bps is not None else None),
+            initial_capital=request.initial_capital,
+            lot_size=request.lot_size,
         )
-        return TrainedStrategyBacktestResponse(**report)
+        return TrainedStrategyBacktestResponse(**_sanitize_public_tree(report))
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "trained_backtest_unavailable", "message": str(exc)},
+            detail={"error": "trained_backtest_unavailable", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -470,7 +489,7 @@ def get_backtest_results(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -478,7 +497,7 @@ def get_backtest_results(
         logger.error(f"查询回测结果失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"查询回测结果失败: {str(exc)}"},
+            detail={"error": "internal_error", "message": f"查询回测结果失败: {_sanitize_public_tree(str(exc))}"},
         )
 
 
@@ -523,7 +542,7 @@ def get_overall_performance(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -531,7 +550,7 @@ def get_overall_performance(
         logger.error(f"查询整体表现失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"查询整体表现失败: {str(exc)}"},
+            detail={"error": "internal_error", "message": f"查询整体表现失败: {_sanitize_public_tree(str(exc))}"},
         )
 
 
@@ -577,7 +596,7 @@ def get_stock_performance(
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_params", "message": str(exc)},
+            detail={"error": "invalid_params", "message": _sanitize_public_tree(str(exc))},
         )
     except HTTPException:
         raise
@@ -585,5 +604,5 @@ def get_stock_performance(
         logger.error(f"查询单股表现失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": f"查询单股表现失败: {str(exc)}"},
+            detail={"error": "internal_error", "message": f"查询单股表现失败: {_sanitize_public_tree(str(exc))}"},
         )

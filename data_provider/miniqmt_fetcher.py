@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code, _is_etf_code
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, normalize_stock_code
 from .miniqmt_bridge import MiniQMTBridgeClient, MiniQMTError
 from .realtime_types import RealtimeSource, UnifiedRealtimeQuote
 
@@ -94,30 +94,30 @@ class MiniQMTFetcher(BaseFetcher):
 
 
 class QuantQMTDataFetcher(BaseFetcher):
-    """Ordinary DSA historical bars from the same committed local snapshots.
-
-    This adapter does no acquisition. Updates remain an explicit separate
-    operation, so a read cannot silently mix unpublished supplier responses.
-    """
+    """Historical bars from one frozen input or an explicit local SDK read."""
     name = "QuantQMTDataFetcher"
     priority = -2
 
     def __init__(self, *, quant_data_root=None):
-        from pathlib import Path
-        from src.services.quant_workflow_paths import quant_data_root as default_root
-        self.root = Path(quant_data_root or default_root())
+        self.root = quant_data_root
 
     def _fetch_raw_data(self, stock_code, start_date, end_date):
-        from quant_qmt_data import DataContractError, bar_snapshot, read_bars
-        dataset = "cn_etf_daily" if _is_etf_code(stock_code) else "ashare_daily_qfq"
+        from src.repositories.quant_price_repo import normalize_market_symbol
+        from src.services.script_universe_loader import load_market_input, MarketDataUnavailable
+        symbol = normalize_market_symbol(stock_code)
         try:
-            snapshot = bar_snapshot(dataset, quant_data_root=self.root, price_basis="qfq")
-            frame = read_bars(dataset, stock_code, quant_data_root=self.root, price_basis="qfq",
-                              expected_identity=snapshot["identity"], start=start_date, end=end_date)
-        except (DataContractError, OSError, ValueError) as exc:
-            raise DataFetchError("本机快照无法满足该证券请求；请显式更新或核对数据范围。") from exc
-        frame.attrs.update(dataset_identity=snapshot["identity"], backend="quant_qmt_data",
-                           volume_unit="units" if dataset == "cn_etf_daily" else "shares")
+            bars, directory = load_market_input(quant_data_root=self.root, custom_symbols=[symbol],
+                                                start=start_date, end=end_date)
+        except MarketDataUnavailable as exc:
+            raise DataFetchError("QMT 实验输入无法满足请求；请核对输入或在 QMT 中维护行情。") from exc
+        frame = bars.loc[bars.symbol.eq(symbol) & pd.to_datetime(bars.date).between(
+            pd.Timestamp(start_date), pd.Timestamp(end_date)) & bars.suspend_flag.eq(0)].copy()
+        if symbol not in bars.attrs["universe"] or frame.empty:
+            raise DataFetchError("QMT 实验输入没有该证券在所选区间的行情。")
+        if bars.attrs["volume_units"].get(symbol) not in {"shares", "units"}:
+            raise DataFetchError("QMT 历史行情需要股/份基础成交量。")
+        frame.attrs.update(input_dir=str(directory), backend="quant_qmt_data",
+                           volume_unit=bars.attrs["volume_units"][symbol])
         return frame
 
     def _normalize_data(self, df, stock_code):

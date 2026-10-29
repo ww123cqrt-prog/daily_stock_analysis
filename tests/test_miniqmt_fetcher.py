@@ -161,7 +161,7 @@ def test_default_stock_manager_selects_miniqmt_when_private_profile_is_available
 def test_configured_local_history_is_available_without_a_quote_connection(monkeypatch, tmp_path):
     from data_provider.base import DataFetcherManager
     from data_provider.miniqmt_bridge import MiniQMTBridgeClient
-    monkeypatch.setenv("QUANT_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("QMT_DATASET_DIR", str(tmp_path))
     monkeypatch.setattr(MiniQMTBridgeClient, "configured", staticmethod(lambda: False))
     manager = DataFetcherManager()
     assert manager.available_fetchers[0] == "QuantQMTDataFetcher"

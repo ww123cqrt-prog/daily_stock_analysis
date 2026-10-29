@@ -349,7 +349,10 @@ def test_market_panel_rejects_reference_from_different_membership_snapshot(
 
 @pytest.mark.parametrize("without_nofollow", [False, True])
 def test_reference_fingerprint_rejects_symlinked_snapshot_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_nofollow: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    without_nofollow: bool,
+    make_symlink,
 ) -> None:
     module = load_module()
     _, _, reference = build_fixture(tmp_path)
@@ -368,7 +371,7 @@ def test_reference_fingerprint_rejects_symlinked_snapshot_file(
     with module.reference_read_lock(reference) as snapshot:
         assert snapshot.fingerprint() == original_fingerprint
     target.replace(external)
-    target.symlink_to(external)
+    make_symlink(target, external)
     assert target.is_symlink()
 
     with pytest.raises(ValueError, match="snapshot files are incomplete"):

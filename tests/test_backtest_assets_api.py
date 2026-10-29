@@ -96,6 +96,21 @@ def client(repo, monkeypatch):
         yield test_client
 
 
+def test_saved_run_keeps_replay_location_private_in_list_and_detail(client, repo):
+    quality = {"input_dir": "D:/private-input/frozen", "experiment_id": "input-1"}
+    saved = repo.create_run(strategy_id=None, strategy_name="native", script=VALID_SCRIPT,
+        script_sha256=hashlib.sha256(VALID_SCRIPT.encode("utf-8")).hexdigest(),
+        symbols=["SH600519"], params={}, data_quality=quality, metrics={},
+        report={"data_quality": quality})
+    for url in ("/api/v1/backtest/runs", f"/api/v1/backtest/runs/{saved['id']}"):
+        response = client.get(url)
+        assert response.status_code == 200
+        assert "input-1" in response.text
+        assert "input_dir" not in response.text
+        assert "private-input" not in response.text
+    assert repo.get_run(saved["id"])["data_quality"]["input_dir"] == quality["input_dir"]
+
+
 # === Strategy asset endpoints ===
 
 

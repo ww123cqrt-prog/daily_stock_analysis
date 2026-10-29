@@ -20,6 +20,22 @@ describe('quantApi', () => {
     post.mockReset();
   });
 
+  it('preserves frozen experiment identity, coverage and offline SDK state', async () => {
+    get.mockResolvedValueOnce({ data: {
+      backend: 'qmt_native', status: 'ready', validation_scope: 'frozen_experiment',
+      available_datasets: 1, checked_at: '2026-10-28T10:00:00Z', datasets: [],
+      sdk: { status: 'not_checked', required_for_offline: false },
+      experiment: { experiment_id: 'experiment-one', bars_sha256: 'a'.repeat(64),
+        price_basis: 'front', actual_end: '2026-10-27', universe_kind: 'custom', symbol_count: 2 },
+    } });
+    const status = await quantApi.getDataStatus();
+    expect(status).toMatchObject({
+      backend: 'qmt_native', sdk: { status: 'not_checked', requiredForOffline: false },
+      experiment: { experimentId: 'experiment-one', barsSha256: 'a'.repeat(64),
+        priceBasis: 'front', universeKind: 'custom', symbolCount: 2 },
+    });
+  });
+
   it('exposes the governed quant_data readiness endpoint', () => {
     expect(quantApi).toHaveProperty('getDataStatus');
   });

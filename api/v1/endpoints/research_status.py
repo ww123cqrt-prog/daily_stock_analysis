@@ -12,6 +12,7 @@ import stat
 import sys
 import threading
 import time
+import yaml
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from quant_workflow.scripts.quant_data_contract import (
     DataContractError,
     filesystem_state_fingerprint,
     resolve_dataset,
+    sha256_file,
     validate_latest_pointer,
 )
 from quant_workflow.scripts._file_lock import lock_file, unlock_file
@@ -535,7 +537,8 @@ def _public_artifacts(raw: Any) -> Dict[str, str]:
 
 def _sanitize_public_tree(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _sanitize_public_tree(item) for key, item in value.items()}
+        return {key: _sanitize_public_tree(item) for key, item in value.items()
+                if key not in {"input_dir", "qmt_data_dir"}}
     if isinstance(value, list):
         return [_sanitize_public_tree(item) for item in value]
     if isinstance(value, tuple):
@@ -1875,23 +1878,17 @@ def _load_training_dataset_identities(*, provider_name: str = "canonical") -> Tu
     Optional[Dict[str, QuantDataIdentity]], Optional[str]
 ]:
     try:
-        import quant_qmt_data as local_data
-    except ImportError:
-        return None, "quant_qmt_data 本地数据模块不可用，正式训练已阻止。"
-
-    try:
-        # The provider resolution validates its frozen inputs. Inspect only the
-        # selected local catalog identities here, without scanning other history.
-        catalog = local_data.inspect_datasets(
-            quant_data_root=QUANT_DATA_ROOT,
-            dataset_ids=_required_training_datasets(provider_name),
-        )
-        identities = {
-            item["dataset_id"]: QuantDataIdentity.from_mapping(item)
-            for item in catalog["datasets"] if item.get("status") == "ready"
-        }
-    except (local_data.DataContractError, OSError, QuantDataClientError, ValueError):
-        return None, "quant_data 本地快照不可用或身份校验失败，正式训练已阻止。"
+        # Explicit historical replays use DSA's existing contract. The QMT
+        # experiment path never enters this branch or imports the retired package.
+        identities = {}
+        for dataset_id in _required_training_datasets(provider_name):
+            resolved = resolve_dataset(dataset_id, quant_data_root=QUANT_DATA_ROOT)
+            identities[dataset_id] = QuantDataIdentity.from_mapping({
+                **resolved.manifest,
+                "manifest_sha256": sha256_file(resolved.snapshot_path / "DATASET_MANIFEST.json"),
+            })
+    except (DataContractError, OSError, QuantDataClientError, ValueError):
+        return None, "历史实验依赖的本地快照缺失或身份校验失败。"
     return (
         identities,
         None,
@@ -3715,9 +3712,12 @@ def _restore_text_file(path: Path, existed: bool, content: str) -> None:
 
 def build_research_status_payload(
     provider_dataset_id: str = ASHARE_DAILY_QFQ_DATASET_ID,
-    provider: str = "canonical",
+    provider: str = "qmt_native",
+    training_config: Path | None = None,
 ) -> Dict[str, Any]:
     """Build the latest quant workflow status used by web pages."""
+    if provider == "qmt_native":
+        return _qmt_native_research_status(training_config=training_config)
     if not RESEARCH_STATUS_PATH.exists():
         return _missing_status_payload(provider_dataset_id, provider)
 
@@ -3791,6 +3791,69 @@ def build_research_status_payload(
     return payload
 
 
+def _qmt_native_research_status(*, training_config: Path | None = None) -> Dict[str, Any]:
+    """The new input path has no catalog, legacy readiness or live SDK gate."""
+    from api.v1.endpoints.data_status import inspect_qmt_input
+
+    config_path = training_config or QUANT_WORKFLOW_ROOT / "configs" / "baseline_qmt_native.yaml"
+    status, identity = inspect_qmt_input(training_config=config_path)
+    experiment = status["experiment"]
+    checked = status.get("training_preflight", {})
+    trainable = checked.get("status") == "passed"
+    summary = checked.get("summary", status["summary"])
+    public_identity = {key: value for key, value in (identity or {}).items() if key != "input_dir"}
+    preflight = {
+        "status": "passed" if trainable else "blocked", "provider": "qmt_native",
+        "provider_identity": public_identity, "checked_at": status["checked_at"],
+        "summary": summary, "time_semantics": checked.get("time_semantics"),
+    }
+    current = {
+        **public_identity, "provider": "qmt_native",
+        "status": "ready" if identity is not None else "blocked",
+        "calendar_end": experiment["calendar_end"] if experiment else None,
+        "error": None if identity is not None else status["summary"],
+    }
+    reports_dir = RESEARCH_STATUS_PATH.parent
+    latest_training = _latest_training_payload(reports_dir)
+    if latest_training is not None:
+        latest_training["provider_current"] = identity is not None and provider_lineages_match(
+            latest_training.get("provider_identity"), public_identity,
+        )
+        latest_training["provider_status"] = "current" if latest_training["provider_current"] else "historical"
+    external_tools = _external_tools_payload()
+    return _sanitize_public_tree({
+        "generated_at": status["checked_at"], "trainable": trainable,
+        "training_readiness": {"status": "trainable" if trainable else "blocked", "summary": summary},
+        "training_preflight": preflight, "training_preflights": {"qmt_native": preflight},
+        "current_provider_identities": {"qmt_native": current}, "provider_quality": {},
+        "qlib_provider": {
+            **public_identity, "provider_source": "qmt_native", "status": current["status"],
+            "calendar_days": experiment["calendar_days"] if experiment else 0,
+            "calendar_range": f"{experiment['calendar_start']} ~ {experiment['calendar_end']}" if experiment else "",
+            "instruments": experiment["symbol_count"] if experiment else 0,
+        },
+        "data_sources": [{
+            "name": "qmt_native", "role": "experiment", "status": "available",
+            "files": 1, "rows": experiment["rows"],
+            "date_range": f"{experiment['actual_start']} ~ {experiment['actual_end']}",
+        }] if experiment else [],
+        "latest_training": _sanitize_public_tree(latest_training),
+        "cash_control_backtest": _sanitize_public_tree(_cash_control_backtest_payload(reports_dir)),
+        "qlib_predictions": _sanitize_public_tree(_qlib_predictions_payload(reports_dir)),
+        "qlib_research": _qlib_research_payload(reports_dir),
+        "candidate_pipeline": _sanitize_public_tree(_read_json_object(reports_dir / CANDIDATE_PIPELINE_FILENAME)),
+        "robust_strategy": _robust_strategy_payload(reports_dir),
+        "robust_signal": _robust_signal_payload(reports_dir),
+        "experiment_notebook": _experiment_notebook_payload(reports_dir),
+        "mlflow": _mlflow_payload(),
+        "external_tools": external_tools,
+        "capability_matrix": _capability_matrix_payload(external_tools),
+        "function_inventory": _function_inventory_payload(),
+        "china_astock_reuse": _china_astock_reuse_payload(),
+        "acceptance_checklist": _acceptance_checklist_payload(),
+    })
+
+
 @router.get("/status")
 def get_research_status() -> Dict[str, Any]:
     """Return the latest quant workflow status used by the research page."""
@@ -3800,7 +3863,7 @@ def get_research_status() -> Dict[str, Any]:
 @router.get("/experiments")
 def get_experiment_notebook() -> Dict[str, Any]:
     """Return experiment records without scanning the Qlib provider."""
-    return _experiment_notebook_payload(RESEARCH_STATUS_PATH.parent)
+    return _sanitize_public_tree(_experiment_notebook_payload(RESEARCH_STATUS_PATH.parent))
 
 
 @router.post("/experiments/{run_id}/archive")
@@ -3808,12 +3871,12 @@ async def archive_experiment_run(run_id: str) -> Dict[str, Any]:
     """Archive one experiment run from the active notebook list."""
     with _experiment_file_guard(RESEARCH_STATUS_PATH.parent):
         removed = _archive_experiment_run(RESEARCH_STATUS_PATH.parent, run_id)
-        return {
+        return _sanitize_public_tree({
             "removed_run": removed,
             "experiment_notebook": _experiment_notebook_payload_unlocked(
                 RESEARCH_STATUS_PATH.parent
             ),
-        }
+        })
 
 
 @router.delete("/experiments/{run_id}")
@@ -3850,8 +3913,8 @@ async def permanently_delete_experiment_run(
             _restore_text_file(runs_path, *runs_snapshot)
             _restore_text_file(log_path, *log_snapshot)
             raise
-        return {
+        return _sanitize_public_tree({
             "removed_run": removed,
             "note_removed": note_removed,
             "experiment_notebook": _experiment_notebook_payload_unlocked(reports_dir),
-        }
+        })

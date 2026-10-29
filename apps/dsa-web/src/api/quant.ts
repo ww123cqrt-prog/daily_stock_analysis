@@ -155,10 +155,32 @@ export interface QuantDataStatus {
   backend: string;
   validationScope: string;
   checkedAt: string;
+  summary?: string;
+  sdk?: { status: string; requiredForOffline: boolean };
+  experiment?: QmtExperimentInput | null;
   datasets: QuantDataStatusDataset[];
   datasetSetVersion?: string;
   generation?: number;
   releaseSetSha256?: string;
+}
+
+export interface QmtExperimentInput {
+  backend?: string;
+  experimentId: string;
+  barsSha256: string;
+  priceBasis: string;
+  actualStart?: string;
+  actualEnd?: string;
+  calendarStart?: string;
+  calendarEnd?: string;
+  calendarDays?: number;
+  symbolCount?: number;
+  universeKind?: string;
+  volumeUnits?: Record<string, string>;
+  rows?: number;
+  missingSymbols?: string[];
+  containsPartial?: boolean;
+  completedThrough?: string;
 }
 
 export interface QuantJobLog {
@@ -267,6 +289,9 @@ export const quantApi = {
       backend: typeof converted.backend === "string" ? converted.backend : "unknown",
       validationScope: typeof converted.validationScope === "string" ? converted.validationScope : "unknown",
       checkedAt: typeof converted.checkedAt === 'string' ? converted.checkedAt : '',
+      summary: converted.summary,
+      sdk: converted.sdk,
+      experiment: converted.experiment ?? null,
       datasets: Array.isArray(converted.datasets) ? converted.datasets : [],
     };
   },

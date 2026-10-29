@@ -1,4 +1,4 @@
-"""DSA's default local data path delegates to quant_qmt_data."""
+"""DSA consumers share frozen QMT bars, pools and benchmarks without the SDK."""
 import json
 
 import pandas as pd
@@ -6,276 +6,76 @@ import pytest
 from fastapi.testclient import TestClient as ApiClient
 
 from api.app import create_app
-from quant_qmt_data import quant_data_contract as contract
+from data_provider.base import DataFetcherManager, DataFetchError
+from data_provider.miniqmt_fetcher import QuantQMTDataFetcher
 from src.services import script_universe_loader as loader
-from quant_workflow.tests.test_quant_data_qlib_provider import direct_fixture  # noqa: F401
+from tests.test_qmt_native_backtest import save_input
 
 
-@pytest.fixture(autouse=True)
-def block_live_miniqmt(monkeypatch):
-    from quant_qmt_data import miniqmt_bridge as bridge
-    def refuse(*args, **kwargs):
-        pytest.fail("integration test attempted a real MiniQMT transport")
-    monkeypatch.setattr(bridge, "_ssh_request", refuse)
-    monkeypatch.setattr(bridge, "_local_request", refuse)
+@pytest.fixture
+def experiment(tmp_path, monkeypatch):
+    directory = save_input(tmp_path, missing=True)
+    monkeypatch.setenv("QMT_DATASET_DIR", str(directory))
+    return directory
 
 
-@pytest.mark.parametrize("job_type", ["train_baseline_lgb", "run_candidate_pipeline", "train_baseline_lgb_equivalence"])
-def test_web_training_uses_local_snapshots_without_retired_ready(direct_fixture, tmp_path, monkeypatch, job_type):
-    from types import SimpleNamespace
-    from api.v1.endpoints import research_status as status, quant_jobs
-    from src.services.quant_job_service import QuantJob
-    from quant_workflow.scripts.quant_data_service_client import QuantDataServiceClient
-    root, _, descriptor = direct_fixture
-    monkeypatch.setenv("QUANT_DATA_ROOT", str(root))
-    monkeypatch.delenv("QLIB_PROVIDER_URI", raising=False)
-    monkeypatch.delenv("QLIB_CLEANED_PROVIDER_URI", raising=False)
-    monkeypatch.setattr(status, "QUANT_DATA_ROOT", root)
-    monkeypatch.setattr(status, "QUANT_WORKFLOW_REPORTS_ROOT", tmp_path / "reports")
-    monkeypatch.setattr(status, "RESEARCH_STATUS_PATH", tmp_path / "reports/research_status_latest.json")
-    monkeypatch.setattr(QuantDataServiceClient, "ready", lambda *_: pytest.fail("retired ready was called"))
-    submitted = []
-    def submit(kind, params, **kwargs):
-        submitted.append(kwargs["approved_provider_identity"])
-        return QuantJob(job_id="test-training", job_type=kind, label=kind, status="pending", params=params)
-    monkeypatch.setattr(quant_jobs, "get_quant_job_service", lambda: SimpleNamespace(submit_job=submit))
-    with ApiClient(create_app(static_dir=tmp_path / "static"), headers={"Origin": "http://127.0.0.1:8010"}) as client:
-        response = client.post("/api/v1/quant/jobs", json={"job_type": job_type, "params": {}})
+def test_form_api_reads_mixed_stock_etf_input_with_truthful_identity(experiment, tmp_path):
+    with ApiClient(create_app(static_dir=tmp_path / "static"),
+                   headers={"Origin": "http://127.0.0.1:8010"}) as client:
+        response = client.post("/api/v1/backtest/strategy/run", json={
+            "strategy_id": "buy_and_hold", "symbols": ["600519", "159915"],
+            "start_date": "2024-01-02", "end_date": "2024-01-05",
+            "initial_capital": 10000, "side_cost_pct": .1,
+        })
     assert response.status_code == 200, response.text
-    assert len(submitted) == 1
-    frozen = json.loads(descriptor.read_text())["dataset"]
-    assert submitted[0]["snapshot_id"] == frozen["snapshot_id"]
-    assert submitted[0]["manifest_sha256"] == frozen["manifest_sha256"]
+    result = response.json()
+    assert result["status"] == "completed"
+    assert result["symbols"] == ["SH600519", "SZ159915"]
+    identity = json.loads((experiment / "dataset.json").read_text())
+    quality = result["data_quality"]
+    assert quality["experiment_id"] == identity["experiment_id"]
+    assert quality["bars_sha256"] == identity["bars_sha256"]
+    assert quality["inputs_sha256"] == identity["inputs_sha256"]
+    assert "input_dir" not in quality
+    assert quality["snapshot_id"] is None
+    assert quality["dataset_set_version"] is None
+    assert quality["price_basis"] == "front"
+    assert quality["volume_units"]["SZ159915"] == "units"
 
 
-@pytest.mark.parametrize("fault", ["missing_membership", "tampered_manifest", "provider_mismatch"])
-def test_local_training_rejects_incomplete_or_inconsistent_inputs(direct_fixture, monkeypatch, fault):
-    from dataclasses import replace
-    from api.v1.endpoints import research_status as status
-    from quant_workflow.scripts.quant_data_service_client import QuantDataServiceClient
-    root, snapshot, descriptor = direct_fixture
-    monkeypatch.setenv("QUANT_DATA_ROOT", str(root))
-    monkeypatch.setattr(status, "QUANT_DATA_ROOT", root)
-    monkeypatch.setattr(QuantDataServiceClient, "ready", lambda *_: pytest.fail("retired ready was called"))
-    native = status._resolution_from_provider_uri(descriptor.parent, provider_name="canonical")
-    if fault == "provider_mismatch":
-        native = replace(native, lineage={**native.lineage, "snapshot_id": "another-snapshot"})
-    elif fault == "missing_membership":
-        catalog = json.loads((root / "DATA_MANIFEST.json").read_text())
-        del catalog["datasets"]["pit_csi800"]
-        (root / "DATA_MANIFEST.json").write_text(json.dumps(catalog))
-    else:
-        with (snapshot / "DATASET_MANIFEST.json").open("a") as f:
-            f.write(" ")
-    payload = {}
-    status._apply_training_preflight(payload, native)
-    assert payload["trainable"] is False
-    assert payload["training_preflight"]["status"] == "blocked"
-    if fault != "provider_mismatch":
-        from api.v1.endpoints import quant_jobs
-        monkeypatch.setattr(status, "QUANT_WORKFLOW_REPORTS_ROOT", root / "reports")
-        monkeypatch.setattr(status, "RESEARCH_STATUS_PATH", root / "reports/status.json")
-        monkeypatch.setattr(quant_jobs, "get_quant_job_service", lambda: None)
-        with ApiClient(create_app(static_dir=root / "static"), headers={"Origin": "http://127.0.0.1:8010"}) as client:
-            response = client.post("/api/v1/quant/jobs", json={"job_type": "train_baseline_lgb", "params": {}})
-        assert response.status_code == 409
-        assert response.json()["error"] == "training_blocked"
+def test_benchmark_replay_stays_on_same_input_after_environment_changes(experiment, tmp_path, monkeypatch):
+    _, meta = loader.load_market_view("custom", custom_symbols=["600519", "159915"],
+        start="2024-01-02", end="2024-01-05", cache_dir=tmp_path / "bundles")
+    first = loader.load_benchmark_series(["SH000300", "159915"], input_dir=meta["input_dir"])
+    replacement = save_input(tmp_path / "another", scale=2.)
+    monkeypatch.setenv("QMT_DATASET_DIR", str(replacement))
+    replay = loader.load_benchmark_series(["SH000300", "159915"], input_dir=meta["input_dir"])
+    for symbol in first:
+        pd.testing.assert_frame_equal(first[symbol], replay[symbol])
+        assert replay[symbol].attrs["experiment_id"] == meta["experiment_id"]
 
 
-def publish_prices(root, dataset="cn_index_daily", symbol="SZ399006", snapshot_id="index-a"):
-    stage = root / "staging" / snapshot_id
-    bars = stage / "bars"
-    bars.mkdir(parents=True)
-    frame = pd.DataFrame(dict(date=pd.to_datetime(["2026-08-03", "2026-08-04"]),
-                              open=[10., 11.], high=[11., 12.], low=[9., 10.], close=[10., 11.],
-                              volume=[100., 110.], amount=[1000., 1210.]))
-    frame.to_parquet(bars / f"{symbol}.parquet", index=False)
-    contract.finalize_price_snapshot(
-        stage, dataset_id=dataset, snapshot_id=stage.name, role="canonical", status="ready",
-        source={"provider": "fixture", "volume_unit": "shares"}, price_basis="derived",
-        adjustment={"method": "none"}, producer={"script": "integration-test", "version": "1"},
-        source_retrieved_at="2026-08-05T10:00:00+08:00")
-    if not (root / "DATA_MANIFEST.json").exists():
-        contract.write_root_manifest(root, {})
-    return contract.publish_snapshot_group([(stage, root / "parquet/index_1d" / dataset)],
-                                           quant_data_root=root, update_root_catalog=True)[0]
+def test_ordinary_history_uses_selected_input_instead_of_old_data_root(experiment, tmp_path):
+    manager = DataFetcherManager(fetchers=[QuantQMTDataFetcher()])
+    frame, source = manager.get_daily_data("159915", "2024-01-02", "2024-01-05")
+    assert source == "QuantQMTDataFetcher"
+    assert frame["close"].tolist() == [2., 2.4, 2.6]
+    assert frame["volume"].tolist() == [1000., 1000., 1000.]
+    assert frame.attrs["experiment_id"] == json.loads((experiment / "dataset.json").read_text())["experiment_id"]
 
 
-def test_status_uses_local_provider_without_old_service(tmp_path, monkeypatch):
-    root = tmp_path / "data"
-    publish_prices(root)
-    monkeypatch.setenv("QUANT_DATA_ROOT", str(root))
-    from quant_workflow.scripts.quant_data_service_client import QuantDataServiceClient
-    monkeypatch.setattr(QuantDataServiceClient, "ready", lambda *_: pytest.fail("old service was called"))
-    with ApiClient(create_app(static_dir=tmp_path / "static")) as client:
-        response = client.get("/api/v1/data/status")
-    assert response.status_code == 200
-    status = response.json()
-    assert status["backend"] == "quant_qmt_data"
-    assert status["validation_scope"] == "snapshot_metadata"
-    assert status["available_datasets"] == 1
-    assert status["datasets"][0]["snapshot_id"] == "index-a"
-    assert str(root) not in response.text
+def test_stock_etf_and_index_codes_share_frozen_input(experiment, tmp_path):
+    view, meta = loader.load_market_view("custom", custom_symbols=["600519.SH", "159915.SZ"],
+                                        cache_dir=tmp_path / "bundles")
+    assert list(view.symbols) == ["SH600519", "SZ159915"]
+    benchmark = loader.load_benchmark_series(["000300.SH"], input_dir=meta["input_dir"])["SH000300"]
+    assert benchmark.symbol.eq("SH000300").all()
+    assert benchmark["volume"].tolist() == [1000.] * 4
+    assert benchmark.attrs["volume_units"]["SH000300"] == "native"
+    assert "SH000300" not in view.symbols
 
 
-def test_benchmark_derives_symbol_from_provider_index_and_pins_version(tmp_path):
-    root = tmp_path / "data"
-    publish_prices(root)
-    first = loader.load_benchmark_series(["SZ399006"], quant_data_root=root)["SZ399006"]
-    assert first["symbol"].tolist() == ["SZ399006"] * 2
-    assert first["close"].tolist() == [10., 11.]
-    identity = first.attrs["dataset_identity"]
-    publish_prices(root, snapshot_id="index-b")
-    replay = loader.load_benchmark_series(["SZ399006"], quant_data_root=root,
-                                          expected_snapshots={"cn_index_daily": identity})["SZ399006"]
-    assert replay.attrs["dataset_identity"] == identity
-    pd.testing.assert_frame_equal(first, replay)
-
-
-def test_ordinary_read_follows_committed_root_not_early_latest(tmp_path):
-    root = tmp_path / "data"
-    current = publish_prices(root)
-    pointer = current.parent.parent / "LATEST.json"
-    pointer.write_text(json.dumps({"snapshot_id": "not-committed", "snapshot_path": "missing"}))
-    snapshot = loader._read_snapshot_latest(root, "index_1d", "cn_index_daily")
-    assert snapshot["snapshot_id"] == "index-a"
-
-
-def test_etf_routing_uses_verified_price_index_and_rejects_ambiguous_bare_code():
-    mapping = loader._etf_code_to_symbol({"file_index": pd.DataFrame({
-        "symbol": ["SZ159915", "SH513100", "SH999999", "SZ999999"]})})
-    assert mapping["159915"] == "SZ159915"
-    assert mapping["SH513100"] == "SH513100"
-    assert "999999" not in mapping
-
-
-@pytest.mark.parametrize("dataset", ["cn_etf_daily", "ashare_daily_raw", "ashare_daily_qfq"])
-def test_update_cli_delegates_to_provider(dataset, monkeypatch, tmp_path):
-    from quant_workflow.scripts import quant_data_cli as cli
-    import quant_qmt_data as provider
-    calls = []
-    def maintain(asset, **kwargs):
-        calls.append((asset, kwargs))
-        return {"status": "already_current", "failed_symbols": []}
-    monkeypatch.setattr(provider, "maintain_market", maintain)
-    assert cli._update(tmp_path, dataset, "2026-10-16", None) == 0
-    assert len(calls) == 1
-    assert calls == [("etf" if dataset == "cn_etf_daily" else "stock",
-                      {"quant_data_dir": tmp_path, "through": "2026-10-16"})]
-
-
-def test_script_default_root_is_lightweight_store(monkeypatch, tmp_path):
-    from src.services import quant_workflow_paths as paths
-    from quant_workflow.scripts import _paths
-    monkeypatch.delenv("QUANT_DATA_ROOT", raising=False)
-    monkeypatch.setenv("WORKING_PROJECTS_ROOT", str(tmp_path))
-    expected = tmp_path / "quant_qmt_data/data"
-    assert paths.quant_data_root() == expected
-    assert _paths.quant_data_root() == expected
-
-
-def test_web_has_a_direct_stock_update_without_training_or_a_full_daily_pipeline():
-    from src.services.quant_job_service import _build_default_command_specs, QUANT_DATA_NETWORK_JOB_TYPES
-    spec = _build_default_command_specs()["update_ashare_miniqmt"]
-    command = spec["command"]({"end": "2026-10-16"})
-    assert command[-4:] == ["update", "ashare_daily_qfq", "--through", "2026-10-16"]
-    assert command[1].endswith("quant_data_cli.py")
-    assert spec["allowed_params"] == {"end"}
-    assert {"update_ashare_miniqmt", "download_etf_momentum"}.issubset(QUANT_DATA_NETWORK_JOB_TYPES)
-
-
-def test_qlib_consumer_reads_frozen_prices_through_package(tmp_path, monkeypatch):
-    pytest.importorskip("qlib")
-    from types import SimpleNamespace
-    from collections import OrderedDict
-    from quant_workflow.quant_data_qlib_provider import QuantDataFeatureProvider
-    import quant_qmt_data as provider
-
-    root = tmp_path / "data"
-    publish_prices(root)
-    snapshot = provider.bar_snapshot("cn_index_daily", quant_data_root=root)
-    consumer = object.__new__(QuantDataFeatureProvider)
-    consumer._context = SimpleNamespace(
-        quant_data_root=root, snapshot_path=snapshot["snapshot_path"],
-        index_snapshot_path=None, cleaning={"mode": "canonical"},
-        descriptor={"dataset": snapshot["identity"]})
-    consumer._rows = {row.symbol: row for row in snapshot["file_index"].itertuples()}
-    consumer._index_rows, consumer._frames, consumer._cache_limit = {}, OrderedDict(), 8
-    original = provider.read_bars
-    calls = []
-    def record(*args, **kwargs):
-        calls.append(kwargs["expected_identity"])
-        return original(*args, **kwargs)
-    monkeypatch.setattr(provider, "read_bars", record)
-    assert consumer._load_frame("SZ399006")["close"].tolist() == [10., 11.]
-    assert calls == [snapshot["identity"]]
-
-
-@pytest.mark.parametrize("stocks", [False, True])
-def test_update_cli_runs_real_temporary_increment_and_zero_network_replay(tmp_path, monkeypatch, stocks):
-    """Only the supplier transport is synthetic; snapshot writes/reads are real."""
-    import hashlib
-    import quant_qmt_data as provider
-    from quant_qmt_data import miniqmt_etf_source as source
-    from quant_qmt_data.miniqmt_bridge import MiniQMTBridgeClient, canonical_bytes
-    from quant_workflow.scripts import quant_data_cli as cli
-
-    monkeypatch.setenv("QUANT_WORKFLOW_REPORTS_ROOT", str(tmp_path / "reports"))
-    calls = []
-    days = ["2026-08-03", "2026-08-04", "2026-08-05"]
-    def transport(request):
-        calls.append(request)
-        selected = [day for day in days if pd.Timestamp(request["start"]) <= pd.Timestamp(day) <= pd.Timestamp(request["end"])]
-        if request["operation"] == "universe":
-            data = {asset: {"symbols": ["920748.BJ"] if stocks else ["159915.SZ"], "status": "ok"}
-                    for asset in request["symbols"]}
-        elif request["operation"] == "instruments":
-            data = {s: {"name": s, "open_date": days[0], "expire_date": None,
-                        "security_types": {"stock": stocks, "etf": not stocks}}
-                    for s in request["symbols"]}
-        elif request["operation"] == "calendar":
-            data = {symbol: {"dates": selected} for symbol in request["symbols"]}
-        else:
-            assert request["operation"] == "update_pair"
-            rows = [dict(date=day, open=10., high=11., low=9., close=10., volume=100.,
-                         amount=100000., suspendFlag=0, preClose=10.) for day in selected]
-            data = {symbol: dict(raw=rows, qfq=rows, actions=[], calendar=selected,
-                                  volume_unit="shares" if stocks else "lots",
-                                  action_history_through=days[-1]) for symbol in request["symbols"]}
-        return dict(status="ok", provider="miniqmt", request=request,
-                    request_sha256=hashlib.sha256(canonical_bytes(request)).hexdigest(),
-                    data=data, data_sha256=hashlib.sha256(canonical_bytes(data)).hexdigest(),
-                    mode="read_existing_cache", network_download_requested=False)
-    monkeypatch.setattr(source, "MiniQMTBridgeClient", lambda: MiniQMTBridgeClient(transport=transport))
-    dataset, symbol = ("ashare_daily_qfq", "BJ920748") if stocks else ("cn_etf_daily", "SZ159915")
-    initialize = provider.initialize_ashare_snapshot if stocks else provider.initialize_cn_etf_snapshot
-    initialize(quant_data_dir=tmp_path, codes=[symbol], start_date=days[0], end_date=days[1])
-    old = provider.read_bars(dataset, symbol, quant_data_root=tmp_path, price_basis="qfq")
-    frozen = provider.bar_snapshot(dataset, quant_data_root=tmp_path, price_basis="qfq")
-    old_file = frozen["bars_dir"] / f"{symbol}.parquet"
-    old_bytes = old_file.read_bytes()
-    from data_provider.miniqmt_fetcher import QuantQMTDataFetcher
-    ordinary = QuantQMTDataFetcher(quant_data_root=tmp_path).get_daily_data(
-        symbol[2:], days[0], days[1])
-    assert ordinary["volume"].tolist() == old["volume"].tolist()
-    assert ordinary["close"].tolist() == old["close"].tolist()
-    assert ordinary.attrs["dataset_identity"] == frozen["identity"]
-    from datetime import date
-    from src.repositories.quant_price_repo import QuantPriceRepository
-    for supplied in (["920748", "BJ920748", "920748.BJ"] if stocks else [symbol]):
-        loaded = QuantPriceRepository(quant_data_root=tmp_path).load(
-            [supplied], start_date=date(2026, 8, 3), end_date=date(2026, 8, 4))
-        assert len(loaded.bars) == 2
-        assert {bar.symbol for bar in loaded.bars} == {symbol}
-        assert set(loaded.dataset_identities) == {dataset}
-    calls.clear()
-    assert cli._update(tmp_path, dataset, days[-1], None) == 0
-    assert any(item["operation"] == "update_pair" for item in calls)
-    new = provider.read_bars(dataset, symbol, quant_data_root=tmp_path, price_basis="qfq")
-    assert len(new) == len(old) + 1
-    values = ["date", "open", "high", "low", "close", "volume", "amount"]
-    pd.testing.assert_frame_equal(new.iloc[:len(old)][values].reset_index(drop=True), old[values])
-    assert old_file.read_bytes() == old_bytes
-    calls.clear()
-    assert cli._update(tmp_path, dataset, days[-1], None) == 0
-    assert calls == []
+def test_missing_symbol_does_not_fall_back_to_a_supplier(experiment):
+    manager = DataFetcherManager(fetchers=[QuantQMTDataFetcher()])
+    with pytest.raises(DataFetchError):
+        manager.get_daily_data("920149", "2024-01-02", "2024-01-05")

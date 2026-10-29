@@ -828,101 +828,9 @@ class QuantJobsApiTestCase(unittest.TestCase):
 
         self.assertNotIn("report_data_quality", available)
 
-    def test_default_specs_include_provider_maintenance_dry_run_jobs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs", command_specs=None
-            )
-            available = service.available_job_types()
 
-        self.assertIn("generate_csi300", available)
-        self.assertIn("add_index_benchmark", available)
-        self.assertEqual(available["generate_csi300"]["allowed_params"], [])
-        self.assertEqual(available["add_index_benchmark"]["allowed_params"], [])
 
-    def test_provider_maintenance_jobs_are_forced_to_dry_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs", command_specs=None
-            )
-            csi300 = service._build_command("generate_csi300", {})
-            benchmark = service._build_command("add_index_benchmark", {})
 
-        self.assertEqual(csi300[0], _python_bin(), csi300)
-        self.assertEqual(benchmark[0], _python_bin(), benchmark)
-        self.assertIn("generate_csi300.py", csi300[1])
-        self.assertIn("add_index_benchmark.py", benchmark[1])
-        self.assertIn("--dry-run", csi300)
-        self.assertIn("--dry-run", benchmark)
-
-    def test_provider_maintenance_jobs_reject_api_params_before_launch(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs", command_specs=None
-            )
-            client = self._make_client(service)
-
-            csi300_resp = client.post(
-                "/api/v1/quant/jobs",
-                json={"job_type": "generate_csi300", "params": {"dry_run": False}},
-            )
-            benchmark_resp = client.post(
-                "/api/v1/quant/jobs",
-                json={"job_type": "add_index_benchmark", "params": {"dry_run": False}},
-            )
-            jobs = service.list_jobs()
-
-        self.assertEqual(csi300_resp.status_code, 400)
-        self.assertEqual(csi300_resp.json()["error"], "invalid_params")
-        self.assertIn(
-            "Unsupported params for generate_csi300", csi300_resp.json()["message"]
-        )
-        self.assertEqual(benchmark_resp.status_code, 400)
-        self.assertEqual(benchmark_resp.json()["error"], "invalid_params")
-        self.assertIn(
-            "Unsupported params for add_index_benchmark",
-            benchmark_resp.json()["message"],
-        )
-        self.assertEqual(jobs, [])
-
-    def test_data_hygiene_report_job_is_inventory_and_dry_run_only(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs", command_specs=None
-            )
-            command = service._build_command("report_data_hygiene", {})
-            available = service.available_job_types()
-            artifact_patterns = service.command_specs["report_data_hygiene"][
-                "artifact_patterns"
-            ]
-
-            with self.assertRaises(ValueError) as ctx:
-                service._build_command("report_data_hygiene", {"delete": True})
-
-        self.assertIn("report_data_hygiene.py", command[1])
-        self.assertEqual(available["report_data_hygiene"]["allowed_params"], [])
-        self.assertIn("Unsupported params for report_data_hygiene", str(ctx.exception))
-        self.assertEqual(
-            [Path(pattern).name for pattern in artifact_patterns],
-            [
-                "data_hygiene_reports_latest.json",
-                "data_hygiene_inventory_latest.md",
-                "data_hygiene_inventory_latest.json",
-                "data_hygiene_cleanup_plan_latest.md",
-                "data_hygiene_cleanup_plan_latest.json",
-                "data_hygiene_inventory_*.md",
-                "data_hygiene_inventory_*.json",
-                "data_hygiene_cleanup_plan_*.md",
-                "data_hygiene_cleanup_plan_*.json",
-            ],
-        )
-        self.assertTrue(
-            all(
-                str(pattern).startswith(str(REPORTS_ROOT))
-                for pattern in artifact_patterns
-            )
-        )
-        self.assertEqual(sum("*" in pattern for pattern in artifact_patterns), 4)
 
     def test_workbench_capability_report_job_is_read_only_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1072,275 +980,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         )
         self.assertIn("Param test_months must be <=", str(too_many_months.exception))
 
-    def test_repair_qlib_provider_web_job_is_forced_to_dry_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs", command_specs=None
-            )
-            command = service._build_command("repair_qlib_provider", {})
-            available = service.available_job_types()
 
-            with self.assertRaises(ValueError) as ctx:
-                service._build_command("repair_qlib_provider", {"dry_run": False})
-            with self.assertRaises(ValueError) as legacy_ctx:
-                service._build_command("repair_qlib_provider", {"dry_run": True})
-
-        self.assertIn("repair_qlib_provider.py", command[1])
-        self.assertIn("--dry-run", command)
-        self.assertEqual(available["repair_qlib_provider"]["allowed_params"], [])
-        self.assertIn("Unsupported params", str(ctx.exception))
-        self.assertIn("Unsupported params", str(legacy_ctx.exception))
-
-    def test_status_includes_research_snapshot_for_workflow_header(self) -> None:
-        from tests.test_research_status_api import local_training_catalog
-        from api.v1.endpoints.research_status import _NativeQlibProviderResolution
-        from quant_workflow.scripts.quant_data_service_client import (
-            QuantDataIdentity,
-            QuantDataReadyResult,
-        )
-
-        identities = tuple(
-            QuantDataIdentity(
-                dataset_id=dataset_id,
-                snapshot_id=f"{dataset_id}-snapshot",
-                manifest_sha256=marker * 64,
-                content_sha256=marker * 64,
-                latest_trade_date="2026-08-07",
-                price_basis=price_basis,
-                data_kind=data_kind,
-            )
-            for dataset_id, marker, price_basis, data_kind in (
-                ("ashare_daily_qfq", "a", "qfq", "daily_bars"),
-                ("cn_index_daily", "b", "raw", "daily_bars"),
-                (
-                    "pit_csi800",
-                    "c",
-                    "not_applicable",
-                    "point_in_time_membership",
-                ),
-                (
-                    "qlib_cleaning_plan",
-                    "d",
-                    "not_applicable",
-                    "qlib_cleaning_plan",
-                ),
-            )
-        )
-        readiness = QuantDataReadyResult(
-            status="ready",
-            validated_datasets=len(identities),
-            identities=identities,
-            datasets=(),
-        )
-
-        def resolve_provider(
-            _dataset_id: str = "ashare_daily_qfq",
-            *,
-            provider: str = "canonical",
-        ) -> _NativeQlibProviderResolution:
-            provider_name = "cleaned" if provider == "cleaned" else "canonical"
-            lineage = {
-                "provider_contract": "direct_parquet_v1",
-                "dataset_id": "ashare_daily_qfq",
-                "snapshot_id": "ashare-daily-qfq-snapshot",
-                "manifest_sha256": "e" * 64,
-                "content_sha256": "f" * 64,
-                "descriptor_path": (
-                    f"runtime/qlib/provider/{provider_name}/PROVIDER_DESCRIPTOR.json"
-                ),
-                "descriptor_sha256": ("1" if provider_name == "canonical" else "2")
-                * 64,
-                "cleaning_mode": provider_name,
-                "index_dataset_id": "cn_index_daily",
-                "index_snapshot_id": "cn-index-snapshot",
-                "index_content_sha256": "3" * 64,
-                "index_manifest_sha256": "4" * 64,
-            }
-            return _NativeQlibProviderResolution(
-                authoritative=True,
-                path=Path(f"/tmp/{provider_name}-provider"),
-                lineage=lineage,
-                provider_name=provider_name,
-                dataset_id=lineage["dataset_id"],
-                snapshot_id=lineage["snapshot_id"],
-                manifest_sha256=lineage["manifest_sha256"],
-                content_sha256=lineage["content_sha256"],
-                calendar_end="2026-08-07",
-                instrument_count=5340,
-                benchmark_complete=True,
-            )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            reports_dir = Path(temp_dir) / "reports"
-            reports_dir.mkdir()
-            quality_markdown = "# Quality\n\n- Stock universe: 5340\n"
-            quality_digest = hashlib.sha256(
-                quality_markdown.encode("utf-8")
-            ).hexdigest()
-            quality_artifact = reports_dir / (
-                f"data_quality_report_20260705_153000_{quality_digest[:16]}.md"
-            )
-            quality_artifact.write_text(quality_markdown, encoding="utf-8")
-            quality_evidence = {
-                "schema_version": 3,
-                "evidence_contract": "immutable_data_quality_evidence_v2",
-                "scan_mode": "full",
-                "coverage_status": "full",
-                "verification_status": "verified",
-                "trainable": True,
-                "training_thresholds": {
-                    "min_calendar_days": 252,
-                    "min_instruments": 100,
-                    "min_merged_instruments": 100,
-                    "authoritative_min_calendar_days": 252,
-                    "authoritative_min_instruments": 100,
-                    "authoritative": True,
-                },
-                "markdown_artifact": quality_artifact.name,
-                "markdown_sha256": quality_digest,
-            }
-            quality_evidence_bytes = (
-                json.dumps(
-                    quality_evidence,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
-            quality_evidence_sha256 = hashlib.sha256(
-                quality_evidence_bytes
-            ).hexdigest()
-            quality_report_id = f"data-quality-{quality_evidence_sha256[:16]}"
-            quality_evidence_artifact = reports_dir / (
-                "data_quality_report_20260705_153000_"
-                f"{quality_evidence_sha256[:16]}.json"
-            )
-            quality_evidence_artifact.write_bytes(quality_evidence_bytes)
-            (reports_dir / "data_quality_report_latest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 3,
-                        "report_id": quality_report_id,
-                        "publication_contract": (
-                            "atomic_json_pointer_to_immutable_quality_evidence_v2"
-                        ),
-                        "evidence_artifact": quality_evidence_artifact.name,
-                        "evidence_sha256": quality_evidence_sha256,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            status_path = reports_dir / "research_status_latest.json"
-            status_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-05T15:30:00+08:00",
-                        "trainable": True,
-                        "quality_report_id": quality_report_id,
-                        "quality_evidence_sha256": quality_evidence_sha256,
-                        "training_readiness": {
-                            "status": "trainable",
-                            "summary": "Qlib provider is ready.",
-                        },
-                        "data_sources": [
-                            {
-                                "name": "merged",
-                                "files": 5340,
-                                "rows": 7580087,
-                                "date_range": "2008-01-02 ~ 2026-07-03",
-                                "status": "available",
-                            }
-                        ],
-                        "qlib_provider": {
-                            "path": "/tmp/qlib",
-                            "calendar_days": 4492,
-                            "calendar_range": "2008-01-02 ~ 2026-07-03",
-                            "instruments": 5340,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (reports_dir / "latest_training_result.json").write_text(
-                json.dumps(
-                    {
-                        "status": "completed",
-                        "experiment_name": "baseline_lgb_alpha158_cleaned",
-                        "run_id": "run_20260705",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (reports_dir / "qlib_research_risk_model_latest.json").write_text(
-                json.dumps(
-                    {
-                        "generated_at": "2026-07-05T16:00:00+08:00",
-                        "mode": "read_only_qlib_research",
-                        "section": "risk_model",
-                        "title": "风险模型集成诊断",
-                        "status": "available",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs",
-                command_specs={},
-            )
-            client = self._make_client(service)
-
-            with (
-                patch(
-                    "api.v1.endpoints.research_status.RESEARCH_STATUS_PATH",
-                    status_path,
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._resolve_native_qlib_provider",
-                    side_effect=resolve_provider,
-                ),
-                patch(
-                    "quant_qmt_data.inspect_datasets",
-                    return_value=local_training_catalog(readiness, resolve_provider().lineage),
-                ),
-                patch(
-                    "api.v1.endpoints.research_status._qlib_provider_from_path",
-                    return_value={
-                        "calendar_days": 4492,
-                        "calendar_range": "2008-01-02 ~ 2026-07-03",
-                        "instruments": 5340,
-                    },
-                ),
-            ):
-                resp = client.get("/api/v1/quant/status")
-
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertTrue(body["trainable"])
-        self.assertEqual(body["training_readiness"]["status"], "trainable")
-        self.assertEqual(body["training_preflight"]["status"], "passed")
-        self.assertEqual(body["data_sources"], [])
-        self.assertEqual(body["provider_quality"], {})
-        self.assertNotIn("quality_report_id", body)
-        self.assertNotIn("quality_evidence_sha256", body)
-        self.assertNotIn("quality_scan", body)
-        self.assertEqual(
-            body["qlib_provider"]["calendar_range"], "2008-01-02 ~ 2026-07-03"
-        )
-        self.assertEqual(body["latest_training"]["run_id"], "run_20260705")
-        self.assertEqual(
-            body["qlib_research"]["sections"]["risk_model"]["status"], "available"
-        )
-        self.assertEqual(body["mlflow"]["url"], "http://127.0.0.1:6006/")
-        self.assertEqual(body["mlflow"]["role"], "experiment_raw_records")
-        self.assertEqual(body["external_services"]["dsa"]["status"], "available")
-        self.assertEqual(
-            body["external_services"]["mlflow"]["url"], "http://127.0.0.1:6006/"
-        )
-        self.assertEqual(
-            body["external_services"]["catdesk"]["url"], "http://127.0.0.1:8765/"
-        )
 
     def test_status_offloads_research_snapshot_build_from_event_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1480,7 +1120,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "run_candidate_pipeline": {
                         "label": "候选流程",
                         "command": [sys.executable, "-c", "print('candidate')"],
-                        "allowed_params": {"dry_run"},
+                        "allowed_params": {"dry_run", "provider"},
                     },
                     "run_robust_signal_research": {
                         "label": "鲁棒信号研究",
@@ -1538,7 +1178,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     "/api/v1/quant/jobs",
                     json={
                         "job_type": "run_candidate_pipeline",
-                        "params": {"dry_run": True},
+                        "params": {"dry_run": True, "provider": "canonical"},
                     },
                 )
                 robust_formal = client.post(
@@ -1711,106 +1351,17 @@ class QuantJobsApiTestCase(unittest.TestCase):
             artifact_sha256=readiness_sha256,
         )
 
-    def test_submit_pins_the_quality_approved_cleaned_snapshot_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(
-                jobs_root=Path(temp_dir) / "jobs",
-                command_specs={
-                    "train_baseline_lgb": {
-                        "label": "训练基线",
-                        "command": [sys.executable, "-c", "print('train')"],
-                    }
-                },
-            )
-            client = self._make_client(service)
-            approved_identity = {
-                "provider_contract": "direct_parquet_v1",
-                "dataset_id": "ashare_daily_qfq",
-                "snapshot_id": "cleaned-snapshot",
-                "manifest_sha256": "a" * 64,
-                "content_sha256": "b" * 64,
-                "descriptor_path": (
-                    "runtime/qlib_direct/providers/ashare_daily_qfq/"
-                    "cleaned-snapshot/cleaned/PROVIDER_DESCRIPTOR.json"
-                ),
-                "descriptor_sha256": "c" * 64,
-                "cleaning_mode": "cleaned",
-                "index_dataset_id": "cn_index_daily",
-                "index_snapshot_id": "index-snapshot",
-                "index_content_sha256": "d" * 64,
-                "index_manifest_sha256": "e" * 64,
-            }
-            ready_status = {
-                "trainable": True,
-                "training_readiness": {"status": "trainable", "summary": "ready"},
-                "qlib_provider": {
-                    **approved_identity,
-                    "path": str(Path(temp_dir) / "cleaned-snapshot"),
-                },
-            }
-            submitted = QuantJob(
-                job_id="qj_20260731130000_1234abcd",
-                job_type="train_baseline_lgb",
-                label="训练基线",
-                status="pending",
-                params={"provider": "cleaned"},
-                command=[sys.executable],
-                cwd=temp_dir,
-                created_at="2026-07-31T13:00:00+08:00",
-                updated_at="2026-07-31T13:00:00+08:00",
-                log_path=str(Path(temp_dir) / "job.log"),
-            )
 
-            with (
-                patch(
-                    "api.v1.endpoints.quant_jobs.build_research_status_payload",
-                    return_value=ready_status,
-                ) as build_status,
-                patch.object(service, "submit_job", return_value=submitted) as submit,
-            ):
-                response = client.post(
-                    "/api/v1/quant/jobs",
-                    json={
-                        "job_type": "train_baseline_lgb",
-                        "params": {"provider": "cleaned"},
-                    },
-                )
-
-        self.assertEqual(response.status_code, 200)
-        build_status.assert_called_once_with(
-            provider_dataset_id="ashare_daily_qfq",
-            provider="cleaned",
-        )
-        submit.assert_called_once_with(
-            "train_baseline_lgb",
-            {"provider": "cleaned"},
-            approved_provider_identity=approved_identity,
-        )
-
-    def test_status_provider_lineage_is_serialized_without_business_storage_checks(
-        self,
-    ) -> None:
+    def test_status_approves_native_identity_with_server_selected_input_path(self) -> None:
         from api.v1.endpoints.quant_jobs import _approved_provider_identity_from_status
-
-        identity = {
-            "provider_contract": "direct_parquet_v1",
-            "dataset_id": "ashare_daily_qfq",
-            "snapshot_id": "provider-snapshot",
-            "manifest_sha256": "a" * 64,
-            "content_sha256": "b" * 64,
-            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
-            "descriptor_sha256": "c" * 64,
-            "cleaning_mode": "canonical",
-            "index_dataset_id": "cn_index_daily",
-            "index_snapshot_id": "index-snapshot",
-            "index_content_sha256": "d" * 64,
-            "index_manifest_sha256": "e" * 64,
-        }
-
-        self.assertEqual(
-            _approved_provider_identity_from_status({"qlib_provider": identity}),
-            identity,
-        )
+        identity = {"backend": "qmt_native", "experiment_id": "frozen-input",
+                    "bars_sha256": "a" * 64, "inputs_sha256": "b" * 64, "price_basis": "front"}
+        directory = Path("input").resolve()
+        with patch.dict(os.environ, {"QMT_DATASET_DIR": str(directory)}):
+            approved = _approved_provider_identity_from_status({
+                "training_preflight": {"status": "passed", "provider_identity": identity},
+            })
+        self.assertEqual(approved, {**identity, "input_dir": str(directory)})
 
     def test_submit_blocks_trainable_status_without_approved_snapshot_identity(
         self,
@@ -1845,27 +1396,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(response.json()["error"], "training_blocked")
 
     def test_formal_training_commands_receive_approved_provider_identity(self) -> None:
-        approved_identity = {
-            "provider_contract": "direct_parquet_v1",
-            "dataset_id": "ashare_daily_qfq",
-            "snapshot_id": "canonical-snapshot",
-            "manifest_sha256": "c" * 64,
-            "content_sha256": "d" * 64,
-            "descriptor_path": (
-                "runtime/qlib_direct/providers/ashare_daily_qfq/"
-                "canonical-snapshot/canonical/PROVIDER_DESCRIPTOR.json"
-            ),
-            "descriptor_sha256": "e" * 64,
-            "cleaning_mode": "canonical",
-            "index_dataset_id": "cn_index_daily",
-            "index_snapshot_id": "index-snapshot",
-            "index_content_sha256": "f" * 64,
-            "index_manifest_sha256": "a" * 64,
-        }
+        approved_identity = {"backend": "qmt_native", "experiment_id": "frozen-input", "bars_sha256": "a" * 64, "inputs_sha256": "b" * 64, "price_basis": "front", "input_dir": str(Path("input").resolve())}
         commands = []
         with tempfile.TemporaryDirectory() as temp_dir:
             for index, job_type in enumerate(
-                ("train_baseline_lgb", "run_candidate_pipeline")
+                ("train_baseline_lgb", "train_baseline_lgb_equivalence")
             ):
                 service = QuantJobService(
                     jobs_root=Path(temp_dir) / f"jobs-{index}",
@@ -1874,7 +1409,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 with patch.object(service, "_start_job"):
                     job = service.submit_job(
                         job_type,
-                        {"provider": "canonical"},
+                        {"provider": "qmt_native"},
                         approved_provider_identity=approved_identity,
                     )
                 commands.append(job.command)
@@ -1886,20 +1421,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
     def test_training_command_serializes_an_opaque_provider_lineage(self) -> None:
         from src.services.quant_job_service import _approved_provider_identity_json
 
-        identity = {
-            "provider_contract": "direct_parquet_v1",
-            "dataset_id": "ashare_daily_qfq",
-            "snapshot_id": "provider-snapshot",
-            "manifest_sha256": "a" * 64,
-            "content_sha256": "b" * 64,
-            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
-            "descriptor_sha256": "c" * 64,
-            "cleaning_mode": "canonical",
-            "index_dataset_id": "cn_index_daily",
-            "index_snapshot_id": "index-snapshot",
-            "index_content_sha256": "d" * 64,
-            "index_manifest_sha256": "e" * 64,
-        }
+        identity = {"backend": "qmt_native", "experiment_id": "frozen-input", "bars_sha256": "a" * 64, "inputs_sha256": "b" * 64, "price_basis": "front", "input_dir": str(Path("input").resolve())}
 
         self.assertEqual(json.loads(_approved_provider_identity_json(identity)), identity)
 
@@ -4990,23 +4512,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             result_lock = threading.Lock()
             submitted = []
             errors = []
-            approved_identity = {
-                "provider_contract": "direct_parquet_v1",
-                "dataset_id": "ashare_daily_qfq",
-                "snapshot_id": "canonical-snapshot",
-                "manifest_sha256": "a" * 64,
-                "content_sha256": "b" * 64,
-                "descriptor_path": (
-                    "runtime/qlib_direct/providers/ashare_daily_qfq/"
-                    "canonical-snapshot/canonical/PROVIDER_DESCRIPTOR.json"
-                ),
-                "descriptor_sha256": "c" * 64,
-                "cleaning_mode": "canonical",
-                "index_dataset_id": "cn_index_daily",
-                "index_snapshot_id": "index-snapshot",
-                "index_content_sha256": "d" * 64,
-                "index_manifest_sha256": "e" * 64,
-            }
+            approved_identity = {"backend": "qmt_native", "experiment_id": "frozen-input", "bars_sha256": "a" * 64, "inputs_sha256": "b" * 64, "price_basis": "front", "input_dir": str(Path("input").resolve())}
 
             def submit(service: QuantJobService, job_type: str) -> None:
                 start_barrier.wait()
@@ -5056,9 +4562,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 jobs_root=Path(temp_dir) / "jobs",
                 command_specs=None,
             )
-            artifact_patterns = service.command_specs["run_daily_update"][
-                "artifact_patterns"
-            ]
+            artifact_patterns = service.command_specs["run_daily_update"].get("artifact_patterns", [])
 
         self.assertFalse(
             any("data_quality" in Path(pattern).name for pattern in artifact_patterns)
@@ -5342,21 +4846,13 @@ class QuantJobsApiTestCase(unittest.TestCase):
             ["run_id", "smoke"],
         )
 
-    def test_report_and_refresh_jobs_use_configured_reports_root(self) -> None:
+    def test_independent_report_uses_configured_reports_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-
-            refresh_command = service._build_command(
-                "prepare_baostock_refresh", {"limit": 3}
-            )
-            anomaly_command = service._build_command("report_data_anomalies", {})
-
-        self.assertIn("prepare_baostock_refresh.py", refresh_command[1])
-        self._assert_reports_dir_arg(refresh_command)
-        self.assertIn("--limit", refresh_command)
-        self.assertIn("3", refresh_command)
-        self.assertIn("report_data_anomalies.py", anomaly_command[1])
-        self._assert_reports_dir_arg(anomaly_command)
+            command = service._build_command("report_china_astock_indicators", {"limit": 3})
+        self.assertIn("report_china_astock_indicators.py", command[1])
+        self._assert_reports_dir_arg(command, "--output-dir")
+        self.assertIn("3", command)
 
     def test_qlib_prediction_summary_job_rejects_unsafe_run_id_before_launch(
         self,
@@ -5820,7 +5316,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
             command = service._build_command(
                 "train_baseline_lgb_equivalence",
-                {"provider": "cleaned"},
+                {"provider": "qmt_native"},
             )
             catalog = service.available_job_types()
 
@@ -5830,11 +5326,11 @@ class QuantJobsApiTestCase(unittest.TestCase):
             ):
                 service.submit_job(
                     "train_baseline_lgb_equivalence",
-                    {"provider": "cleaned"},
+                    {"provider": "qmt_native"},
                 )
 
         command_text = " ".join(command)
-        self.assertIn("baseline_lgb_equivalence.yaml", command_text)
+        self.assertIn("baseline_qmt_native.yaml", command_text)
         self.assertIn("--experiment-name dsa_training_equivalence", command_text)
         self.assertIn("--result-scope training_equivalence", command_text)
         self.assertIn("--equivalence-channel web", command_text)
@@ -5846,7 +5342,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertTrue(
             _requires_training_readiness_gate(
                 "train_baseline_lgb_equivalence",
-                {"provider": "cleaned"},
+                {"provider": "qmt_native"},
             )
         )
 
@@ -5875,79 +5371,8 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertEqual(command.count("--backtest-days"), 1)
         self.assertIn("--backtest-force", command)
 
-    def test_apply_data_cleaning_job_is_whitelisted_with_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
 
-            command = service._build_command("apply_data_cleaning", {})
-            status = service.available_job_types()
-            spec = service.command_specs["apply_data_cleaning"]
 
-        self.assertIn("build_qlib_direct_provider.py", command[1])
-        self.assertIn("--cleaning-mode", command)
-        self.assertIn("cleaned", command)
-        self.assertEqual(
-            status["apply_data_cleaning"]["label"],
-            "生成正式 cleaned Qlib Provider",
-        )
-        self.assertEqual(
-            status["apply_data_cleaning"]["allowed_params"],
-            ["dry_run"],
-        )
-        dry_run = service._build_command("apply_data_cleaning", {"dry_run": True})
-        self.assertIn("apply_data_cleaning.py", dry_run[1])
-        self.assertIn("--dry-run", dry_run)
-        self._assert_reports_dir_arg(dry_run)
-        self.assertTrue(
-            any(
-                "data_cleaning_applied_latest.json" in item
-                for item in spec["artifact_patterns"]
-            )
-        )
-        self.assertTrue(
-            any(
-                "data_cleaning_applied_latest.md" in item
-                for item in spec["artifact_patterns"]
-            )
-        )
-
-    def test_merge_to_qlib_job_supports_isolated_smoke_fixture_only(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-
-            command = service._build_command("merge_to_qlib", {"smoke": True})
-            status = service.available_job_types()
-
-            with self.assertRaises(ValueError) as ctx:
-                service._build_command("merge_to_qlib", {"qlib_dir": "/tmp/unsafe"})
-
-        self.assertIn("merge_to_qlib.py", command[1])
-        self.assertIn("--smoke-fixture", command)
-        self.assertIn("--smoke-dir", command)
-        self.assertEqual(
-            Path(command[command.index("--smoke-dir") + 1]).parts[-3:],
-            ("reports", "smoke", "merge_to_qlib"),
-        )
-        self.assertEqual(
-            status["merge_to_qlib"]["allowed_params"], ["no_overwrite", "smoke"]
-        )
-        self.assertIn("Unsupported params for merge_to_qlib", str(ctx.exception))
-
-    def test_merge_to_qlib_job_publishes_direct_provider_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-
-            command = service._build_command("merge_to_qlib", {})
-            status = service.available_job_types()
-
-        self.assertIn("build_qlib_direct_provider.py", command[1])
-        self.assertIn("--cleaning-mode", command)
-        self.assertIn("canonical", command)
-        self.assertNotIn("merge_to_qlib.py", command[1])
-        self.assertEqual(
-            status["merge_to_qlib"]["label"],
-            "生成正式 Qlib Provider",
-        )
 
     def test_download_jqdata_job_supports_browser_safe_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5991,203 +5416,29 @@ class QuantJobsApiTestCase(unittest.TestCase):
         self.assertIn("only support dry_run=true", str(real_download_ctx.exception))
         self.assertIn("Param limit must be <= 20", str(too_many_ctx.exception))
 
-    def test_public_ashare_source_jobs_are_whitelisted_with_safe_params(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
 
-            eastmoney = service._build_command(
-                "download_eastmoney",
-                {
-                    "start": "2026-07-01",
-                    "end": "2026-07-08",
-                    "limit": 2,
-                    "incremental": True,
-                    "overlap_days": 7,
-                    "use_system_proxy": True,
-                },
-            )
-            akshare = service._build_command(
-                "download_akshare",
-                {
-                    "start": "2026-07-01",
-                    "end": "2026-07-08",
-                    "limit": 2,
-                    "incremental": True,
-                    "overlap_days": 7,
-                },
-            )
-            etf = service._build_command(
-                "download_etf_momentum",
-                {
-                    "end": "2026-07-08",
-                },
-            )
-            etf_report = service._build_command("generate_etf_momentum_report", {})
-            snapshot = service._build_command(
-                "validate_latest_snapshot", {"limit": 3, "timeout": 9}
-            )
-            global_daily = service._build_command(
-                "download_global_daily",
-                {"start": "2026-07-01", "end": "2026-07-08", "limit": 2, "incremental": True},
-            )
-            news = service._build_command("download_ashare_news", {"limit": 5, "timeout": 9})
-            status = service.available_job_types()
-
-            with self.assertRaises(ValueError) as unsafe_ctx:
-                service._build_command(
-                    "download_eastmoney", {"output_dir": "/tmp/unsafe"}
-                )
-
-        self.assertIn("download_eastmoney.py", eastmoney[1])
-        self.assertIn("--incremental", eastmoney)
-        self.assertIn("--overlap-days", eastmoney)
-        self.assertIn("--use-system-proxy", eastmoney)
-        self.assertIn("download_akshare.py", akshare[1])
-        self.assertIn("--incremental", akshare)
-        self.assertIn("quant_data_cli.py", etf[1])
-        self.assertIn("cn_etf_daily", etf)
-        self.assertIn("--through", etf)
-        self.assertNotIn("--output-dir", etf)
-        self.assertIn("generate_etf_momentum_strategy_report.py", etf_report[1])
-        self.assertIn("validate_latest_snapshot.py", snapshot[1])
-        self.assertIn("--out-dir", snapshot)
-        self.assertIn("download_global_daily.py", global_daily[1])
-        self.assertIn("--incremental", global_daily)
-        self.assertIn("download_ashare_news.py", news[1])
-        self.assertEqual(news[news.index("--limit") + 1], "5")
-        self.assertEqual(
-            status["download_eastmoney"]["allowed_params"],
-            [
-                "end",
-                "incremental",
-                "limit",
-                "max_consecutive_failures",
-                "max_requests",
-                "overlap_days",
-                "retries",
-                "retry_failed",
-                "sleep",
-                "start",
-                "timeout",
-                "use_system_proxy",
-            ],
-        )
-        self.assertEqual(
-            status["download_akshare"]["allowed_params"],
-            [
-                "end",
-                "incremental",
-                "limit",
-                "max_consecutive_failures",
-                "max_requests",
-                "overlap_days",
-                "retries",
-                "retry_failed",
-                "sleep",
-                "start",
-                "timeout",
-                "use_system_proxy",
-            ],
-        )
-        self.assertEqual(status["validate_latest_snapshot"]["allowed_params"], ["limit", "timeout", "use_system_proxy"])
-        self.assertEqual(
-            status["download_global_daily"]["allowed_params"],
-            ["end", "incremental", "limit", "overlap_days", "retries", "sleep", "start", "timeout", "use_system_proxy"],
-        )
-        self.assertEqual(
-            status["download_ashare_news"]["allowed_params"],
-            ["limit", "retries", "sleep", "timeout", "use_system_proxy"],
-        )
-        self.assertEqual(
-            status["download_etf_momentum"]["allowed_params"],
-            ["end"],
-        )
-        self.assertEqual(
-            status["run_daily_update"]["label"],
-            "运行每日 quant_data 更新与校验",
-        )
-        self.assertEqual(
-            status["generate_etf_momentum_report"]["allowed_params"], []
-        )
-        self.assertEqual(
-            status["generate_etf_momentum_report"]["label"],
-            "生成 ETF 完整策略报告",
-        )
-        default_etf = service._build_command("download_etf_momentum", {})
-        self.assertIn(
-            "Unsupported params for download_eastmoney", str(unsafe_ctx.exception)
-        )
-        self.assertEqual(default_etf[-2:], ["update", "cn_etf_daily"])
-
-    def test_ashare_source_jobs_enforce_conservative_request_limits(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
-
-            eastmoney = service._build_command(
-                "download_eastmoney",
-                {
-                    "sleep": 2,
-                    "retries": 1,
-                    "max_consecutive_failures": 3,
-                    "max_requests": 6000,
-                    "overlap_days": 0,
-                },
-            )
-            daily = service._build_command(
-                "run_daily_update",
-                {
-                    "ashare_source": "none",
-                    "sleep": 2,
-                    "retries": 1,
-                    "max_consecutive_failures": 3,
-                    "max_requests": 6000,
-                    "overlap_days": 7,
-                },
-            )
-
-            unsafe_cases = [
-                ("download_baostock", {"sleep": 1.99}, "Param sleep must be >= 2"),
-                ("download_eastmoney", {"retries": 2}, "Param retries must equal 1"),
-                (
-                    "download_akshare",
-                    {"max_consecutive_failures": 4},
-                    "Param max_consecutive_failures must be <= 3",
-                ),
-                ("download_eastmoney", {"max_requests": 6001}, "Param max_requests must be <= 6000"),
-                ("run_daily_update", {"overlap_days": 8}, "Param overlap_days must be <= 7"),
-                ("run_daily_update", {"ashare_source": "all"}, "Param ashare_source must be one of"),
-            ]
-            for job_type, params, expected_message in unsafe_cases:
-                with self.subTest(job_type=job_type, params=params):
-                    with self.assertRaises(ValueError) as ctx:
-                        service._build_command(job_type, params)
-                    self.assertIn(expected_message, str(ctx.exception))
-
-        self.assertEqual(eastmoney[eastmoney.index("--max-requests") + 1], "6000")
-        self.assertEqual(daily[daily.index("--ashare-source") + 1], "none")
-        self.assertEqual(daily[daily.index("--max-requests") + 1], "6000")
 
     def test_only_one_quant_data_network_job_can_be_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = QuantJobService(
                 jobs_root=Path(temp_dir) / "jobs",
                 command_specs={
-                    "download_eastmoney": {
+                    "download_global_daily": {
                         "label": "下载东方财富日线",
                         "command": [sys.executable, "-c", "import time; time.sleep(5)"],
                         "allowed_params": set(),
                     },
-                    "download_akshare": {
+                    "download_jqdata": {
                         "label": "下载 AkShare 日线",
                         "command": [sys.executable, "-c", "print('must not start')"],
                         "allowed_params": set(),
                     },
                 },
             )
-            first = service.submit_job("download_eastmoney")
+            first = service.submit_job("download_global_daily")
             try:
                 with self.assertRaises(ValueError) as ctx:
-                    service.submit_job("download_akshare")
+                    service.submit_job("download_jqdata")
                 jobs = service.list_jobs()
             finally:
                 service.cancel_job(first.job_id)
@@ -6197,7 +5448,7 @@ class QuantJobsApiTestCase(unittest.TestCase):
                 self.assertNotIn(first.job_id, service._processes)
 
         self.assertIn("quant_data network job is already active", str(ctx.exception))
-        self.assertEqual([job.job_type for job in jobs], ["download_eastmoney"])
+        self.assertEqual([job.job_type for job in jobs], ["download_global_daily"])
 
     def test_market_regime_report_job_is_whitelisted_with_safe_params(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6334,22 +5585,6 @@ class QuantJobsApiTestCase(unittest.TestCase):
             service = QuantJobService(jobs_root=Path(temp_dir) / "jobs")
 
             cases = [
-                ("download_baostock", {"retries": 21}, "Param retries must be <="),
-                (
-                    "download_baostock",
-                    {"max_consecutive_failures": 1001},
-                    "Param max_consecutive_failures must be <=",
-                ),
-                (
-                    "run_daily_update",
-                    {"overlap_sample": 100001},
-                    "Param overlap_sample must be <=",
-                ),
-                (
-                    "run_daily_update",
-                    {"merged_sample": 100001},
-                    "Param merged_sample must be <=",
-                ),
                 (
                     "run_dsa_backtest",
                     {"code": "600519", "eval_window_days": 3651},
@@ -6371,14 +5606,6 @@ class QuantJobsApiTestCase(unittest.TestCase):
                     {"limit": 10001},
                     "Param limit must be <=",
                 ),
-                (
-                    "prepare_baostock_refresh",
-                    {"limit": 10001},
-                    "Param limit must be <=",
-                ),
-                ("download_baostock", {"limit": 10001}, "Param limit must be <="),
-                ("download_eastmoney", {"limit": 10001}, "Param limit must be <="),
-                ("download_akshare", {"limit": 10001}, "Param limit must be <="),
                 (
                     "optimize_strategy",
                     {"dry_run": True, "phase": 5},

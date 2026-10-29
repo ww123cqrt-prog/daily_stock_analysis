@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read local snapshot prices; retain explicit clients for historical callers."""
+"""Read one QMT experiment input; retain explicit clients for historical callers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from quant_workflow.scripts.quant_data_service_client import (
     NativeReleaseIdentity,
 )
 from src.core.strategy_backtest import PriceBar
+from src.core.script_market import MarketView
 
 
 FORMAL_QFQ_DATASETS = ("cn_etf_daily", "ashare_daily_raw")
@@ -50,7 +51,7 @@ def normalize_market_symbol(value: str) -> str:
 class QuantPriceLoad:
     symbols: tuple[str, ...]
     bars: tuple[PriceBar, ...]
-    dataset_id: str
+    dataset_id: str | None
     snapshot_id: str | None
     price_basis: str
     provider: str
@@ -63,10 +64,16 @@ class QuantPriceLoad:
     release_set_sha256: str | None = None
     module_identities: Mapping[str, Mapping[str, Any]] | None = None
     dataset_identities: Mapping[str, Mapping[str, Any]] | None = None
+    experiment_id: str | None = None
+    input_dir: str | None = None
+    bars_sha256: str | None = None
+    inputs_sha256: str | None = None
+    volume_units: Mapping[str, str] | None = None
+    view: MarketView | None = None
 
 
 class QuantPriceRepository:
-    """Load requested symbols from pinned local qfq snapshots by default."""
+    """Load requested symbols from a frozen QMT experiment input by default."""
 
     def __init__(self, *, client: QuantDataServiceClient | None = None, quant_data_root: Path | None = None):
         self._client = client
@@ -182,11 +189,12 @@ class QuantPriceRepository:
         return QuantPriceLoad(
             symbols=normalized, bars=self._price_bars(normalized, frame),
             dataset_id=meta["dataset_id"], snapshot_id=meta["snapshot_id"],
-            price_basis="qfq", provider="quant_qmt_data",
+            price_basis=meta["price_basis"], provider="qmt",
             latest_trade_date=meta.get("latest_trade_date"),
             manifest_sha256=meta.get("manifest_sha256"),
             content_sha256=meta.get("content_sha256"), data_kind="daily_bars",
-            dataset_set_version="local_snapshots", dataset_identities=meta["datasets"],
+            experiment_id=meta["experiment_id"], input_dir=meta["input_dir"],
+            bars_sha256=meta["bars_sha256"], inputs_sha256=meta["inputs_sha256"], volume_units=meta["volume_units"], view=view,
         )
 
     @staticmethod

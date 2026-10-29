@@ -4,7 +4,19 @@
 
 ## 一句话架构
 
-当前框架是：入口统一到 DSA，股票／ETF 本地快照的读取与维护由 `quant_qmt_data` 提供，研究执行留在仓内 `quant_workflow/` 与 Qlib。DSA 委托轻量项目完成行情更新，不连接封存的 `quant_data` 项目版服务。`china-astock-quant` 是 A 股指标、策略和回测经验参考库；`ashare-live-research` 是独立只读实时观察 skill；`a-share-us-catalyst` / CatDesk 是独立催化观察服务；MLflow 保存实验原始记录，页面通过 DSA `/experiments/` 访问。
+当前主线是：QMT 下载维护行情，`quant_qmt_data` 通过官方 SDK 只读本地库并冻结本次实验输入，Qlib 训练和预测，DSA 回测与展示；MLflow 保存实验记录，页面通过 DSA `/experiments/` 访问。数据包不再提供补数、复权校正、发布或保留管理。`china-astock-quant`、实时观察及 CatDesk 继续作为独立参考能力。
+
+## QMT 原生实验输入
+
+新入口使用 `qmt_native` 和 `QMT_DATASET_DIR` 指定的实验目录，其中只有 `bars.parquet` 与 `dataset.json`。JSON 冻结本次行情身份、完整交易日历、选定标的及列表性质、单位、复权、读取时间和实际范围；离线训练/回测不要求 QMT 在线。首次准备输入时，需要运行 QMT 并在 QMT 中下载相应区间，读取不会暗中补数。
+
+SDK Python 由 `QMT_PYTHON` 指定，调用方安装数据包，SDK 环境只需现有官方 xtquant；worker 从安装位置的绝对路径启动。可用 `python -m quant_qmt_data export --symbols SH600519 SH510300 --start 2021-01-01 --end 2024-12-31 --output <新实验目录>` 准备输入，然后把该目录设为 `QMT_DATASET_DIR`。不能覆盖旧实验输入或写入 QMT datadir。
+
+新训练默认使用 `qmt_native` 与 `baseline_qmt_native.yaml`，只读取冻结输入。已训练 Run 可选择“每日预测 TopK”进行 DSA 自定义回测，按下一交易日开盘撮合；初始资金、整手与每侧成交费用均进入结果。它保留完整成交账本，不把标签收益当成撮合收益，也不把预测契约标成已冻结的精确策略。`QMT_DATASET_DIR` 以后改变时，保存 Run 仍绑定其原输入目录。
+
+当前标的列表不代表历史成员。历史 CSI800 没有真实成员区间时明确不可用；不恢复旧数据平台来掩盖缺失。前复权数据下的数量、整手、现金与费用为该价格尺度下的研究模拟，不宣称等于历史账户流水。训练按标签实际未来窗口排除跨界样本，预处理只拟合有效训练数据；现实运行时间与回测逻辑时刻分别记录。2025 年以后严格留出期不用于本次工程训练拟合或参数搜索。
+
+下文涉及旧 `quant_data` 发布、`snapshot_id` 或 canonical/cleaned 数据治理的说明仅对应保留的历史/独立工作流，不是新 QMT 入口的准备条件；既有策略、模型、报告和 MLflow Run 不会自动换源或被覆盖。
 
 ## 默认 A 股股票费用口径
 

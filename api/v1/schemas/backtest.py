@@ -94,6 +94,8 @@ class TrainedStrategyBacktestRunRequest(BaseModel):
     end_date: Optional[date] = None
     topk: Optional[int] = Field(None, ge=1, le=500, description="每次持有的模型评分前K只股票")
     cost_bps: Optional[float] = Field(None, ge=0, le=1000, description="按换手扣除的成本；1基点=0.01%")
+    initial_capital: float = Field(1_000_000.0, gt=0, le=1_000_000_000_000.0)
+    lot_size: int = Field(100, ge=1, le=1_000_000)
 
 
 class TrainedStrategyCatalogStrategy(BaseModel):
@@ -101,7 +103,7 @@ class TrainedStrategyCatalogStrategy(BaseModel):
     label: str
     config: Dict[str, Any]
     exact_replay_available: bool = False
-    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"] = (
+    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy", "dsa"] = (
         "dsa_optimized_strategy"
     )
 
@@ -171,14 +173,15 @@ class TrainedStrategyBacktestResponse(BaseModel):
     artifact_sha256: Dict[str, str]
     strategy_config: Dict[str, Any]
     replay_mode: Literal["exact", "custom"]
-    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"]
-    source_replay_engine: Literal["qlib_portana", "dsa_optimized_strategy"]
+    replay_engine: Literal["qlib_portana", "dsa_optimized_strategy", "dsa"]
+    source_replay_engine: Literal["qlib_portana", "dsa_optimized_strategy", "dsa"]
     modified_from_original: bool
     config_hash: Optional[str] = None
     contract_version: Optional[int] = None
     original_parameters: Dict[str, Any]
     execution_assumptions: Dict[str, Any] = Field(default_factory=dict)
     exact_metric_validation: Optional[Dict[str, Any]] = None
+    execution_report: Optional[Dict[str, Any]] = None
     period: Dict[str, str]
     parameters: Dict[str, Any]
     metrics: TrainedStrategyBacktestMetrics

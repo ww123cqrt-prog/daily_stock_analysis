@@ -285,6 +285,7 @@ def test_filesystem_state_fingerprint_fallback_accepts_windows_fd_ctime(
 
 def test_filesystem_state_fingerprint_rejects_directory_replaced_by_symlink(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     module = load_module()
     root = tmp_path / "snapshot"
@@ -302,7 +303,7 @@ def test_filesystem_state_fingerprint_rejects_directory_replaced_by_symlink(
         if result and not replaced:
             replaced = True
             nested.rmdir()
-            nested.symlink_to(outside, target_is_directory=True)
+            make_symlink(nested, outside, target_is_directory=True)
         return result
 
     with patch.object(module.stat, "S_ISDIR", side_effect=replace_after_directory_check):
@@ -418,6 +419,7 @@ def test_filesystem_state_fingerprint_rejects_file_rewritten_after_scan(
 
 def test_filesystem_state_fingerprint_rejects_file_replaced_by_symlink(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     module = load_module()
     root = tmp_path / "snapshot"
@@ -435,7 +437,7 @@ def test_filesystem_state_fingerprint_rejects_file_replaced_by_symlink(
         if result and not replaced:
             replaced = True
             target.unlink()
-            target.symlink_to(outside)
+            make_symlink(target, outside)
         return result
 
     with patch.object(
@@ -997,7 +999,7 @@ def test_publish_and_resolve_immutable_snapshot(tmp_path: Path) -> None:
     assert not staging.exists()
 
 
-def test_resolve_dataset_rejects_symlinked_latest_pointer(tmp_path: Path) -> None:
+def test_resolve_dataset_rejects_symlinked_latest_pointer(tmp_path: Path, make_symlink) -> None:
     module = load_module()
     quant_data = tmp_path / "quant_data"
     staging = finalize_qfq_snapshot(module, quant_data)
@@ -1027,7 +1029,7 @@ def test_resolve_dataset_rejects_symlinked_latest_pointer(tmp_path: Path) -> Non
     relocated_pointer = relocated_root / "LATEST.json"
     module.atomic_write_json(relocated_pointer, pointer)
     pointer_path.unlink()
-    pointer_path.symlink_to(relocated_pointer)
+    make_symlink(pointer_path, relocated_pointer)
 
     with pytest.raises(module.DataContractError, match="symlink"):
         module.resolve_dataset(
@@ -1937,7 +1939,7 @@ def test_qlib_snapshot_validation_rejects_unindexed_feature_tampering(
         module.validate_dataset_snapshot(snapshot, verify_hashes=True)
 
 
-def test_qlib_snapshot_validation_rejects_symlinked_files(tmp_path: Path) -> None:
+def test_qlib_snapshot_validation_rejects_symlinked_files(tmp_path: Path, make_symlink) -> None:
     module = load_module()
     quant_data = tmp_path / "quant_data"
     snapshot = finalize_qlib_snapshot(module, quant_data, "qlib-symlink")
@@ -1945,7 +1947,7 @@ def test_qlib_snapshot_validation_rejects_symlinked_files(tmp_path: Path) -> Non
     external = tmp_path / "external-close.day.bin"
     external.write_bytes(feature.read_bytes())
     feature.unlink()
-    feature.symlink_to(external)
+    make_symlink(feature, external)
 
     with pytest.raises(module.DataContractError, match="symlink"):
         module.validate_dataset_snapshot(snapshot, verify_hashes=True)

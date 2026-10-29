@@ -618,7 +618,7 @@ def test_prune_snapshot_history_supports_three_immutable_snapshots(tmp_path) -> 
     ]
 
 
-def test_prune_snapshot_history_rejects_symlinked_dataset_root(tmp_path) -> None:
+def test_prune_snapshot_history_rejects_symlinked_dataset_root(tmp_path, make_symlink) -> None:
     module = load_module()
     external = tmp_path / "external"
     snapshot = external / "snapshots" / "snapshot-1"
@@ -636,7 +636,7 @@ def test_prune_snapshot_history_rejects_symlinked_dataset_root(tmp_path) -> None
         json.dumps({"snapshot_id": "snapshot-1"}), encoding="utf-8"
     )
     linked = tmp_path / "cn_etf_daily"
-    linked.symlink_to(external, target_is_directory=True)
+    make_symlink(linked, external, target_is_directory=True)
 
     with pytest.raises(module.CnEtfDownloadError, match="symlink"):
         module.prune_snapshot_history(linked, keep=2)

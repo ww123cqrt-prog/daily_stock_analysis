@@ -525,6 +525,7 @@ def test_read_only_failure_does_not_leave_reusable_writable_provider(
 
 def test_provider_snapshot_rejects_symlinks_without_touching_link_target(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     module = load_module()
     canonical = tmp_path / "canonical"
@@ -537,7 +538,7 @@ def test_provider_snapshot_rejects_symlinks_without_touching_link_target(
     external.write_bytes(b"external")
     external.chmod(0o600)
     external_mode = external.stat().st_mode
-    (canonical / "features" / "linked.bin").symlink_to(external)
+    make_symlink(canonical / "features" / "linked.bin", external)
     intervals = tmp_path / "membership_intervals.parquet"
     pd.DataFrame(
         {
@@ -564,25 +565,45 @@ def test_provider_snapshot_rejects_symlinks_without_touching_link_target(
     assert external.stat().st_mode == external_mode
 
 
-def test_reuse_check_rejects_provider_root_symlink(tmp_path: Path) -> None:
+def test_reuse_check_rejects_provider_root_symlink(
+    tmp_path: Path, make_symlink
+) -> None:
     module = load_module()
-    target = tmp_path / "target"
-    (target / "calendars").mkdir(parents=True)
-    (target / "features").mkdir()
-    (target / "instruments").mkdir()
-    (target / "instruments" / "csi800.txt").write_text("", encoding="utf-8")
-    (target / "ROBUST_PROVIDER.json").write_text(
-        json.dumps({"format_version": 2, "provider_key": "key"}),
-        encoding="utf-8",
+    canonical = tmp_path / "canonical"
+    (canonical / "calendars").mkdir(parents=True)
+    (canonical / "features").mkdir()
+    (canonical / "calendars" / "day.txt").write_text(
+        "2023-01-02\n2023-01-03\n", encoding="utf-8"
     )
-    link = tmp_path / "provider-link"
-    link.symlink_to(target, target_is_directory=True)
+    (canonical / "features" / "sample.bin").write_bytes(b"canonical")
+    intervals = tmp_path / "membership_intervals.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["SH600000"],
+            "start_date": ["2023-01-02"],
+            "end_date": ["2023-01-03"],
+        }
+    ).to_parquet(intervals, index=False)
+    result = module.prepare_runtime_provider(
+        canonical_provider=canonical,
+        intervals_path=intervals,
+        runtime_root=tmp_path / "runtime",
+        data_manifest_path=write_manifest(tmp_path),
+    )
+    target = Path(result["provider_uri"])
+    key = result["provider_key"]
+    assert not target.is_symlink()
+    assert module._snapshot_is_reusable(target, key) is True
 
-    assert module._snapshot_is_reusable(link, "key") is False
+    link = tmp_path / "provider-link"
+    make_symlink(link, target, target_is_directory=True)
+
+    assert module._snapshot_is_reusable(link, key) is False
 
 
 def test_invalid_cached_root_symlink_is_unlinked_without_modifying_target(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     module = load_module()
     canonical = tmp_path / "canonical"
@@ -610,7 +631,7 @@ def test_invalid_cached_root_symlink_is_unlinked_without_modifying_target(
     )
     cached = runtime / "providers" / key[:16]
     cached.parent.mkdir(parents=True)
-    cached.symlink_to(canonical, target_is_directory=True)
+    make_symlink(cached, canonical, target_is_directory=True)
 
     result = module.prepare_runtime_provider(
         canonical_provider=canonical,

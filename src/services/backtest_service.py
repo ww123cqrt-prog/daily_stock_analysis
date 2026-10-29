@@ -126,7 +126,7 @@ class BacktestService:
         slow_ma_days: int = 20,
         top_n: int = 1,
     ) -> Dict[str, Any]:
-        """Run one explicit form strategy against governed qfq bars."""
+        """Run one explicit form strategy against the selected experiment input."""
 
         normalized_strategy = str(strategy_id or "").strip().lower()
         if start_date and end_date and start_date > end_date:
@@ -182,6 +182,11 @@ class BacktestService:
 
         data_quality = {
             "dataset_id": price_data.dataset_id,
+            "experiment_id": price_data.experiment_id,
+            "input_dir": price_data.input_dir,
+            "bars_sha256": price_data.bars_sha256,
+            "inputs_sha256": price_data.inputs_sha256,
+            "volume_units": price_data.volume_units,
             "dataset_set_version": price_data.dataset_set_version,
             "generation": price_data.generation,
             "release_set_sha256": price_data.release_set_sha256,
@@ -219,12 +224,23 @@ class BacktestService:
                 },
             }
 
-        report = run_portfolio_backtest(
-            strategy_name=normalized_strategy,
-            allocations=allocations,
-            bars=bars,
-            config=config,
-        )
+        if price_data.view is not None:
+            metadata["execution"] = "next_trading_day_open"
+            report = run_portfolio_backtest_view(
+                strategy_name=normalized_strategy, allocations=allocations,
+                view=price_data.view, config=config,
+                period_start=start_date, period_end=end_date,
+            )
+            report["assumptions"].update(
+                execution="next_trading_day_open",
+                price_basis=price_data.price_basis,
+                execution_basis="research_price_simulation",
+                quantity_basis="simulated_units_at_selected_price",
+            )
+        else:
+            report = run_portfolio_backtest(
+                strategy_name=normalized_strategy, allocations=allocations, bars=bars, config=config,
+            )
         report["strategy"] = metadata
         report["data_quality"] = data_quality
         return report
@@ -260,6 +276,7 @@ class BacktestService:
             custom_symbols=symbols if pool == "custom" else None,
             start=start_date.isoformat() if start_date else None,
             end=end_date.isoformat() if end_date else None,
+            benchmark_symbols=benchmarks or [],
         )
         bundle_dir = Path(str(pool_meta["bundle_dir"]))
         allocations, logs, check = run_script_in_sandbox(
@@ -273,13 +290,8 @@ class BacktestService:
             benchmarks or [],
             start=start_date.isoformat() if start_date else None,
             end=end_date.isoformat() if end_date else None,
-            expected_release=pool_meta.get("release"),
-            expected_snapshots=pool_meta.get("datasets"),
+            input_dir=pool_meta.get("input_dir"),
         )
-        for frame in benchmark_frames.values():
-            identity = frame.attrs.get("dataset_identity")
-            if identity:
-                pool_meta.setdefault("datasets", {})[identity["dataset_id"]] = identity
         strategy_comparisons, comparison_failures = self._run_strategy_comparisons(
             strategy_ids=comparison_strategy_ids or [],
             presets=comparison_presets or [],
@@ -293,14 +305,20 @@ class BacktestService:
             "strategy_id": "python_script",
             "name": "DSA Python strategy",
             "pool": pool,
-            "asset_scope": "symbols_from_frozen_local_qfq_snapshots",
+            "asset_scope": "symbols_from_frozen_experiment_input",
             "signal_at": "trading_day_close",
-            "execution": "next_common_trading_day_open",
+            "execution": "next_trading_day_open",
             "script_api_version": check.get("api_version"),
             "script_sha256": hashlib.sha256(script.encode("utf-8")).hexdigest(),
         }
         data_quality = {
             "dataset_id": pool_meta.get("dataset_id"),
+            "experiment_id": pool_meta.get("experiment_id"),
+            "input_dir": pool_meta.get("input_dir"),
+            "bars_sha256": pool_meta.get("bars_sha256"),
+            "inputs_sha256": pool_meta.get("inputs_sha256"),
+            "volume_units": pool_meta.get("volume_units"),
+            "universe_kind": pool_meta.get("universe_kind"),
             "dataset_set_version": pool_meta.get("dataset_set_version"),
             "release_set_sha256": pool_meta.get("release_set_sha256"),
             "generation": pool_meta.get("generation"),
@@ -314,7 +332,7 @@ class BacktestService:
             "etf_manifest_sha256": pool_meta.get("etf_manifest_sha256"),
             "etf_content_sha256": pool_meta.get("etf_content_sha256"),
             "etf_latest_trade_date": pool_meta.get("etf_latest_trade_date") or None,
-            "price_basis": "qfq",
+            "price_basis": pool_meta.get("price_basis", "qfq"),
             "provider": pool_meta.get("provider", "quant_data"),
             "data_kind": "daily_bars",
             "pool": pool,
@@ -346,8 +364,14 @@ class BacktestService:
                 benchmarks=benchmark_frames,
                 strategy_comparisons=strategy_comparisons,
             )
-            report["strategy"] = metadata
-            report["data_quality"] = data_quality
+        if pool_meta.get("experiment_id"):
+            report.setdefault("assumptions", {}).update(
+                execution="next_trading_day_open",
+                price_basis=pool_meta["price_basis"], execution_basis="research_price_simulation",
+                quantity_basis="simulated_units_at_selected_price",
+            )
+        report["strategy"] = metadata
+        report["data_quality"] = data_quality
         report["logs"] = logs
         report["script_check"] = check
         report["comparison_failures"] = comparison_failures
@@ -491,6 +515,12 @@ class BacktestService:
             "samples": samples,
             "data_quality": {
                 "dataset_id": pool_meta.get("dataset_id"),
+                "experiment_id": pool_meta.get("experiment_id"),
+                "input_dir": pool_meta.get("input_dir"),
+                "bars_sha256": pool_meta.get("bars_sha256"),
+            "inputs_sha256": pool_meta.get("inputs_sha256"),
+                "price_basis": pool_meta.get("price_basis"),
+                "volume_units": pool_meta.get("volume_units"),
                 "snapshot_id": pool_meta.get("snapshot_id"),
                 "manifest_sha256": pool_meta.get("manifest_sha256"),
                 "content_sha256": pool_meta.get("content_sha256"),

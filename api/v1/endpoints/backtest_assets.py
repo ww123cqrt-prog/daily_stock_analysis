@@ -15,6 +15,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
+from api.v1.endpoints.research_status import _sanitize_public_tree
+
 from src.core.script_strategy import SCRIPT_API_VERSION, validate_strategy_script
 from src.repositories.strategy_assets_repo import get_strategy_assets_repo
 from api.v1.schemas.backtest_assets import (
@@ -108,7 +110,7 @@ async def list_backtest_runs(
         strategy_id=strategy_id,
         script_sha256=script_sha256,
     )
-    return [BacktestRunSummary(**item) for item in runs]
+    return [BacktestRunSummary(**_sanitize_public_tree(item)) for item in runs]
 
 
 @router.get("/runs/{run_id}", response_model=BacktestRunDetail)
@@ -118,7 +120,7 @@ async def get_backtest_run(run_id: str) -> BacktestRunDetail:
     run = repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="回测运行记录不存在。")
-    return BacktestRunDetail(**run)
+    return BacktestRunDetail(**_sanitize_public_tree(run))
 
 
 @router.delete("/runs/{run_id}", status_code=204)

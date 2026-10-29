@@ -50,6 +50,8 @@ export const backtestApi = {
       requestData.end_date = params.endDate;
       requestData.topk = params.topk;
       requestData.cost_bps = params.costBps;
+      if (params.initialCapital !== undefined) requestData.initial_capital = params.initialCapital;
+      if (params.lotSize !== undefined) requestData.lot_size = params.lotSize;
     }
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/backtest/strategy/trained',

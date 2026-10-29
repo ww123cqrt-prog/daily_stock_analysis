@@ -1878,6 +1878,7 @@ def test_recovery_rejects_crafted_cleanup_path_without_deleting_canonical_file(
 
 def test_recovery_rejects_symlinked_backup_without_overwriting_target(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     module = load_module()
     reference_dir = tmp_path / "reference"
@@ -1890,7 +1891,7 @@ def test_recovery_rejects_symlinked_backup_without_overwriting_target(
     transaction_id = "b" * 32
     stage = target.with_name(f".{target.name}.{transaction_id}.stage")
     backup = target.with_name(f".{target.name}.{transaction_id}.backup")
-    backup.symlink_to(external)
+    make_symlink(backup, external)
     journal_path = reference_dir / module.TRANSACTION_JOURNAL_FILENAME
     journal_path.write_text(
         json.dumps(
@@ -1920,7 +1921,7 @@ def test_recovery_rejects_symlinked_backup_without_overwriting_target(
     assert journal_path.is_file()
 
 
-def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path) -> None:
+def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path, make_symlink) -> None:
     module = load_module()
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir()
@@ -1947,7 +1948,7 @@ def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     journal_path = reference_dir / module.TRANSACTION_JOURNAL_FILENAME
-    journal_path.symlink_to(external_journal)
+    make_symlink(journal_path, external_journal)
 
     with pytest.raises(module.BlockedData) as exc_info:
         module._recover_transaction(journal_path, [target])

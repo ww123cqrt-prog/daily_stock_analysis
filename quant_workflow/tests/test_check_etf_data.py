@@ -375,29 +375,6 @@ def test_closed_day_and_missing_session_have_different_classification(tmp_path):
     ).any()
 
 
-def test_unified_cli_check_is_diagnostic_and_never_calls_publish(
-    tmp_path, capsys, monkeypatch
-):
-    root = tmp_path / "data"
-    frozen_fixture(root)
-    sys.path.insert(0, str(SCRIPTS)) if str(SCRIPTS) not in sys.path else None
-    import quant_data_cli as cli
-
-    monkeypatch.setattr(
-        cli,
-        "publish_snapshot_group",
-        lambda *a, **kw: pytest.fail("check published data"),
-    )
-    before = digest_tree(root)
-    assert (
-        cli.main(
-            ["--root", str(root), "check-etf", "--output-dir", str(tmp_path / "report")]
-        )
-        == 0
-    )
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["symbol_count"] == 1
-    assert digest_tree(root) == before
 
 
 def test_whole_snapshot_digest_includes_index_bytes(tmp_path):
@@ -458,7 +435,7 @@ def test_saved_external_sample_compares_exact_dates_and_all_ohlc():
     assert issues[0]["severity"] == "needs_review"
 
 
-def test_symlink_object_does_not_escape_snapshot(tmp_path):
+def test_symlink_object_does_not_escape_snapshot(tmp_path, make_symlink):
     mod = checker()
     root = tmp_path / "data"
     snapshot = frozen_fixture(root)
@@ -466,7 +443,7 @@ def test_symlink_object_does_not_escape_snapshot(tmp_path):
     outside = tmp_path / "outside.parquet"
     outside.write_bytes(target.read_bytes())
     target.unlink()
-    target.symlink_to(outside)
+    make_symlink(target, outside)
     mod.audit_etf_snapshot(root, output_dir=tmp_path / "report")
     issues = pd.read_csv(tmp_path / "report/findings.csv")
     assert (issues.rule == "file_identity").any()

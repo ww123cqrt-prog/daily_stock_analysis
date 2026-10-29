@@ -655,6 +655,7 @@ class CandidatePipelineTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "completed")
         self.assertTrue(report["dry_run"])
+        self.assertIsNone(report["provider_identity"])
         self.assertEqual(len(report["models"]), 5)
         self.assertEqual(len(report["selected_models"]), 2)
         self.assertEqual(len(report["strategy_evaluations"]), 10)
@@ -691,10 +692,6 @@ class CandidatePipelineTest(unittest.TestCase):
         self.assertRegex(
             report["backtest_contract"]["config_hash"],
             r"^[0-9a-f]{64}$",
-        )
-        self.assertEqual(
-            report["provider_identity"]["provider_contract"],
-            "path_only_override",
         )
         self.assertFalse(report["experiment_notebook_appended"])
         self.assertIn("candidate", report["experiment_notebook_policy"])

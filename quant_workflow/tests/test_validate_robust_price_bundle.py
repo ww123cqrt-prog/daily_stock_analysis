@@ -189,13 +189,13 @@ def test_verify_rejects_duplicate_manifest_symbols(tmp_path: Path) -> None:
     assert exc_info.value.reason_code == "manifest_invalid"
 
 
-def test_build_rejects_symlinked_parquet(tmp_path: Path) -> None:
+def test_build_rejects_symlinked_parquet(tmp_path: Path, make_symlink) -> None:
     module = load_module()
     price_dir, symbols_file = build_valid_fixture(tmp_path)
     target = price_dir / "600000.parquet"
     outside = tmp_path / "outside.parquet"
     target.replace(outside)
-    target.symlink_to(outside)
+    make_symlink(target, outside)
 
     with pytest.raises(module.PriceBundleError) as exc_info:
         module.build_bundle_manifest(

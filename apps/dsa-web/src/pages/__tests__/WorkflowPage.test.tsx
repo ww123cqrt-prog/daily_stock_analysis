@@ -92,75 +92,20 @@ vi.mock('../../api/research', () => ({
 
 function readyResearchStatus() {
   return {
-      generatedAt: '2026-07-03T21:00:00+08:00',
+      generatedAt: '2026-10-28T10:00:00+08:00',
       trainable: true,
-      trainingReadiness: { status: 'trainable', summary: 'Qlib provider 已可训练。' },
-      trainingPreflight: {
-        status: 'passed',
-        provider: 'canonical',
-        requiredDatasets: ['ashare_daily_qfq', 'cn_index_daily', 'pit_csi800'],
-        availableDatasets: [
-          'ashare_daily_qfq',
-          'cn_index_daily',
-          'pit_csi800',
-          'qlib_cleaning_plan',
-        ],
-        summary: 'quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。',
-      },
+      trainingReadiness: { status: 'trainable', summary: '冻结实验输入可离线读取。' },
+      trainingPreflight: { status: 'passed', provider: 'qmt_native', summary: '冻结实验输入可离线读取。' },
       trainingPreflights: {
-        canonical: {
-          status: 'passed',
-          provider: 'canonical',
-          requiredDatasets: ['ashare_daily_qfq', 'cn_index_daily', 'pit_csi800'],
-          availableDatasets: [
-            'ashare_daily_qfq',
-            'cn_index_daily',
-            'pit_csi800',
-            'qlib_cleaning_plan',
-          ],
-          summary: 'quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。',
-        },
-        cleaned: {
-          status: 'passed',
-          provider: 'cleaned',
-          requiredDatasets: [
-            'ashare_daily_qfq',
-            'cn_index_daily',
-            'pit_csi800',
-            'qlib_cleaning_plan',
-          ],
-          availableDatasets: [
-            'ashare_daily_qfq',
-            'cn_index_daily',
-            'pit_csi800',
-            'qlib_cleaning_plan',
-          ],
-          summary: 'quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。',
-        },
+        qmt_native: { status: 'passed', provider: 'qmt_native', summary: '冻结实验输入可离线读取。' },
       },
       dataSources: [],
-      qlibProvider: {
-        path: '/Users/cq/WorkingProjects/quant_data/qlib/cn_data_baostock_jqdata',
-        calendarDays: 1500,
-        calendarRange: '2020-01-02 ~ 2026-07-03',
-        instruments: 5300,
-      },
+      qlibProvider: { calendarDays: 438, calendarRange: '2025-01-02 ~ 2026-10-27', instruments: 4 },
       providerQuality: {},
       currentProviderIdentities: {
-        canonical: {
-          provider: 'canonical',
-          datasetId: 'ashare_daily_qfq',
-          snapshotId: 'snapshot-20260802',
-          calendarEnd: '2026-07-24',
-          status: 'ready',
-        },
-        cleaned: {
-          provider: 'cleaned',
-          datasetId: 'ashare_daily_qfq',
-          snapshotId: 'cleaned-snapshot-20260802',
-          calendarEnd: '2026-07-24',
-          status: 'ready',
-        },
+        qmt_native: { provider: 'qmt_native', backend: 'qmt_native', status: 'ready',
+          experimentId: 'qmt-experiment-one', barsSha256: 'a'.repeat(64),
+          priceBasis: 'front', calendarEnd: '2026-10-27' },
       },
       robustSignal: {
         status: 'missing',
@@ -216,6 +161,28 @@ function renderWorkflowPage(
 }
 
 describe('WorkflowPage', () => {
+  it('trains from an approved frozen QMT input without a snapshotId and retires write tasks', async () => {
+    const status = readyResearchStatus();
+    const native = {
+      provider: 'qmt_native', backend: 'qmt_native', status: 'ready',
+      experimentId: 'qmt-experiment-one', barsSha256: 'a'.repeat(64),
+      priceBasis: 'front', calendarEnd: '2026-10-27',
+    };
+    getResearchStatus.mockResolvedValue({ ...status,
+      currentProviderIdentities: { qmt_native: native },
+      trainingPreflights: { qmt_native: { status: 'passed', provider: 'qmt_native',
+        providerIdentity: native, summary: '冻结实验输入可离线读取。' } },
+    });
+    renderWorkflowPage();
+    const run = await screen.findByTestId('workflow-run-train_baseline_lgb');
+    await waitFor(() => expect(run).toBeEnabled());
+    expect(screen.getAllByText(/qmt-experiment-one/).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('workflow-job-update_ashare_miniqmt')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-apply_data_cleaning')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('workflow-job-repair_qlib_provider')).not.toBeInTheDocument();
+    fireEvent.click(run);
+    await waitFor(() => expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', expect.objectContaining({provider: 'qmt_native'})));
+  });
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -253,7 +220,6 @@ describe('WorkflowPage', () => {
         repair_qlib_provider: { label: '预演旧兼容 Qlib 修复', allowedParams: [] },
         check_qlib_data: { label: '检查 Qlib 数据', allowedParams: [] },
         report_data_anomalies: { label: '生成异常股票和清洗策略', allowedParams: [] },
-        report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
         report_workbench_capabilities: { label: '生成工作台能力盘点', allowedParams: [] },
         report_market_regime: { label: '生成市场状态和现金仓位信号', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
         report_cash_control_backtest: { label: '生成现金仓位叠加回测', allowedParams: ['lookback_days', 'min_symbols', 'limit'] },
@@ -416,7 +382,7 @@ describe('WorkflowPage', () => {
       jobType: 'train_baseline_lgb_equivalence',
       label: '运行真实 LightGBM 网页等价验收',
       status: 'completed',
-      params: { provider: 'canonical' },
+      params: { provider: 'qmt_native' },
       createdAt: '2026-08-02T09:00:00+08:00',
       updatedAt: '2026-08-02T09:05:00+08:00',
       artifactPaths: [],
@@ -486,7 +452,7 @@ describe('WorkflowPage', () => {
       jobType: 'train_baseline_lgb',
       label: '训练 Qlib LightGBM 选股模型基线',
       status: 'running',
-      params: { provider: 'canonical' },
+      params: { provider: 'qmt_native' },
       command: [],
       cwd: '/Users/cq/WorkingProjects',
       createdAt: '2026-08-02T17:45:00+08:00',
@@ -607,7 +573,7 @@ describe('WorkflowPage', () => {
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith(
         'train_baseline_lgb_equivalence',
-        { provider: 'canonical' },
+        { provider: 'qmt_native' },
       );
     });
   });
@@ -665,7 +631,7 @@ describe('WorkflowPage', () => {
       jobType: 'run_candidate_pipeline',
       label: '运行五个选股模型候选流程',
       status: 'running',
-      params: { provider: 'canonical' },
+      params: { provider: 'qmt_native' },
       pid: 43210,
       runnerAlive: true,
       progress: {
@@ -1221,54 +1187,6 @@ describe('WorkflowPage', () => {
     expect(screen.getAllByText(/缺少真实 Run ID/).length).toBeGreaterThan(0);
   });
 
-  it('gates each training card with the selected provider snapshot', async () => {
-    const status = readyResearchStatus();
-    getResearchStatus.mockResolvedValue({
-      ...status,
-      trainingPreflights: {
-        ...status.trainingPreflights,
-        cleaned: {
-          ...status.trainingPreflights.cleaned,
-          status: 'blocked',
-          summary: 'cleaned provider 缺少完整 benchmark',
-        },
-      },
-      currentProviderIdentities: {
-        ...status.currentProviderIdentities,
-        cleaned: {
-          ...status.currentProviderIdentities.cleaned,
-          snapshotId: 'cleaned-snapshot-blocked',
-        },
-      },
-      providerQuality: {
-        ...status.providerQuality,
-        cleaned: {
-          snapshotId: 'cleaned-snapshot-blocked',
-          trainable: false,
-          structuralStatus: 'blocked',
-          trainingReadiness: { status: 'blocked', summary: 'cleaned provider 缺少完整 benchmark' },
-        },
-      },
-    });
-    renderWorkflowPage('training');
-
-    const baselineCard = await screen.findByTestId('workflow-job-train_baseline_lgb');
-    expect(
-      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
-    ).toHaveValue('canonical');
-    expect(within(baselineCard).getByText(/snapshot-20260802/)).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
-
-    fireEvent.change(
-      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
-      { target: { value: 'cleaned' } },
-    );
-
-    expect(within(baselineCard).getByText(/cleaned-snapshot-blocked/)).toBeInTheDocument();
-    expect(within(baselineCard).getByText(/cleaned provider 缺少完整 benchmark/)).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
-  });
-
   it('keeps remaining quant tasks on the legacy other route', async () => {
     localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
     render(
@@ -1287,85 +1205,25 @@ describe('WorkflowPage', () => {
     expect(screen.queryByTestId('workflow-job-train_baseline_lgb')).not.toBeInTheDocument();
   });
 
-  it('renders a Chinese web-first quant workflow console', async () => {
+  it('renders a Chinese workflow console with frozen input and preserved research tools', async () => {
     renderWorkflowPage();
-
     expect(screen.getByRole('heading', { name: '量化任务中心' })).toBeInTheDocument();
     expect(await screen.findByText('实时检查通过')).toBeInTheDocument();
     expect(screen.getByText('外部服务状态')).toBeInTheDocument();
-    expect(screen.getByText('本地研究工作台')).toBeInTheDocument();
-    expect(screen.getByText('MLflow 原始记录')).toBeInTheDocument();
-    expect(screen.getByText('CatDesk')).toBeInTheDocument();
-    expect(screen.getByText('美股催化观察台')).toBeInTheDocument();
-    expect(screen.getAllByText('可用').length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: '打开 MLflow，新窗口' })).toHaveAttribute('href', '/experiments/');
     expect(screen.getByRole('link', { name: '打开 CatDesk，新窗口' })).toHaveAttribute('href', 'http://127.0.0.1:8765/');
-    expect(screen.getByRole('link', { name: 'MLflow' })).toHaveAttribute('href', '/experiments/');
-    expect(screen.queryByText('/Users/cq/WorkingProjects')).not.toBeInTheDocument();
-    expect(screen.queryByText('/tmp/job.log')).not.toBeInTheDocument();
-    expect(screen.getByText('2020-01-02 ~ 2026-07-03')).toBeInTheDocument();
-    expect(screen.getAllByText('更新数据')).toHaveLength(2);
-    expect(screen.getByText('下载东方财富日线')).toBeInTheDocument();
-    expect(screen.getByText('匿名抓取东财 qfq 日线，写入 eastmoney_qfq 作为 Baostock/JQData 的冗余源。')).toBeInTheDocument();
-    expect(screen.getByText('下载 AkShare 日线')).toBeInTheDocument();
-    expect(screen.getByText('调用 AkShare stock_zh_a_hist(qfq)，写入 akshare_qfq 作为第二条免费冗余源。')).toBeInTheDocument();
-    expect(screen.getAllByText('Qlib Provider').length).toBeGreaterThan(0);
-    expect(screen.getByText('校验新浪最新快照')).toBeInTheDocument();
-    expect(screen.getByText('抽样读取新浪行情快照，对比合并后的最新收盘价；只生成校验报告，不参与训练。')).toBeInTheDocument();
-    expect(screen.getByText('预演旧兼容 CSI300 股票池')).toBeInTheDocument();
-    expect(screen.getByText('预演旧兼容 benchmark')).toBeInTheDocument();
-    expect(screen.queryByLabelText('修复 Qlib Provider 只检查不写入')).not.toBeInTheDocument();
-    expect(screen.getByText('生成正式 cleaned Qlib Provider')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /生成数据质量报告/ })).not.toBeInTheDocument();
-    expect(screen.getByText('选股模型训练与交易策略验证')).toBeInTheDocument();
-    expect(screen.getByText('运行五个选股模型候选流程')).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-job-run_candidate_pipeline')).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-run_candidate_pipeline')).toHaveAccessibleName('运行 运行五个选股模型候选流程');
-    expect(screen.getByLabelText('运行五个选股模型候选流程 数据版本')).toBeInTheDocument();
-    expect(screen.getAllByRole('option', { name: 'Qlib Provider（canonical）' })).toHaveLength(3);
-    expect(screen.getAllByRole('option', { name: 'Qlib Provider（cleaned）' })).toHaveLength(3);
-    expect(screen.getByLabelText('运行五个选股模型候选流程 只做小样本预演')).toBeInTheDocument();
-    expect(screen.getByText('生成市场状态和现金仓位信号')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成市场状态和现金仓位信号 回看交易日')).toBeInTheDocument();
-    expect(screen.getByText('生成现金仓位叠加回测')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成现金仓位叠加回测 回看交易日')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 预测摘要')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 预测摘要 TopK')).toBeInTheDocument();
-    expect(screen.getByText('Qlib研究增强')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 选股模型解释报告')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 选股模型解释报告 TopK')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 回测明细报告')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 多选股模型/多实验对比')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 多选股模型/多实验对比 对比 Run 数')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 因子分析报告')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 滚动训练计划')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 Qlib 滚动训练计划 窗口数')).toBeInTheDocument();
-    expect(screen.getByText('生成 Qlib 组合风险诊断')).toBeInTheDocument();
-    expect(screen.getByText('生成 china-astock 策略对比')).toBeInTheDocument();
-    expect(screen.getByText('读取 china-astock-quant 既有搜索和赢家评估结果，生成策略对比 CSV/Markdown 报告；只读报告，不连接券商或交易接口。')).toBeInTheDocument();
-    expect(screen.getByText('生成 china-astock 技术指标报告')).toBeInTheDocument();
-    expect(screen.getByText('复用 china-astock-quant 的 SMA/EMA/RSI/ATR/Bollinger 指标函数，读取 Qlib Provider 前复权行情生成只读技术面观察报告，不连接券商、不自动下单。')).toBeInTheDocument();
-    expect(screen.getByLabelText('生成 china-astock 技术指标报告 股票代码')).toBeInTheDocument();
-    expect(screen.getByText('生成数据治理盘点和清理预案')).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-job-report_data_hygiene')).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-report_data_hygiene')).toHaveAccessibleName('运行 生成数据治理盘点和清理预案');
-    expect(screen.getByText('只读盘点当前数据、日志、旧 provider 和临时脚本，生成 inventory 与 dry-run 清理计划；不移动、不删除、不改配置。')).toBeInTheDocument();
-    expect(screen.getByText('生成工作台能力盘点')).toBeInTheDocument();
-    expect(screen.getByText('只读扫描 DSA 页面/API、quant_workflow 脚本、Qlib 接入和 china-astock-quant 可复用能力，输出功能入口和缺口清单。')).toBeInTheDocument();
-    expect(screen.getByText('今日流程')).toBeInTheDocument();
-    expect(screen.getByText('按顺序完成检查、报告、预演、训练和记录。')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '今日流程 异常清单 异常清单' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '今日流程 清洗预演 预演' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '实验记录' })).toHaveAttribute('href', '/research');
-    expect(document.body).not.toHaveTextContent('原生 V2');
+    expect(screen.getByText('2025-01-02 ~ 2026-10-27')).toBeInTheDocument();
+    expect(screen.getByText('实验输入检查')).toBeInTheDocument();
+    for (const job of ['update_ashare_miniqmt', 'merge_to_qlib', 'repair_qlib_provider', 'apply_data_cleaning', 'report_data_hygiene']) {
+      expect(screen.queryByTestId('workflow-job-' + job)).not.toBeInTheDocument();
+    }
+    for (const job of ['run_candidate_pipeline', 'report_market_regime', 'report_cash_control_backtest', 'report_qlib_predictions', 'report_qlib_model_comparison', 'report_china_astock_indicators', 'report_workbench_capabilities']) {
+      expect(screen.getByTestId('workflow-job-' + job)).toBeInTheDocument();
+    }
+    expect(screen.getByRole('button', { name: '今日流程 检查数据 检查输入' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /清洗预演/ })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: '回测页' })).toHaveAttribute('href', '/backtest');
-    expect(screen.getByText('检查 Qlib 数据')).toBeInTheDocument();
-    expect(screen.getAllByText('训练 Qlib LightGBM 选股模型基线')).toHaveLength(2);
-    expect(screen.getByText('latest_training_result.json')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'latest_training_result.json' })).toHaveAttribute(
-      'href',
-      '/api/v1/quant/jobs/qj_train/artifacts/0',
-    );
+    expect(screen.getByRole('link', { name: 'latest_training_result.json' })).toHaveAttribute('href', '/api/v1/quant/jobs/qj_train/artifacts/0');
   });
 
   it('shows a clear unavailable MLflow state from the quant status API', async () => {
@@ -1579,118 +1437,10 @@ describe('WorkflowPage', () => {
     renderWorkflowPage('training');
 
     const baselineCard = await screen.findByTestId('workflow-job-train_baseline_lgb');
-    expect(within(baselineCard).getByText(/实时检查：通过/)).toBeInTheDocument();
-    expect(within(baselineCard).getByText(/Provider 日历截止 2026-07-24/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/冻结输入: 离线可用/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/2026-10-27/)).toBeInTheDocument();
     expect(within(baselineCard).queryByText(/已落后 9 天/)).not.toBeInTheDocument();
     expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
-  });
-
-  it('uses lightweight training preflight instead of previous quality evidence', async () => {
-    const status = readyResearchStatus();
-    getResearchStatus.mockResolvedValue({
-      ...status,
-      trainable: true,
-      trainingReadiness: {
-        status: 'trainable',
-        summary: 'quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。',
-      },
-      trainingPreflight: {
-        status: 'passed',
-        requiredDatasets: ['ashare_daily_qfq', 'cn_index_daily', 'pit_csi800'],
-        availableDatasets: [
-          'ashare_daily_qfq',
-          'cn_index_daily',
-          'pit_csi800',
-          'qlib_cleaning_plan',
-        ],
-        summary: 'quant_data 已发布所需数据集，当前 Qlib Provider 轻量预检通过。',
-      },
-      currentProviderIdentities: {
-        ...status.currentProviderIdentities,
-        canonical: {
-          provider: 'canonical',
-          datasetId: 'ashare_daily_qfq',
-          snapshotId: 'ashare-baostock-qfq-20260805-new',
-          calendarEnd: '2026-08-04',
-          status: 'ready',
-        },
-        cleaned: {
-          provider: 'cleaned',
-          datasetId: 'ashare_daily_qfq',
-          snapshotId: 'ashare-baostock-qfq-20260805-new',
-          calendarEnd: '2026-08-04',
-          status: 'ready',
-        },
-      },
-    });
-
-    renderWorkflowPage('training');
-
-    expect(await screen.findByText('实时检查通过')).toBeInTheDocument();
-    expect(screen.getByText(/quant_data 已发布所需数据集/)).toBeInTheDocument();
-    expect(screen.queryByText('新快照待验收')).not.toBeInTheDocument();
-    expect(screen.queryByText(/数据验收/)).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '运行正式全量数据验收' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/重新验收数据/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/上次已验收快照/)).not.toBeInTheDocument();
-    const baselineCard = screen.getByTestId('workflow-job-train_baseline_lgb');
-    expect(within(baselineCard).getByText(/快照 ashare-baostock-qfq-20260805-new/)).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
-    fireEvent.change(
-      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
-      { target: { value: 'cleaned' } },
-    );
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
-  });
-
-  it('reports mixed Provider preflight without consulting historical quality evidence', async () => {
-    const status = readyResearchStatus();
-    getResearchStatus.mockResolvedValue({
-      ...status,
-      trainable: true,
-      trainingPreflights: {
-        canonical: status.trainingPreflights.canonical,
-        cleaned: {
-          ...status.trainingPreflights.cleaned,
-          status: 'blocked',
-          summary: '当前 cleaned Qlib Provider 缺少完整的不可变数据血缘，正式训练已阻止。',
-        },
-      },
-      currentProviderIdentities: {
-        canonical: {
-          provider: 'canonical',
-          datasetId: 'qlib_ashare_v2',
-          snapshotId: 'snapshot-20260802',
-          calendarEnd: '2026-07-24',
-          status: 'ready',
-        },
-        cleaned: {
-          provider: 'cleaned',
-          datasetId: 'qlib_ashare_cleaned_v2',
-          snapshotId: 'cleaned-snapshot-20260805-new',
-          calendarEnd: '2026-08-04',
-          status: 'ready',
-        },
-      },
-    });
-
-    renderWorkflowPage('training');
-
-    expect(await screen.findByText('部分 Provider 实时检查通过')).toBeInTheDocument();
-    expect(screen.getByText('实时检查：部分通过，部分阻塞')).toBeInTheDocument();
-    expect(screen.getByText(/canonical 实时检查通过；cleaned 当前不能用于正式训练/)).toBeInTheDocument();
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeEnabled();
-
-    const baselineCard = screen.getByTestId('workflow-job-train_baseline_lgb');
-    fireEvent.change(
-      within(baselineCard).getByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'),
-      { target: { value: 'cleaned' } },
-    );
-
-    const selectedProviderStatus = within(baselineCard).getByText(/当前数据：cleaned/);
-    expect(selectedProviderStatus).toHaveTextContent('实时检查未通过');
-    expect(selectedProviderStatus).toHaveTextContent('缺少完整的不可变数据血缘');
-    expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
   });
 
   it('does not present the previous accepted snapshot as current when the Qlib Provider is unavailable', async () => {
@@ -1703,16 +1453,16 @@ describe('WorkflowPage', () => {
         summary: 'The current Qlib Provider is unavailable.',
       },
       trainingPreflights: {
-        canonical: {
+        qmt_native: {
           status: 'blocked',
-          provider: 'canonical',
+          provider: 'qmt_native',
           summary: 'The current Qlib Provider is unavailable.',
         },
-        cleaned: status.trainingPreflights.cleaned,
+
       },
       currentProviderIdentities: {
-        canonical: {
-          provider: 'canonical',
+        qmt_native: {
+          provider: 'qmt_native',
           datasetId: 'qlib_ashare_v2',
           status: 'blocked',
           error: 'Current provider is unavailable.',
@@ -1725,8 +1475,8 @@ describe('WorkflowPage', () => {
     expect(await screen.findByText('数据暂不可训练')).toBeInTheDocument();
     expect(screen.getByText('实时检查：阻塞')).toBeInTheDocument();
     const baselineCard = screen.getByTestId('workflow-job-train_baseline_lgb');
-    expect(within(baselineCard).getByText(/快照 -/)).toBeInTheDocument();
-    expect(within(baselineCard).getByText(/实时检查未通过/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/实验输入 -/)).toBeInTheDocument();
+    expect(within(baselineCard).getByText(/冻结输入: 未就绪/)).toBeInTheDocument();
     expect(baselineCard).not.toHaveTextContent('上次已验收快照');
     expect(baselineCard).not.toHaveTextContent('快照 snapshot-20260802');
     expect(screen.getByTestId('workflow-run-train_baseline_lgb')).toBeDisabled();
@@ -1769,13 +1519,13 @@ describe('WorkflowPage', () => {
 
     renderWorkflowPage();
 
-    const hygieneButton = await screen.findByRole('button', { name: '运行 生成数据治理盘点和清理预案' });
+    const hygieneButton = await screen.findByRole('button', { name: '运行 生成工作台能力盘点' });
     expect(hygieneButton).toBeDisabled();
     expect(screen.getAllByText('后端未启用').length).toBeGreaterThan(0);
 
     fireEvent.click(hygieneButton);
 
-    expect(submitQuantJob).not.toHaveBeenCalledWith('report_data_hygiene', expect.anything());
+    expect(submitQuantJob).not.toHaveBeenCalledWith('report_workbench_capabilities', expect.anything());
   });
 
   it('waits for the backend whitelist before reporting a job as disabled', async () => {
@@ -1789,8 +1539,8 @@ describe('WorkflowPage', () => {
 
     renderWorkflowPage();
 
-    const hygieneButton = await screen.findByRole('button', { name: '运行 生成数据治理盘点和清理预案' });
-    const hygieneHeading = screen.getByText('生成数据治理盘点和清理预案');
+    const hygieneButton = await screen.findByRole('button', { name: '运行 生成工作台能力盘点' });
+    const hygieneHeading = screen.getByText('生成工作台能力盘点');
     const hygieneHeadingCluster = hygieneHeading.closest('div');
     expect(hygieneButton).toBeDisabled();
     expect(screen.queryByText('后端未启用')).not.toBeInTheDocument();
@@ -1798,7 +1548,7 @@ describe('WorkflowPage', () => {
     await act(async () => {
       resolveStatus({
         availableJobTypes: {
-          report_data_hygiene: { label: '生成数据治理盘点和清理预案', allowedParams: [] },
+          report_workbench_capabilities: { label: '生成工作台能力盘点', allowedParams: [] },
         },
         apiContract: {
           version: 'quant-workbench-v2',
@@ -1825,7 +1575,7 @@ describe('WorkflowPage', () => {
 
     renderWorkflowPage();
 
-    const guideButton = await screen.findByRole('button', { name: '今日流程 清洗预演 预演' });
+    const guideButton = await screen.findByRole('button', { name: '今日流程 检查数据 检查输入' });
     expect(guideButton).toBeDisabled();
 
     fireEvent.click(guideButton);
@@ -1835,7 +1585,7 @@ describe('WorkflowPage', () => {
     await act(async () => {
       resolveStatus({
         availableJobTypes: {
-          apply_data_cleaning: { label: '生成正式 cleaned Qlib Provider', allowedParams: ['dry_run'] },
+          run_daily_update: { label: '检查冻结实验输入', allowedParams: [] },
         },
         apiContract: {
           version: 'quant-workbench-v2',
@@ -1872,7 +1622,7 @@ describe('WorkflowPage', () => {
 
     renderWorkflowPage();
 
-    const guideButton = await screen.findByRole('button', { name: '今日流程 清洗预演 预演' });
+    const guideButton = await screen.findByRole('button', { name: '今日流程 检查数据 检查输入' });
     await waitFor(() => {
       expect(guideButton).toBeDisabled();
     });
@@ -1880,18 +1630,6 @@ describe('WorkflowPage', () => {
 
     fireEvent.click(guideButton);
     expect(submitQuantJob).not.toHaveBeenCalledWith('apply_data_cleaning', expect.anything());
-  });
-
-  it('submits provider maintenance preview jobs without user params', async () => {
-    renderWorkflowPage();
-
-    fireEvent.click(await screen.findByRole('button', { name: '运行 预演旧兼容 CSI300 股票池' }));
-    fireEvent.click(await screen.findByRole('button', { name: '运行 预演旧兼容 benchmark' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('generate_csi300', {});
-      expect(submitQuantJob).toHaveBeenCalledWith('add_index_benchmark', {});
-    });
   });
 
   it('submits the read-only workbench capability inventory job without parameters', async () => {
@@ -2004,50 +1742,12 @@ describe('WorkflowPage', () => {
     });
   });
 
-  it('submits conservative defaults for an A-share network source job', async () => {
+  it('submits the selected frozen QMT input provider for training', async () => {
     renderWorkflowPage();
-
-    fireEvent.click(await screen.findByRole('button', { name: '运行 下载东方财富日线' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('download_eastmoney', {
-        incremental: true,
-        sleep: '2',
-        retries: '1',
-        max_consecutive_failures: '3',
-        max_requests: '6000',
-        overlap_days: '7',
-      });
-    });
-  });
-
-  it('submits the selected Qlib provider for training jobs', async () => {
-    const status = readyResearchStatus();
-    getResearchStatus.mockResolvedValueOnce({
-      ...status,
-      providerQuality: {
-        ...status.providerQuality,
-        cleaned: {
-          provider: 'cleaned',
-          datasetId: 'qlib_ashare_cleaned_v2',
-          snapshotId: 'cleaned-snapshot-ready',
-          trainable: true,
-          trainingReadiness: { status: 'trainable', summary: 'cleaned ready' },
-        },
-      },
-    });
-    renderWorkflowPage();
-
-    fireEvent.change(await screen.findByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本'), {
-      target: { value: 'cleaned' },
-    });
+    const choice = await screen.findByLabelText('训练 Qlib LightGBM 选股模型基线 数据版本');
+    expect(choice).toHaveValue('qmt_native');
     fireEvent.click(screen.getByRole('button', { name: '运行 训练 Qlib LightGBM 选股模型基线' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {
-        provider: 'cleaned',
-      });
-    });
+    await waitFor(() => expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', { provider: 'qmt_native' }));
   });
 
   it('renders and submits only parameters advertised by the backend whitelist', async () => {
@@ -2080,19 +1780,6 @@ describe('WorkflowPage', () => {
 
     await waitFor(() => {
       expect(submitQuantJob).toHaveBeenCalledWith('train_baseline_lgb', {});
-    });
-  });
-
-  it('submits the isolated smoke fixture flag for Qlib merge jobs', async () => {
-    renderWorkflowPage();
-
-    fireEvent.click(await screen.findByLabelText('生成正式 Qlib Provider 使用隔离小样本演练'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 生成正式 Qlib Provider' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('merge_to_qlib', {
-        smoke: true,
-      });
     });
   });
 
@@ -2181,31 +1868,6 @@ describe('WorkflowPage', () => {
       expect(submitQuantJob).toHaveBeenCalledWith('report_qlib_predictions', {
         topk: '15',
         run_id: 'safe_run_20260705',
-      });
-    });
-  });
-
-  it('submits the cleaned Qlib provider task from the workflow page', async () => {
-    renderWorkflowPage();
-
-    fireEvent.click(await screen.findByLabelText('生成正式 cleaned Qlib Provider 只预演不写入'));
-    fireEvent.click(screen.getByRole('button', { name: '运行 生成正式 cleaned Qlib Provider' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('apply_data_cleaning', {
-        dry_run: true,
-      });
-    });
-  });
-
-  it('runs the daily guide cleaning preflight with safe dry-run parameters', async () => {
-    renderWorkflowPage();
-
-    fireEvent.click(await screen.findByRole('button', { name: '今日流程 清洗预演 预演' }));
-
-    await waitFor(() => {
-      expect(submitQuantJob).toHaveBeenCalledWith('apply_data_cleaning', {
-        dry_run: true,
       });
     });
   });

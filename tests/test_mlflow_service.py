@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from src.services import mlflow_service
@@ -93,6 +92,7 @@ def test_start_local_mlflow_service_does_not_launch_duplicate(monkeypatch, tmp_p
 def test_start_local_mlflow_service_preserves_virtualenv_python_symlink(
     monkeypatch,
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     observed: dict[str, object] = {}
     interpreter = tmp_path / "runtime" / "python3.11"
@@ -100,7 +100,7 @@ def test_start_local_mlflow_service_preserves_virtualenv_python_symlink(
     interpreter.touch()
     virtualenv_python = tmp_path / ".venv" / "bin" / "python"
     virtualenv_python.parent.mkdir(parents=True)
-    os.symlink(interpreter, virtualenv_python)
+    make_symlink(virtualenv_python, interpreter)
 
     monkeypatch.setattr(mlflow_service, "_port_is_open", lambda: False)
 

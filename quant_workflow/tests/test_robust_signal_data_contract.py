@@ -8,13 +8,13 @@ from unittest.mock import MagicMock, call
 import pandas as pd
 import pytest
 
-from prepare_robust_provider import prepare_runtime_provider
-from quant_data_service_client import (
+from quant_workflow.scripts.prepare_robust_provider import prepare_runtime_provider
+from quant_workflow.scripts.quant_data_service_client import (
     QuantDataDatasetResult,
     QuantDataIdentity,
     QuantDataSnapshotChanged,
 )
-from robust_signal_data_contract import (
+from quant_workflow.scripts.robust_signal_data_contract import (
     ACCEPTANCE_CONTRACT,
     ACCEPTANCE_OWNER,
     CONTRACT_VERSION,
@@ -673,6 +673,7 @@ def test_latest_consumer_rejects_direct_manually_relabelled_readiness(
 
 def test_publisher_does_not_advance_latest_when_artifact_path_is_a_symlink(
     tmp_path: Path,
+    make_symlink,
 ) -> None:
     payload = {
         "contract_version": CONTRACT_VERSION,
@@ -694,7 +695,7 @@ def test_publisher_does_not_advance_latest_when_artifact_path_is_a_symlink(
     artifact_path.parent.mkdir()
     attacker_file = tmp_path / "attacker.json"
     attacker_file.write_text("{}\n", encoding="utf-8")
-    artifact_path.symlink_to(attacker_file)
+    make_symlink(artifact_path, attacker_file)
 
     with pytest.raises(RuntimeError, match="content-addressed readiness artifact"):
         publish_robust_signal_data_readiness(

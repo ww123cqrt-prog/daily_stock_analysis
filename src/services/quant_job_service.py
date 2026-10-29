@@ -65,10 +65,11 @@ QUANT_WORKFLOW_PYTHON = _env_path("QUANT_WORKFLOW_PYTHON", DSA_VENV_PYTHON)
 _LEGACY_QLIB_PYTHON_WARNING_EMITTED = False
 _MISSING_QUANT_WORKFLOW_PYTHON_WARNING_EMITTED = False
 CHILD_ENV_EXACT_NAMES = {
-    "MINIQMT_ENABLED",
-    "MINIQMT_TARGET",
-    "MINIQMT_CONFIG_DIR",
-    "MINIQMT_TIMEOUT",
+    "QMT_DATASET_DIR",
+    "QMT_PYTHON",
+    "QMT_PORT",
+    "QMT_DATA_DIR",
+    "QMT_TIMEOUT",
     "BAOSTOCK_LOGIN_TIMEOUT",
     "CHINA_ASTOCK_COMPARISON_TIMEOUT_SECONDS",
     "CHINA_ASTOCK_PYTHON",
@@ -137,18 +138,11 @@ ASHARE_SOURCE_MAX_CONSECUTIVE_FAILURES = 3
 ASHARE_SOURCE_MAX_REQUESTS = 6000
 ASHARE_SOURCE_MAX_OVERLAP_DAYS = 7
 ASHARE_SOURCE_JOB_TYPES = {
-    "download_baostock",
-    "download_eastmoney",
-    "download_akshare",
     "download_ashare_news",
-    "run_daily_update",
 }
 QUANT_DATA_NETWORK_JOB_TYPES = ASHARE_SOURCE_JOB_TYPES | {
-    "update_ashare_miniqmt",
-    "download_etf_momentum",
     "download_global_daily",
     "download_jqdata",
-    "validate_latest_snapshot",
 }
 DATA_QUALITY_WEB_MAX_SAMPLE = 100000
 DSA_BACKTEST_WEB_MAX_EVAL_WINDOW_DAYS = 3650
@@ -528,12 +522,6 @@ def _validate_ashare_source_safety(job_type: str, params: Mapping[str, Any]) -> 
             f"Param overlap_days must be <= {ASHARE_SOURCE_MAX_OVERLAP_DAYS} for A-share source jobs."
         )
 
-    if job_type == "run_daily_update":
-        source = str(params.get("ashare_source") or "miniqmt")
-        allowed_sources = {"miniqmt", "none", "baostock", "eastmoney", "akshare"}
-        if source not in allowed_sources:
-            raise ValueError(f"Param ashare_source must be one of: {', '.join(sorted(allowed_sources))}.")
-
 
 def _int_param(value: Any, key: str) -> int:
     if isinstance(value, bool):
@@ -769,18 +757,19 @@ def _safe_config_path(value: Any) -> str:
 
 
 def _safe_provider(value: Any) -> str:
-    raw = str(value or "canonical").strip().lower()
-    allowed = {"canonical", "cleaned"}
+    raw = str(value or "qmt_native").strip().lower()
+    allowed = {"qmt_native", "canonical", "cleaned"}
     if raw not in allowed:
-        raise ValueError("Provider must be one of: canonical, cleaned.")
+        raise ValueError("Provider must be one of: qmt_native, canonical, cleaned.")
     return raw
 
 
 def _approved_provider_identity_json(identity: Mapping[str, Any]) -> str:
     try:
-        return _json_dumps(normalize_provider_lineage(identity))
+        public_identity = normalize_provider_lineage(identity)
     except RunProvenanceError as exc:
         raise ValueError("Approved Qlib Provider lineage is invalid.") from exc
+    return _json_dumps({**public_identity, "input_dir": identity["input_dir"]})
 
 
 def _approved_market_data_bars_path(identity: Mapping[str, Any]) -> Path:
@@ -988,35 +977,7 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         str(REPORTS_ROOT / "ic_ir_analysis.md"),
     ]
 
-    def prepare_baostock_refresh(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("prepare_baostock_refresh.py")
-        _append_reports_out_dir(command)
-        _append_value(command, params, "target_end", "--target-end")
-        _append_value(command, params, "limit", "--limit")
-        return command
 
-    def download_baostock(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("download_baostock.py")
-        for key, flag in (
-            ("start", "--start"),
-            ("end", "--end"),
-            ("sleep", "--sleep"),
-            ("limit", "--limit"),
-            ("retries", "--retries"),
-            ("timeout", "--timeout"),
-            ("max_consecutive_failures", "--max-consecutive-failures"),
-            ("max_requests", "--max-requests"),
-            ("overlap_days", "--overlap-days"),
-        ):
-            _append_value(command, params, key, flag)
-        for key, flag in (
-            ("retry_failed", "--retry-failed"),
-            ("retry_empty", "--retry-empty"),
-            ("retry_timeout", "--retry-timeout"),
-            ("incremental", "--incremental"),
-        ):
-            _append_flag(command, params, key, flag)
-        return command
 
     def download_public_daily(script_name: str, params: Mapping[str, Any]) -> List[str]:
         command = _script_command(script_name)
@@ -1040,28 +1001,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
             _append_flag(command, params, key, flag)
         return command
 
-    def download_etf_momentum(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("quant_data_cli.py")
-        command.extend(["update", "cn_etf_daily"])
-        _append_value(command, params, "end", "--through")
-        return command
 
-    def update_ashare_miniqmt(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("quant_data_cli.py") + ["update", "ashare_daily_qfq"]
-        _append_value(command, params, "end", "--through")
-        return command
 
     def generate_etf_momentum_report(params: Mapping[str, Any]) -> List[str]:
         del params
         return _script_command("generate_etf_momentum_strategy_report.py")
 
-    def validate_latest_snapshot(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("validate_latest_snapshot.py")
-        _append_reports_out_dir(command)
-        _append_value(command, params, "limit", "--limit")
-        _append_value(command, params, "timeout", "--timeout")
-        _append_flag(command, params, "use_system_proxy", "--use-system-proxy")
-        return command
 
     def download_ashare_news(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("download_ashare_news.py")
@@ -1088,54 +1033,12 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         command.extend(["--limit", str(_safe_jqdata_web_limit(params)), "--dry-run"])
         return command
 
-    def merge_to_qlib(params: Mapping[str, Any]) -> List[str]:
-        if _as_bool(params.get("smoke")):
-            command = _script_command("merge_to_qlib.py")
-            command.extend(
-                [
-                    "--smoke-fixture",
-                    "--smoke-dir",
-                    str(REPORTS_ROOT / "smoke" / "merge_to_qlib"),
-                ]
-            )
-            _append_flag(command, params, "no_overwrite", "--no-overwrite")
-            return command
-        if _as_bool(params.get("no_overwrite")):
-            raise ValueError("no_overwrite is only supported by the isolated smoke fixture")
-        return _script_command("build_qlib_direct_provider.py") + [
-            "--cleaning-mode",
-            "canonical",
-        ]
 
-    def apply_data_cleaning(params: Mapping[str, Any]) -> List[str]:
-        if _as_bool(params.get("dry_run")):
-            command = _script_command("apply_data_cleaning.py")
-            _append_reports_out_dir(command)
-            command.append("--dry-run")
-            return command
-        return _script_command("build_qlib_direct_provider.py") + [
-            "--cleaning-mode",
-            "cleaned",
-        ]
 
-    def repair_qlib_provider(_params: Mapping[str, Any]) -> List[str]:
-        return _script_command("repair_qlib_provider.py") + ["--dry-run"]
 
-    def generate_csi300(params: Mapping[str, Any]) -> List[str]:
-        return _script_command("generate_csi300.py") + ["--dry-run"]
 
-    def add_index_benchmark(params: Mapping[str, Any]) -> List[str]:
-        return _script_command("add_index_benchmark.py") + ["--dry-run"]
 
-    def report_data_anomalies(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("report_data_anomalies.py")
-        _append_reports_out_dir(command)
-        return command
 
-    def report_data_hygiene(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("report_data_hygiene.py")
-        _append_reports_out_dir(command)
-        return command
 
     def report_workbench_capabilities(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("report_workbench_capabilities.py")
@@ -1213,19 +1116,25 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
 
     def train_baseline_lgb(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("train_baseline_lgb.py")
-        command.extend(["--config", _safe_config_path(params.get("config"))])
-        command.extend(["--provider", _safe_provider(params.get("provider"))])
+        provider = _safe_provider(params.get("provider"))
+        config = params.get("config") or ("baseline_qmt_native.yaml" if provider == "qmt_native" else None)
+        command.extend(["--config", _safe_config_path(config), "--provider", provider])
+        if provider == "qmt_native":
+            command.append("--no-publish-latest")
+            if not params.get("experiment_name"):
+                command.extend(["--experiment-name", "dsa_qmt_native"])
         _append_value(command, params, "experiment_name", "--experiment-name")
         return command
 
     def train_baseline_lgb_equivalence(params: Mapping[str, Any]) -> List[str]:
         command = _script_command("train_baseline_lgb.py")
+        provider = _safe_provider(params.get("provider"))
         command.extend(
             [
                 "--config",
-                _safe_config_path("baseline_lgb_equivalence.yaml"),
+                _safe_config_path("baseline_qmt_native.yaml" if provider == "qmt_native" else "baseline_lgb_equivalence.yaml"),
                 "--provider",
-                _safe_provider(params.get("provider")),
+                provider,
                 "--experiment-name",
                 "dsa_training_equivalence",
                 "--no-publish-latest",
@@ -1244,40 +1153,8 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         _append_flag(command, params, "dry_run", "--dry-run")
         return command
 
-    def run_daily_update(params: Mapping[str, Any]) -> List[str]:
-        command = _script_command("run_daily_update.py")
-        _append_value(command, params, "ashare_source", "--ashare-source")
-        for key, flag in (
-            ("skip_download", "--skip-download"),
-            ("dry_run", "--dry-run"),
-            ("continue_on_error", "--continue-on-error"),
-        ):
-            _append_flag(command, params, key, flag)
-        for key, flag in (
-            ("overlap_days", "--overlap-days"),
-            ("sleep", "--sleep"),
-            ("timeout", "--timeout"),
-            ("retries", "--retries"),
-            ("max_consecutive_failures", "--max-consecutive-failures"),
-            ("max_requests", "--max-requests"),
-            ("limit", "--limit"),
-            ("end", "--end"),
-            ("news_limit", "--news-limit"),
-            ("overlap_sample", "--overlap-sample"),
-            ("merged_sample", "--merged-sample"),
-        ):
-            _append_value(command, params, key, flag)
-        for key, flag in (
-            ("skip_baostock", "--skip-baostock"),
-            ("skip_eastmoney", "--skip-eastmoney"),
-            ("skip_akshare", "--skip-akshare"),
-            ("skip_global_daily", "--skip-global-daily"),
-            ("skip_ashare_news", "--skip-ashare-news"),
-            ("skip_etf_momentum", "--skip-etf-momentum"),
-            ("use_system_proxy", "--use-system-proxy"),
-        ):
-            _append_flag(command, params, key, flag)
-        return command
+    def run_daily_update(_params: Mapping[str, Any]) -> List[str]:
+        return _script_command("run_daily_update.py")
 
     def run_dsa_backtest(params: Mapping[str, Any]) -> List[str]:
         command = [_python_bin(), str(DSA_ROOT / "main.py"), "--backtest"]
@@ -1415,117 +1292,10 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
         ]
 
     return {
-        "update_ashare_miniqmt": {
-            "label": "更新股票快照（MiniQMT）",
-            "command": update_ashare_miniqmt,
-            "allowed_params": {"end"},
-            "artifact_patterns": [str(quant_data_root(DSA_ROOT) / "DATA_MANIFEST.json")],
-        },
-        "prepare_baostock_refresh": {
-            "label": "准备 Baostock 增量清单",
-            "command": prepare_baostock_refresh,
-            "allowed_params": {"target_end", "limit"},
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "baostock_refresh_plan_latest.md"),
-                str(REPORTS_ROOT / "baostock_refresh_symbols_latest.csv"),
-                str(REPORTS_ROOT / "baostock_refresh_remaining_latest.txt"),
-                str(REPORTS_ROOT / "baostock_refresh_remaining_plan_latest.md"),
-            ],
-        },
-        "download_baostock": {
-            "label": "下载 Baostock 长历史",
-            "command": download_baostock,
-            "allowed_params": {
-                "start",
-                "end",
-                "sleep",
-                "limit",
-                "retries",
-                "timeout",
-                "max_consecutive_failures",
-                "max_requests",
-                "overlap_days",
-                "retry_failed",
-                "retry_empty",
-                "retry_timeout",
-                "incremental",
-            },
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "baostock_refresh_remaining_latest.txt"),
-                str(REPORTS_ROOT / "baostock_refresh_stale_*_latest.txt"),
-            ],
-        },
         "run_daily_update": {
-            "label": "运行每日 quant_data 更新与校验",
+            "label": "检查冻结 QMT 实验输入",
             "command": run_daily_update,
-            "allowed_params": {
-                "skip_download",
-                "ashare_source",
-                "dry_run",
-                "continue_on_error",
-                "overlap_days",
-                "sleep",
-                "timeout",
-                "retries",
-                "max_consecutive_failures",
-                "max_requests",
-                "limit",
-                "end",
-                "news_limit",
-                "skip_baostock",
-                "skip_eastmoney",
-                "skip_akshare",
-                "skip_global_daily",
-                "skip_ashare_news",
-                "skip_etf_momentum",
-                "use_system_proxy",
-                "overlap_sample",
-                "merged_sample",
-            },
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "daily_update_summary_latest.json"),
-                str(REPORTS_ROOT / "daily_update_summary_*.json"),
-            ],
-        },
-        "download_eastmoney": {
-            "label": "下载东方财富日线",
-            "command": lambda params: download_public_daily(
-                "download_eastmoney.py", params
-            ),
-            "allowed_params": {
-                "start",
-                "end",
-                "sleep",
-                "limit",
-                "retries",
-                "timeout",
-                "max_consecutive_failures",
-                "max_requests",
-                "retry_failed",
-                "incremental",
-                "overlap_days",
-                "use_system_proxy",
-            },
-        },
-        "download_akshare": {
-            "label": "下载 AkShare 日线",
-            "command": lambda params: download_public_daily(
-                "download_akshare.py", params
-            ),
-            "allowed_params": {
-                "start",
-                "end",
-                "sleep",
-                "limit",
-                "retries",
-                "timeout",
-                "max_consecutive_failures",
-                "max_requests",
-                "retry_failed",
-                "incremental",
-                "overlap_days",
-                "use_system_proxy",
-            },
+            "allowed_params": set(),
         },
         "download_global_daily": {
             "label": "下载全球日线与原始证据",
@@ -1555,20 +1325,6 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 str(QUANT_DATA_ROOT / "raw" / "ashare_news" / "**" / "*.json"),
             ],
         },
-        "download_etf_momentum": {
-            "label": "更新统一 ETF 数据",
-            "command": download_etf_momentum,
-            "allowed_params": {"end"},
-            "artifact_patterns": [
-                str(
-                    quant_data_root(DSA_ROOT)
-                    / "parquet"
-                    / "etf_1d"
-                    / "cn_etf_daily"
-                    / "LATEST.json"
-                ),
-            ],
-        },
         "generate_etf_momentum_report": {
             "label": "生成 ETF 完整策略报告",
             "command": generate_etf_momentum_report,
@@ -1593,87 +1349,16 @@ def _build_default_command_specs() -> Dict[str, Dict[str, Any]]:
                 ),
             ],
         },
-        "validate_latest_snapshot": {
-            "label": "校验新浪最新快照",
-            "command": validate_latest_snapshot,
-            "allowed_params": {"limit", "timeout", "use_system_proxy"},
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "latest_snapshot_validation_latest.json"),
-                str(REPORTS_ROOT / "latest_snapshot_validation_latest.md"),
-                str(REPORTS_ROOT / "latest_snapshot_validation_*.json"),
-                str(REPORTS_ROOT / "latest_snapshot_validation_*.md"),
-            ],
-        },
         "download_jqdata": {
             "label": "验证 JQData 连接（dry-run）",
             "command": download_jqdata,
             "allowed_params": {"universe", "start", "end", "limit", "sleep", "dry_run"},
             "env_names": {"JQ_USERNAME", "JQ_PASSWORD"},
         },
-        "merge_to_qlib": {
-            "label": "生成正式 Qlib Provider",
-            "command": merge_to_qlib,
-            "allowed_params": {"no_overwrite", "smoke"},
-        },
-        "apply_data_cleaning": {
-            "label": "生成正式 cleaned Qlib Provider",
-            "command": apply_data_cleaning,
-            "allowed_params": {"dry_run"},
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "data_cleaning_applied_latest.json"),
-                str(REPORTS_ROOT / "data_cleaning_applied_latest.md"),
-                str(REPORTS_ROOT / "data_cleaning_applied_*.json"),
-                str(REPORTS_ROOT / "data_cleaning_applied_*.md"),
-            ],
-        },
-        "repair_qlib_provider": {
-            "label": "预演旧兼容 Qlib 修复",
-            "command": repair_qlib_provider,
-            "allowed_params": set(),
-        },
         "check_qlib_data": {
             "label": "检查 Qlib 数据",
             "command": _script_command("check_qlib_data.py"),
             "allowed_params": set(),
-        },
-        "generate_csi300": {
-            "label": "预演旧兼容 CSI300 股票池",
-            "command": generate_csi300,
-            "allowed_params": set(),
-        },
-        "add_index_benchmark": {
-            "label": "预演旧兼容 benchmark",
-            "command": add_index_benchmark,
-            "allowed_params": set(),
-        },
-        "report_data_anomalies": {
-            "label": "生成异常股票和清洗策略",
-            "command": report_data_anomalies,
-            "allowed_params": set(),
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "data_anomaly_stocks_latest.csv"),
-                str(REPORTS_ROOT / "data_anomaly_events_latest.csv"),
-                str(REPORTS_ROOT / "data_cleaning_strategy_latest.md"),
-                str(REPORTS_ROOT / "data_anomaly_stocks_*.csv"),
-                str(REPORTS_ROOT / "data_anomaly_events_*.csv"),
-                str(REPORTS_ROOT / "data_cleaning_strategy_*.md"),
-            ],
-        },
-        "report_data_hygiene": {
-            "label": "生成数据治理盘点和清理预案",
-            "command": report_data_hygiene,
-            "allowed_params": set(),
-            "artifact_patterns": [
-                str(REPORTS_ROOT / "data_hygiene_reports_latest.json"),
-                str(REPORTS_ROOT / "data_hygiene_inventory_latest.md"),
-                str(REPORTS_ROOT / "data_hygiene_inventory_latest.json"),
-                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.md"),
-                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_latest.json"),
-                str(REPORTS_ROOT / "data_hygiene_inventory_*.md"),
-                str(REPORTS_ROOT / "data_hygiene_inventory_*.json"),
-                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_*.md"),
-                str(REPORTS_ROOT / "data_hygiene_cleanup_plan_*.json"),
-            ],
         },
         "report_workbench_capabilities": {
             "label": "生成工作台能力盘点",
@@ -2085,7 +1770,9 @@ class QuantJobService:
                 raise ValueError(
                     "Approved provider identity is only valid for provider-pinned training jobs."
                 )
-            _safe_provider(params_dict.get("provider"))
+            provider = _safe_provider(params_dict.get("provider"))
+            if (provider == "qmt_native") != (approved_provider_identity.get("backend") == "qmt_native"):
+                raise ValueError("Approved input does not match the requested provider.")
             command.extend(
                 [
                     "--provider-identity-json",

@@ -31,6 +31,24 @@ def test_offline_guard_keeps_real_loopback_connections():
             connection.close()
 
 
+@pytest.mark.parametrize("winerror", [1314, 5])
+def test_symlink_factory_skips_only_missing_windows_privilege(
+    tmp_path, monkeypatch, make_symlink, winerror,
+):
+    error = OSError("symlink creation failed")
+    error.winerror = winerror
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(Path, "symlink_to", fail)
+    expected = pytest.skip.Exception if os.name == "nt" and winerror == 1314 else OSError
+    with pytest.raises(expected) as caught:
+        make_symlink(tmp_path / "link", tmp_path / "target")
+    if expected is OSError:
+        assert caught.value is error
+
+
 def test_default_database_and_assets_use_private_paths():
     from src.repositories.strategy_assets_repo import StrategyAssetsRepository
     from src.storage import DatabaseManager
@@ -46,18 +64,13 @@ def test_default_miniqmt_transport_cannot_start_ssh():
         MiniQMTBridgeClient().request("calendar", ["SH"], "2026-10-16", "2026-10-16")
 
 
-def test_package_miniqmt_constructor_reads_only_the_private_env(tmp_path, monkeypatch):
-    import dotenv
-    from quant_qmt_data.miniqmt_bridge import MiniQMTBridgeClient
+def test_qmt_reader_uses_explicit_env_and_cannot_start_live_sdk(monkeypatch):
+    from quant_qmt_data import QMTClient
 
-    original = dotenv.load_dotenv
-    observed = []
-
-    def load_private(path, **kwargs):
-        assert Path(path).resolve() == (tmp_path / ".env").resolve()
-        observed.append(path)
-        return original(path, **kwargs)
-
-    monkeypatch.setattr(dotenv, "load_dotenv", load_private)
-    MiniQMTBridgeClient()
-    assert len(observed) == 1
+    monkeypatch.setenv("QMT_PORT", "12345")
+    monkeypatch.setenv("QMT_PYTHON", "private-python")
+    client = QMTClient.from_env()
+    assert client.port == 12345
+    assert client.python == "private-python"
+    with pytest.raises(AssertionError, match="live MiniQMT"):
+        client.status()

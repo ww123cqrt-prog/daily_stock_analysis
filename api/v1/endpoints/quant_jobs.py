@@ -49,7 +49,8 @@ from quant_workflow.scripts.robust_signal_data_contract import (
 from src.safe_errors import sanitize_public_error
 from src.services.catdesk_service import start_local_catdesk_service
 from src.services.mlflow_service import start_local_mlflow_service
-from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT
+from src.services.quant_job_service import QuantJob, QuantJobService, REPORTS_ROOT, _safe_config_path
+from src.services.quant_workflow_paths import qmt_dataset_dir
 from src.safe_urls import public_http_url
 
 
@@ -79,6 +80,7 @@ MARKET_DATA_PINNED_JOB_TYPES = {
     "report_cash_control_backtest",
 }
 TRAINING_PROVIDER_DATASET_IDS = {
+    "qmt_native": "qmt_native",
     "canonical": "ashare_daily_qfq",
     "cleaned": "ashare_daily_qfq",
 }
@@ -436,17 +438,17 @@ def _approved_robust_signal_submission_data(
 
 
 def _training_provider_dataset_id(params: Dict[str, Any]) -> str:
-    provider = str(params.get("provider") or "canonical").strip().lower()
+    provider = str(params.get("provider") or "qmt_native").strip().lower()
     dataset_id = TRAINING_PROVIDER_DATASET_IDS.get(provider)
     if dataset_id is None:
-        raise ValueError("Provider must be one of: canonical, cleaned.")
+        raise ValueError("Provider must be one of: qmt_native, canonical, cleaned.")
     return dataset_id
 
 
 def _training_provider_name(params: Dict[str, Any]) -> str:
-    provider = str(params.get("provider") or "canonical").strip().lower()
+    provider = str(params.get("provider") or "qmt_native").strip().lower()
     if provider not in TRAINING_PROVIDER_DATASET_IDS:
-        raise ValueError("Provider must be one of: canonical, cleaned.")
+        raise ValueError("Provider must be one of: qmt_native, canonical, cleaned.")
     return provider
 
 
@@ -462,6 +464,11 @@ def _approved_provider_identity_from_status(
         provider = research_status.get("qlib_provider")
     if not isinstance(provider, dict):
         raise ValueError("Training status does not expose an approved Qlib Provider.")
+    if provider.get("backend") == "qmt_native":
+        directory = qmt_dataset_dir()
+        if directory is None:
+            raise ValueError("No frozen QMT input is selected.")
+        return {**provider, "input_dir": str(directory)}
     try:
         return normalize_provider_lineage(provider)
     except RunProvenanceError as exc:
@@ -615,6 +622,8 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
     approved_market_data_identity = None
     approved_robust_signal_data = None
     try:
+        if request.job_type == "run_candidate_pipeline" and _training_provider_name(request.params) == "qmt_native":
+            raise api_error(409, "training_blocked", "候选流程尚未接入冻结 QMT 输入，请使用 QMT 基线训练。")
         if request.job_type in MARKET_DATA_PINNED_JOB_TYPES:
             try:
                 approved_market_data_identity = await asyncio.to_thread(
@@ -647,10 +656,16 @@ async def submit_quant_job(request: QuantJobSubmitRequest) -> QuantJobResponse:
                 ) from exc
         elif _requires_training_readiness_gate(request.job_type, request.params):
             provider_dataset_id = _training_provider_dataset_id(request.params)
+            preflight_kwargs = {
+                "provider_dataset_id": provider_dataset_id,
+                "provider": _training_provider_name(request.params),
+            }
+            if preflight_kwargs["provider"] == "qmt_native":
+                config = request.params.get("config") if request.job_type == "train_baseline_lgb" else None
+                preflight_kwargs["training_config"] = Path(_safe_config_path(config or "baseline_qmt_native.yaml"))
             research_status = await asyncio.to_thread(
                 build_research_status_payload,
-                provider_dataset_id=provider_dataset_id,
-                provider=_training_provider_name(request.params),
+                **preflight_kwargs,
             )
             if research_status.get("trainable") is not True:
                 readiness = research_status.get("training_readiness")

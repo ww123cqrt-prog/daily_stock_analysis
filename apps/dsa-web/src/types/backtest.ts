@@ -80,6 +80,8 @@ export interface TrainedStrategyBacktestRunRequest {
   endDate?: string;
   topk?: number;
   costBps?: number;
+  initialCapital?: number;
+  lotSize?: number;
 }
 
 export interface TrainedStrategyCatalogStrategy {
@@ -87,7 +89,7 @@ export interface TrainedStrategyCatalogStrategy {
   label: string;
   config: Record<string, unknown>;
   exactReplayAvailable: boolean;
-  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
+  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy' | 'dsa';
 }
 
 export interface TrainedStrategyCatalogRun {
@@ -161,13 +163,14 @@ export interface TrainedStrategyBacktestResponse {
   artifactSha256: Record<string, string>;
   strategyConfig: Record<string, unknown>;
   replayMode: 'exact' | 'custom';
-  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
-  sourceReplayEngine: 'qlib_portana' | 'dsa_optimized_strategy';
+  replayEngine: 'qlib_portana' | 'dsa_optimized_strategy' | 'dsa';
+  sourceReplayEngine: 'qlib_portana' | 'dsa_optimized_strategy' | 'dsa';
   modifiedFromOriginal: boolean;
   configHash?: string | null;
   contractVersion?: number | null;
   originalParameters: Record<string, unknown>;
   executionAssumptions: Record<string, unknown>;
+  executionReport?: StrategyBacktestResponse | null;
   exactMetricValidation?: {
     status: 'pass';
     tolerance: number;
@@ -181,6 +184,8 @@ export interface TrainedStrategyBacktestResponse {
     endDate: string;
     topk: number;
     costBps: number;
+    initialCapital?: number;
+    lotSize?: number;
   };
   metrics: TrainedStrategyBacktestMetrics;
   equityCurve: TrainedStrategyBacktestPoint[];

@@ -18,12 +18,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from quant_data_contract import (  # noqa: E402
-    DataContractError,
-    resolve_dataset,
-    sha256_file,
-    validate_qlib_snapshot,
-)
+# These names remain patchable by existing DSA helper consumers. Import their
+# historical implementation only when the explicit historical helper is used.
+def resolve_dataset(*args, **kwargs):
+    from quant_workflow.scripts.quant_data_contract import resolve_dataset
+    return resolve_dataset(*args, **kwargs)
+
+
+def sha256_file(*args, **kwargs):
+    from quant_workflow.scripts.quant_data_contract import sha256_file
+    return sha256_file(*args, **kwargs)
+
+
+def validate_qlib_snapshot(*args, **kwargs):
+    from quant_workflow.scripts.quant_data_contract import validate_qlib_snapshot
+    return validate_qlib_snapshot(*args, **kwargs)
+
 
 
 DEFAULT_WORKFLOW_ROOT = SCRIPT_DIR.parent
@@ -86,6 +96,8 @@ def china_astock_root() -> Path:
 def _resolve_native_qlib(
     root_text: str, dataset_id: str = "qlib_ashare_v2"
 ) -> Path:
+    from quant_workflow.scripts.quant_data_contract import DataContractError
+
     root = Path(root_text)
     try:
         resolved = resolve_dataset(
@@ -102,6 +114,8 @@ def _resolve_native_qlib(
 
 @lru_cache(maxsize=8)
 def _resolve_native_ashare_qfq(root_text: str) -> Path:
+    from quant_workflow.scripts.quant_data_contract import DataContractError
+
     root = Path(root_text)
     try:
         resolved = resolve_dataset(
@@ -138,6 +152,8 @@ def _validate_native_provider_override(
     dataset_id: str,
 ) -> Path:
     """Accept an override only when it names a complete immutable V2 snapshot."""
+    from quant_workflow.scripts.quant_data_contract import DataContractError
+
 
     root = quant_data_root().expanduser().resolve()
     dataset_root = NATIVE_QLIB_DATASET_ROOTS[dataset_id]
@@ -308,25 +324,27 @@ def _resolve_approved_workflow_provider_uri(
 
 
 def qlib_workflow_provider_uri(
-    provider: str = "canonical",
+    provider: str = "qmt_native",
     *,
     expected_provider_identity: Mapping[str, Any] | None = None,
+    snapshot_override: str | Path | None = None,
     append_only_from: str | Path | None = None,
 ) -> Path:
-    """Return the formal Qlib Provider URI used by runtime workflows."""
-
+    """Select QMT by default; canonical/cleaned retain their existing DSA lineage."""
+    if provider not in {"qmt_native", "canonical", "cleaned"}:
+        raise ValueError(f"Unknown Qlib provider: {provider}")
     if expected_provider_identity is not None:
-        resolved = _resolve_approved_workflow_provider_uri(
-            provider,
-            expected_provider_identity,
-        )
+        resolved = _resolve_approved_workflow_provider_uri(provider, expected_provider_identity)
+    elif provider == "qmt_native":
+        resolved = Path(snapshot_override).expanduser().resolve() if snapshot_override is not None else qmt_dataset_dir()
+    elif snapshot_override is not None:
+        resolved = Path(snapshot_override).expanduser().resolve()
     else:
         resolved = qlib_direct_provider_uri(provider)
     if append_only_from is not None:
-        _verify_direct_provider_history_is_append_only(
-            Path(append_only_from),
-            resolved,
-        )
+        if provider == "qmt_native":
+            raise ValueError("qmt_native replays one frozen input; append-only Provider history is a descriptor contract")
+        _verify_direct_provider_history_is_append_only(Path(append_only_from), resolved)
     return resolved
 
 
@@ -549,86 +567,81 @@ def _verify_direct_provider_history_is_append_only(
 
 def qlib_workflow_init_config(
     *,
-    provider: str = "canonical",
+    provider: str = "qmt_native",
     provider_uri: str | Path | None = None,
     kernels: int | None = None,
 ) -> dict:
-    """Return a YAML-safe Qlib config for the formal Qlib Provider."""
-
-    from quant_workflow.quant_data_qlib_provider import qlib_direct_init_config
-
-    descriptor = (
-        _direct_descriptor_from_uri(provider_uri)
-        if provider_uri is not None
-        else qlib_workflow_provider_descriptor(provider)
+    """Initialize the explicitly selected QMT, descriptor or binary input format."""
+    selected = (
+        Path(provider_uri).expanduser().resolve()
+        if provider_uri is not None else qlib_workflow_provider_uri(provider)
     )
-    if descriptor is None:
-        raise RuntimeError(
-            "formal Qlib workflow requires a Qlib Provider descriptor; "
-            "configured compatibility paths are not accepted"
+    native_input = _qmt_input_directory(selected)
+    if native_input is not None:
+        if provider != "qmt_native":
+            raise ValueError(
+                "A QMT frozen input requires qmt_native; "
+                "canonical/cleaned use their original data format"
+            )
+        from quant_workflow.qmt_native_provider import qlib_direct_init_config
+        return qlib_direct_init_config(input_dir=native_input, kernels=kernels)
+    descriptor = _direct_descriptor_from_uri(selected)
+    if descriptor is not None:
+        from quant_workflow.quant_data_qlib_provider import qlib_direct_init_config
+        return qlib_direct_init_config(
+            descriptor_path=descriptor, quant_data_root=quant_data_root(), kernels=kernels
         )
-    return qlib_direct_init_config(
-        descriptor_path=descriptor,
-        quant_data_root=quant_data_root(),
-        kernels=kernels,
+    if (selected / "calendars" / "day.txt").is_file():
+        config = {"provider_uri": str(selected), "provider": "LocalProvider", "region": "cn"}
+        if kernels is not None:
+            config["kernels"] = max(1, int(kernels))
+        return config
+    raise RuntimeError(
+        "Qlib Provider format is unavailable: expected a QMT frozen input, "
+        "descriptor or binary calendar"
     )
 
 
 def init_qlib_workflow(
     *,
-    provider: str = "canonical",
+    provider: str = "qmt_native",
     provider_uri: str | Path | None = None,
     kernels: int | None = None,
     **overrides,
 ) -> Path:
-    """Initialize Qlib for a workflow using the governed Qlib Provider."""
+    """Initialize Qlib without changing the selected experiment's data format."""
+    import qlib
 
-    from quant_workflow.quant_data_qlib_provider import init_qlib_from_quant_data
-
-    descriptor = (
-        _direct_descriptor_from_uri(provider_uri)
-        if provider_uri is not None
-        else qlib_workflow_provider_descriptor(provider)
+    selected = (
+        Path(provider_uri).expanduser().resolve()
+        if provider_uri is not None else qlib_workflow_provider_uri(provider)
     )
-    if descriptor is None:
-        raise RuntimeError(
-            "formal Qlib workflow requires a Qlib Provider descriptor; "
-            "configured compatibility paths are not accepted"
-        )
-    init_qlib_from_quant_data(
-        descriptor_path=descriptor,
-        quant_data_root=quant_data_root(),
-        kernels=kernels,
-        **overrides,
-    )
-    return descriptor
+    if _qmt_input_directory(selected) is not None:
+        from quant_workflow.qmt_native_provider import _clear_context_cache
+        _clear_context_cache()
+    config = qlib_workflow_init_config(provider=provider, provider_uri=selected, kernels=kernels)
+    config.update(overrides)
+    qlib.init(default_conf="client", **config)
+    return _direct_descriptor_from_uri(selected) or _qmt_input_directory(selected) or selected
 
 
 def qlib_init_config_for_uri(
     provider_uri: str | Path,
     *,
-    provider: str = "canonical",
+    provider: str = "qmt_native",
     kernels: int | None = None,
 ) -> dict:
-    """Build config for a Qlib Provider URI; compatibility paths remain explicit."""
-
-    descriptor = _direct_descriptor_from_uri(provider_uri)
-    if descriptor is None:
-        legacy = Path(provider_uri).expanduser().resolve()
-        return {
-            "provider_uri": str(legacy),
-            "provider": "LocalProvider",
-            "region": "cn",
-        }
-    return qlib_workflow_init_config(
-        provider=provider,
-        provider_uri=descriptor,
-        kernels=kernels,
-    )
+    """Build Qlib configuration from the supplied input's own format."""
+    return qlib_workflow_init_config(provider=provider, provider_uri=provider_uri, kernels=kernels)
 
 
 def provider_calendar_days(provider_uri: str | Path) -> list[str]:
     """Read the frozen calendar from a Qlib Provider or compatibility snapshot."""
+
+    native_input = _qmt_input_directory(provider_uri)
+    if native_input is not None:
+        from quant_workflow.qmt_native_provider import _load_input
+        return _load_input(str(native_input)).calendar.strftime("%Y-%m-%d").tolist()
 
     descriptor = _direct_descriptor_from_uri(provider_uri)
     if descriptor is not None:
@@ -651,6 +664,14 @@ def provider_instrument_ranges(
     provider_uri: str | Path,
 ) -> dict[str, tuple[str, str]]:
     """Read instrument coverage from direct metadata or a legacy snapshot."""
+
+    native_input = _qmt_input_directory(provider_uri)
+    if native_input is not None:
+        from quant_workflow.qmt_native_provider import _load_input
+        context = _load_input(str(native_input))
+        return {symbol: (min(left for left, _ in spans).date().isoformat(),
+                         max(right for _, right in spans).date().isoformat())
+                for symbol, spans in context.instruments.items() if spans}
 
     descriptor = _direct_descriptor_from_uri(provider_uri)
     if descriptor is not None:
@@ -680,6 +701,10 @@ def provider_instrument_ranges(
 
 def provider_has_instrument_pool(provider_uri: str | Path, pool: str) -> bool:
     """Return whether a named instrument pool is present in the Provider."""
+
+    native_input = _qmt_input_directory(provider_uri)
+    if native_input is not None:
+        return str(pool).strip().lower() == "all" and bool(provider_instrument_ranges(native_input))
 
     normalized_pool = str(pool or "").strip().lower()
     descriptor = _direct_descriptor_from_uri(provider_uri)
@@ -731,3 +756,18 @@ def qlib_compatibility_provider_uri(provider: str = "canonical") -> Path:
             root / "cn_data_baostock_jqdata_cleaned",
         )
     raise ValueError(f"Unknown compatibility Qlib provider: {provider}")
+
+
+def qmt_dataset_dir() -> Path:
+    """Select a complete frozen QMT experiment, independently of historical assets."""
+    configured = os.environ.get("QMT_DATASET_DIR")
+    if not configured:
+        raise ValueError("Set QMT_DATASET_DIR to one frozen experiment input directory")
+    return Path(configured).expanduser().resolve()
+
+
+def _qmt_input_directory(provider_uri: str | Path) -> Path | None:
+    candidate = Path(provider_uri).expanduser().resolve()
+    if candidate.name == "dataset.json":
+        candidate = candidate.parent
+    return candidate if (candidate / "dataset.json").is_file() else None

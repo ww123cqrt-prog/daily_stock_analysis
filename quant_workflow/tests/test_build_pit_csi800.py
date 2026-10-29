@@ -2096,7 +2096,7 @@ def test_recovery_rejects_crafted_internal_entry_without_deleting_target(
     assert journal_path.is_file()
 
 
-def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path) -> None:
+def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path, make_symlink) -> None:
     module = load_module()
     output_dir = tmp_path / "pit"
     output_dir.mkdir()
@@ -2127,7 +2127,7 @@ def test_recovery_rejects_symlinked_transaction_journal(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     journal_path = output_dir / module.TRANSACTION_JOURNAL_FILENAME
-    journal_path.symlink_to(external_journal)
+    make_symlink(journal_path, external_journal)
 
     with pytest.raises(module.BuildBlocked) as exc_info:
         module._recover_transaction(output_dir)

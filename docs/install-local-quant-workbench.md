@@ -2,6 +2,18 @@
 
 本文同时面向用户和 agent。用户可以按步骤把本地 DSA 量化工作台跑起来；agent 可以按同一套步骤复现环境、启动服务、验证状态和排查问题。
 
+## QMT 原生数据入口
+
+新 QMT 读取环境要求 Python 3.11 或更新版本；本机验收使用 DSA Python 3.12.7。SDK 解释器沿用券商官方 xtquant 的匹配环境。
+
+本机 Windows QMT 的新主线需要两套已有环境：DSA Python 安装 `quant_qmt_data`，`QMT_PYTHON` 指定的 Python 保留券商官方 xtquant 及其依赖。SDK 环境不必安装 DSA 或本数据包。将 `QMT_PORT` 设为已核实的行情端点，`QMT_DATA_DIR` 可选指定行情库；本机值放私有 `.env`，不写入源码。调用方按环境启动 worker 的绝对文件路径，不要求 cwd 位于仓库。
+
+先在 QMT 中维护所需日线，再使用数据包 `export` 命令保存一个新实验目录，将目录设为 `QMT_DATASET_DIR`。完整输入包含 `bars.parquet` 与 `dataset.json`，训练入口选择 `qmt_native` 和 `baseline_qmt_native.yaml`。之后可离线训练、预测与 DSA 回测，无需旧数据服务、全库清单或发布指针。未收盘数据与中途保存失败的目录不能作为正式输入。
+
+新训练默认使用 `qmt_native` 与 `baseline_qmt_native.yaml`，只读取冻结输入。已训练 Run 可选择“每日预测 TopK”进行 DSA 自定义回测，按下一交易日开盘撮合；初始资金、整手与每侧成交费用均进入结果。它保留完整成交账本，不把标签收益当成撮合收益，也不把预测契约标成已冻结的精确策略。`QMT_DATASET_DIR` 以后改变时，保存 Run 仍绑定其原输入目录。
+
+本节是新 QMT 数据入口的安装方式；下文中的旧数据源账号、canonical/cleaned Provider 构建等内容只适用于独立/历史工作流，不是 QMT 原生模式的依赖。
+
 ## 目标架构
 
 | 组件 | 角色 | 安装方式 |

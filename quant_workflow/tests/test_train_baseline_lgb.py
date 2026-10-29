@@ -229,18 +229,8 @@ class TrainBaselineLgbTest(unittest.TestCase):
         module = load_module()
         pinned = Path("/quant_data/runtime/qlib_provider/canonical")
         identity = {
-            "provider_contract": "direct_parquet_v1",
-            "dataset_id": "ashare_daily_qfq",
-            "snapshot_id": "ashare-snapshot",
-            "content_sha256": "a" * 64,
-            "manifest_sha256": "b" * 64,
-            "descriptor_path": "runtime/qlib_provider/canonical/PROVIDER_DESCRIPTOR.json",
-            "descriptor_sha256": "c" * 64,
-            "cleaning_mode": "canonical",
-            "index_dataset_id": "cn_index_daily",
-            "index_snapshot_id": "index-snapshot",
-            "index_content_sha256": "d" * 64,
-            "index_manifest_sha256": "e" * 64,
+            "backend": "qmt_native", "experiment_id": "native-experiment",
+            "bars_sha256": "a" * 64, "price_basis": "front", "input_dir": "/tmp/input",
         }
 
         with patch.object(
@@ -249,12 +239,12 @@ class TrainBaselineLgbTest(unittest.TestCase):
             return_value=pinned,
         ) as provider_resolver:
             resolved = module.resolve_provider_uri(
-                "canonical", expected_provider_identity=identity
+                "qmt_native", expected_provider_identity=identity
             )
 
         self.assertEqual(resolved, pinned)
         provider_resolver.assert_called_once_with(
-            "canonical",
+            "qmt_native",
             expected_provider_identity=identity,
         )
 
@@ -267,72 +257,14 @@ class TrainBaselineLgbTest(unittest.TestCase):
                 "qlib_workflow_init_config",
                 return_value={"provider_uri": str(pinned)},
             ) as resolver:
-                resolved = module.resolve_provider_uri("canonical", pinned)
+                resolved = module.resolve_provider_uri("qmt_native", pinned)
 
         self.assertEqual(resolved, pinned)
         resolver.assert_called_once_with(
-            provider="canonical",
+            provider="qmt_native",
             provider_uri=pinned,
         )
 
-    def test_rejects_legacy_provider_environment_overrides(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            quant_data = Path(temp_dir) / "quant_data"
-            canonical = quant_data / "qlib" / "cn_data_baostock_jqdata"
-            cleaned = quant_data / "qlib" / "cn_data_baostock_jqdata_cleaned"
-            canonical.mkdir(parents=True)
-            cleaned.mkdir(parents=True)
-            script_path = Path(__file__).resolve().parents[1] / "scripts" / "train_baseline_lgb.py"
-            env = os.environ.copy()
-            env["QUANT_DATA_ROOT"] = str(quant_data)
-            env["QLIB_PROVIDER_URI"] = str(canonical)
-            env["QLIB_CLEANED_PROVIDER_URI"] = str(cleaned)
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "import importlib.util, json; "
-                        "from pathlib import Path; "
-                        f"path=Path({str(script_path)!r}); "
-                        "spec=importlib.util.spec_from_file_location('train_baseline_lgb', path); "
-                        "module=importlib.util.module_from_spec(spec); "
-                        "spec.loader.exec_module(module); "
-                        "print(json.dumps({"
-                        "'canonical': str(module.resolve_provider_uri('canonical')), "
-                        "'cleaned': str(module.resolve_provider_uri('cleaned'))"
-                        "}))"
-                    ),
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("legacy compatibility providers are rejected", result.stderr)
-
-    def test_resolves_canonical_and_cleaned_provider_uris(self):
-        module = load_module()
-        canonical_provider = Path("/quant_data/providers/canonical")
-        cleaned_provider = Path("/quant_data/providers/cleaned")
-
-        with patch.object(
-            module,
-            "qlib_workflow_provider_uri",
-            side_effect=[canonical_provider, cleaned_provider],
-        ) as resolver:
-            canonical = module.resolve_provider_uri("canonical")
-            cleaned = module.resolve_provider_uri("cleaned")
-
-        self.assertEqual(canonical, canonical_provider)
-        self.assertEqual(cleaned, cleaned_provider)
-        self.assertEqual(
-            resolver.call_args_list,
-            [unittest.mock.call("canonical"), unittest.mock.call("cleaned")],
-        )
 
     def test_rejects_unknown_provider_name(self):
         module = load_module()
@@ -340,199 +272,6 @@ class TrainBaselineLgbTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.resolve_provider_uri("remote-shell")
 
-    def test_writes_runtime_config_with_selected_provider_without_mutating_source(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base = Path(temp_dir)
-            source = base / "baseline.yaml"
-            source.write_text(
-                yaml.safe_dump(
-                    {
-                        "qlib_init": {"provider_uri": "/old/provider", "region": "cn"},
-                        "task": {"model": {"class": "LGBModel"}},
-                    },
-                    sort_keys=False,
-                ),
-                encoding="utf-8",
-            )
-            with patch.object(
-                module,
-                "qlib_workflow_init_config",
-                return_value={"provider_uri": "/new/provider", "region": "cn"},
-            ):
-                runtime = module.write_runtime_config_with_provider(
-                    source,
-                    Path("/new/provider"),
-                    "cleaned",
-                    base / "runtime",
-                )
-
-            source_payload = yaml.safe_load(source.read_text(encoding="utf-8"))
-            runtime_payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
-
-        self.assertEqual(source_payload["qlib_init"]["provider_uri"], "/old/provider")
-        self.assertEqual(runtime_payload["qlib_init"]["provider_uri"], "/new/provider")
-        self.assertIn("cleaned", runtime.name)
-
-    def test_runtime_config_contains_direct_provider_components(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base = Path(temp_dir)
-            source = base / "baseline.yaml"
-            source.write_text(
-                yaml.safe_dump({"qlib_init": {"provider_uri": "/old/provider"}}),
-                encoding="utf-8",
-            )
-            direct_provider = base / "direct" / "provider"
-            direct_provider.mkdir(parents=True)
-            (direct_provider / "PROVIDER_DESCRIPTOR.json").write_text(
-                "{}\n", encoding="utf-8"
-            )
-            direct_config = {
-                "provider_uri": "/direct/provider",
-                "calendar_provider": {"class": "QuantDataCalendarProvider"},
-                "instrument_provider": {"class": "QuantDataInstrumentProvider"},
-                "feature_provider": {"class": "QuantDataFeatureProvider"},
-                "provider": {"class": "QuantDataProvider"},
-            }
-            with patch.object(
-                module,
-                "qlib_workflow_init_config",
-                return_value=direct_config,
-            ):
-                runtime = module.write_runtime_config_with_provider(
-                    source,
-                    direct_provider,
-                    "canonical",
-                    base / "runtime",
-                    extend_dates_to_provider_latest=False,
-                )
-
-            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
-
-        self.assertEqual(payload["qlib_init"]["provider_uri"], "/direct/provider")
-        self.assertEqual(
-            payload["qlib_init"]["feature_provider"]["class"],
-            "QuantDataFeatureProvider",
-        )
-
-    def test_runtime_config_extends_dates_to_provider_latest_calendar_day(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base = Path(temp_dir)
-            provider = base / "provider"
-            (provider / "calendars").mkdir(parents=True)
-            (provider / "calendars" / "day.txt").write_text(
-                "2026-07-08\n2026-07-09\n",
-                encoding="utf-8",
-            )
-            source = base / "baseline.yaml"
-            source.write_text(
-                yaml.safe_dump(
-                    {
-                        "qlib_init": {"provider_uri": "/old/provider", "region": "cn"},
-                        "task": {
-                            "dataset": {
-                                "kwargs": {
-                                    "handler": {"kwargs": {"end_time": "2026-07-03"}},
-                                    "segments": {"test": ["2024-01-01", "2026-07-01"]},
-                                }
-                            },
-                            "record": [
-                                {"class": "SignalRecord"},
-                                {
-                                    "class": "PortAnaRecord",
-                                    "config": {"backtest": {"end_time": "2026-07-01"}},
-                                },
-                            ],
-                        },
-                    },
-                    sort_keys=False,
-                ),
-                encoding="utf-8",
-            )
-
-            with patch.object(
-                module,
-                "qlib_workflow_init_config",
-                return_value={"provider_uri": str(provider), "region": "cn"},
-            ):
-                runtime = module.write_runtime_config_with_provider(
-                    source, provider, "cleaned", base / "runtime"
-                )
-
-            runtime_payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
-            source_payload = yaml.safe_load(source.read_text(encoding="utf-8"))
-
-        task = runtime_payload["task"]
-        self.assertEqual(task["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"], "2026-07-09")
-        self.assertEqual(task["dataset"]["kwargs"]["segments"]["test"], ["2024-01-01", "2026-07-08"])
-        self.assertEqual(task["record"][1]["kwargs"]["config"]["backtest"]["end_time"], "2026-07-08")
-        self.assertEqual(source_payload["task"]["dataset"]["kwargs"]["handler"]["kwargs"]["end_time"], "2026-07-03")
-
-    def test_equivalence_runtime_config_preserves_registered_fixed_dates(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base = Path(temp_dir)
-            provider = base / "provider"
-            (provider / "calendars").mkdir(parents=True)
-            (provider / "calendars" / "day.txt").write_text(
-                "2026-07-23\n2026-07-24\n",
-                encoding="utf-8",
-            )
-            source = base / "equivalence.yaml"
-            source.write_text(
-                yaml.safe_dump(
-                    {
-                        "qlib_init": {"provider_uri": "placeholder"},
-                        "task": {
-                            "dataset": {
-                                "kwargs": {
-                                    "handler": {"kwargs": {"end_time": "2024-12-31"}},
-                                    "segments": {
-                                        "test": ["2024-10-08", "2024-12-31"]
-                                    },
-                                }
-                            },
-                            "record": [
-                                {
-                                    "class": "PortAnaRecord",
-                                    "kwargs": {
-                                        "config": {
-                                            "backtest": {
-                                                "start_time": "2024-10-08",
-                                                "end_time": "2024-12-31",
-                                            }
-                                        }
-                                    },
-                                }
-                            ],
-                        },
-                    },
-                    sort_keys=False,
-                ),
-                encoding="utf-8",
-            )
-
-            with patch.object(
-                module,
-                "qlib_workflow_init_config",
-                return_value={"provider_uri": str(provider), "region": "cn"},
-            ):
-                runtime = module.write_runtime_config_with_provider(
-                    source,
-                    provider,
-                    "canonical",
-                    base / "runtime",
-                    extend_dates_to_provider_latest=False,
-                )
-            payload = yaml.safe_load(runtime.read_text(encoding="utf-8"))
-
-        dataset = payload["task"]["dataset"]["kwargs"]
-        backtest = payload["task"]["record"][0]["kwargs"]["config"]["backtest"]
-        self.assertEqual(dataset["handler"]["kwargs"]["end_time"], "2024-12-31")
-        self.assertEqual(dataset["segments"]["test"], ["2024-10-08", "2024-12-31"])
-        self.assertEqual(backtest["end_time"], "2024-12-31")
 
     def test_runtime_config_keeps_portana_config_under_qlib_kwargs(self):
         module = load_module()
@@ -700,55 +439,6 @@ class TrainBaselineLgbTest(unittest.TestCase):
         tag_provider.assert_not_called()
         record_result.assert_not_called()
 
-    def test_builds_csi300_lines_from_provider_instrument_ranges(self):
-        module = load_module()
-        ranges = {
-            "SZ000001": ("2008-01-02", "2026-07-03"),
-            "SH600000": ("2009-01-05", "2026-07-03"),
-        }
-
-        lines = module.build_csi300_lines(["000001", "600000", "430001"], ranges)
-
-        self.assertEqual(
-            lines,
-            [
-                "SZ000001\t2008-01-02\t2026-07-03",
-                "SH600000\t2009-01-05\t2026-07-03",
-            ],
-        )
-
-    def test_load_csi300_symbols_uses_local_quant_data_cache_without_network_project(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            stock_list = Path(temp_dir) / "stock_lists.json"
-            stock_list.write_text(
-                json.dumps({"csi300": ["000001", "600000"]}),
-                encoding="utf-8",
-            )
-            module.ASTOCK_PROJECT = Path(temp_dir) / "missing-network-project"
-
-            symbols = module.load_csi300_symbols(stock_list)
-
-        self.assertEqual(symbols, ["000001", "600000"])
-
-    def test_ensure_csi300_instruments_refuses_to_mutate_provider(self):
-        module = load_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            provider = Path(temp_dir)
-            instruments_dir = provider / "instruments"
-            instruments_dir.mkdir(parents=True)
-            (instruments_dir / "all.txt").write_text(
-                "SZ000001\t2008-01-02\t2026-07-03\n"
-                "SH600000\t2009-01-05\t2026-07-03\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(FileNotFoundError, "formal Qlib Provider"):
-                module.ensure_csi300_instruments(
-                    provider, csi300_symbols=["000001", "600000"]
-                )
-
-            self.assertFalse((instruments_dir / "csi300.txt").exists())
 
     def test_experiment_file_lock_uses_cross_platform_adapter_and_unlocks_on_error(
         self,
@@ -1043,11 +733,8 @@ class TrainBaselineLgbTest(unittest.TestCase):
     def test_publication_forwards_isolated_result_output(self):
         module = load_module()
         identity = {
-            "provider_contract": "immutable_snapshot_v2",
-            "dataset_id": "qlib_ashare_v2",
-            "snapshot_id": "native-v2",
-            "content_sha256": "a" * 64,
-            "manifest_sha256": "b" * 64,
+            "backend": "qmt_native", "experiment_id": "native-experiment",
+            "bars_sha256": "a" * 64, "price_basis": "front", "input_dir": "/tmp/input",
         }
         result_output = Path("/tmp/candidate-result.json")
 
@@ -1058,7 +745,11 @@ class TrainBaselineLgbTest(unittest.TestCase):
             strategy = root / "candidate.yaml"
             source.write_text("task: {}\n", encoding="utf-8")
             runtime.write_text(
-                yaml.safe_dump({"task": {"dataset": {"kwargs": {"segments": {}}}, "record": []}}),
+                yaml.safe_dump({"task": {"dataset": {"kwargs": {"segments": {
+                    "train": ["2021-01-01", "2022-12-31"],
+                    "valid": ["2023-01-01", "2023-12-31"],
+                    "test": ["2024-01-01", "2024-12-31"],
+                }}}, "record": [], "time_semantics": {"label_future_sessions": 2}}}),
                 encoding="utf-8",
             )
             strategy.write_text("cost_bps: 15\nstrategies: []\n", encoding="utf-8")
@@ -1076,7 +767,7 @@ class TrainBaselineLgbTest(unittest.TestCase):
             ):
                 module.publish_training_result(
                     {"run_id": "candidate-run", "status": "completed"},
-                    provider="canonical",
+                    provider="qmt_native",
                     provider_uri=Path("/tmp/native-v2"),
                     expected_provider_identity=identity,
                     source_config=source,

@@ -46,3 +46,9 @@ def quant_data_root(root: Path | None = None) -> Path:
         return Path(configured).expanduser()
 
     return projects_root(root) / "quant_qmt_data" / "data"
+
+
+def qmt_dataset_dir() -> Path | None:
+    """The explicitly selected frozen input, separate from QMT's own cache."""
+    configured = os.environ.get("QMT_DATASET_DIR", "").strip()
+    return Path(configured).expanduser().resolve() if configured else None

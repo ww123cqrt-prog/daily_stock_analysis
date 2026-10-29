@@ -32,6 +32,8 @@ from src.services.quant_workflow_paths import (
     reports_root as resolve_reports_root,
     workflow_root as resolve_workflow_root,
 )
+from src.core.strategy_backtest import StrategyBacktestConfig, TargetAllocation, run_portfolio_backtest_view
+from src.services.script_universe_loader import load_market_view, load_benchmark_series
 
 
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -71,6 +73,11 @@ EXACT_METRIC_TOLERANCE = 1e-10
 SUPPORTED_REPLAY_ENGINES = {"qlib_portana", "dsa_optimized_strategy"}
 QLIB_EXACT_ARTIFACTS = ("pred.pkl", "label.pkl", "task")
 CUSTOM_REPLAY_ARTIFACTS = ("pred.pkl", "label.pkl")
+NATIVE_PREDICTION_STRATEGY = {
+    "id": "daily_prediction_topk",
+    "label": "每日预测 TopK（自定义，下一交易日开盘）",
+    "config": {"weighting": "equal", "execution": "next_trading_day_open", "cost_basis": "per_side_notional"},
+}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -329,6 +336,8 @@ class TrainedStrategyBacktestService:
         topk: int | None,
         cost_bps: float | None,
         replay_mode: str = "custom",
+        initial_capital: float = 1_000_000.0,
+        lot_size: int = 100,
     ) -> dict[str, Any]:
         if not RUN_ID_RE.fullmatch(run_id):
             raise ValueError("Run ID must contain exactly 32 lowercase hexadecimal characters")
@@ -361,6 +370,8 @@ class TrainedStrategyBacktestService:
         if not 0 <= float(cost_bps) <= 1000:
             raise ValueError("cost_bps must be between 0 and 1000")
 
+        native = selection["provider_identity"].get("backend") == "qmt_native"
+        execution_report = None
         source_replay_engine = str(
             selection.get("replay_engine") or "dsa_optimized_strategy"
         )
@@ -368,10 +379,10 @@ class TrainedStrategyBacktestService:
             replay_mode == "exact" and source_replay_engine == "qlib_portana"
         )
         replay_engine = (
-            "qlib_portana" if use_qlib_exact_replay else "dsa_optimized_strategy"
+            "dsa" if native else "qlib_portana" if use_qlib_exact_replay else "dsa_optimized_strategy"
         )
         report_artifact_sha256 = selection.get("artifact_sha256") or {}
-        required_artifacts = list(CUSTOM_REPLAY_ARTIFACTS)
+        required_artifacts = ["pred.pkl"] if native else list(CUSTOM_REPLAY_ARTIFACTS)
         if use_qlib_exact_replay:
             required_artifacts.append("task")
         expected_artifact_sha256 = {
@@ -386,23 +397,26 @@ class TrainedStrategyBacktestService:
             expected_provider_path=selection["provider_uri"],
             expected_artifact_sha256=expected_artifact_sha256["pred.pkl"],
         )
-        label, label_provenance = self._read_artifact(
-            selection["experiment_id"],
-            run_id,
-            "label.pkl",
-            expected_provider_identity=selection["provider_identity"],
-            expected_provider_path=selection["provider_uri"],
-            expected_artifact_sha256=expected_artifact_sha256["label.pkl"],
-        )
         pred_slice = _single_column(_slice_frame(pred, start_date, end_date), "score")
-        label_slice = _single_column(_slice_frame(label, start_date, end_date), "label")
-        if pred_slice.empty or label_slice.empty:
-            raise ValueError("The selected run has no prediction and label data in this date range")
-
-        artifact_sha256 = {
-            "pred.pkl": pred_provenance["artifact_sha256"],
-            "label.pkl": label_provenance["artifact_sha256"],
-        }
+        artifact_sha256 = {"pred.pkl": pred_provenance["artifact_sha256"]}
+        if native:
+            if pred_slice.empty:
+                raise ValueError("The selected run has no predictions in this date range")
+            execution_report, backtest, benchmark = self._native_prediction_backtest(
+                selection, pred_slice, start_date=start_date, end_date=end_date,
+                topk=int(topk), cost_bps=float(cost_bps), initial_capital=initial_capital, lot_size=lot_size,
+            )
+        else:
+            label, label_provenance = self._read_artifact(
+                selection["experiment_id"], run_id, "label.pkl",
+                expected_provider_identity=selection["provider_identity"],
+                expected_provider_path=selection["provider_uri"],
+                expected_artifact_sha256=expected_artifact_sha256["label.pkl"],
+            )
+            label_slice = _single_column(_slice_frame(label, start_date, end_date), "label")
+            if pred_slice.empty or label_slice.empty:
+                raise ValueError("The selected run has no prediction and label data in this date range")
+            artifact_sha256["label.pkl"] = label_provenance["artifact_sha256"]
         if use_qlib_exact_replay:
             task, task_provenance = self._read_pickle_artifact(
                 selection["experiment_id"],
@@ -423,7 +437,7 @@ class TrainedStrategyBacktestService:
             )
             backtest, benchmark = self._normalize_qlib_report(qlib_report)
             artifact_sha256["task"] = task_provenance["artifact_sha256"]
-        else:
+        elif not native:
             market = self.market_loader(
                 selection["provider_uri"], start_date, end_date
             ).copy()
@@ -490,7 +504,7 @@ class TrainedStrategyBacktestService:
                 }
             )
 
-        warnings: list[str] = []
+        warnings: list[str] = list(execution_report["warnings"]) if native else []
         actual_start = equity_curve[0]["date"]
         actual_end = equity_curve[-1]["date"]
         if actual_start != start_date or actual_end != end_date:
@@ -498,7 +512,7 @@ class TrainedStrategyBacktestService:
                 f"The saved run contains evaluable trading days from {actual_start} to {actual_end}."
             )
 
-        return {
+        result = {
             "status": "completed",
             "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "run_id": run_id,
@@ -558,6 +572,82 @@ class TrainedStrategyBacktestService:
             "equity_curve": equity_curve,
             "warnings": warnings,
         }
+        if native:
+            result.update(execution_report=execution_report,
+                time_semantics=selection["contract"]["time_semantics"], strategy_frozen=False)
+            result["parameters"].update(initial_capital=initial_capital, lot_size=lot_size)
+        return result
+
+    def _native_prediction_backtest(
+        self, selection: dict[str, Any], predictions: pd.DataFrame, *,
+        start_date: str, end_date: str, topk: int, cost_bps: float,
+        initial_capital: float, lot_size: int,
+    ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series]:
+        """Use saved scores for selection and frozen OHLC for actual DSA fills."""
+        if "instrument" not in predictions.index.names or predictions.index.has_duplicates:
+            raise ValueError("Native predictions require unique datetime/instrument rows")
+        scores = predictions.reset_index()
+        scores["score"] = pd.to_numeric(scores["score"], errors="raise")
+        symbols = sorted(scores["instrument"].unique())
+        directory = selection["provider_uri"]
+        view, metadata = load_market_view("custom", custom_symbols=symbols,
+            quant_data_root=directory, start=start_date, end=end_date,
+            cache_dir=self.reports_root / "cache" / "trained_replay")
+        benchmarks = load_benchmark_series(["SH000300"], input_dir=directory,
+            start=start_date, end=end_date)
+        positions = {day: i for i, day in enumerate(view.calendar)}
+        allocations = []
+        for timestamp, group in scores.groupby("datetime", sort=True):
+            day = pd.Timestamp(timestamp).date()
+            if day not in positions:
+                raise ValueError("Prediction date is outside the saved trading calendar")
+            available = view.members_on(positions[day])
+            ranked = group.loc[group.instrument.isin(available) & np.isfinite(group.score)]
+            chosen = ranked.sort_values(["score", "instrument"], ascending=[False, True]).head(topk)
+            if chosen.empty:
+                continue
+            allocations.append(TargetAllocation(
+                source_id=f"prediction-{day.isoformat()}", signal_date=day,
+                target_weights={symbol: 1.0 / len(chosen) for symbol in chosen.instrument},
+                reason="Saved daily prediction TopK; custom research strategy",
+            ))
+        config = StrategyBacktestConfig(initial_capital=initial_capital,
+            side_cost_pct=cost_bps / 100.0, lot_size=lot_size)
+        ledger = run_portfolio_backtest_view(strategy_name=NATIVE_PREDICTION_STRATEGY["id"],
+            allocations=allocations, view=view, config=config, benchmarks=benchmarks,
+            period_start=pd.Timestamp(start_date).date(), period_end=pd.Timestamp(end_date).date())
+        if ledger["status"] != "completed":
+            raise ValueError("The selected predictions have no executable next-trading-day targets")
+        comparison = ledger["comparisons"].get("SH000300")
+        if comparison is None or any(value is None for value in comparison["equity"]):
+            raise ValueError("SH000300 benchmark is missing selected trading days in the frozen input")
+        assumptions = {**ledger["assumptions"], "execution": "next_trading_day_open",
+            "price_basis": metadata["price_basis"], "execution_basis": "research_price_simulation",
+            "quantity_basis": "simulated_units_at_selected_price", "cost_basis": "per_side_notional",
+            "volume_units": metadata["volume_units"], "read_at": metadata["read_at"],
+            "summary_benchmark": "SH000300", "benchmark_basis": "saved_close_buy_and_hold"}
+        ledger["assumptions"] = assumptions
+        selection["execution_assumptions"] = assumptions
+        # Adapt the cash ledger to the existing trained-Run summary fields;
+        # the complete engine report remains available without losing fills.
+        trades_by_day: dict[str, list] = {}
+        for trade in ledger["trades"]:
+            trades_by_day.setdefault(trade["execution_date"], []).append(trade)
+        rows = []
+        cash = previous = float(initial_capital)
+        previous_benchmark = float(initial_capital)
+        for point, benchmark_equity in zip(ledger["equity_curve"], comparison["equity"], strict=True):
+            turnover = 0.0
+            for trade in trades_by_day.get(point["date"], []):
+                cash += (trade["notional"] if trade["action"] == "sell" else -trade["notional"]) - trade["fee"]
+                turnover += trade["notional"] / initial_capital
+            equity = point["strategy_equity"]
+            rows.append(dict(date=pd.Timestamp(point["date"]),
+                **{"return": equity / previous - 1.0}, turnover=turnover,
+                position_pct=(equity - cash) / equity, benchmark_return=benchmark_equity / previous_benchmark - 1.0))
+            previous, previous_benchmark = equity, benchmark_equity
+        backtest = pd.DataFrame(rows).set_index("date")
+        return ledger, backtest, backtest["benchmark_return"]
 
     @staticmethod
     def _normalize_qlib_report(
@@ -780,11 +870,11 @@ class TrainedStrategyBacktestService:
         ):
             return None
         contract = self._validated_replay_contract(report.get("replay_contract"))
-        strategies = (
-            list(contract["strategies"])
-            if contract is not None
-            else [self._legacy_baseline_strategy(report)]
-        )
+        native = (report.get("provider_identity") or {}).get("backend") == "qmt_native"
+        if native:
+            strategies = [NATIVE_PREDICTION_STRATEGY] if contract and contract["contract_version"] == 3 else []
+        else:
+            strategies = list(contract["strategies"]) if contract is not None else [self._legacy_baseline_strategy(report)]
         return self._catalog_row(
             report=report,
             run_id=run_id,
@@ -795,7 +885,7 @@ class TrainedStrategyBacktestService:
             strategies=strategies,
             artifact_sha256=report.get("artifact_sha256"),
             original_parameters=(
-                dict(contract["original_parameters"])
+                {} if native else dict(contract["original_parameters"])
                 if contract is not None
                 else self._legacy_baseline_parameters(report)
             ),
@@ -875,10 +965,11 @@ class TrainedStrategyBacktestService:
         original_parameters: dict[str, Any],
     ) -> dict[str, Any]:
         identity = _sanitized_provider_identity(report.get("provider_identity"))
+        native = (report.get("provider_identity") or {}).get("backend") == "qmt_native"
         provider_complete = provider_lineage_is_complete(identity)
         artifact_hashes_complete = self._artifact_hashes_complete(
             artifact_sha256,
-            CUSTOM_REPLAY_ARTIFACTS,
+            ("pred.pkl",) if native else CUSTOM_REPLAY_ARTIFACTS,
         )
         custom_available = provider_complete and bool(strategies) and artifact_hashes_complete
         exact_strategy_ids = (
@@ -891,7 +982,7 @@ class TrainedStrategyBacktestService:
                 **strategy,
                 "exact_replay_available": strategy.get("id") in exact_strategy_ids,
                 "replay_engine": (
-                    contract.get("replay_engine")
+                    "dsa" if native else contract.get("replay_engine")
                     if contract is not None
                     and strategy.get("id") in exact_strategy_ids
                     else "dsa_optimized_strategy"
@@ -905,7 +996,9 @@ class TrainedStrategyBacktestService:
             reason = None
         elif custom_available:
             capability = "custom_only"
-            if (
+            if native:
+                reason = "该 Run 仅保存预测；日期、TopK 和每边成本由本次选择，未冻结交易策略，不能精确重放。"
+            elif (
                 source_type == "candidate"
                 or (
                     contract is not None
@@ -930,7 +1023,8 @@ class TrainedStrategyBacktestService:
         else:
             capability = "unavailable"
             if provider_complete and strategies and not artifact_hashes_complete:
-                reason = "该 Run 缺少冻结的 pred.pkl 或 label.pkl 哈希，不能回测。"
+                reason = ("该 Run 缺少冻结的 pred.pkl 哈希，不能回测。" if native
+                          else "该 Run 缺少冻结的 pred.pkl 或 label.pkl 哈希，不能回测。")
             else:
                 reason = (
                     "该 Run 缺少不可变数据身份或冻结交易策略配置，不能回测。"
@@ -965,13 +1059,23 @@ class TrainedStrategyBacktestService:
 
     @classmethod
     def _validated_replay_contract(cls, value: Any) -> dict[str, Any] | None:
-        if not isinstance(value, dict) or value.get("contract_version") not in {1, 2}:
+        if not isinstance(value, dict) or value.get("contract_version") not in {1, 2, 3}:
             return None
         config_hash = str(value.get("config_hash") or "")
         if not re.fullmatch(r"[0-9a-f]{64}", config_hash):
             return None
         if _contract_hash(value) != config_hash:
             return None
+        if value["contract_version"] == 3:
+            periods = _safe_periods(value.get("periods"))
+            semantics = value.get("time_semantics")
+            if (value.get("replay_engine") != "dsa" or value.get("exact_strategy_ids") != []
+                    or value.get("purpose") != "data_engineering_acceptance" or not periods.get("test")
+                    or not isinstance(semantics, dict)
+                    or semantics.get("order_execution") != "next_trading_day_open"):
+                return None
+            return {**value, "periods": periods, "strategies": [], "original_parameters": {},
+                    "replay_capability": "custom_only"}
         parameters = cls._sanitized_original_parameters(value.get("original_parameters"))
         if not parameters.get("start_date") or not parameters.get("end_date"):
             return None
@@ -1184,13 +1288,16 @@ class TrainedStrategyBacktestService:
                 raise ValueError("Run is not available in the current training results")
             experiment_id = str(report.get("experiment_id") or "")
             self._validate_experiment_id(experiment_id)
-            normalized_strategy_id = "baseline_daily" if strategy_id == "qlib_default" else strategy_id
+            native = (report.get("provider_identity") or {}).get("backend") == "qmt_native"
             contract = self._validated_replay_contract(report.get("replay_contract"))
-            available_strategies = (
-                contract["strategies"]
-                if contract is not None
-                else [self._legacy_baseline_strategy(report)]
-            )
+            if native:
+                if contract is None or contract["contract_version"] != 3:
+                    raise ValueError("Native prediction Run does not contain a valid v3 contract")
+                normalized_strategy_id = strategy_id
+                available_strategies = [NATIVE_PREDICTION_STRATEGY]
+            else:
+                normalized_strategy_id = "baseline_daily" if strategy_id == "qlib_default" else strategy_id
+                available_strategies = contract["strategies"] if contract is not None else [self._legacy_baseline_strategy(report)]
             strategy = next(
                 (
                     item
@@ -1213,7 +1320,7 @@ class TrainedStrategyBacktestService:
                 "provider_identity": dict(report["provider_identity"]),
                 "exact_replay_available": normalized_strategy_id in exact_strategy_ids,
                 "replay_engine": (
-                    contract.get("replay_engine")
+                    "dsa" if native else contract.get("replay_engine")
                     if contract is not None
                     and normalized_strategy_id in exact_strategy_ids
                     else "dsa_optimized_strategy"
@@ -1232,7 +1339,7 @@ class TrainedStrategyBacktestService:
                     else {}
                 ),
                 "original_parameters": (
-                    contract["original_parameters"]
+                    {} if native else contract["original_parameters"]
                     if contract is not None
                     else self._legacy_baseline_parameters(report)
                 ),
@@ -1368,6 +1475,8 @@ class TrainedStrategyBacktestService:
             )
         try:
             lineage = normalize_provider_lineage(identity)
+            if lineage.get("backend") == "qmt_native" and identity.get("input_dir"):
+                lineage["input_dir"] = identity["input_dir"]
             return Path(
                 self.provider_resolver(lineage, self.quant_data_root)
             ).resolve()

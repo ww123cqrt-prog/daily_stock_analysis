@@ -21,38 +21,21 @@ describe('DataPage', () => {
     getDataStatus.mockReset();
     getDataStatus.mockResolvedValue({
       status: 'ready',
-      availableDatasets: 2,
-      backend: "quant_qmt_data",
-      validationScope: "snapshot_metadata",
+      availableDatasets: 1,
+      backend: "qmt_native",
+      validationScope: "frozen_experiment",
       checkedAt: '2026-08-11T03:30:00Z',
-      datasets: [
-        {
-          datasetId: 'ashare_daily_qfq',
-          snapshotId: 'ashare-snapshot-1',
-          manifestSha256: 'a'.repeat(64),
-          contentSha256: 'b'.repeat(64),
-          latestTradeDate: '2026-08-04',
-          priceBasis: 'qfq',
-          dataKind: 'daily_bars',
-          role: 'canonical',
-          status: 'ready',
-        },
-        {
-          datasetId: 'cn_etf_daily',
-          snapshotId: 'etf-snapshot-1',
-          manifestSha256: 'c'.repeat(64),
-          contentSha256: 'd'.repeat(64),
-          latestTradeDate: '2026-08-07',
-          priceBasis: 'qfq',
-          dataKind: 'paired_daily_bars',
-          role: 'canonical',
-          status: 'ready',
-        },
-      ],
+      datasets: [],
+      sdk: { status: 'not_checked', requiredForOffline: false },
+      experiment: { experimentId: 'qmt-input-one', barsSha256: 'a'.repeat(64),
+        priceBasis: 'front', actualStart: '2026-06-01', actualEnd: '2026-08-07',
+        calendarStart: '2026-06-01', calendarEnd: '2026-08-07', calendarDays: 50,
+        universeKind: 'current', symbolCount: 2, rows: 100, missingSymbols: [],
+        volumeUnits: { SH600519: 'shares', SH510300: 'units' } },
     });
   });
 
-  it('renders lightweight local metadata and immutable snapshot identities', async () => {
+  it('renders frozen experiment coverage independently of live QMT', async () => {
     render(
       <UiLanguageProvider>
         <DataPage />
@@ -60,13 +43,11 @@ describe('DataPage', () => {
     );
 
     expect(await screen.findByRole('heading', { name: '数据状态' })).toBeInTheDocument();
-    expect(screen.getByText('2 个可用数据集')).toBeInTheDocument();
-    expect(screen.getByText('A股前复权日线')).toBeInTheDocument();
-    expect(screen.getByText('ETF 日线')).toBeInTheDocument();
-    expect(screen.getByText(/quant_qmt_data 本机快照/)).toBeInTheDocument();
-    expect(screen.getByText(/不是全库质量检查/)).toBeInTheDocument();
-    expect(screen.getByText('ashare-snapshot-1')).toBeInTheDocument();
-    expect(screen.getByText('etf-snapshot-1')).toBeInTheDocument();
+    expect(screen.getByText('qmt-input-one')).toBeInTheDocument();
+    expect(screen.getByText(/2 个标的/)).toBeInTheDocument();
+    expect(screen.getByText(/当前列表/)).toBeInTheDocument();
+    expect(screen.getByText(/无需连接 QMT/)).toBeInTheDocument();
+    expect(screen.getByText('a'.repeat(64))).toBeInTheDocument();
     expect(screen.queryByText('旧数据任务中心')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /下载|发布|构建/ })).not.toBeInTheDocument();
     await waitFor(() => expect(getDataStatus).toHaveBeenCalledTimes(1));

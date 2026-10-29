@@ -207,6 +207,27 @@ def test_run_generic_strategy_backtest_passes_strategy_and_symbols() -> None:
     assert kwargs["top_n"] == 1
 
 
+def test_successful_backtest_hides_internal_input_paths() -> None:
+    temp_dir, client = _client()
+    try:
+        report = _report()
+        report["data_quality"].update(input_dir="D:/private-input/frozen",
+            provider_config="C:/private-source/model.yaml", experiment_id="input-1")
+        with patch("api.v1.endpoints.backtest.BacktestService") as service_cls:
+            service_cls.return_value.run_strategy.return_value = report
+            response = client.post("/api/v1/backtest/strategy/run", json={
+                "strategy_id": "buy_and_hold", "symbols": ["159915"],
+                "start_date": "2026-08-20", "end_date": "2026-08-21",
+            })
+    finally:
+        temp_dir.cleanup()
+    assert response.status_code == 200
+    assert response.json()["data_quality"]["experiment_id"] == "input-1"
+    assert "input_dir" not in response.text
+    assert "private-input" not in response.text
+    assert "private-source" not in response.text
+
+
 def test_form_backtest_returns_strict_coverage_conflict() -> None:
     temp_dir, client = _client()
     try:
@@ -303,6 +324,8 @@ def test_run_trained_strategy_backtest_passes_the_human_selected_run_and_paramet
         end_date="2025-12-31",
         topk=50,
         cost_bps=15.0,
+        initial_capital=1_000_000.0,
+        lot_size=100,
     )
 
 
@@ -385,6 +408,8 @@ def test_exact_replay_does_not_require_browser_backtest_parameters() -> None:
         end_date=None,
         topk=None,
         cost_bps=None,
+        initial_capital=1_000_000.0,
+        lot_size=100,
     )
 
 

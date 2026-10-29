@@ -82,7 +82,7 @@ def _experiment_by_name(client, experiment_name: str):
 
 
 def resolve_data_dir(data_dir: Path | None = None) -> Path:
-    return Path(data_dir) if data_dir is not None else qlib_workflow_provider_uri()
+    return Path(data_dir) if data_dir is not None else qlib_workflow_provider_uri("canonical")
 
 
 def init_qlib(data_dir: Path | None = None):

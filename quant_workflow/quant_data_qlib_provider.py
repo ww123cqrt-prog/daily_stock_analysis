@@ -1,4 +1,4 @@
-"""Qlib providers that read governed ``quant_data`` Parquet snapshots directly.
+"""Qlib storage for frozen QMT inputs and existing DSA Parquet descriptors.
 
 The adapter keeps Qlib's expression, dataset, model, and backtest layers.  It
 only replaces the storage-facing calendar, instrument, and feature providers.
@@ -28,14 +28,24 @@ from qlib.data.data import (
     LocalProvider,
 )
 
-from quant_qmt_data.quant_data_contract import (
-    _committed_snapshot_path,
+from quant_workflow.qmt_native_provider import (
+    DirectProviderError,
+    QMTNativeCalendarProvider,
+    QMTNativeInstrumentProvider,
+    QMTNativeFeatureProvider,
+    QMTNativeOHLCV,
+    _load_input,
+    _clear_context_cache,
+)
+
+from quant_workflow.scripts.quant_data_contract import (
     DataContractError,
     ResolvedDataset,
     ResolvedDatasetArtifact,
     resolve_dataset,
     resolve_dataset_artifact,
     sha256_file,
+    validate_latest_pointer,
 )
 
 
@@ -91,10 +101,6 @@ CLEANING_EVENT_FIELDS = (
     "pctChg",
 )
 QLIB_REQUIRED_FIELDS = ("open", "close", "high", "low", "volume")
-
-
-class DirectProviderError(RuntimeError):
-    """Raised when a direct provider cannot prove or read its frozen input."""
 
 
 @dataclass(frozen=True)
@@ -815,26 +821,20 @@ def _current_dataset_identity(
     entry = datasets.get(dataset_id) if isinstance(datasets, dict) else None
     if not isinstance(entry, dict):
         raise DirectProviderError(f"dataset is not registered: {dataset_id}")
-    if (
-        entry.get("status") != "ready"
-        or entry.get("price_basis") != expected_price_basis
-    ):
-        raise DirectProviderError(
-            f"formal {expected_price_basis} dataset is not ready: {dataset_id}"
-        )
+    if entry.get("status") != "ready" or entry.get("price_basis") != expected_price_basis:
+        raise DirectProviderError(f"formal {expected_price_basis} dataset is not ready: {dataset_id}")
+    pointer_path = _safe_child(root, entry.get("latest_pointer"), "catalog latest pointer")
     try:
-        snapshot = _committed_snapshot_path(root, entry)
+        pointer, snapshot = validate_latest_pointer(
+            pointer_path, quant_data_root=root, expected_dataset_id=dataset_id
+        )
     except DataContractError as exc:
         raise DirectProviderError(str(exc)) from exc
-    manifest_path = snapshot / "DATASET_MANIFEST.json"
-    manifest = _read_json(manifest_path, "latest snapshot manifest")
-    for field in (
-        "dataset_id",
-        "snapshot_id",
-        "content_sha256",
-        "price_basis",
-        "status",
-    ):
+    if (entry.get("snapshot_id") != pointer.get("snapshot_id")
+            or entry.get("snapshot_manifest_sha256") != pointer.get("manifest_sha256")):
+        raise DirectProviderError("catalog and latest snapshot pointer disagree")
+    manifest = _read_json(snapshot / "DATASET_MANIFEST.json", "latest snapshot manifest")
+    for field in ("dataset_id", "snapshot_id", "content_sha256", "price_basis", "status"):
         if manifest.get(field) != entry.get(field):
             raise DirectProviderError(f"catalog and snapshot disagree on {field}")
     return dict(entry), snapshot
@@ -1259,8 +1259,15 @@ def _merge_spans(spans: Sequence[tuple[pd.Timestamp, pd.Timestamp]]) -> list[tup
 class QuantDataCalendarProvider(CalendarProvider):
     """Expose the frozen snapshot's derived day calendar to Qlib."""
 
-    def __init__(self, *, descriptor_path: str | Path, quant_data_root: str | Path):
+    def __init__(self, *, descriptor_path: str | Path | None = None,
+                 quant_data_root: str | Path | None = None, input_dir: str | Path | None = None):
         super().__init__()
+        self._native = None
+        if input_dir is not None:
+            if descriptor_path is not None or quant_data_root is not None:
+                raise DirectProviderError("Choose input_dir or a DSA descriptor, not both input formats")
+            self._native = QMTNativeCalendarProvider(input_dir=input_dir)
+            return
         self._context = _load_descriptor(descriptor_path, quant_data_root)
 
     @property
@@ -1268,6 +1275,8 @@ class QuantDataCalendarProvider(CalendarProvider):
         return self._context.snapshot_path
 
     def load_calendar(self, freq, future):
+        if self._native is not None:
+            return self._native.load_calendar(freq, future)
         if str(freq).lower() not in {"day", "1d"}:
             raise DirectProviderError("direct provider currently supports day frequency only")
         # Qlib's historical executor requests future=True too. It may use the
@@ -1278,8 +1287,15 @@ class QuantDataCalendarProvider(CalendarProvider):
 class QuantDataInstrumentProvider(InstrumentProvider):
     """Map Qlib stock-pool requests to quant_data point-in-time intervals."""
 
-    def __init__(self, *, descriptor_path: str | Path, quant_data_root: str | Path):
+    def __init__(self, *, descriptor_path: str | Path | None = None,
+                 quant_data_root: str | Path | None = None, input_dir: str | Path | None = None):
         super().__init__()
+        self._native = None
+        if input_dir is not None:
+            if descriptor_path is not None or quant_data_root is not None:
+                raise DirectProviderError("Choose input_dir or a DSA descriptor, not both input formats")
+            self._native = QMTNativeInstrumentProvider(input_dir=input_dir)
+            return
         self._context = _load_descriptor(descriptor_path, quant_data_root)
         excluded = set(
             self._context.cleaning.get("plan", {}).get("excluded_symbols", [])
@@ -1352,6 +1368,8 @@ class QuantDataInstrumentProvider(InstrumentProvider):
         freq="day",
         as_list=False,
     ):
+        if self._native is not None:
+            return self._native.list_instruments(instruments, start_time, end_time, freq, as_list)
         if str(freq).lower() not in {"day", "1d"}:
             raise DirectProviderError("direct provider currently supports day frequency only")
         calendar = self._context.calendar
@@ -1446,11 +1464,18 @@ class QuantDataFeatureProvider(FeatureProvider):
     def __init__(
         self,
         *,
-        descriptor_path: str | Path,
-        quant_data_root: str | Path,
+        descriptor_path: str | Path | None = None,
+        quant_data_root: str | Path | None = None,
+        input_dir: str | Path | None = None,
         max_cached_instruments: int = 8,
     ):
         super().__init__()
+        self._native = None
+        if input_dir is not None:
+            if descriptor_path is not None or quant_data_root is not None:
+                raise DirectProviderError("Choose input_dir or a DSA descriptor, not both input formats")
+            self._native = QMTNativeFeatureProvider(input_dir=input_dir)
+            return
         self._context = _load_descriptor(descriptor_path, quant_data_root)
         self._rows = {
             str(row.symbol): row
@@ -1526,21 +1551,17 @@ class QuantDataFeatureProvider(FeatureProvider):
             raise DirectProviderError(f"instrument is not in frozen snapshot: {symbol}")
         if snapshot is None:
             raise DirectProviderError(f"instrument is not in frozen snapshot: {symbol}")
-        # Qlib's pool/cleaning behavior stays in this consumer. The package
-        # owns frozen price resolution, byte validation and unit conversion.
-        from quant_qmt_data import DataContractError as PackageError, read_bars
-        spec = self._context.descriptor[
-            "dataset" if symbol in self._rows else "index_dataset"]
-        identity = {key: spec[key] for key in (
-            "dataset_id", "snapshot_id", "snapshot_path", "manifest_sha256",
-            "content_sha256", "latest_trade_date", "file_index_sha256")}
-        try:
-            frame = read_bars(
-                spec["dataset_id"], symbol, quant_data_root=self._context.quant_data_root,
-                expected_identity=identity,
-                volume_unit="native" if spec["dataset_id"] == "cn_index_daily" else "base")
-        except (PackageError, ValueError, OSError) as exc:
-            raise DirectProviderError(f"cannot read bar file {symbol}: {exc}") from exc
+        # Read the selected DSA file in its own declared units, without routing
+        # through the retired package or reinterpreting it as a QMT input.
+        path = _safe_snapshot_child(snapshot, row.relative_path, "bar path")
+        _validate_file_hash(path, row.sha256, f"bar file {symbol}")
+        frame = pd.read_parquet(path)
+        if symbol in self._rows and "volume" in frame:
+            source_unit = (self._context.manifest.get("source") or {}).get("volume_unit", "shares")
+            if source_unit in {"lots", "lot_100_shares_rounded"}:
+                frame["volume"] = pd.to_numeric(frame["volume"]).astype(float) * 100
+            elif source_unit not in {"shares", "units"}:
+                raise DirectProviderError(f"cannot convert volume unit {source_unit!r} for {symbol}")
         if "date" not in frame.columns:
             raise DirectProviderError(f"bar file has no date column: {symbol}")
         dates = pd.DatetimeIndex(pd.to_datetime(frame["date"], errors="coerce")).normalize()
@@ -1625,6 +1646,8 @@ class QuantDataFeatureProvider(FeatureProvider):
         return result
 
     def feature(self, instrument, field, start_index, end_index, freq):
+        if self._native is not None:
+            return self._native.feature(instrument, field, start_index, end_index, freq)
         if str(freq).lower() not in {"day", "1d"}:
             raise DirectProviderError("direct provider currently supports day frequency only")
         symbol = _normalize_symbol(instrument)
@@ -1696,10 +1719,18 @@ class QuantDataProvider(LocalProvider):
 
 def qlib_direct_init_config(
     *,
-    descriptor_path: str | Path,
-    quant_data_root: str | Path,
+    input_dir: str | Path | None = None,
+    descriptor_path: str | Path | None = None,
+    quant_data_root: str | Path | None = None,
     kernels: int | None = None,
 ) -> dict[str, Any]:
+    if input_dir is not None:
+        if descriptor_path is not None or quant_data_root is not None:
+            raise DirectProviderError("Choose input_dir or a DSA descriptor, not both input formats")
+        from quant_workflow.qmt_native_provider import qlib_direct_init_config as native_config
+        return native_config(input_dir=input_dir, kernels=kernels)
+    if descriptor_path is None or quant_data_root is None:
+        raise DirectProviderError("Set input_dir for QMT or descriptor_path and quant_data_root for an existing DSA input")
     root = Path(quant_data_root).expanduser().resolve()
     descriptor = _descriptor_file(descriptor_path, root)
     _load_descriptor(descriptor, root)
@@ -1753,19 +1784,16 @@ def qlib_direct_init_config(
 
 def init_qlib_from_quant_data(
     *,
-    descriptor_path: str | Path,
-    quant_data_root: str | Path,
+    input_dir: str | Path | None = None,
+    descriptor_path: str | Path | None = None,
+    quant_data_root: str | Path | None = None,
     kernels: int | None = None,
     **overrides: Any,
 ) -> None:
-    """Initialize Qlib without converting Parquet market data to ``.bin``."""
-
+    """Initialize Qlib from one explicit frozen QMT input or original DSA descriptor."""
     import qlib
-
-    config = qlib_direct_init_config(
-        descriptor_path=descriptor_path,
-        quant_data_root=quant_data_root,
-        kernels=kernels,
-    )
+    _clear_context_cache()
+    config = qlib_direct_init_config(input_dir=input_dir, descriptor_path=descriptor_path,
+                                    quant_data_root=quant_data_root, kernels=kernels)
     config.update(overrides)
     qlib.init(default_conf="client", **config)
