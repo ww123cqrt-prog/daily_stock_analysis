@@ -54,7 +54,7 @@ def normalize_provider_lineage(identity: Mapping[str, Any]) -> dict[str, str]:
         normalized = {field: str(identity.get(field) or "") for field in PROVIDER_IDENTITY_FIELDS}
         if (not normalized["experiment_id"]
                 or any(not SHA256_RE.fullmatch(normalized[field]) for field in ("bars_sha256", "inputs_sha256"))
-                or normalized["price_basis"] not in ("none", "front", "back")):
+                or normalized["price_basis"] not in ("none", "front", "back", "front_ratio", "back_ratio")):
             raise RunProvenanceError("QMT provider lineage is incomplete or invalid (including inputs_sha256)")
         return normalized
 

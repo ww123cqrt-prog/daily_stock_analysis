@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] Mac 可从 HOME QMT 原生镜像离线冻结研究输入，沿用网页、Qlib 和回测入口；股票/ETF 可分别保留复权选择，跨口径基准明确拒绝，旧行情库不自动参与回退。见 [Mac 镜像使用](mac-qmt-mirror.md)。
+
 - [改进] QMT 数据主线改为官方 SDK 本地只读与完整实验输入，接入 Qlib 训练和 DSA 回测；退役旧补数、校正、发布及对应失效测试，保留原策略和实验资产。
 
 - [修复] 策略保存只校验名称和脚本，回测日期在运行时校验；Qlib 训练与结果读取显式共用标准 MLflow 文件 URI，首次实验由同一客户端创建，避免井号和字面量百分号路径产生错误的锁目录。

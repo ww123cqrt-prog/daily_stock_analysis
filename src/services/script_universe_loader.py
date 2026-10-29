@@ -35,6 +35,28 @@ def _normalize_ashare_symbol(value: str) -> str:
     return normalize_market_symbol(value)
 
 
+def _research_adjustment(client, selected, *, benchmarks=()):
+    """Keep deployment stock/ETF conventions without mixing bases in one input."""
+    from quant_qmt_data.reader import ADJUSTMENTS
+    default = os.environ.get('QMT_ADJUSTMENT', 'front')
+    stock = os.environ.get('QMT_STOCK_ADJUSTMENT', default)
+    etf = os.environ.get('QMT_ETF_ADJUSTMENT', default)
+    if stock not in ADJUSTMENTS or etf not in ADJUSTMENTS:
+        raise ValueError('Unsupported configured QMT research adjustment')
+    if stock == etf:
+        return stock
+    types = client.instrument_types(list(dict.fromkeys([*selected, *benchmarks])))
+    modes = {etf if types.get(symbol, {}).get('etf') else stock
+             for symbol in selected}
+    # Index benchmarks are neutral; a stock/ETF benchmark retains its own basis.
+    modes.update(etf if types[symbol].get('etf') else stock
+                 for symbol in benchmarks
+                 if types.get(symbol, {}).get('etf') or types.get(symbol, {}).get('stock'))
+    if len(modes) != 1:
+        raise ValueError('Different stock/ETF bases require separate inputs; mixed bases are not allowed')
+    return modes.pop()
+
+
 def load_market_input(*, quant_data_root=None, pool="custom", custom_symbols=None,
                       start=None, end=None, benchmark_symbols=()):
     """Load a selected input, or freeze one live request when none is configured.
@@ -65,7 +87,8 @@ def load_market_input(*, quant_data_root=None, pool="custom", custom_symbols=Non
         if pool in {"custom", "all_a"} and "SZ399006" not in selected + benchmarks:
             benchmarks.append("SZ399006")
         symbols = list(dict.fromkeys(selected + benchmarks))
-        bars = client.read_bars(symbols, start=start, end=end, adjustment="front", volume_unit="base")
+        adjustment = _research_adjustment(client, selected, benchmarks=benchmarks)
+        bars = client.read_bars(symbols, start=start, end=end, adjustment=adjustment, volume_unit="base")
         calendar = sorted({pd.Timestamp(day).date().isoformat()
                            for market in sorted({symbol[:2] for symbol in symbols})
                            for day in client.trading_dates(market, start=start, end=end)})
