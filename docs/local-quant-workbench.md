@@ -4,7 +4,7 @@
 
 ## 一句话架构
 
-Mac 的原生镜像接入与新旧数据边界见 [Mac QMT 镜像使用](mac-qmt-mirror.md)。镜像与冻结实验输入均不自动回退旧库。
+Mac 的远程 SDK 接入与新旧数据边界见 [Mac QMT 使用](mac-qmt-mirror.md)。固定实验输入不自动回退旧库；HOME 本机默认流程保持不变。
 
 当前主线是：QMT 下载维护行情，`quant_qmt_data` 通过官方 SDK 只读本地库并冻结本次实验输入，Qlib 训练和预测，DSA 回测与展示；MLflow 保存实验记录，页面通过 DSA `/experiments/` 访问。数据包不再提供补数、复权校正、发布或保留管理。`china-astock-quant`、实时观察及 CatDesk 继续作为独立参考能力。
 

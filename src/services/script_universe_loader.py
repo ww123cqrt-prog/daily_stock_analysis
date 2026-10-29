@@ -89,6 +89,9 @@ def load_market_input(*, quant_data_root=None, pool="custom", custom_symbols=Non
         symbols = list(dict.fromkeys(selected + benchmarks))
         adjustment = _research_adjustment(client, selected, benchmarks=benchmarks)
         bars = client.read_bars(symbols, start=start, end=end, adjustment=adjustment, volume_unit="base")
+        unresolved=[item['symbol'] for item in bars.attrs.get('download_attempts',[]) if item['status']=='no_rows']
+        if unresolved:
+            raise MarketDataUnavailable('QMT补缺后窗口仍无行情，原因未确认：'+', '.join(sorted(set(unresolved))))
         calendar = sorted({pd.Timestamp(day).date().isoformat()
                            for market in sorted({symbol[:2] for symbol in symbols})
                            for day in client.trading_dates(market, start=start, end=end)})

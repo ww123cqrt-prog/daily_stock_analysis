@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] Mac 新输入可通过 SSH 调用 HOME 官方 SDK，由 QMT 按显式开关补缺并写入 HOME 原生库；HOME 本机默认只读流程不变，固定实验仍离线复用，补后无行情不冒充完整输入。
+
 - [改进] Mac 可从 HOME QMT 原生镜像离线冻结研究输入，沿用网页、Qlib 和回测入口；股票/ETF 可分别保留复权选择，跨口径基准明确拒绝，旧行情库不自动参与回退。见 [Mac 镜像使用](mac-qmt-mirror.md)。
 
 - [改进] QMT 数据主线改为官方 SDK 本地只读与完整实验输入，接入 Qlib 训练和 DSA 回测；退役旧补数、校正、发布及对应失效测试，保留原策略和实验资产。

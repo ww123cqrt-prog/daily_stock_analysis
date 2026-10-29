@@ -50,3 +50,18 @@ def test_etf_with_neutral_index_benchmark_keeps_cash_basis(monkeypatch):
     client=SimpleNamespace(instrument_types=lambda symbols:{
         'SH510300':{'etf':True},'SZ399006':{'index':True}})
     assert loader._research_adjustment(client,['SH510300'],benchmarks=['SZ399006'])=='front'
+
+
+def test_unresolved_remote_download_is_not_frozen_as_a_complete_input(monkeypatch):
+    import pandas as pd
+    from src.services import script_universe_loader as loader
+    monkeypatch.delenv('QMT_DATASET_DIR',raising=False)
+    frame=pd.DataFrame([dict(symbol='SH600519',date=pd.Timestamp('2024-01-02'))])
+    frame.attrs['download_attempts']=[dict(symbol='SH600519',status='no_rows')]
+    client=SimpleNamespace(read_bars=lambda *a,**kw:frame,
+        instrument_types=lambda codes:{'SH600519':{'stock':True}})
+    monkeypatch.setattr(loader.QMTClient,'from_env',lambda:client)
+    def forbidden(*a,**kw):raise AssertionError('Unresolved input must not be frozen')
+    monkeypatch.setattr(loader,'save_dataset',forbidden)
+    with pytest.raises(loader.MarketDataUnavailable,match='SH600519'):
+        loader.load_market_input(pool='custom',custom_symbols=['SH600519'],start='2024-01-02',end='2024-01-05')

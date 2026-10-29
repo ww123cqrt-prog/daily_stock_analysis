@@ -6,7 +6,7 @@
 
 | 我想要 | 先看 | 继续看 |
 | --- | --- | --- |
-| Mac 离线使用 HOME QMT 行情 | [Mac QMT 原生镜像](mac-qmt-mirror.md) | [本地量化工作台](local-quant-workbench.md) |
+| Mac 使用 HOME QMT 行情 | [Mac QMT 远程 SDK](mac-qmt-mirror.md) | [本地量化工作台](local-quant-workbench.md) |
 | 快速了解项目能做什么 | [README](../README.md) | [完整配置与部署指南](full-guide.md) |
 | 第一次把项目跑起来 | [小白客户端安装与配置](beginner-client-setup.md) | [完整配置与部署指南](full-guide.md) |
 | 配置大模型渠道 | [LLM 配置指南](LLM_CONFIG_GUIDE.md) | [LLM 服务商配置指南](llm-providers.md) |

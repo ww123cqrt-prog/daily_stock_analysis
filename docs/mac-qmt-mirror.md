@@ -1,33 +1,24 @@
-# Mac 使用 HOME QMT 原生镜像
+# Mac 通过 HOME 官方 SDK 取数
 
-HOME 负责在 QMT 中下载行情。`quant_qmt_data sync` 单向复制已存在的日线 DAT 和必要 SDK 元数据；Mac 从已提交镜像读取。DSA 沿用 Windows 分支的字段、成交量单位、实验冻结、网页状态、Qlib 和回测入口，无需安装 Windows SDK。
+## 当前默认：HOME 一份原生库，两端共用官方 SDK
 
-## 三类位置各做一件事
+HOME 本机继续 `QMT_TRANSPORT=local`，不需要 SSH，默认不下载，原有读取/导出入口不变。Mac 配置 `QMT_TRANSPORT=ssh`、`QMT_REMOTE_TARGET=HOME`，清除 `QMT_MIRROR_DIR`；可明确设置 `QMT_DOWNLOAD_MISSING=true`。连接和软件路径沿用工作站技能的私有配置，不在项目复制机器配置。
 
-| 位置 | 用途 | 读取选择 |
-| --- | --- | --- |
-| HOME 当前 QMT 原生目录 | 行情真源，由 QMT 维护 | 同步时由正在运行的 QMT 返回，忽略旧 MiniQMT 缓存配置 |
-| `quant_qmt_data/runtime/qmt-mirror` | 原生文件的离线镜像，`MIRROR.json` 为提交点 | `QMT_MIRROR_DIR`，只读请求所需对象 |
-| 本次实验目录 | 有限标的、日期、日历和身份，可复现训练/回测 | `QMT_DATASET_DIR`；损坏时明确失败，不回退其他目录 |
+已有选定的 `QMT_DATASET_DIR` 直接离线重跑。未选定输入时，以证券、日期和既有口径请求 HOME SDK；HOME 已有数据直接读取，确需补的头尾窗口由 QMT 官方下载接口写入 HOME 原生库，再读取结果返回 Mac。Mac 仅冻结本次有限实验输入，不另建全市场库，不自行解析原生文件或计算复权。HOME 不因 Mac 的补缺开关改变本机默认行为。
 
-旧 `quant_data` 和 `quant_qmt_data/data` 本轮保持原位，不是新入口的候选来源。旧代码只在 Git 历史，不复制源码目录，也不自动加载历史分支。新入口缺失时显示缺失，不能偷偷借旧库补齐。
+股票/ETF 的原复权选择保留，跨口径输入仍明确分开。内部稀疏日不盲目下载，上市前和休市范围不制造行情。QMT 补完仍无记录时单列未知原因，网页/CLI不将其冻结为完整输入；已有正常固定输入仍可使用。
 
-## 在现有环境运行
+切回默认本机模式只需 `QMT_TRANSPORT=local`；重放旧实验继续显式选择它的输入路径。既有原生镜像和两份旧 Parquet 库本轮不移动、不删除，新默认路径不会回退它们。
 
-先在 `quant_qmt_data` 原目录执行同步（证券清单可以按研究需求增加）：
 
-```sh
-python -m quant_qmt_data sync --symbols SH600519 SZ000001 SH600000 SZ002415 SH510300 SZ159915 SH000001 SH000300 SZ399006 --mirror-dir ./runtime/qmt-mirror
-```
+## 请求与实验
 
-DSA 进程配置 `QMT_MIRROR_DIR` 的绝对路径。Mac 股票保持 `QMT_STOCK_ADJUSTMENT=front_ratio`，ETF 保持 `QMT_ETF_ADJUSTMENT=front`；HOME 原有配置不变。若两类复权不同，应分别冻结输入，不在一份实验里悄悄混用。未设置分类配置时保持 Windows 原来的 `front` 默认行为。
+先选定本次实验输入则直接离线读取；没有选定输入时，按证券、日期、价格口径向 HOME 请求。HOME 已有行情不重下，明确允许补缺才由 QMT 下载并写入 HOME 原生库，然后 SDK 读取结果返回 Mac。Mac 保存这次研究需要的有限 Parquet 与身份，不另建全市场镜像，不自行计算复权。
 
-已有 `load_market_input` 在没有选定输入时，从镜像读取所需证券和日期，并用 `save_dataset` 冻结到 reports 下；它只保存本次研究范围。选择已生成目录到 `QMT_DATASET_DIR` 后，`/data` 展示该输入，网页回测和训练均使用其 `experiment_id/bars_sha256/inputs_sha256/price_basis`。更换研究范围需明确选择或重新冻结，不能把一个小样本目录说成全市场数据状态。
+当前配置是对已有“选定输入优先”流程接线，不增加全盘搜索旧输入、自动切换历史版本或第三方数据源。固定输入失败不会悄悄换成新数据。
 
-训练沿用 `baseline_qmt_native.yaml`、`--provider qmt_native --provider-uri <input>`，不依赖旧 HTTP 服务。正式研究仍需合理选择股票池、训练/验证/测试日期；当前股票池没有历史成员时不能声称消除存续偏差。
+## 回退与保留
 
-## 本轮验收范围
+HOME 本机保持 local/false，不增加远程依赖。Mac 若需退回此前镜像原型，应明确切回 Git `8e7a9bd`；当前代码已移除原生解析、镜像同步及自算复权入口，旧 `QMT_MIRROR_DIR` 会清楚报错，避免两条默认路径并存。已有旧实验仍可按其路径重放。旧库和镜像样本本轮不移动、不删除。
 
-在原目录、原 DSA 环境完成九个股票/ETF/指数文件的同步，重复同步零文件传输。15 组原始/等比/现金读取共 18,178 行与 HOME 官方 SDK 对齐；这是有限样本，不是全市场验收。四股票等比输入和两 ETF 现金输入分别冻结；网页、2024 小回测及 2021–2024 小训练的日志和输入身份保存在本机 `quant_workflow/reports/experiments/mac-native-mirror-20261029`，不提交行情和模型。
-
-茅台 2006-05-25 现金前复权的 SDK 窗口差异继续作为已知问题暂缓，本轮没有修改原始行情或植入特殊修正。旧库封存留待镜像使用范围确认后另行处理。
+茅台现金前复权单日窗口差异保持已知暂缓，不改变正式原始行情或擅自换口径。
