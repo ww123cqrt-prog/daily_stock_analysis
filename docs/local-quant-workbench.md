@@ -4,15 +4,19 @@
 
 ## 一句话架构
 
-Mac 的远程 SDK 接入与新旧数据边界见 [Mac QMT 使用](mac-qmt-mirror.md)。固定实验输入不自动回退旧库；HOME 本机默认流程保持不变。
+Mac 的远程 SDK 接入、显式离线镜像备用与新旧数据边界见 [Mac QMT 使用](mac-qmt-mirror.md)。固定实验输入不自动回退旧库；HOME 本机默认流程保持不变。
 
-当前主线是：QMT 下载维护行情，`quant_qmt_data` 通过官方 SDK 只读本地库并冻结本次实验输入，Qlib 训练和预测，DSA 回测与展示；MLflow 保存实验记录，页面通过 DSA `/experiments/` 访问。数据包不再提供补数、复权校正、发布或保留管理。`china-astock-quant`、实时观察及 CatDesk 继续作为独立参考能力。
+当前主线是：QMT 下载维护行情，`quant_qmt_data` 默认通过官方 SDK 读取并冻结本次实验输入，Qlib 训练和预测，DSA 回测与展示；MLflow 保存实验记录，页面通过 DSA `/experiments/` 访问。行情补缺由 QMT 执行；数据包不恢复旧补数、复权校正、发布或保留平台。`china-astock-quant`、实时观察及 CatDesk 继续作为独立参考能力。
 
 ## QMT 原生实验输入
 
-新入口使用 `qmt_native` 和 `QMT_DATASET_DIR` 指定的实验目录，其中只有 `bars.parquet` 与 `dataset.json`。JSON 冻结本次行情身份、完整交易日历、选定标的及列表性质、单位、复权、读取时间和实际范围；离线训练/回测不要求 QMT 在线。首次准备输入时，需要运行 QMT 并在 QMT 中下载相应区间，读取不会暗中补数。
+新入口使用 `qmt_native` 和 `QMT_DATASET_DIR` 指定的实验目录，其中只有 `bars.parquet` 与 `dataset.json`。JSON 冻结本次行情身份、完整交易日历、选定标的及列表性质、单位、复权、读取时间和实际范围。已选定的完整冻结输入优先，离线训练/回测不连接 SDK 或镜像。首次准备 SDK 输入时，需要运行 QMT 并具备相应区间；只有显式允许下载时才由 QMT 补缺。
 
-SDK Python 由 `QMT_PYTHON` 指定，调用方安装数据包，SDK 环境只需现有官方 xtquant；worker 从安装位置的绝对路径启动。可用 `python -m quant_qmt_data export --symbols SH600519 SH510300 --start 2021-01-01 --end 2024-12-31 --output <新实验目录>` 准备输入，然后把该目录设为 `QMT_DATASET_DIR`。不能覆盖旧实验输入或写入 QMT datadir。
+SDK Python 由 `QMT_PYTHON` 指定，调用方安装数据包，SDK 环境只需现有官方 xtquant；worker 从安装位置的绝对路径启动。HOME 保持 `local`，Mac 可显式选择 `ssh`。可用 `python -m quant_qmt_data export --symbols SH600519 SH510300 --start 2021-01-01 --end 2024-12-31 --output <新实验目录>` 准备输入，然后把该目录设为 `QMT_DATASET_DIR`。冻结输出不能覆盖旧实验输入，或写入 QMT datadir、镜像目录。
+
+离线备用需同时设置 `QMT_TRANSPORT=mirror`、`QMT_MIRROR_DIR=<已有镜像目录>` 和 `QMT_DOWNLOAD_MISSING=false`，沿用上述导出入口。镜像读取已有 `MIRROR.json` + `objects/` 快照，由保留的解析器独立计算复权，不依赖 SDK 内部实现。它拒绝下载和 SDK 对比，不新增创建或同步服务。缺失数据须由 QMT 补齐后更新镜像；SDK 失败不自动切源，一次请求和实验不逐行混用两种来源。返回 SDK 时清空镜像目录配置并选择 `local` / `ssh`；未显式选择 `mirror` 的遗留目录配置仍被拒绝。
+
+`dataset.json` 区分 `qmt_sdk_local`、既有 `qmt_sdk_ssh` 和 `qmt_native_mirror` 三种 `source_kind`。镜像保留 `mirror_dir`、`mirror_manifest_sha256`、`mirror_synced_at` 和 `source_native_sha256`，与复权、单位一起冻结；同步时间不代表数据覆盖完整。
 
 新训练默认使用 `qmt_native` 与 `baseline_qmt_native.yaml`，只读取冻结输入。已训练 Run 可选择“每日预测 TopK”进行 DSA 自定义回测，按下一交易日开盘撮合；初始资金、整手与每侧成交费用均进入结果。它保留完整成交账本，不把标签收益当成撮合收益，也不把预测契约标成已冻结的精确策略。`QMT_DATASET_DIR` 以后改变时，保存 Run 仍绑定其原输入目录。
 

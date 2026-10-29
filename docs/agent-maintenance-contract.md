@@ -77,7 +77,9 @@ sed -n '1,260p' docs/install-local-quant-workbench.md
 7. 不将 ETF/场内基金误按单家公司财报逻辑分析。ETF 基本面必须标注降级或待补强。
 8. 不接券商自动交易。本阶段同花顺和手机镜像只作为后续只读观察方向。
 9. `run_daily_update.py` 只负责 18:40 数据更新；60 日纸面跟踪由 19:10 的 `run_robust_shadow_schedule.py` 独立运行。不得重新把跟踪做成可选 warning，也不得在冻结组合含 `mps_dnn` 时用普通 `.venv` 或 CPU 代替 MPS。
-10. 新 QMT 主线使用 `QMT_DATASET_DIR` 指定的完整实验输入和 `qmt_native`，通过官方 SDK 只读 QMT，不运行数据包旧下载、发布、保留或修复功能。首次读取检查连接；冻结输入完整时允许无 QMT 的离线训练/回测，不访问旧服务 `/ready` 或历史全库质量门禁。实验需冻结行情、交易日历、标的选择/性质、单位和时间口径。既有 Run 的原冻结身份与历史 CSI800 成员契约保留，不伪造缺失历史输入、不改写旧 Run；日期不足如实报告。
+10. 新 QMT 主线使用 `QMT_DATASET_DIR` 指定的完整实验输入和 `qmt_native`，默认通过官方 SDK 读取 QMT；补缺只由 QMT 按显式开关执行，不恢复数据包旧下载、发布、保留或修复平台。首次 SDK 读取检查连接；已选定的完整冻结输入优先，离线训练/回测不访问 SDK、镜像、旧服务 `/ready` 或历史全库质量门禁。实验需冻结行情、交易日历、标的选择/性质、单位和时间口径。既有 Run 的原冻结身份与历史 CSI800 成员契约保留，不伪造缺失历史输入、不改写旧 Run；日期不足如实报告。
+11. 镜像仅作显式离线备用：API 使用 `QMTClient(transport='mirror', mirror_dir=path)`，环境变量同时设置 `QMT_TRANSPORT=mirror`、`QMT_MIRROR_DIR` 和 `QMT_DOWNLOAD_MISSING=false`。只读已有 `MIRROR.json` + `objects/` 快照，保留的解析器独立计算复权；读取拒绝 `download_missing=True` 与非空 `compare_mirror_dir`，不新增创建、同步或下载服务。SDK 失败不自动切源，一次请求和实验只用一个来源，不逐行混源。缺数须由 QMT 补齐后更新镜像；返回 SDK 先清空镜像目录配置，再选择 `local` / `ssh`，未显式选择 `mirror` 的遗留目录配置仍须拒绝。
+12. 冻结来源身份不得丢失：本机 SDK 的 `source_kind='qmt_sdk_local'`、SSH 既有 `qmt_sdk_ssh`、镜像的 `qmt_native_mirror` 应明确区分。镜像的 `mirror_dir`、`mirror_manifest_sha256`、`mirror_synced_at` 和 `source_native_sha256` 须随所选复权口径保留在 `dataset.json`；同步时间不能当成完整覆盖的证明。两端 `local` / `ssh` 默认不变，不要求全市场复制或恢复旧平台。
 
 ## 用户沟通口径
 

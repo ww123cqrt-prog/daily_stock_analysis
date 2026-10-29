@@ -137,7 +137,9 @@ def _isolate_test_runtime(tmp_path, monkeypatch, request):
     monkeypatch.chdir(tmp_path)
     for key, value in _runtime_environment(tmp_path).items():
         monkeypatch.setenv(key, value)
-    for key in (*_EXTERNAL_PATH_ENV, "QMT_PYTHON", "QMT_PORT", "QMT_DATA_DIR", "QMT_TIMEOUT", "QMT_DATASET_DIR"):
+    for key in (*_EXTERNAL_PATH_ENV, "QMT_PYTHON", "QMT_PORT", "QMT_DATA_DIR", "QMT_TIMEOUT", "QMT_DATASET_DIR",
+                "QMT_TRANSPORT", "QMT_REMOTE_TARGET", "QMT_DOWNLOAD_MISSING", "QMT_MIRROR_DIR",
+                "QMT_ADJUSTMENT", "QMT_STOCK_ADJUSTMENT", "QMT_ETF_ADJUSTMENT"):
         monkeypatch.delenv(key, raising=False)
     from src.config import Config
     from src import auth
@@ -153,7 +155,12 @@ def _isolate_test_runtime(tmp_path, monkeypatch, request):
         if exc.name != "quant_qmt_data":
             raise
     else:
-        monkeypatch.setattr(QMTClient, "_request", _refuse_live_miniqmt)
+        original_request = QMTClient._request
+        def offline_request(client, *args, **kwargs):
+            if client.transport == 'mirror':
+                return original_request(client, *args, **kwargs)
+            return _refuse_live_miniqmt(*args, **kwargs)
+        monkeypatch.setattr(QMTClient, "_request", offline_request)
 
     # Screening also searches its source root independently of ENV_FILE.
     monkeypatch.setattr(screening_config, "_PROJECT_ROOT", tmp_path)
