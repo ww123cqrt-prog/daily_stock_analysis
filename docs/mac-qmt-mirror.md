@@ -39,6 +39,8 @@ Python API 使用 `QMTClient(transport='mirror', mirror_dir=path)`。导出后�
 
 镜像读取拒绝 `download_missing=True` 和非空 `compare_mirror_dir`；CLI 对应的 `--download-missing` 和 `--compare-mirror` 同样无效。缺失证券或日期须先在 QMT 中补齐，再更新镜像。镜像不会向 SDK 借行补缺，也不从镜像下载数据。本轮不新增镜像创建、同步服务或全市场副本，不恢复旧数据平台。
 
+镜像按各原生对象已核实的 `completed_through` 判断完整日线，不能由全局同步时间或读取时刻推定。旧清单没有逐对象完成界限时，默认排除各对象最后一行；返回的完成范围及日历随之收窄。该界限只应根据对应原文件 SHA 的核验填写。显式读取未完成行会保留标记，不能冻结为训练或回测输入；既有选定冻结输入仍直接离线复用。
+
 ## 来源身份与复权
 
 冻结的 `dataset.json` 保留实际来源：本机 SDK 为 `source_kind='qmt_sdk_local'`，SSH 为既有 `qmt_sdk_ssh`，镜像为 `qmt_native_mirror`。镜像还保留 `mirror_dir`、`mirror_manifest_sha256`、`mirror_synced_at` 和 `source_native_sha256`，并记录所选复权口径。`mirror_synced_at` 是清单中的同步时间，不等于行情覆盖到该日。

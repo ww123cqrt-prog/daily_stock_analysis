@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 显式 QMT 镜像按逐对象完成范围过滤未确认尾行，旧镜像不因读取变晚或全局同步时间更新而误入正式实验；补充 DSA 冻结、离线 Qlib 与回测读取回归。
+
 - [改进] Mac 新输入可通过 SSH 调用 HOME 官方 SDK，由 QMT 按显式开关补缺并写入 HOME 原生库；HOME 本机默认只读流程不变，固定实验仍离线复用，补后无行情不冒充完整输入。
 
 - [改进] QMT 保持 SDK 默认，新增 `QMT_TRANSPORT=mirror` + `QMT_MIRROR_DIR` 显式离线备用；镜像独立计算复权，禁止下载、自动切源和逐行混源，冻结输入保留来源身份并优先离线复用。见 [Mac QMT 使用](mac-qmt-mirror.md)。

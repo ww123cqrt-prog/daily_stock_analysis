@@ -67,7 +67,8 @@ def test_unresolved_remote_download_is_not_frozen_as_a_complete_input(monkeypatc
         loader.load_market_input(pool='custom',custom_symbols=['SH600519'],start='2024-01-02',end='2024-01-05')
 
 
-def test_explicit_mirror_input_serves_training_provider_and_dsa_view(tmp_path, monkeypatch):
+@pytest.mark.parametrize('tail_complete', [True, False])
+def test_explicit_mirror_input_serves_training_provider_and_dsa_view(tmp_path, monkeypatch, tail_complete):
     import hashlib
     import json
     import struct
@@ -94,6 +95,8 @@ def test_explicit_mirror_input_serves_training_provider_and_dsa_view(tmp_path, m
         (root / 'objects' / f'{digest}.DAT').write_bytes(body)
         files[symbol] = dict(path=f'objects/{digest}.DAT', sha256=digest, size=len(body),
                              types={kind: True}, actions=[], suspend_flags={})
+        if tail_complete:
+            files[symbol]['completed_through'] = days[-1].date().isoformat()
     manifest = dict(schema_version=1, source_data_dir=str(tmp_path / 'qmt-source'),
                     sdk_version='synthetic', synced_at='2024-01-06T00:00:00+08:00',
                     files=files, universes={}, calendars={
@@ -118,11 +121,14 @@ def test_explicit_mirror_input_serves_training_provider_and_dsa_view(tmp_path, m
     assert frame.attrs['mirror_synced_at'] == manifest['synced_at']
     assert frame.attrs['universe'] == selected
     assert frame.attrs['volume_units']['SH510300'] == 'units'
-    assert len(frame) == 9
+    assert len(frame) == (9 if tail_complete else 6)
+    assert frame.attrs['contains_partial'] is False
+    assert frame.attrs['completed_through'] == ('2024-01-05' if tail_complete else '2024-01-04')
     monkeypatch.setattr(loader.QMTClient, 'from_env', forbidden)
     provider = QMTNativeFeatureProvider(input_dir=directory)
-    assert provider.feature('SH600519', '$close', 0, 2, 'day').tolist() == [10., 11., 12.]
+    prices = [10., 11., 12.] if tail_complete else [10., 11.]
+    assert provider.feature('SH600519', '$close', 0, len(prices) - 1, 'day').tolist() == prices
     view, _ = loader.load_market_view('custom', custom_symbols=selected, quant_data_root=directory,
                                       cache_dir=tmp_path / 'bundles')
-    assert view.close[:, list(view.symbols).index('SH600519')].tolist() == [10., 11., 12.]
+    assert view.close[:, list(view.symbols).index('SH600519')].tolist() == prices
     assert view.volume[0, list(view.symbols).index('SH510300')] == 2000.
