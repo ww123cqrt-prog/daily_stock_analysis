@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- [改进] BVR候选规则允许25个市场交易日内最多4条缺价，保持BOLL20有效样本数和5日触碰时限；正式策略资产须另行确认更新。
+- [改进] BVR候选仅容忍25日期中21～24条有效收盘；撤回额外5日确认过期和退出取样改动，保留原观察确认及正式资产。
 
 - [修复] BVR历史不足时不再误把布尔值当触碰价格生成B模式入场；历史Provider测试显式走canonical并保留不完整身份为unknown的断言。
 
