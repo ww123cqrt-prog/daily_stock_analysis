@@ -192,3 +192,64 @@ def test_fill_aware_comparison_and_stability_keep_real_execution(tmp_path, monke
         iterations=2,min_window_days=20,seed=42)
     assert result["status"] == "completed" and len(result["samples"]) == 2
     assert all(sample["total_return_pct"] == 0 for sample in result["samples"])
+
+
+@pytest.mark.parametrize("start,suspended,cancel,trade_count", [
+    (None, False, False, 1),
+    (date(2026, 1, 5), False, False, 1),
+    (date(2026, 1, 5), True, True, 0),
+    (date(2026, 1, 5), True, False, 1),
+])
+def test_feedback_optional_start_and_cash_cancellation(tmp_path, monkeypatch, start, suspended, cancel, trade_count):
+    from src.core.script_market import MarketBundle
+    from src.services.backtest_service import BacktestService
+    prices = (10, np.nan if suspended else 10, 10)
+    v = view(prices, prices)
+    bundle = tmp_path / "bundle"
+    MarketBundle(dates=v.dates, symbols=v.symbols, open=v.open, close=v.close, members=v.members, meta={}).save(bundle)
+    monkeypatch.setattr("src.services.backtest_service.load_market_view", lambda *a, **k: (v, {"bundle_dir": str(bundle)}))
+    monkeypatch.setattr("src.services.backtest_service.load_benchmark_series", lambda *a, **k: {})
+    monkeypatch.setattr(BacktestService, "_run_strategy_comparisons", lambda *a, **k: ([], []))
+    source = '''
+def on_fill(context, trade):
+    pass
+def on_bar(context, data):
+    if context.current_date.day == 5:
+        context.target_percent("A", 0.75)
+'''
+    if cancel:
+        source += '    elif context.current_date.day == 6:\n        context.target_cash()\n'
+    report = BacktestService.__new__(BacktestService).run_script_strategy(
+        script=source, pool="custom", symbols=["A"], start_date=start, end_date=date(2026, 1, 7),
+        initial_capital=3000, side_cost_pct=0, lot_size=100)
+    assert report["status"] == "completed"
+    assert report["period"]["start_date"] == "2026-01-05"
+    assert len(report["equity_curve"]) == 3
+    assert len(report["trades"]) == trade_count
+    if suspended and not cancel:
+        assert report["trades"][0]["execution_date"] == "2026-01-07"
+
+
+def test_explicit_existing_holding_cancels_pending_rotation():
+    source = '''
+def on_fill(context, trade):
+    pass
+def on_bar(context, data):
+    if context.current_date.day == 5:
+        context.target_percent("A", 0.75)
+    elif context.current_date.day == 6:
+        context.target_cash()
+        context.target_percent("B", 0.75)
+    elif context.current_date.day == 7:
+        context.target_cash()
+        for symbol in context.current_weights:
+            context.target_percent(symbol, context.current_weights[symbol])
+'''
+    prices = np.full((4, 2), 10.0)
+    prices[2, 1] = np.nan
+    v = MarketView(dates=np.array([date(2026,1,d).toordinal() for d in [5,6,7,8]]),
+        symbols=np.array(["A", "B"], dtype=object), open_matrix=prices, close_matrix=prices,
+        members=np.isfinite(prices), meta={})
+    result = execute_strategy_script(source, view=v, start_date=date(2026,1,5), end_date=date(2026,1,8),
+        execution_config=StrategyBacktestConfig(initial_capital=3000, lot_size=100, side_cost_pct=0))
+    assert [(t["symbol"], t["action"]) for t in result.backtest_report["trades"]] == [("A", "buy")]

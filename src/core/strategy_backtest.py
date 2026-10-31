@@ -857,6 +857,10 @@ def run_portfolio_backtest_view(
     # with the position the strategy already held.
     if period_start is not None:
         window_start_index = bisect_left(dates, period_start)
+    elif signal_callback is not None or reapply_targets:
+        # Live feedback and its replay share the complete selected window,
+        # including cash days before the first executable signal.
+        window_start_index = 0
     else:
         window_start_index = dates.index(min(scheduled)) if scheduled else 0
     if window_start_index >= window_end:

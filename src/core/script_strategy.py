@@ -497,7 +497,9 @@ def execute_strategy_script(
                 tradable = set(view.members_on(index)) if str(view.meta.get("pool") or "") in ("csi800", "all_a") else None
                 context._begin_bar(current_date, dict(weights), tradable)
                 on_bar(context, data)
-                if context._touched and context._target != weights:
+                # Explicit targets also cancel pending orders when already at
+                # that holding (for example cash after a suspended buy).
+                if context._touched:
                     allocation = TargetAllocation(
                         source_id=f"python_script:{current_date.isoformat()}", signal_date=current_date,
                         target_weights=dict(sorted(context._target.items())),
