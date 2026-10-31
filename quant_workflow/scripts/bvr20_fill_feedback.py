@@ -1,4 +1,4 @@
-"""BVR-20 V0.1 DSA dsa-script-v1 asset."""
+"""BVR-20 short-suspension proposal; saved assets require separate approval."""
 
 def initialize(context):
     context.stock_pool = ("SH601208", "SZ300054", "SZ002709", "SH603986", "SH688008", "SH600584", "SZ301566", "SH603019", "SZ002409", "SH688313", "SH688017", "SZ300408", "SZ002138", "SH600183", "SZ002463", "SH600378", "SZ002886", "SH688183", "SH688498", "SH601869", "SH600487", "SZ002484", "SZ002859", "SH688019", "SZ300666", "SZ300346", "SH688268", "SH688146", "SH688072", "SH688012", "SH688120", "SZ300604", "SZ300373", "SH603290", "SH603938", "SH603688", "SZ002371", "SH688082", "SH688652")
@@ -7,6 +7,7 @@ def initialize(context):
     context.pending_exits = set()
     context.pending_adds = {}
     context.observations = {}
+    context.market_bar = 0
 
 def _mean(values):
     return sum(values) / len(values) if values else None
@@ -17,9 +18,21 @@ def _std(values):
     mean = _mean(values)
     return (sum((value - mean) * (value - mean) for value in values) / (len(values) - 1)) ** 0.5
 
-def _bands(data, symbol):
-    closes = data.history(symbol, 20, "close")
-    volumes = data.history(symbol, 20, "volume")
+def _b_values(data, symbol, field="close", ago=0):
+    """Twenty valid observations, bounded to 25 market dates at that date."""
+    newer = len(data.history(symbol, ago, field)) if ago else 0
+    if len(data.history(symbol, ago + 1, field)) == newer:
+        return ()
+    for span in range(25 + ago, 19 + ago, -1):
+        values = data.history(symbol, span, field)
+        if values:
+            values = values[:len(values) - newer]
+            return values[-20:] if len(values) >= 20 else ()
+    return ()
+
+def _bands(data, symbol, b_mode=False):
+    closes = _b_values(data, symbol) if b_mode else data.history(symbol, 20, "close")
+    volumes = _b_values(data, symbol, "volume") if b_mode else data.history(symbol, 20, "volume")
     if len(closes) < 20 or len(volumes) < 20:
         return None
     middle = _mean(closes)
@@ -53,15 +66,16 @@ def _mode_b_pullback(data, symbol, bands):
     if _strong_streak(data) < 3 or bands["close"] < bands["middle"] or bands["close"] >= bands["upper"]:
         return None
     closes = data.history(symbol, 25, "close")
-    if len(closes) < 25:
+    if len(closes) < 21:
         return None
-    touches = []
-    for touch_index in range(19, 24):
-        window = closes[touch_index - 19:touch_index + 1]
+    for ago in range(1, 6):
+        window = _b_values(data, symbol, ago=ago)
+        if len(window) < 20:
+            continue
         deviation = _std(window)
-        if deviation is not None and closes[touch_index] >= _mean(window) + 2.0 * deviation:
-            touches.append(closes[touch_index])
-    return touches[-1] if touches else None
+        if deviation is not None and window[-1] >= _mean(window) + 2.0 * deviation:
+            return (window[-1], ago)
+    return None
 
 def _apply_targets(context, targets):
     context.target_cash()
@@ -70,6 +84,7 @@ def _apply_targets(context, targets):
             context.target_percent(symbol, targets[symbol])
 
 def on_bar(context, data):
+    context.market_bar += 1
     if set(context.symbols) != set(context.stock_pool):
         context.target_cash()
         return
@@ -84,7 +99,7 @@ def on_bar(context, data):
         if symbol not in current:
             continue
         state = context.states[symbol]
-        bands = _bands(data, symbol)
+        bands = _bands(data, symbol, b_mode=state["mode"] == "B")
         if bands is None:
             continue
         close = bands["close"]
@@ -104,14 +119,16 @@ def on_bar(context, data):
                 context.pending_exits.add(symbol)
 
     for symbol in list(context.observations):
-        if symbol in context.states or not strong:
+        observation = context.observations[symbol]
+        if (symbol in context.states or not strong
+                or context.market_bar - observation["touch_bar"] > 5
+                or len(data.history(symbol, 25, "close")) < 21):
             context.observations.pop(symbol, None)
             continue
-        bands = _bands(data, symbol)
+        bands = _bands(data, symbol, b_mode=True)
         if bands is None or bands["close"] < bands["middle"]:
             context.observations.pop(symbol, None)
             continue
-        observation = context.observations[symbol]
         if bands["close"] >= observation["touch_close"] * 1.03:
             targets[symbol] = 0.50
             context.pending_entries[symbol] = "B"
@@ -125,15 +142,16 @@ def on_bar(context, data):
     for symbol in context.stock_pool:
         if symbol in context.states:
             continue
-        bands = _bands(data, symbol)
+        bands = _bands(data, symbol, b_mode=strong)
         if bands is None:
             continue
         if not strong and bands["close"] < bands["lower"] and bands["volume"] >= bands["volume_mean"] * 1.40:
             candidates.append((symbol, "A"))
         elif strong:
-            touch_close = _mode_b_pullback(data, symbol, bands)
-            if touch_close is not None:
-                context.observations[symbol] = {"touch_close": touch_close, "days_left": 3}
+            touch = _mode_b_pullback(data, symbol, bands)
+            if touch is not None:
+                context.observations[symbol] = {"touch_close": touch[0], "days_left": 3,
+                                                "touch_bar": context.market_bar - touch[1]}
     selected = candidates[:slots]
     if selected:
         remaining = max(0.0, 0.75 - sum(targets.values()))
