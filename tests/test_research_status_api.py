@@ -895,7 +895,7 @@ class ResearchStatusApiTestCase(unittest.TestCase):
             payload = self._build_status_for_roots(reports_dir, data_root)
 
         self.assertFalse(payload["latest_training"]["provider_current"])
-        self.assertEqual(payload["latest_training"]["provider_status"], "historical")
+        self.assertEqual(payload["latest_training"]["provider_status"], "unknown")
 
     def _build_status_for_roots(
         self, reports_dir: Path, data_root: Path
@@ -923,12 +923,16 @@ class ResearchStatusApiTestCase(unittest.TestCase):
                 "api.v1.endpoints.research_status.QLIB_PROVIDER_ROOT",
                 data_root / "qlib",
             ),
+            patch(
+                "api.v1.endpoints.research_status._qmt_native_research_status",
+                side_effect=AssertionError("Legacy provider fixtures must not use QMT defaults"),
+            ),
         ):
             # These fixtures exercise the retained legacy .bin compatibility
             # catalog.  The production default is the direct Parquet Provider;
             # opt into the old catalog explicitly in legacy-focused tests.
             return build_research_status_payload(
-                provider_dataset_id="qlib_ashare_v2"
+                provider_dataset_id="qlib_ashare_v2", provider="canonical"
             )
 
     def test_robust_signal_status_exposes_bounded_sanitized_matrices(self) -> None:

@@ -150,6 +150,38 @@ def test_bvr_updates_anchor_only_for_confirmed_add_and_keeps_partial_sale():
     assert "A" not in context.states
 
 
+def test_bvr_short_history_does_not_observe_or_enter_mode_b():
+    from quant_workflow.scripts.bvr20_fill_feedback import initialize, on_bar
+
+    targets = []
+    context = SimpleNamespace(current_weights={}, target_cash=lambda: targets.append({}),
+                              target_percent=lambda symbol, weight: targets.append({symbol: weight}))
+    initialize(context)
+    context.symbols = context.stock_pool
+
+    class Data:
+        available = 22
+
+        def history(self, symbol, count, field):
+            if symbol != context.stock_pool[0]:
+                return []
+            values = ([10 + i * 0.1 for i in range(self.available)]
+                      if field == "close" else [100] * self.available)
+            return values[-count:]
+
+        def index_history(self, count):
+            return list(range(100, 140))[-count:]
+
+    data = Data()
+    on_bar(context, data)
+    first_observations = dict(context.observations)
+    data.available = 23
+    on_bar(context, data)
+    assert context.pending_entries == {}
+    assert targets == []
+    assert first_observations == context.observations == {}
+
+
 def test_real_sandbox_and_service_use_actual_fill_feedback(tmp_path, monkeypatch):
     from src.core.script_market import MarketBundle
     from src.services.script_strategy_executor import run_script_backtest_in_sandbox

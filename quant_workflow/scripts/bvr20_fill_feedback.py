@@ -54,7 +54,7 @@ def _mode_b_pullback(data, symbol, bands):
         return None
     closes = data.history(symbol, 25, "close")
     if len(closes) < 25:
-        return False
+        return None
     touches = []
     for touch_index in range(19, 24):
         window = closes[touch_index - 19:touch_index + 1]

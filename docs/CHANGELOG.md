@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] BVR历史不足时不再误把布尔值当触碰价格生成B模式入场；历史Provider测试显式走canonical并保留不完整身份为unknown的断言。
+
 - [修复] 成交反馈回测省略开始日期时统一执行与重放起点；显式现金或原持仓目标能撤销停牌待重试买单，无新指令时继续重试。
 
 - [修复] BVR可选真实成交反馈在原沙箱中执行，未成交不计加仓，买入价按实际成交更新；原普通脚本路径及历史回测保留。见 [成交反馈说明](bvr-fill-feedback.md)。
