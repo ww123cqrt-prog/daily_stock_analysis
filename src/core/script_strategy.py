@@ -14,7 +14,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from src.core.script_market import MarketView
-from src.core.strategy_backtest import PriceBar, TargetAllocation
+from src.core.strategy_backtest import PriceBar, TargetAllocation, StrategyBacktestConfig, run_portfolio_backtest_view
 
 
 SCRIPT_API_VERSION = "dsa-script-v1"
@@ -85,6 +85,7 @@ class StrategyScriptResult:
     allocations: tuple[TargetAllocation, ...]
     logs: tuple[str, ...]
     check: dict[str, Any]
+    backtest_report: dict[str, Any] | None = None
 
 
 def validate_strategy_script(source: str) -> dict[str, Any]:
@@ -124,6 +125,7 @@ def validate_strategy_script(source: str) -> dict[str, Any]:
             continue
         raise ScriptValidationError("top-level code is not allowed; define initialize and on_bar functions")
     return {
+        **({"fill_feedback": True} if "on_fill" in function_names else {}),
         "status": "passed",
         "api_version": SCRIPT_API_VERSION,
         "ast_nodes": len(nodes),
@@ -444,6 +446,7 @@ def execute_strategy_script(
     symbols: Sequence[str] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    execution_config: StrategyBacktestConfig | None = None,
 ) -> StrategyScriptResult:
     check = validate_strategy_script(source)
     if view is None:
@@ -470,6 +473,44 @@ def execute_strategy_script(
         data = _StrategyData(view)
         if initialize is not None:
             initialize(context)
+
+        on_fill = namespace.get("on_fill")
+        if on_fill is not None and not callable(on_fill):
+            raise ScriptExecutionError("on_fill must be callable")
+        if on_fill is not None and execution_config is None:
+            raise ScriptExecutionError("on_fill requires execution_config and actual trade feedback")
+        if execution_config is not None:
+            allocations: list[TargetAllocation] = []
+
+            def filled(trade, positions, cash):
+                context.current_date = date.fromisoformat(trade["execution_date"])
+                context.positions = MappingProxyType({s: n for s, n in positions.items() if n})
+                context.cash = cash
+                if on_fill is not None:
+                    on_fill(context, MappingProxyType(dict(trade)))
+
+            def closed(index, positions, cash, weights):
+                current_date = calendar[index]
+                data._index = index
+                context.positions = MappingProxyType({s: n for s, n in positions.items() if n})
+                context.cash = cash
+                tradable = set(view.members_on(index)) if str(view.meta.get("pool") or "") in ("csi800", "all_a") else None
+                context._begin_bar(current_date, dict(weights), tradable)
+                on_bar(context, data)
+                if context._touched and context._target != weights:
+                    allocation = TargetAllocation(
+                        source_id=f"python_script:{current_date.isoformat()}", signal_date=current_date,
+                        target_weights=dict(sorted(context._target.items())),
+                        reason=f"DSA Python strategy target on {current_date.isoformat()}")
+                    allocations.append(allocation)
+                    return allocation
+                return None
+
+            report = run_portfolio_backtest_view(strategy_name="python_script", allocations=[],
+                view=view, config=execution_config, period_start=start_date, period_end=end_date,
+                signal_callback=closed, fill_callback=filled)
+            report["assumptions"]["execution_feedback"] = "actual_fills"
+            return StrategyScriptResult(tuple(allocations), tuple(logs[-500:]), check, report)
 
         allocations: list[TargetAllocation] = []
         current_target: dict[str, float] = {}

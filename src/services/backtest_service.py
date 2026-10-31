@@ -36,7 +36,8 @@ from src.market_phase_summary import (
 from src.repositories.backtest_repo import BacktestRepository
 from src.repositories.quant_price_repo import QuantPriceRepository
 from src.repositories.stock_repo import StockRepository
-from src.services.script_strategy_executor import run_script_in_sandbox
+from src.services.script_strategy_executor import run_script_in_sandbox, run_script_backtest_in_sandbox
+from src.core.script_strategy import validate_strategy_script
 from src.schemas.decision_action import build_action_fields
 from src.services.stock_code_utils import (
     normalize_code as normalize_backtest_code,
@@ -279,13 +280,13 @@ class BacktestService:
             benchmark_symbols=benchmarks or [],
         )
         bundle_dir = Path(str(pool_meta["bundle_dir"]))
-        allocations, logs, check = run_script_in_sandbox(
-            script,
-            bundle_dir=bundle_dir,
-            start_date=start_date,
-            end_date=end_date,
-            timeout_seconds=30,
-        )
+        live_report = None
+        if validate_strategy_script(script).get("fill_feedback"):
+            live_report, allocations, logs, check = run_script_backtest_in_sandbox(
+                script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, config=config)
+        else:
+            allocations, logs, check = run_script_in_sandbox(
+                script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, timeout_seconds=30)
         benchmark_frames = load_benchmark_series(
             benchmarks or [],
             start=start_date.isoformat() if start_date else None,
@@ -363,7 +364,14 @@ class BacktestService:
                 config=config,
                 benchmarks=benchmark_frames,
                 strategy_comparisons=strategy_comparisons,
+                period_start=start_date if live_report is not None else None,
+                period_end=end_date if live_report is not None else None,
+                reapply_targets=live_report is not None,
             )
+            if live_report is not None:
+                if report["trades"] != live_report["trades"] or report["equity_curve"] != live_report["equity_curve"]:
+                    raise ValueError("Actual-fill signal replay differs from the sandbox execution")
+                report["assumptions"]["execution_feedback"] = "actual_fills"
         if pool_meta.get("experiment_id"):
             report.setdefault("assumptions", {}).update(
                 execution="next_trading_day_open",
@@ -417,13 +425,13 @@ class BacktestService:
             end=end_date.isoformat() if end_date else None,
         )
         bundle_dir = Path(str(pool_meta["bundle_dir"]))
-        allocations, logs, check = run_script_in_sandbox(
-            script,
-            bundle_dir=bundle_dir,
-            start_date=start_date,
-            end_date=end_date,
-            timeout_seconds=30,
-        )
+        feedback = bool(validate_strategy_script(script).get("fill_feedback"))
+        if feedback:
+            _full_report, allocations, logs, check = run_script_backtest_in_sandbox(
+                script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, config=config)
+        else:
+            allocations, logs, check = run_script_in_sandbox(
+                script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, timeout_seconds=30)
         if not allocations:
             return {
                 "status": "no_executable_signals",
@@ -458,6 +466,7 @@ class BacktestService:
                 config=config,
                 period_start=period_start,
                 period_end=period_end,
+                reapply_targets=feedback,
             )
             metrics = result.get("metrics") or {}
             if result.get("status") != "completed":
@@ -586,19 +595,19 @@ class BacktestService:
                 failures.append({"name": name, "error": "empty script"})
                 continue
             try:
-                allocations, _logs, _check = run_script_in_sandbox(
-                    script,
-                    bundle_dir=bundle_dir,
-                    start_date=start_date,
-                    end_date=end_date,
-                    timeout_seconds=30,
-                )
+                live_report = None
+                if validate_strategy_script(script).get("fill_feedback"):
+                    live_report, allocations, _logs, _check = run_script_backtest_in_sandbox(
+                        script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, config=config)
+                else:
+                    allocations, _logs, _check = run_script_in_sandbox(
+                        script, bundle_dir=bundle_dir, start_date=start_date, end_date=end_date, timeout_seconds=30)
                 if not allocations:
                     failures.append(
                         {"name": name, "error": "no target allocations produced"}
                     )
                     continue
-                comparison_report = run_portfolio_backtest_view(
+                comparison_report = live_report if live_report is not None else run_portfolio_backtest_view(
                     strategy_name=name,
                     allocations=allocations,
                     view=view,

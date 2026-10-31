@@ -26,6 +26,7 @@ from typing import Any
 
 from src.core.script_market import MarketView
 from src.core.script_strategy import execute_strategy_script
+from src.core.strategy_backtest import StrategyBacktestConfig
 
 
 def _apply_limits() -> None:
@@ -91,9 +92,11 @@ def _serialize_result(payload: dict[str, Any]) -> dict[str, Any]:
         view=view,
         start_date=start_date,
         end_date=end_date,
+        execution_config=StrategyBacktestConfig(**payload["execution_config"]) if payload.get("execution_config") is not None else None,
     )
     return {
         "status": "completed",
+        **({"backtest_report": result.backtest_report} if result.backtest_report is not None else {}),
         "allocations": [
             {
                 "source_id": item.source_id,

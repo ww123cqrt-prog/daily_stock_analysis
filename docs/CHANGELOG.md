@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] BVR可选真实成交反馈在原沙箱中执行，未成交不计加仓，买入价按实际成交更新；原普通脚本路径及历史回测保留。见 [成交反馈说明](bvr-fill-feedback.md)。
+
 - [修复] 显式 QMT 镜像按逐对象完成范围过滤未确认尾行，旧镜像不因读取变晚或全局同步时间更新而误入正式实验；补充 DSA 冻结、离线 Qlib 与回测读取回归。
 
 - [改进] Mac 新输入可通过 SSH 调用 HOME 官方 SDK，由 QMT 按显式开关补缺并写入 HOME 原生库；HOME 本机默认只读流程不变，固定实验仍离线复用，补后无行情不冒充完整输入。

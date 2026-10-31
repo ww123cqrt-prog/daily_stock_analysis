@@ -13,7 +13,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date
 import math
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -764,6 +764,9 @@ def run_portfolio_backtest_view(
     period_start: date | None = None,
     period_end: date | None = None,
     execution_price: str = "open",
+    signal_callback: Callable[[int, Mapping[str, int], float, Mapping[str, float]], TargetAllocation | None] | None = None,
+    fill_callback: Callable[[Mapping[str, Any], Mapping[str, int], float], None] | None = None,
+    reapply_targets: bool = False,
 ) -> dict[str, Any]:
     """Vectorized portfolio backtest over a MarketView (large universes).
 
@@ -813,6 +816,8 @@ def run_portfolio_backtest_view(
     if period_end is not None:
         window_end = min(window_end, bisect_right(dates, period_end))
 
+    # A live script may append close signals only after that day's real fills.
+    allocations = list(allocations)
     scheduled: dict[date, tuple[TargetAllocation, dict[str, float]]] = {}
     skipped_signal_count = 0
     indexed_allocations = list(enumerate(allocations))
@@ -834,7 +839,7 @@ def run_portfolio_backtest_view(
             continue
         scheduled[dates[calendar_index]] = (allocation, weights)
 
-    if not scheduled:
+    if not scheduled and signal_callback is None:
         return _empty_report(
             strategy_name=strategy_name,
             status="no_executable_signals",
@@ -853,7 +858,7 @@ def run_portfolio_backtest_view(
     if period_start is not None:
         window_start_index = bisect_left(dates, period_start)
     else:
-        window_start_index = dates.index(min(scheduled))
+        window_start_index = dates.index(min(scheduled)) if scheduled else 0
     if window_start_index >= window_end:
         return _empty_report(
             strategy_name=strategy_name,
@@ -904,7 +909,7 @@ def run_portfolio_backtest_view(
         never silently drops a rebalance even when no new signal arrives.
         """
         nonlocal cash, current_target, total_cost, turnover_notional, blocked_signal_count, pending_retry
-        if current_target == weights:
+        if current_target == weights and signal_callback is None and not reapply_targets:
             pending_retry = None
             return
         t = dates.index(execution_date)
@@ -976,6 +981,8 @@ def run_portfolio_backtest_view(
                     "reason": allocation.reason,
                 }
             )
+            if fill_callback is not None:
+                fill_callback(trades[-1], dict(holdings), cash)
 
         for symbol in symbols:
             shares_needed = target_holdings.get(symbol, 0) - holdings[symbol]
@@ -1013,6 +1020,8 @@ def run_portfolio_backtest_view(
                     "reason": allocation.reason,
                 }
             )
+            if fill_callback is not None:
+                fill_callback(trades[-1], dict(holdings), cash)
         if blocked:
             if not is_retry:
                 blocked_signal_count += 1
@@ -1024,10 +1033,23 @@ def run_portfolio_backtest_view(
     # Pre-execute signals whose execution day falls before the window so a
     # sub-period starts with the position the strategy already held, instead
     # of silently resetting to cash.
-    for execution_date, (allocation, weights) in sorted(scheduled.items()):
-        if execution_date >= first_date:
-            break
-        _apply_target(execution_date, allocation, weights)
+    if reapply_targets:
+        for prior_index in range(window_start_index):
+            prior_date = dates[prior_index]
+            prior_target = scheduled.get(prior_date)
+            if prior_target is not None:
+                _apply_target(prior_date, *prior_target)
+            elif pending_retry is not None:
+                _apply_target(prior_date, *pending_retry, is_retry=True)
+            for symbol in symbols:
+                price = close_matrix[prior_index, symbol_index[symbol]]
+                if holdings[symbol] and not np.isnan(price):
+                    last_close[symbol] = float(price)
+    else:
+        for execution_date, (allocation, weights) in sorted(scheduled.items()):
+            if execution_date >= first_date:
+                break
+            _apply_target(execution_date, allocation, weights)
 
     # Window-scoped metric baselines: opening trades (pre-window execution)
     # stay visible in the trade list but are excluded from the sub-period's
@@ -1117,6 +1139,24 @@ def run_portfolio_backtest_view(
                 "position": _position_label(holdings),
             }
         )
+        if signal_callback is not None:
+            actual_weights = {symbol: holdings[symbol] * last_close[symbol] / equity
+                              for symbol in symbols if holdings[symbol] and equity > 0}
+            allocation = signal_callback(t, dict(holdings), cash, actual_weights)
+            if allocation is not None:
+                if allocation.signal_date != trading_date:
+                    raise ValueError("Live close signal must belong to the current trading day")
+                weights = _normalized_weights(allocation.target_weights, available_symbols=set(symbols))
+                allocations.append(allocation)
+                if t + 1 < window_end:
+                    scheduled[dates[t + 1]] = (allocation, weights)
+                else:
+                    skipped_signal_count += 1
+
+    if signal_callback is not None and not scheduled:
+        return _empty_report(strategy_name=strategy_name, status="no_executable_signals",
+            config=config, signal_count=len(allocations), skipped_signal_count=skipped_signal_count,
+            symbols=symbols, warning="No signal has a later common trading-day open in the supplied data.")
 
     strategy_values = [float(point["strategy_equity"]) for point in equity_curve]
     benchmark_values = [
@@ -1188,7 +1228,9 @@ def run_portfolio_backtest_view(
         warnings.append("Fewer than two executable signals; the result is not enough to judge a strategy.")
     if not trades:
         warnings.append("Signals produced no actual trade.")
-    if blocked_signal_count:
+    if blocked_signal_count and (signal_callback is not None or reapply_targets):
+        warnings.append(f"{blocked_signal_count} signal(s) were deferred by unavailable execution prices; state updates use actual fills.")
+    elif blocked_signal_count:
         warnings.append(
             f"{blocked_signal_count} signal(s) were blocked by suspensions: "
             "context.current_weights reflects requested targets, not the "

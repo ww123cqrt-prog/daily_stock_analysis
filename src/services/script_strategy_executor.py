@@ -73,7 +73,7 @@ the repo/venv/interpreter trees.
 '''
 
 
-def run_script_in_sandbox(
+def _run_strategy_process(
     source: str,
     *,
     bundle_dir: Path | None = None,
@@ -83,7 +83,8 @@ def run_script_in_sandbox(
     start_date: date | None,
     end_date: date | None,
     timeout_seconds: int = 30,
-) -> tuple[list[TargetAllocation], list[str], dict[str, Any]]:
+    execution_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Execute a strategy script against a market bundle in the sandbox.
 
     ``bundle_dir`` (preferred) points at a ``MarketBundle`` directory written
@@ -115,6 +116,8 @@ def run_script_in_sandbox(
             "start_date": start_date.isoformat() if start_date else None,
             "end_date": end_date.isoformat() if end_date else None,
         }
+        if execution_config is not None:
+            payload["execution_config"] = execution_config
         input_path = temp_dir / "input.json"
         output_path = temp_dir / "output.json"
         profile_path = temp_dir / "strategy.sb"
@@ -207,6 +210,10 @@ def run_script_in_sandbox(
         if completed.returncode != 0 or result.get("status") != "completed":
             raise ScriptExecutionError(str(result.get("message") or "script execution failed"))
 
+    return result
+
+
+def _allocations(result):
     allocations = [
         TargetAllocation(
             source_id=str(item["source_id"]),
@@ -216,4 +223,26 @@ def run_script_in_sandbox(
         )
         for item in result.get("allocations", [])
     ]
-    return allocations, [str(item) for item in result.get("logs", [])], result.get("check") or check
+    return allocations
+
+
+def run_script_in_sandbox(
+    source: str, *, bundle_dir: Path | None = None, view: MarketView | None = None,
+    bars: Sequence[PriceBar] | None = None, symbols: Sequence[str] | None = None,
+    start_date: date | None, end_date: date | None, timeout_seconds: int = 30,
+) -> tuple[list[TargetAllocation], list[str], dict[str, Any]]:
+    """Legacy signal-only scripts retain their existing sandbox contract."""
+    result = _run_strategy_process(source, bundle_dir=bundle_dir, view=view, bars=bars, symbols=symbols,
+        start_date=start_date, end_date=end_date, timeout_seconds=timeout_seconds)
+    return _allocations(result), result.get("logs", []), result["check"]
+
+
+def run_script_backtest_in_sandbox(
+    source: str, *, bundle_dir: Path, start_date: date | None, end_date: date | None,
+    config: Any, timeout_seconds: int = 30,
+) -> tuple[dict[str, Any], list[TargetAllocation], list[str], dict[str, Any]]:
+    """Run fill-aware signals and the existing matcher in the same OS sandbox."""
+    from dataclasses import asdict
+    result = _run_strategy_process(source, bundle_dir=bundle_dir, start_date=start_date,
+        end_date=end_date, timeout_seconds=timeout_seconds, execution_config=asdict(config))
+    return result["backtest_report"], _allocations(result), result.get("logs", []), result["check"]
