@@ -51,7 +51,7 @@ def _strong_streak(data):
 
 def _mode_b_pullback(data, symbol, bands):
     closes = data.history(symbol, 25, "close")
-    if len(closes) < 21:
+    if len(closes) < 21 or not data.history(symbol, 1, "close"):
         return None
     if bands is None:
         if len(closes) == 25:

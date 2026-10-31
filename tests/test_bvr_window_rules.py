@@ -111,6 +111,21 @@ def test_complete_closes_do_not_bypass_original_volume_requirement():
     assert not context.observations
 
 
+@pytest.mark.parametrize('today_present', [False, True])
+def test_new_observation_requires_todays_close(today_present):
+    context, data, requests = scenario(touch_ago=2)
+    symbol = context.symbols[0]
+    data._view.close[48, 0] = 10.5
+    if not today_present:
+        data._view.close[49, 0] = np.nan
+        data._view.volume[49, 0] = np.nan
+    assert len(data.history(symbol, 25)) == (25 if today_present else 24)
+    bvr.on_bar(context, data)
+    assert bool(context.observations) is today_present
+    assert not context.pending_entries
+    assert not requests
+
+
 def test_short_history_uses_twenty_sample_boll_not_shorter_windows():
     context, data, _ = scenario(missing=4)
     prices = data.history(context.symbols[0], 25)
